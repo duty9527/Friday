@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Super-agent · 持续对话</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/client.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="mark" aria-hidden="true">↳</span> Super-agent</div>
+    <button id="work-toggle" class="fold-control" type="button" aria-expanded="false" aria-controls="work-sidebar">后台工作</button>
+    <span class="workspace meta">本机工作区 · 只读文件分析</span>
+    <span id="mode" class="mode meta">正在连接</span>
+  </header>
+  <div class="app">
+    <aside id="work-sidebar" class="sidebar" aria-label="后台工作">
+      <div class="sidebar-intro"><strong>一个持续在线的 Agent</strong><p class="meta">上下文由系统维护</p></div>
+      <h2 class="sidebar-label">后台工作 · 最近 80 项</h2>
+      <p class="meta sidebar-hint">查看只改变轨迹，不切换对话</p>
+      <label class="filter-label" for="work-filter">工作筛选</label>
+      <select id="work-filter"><option value="all">全部工作</option><option value="active">进行中</option><option value="settled">已结束 / 暂停</option></select>
+      <div id="works" class="works"><p class="empty">正在读取后台工作…</p></div>
+      <p class="sidebar-bottom meta">本机持久化 · 断开页面不停止工作<br>模型以实际配置为准<br>页面不接收 SDK 凭据</p>
+    </aside>
+    <main class="sheet">
+      <div class="titlebar">
+        <div><h1>与 Super-agent 对话</h1><p class="meta">同一个 Agent · 多项工作并行推进</p></div>
+        <button id="stop-work" type="button" disabled>停止选中的工作</button>
+      </div>
+      <div class="connection-bar" role="status" aria-live="polite"><span id="connection">正在连接本机服务…</span><button id="reconnect" type="button">重新连接</button></div>
+      <div class="panel-nav" aria-label="面板导航"><button id="show-chat" type="button" aria-pressed="true">主对话</button><button id="show-trace" type="button" aria-pressed="false">执行轨迹</button></div>
+      <div id="panels" class="panels">
+        <section class="conversation" aria-label="持续主对话">
+          <div id="messages-scroll" class="messages-scroll" tabindex="0" aria-label="消息记录">
+            <button id="older" class="older" type="button" hidden>加载更早消息</button>
+            <div id="history-error" class="error" role="status"></div>
+            <div id="messages"><p class="empty">正在读取对话…</p></div>
+          </div>
+          <form id="composer" class="composer">
+            <label for="draft">发送给 Super-agent</label>
+            <textarea id="draft" rows="3" maxlength="16384" placeholder="直接说你的目标、补充要求，或问问之前那件事…" disabled></textarea>
+            <details id="paths-disclosure" class="paths-disclosure"><summary>附加本地文件路径（可选）</summary><label for="paths">本机绝对文件路径，每行一个</label><textarea id="paths" rows="3" spellcheck="false" placeholder="/Users/你的用户名/项目/README.md" disabled></textarea><p class="meta">仅限明确指定的普通文件，不接受目录。服务会建立本机只读副本；真实模式会将内容发送给已配置的模型供应商。最多 32 个文件，每个 256 KiB，合计 1 MiB。</p></details>
+            <p id="send-error" class="error" role="alert"></p>
+            <div class="composer-bottom"><span class="meta">Enter 发送 · Shift + Enter 换行</span><button id="send" class="primary" type="submit" disabled>发送 ↑</button></div>
+          </form>
+        </section>
+        <aside class="trace" aria-label="诊断执行轨迹">
+          <div class="trace-heading"><h2>执行轨迹</h2><button id="clear-filter" type="button">全部轨迹</button></div>
+          <p id="trace-scope" class="meta trace-scope">全部已记录事件</p>
+          <div class="trace-tabs" aria-label="轨迹显示方式"><button id="graph-mode" class="tab active" type="button" aria-pressed="true">因果线路</button><button id="timeline-mode" class="tab" type="button" aria-pressed="false">事件时间线</button></div>
+          <div class="trace-scroll">
+            <p id="trace-error" class="error" role="status"></p>
+            <button id="trace-retry" type="button" hidden>重试读取轨迹</button>
+            <div id="trace-content" class="trace-content"><p class="empty">等待服务连接后读取实际事件。</p></div>
+            <button id="trace-more" class="trace-more" type="button" hidden>加载更多事件</button>
+            <section id="event-detail" class="event-detail" aria-label="选中节点详情"><h3>节点详情</h3><p class="meta">选择节点查看公开数据与记录时间。</p></section>
+            <section id="work-detail" class="work-detail" aria-label="后台工作详情" hidden></section>
+          </div>
+          <p class="trace-help meta">仅展示实际调用、公开结果和错误，不展示模型私有思维链。Worker 的细节仅在诊断轨迹中显示。</p>
+        </aside>
+      </div>
+    </main>
+  </div>
+  <noscript>此本机界面需要 JavaScript。请启用后使用当前服务生成的本地启动链接。</noscript>
+</body>
+</html>

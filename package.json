@@ -1,0 +1,32 @@
+{
+  "name": "super-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local persistent Router/Worker agent with explicitly scoped read-only inputs",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "bin": {
+    "super-agent": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/copy-web.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && tsx --test --test-concurrency=1 test/*.test.ts",
+    "start": "node dist/cli.js",
+    "check": "npm run typecheck && npm test",
+    "check:browser": "node scripts/browser-check.mjs"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@earendil-works/pi-schema": "1.5.0",
+    "proper-lockfile": "4.1.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "@types/proper-lockfile": "^4.1.4",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}
