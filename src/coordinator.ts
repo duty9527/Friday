@@ -147,6 +147,10 @@ export class Coordinator {
     if (!args || typeof args !== 'object' || Array.isArray(args)) args = {};
     const action: RouteAction = { id: randomUUID(), kind: kinds[name]!, status: 'pending', at: Date.now(),
       taskId: typeof args.taskId === 'string' ? args.taskId : undefined };
+    if (action.taskId) {
+      try { action.taskLabel = String(publicData(this.store.get(action.taskId).prompt.slice(0, 240))); }
+      catch { /* The original tool reports unknown or invalid targets. */ }
+    }
     this.store.conversation.routeAction(context.message.id, action);
     try {
       if (args.summary !== undefined) action.summary = String(publicData(text(args.summary, 'summary', 240)));

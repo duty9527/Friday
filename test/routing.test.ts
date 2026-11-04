@@ -33,6 +33,10 @@ test('routing records new work, a targeted follow-up among two running works, qu
       } else if (event.message.text === 'supplement A and query B') {
         await call('continue_work', { taskId: a, instruction: 'add recovery analysis', summary: '补充当前 A 工作' });
         await call('inspect_work', { taskId: b });
+      } else if (event.message.text === 'continue settled A') {
+        await call('continue_work', { taskId: a, instruction: 'new execution after settlement' });
+      } else if (event.message.text === 'recall A') {
+        await call('recall_messages', { messageId: coordinator.store.conversation.byRequest('a')!.id });
       } else if (event.message.text === 'bad dispatch') {
         await assert.rejects(call('start_work', { instruction: 'bad', cwd: '/this-directory-does-not-exist-super-agent' }));
       }
@@ -73,6 +77,20 @@ test('routing records new work, a targeted follow-up among two running works, qu
     assert.deepEqual(updated.routing?.context, record.context, 'routing-time context must not turn into current task state');
     const result = coordinator.store.conversation.history(undefined, 40).items.find(message => message.text === 'new independent result' && message.taskIds.includes(a));
     assert.ok(result && result.seq > direct.seq, 'late result is a newly inserted message');
+    const related = coordinator.chat('related', 'continue settled A');
+    await until(() => coordinator.store.conversation.get(related.id).status === 'completed');
+    const relatedAction = coordinator.store.conversation.get(related.id).routing!.actions[0]!;
+    assert.equal(relatedAction.kind, 'related_work');
+    assert.equal(relatedAction.parentTaskId, a);
+    assert.notEqual(relatedAction.taskId, a);
+    assert.equal(coordinator.store.list().length, 3, 'continuing settled work is visibly a new related execution');
+    gates.forEach(release => release());
+    await until(() => coordinator.store.get(relatedAction.taskId!).status === 'completed');
+    const recall = coordinator.chat('recall', 'recall A');
+    await until(() => coordinator.store.conversation.get(recall.id).status === 'completed');
+    const recalled = coordinator.store.conversation.get(recall.id).routing!.actions[0]!;
+    assert.equal(recalled.kind, 'recall');
+    assert.deepEqual(recalled.messageIds, [first.id], 'actual recalled references remain inspectable, not guessed from reply prose');
     await coordinator.close();
     const reopened = new Store(home);
     try { assert.deepEqual(reopened.conversation.get(followupMessage).routing, updated.routing); }

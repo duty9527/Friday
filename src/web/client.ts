@@ -246,7 +246,7 @@ async function jumpMessage(id: string) {
 }
 function actionRow(action: RouteAction): HTMLElement {
   const row = node('div', '', 'route-action');
-  const title = `${routeLabel(action)}${action.taskLabel ? ` · ${action.taskLabel}` : ''}`;
+  const title = `${routeLabel(action)}${action.taskId ? ` · ${action.taskLabel ?? '目标工作名称未记录'}` : ''}`;
   if (action.taskId) row.append(button(title, () => {
     selectTrace({ type: 'task', id: action.taskId!, label: action.taskLabel ?? '目标工作' }); showPanel(true);
   }, 'route-target'));
@@ -268,7 +268,7 @@ function routingSummary(message: ChatMessage): HTMLElement {
   }
   for (const action of message.routing.actions) area.append(actionRow(action));
   if (!message.routing.actions.length) area.append(node('p', message.routing.status === 'processing' ? 'Router 正在处理，尚无已受理动作。' : '本次路由未确认完成，没有可确认的分配动作。', 'meta'));
-  if (message.routing.omittedActions) area.append(node('p', `另有 ${message.routing.omittedActions} 条较早动作，请在事件时间线查看。`, 'meta'));
+  if (message.routing.omittedActions) area.append(node('p', '动作较多，摘要只展示最近 40 条；完整动作记录请在事件时间线查看。', 'meta'));
   if (message.routing.status === 'failed' || message.routing.status === 'interrupted') area.append(node('p', 'Router 处理未完成；已受理的动作保留，不代表已撤销。', 'meta'));
   return area;
 }
@@ -293,7 +293,12 @@ function renderRoutingDetail() {
   if (!routing.context.works.length) ui.routingDetail.append(node('p', '当时没有后台工作。', 'meta'));
   if (routing.context.truncated) ui.routingDetail.append(node('p', `当时共 ${routing.context.totalWorks} 项工作，Router 仅收到最近 ${routing.context.works.length} 项摘要。`, 'meta'));
   ui.routingDetail.append(node('p', '以上是处理当时的状态，不随当前工作状态改写。', 'meta'), node('h4', '已记录动作'));
-  for (const action of routing.actions) ui.routingDetail.append(actionRow(action));
+  for (const action of routing.actions) {
+    ui.routingDetail.append(actionRow(action));
+    for (const [index, id] of (action.messageIds ?? []).entries()) ui.routingDetail.append(button(
+      `召回引用 ${index + 1}：${messages.get(id)?.text.slice(0, 60) ?? '读取原消息'}`, () => { void jumpMessage(id); }, 'source-reference'));
+  }
+  if (routing.omittedActions) ui.routingDetail.append(node('p', '摘要只展示最近 40 条动作；完整动作记录请查看事件时间线。', 'meta'));
   if (!routing.actions.length) ui.routingDetail.append(node('p', '尚无已确认的路由动作。', 'meta'));
   const refs = node('details'); refs.open = referencesOpen; refs.append(node('summary', '当时的近期对话引用'));
   for (const reference of routing.context.messages) refs.append(button(`${reference.role === 'user' ? '你' : 'Router'}：${reference.preview || '无公开文本'}`, () => { void jumpMessage(reference.id); }, 'source-reference'));

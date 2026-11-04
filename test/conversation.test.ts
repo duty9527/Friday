@@ -51,6 +51,34 @@ test('restart interrupts unfinished conversation and model spans instead of fabr
   } finally { await rm(home, { recursive: true, force: true }); }
 });
 
+test('recovery preserves accepted routing facts, marks uncertain decisions interrupted and settles undelivered supplements', async () => {
+  const home = await fixture();
+  try {
+    const store = new Store(home); const chat = store.conversation;
+    const routing = { at: 123, status: 'processing' as const, context: { execution: 'native' as const, cwd: home,
+      totalWorks: 0, truncated: false, works: [], messages: [] }, actions: [] };
+    const message = chat.create({ id: 'route', role: 'user', text: 'more', status: 'processing', mode: 'offline', paths: [], routing });
+    const work = task('work', message.id); store.create(work); store.addEvent('followup', work.id, 'more');
+    chat.routeAction(message.id, { id: 'accepted', kind: 'followup', at: 124, status: 'accepted', taskId: work.id, followupId: 'followup', delivery: 'pending' });
+    chat.routeAction(message.id, { id: 'unknown', kind: 'new_work', at: 125, status: 'pending' });
+    const before = chat.get(message.id).version;
+    store.takeEvents(work.id);
+    assert.equal(chat.get(message.id).routing?.actions[0]?.delivery, 'processing');
+    assert.ok(chat.get(message.id).version > before, 'supplement settlement invalidates the message SSE version');
+    store.close();
+    const resumed = new Store(home);
+    try {
+      resumed.recover();
+      const recovered = resumed.conversation.get(message.id).routing!;
+      assert.equal(recovered.at, 123); assert.equal(recovered.status, 'interrupted');
+      assert.equal(recovered.actions[0]!.status, 'accepted', 'a successful dispatch is not retroactively called a failed action');
+      assert.equal(recovered.actions[0]!.delivery, 'failed', 'recovery cannot claim Worker processing completed');
+      assert.equal(recovered.actions[1]!.status, 'interrupted', 'uncertain pending action is never fabricated as a success');
+      assert.equal(resumed.events(work.id)[0]!.state, 'failed');
+    } finally { resumed.close(); }
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
 test('nested state/message transactions roll back together and trace payloads are bounded and redacted', async () => {
   const home = await fixture();
   try {
