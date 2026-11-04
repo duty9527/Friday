@@ -11,7 +11,8 @@ export function tracePreview(kind: 'input' | 'output', value: unknown): Record<s
     if (typeof raw === 'string') {
       try { args = object(JSON.parse(raw)); } catch { return { input: { input: raw.slice(0, 400) }, inputTruncated: raw.length > 400 }; }
     }
-    const entries = Object.entries(args);
+    // Internal message ids are redundant inside that message's own round.
+    const entries = Object.entries(args).filter(([key]) => key !== 'sourceMessageId');
     let truncated = entries.length > 8;
     const input = Object.fromEntries(entries.slice(0, 8).map(([key, item]) => {
       const text = typeof item === 'string' ? item : JSON.stringify(item) ?? '—';

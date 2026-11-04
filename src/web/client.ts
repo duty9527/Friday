@@ -40,6 +40,7 @@ const statusNames: Record<string, string> = {
   paused: '已暂停', cancelled: '已取消', stopped: '已停止', stopping: '正在请求停止',
   stop_requested: '已请求停止', cancel_requested: '已请求取消', unknown: '结果未知',
   linked: '已关联', ready: '就绪', degraded: '服务降级', pending: '处理中', accepted: '已受理',
+  followup: '收到补充要求', followup_failed: '补充要求未处理',
 };
 const statusText = (value: string) => statusNames[value] ?? value;
 import { activeStatus as active, settledStatus as terminal } from './model.js';
@@ -606,6 +607,7 @@ function workLabel(step: TimelineStep): string | undefined {
   if (step.taskLabel) return step.taskLabel;
   return step.taskId ? view?.works.find(work => work.id === step.taskId)?.prompt : undefined;
 }
+const openSteps = new Set<string>();
 function renderSteps(contents: DocumentFragment) {
   const steps = timelineSteps(traceEvents);
   if (traceHasEarlier) contents.append(node('p', '从最近记录的步骤开始显示；更早的步骤可继续加载。', 'branch-note'));
@@ -640,14 +642,25 @@ function renderSteps(contents: DocumentFragment) {
       const lines = Object.entries(step.input).filter(([, value]) => value !== '').map(([key, value]) => `${key}: ${value}`);
       if (lines.length) item.append(node('pre', `${lines.join('\n')}${step.inputTruncated ? '\n…（已截断）' : ''}`, 'step-io input'));
     }
-    if (step.output) item.append(node('div', '', 'step-output'), node('p', '已记录结果：', 'meta'),
+    if (step.output) item.append(node('p', '已记录结果：', 'meta'),
       node('pre', `${step.output}${step.outputTruncated ? '\n…（已截断）' : ''}`, 'step-io'));
     if (step.exitCode !== undefined) item.append(node('p', `退出码 ${step.exitCode}`, 'meta'));
     if (step.error) item.append(node('p', `错误：${step.error}`, 'error'));
-    const raw = traceEvents.filter(event => event.spanId === step.id || event.parentSpanId === step.id);
-    const details = node('details');
-    details.append(node('summary', `已记录的 ${step.detailCount} 条记录`),
-      node('pre', json(raw.map(event => ({ seq: event.seq, label: event.label, status: event.status, at: event.at, data: event.data })))));
+    const raw = traceEvents.filter(event => (event.spanId === step.id || event.parentSpanId === step.id || event.spanId === step.parentTool)
+      && event.kind !== 'visible_text' && event.kind !== 'thinking');
+    const details = node('details', '', 'step-records');
+    const records = node('pre');
+    // Raw records are built only when opened: a live window can hold hundreds of events per step.
+    const fillRecords = () => {
+      if (!records.textContent) records.textContent = json(raw.map(event =>
+        ({ seq: event.seq, label: event.label, status: event.status, at: event.at, data: event.data })));
+    };
+    details.open = openSteps.has(step.id);
+    if (details.open) fillRecords();
+    details.addEventListener('toggle', () => {
+      if (details.open) { openSteps.add(step.id); fillRecords(); } else openSteps.delete(step.id);
+    });
+    details.append(node('summary', `已记录的 ${raw.length} 条记录${traceHasEarlier ? '（更早记录可能未加载）' : ''}`), records);
     item.append(details);
     list.append(item);
   }
@@ -660,7 +673,7 @@ function renderSteps(contents: DocumentFragment) {
 async function fillProcessStart() {
   if (traceMode !== 'steps') return;
   const generation = selectionGeneration;
-  const starts = new Set(['Router 处理新输入', 'Router 派发任务', 'Worker 接收任务', '后台工作状态变化']);
+  const starts = new Set(['Router 处理新输入', 'Router 派发任务', 'Worker 接收任务']);
   for (let page = 0; page < 4; page++) {
     if (generation !== selectionGeneration || !traceHasEarlier || traceBusy) return;
     const steps = timelineSteps(traceEvents);

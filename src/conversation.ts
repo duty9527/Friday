@@ -85,8 +85,9 @@ export class Conversation {
       const actions = [...message.routing.actions];
       const index = actions.findIndex(item => item.id === action.id);
       if (index < 0) actions.push(action); else actions[index] = action;
-      const omitted = Math.max(0, actions.length - 40);
-      this.update(messageId, { routing: { ...message.routing, actions: actions.slice(-40), omittedActions: (message.routing.omittedActions ?? 0) + omitted } });
+      // Only a newly appended action can push the oldest out; updating a visible one drops nothing.
+      const dropped = index < 0 ? Math.max(0, actions.length - 40) : 0;
+      this.update(messageId, { routing: { ...message.routing, actions: actions.slice(-40), omittedActions: (message.routing.omittedActions ?? 0) + dropped } });
       this.emit({ type: 'trace', kind: 'route_action', rootId: messageId, messageId, taskId: action.taskId,
         spanId: action.id, parentSpanId: parentSpanId ?? messageId, actor: 'router', label: action.kind, status: action.status, data: action });
     });
@@ -134,12 +135,20 @@ export class Conversation {
   trace(filter: { messageId?: string; taskId?: string }, after?: number, before?: number): TraceEvent[] {
     const limit = 60;
     // A work's process starts with the Router turn that created it, so that decision stays visible
-    // instead of a Worker apparently starting on its own.
+    // instead of a Worker apparently starting on its own. Only the creating round's message-level
+    // rows are added: rows stamped with a sibling work's id belong to that sibling, not to this one.
     const origin = filter.taskId ? this.originMessage(filter.taskId) : undefined;
-    const scope = filter.taskId ? (origin ? '(task_id=? OR message_id=?)' : 'task_id=?') : filter.messageId
-      ? '(root_id=? OR message_id=? OR task_id IN (SELECT task_id FROM message_tasks WHERE message_id=?))' : '';
+    // A message's own round is what happened because of it, including the replies its Router turns
+    // produced. Work events belong to the message that created the work, so a later follow-up's
+    // routing decision cannot appear inside an earlier round.
+    const own = filter.messageId ? [filter.messageId, ...this.replyIds(filter.messageId)] : [];
+    const listed = own.map(() => '?').join(',');
+    const scope = filter.taskId ? (origin ? '(task_id=? OR (message_id=? AND task_id IS NULL))' : 'task_id=?')
+      : filter.messageId
+        ? `(root_id=? OR message_id IN (${listed}) OR task_id IN (SELECT task_id FROM message_tasks WHERE message_id=?))
+          AND (json_extract(body,'$.messageId') IS NULL OR json_extract(body,'$.messageId') IN (${listed}))` : '';
     const args = filter.taskId ? origin ? [filter.taskId, origin] : [filter.taskId]
-      : filter.messageId ? [filter.messageId, filter.messageId, filter.messageId] : [];
+      : filter.messageId ? [filter.messageId, ...own, filter.messageId, ...own] : [];
     const where = [scope, after !== undefined ? 'seq>?' : 'seq<?']
       .filter(Boolean).join(' AND ');
     const anchor = after !== undefined ? after : before !== undefined ? before : Number.MAX_SAFE_INTEGER;
@@ -148,6 +157,9 @@ export class Conversation {
     const rows = this.db.prepare(sql).all(...args, anchor) as Array<Record<string, unknown>>;
     if (descending) rows.reverse();
     return rows.map(row => ({ ...JSON.parse(String(row.body)), seq: Number(row.seq) } as TraceEvent));
+  }
+  private replyIds(messageId: string): string[] {
+    return this.db.prepare("SELECT id FROM messages WHERE json_extract(body,'$.replyTo')=?").all(messageId).map(row => String(row.id));
   }
   private originMessage(taskId: string): string | undefined {
     const row = this.db.prepare('SELECT body FROM tasks WHERE id=?').get(taskId);

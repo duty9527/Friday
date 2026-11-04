@@ -136,9 +136,10 @@ try {
   assert.equal(await count(), beforeSelection, 'selecting a work must not change the conversation');
   checks.push('causal graph and raw node details stay available; step mode hides raw inspector; a work never switches conversation');
 
-  const burstsBefore = await page.eval("[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('连续消息')).length");
-  await burst(Array.from({ length: 12 }, (_, index) => `连续消息 ${index}`));
-  await until(() => page.eval(`[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('连续消息')).length >= ${burstsBefore + 12}`), 'burst hydration');
+  // A per-run marker keeps this check independent of whatever an earlier run left in the fixture.
+  const burstTag = `连续消息-${Date.now().toString(36)}`;
+  await burst(Array.from({ length: 12 }, (_, index) => `${burstTag} ${index}`));
+  await until(() => page.eval(`[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('${burstTag}')).length === 12`), 'burst hydration');
   checks.push('a burst larger than one history page is fully hydrated from the event stream');
 
   const orphans = await page.eval(() => {
@@ -147,12 +148,13 @@ try {
     return articles.filter(item => item.dataset.replyTo && index.has(item.dataset.replyTo) && index.get(item.dataset.replyTo) > index.get(item.dataset.messageId)).length;
   });
   assert.equal(orphans, 0, 'no reply may appear before the user message it belongs to');
-  assert.doesNotMatch(await page.eval("document.querySelector('#trace-content').innerText"), /关联后台工作/, 'bookkeeping events stay out of the readable process');
-  assert.doesNotMatch(await page.eval("document.querySelector('#trace-scope').innerText"), /连续消息/,
+  assert.doesNotMatch(await page.eval("[...document.querySelectorAll('#trace-content .timeline-step .step-title')].map(item => item.innerText).join(' ')"), /关联后台工作/,
+    'bookkeeping events stay out of the readable process');
+  assert.doesNotMatch(await page.eval("document.querySelector('#trace-scope').innerText"), new RegExp(burstTag),
     'a scope the reader opened stays put instead of jumping to a burst of new messages');
   checks.push('every shown reply carries its user message; a pinned scope holds while bookkeeping stays out');
 
-  const beforeReload = await page.eval("[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('连续消息')).length");
+  const beforeReload = await page.eval(`[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('${burstTag}')).length`);
   await page.goto(new URL(entryUrl).origin, { settleMs: 300 });
   await until(() => page.eval("!document.querySelector('#draft').disabled"), 'sessionStorage refresh authentication');
   for (let round = 0; round < 8; round++) {
@@ -160,9 +162,9 @@ try {
     await page.eval(() => document.querySelector('#older').click());
     await sleep(200);
   }
-  assert.equal(await page.eval("[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('连续消息')).length"), beforeReload);
+  assert.equal(await page.eval(`[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('${burstTag}')).length`), beforeReload);
   checks.push('refresh keeps the same main history and load-older restores it');
-  await until(() => page.eval("[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('连续消息')).every(x => x.querySelector('.speaker').innerText.includes('Router 已处理'))"), 'burst replies settled');
+  await until(() => page.eval(`[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('${burstTag}')).every(x => x.querySelector('.speaker').innerText.includes('Router 已处理'))`), 'burst replies settled');
   const order = await page.eval(() => [...document.querySelectorAll('#messages article')].map(item => Number(item.dataset.seq)));
   assert.ok(order.every((seq, index) => index === 0 || order[index - 1] < seq), 'persisted insertion order survives hydration, refresh and paging');
   assert.equal(await page.eval("document.querySelectorAll('#messages .router-message .source-reference').length > 0"), true, 'replies carry clickable source references');

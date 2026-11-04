@@ -34,7 +34,7 @@ export interface TimelineStep {
   summary?: string; summarySource?: 'turn' | 'action' | 'stream'; summaryTruncated?: boolean;
   input?: Record<string, string>; inputTruncated?: boolean; trigger?: string;
   output?: string; outputTruncated?: boolean; exitCode?: number; error?: string;
-  detailCount: number; route?: RouteAction; followupState?: string; parent?: string;
+  route?: RouteAction; followupState?: string; parent?: string; parentTool?: string;
 }
 const WORKER_TOOLS: Record<string, string> = {
   read: '读取文件', ls: '列出目录', find: '查找文件', grep: '搜索内容', bash: '执行命令',
@@ -122,8 +122,8 @@ export function timelineSteps(events: TraceEvent[]): TimelineStep[] {
     const start = ordered.find(event => activeStatus(event.status)) ?? ordered[0]!;
     const step: TimelineStep = {
       id: group.id, seq: start.seq, at: start.at, actor: latest.actor, kind: latest.kind, label: latest.label,
-      title: stepTitle(latest, triggerKind(start.data)), status: start === latest && activeStatus(latest.status) ? latest.status : latest.status,
-      taskId: latest.taskId, parent: group.parent, detailCount: ordered.length,
+      title: stepTitle(latest, triggerKind(start.data)), status: latest.status,
+      taskId: latest.taskId, parent: group.parent,
     };
     const trigger = record(record(start.data).trigger);
     if (typeof trigger.preview === 'string' && trigger.preview) step.trigger = trigger.preview;
@@ -136,6 +136,21 @@ export function timelineSteps(events: TraceEvent[]): TimelineStep[] {
       step.error = action.error;
       step.at = action.at ?? start.at;
       step.title = stepTitle(latest);
+      // The routing action replaces its tool call in the list, so keep that call's recorded
+      // arguments and result readable instead of hiding them behind a second, folded node.
+      const call = group.parent ? groups.get(group.parent) : undefined;
+      if (call && ROUTER_TOOLS.has(call.events[0]!.label)) {
+        const callEvents = call.events.slice().sort((a, b) => a.seq - b.seq);
+        const callStart = callEvents.find(event => activeStatus(event.status)) ?? callEvents[0]!;
+        const callEnd = callEvents.at(-1)!;
+        const args = record(record(callStart.data).summary);
+        const result = record(record(callEnd.data).summary);
+        if (Object.keys(record(args.input)).length) step.input = args.input as Record<string, string>;
+        if (args.inputTruncated === true) step.inputTruncated = true;
+        if (typeof result.output === 'string' && result.output) step.output = result.output;
+        if (result.outputTruncated === true) step.outputTruncated = true;
+        step.parentTool = call.id;
+      }
     } else if (latest.kind === 'followup_state') {
       const data = record(latest.data);
       step.followupState = String(data.state ?? latest.status);
@@ -156,7 +171,6 @@ export function timelineSteps(events: TraceEvent[]): TimelineStep[] {
     }
     const childOperations = operations.get(group.id);
     if (childOperations?.length) {
-      step.detailCount += childOperations.length;
       const settlement = childOperations.at(-1)!;
       const data = record(settlement.data);
       step.error ??= typeof data.error === 'string' ? data.error : undefined;

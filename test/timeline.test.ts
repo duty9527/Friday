@@ -76,6 +76,71 @@ test('steps stay in recorded order across concurrent roles, and missing summarie
   assert.equal(steps[2]!.status, 'failed');
 });
 
+test('a work\'s process starts at the Router decision that created it', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-timeline-origin-'));
+  try {
+    const store = new Store(home);
+    const chat = store.conversation;
+    const message = chat.create({ id: 'origin', role: 'user', text: '比较两个实现', status: 'completed', mode: 'offline', paths: [],
+      routing: { at: Date.now(), status: 'completed', actions: [], context: { execution: 'snapshot', cwd: '/tmp', totalWorks: 0, truncated: false, works: [], messages: [] } } });
+    chat.span({ rootId: message.id, messageId: message.id, spanId: 'router-turn' }, 'router', '模型推理调用', 'completed');
+    chat.routeAction(message.id, { id: 'route', kind: 'new_work', status: 'accepted', at: Date.now(), taskId: 'work-1' }, 'router-tool');
+    const task = { id: 'work-1', requestId: 'work-1', fingerprint: 'f', prompt: '比较两个实现', files: [], status: 'running' as const,
+      revision: 0, mode: 'offline' as const, createdAt: Date.now(), limitMs: 600_000, activeMs: 0, originMessageId: message.id };
+    store.create(task);
+    chat.span({ rootId: message.id, messageId: message.id, taskId: task.id, spanId: 'worker-turn' }, 'worker', '模型推理调用', 'completed');
+    const scoped = chat.trace({ taskId: task.id });
+    assert.deepEqual(scoped.filter(event => event.kind === 'span' || event.kind === 'route_action').map(event => event.spanId),
+      ['router-turn', 'route', 'worker-turn'], 'the work view includes the Router turn that created it, in recorded order');
+    const steps = timelineSteps(scoped);
+    assert.equal(steps[0]!.title, 'Router 判断');
+    assert.equal(steps[1]!.title, '新建工作');
+    assert.deepEqual(steps.map(step => step.title), ['Router 判断', '新建工作', '后台工作状态变化', 'Worker 推理']);
+    assert.equal(steps.at(-1)!.actor, 'worker');
+    store.close();
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test('one message that starts two works keeps each work\'s process to itself', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-timeline-siblings-'));
+  try {
+    const store = new Store(home);
+    const chat = store.conversation;
+    const message = chat.create({ id: 'origin', role: 'user', text: 'compare two', status: 'completed', mode: 'offline', paths: [],
+      routing: { at: Date.now(), status: 'completed', actions: [], context: { execution: 'snapshot', cwd: '/tmp', totalWorks: 0, truncated: false, works: [], messages: [] } } });
+    for (const id of ['w1', 'w2']) {
+      store.create({ id, requestId: id, fingerprint: id, prompt: `work ${id}`, files: [], status: 'running', revision: 0,
+        mode: 'offline', createdAt: Date.now(), limitMs: 600_000, activeMs: 0, originMessageId: message.id });
+      chat.routeAction(message.id, { id: `route-${id}`, kind: 'new_work', status: 'accepted', at: Date.now(), taskId: id }, 'router-tool');
+      chat.span({ rootId: message.id, messageId: message.id, taskId: id, spanId: `${id}-turn` }, 'worker', '模型推理调用', 'completed');
+    }
+    const first = chat.trace({ taskId: 'w1' });
+    const second = chat.trace({ taskId: 'w2' });
+    assert.ok(first.some(event => event.spanId === 'origin'), 'the creating Router turn is part of the process');
+    assert.ok(first.some(event => event.spanId === 'route-w1'));
+    assert.ok(!first.some(event => event.spanId === 'route-w2' || event.spanId === 'w2-turn'),
+      'a sibling work started by the same message never appears in this work');
+    assert.ok(!second.some(event => event.spanId === 'route-w1' || event.spanId === 'w1-turn'));
+    store.close();
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test('a round keeps the Router delivery its own turns produced', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-timeline-reply-'));
+  try {
+    const store = new Store(home);
+    const chat = store.conversation;
+    const message = chat.create({ id: 'origin', role: 'user', text: 'work', status: 'processing', mode: 'offline', paths: [] });
+    const reply = chat.create({ id: 'reply', replyTo: message.id, role: 'assistant', text: '', status: 'streaming', mode: 'offline', paths: [] });
+    chat.span({ rootId: message.id, messageId: reply.id, spanId: 'delivery' }, 'router', 'Agent 请求', 'started');
+    chat.update(reply.id, { text: 'done', status: 'completed' });
+    const scoped = chat.trace({ messageId: message.id });
+    assert.ok(scoped.some(event => event.spanId === 'delivery'), 'the delivery turn is part of the round it answered');
+    assert.ok(scoped.some(event => event.type === 'message' && event.messageId === 'reply'), 'the reply itself is readable');
+    store.close();
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
 test('trace reads the recent window, then earlier pages, without losing durable order', async () => {
   const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-timeline-'));
   try {

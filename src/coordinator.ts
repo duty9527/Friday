@@ -152,9 +152,11 @@ export class Coordinator {
       catch { /* The original tool reports unknown or invalid targets. */ }
     }
     const routeParent = this.routerTrace?.toolSpan(callId);
+    if (typeof args.summary === 'string' && args.summary.trim()) {
+      action.summary = String(publicData(args.summary.trim().slice(0, 240)));
+    }
     this.store.conversation.routeAction(context.message.id, action, routeParent);
     try {
-      if (args.summary !== undefined) action.summary = String(publicData(text(args.summary, 'summary', 240)));
       const result = await execute();
       const value = JSON.parse(result) as Record<string, unknown>;
       action.status = 'accepted';
