@@ -125,7 +125,7 @@ export async function startWeb(options: { home: string; port?: number }): Promis
           case '/api/view': command = { command: 'view' }; break;
           case '/api/message': command = { command: 'message', messageId: search.get('messageId') }; break;
           case '/api/history': command = { command: 'history', before: numeric('before') }; break;
-          case '/api/trace': command = { command: 'trace', messageId: search.get('messageId') ?? undefined, taskId: search.get('taskId') ?? undefined, after: numeric('after') }; break;
+          case '/api/trace': command = { command: 'trace', messageId: search.get('messageId') ?? undefined, taskId: search.get('taskId') ?? undefined, after: numeric('after'), before: numeric('before') }; break;
           case '/api/work': command = { command: 'get', taskId: search.get('taskId') }; break;
           case '/api/operation': command = { command: 'operation', taskId: search.get('taskId'), operationId: search.get('operationId') }; break;
           default: throw new HttpFailure(404, 'Unknown API endpoint');

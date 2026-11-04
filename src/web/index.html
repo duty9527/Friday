@@ -50,17 +50,17 @@
         <aside class="trace" aria-label="诊断执行轨迹">
           <div class="trace-heading"><h2>执行轨迹</h2><button id="clear-filter" type="button">全部轨迹</button></div>
           <p id="trace-scope" class="meta trace-scope">全部已记录事件</p>
-          <div class="trace-tabs" aria-label="轨迹显示方式"><button id="graph-mode" class="tab active" type="button" aria-pressed="true">因果线路</button><button id="timeline-mode" class="tab" type="button" aria-pressed="false">事件时间线</button></div>
+          <div class="trace-tabs" aria-label="轨迹显示方式"><button id="step-mode" class="tab active" type="button" aria-pressed="true">逐步过程</button><button id="graph-mode" class="tab" type="button" aria-pressed="false">因果线路</button><button id="timeline-mode" class="tab" type="button" aria-pressed="false">原始事件</button></div>
           <div class="trace-scroll">
             <p id="trace-error" class="error" role="status"></p>
             <button id="trace-retry" type="button" hidden>重试读取轨迹</button>
-            <section id="routing-detail" class="routing-detail" aria-label="本次路由上下文" hidden></section>
-            <div id="trace-content" class="trace-content"><p class="empty">等待服务连接后读取实际事件。</p></div>
+            <div id="trace-content" class="trace-content"><p class="empty">等待服务连接后读取实际过程。</p></div>
             <button id="trace-more" class="trace-more" type="button" hidden>加载更多事件</button>
+            <section id="routing-detail" class="routing-detail" aria-label="本次路由上下文" hidden></section>
             <section id="event-detail" class="event-detail" aria-label="选中节点详情"><h3>节点详情</h3><p class="meta">选择节点查看公开数据与记录时间。</p></section>
             <section id="work-detail" class="work-detail" aria-label="后台工作详情" hidden></section>
           </div>
-          <p class="trace-help meta">仅展示实际调用、公开结果和错误，不展示模型私有思维链。Worker 的细节仅在诊断轨迹中显示。</p>
+          <p class="trace-help meta">逐步过程按记录顺序展示 Router 的调用、公开说明与调度，以及 Worker 的每个工具动作。公开说明是模型主动给出的简短结论，不是私有思维链；未记录的说明或数据明确标为缺失。「因果线路」和「原始事件」用于核对原始记录。</p>
         </aside>
       </div>
     </main>

@@ -144,7 +144,8 @@ export class Store {
         messageId: task.originMessageId, taskId: task.id, spanId: op.id, parentSpanId: op.parentSpanId ?? task.id,
         actor: op.fileId.startsWith('native:') || op.status === 'requested' ? 'worker' : 'executor',
         label: op.fileId.startsWith('native:') ? `本机工具 · ${op.fileId.slice(7)}` : '读取文件副本', status: op.status,
-        data: { fileId: op.fileId, resultRef: op.result === undefined ? undefined : op.id, preview: op.result?.slice(0, 512), error: op.error } });
+        data: { fileId: op.fileId, fileName: task.files.find(file => file.id === op.fileId)?.name,
+          resultRef: op.result === undefined ? undefined : op.id, preview: op.result?.slice(0, 512), error: op.error } });
     });
   }
   operations(taskId: string): Operation[] {

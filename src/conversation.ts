@@ -78,7 +78,7 @@ export class Conversation {
       return message;
     });
   }
-  routeAction(messageId: string, action: RouteAction) {
+  routeAction(messageId: string, action: RouteAction, parentSpanId?: string) {
     this.atomic(() => {
       const message = this.get(messageId);
       if (!message.routing) return;
@@ -88,7 +88,7 @@ export class Conversation {
       const omitted = Math.max(0, actions.length - 40);
       this.update(messageId, { routing: { ...message.routing, actions: actions.slice(-40), omittedActions: (message.routing.omittedActions ?? 0) + omitted } });
       this.emit({ type: 'trace', kind: 'route_action', rootId: messageId, messageId, taskId: action.taskId,
-        spanId: action.id, parentSpanId: messageId, actor: 'router', label: action.kind, status: action.status, data: action });
+        spanId: action.id, parentSpanId: parentSpanId ?? messageId, actor: 'router', label: action.kind, status: action.status, data: action });
     });
   }
   routeState(messageId: string, status: RoutingRecord['status']) {
@@ -103,6 +103,10 @@ export class Conversation {
       const message = this.get(String(row.id));
       if (message.routing) this.update(message.id, { routing: { ...message.routing,
         actions: message.routing.actions.map(action => action.followupId === id ? { ...action, delivery: state } : action) } });
+      for (const action of message.routing?.actions.filter(item => item.followupId === id) ?? []) this.emit({
+        type: 'trace', kind: 'followup_state', rootId: message.id, messageId: message.id, taskId: action.taskId,
+        spanId: `${action.id}:delivery`, parentSpanId: action.id, actor: 'worker', label: '处理补充要求', status: state,
+        data: { followupId: id, taskLabel: action.taskLabel, state } });
     }
   }
   link(messageId: string, taskId: string) {
@@ -122,14 +126,34 @@ export class Conversation {
   recentContext(): unknown[] {
     return this.history(undefined, 12).items.map(({ id, role, text, mode, status, taskIds, paths }) => ({ id, role, mode, text: text.slice(-4096), truncated: text.length > 4096, status, taskIds, fileCount: paths.length }));
   }
-  trace(filter: { messageId?: string; taskId?: string }, after = 0): TraceEvent[] {
-    let rows;
-    if (filter.taskId) rows = this.db.prepare('SELECT seq,body FROM journal WHERE seq>? AND task_id=? ORDER BY seq LIMIT 60').all(after, filter.taskId);
-    else if (filter.messageId) rows = this.db.prepare(`SELECT seq,body FROM journal WHERE seq>? AND
-      (root_id=? OR message_id=? OR task_id IN (SELECT task_id FROM message_tasks WHERE message_id=?)) ORDER BY seq LIMIT 60`)
-      .all(after, filter.messageId, filter.messageId, filter.messageId);
-    else rows = this.db.prepare('SELECT seq,body FROM journal WHERE seq>? ORDER BY seq LIMIT 60').all(after);
+  /**
+   * `after` reads forward for live updates, `before` reads the window that precedes a known event,
+   * and neither reads the most recent window, so a long-running work can be opened where it is now
+   * instead of replaying its first hour. Every direction returns durable sequence order.
+   */
+  trace(filter: { messageId?: string; taskId?: string }, after?: number, before?: number): TraceEvent[] {
+    const limit = 60;
+    // A work's process starts with the Router turn that created it, so that decision stays visible
+    // instead of a Worker apparently starting on its own.
+    const origin = filter.taskId ? this.originMessage(filter.taskId) : undefined;
+    const scope = filter.taskId ? (origin ? '(task_id=? OR message_id=?)' : 'task_id=?') : filter.messageId
+      ? '(root_id=? OR message_id=? OR task_id IN (SELECT task_id FROM message_tasks WHERE message_id=?))' : '';
+    const args = filter.taskId ? origin ? [filter.taskId, origin] : [filter.taskId]
+      : filter.messageId ? [filter.messageId, filter.messageId, filter.messageId] : [];
+    const where = [scope, after !== undefined ? 'seq>?' : 'seq<?']
+      .filter(Boolean).join(' AND ');
+    const anchor = after !== undefined ? after : before !== undefined ? before : Number.MAX_SAFE_INTEGER;
+    const descending = after === undefined;
+    const sql = `SELECT seq,body FROM journal${where ? ` WHERE ${where}` : ''} ORDER BY seq ${descending ? 'DESC' : 'ASC'} LIMIT ${limit}`;
+    const rows = this.db.prepare(sql).all(...args, anchor) as Array<Record<string, unknown>>;
+    if (descending) rows.reverse();
     return rows.map(row => ({ ...JSON.parse(String(row.body)), seq: Number(row.seq) } as TraceEvent));
+  }
+  private originMessage(taskId: string): string | undefined {
+    const row = this.db.prepare('SELECT body FROM tasks WHERE id=?').get(taskId);
+    if (!row) return undefined;
+    const origin = (JSON.parse(String(row.body)) as { originMessageId?: string }).originMessageId;
+    return typeof origin === 'string' ? origin : undefined;
   }
   latestSeq(): number { return Number(this.db.prepare('SELECT coalesce(max(seq),0) AS seq FROM journal').get()!.seq); }
   recover() {

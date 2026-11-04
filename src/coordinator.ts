@@ -151,7 +151,8 @@ export class Coordinator {
       try { action.taskLabel = String(publicData(this.store.get(action.taskId).prompt.slice(0, 240))); }
       catch { /* The original tool reports unknown or invalid targets. */ }
     }
-    this.store.conversation.routeAction(context.message.id, action);
+    const routeParent = this.routerTrace?.toolSpan(callId);
+    this.store.conversation.routeAction(context.message.id, action, routeParent);
     try {
       if (args.summary !== undefined) action.summary = String(publicData(text(args.summary, 'summary', 240)));
       const result = await execute();
@@ -170,12 +171,12 @@ export class Coordinator {
         action.messageIds = typeof value.id === 'string' ? [value.id] : Array.isArray(value.items)
           ? value.items.map(item => item && typeof item === 'object' && 'id' in item ? String(item.id) : '').filter(Boolean) : [];
       }
-      this.store.conversation.routeAction(context.message.id, action);
+      this.store.conversation.routeAction(context.message.id, action, routeParent);
       return result;
     } catch (error) {
       action.status = context.controller.signal.aborted ? 'interrupted' : 'failed';
       action.error = String(publicData(error instanceof Error ? error.message : 'Router tool failed'));
-      this.store.conversation.routeAction(context.message.id, action);
+      this.store.conversation.routeAction(context.message.id, action, routeParent);
       throw error;
     }
   }

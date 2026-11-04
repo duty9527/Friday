@@ -61,7 +61,8 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
           case 'trace': return store.conversation.trace({
             messageId: command.messageId === undefined ? undefined : text(command.messageId, 'messageId', 128),
             taskId: command.taskId === undefined ? undefined : text(command.taskId, 'taskId', 128),
-          }, integer(command.after, 0, 0, Number.MAX_SAFE_INTEGER));
+          }, command.after === undefined ? undefined : integer(command.after, 0, 0, Number.MAX_SAFE_INTEGER),
+            command.before === undefined ? undefined : integer(command.before, 0, 0, Number.MAX_SAFE_INTEGER));
           case 'updates': {
             const after = integer(command.after, 0, 0, Number.MAX_SAFE_INTEGER);
             const events = store.conversation.trace({}, after);

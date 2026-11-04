@@ -1,5 +1,6 @@
 import type { ChatMessage, MainView, MessagePage, TraceEvent, WorkView, RouteAction } from '../view.js';
-import { mergeMessages as mergeInto, orderConversation, routeLabel, routeState, spanDuration, spanNodes as buildSpans, spanTree, usageSummary, type SpanNode } from './model.js';
+import { mergeMessages as mergeInto, orderConversation, routeLabel, routeState, spanDuration, spanNodes as buildSpans,
+  spanTree, timelineSteps, usageSummary, type SpanNode, type TimelineStep } from './model.js';
 
 function element<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -30,6 +31,7 @@ const ui = {
   traceScope: element('trace-scope'), traceContent: element('trace-content'), traceMore: element<HTMLButtonElement>('trace-more'),
   traceError: element('trace-error'), traceRetry: element<HTMLButtonElement>('trace-retry'),
   graphMode: element<HTMLButtonElement>('graph-mode'), timelineMode: element<HTMLButtonElement>('timeline-mode'),
+  stepMode: element<HTMLButtonElement>('step-mode'),
   eventDetail: element('event-detail'), workDetail: element('work-detail'), routingDetail: element('routing-detail'),
 };
 const statusNames: Record<string, string> = {
@@ -93,9 +95,11 @@ let selectionGeneration = 0;
 let traceEvents: TraceEvent[] = [];
 let traceAfter = 0;
 let traceHasMore = false;
+let traceHasEarlier = false;
 let traceBusy = false;
 let traceAgain = false;
-let timeline = false;
+/** `steps` is the readable process; `graph` and `events` stay available as raw diagnostics. */
+let traceMode: 'steps' | 'graph' | 'events' = 'steps';
 let selectedEvent: number | undefined;
 let selectedSpan: string | undefined;
 let workData: unknown;
@@ -272,37 +276,64 @@ function routingSummary(message: ChatMessage): HTMLElement {
   if (message.routing.status === 'failed' || message.routing.status === 'interrupted') area.append(node('p', 'Router 处理未完成；已受理的动作保留，不代表已撤销。', 'meta'));
   return area;
 }
+let routingDetailRequest = 0;
 function renderRoutingDetail() {
   ui.routingDetail.hidden = selection.type !== 'message';
   if (selection.type !== 'message') return;
   const message = messages.get(selection.id);
-  const referencesOpen = ui.routingDetail.querySelector('details')?.open ?? false;
-  ui.routingDetail.replaceChildren(node('h3', '本次 Router 分配'));
+  if (!message) {
+    // A message outside the loaded page still has a recorded routing decision; read it instead of claiming none.
+    const request = ++routingDetailRequest;
+    const generation = selectionGeneration;
+    const id = selection.id;
+    ui.routingDetail.replaceChildren(node('p', '正在读取该消息的路由记录…', 'meta'));
+    void api<ChatMessage>(`/api/message?${new URLSearchParams({ messageId: id })}`).then(fetched => {
+      if (request !== routingDetailRequest || generation !== selectionGeneration) return;
+      mergeMessages([fetched]);
+      renderMessages();
+    }).catch(error => {
+      if (request === routingDetailRequest) ui.routingDetail.replaceChildren(node('p', `读取路由记录失败：${errorText(error)}`, 'error'));
+    });
+    return;
+  }
+  const previous = ui.routingDetail.querySelector<HTMLDetailsElement>('details.routing-facts');
+  const factsOpen = previous?.open ?? false;
+  const referencesOpen = previous?.querySelector<HTMLDetailsElement>('details.references')?.open ?? false;
+  ui.routingDetail.replaceChildren();
   if (!message?.routing) {
     ui.routingDetail.append(node('p', '此消息尚无已记录的路由上下文。旧历史不会补造。', 'meta')); return;
   }
   const routing = message.routing;
-  ui.routingDetail.append(node('p', `路由处理时：${timestamp(routing.at)} · ${statusText(routing.status)}`, 'meta'));
-  ui.routingDetail.append(node('h4', '当时可见的工作'));
+  // The readable process leads; the recorded routing context stays available without crowding it.
+  const summary = routing.actions.length
+    ? routing.actions.map(action => `${routeLabel(action)}${action.taskLabel ? ` · ${action.taskLabel}` : ''}`).join('；')
+    : routing.status === 'processing' ? 'Router 正在处理' : '没有已确认的分配动作';
+  const wrap = node('details', '', 'routing-facts');
+  wrap.open = factsOpen;
+  const target = node('div', '', 'routing-facts-body');
+  wrap.append(node('summary', `分配记录与当时上下文：${summary}`), target);
+  ui.routingDetail.append(wrap);
+  target.append(node('p', `路由处理时：${timestamp(routing.at)} · ${statusText(routing.status)}`, 'meta'));
+  target.append(node('h4', '当时可见的工作'));
   for (const work of routing.context.works) {
     const row = node('div', '', 'routing-work');
     row.append(button(work.prompt || '后台工作', () => { selectTrace({ type: 'task', id: work.id, label: work.prompt }); showPanel(true); }, 'source-reference'),
       node('span', `当时${statusText(work.status)}`, 'meta'));
-    ui.routingDetail.append(row);
+    target.append(row);
   }
-  if (!routing.context.works.length) ui.routingDetail.append(node('p', '当时没有后台工作。', 'meta'));
-  if (routing.context.truncated) ui.routingDetail.append(node('p', `当时共 ${routing.context.totalWorks} 项工作，Router 仅收到最近 ${routing.context.works.length} 项摘要。`, 'meta'));
-  ui.routingDetail.append(node('p', '以上是处理当时的状态，不随当前工作状态改写。', 'meta'), node('h4', '已记录动作'));
+  if (!routing.context.works.length) target.append(node('p', '当时没有后台工作。', 'meta'));
+  if (routing.context.truncated) target.append(node('p', `当时共 ${routing.context.totalWorks} 项工作，Router 仅收到最近 ${routing.context.works.length} 项摘要。`, 'meta'));
+  target.append(node('p', '以上是处理当时的状态，不随当前工作状态改写。', 'meta'), node('h4', '已记录动作'));
   for (const action of routing.actions) {
-    ui.routingDetail.append(actionRow(action));
-    for (const [index, id] of (action.messageIds ?? []).entries()) ui.routingDetail.append(button(
+    target.append(actionRow(action));
+    for (const [index, id] of (action.messageIds ?? []).entries()) target.append(button(
       `召回引用 ${index + 1}：${messages.get(id)?.text.slice(0, 60) ?? '读取原消息'}`, () => { void jumpMessage(id); }, 'source-reference'));
   }
-  if (routing.omittedActions) ui.routingDetail.append(node('p', '摘要只展示最近 40 条动作；完整动作记录请查看事件时间线。', 'meta'));
-  if (!routing.actions.length) ui.routingDetail.append(node('p', '尚无已确认的路由动作。', 'meta'));
-  const refs = node('details'); refs.open = referencesOpen; refs.append(node('summary', '当时的近期对话引用'));
+  if (routing.omittedActions) target.append(node('p', '摘要只展示最近 40 条动作；完整动作记录请查看原始事件。', 'meta'));
+  if (!routing.actions.length) target.append(node('p', '尚无已确认的路由动作。', 'meta'));
+  const refs = node('details', '', 'references'); refs.open = referencesOpen; refs.append(node('summary', '当时的近期对话引用'));
   for (const reference of routing.context.messages) refs.append(button(`${reference.role === 'user' ? '你' : 'Router'}：${reference.preview || '无公开文本'}`, () => { void jumpMessage(reference.id); }, 'source-reference'));
-  ui.routingDetail.append(refs, node('p', `执行环境：${routing.context.execution} · ${routing.context.cwd}`, 'meta'));
+  target.append(refs, node('p', `执行环境：${routing.context.execution} · ${routing.context.cwd}`, 'meta'));
 }
 function renderWorks() {
   const filter = ui.workFilter.value;
@@ -360,6 +391,7 @@ async function refreshView(initial = false) {
     renderMessages();
     renderWorks();
     updateComposer();
+    followLatestMessage(result);
     if (!initial && selection.type === 'task' && result.works.find(work => work.id === selectedTaskId)?.status !== previousWorkStatus) {
       void loadWork(selection.id, selectionGeneration, true);
     }
@@ -368,12 +400,22 @@ async function refreshView(initial = false) {
     if (refreshAgain && !authExpired) { refreshAgain = false; scheduleRefresh(); }
   }
 }
+/**
+ * The readable process follows the newest round unless the reader pinned another work or message.
+ * Following never changes the conversation itself, only which recorded steps are shown.
+ */
+function followLatestMessage(result: MainView) {
+  if (selectionPinned) return;
+  const latest = [...messages.values()].filter(message => message.role === 'user').sort((a, b) => b.seq - a.seq)[0];
+  if (!latest || latest.id === followedMessage) return;
+  selectTrace({ type: 'message', id: latest.id, label: latest.text.slice(0, 80) }, false);
+}
 function scheduleRefresh() {
   if (refreshTimer || authExpired) return;
   refreshTimer = setTimeout(() => {
     refreshTimer = undefined;
     void refreshView().catch(error => connection(`数据可能已过时：${errorText(error)}。后台工作不会因页面断开而停止。`, true));
-    if (!traceHasMore) void loadTrace();
+    if (!traceHasMore) void loadTrace('live');
   }, 150);
 }
 async function loadOlder() {
@@ -477,12 +519,17 @@ function closeSidebar() {
   ui.sidebar.classList.remove('open');
   ui.workToggle.setAttribute('aria-expanded', 'false');
 }
-function selectTrace(next: Selection) {
+let selectionPinned = false;
+let followedMessage: string | undefined;
+function selectTrace(next: Selection, pin = true) {
+  if (pin) selectionPinned = true;
+  if (next.type === 'message') followedMessage = next.id;
   selection = next;
   selectionGeneration++;
   traceEvents = [];
   traceAfter = 0;
   traceHasMore = false;
+  traceHasEarlier = false;
   traceBusy = false;
   traceAgain = false;
   selectedEvent = undefined;
@@ -492,18 +539,21 @@ function selectTrace(next: Selection) {
   ui.traceScope.title = ui.traceScope.textContent;
   ui.traceContent.replaceChildren(node('p', '正在读取实际轨迹…', 'empty'));
   ui.eventDetail.replaceChildren(node('h3', '节点详情'), node('p', '选择节点查看公开数据与记录时间。', 'meta'));
+  ui.eventDetail.hidden = true;
   renderWorks();
   renderWorkDetail();
   renderRoutingDetail();
-  void loadTrace();
+  void loadTrace('recent').then(fillProcessStart);
   if (next.type === 'task') void loadWork(next.id, selectionGeneration);
 }
-async function loadTrace() {
+async function loadTrace(direction: 'live' | 'earlier' | 'recent' = 'live') {
   if (!ready || authExpired) return;
   if (traceBusy) { traceAgain = true; return; }
   const generation = selectionGeneration;
-  const after = traceAfter;
-  const params = new URLSearchParams({ after: String(after) });
+  const latest = direction === 'live';
+  const anchor = direction === 'earlier' ? traceEvents[0]?.seq : latest ? traceAfter : undefined;
+  const params = new URLSearchParams();
+  if (anchor !== undefined) params.set(direction === 'earlier' ? 'before' : 'after', String(anchor));
   if (selection.type !== 'all') params.set(selection.type === 'task' ? 'taskId' : 'messageId', selection.id);
   traceBusy = true;
   ui.traceMore.disabled = true;
@@ -511,12 +561,16 @@ async function loadTrace() {
   ui.traceRetry.hidden = true;
   try {
     const events = await api<TraceEvent[]>(`/api/trace?${params}`);
-    if (generation !== selectionGeneration || after !== traceAfter) return;
+    if (generation !== selectionGeneration) return;
     const merged = new Map(traceEvents.map(event => [event.seq, event]));
     for (const event of events) merged.set(event.seq, event);
     traceEvents = [...merged.values()].sort((a, b) => a.seq - b.seq);
-    traceAfter = events.at(-1)?.seq ?? after;
-    traceHasMore = events.length === 60;
+    traceAfter = Math.max(traceAfter, events.at(-1)?.seq ?? 0);
+    // A full page forward means there may be more; the recent window may legitimately end at the head.
+    if (direction === 'live') traceHasMore = events.length === 60;
+    const full = events.length === 60;
+    if (direction === 'recent') traceHasEarlier = full;
+    else if (direction === 'earlier') traceHasEarlier = full;
     renderTrace();
   } catch (error) {
     if (generation === selectionGeneration) {
@@ -527,8 +581,10 @@ async function loadTrace() {
     if (generation === selectionGeneration) {
       traceBusy = false;
       ui.traceMore.disabled = false;
-      ui.traceMore.hidden = !traceHasMore;
-      if ((!timeline && selection.type !== 'all' && traceHasMore) || (traceAgain && !traceHasMore)) { traceAgain = false; void loadTrace(); }
+      syncTraceMore();
+      if ((traceMode !== 'events' && selection.type !== 'all' && traceHasMore) || (traceAgain && !traceHasMore)) {
+        traceAgain = false; void loadTrace('live');
+      }
     }
   }
 }
@@ -545,9 +601,82 @@ function eventButton(event: TraceEvent, events: TraceEvent[], span?: string): HT
   entry.append(node('span', `${statusText(event.status)} · ${measured ?? timestamp(events.at(-1)?.at ?? event.at)}`, 'meta'));
   return entry;
 }
+const actorNames: Record<string, string> = { router: 'Router', worker: 'Worker', executor: '执行器', system: '系统', user: '你' };
+function workLabel(step: TimelineStep): string | undefined {
+  if (step.taskLabel) return step.taskLabel;
+  return step.taskId ? view?.works.find(work => work.id === step.taskId)?.prompt : undefined;
+}
+function renderSteps(contents: DocumentFragment) {
+  const steps = timelineSteps(traceEvents);
+  if (traceHasEarlier) contents.append(node('p', '从最近记录的步骤开始显示；更早的步骤可继续加载。', 'branch-note'));
+  if (!steps.length) {
+    contents.append(node('p', traceEvents.length ? '暂无已记录的执行步骤，请查看原始事件。' :
+      selection.type === 'task' ? '此历史工作未采集详细轨迹。' : '此范围尚无可阅读的执行步骤。', 'empty'));
+    return;
+  }
+  const list = node('ul', '', 'timeline');
+  for (const step of steps) {
+    const item = node('li', '', `timeline-step ${step.actor}${active(step.status) ? ' live' : ''}`);
+    const head = node('div', '', 'step-head');
+    head.append(node('span', actorNames[step.actor] ?? step.actor, `step-role ${step.actor}`));
+    const task = workLabel(step);
+    if (task) head.append(button(task, () => {
+      if (!step.taskId) return;
+      selectTrace({ type: 'task', id: step.taskId, label: task }); showPanel(true);
+    }, 'step-task'));
+    head.append(node('span', step.route ? routeState(step.route) : step.followupState
+      ? `补充要求：${statusText(step.followupState)}` : statusText(step.status), 'step-state'));
+    head.append(node('time', timestamp(step.at), 'step-time'));
+    item.append(head, node('p', step.title, 'step-title'));
+    if (step.trigger && step.title.startsWith('Router')) item.append(node('p', `触发内容：${step.trigger}`, 'meta'));
+    if (step.summary) {
+      const text = step.summary.length > 1200 ? step.summary.slice(0, 1200) : step.summary;
+      item.append(node('p', `${step.summarySource === 'stream' ? '公开输出' : '公开说明'}：${text}${step.summaryTruncated || text.length < step.summary.length ? '…（已截断）' : ''}`,
+        step.summarySource === 'stream' ? 'step-summary streaming' : 'step-summary'));
+    } else if (step.kind === 'span' && step.label === '模型推理调用') {
+      item.append(node('p', active(step.status) ? '本轮尚无公开说明。' : '本轮未记录公开说明。', 'meta'));
+    }
+    if (step.input) {
+      const lines = Object.entries(step.input).filter(([, value]) => value !== '').map(([key, value]) => `${key}: ${value}`);
+      if (lines.length) item.append(node('pre', `${lines.join('\n')}${step.inputTruncated ? '\n…（已截断）' : ''}`, 'step-io input'));
+    }
+    if (step.output) item.append(node('div', '', 'step-output'), node('p', '已记录结果：', 'meta'),
+      node('pre', `${step.output}${step.outputTruncated ? '\n…（已截断）' : ''}`, 'step-io'));
+    if (step.exitCode !== undefined) item.append(node('p', `退出码 ${step.exitCode}`, 'meta'));
+    if (step.error) item.append(node('p', `错误：${step.error}`, 'error'));
+    const raw = traceEvents.filter(event => event.spanId === step.id || event.parentSpanId === step.id);
+    const details = node('details');
+    details.append(node('summary', `已记录的 ${step.detailCount} 条记录`),
+      node('pre', json(raw.map(event => ({ seq: event.seq, label: event.label, status: event.status, at: event.at, data: event.data })))));
+    item.append(details);
+    list.append(item);
+  }
+  contents.append(list);
+}
+/**
+ * The recent window is where live work is, but a short round should read from its own beginning.
+ * Earlier pages are bounded so a very long work still opens quickly and says what is not loaded.
+ */
+async function fillProcessStart() {
+  if (traceMode !== 'steps') return;
+  const starts = new Set(['Router 处理新输入', 'Router 派发任务', 'Worker 接收任务', '后台工作状态变化']);
+  for (let page = 0; page < 4; page++) {
+    if (!traceHasEarlier || traceBusy) return;
+    const steps = timelineSteps(traceEvents);
+    if (!steps.length || starts.has(steps[0]!.title)) return;
+    await loadTrace('earlier');
+  }
+}
+function syncTraceMore() {
+  ui.traceMore.hidden = traceMode === 'steps' ? !traceHasEarlier : !traceHasMore;
+  ui.traceMore.textContent = traceMode === 'steps' ? '加载更早记录' : '加载更多事件';
+}
 function renderTrace() {
   const contents = document.createDocumentFragment();
-  if (timeline) {
+  const scroller = ui.traceContent.closest<HTMLElement>('.trace-scroll');
+  const pinned = scroller ? scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 120 : false;
+  if (traceMode === 'steps') renderSteps(contents);
+  else if (traceMode === 'events') {
     const list = node('ul');
     for (const event of traceEvents) {
       if (event.kind === 'thinking') continue;
@@ -597,11 +726,14 @@ function renderTrace() {
     for (const events of unspanned.values()) contents.append(eventButton(events.at(-1)!, events));
   }
   if (!traceEvents.length) contents.append(node('p', selection.type === 'task' ? '此历史工作未采集详细轨迹' : '此范围尚无已记录轨迹。', 'empty'));
-  else if (!timeline && !buildSpans(traceEvents).length && traceEvents.every(event => event.kind === 'visible_text')) {
-    contents.append(node('p', '仅有公开文本增量，请在事件时间线查看。', 'empty'));
+  else if (traceMode === 'graph' && !buildSpans(traceEvents).length && traceEvents.every(event => event.kind === 'visible_text')) {
+    contents.append(node('p', '仅有公开文本增量，请在原始事件中查看。', 'empty'));
   }
   ui.traceContent.replaceChildren(contents);
-  ui.traceMore.hidden = !traceHasMore;
+  syncTraceMore();
+  // The raw node inspector belongs to the diagnostic modes; each step carries its own recorded data.
+  ui.eventDetail.hidden = traceMode === 'steps' && selectedEvent === undefined && !selectedSpan;
+  if (scroller && pinned) scroller.scrollTop = scroller.scrollHeight;
   if (selectedEvent !== undefined || selectedSpan) renderEventDetail();
 }
 function detailRow(parent: HTMLElement, label: string, value: string) {
@@ -762,9 +894,9 @@ async function connect() {
     if (generation !== connectionGeneration || authExpired) return;
     if (initial) {
       const latest = [...messages.values()].sort((a, b) => b.seq - a.seq).find(message => message.role === 'user');
-      selectTrace(latest ? { type: 'message', id: latest.id, label: latest.text.slice(0, 80) } : { type: 'all' });
+      selectTrace(latest ? { type: 'message', id: latest.id, label: latest.text.slice(0, 80) } : { type: 'all' }, false);
     }
-    else if (!traceHasMore) void loadTrace();
+    else if (!traceHasMore) void loadTrace('live');
     const response = await request(`/api/stream?after=${cursor}`, { signal: controller.signal, headers: { Accept: 'text/event-stream' } });
     if (generation !== connectionGeneration) return;
     ui.reconnect.disabled = false;
@@ -803,19 +935,23 @@ ui.older.addEventListener('click', () => { void loadOlder(); });
 ui.workFilter.addEventListener('change', renderWorks);
 ui.stopWork.addEventListener('click', () => { void stopWork(); });
 ui.reconnect.addEventListener('click', () => { retryDelay = 500; void connect(); });
-ui.traceMore.addEventListener('click', () => { void loadTrace(); });
-ui.traceRetry.addEventListener('click', () => { void loadTrace(); });
+ui.traceMore.addEventListener('click', () => { void loadTrace(traceMode === 'steps' ? 'earlier' : 'live'); });
+ui.traceRetry.addEventListener('click', () => { void loadTrace(traceEvents.length ? 'live' : 'recent'); });
 element('clear-filter').addEventListener('click', () => selectTrace({ type: 'all' }));
-ui.graphMode.addEventListener('click', () => setTraceMode(false));
-ui.timelineMode.addEventListener('click', () => setTraceMode(true));
-function setTraceMode(value: boolean) {
-  timeline = value;
-  ui.graphMode.classList.toggle('active', !value);
-  ui.timelineMode.classList.toggle('active', value);
-  ui.graphMode.setAttribute('aria-pressed', String(!value));
-  ui.timelineMode.setAttribute('aria-pressed', String(value));
+ui.stepMode.addEventListener('click', () => setTraceMode('steps'));
+ui.graphMode.addEventListener('click', () => setTraceMode('graph'));
+ui.timelineMode.addEventListener('click', () => setTraceMode('events'));
+function setTraceMode(mode: 'steps' | 'graph' | 'events') {
+  if (traceMode === mode) return;
+  traceMode = mode;
+  if (mode === 'steps') { selectedEvent = undefined; selectedSpan = undefined; }
+  for (const [key, control] of [['steps', ui.stepMode], ['graph', ui.graphMode], ['events', ui.timelineMode]] as const) {
+    control.classList.toggle('active', key === mode);
+    control.setAttribute('aria-pressed', String(key === mode));
+  }
   renderTrace();
-  if (!timeline && traceHasMore && selection.type !== 'all') void loadTrace();
+  // The readable process must open where the work is now, not replay a very long history from its first event.
+  if (mode === 'steps' && traceHasMore && traceEvents.length) void loadTrace('recent');
 }
 ui.showChat.addEventListener('click', () => showPanel(false));
 ui.showTrace.addEventListener('click', () => showPanel(true));

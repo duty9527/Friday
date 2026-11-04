@@ -120,7 +120,7 @@ export async function realFactory(home: string, config: {
       }
       const { session } = await createAgentSession({
         cwd, agentDir: sdkDir, modelRuntime: runtime, model, thinkingLevel: 'off',
-        resourceLoader: resourceLoader(systemPrompt),
+        resourceLoader: resourceLoader(`${systemPrompt} Provide a concise public action summary in ordinary assistant text for each model round when there is something to do: the decision or next action, not hidden reasoning or a reasoning transcript. Router work tools should include the optional summary explaining the routing conclusion briefly. Never fabricate progress, observations or tool results. Worker progress is diagnostic output to Router, not a direct message to the user.`),
         tools: customTools.map(tool => tool.name), customTools,
         sessionManager: manager,
         settingsManager: SettingsManager.inMemory({
@@ -173,7 +173,12 @@ class SdkAgent implements AgentPort {
     this.unsubscribe = session.subscribe(event => {
       if (!onEvent) return;
       if (event.type === 'turn_start') { turn = randomUUID(); onEvent({ kind: 'turn_start', id: turn }); }
-      else if (event.type === 'turn_end') onEvent({ kind: 'turn_end', id: turn, data: event.message.role === 'assistant' ? { stopReason: event.message.stopReason, usage: event.message.usage } : undefined });
+      else if (event.type === 'turn_end') {
+        const message = event.message;
+        const publicText = message.role === 'assistant' ? message.content.filter(item => item.type === 'text').map(item => item.text).join('\n') : '';
+        onEvent({ kind: 'turn_end', id: turn, data: message.role === 'assistant' ? { stopReason: message.stopReason,
+          usage: message.usage, publicText: publicText.slice(0, 1600), publicTextTruncated: publicText.length > 1600 } : undefined });
+      }
       else if (event.type === 'message_update' && event.assistantMessageEvent.type === 'text_delta') onEvent({ kind: 'text_delta', id: turn, text: event.assistantMessageEvent.delta });
       else if (event.type === 'tool_execution_start') onEvent({ kind: 'tool_start', id: event.toolCallId, parentId: turn, toolName: event.toolName, data: event.args });
       else if (event.type === 'tool_execution_end') onEvent({ kind: 'tool_end', id: event.toolCallId, parentId: turn, toolName: event.toolName, data: event.result, error: event.isError });

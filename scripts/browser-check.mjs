@@ -76,10 +76,16 @@ try {
   assert.equal(await count(), before, 'an IME composition Enter must not send');
   await pressEnter();
   await until(() => page.eval("[...document.querySelectorAll('#messages .router-message .message-text')].some(x => x.innerText.includes('我们始终在同一个对话中'))"), 'ordinary reply');
-  checks.push('ordinary conversation without files, IME Enter suppressed');
-  await until(() => page.eval("document.querySelector('#messages .routing-summary')?.innerText.includes('仅回复')"), 'direct reply routing summary');
-  await page.eval(() => document.querySelector('#messages .user-message .message-actions button').click());
-  await until(() => page.eval("document.querySelector('#routing-detail')?.innerText.includes('当时没有后台工作')"), 'routing-time context');
+  await until(() => page.eval("document.querySelector('#trace-scope').innerText.includes('我们始终在同一个对话中')"), 'the process follows the newest round');
+  checks.push('ordinary conversation without files, IME Enter suppressed, process follows the newest round');
+  await until(() => page.eval("[...document.querySelectorAll('#messages .user-message')].at(-1)?.querySelector('.routing-summary')?.innerText.includes('仅回复')"), 'direct reply routing summary');
+  await page.eval(() => {
+    const user = [...document.querySelectorAll('#messages .user-message')].at(-1);
+    [...user.querySelectorAll('.message-actions button')].find(button => button.innerText.includes('路由'))?.click();
+  });
+  await until(() => page.eval("document.querySelector('#routing-detail').hidden === false"), 'routing detail panel');
+  await page.eval(() => { const facts = document.querySelector('#routing-detail details.routing-facts'); if (facts) facts.open = true; });
+  await until(() => page.eval("document.querySelector('#routing-detail').innerText.includes('当时可见的工作')"), 'routing-time context');
   assert.match(await page.eval("document.querySelector('#routing-detail').innerText"), /当时的近期对话引用/);
   checks.push('direct-reply decision is explicit; per-message route context opens without inspecting raw JSON');
 
@@ -91,27 +97,48 @@ try {
   checks.push('user and model text is rendered as text, never as HTML');
 
   if (sample) {
+    const usersBefore = await page.eval("document.querySelectorAll('#messages .user-message').length");
     await fill('分析这份文件，说明职责边界', sample);
     await pressEnter();
+    await until(() => page.eval(`document.querySelectorAll('#messages .user-message').length === ${usersBefore + 1}`), 'the submitted message');
     await until(() => page.eval("document.querySelectorAll('.work-row').length > 0"), 'background work');
     await until(() => page.eval("[...document.querySelectorAll('.work-row')].some(x => x.innerText.includes('已完成'))"), 'work completion');
-    await page.eval(() => document.querySelector('.work-row').click());
-    await until(() => page.eval("document.querySelector('#trace-content').innerText.includes('读取文件副本')"), 'operation node');
-    assert.match(await page.eval("document.querySelector('#trace-content').innerText"), /worker/);
+    // Select exactly the work this message created, not an older work from an earlier message.
+    await until(() => page.eval("[...document.querySelectorAll('#messages .user-message')].at(-1)?.querySelector('.routing-summary .route-target') !== null && [...document.querySelectorAll('#messages .user-message')].at(-1)?.querySelector('.routing-summary .route-target') !== undefined"), 'routing target for the new work');
+    await page.eval(() => [...document.querySelectorAll('#messages .user-message')].at(-1).querySelector('.routing-summary .route-target').click());
+    await until(() => page.eval("document.querySelector('#trace-content').innerText.includes('读取文件副本')"), 'worker tool step');
+    await until(() => page.eval("document.querySelector('#trace-content').innerText.includes('Worker 接收任务')"), 'process start');
+    await until(() => page.eval("document.querySelector('#trace-content').innerText.includes('Router 处理新输入')"), 'routing decision that created the work');
+    assert.equal(await page.eval("document.querySelector('#step-mode').getAttribute('aria-pressed')"), 'true', 'the readable process is the default');
+    const steps = await page.eval("document.querySelector('#trace-content').innerText");
+    assert.match(steps, /Router 处理新输入/);
+    assert.match(steps, /新建工作/);
+    assert.match(steps, /Worker 接收任务/);
+    assert.match(steps, /文件: /, 'a file read names the file instead of its internal id');
+    assert.doesNotMatch(steps, /sk-[A-Za-z0-9]{12,}/, 'recorded steps never expose credentials');
+    await page.eval(() => [...document.querySelectorAll('#trace-content .timeline-step details')]
+      .find(detail => detail.innerText.includes('已记录的'))?.setAttribute('open', ''));
+    assert.match(await page.eval("document.querySelector('#trace-content').innerText"), /已记录的 \d+ 条记录/);
     assert.match(await page.eval("document.querySelector('#messages').innerText"), /新建工作/);
-    checks.push('explicit absolute path analysis, persisted new-work routing summary, causal nodes, no task-ID entry');
+    checks.push('readable steps: Router input, routing decision, Worker task and file read, with recorded details on demand');
   } else checks.push('skipped path analysis (no --sample given)');
 
+  await page.eval(() => document.querySelector('#graph-mode').click());
+  await sleep(200);
   await page.eval(() => document.querySelector('#trace-content .node-button')?.click());
   assert.match(await page.eval("document.querySelector('#event-detail').innerText"), /Span|Token|状态/);
+  await page.eval(() => document.querySelector('#step-mode').click());
+  await sleep(200);
+  assert.equal(await page.eval("document.querySelector('#event-detail').hidden"), true, 'step mode keeps the raw node inspector closed');
   const beforeSelection = await count();
   await page.eval(() => document.querySelector('.work-row')?.click());
   await sleep(150);
   assert.equal(await count(), beforeSelection, 'selecting a work must not change the conversation');
-  checks.push('node details render; selecting a work never switches conversation context');
+  checks.push('causal graph and raw node details stay available; step mode hides raw inspector; a work never switches conversation');
 
+  const burstsBefore = await page.eval("[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('连续消息')).length");
   await burst(Array.from({ length: 12 }, (_, index) => `连续消息 ${index}`));
-  await until(() => page.eval("[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('连续消息')).length === 12"), 'burst hydration');
+  await until(() => page.eval(`[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('连续消息')).length >= ${burstsBefore + 12}`), 'burst hydration');
   checks.push('a burst larger than one history page is fully hydrated from the event stream');
 
   const orphans = await page.eval(() => {
@@ -120,8 +147,10 @@ try {
     return articles.filter(item => item.dataset.replyTo && index.has(item.dataset.replyTo) && index.get(item.dataset.replyTo) > index.get(item.dataset.messageId)).length;
   });
   assert.equal(orphans, 0, 'no reply may appear before the user message it belongs to');
-  assert.doesNotMatch(await page.eval("document.querySelector('#trace-content').innerText"), /关联后台工作/, 'bookkeeping events stay out of the causal graph');
-  checks.push('every shown reply carries its user message; graph hides bookkeeping events');
+  assert.doesNotMatch(await page.eval("document.querySelector('#trace-content').innerText"), /关联后台工作/, 'bookkeeping events stay out of the readable process');
+  assert.doesNotMatch(await page.eval("document.querySelector('#trace-scope').innerText"), /连续消息/,
+    'a scope the reader opened stays put instead of jumping to a burst of new messages');
+  checks.push('every shown reply carries its user message; a pinned scope holds while bookkeeping stays out');
 
   const beforeReload = await page.eval("[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('连续消息')).length");
   await page.goto(new URL(entryUrl).origin, { settleMs: 300 });
@@ -138,7 +167,8 @@ try {
   assert.ok(order.every((seq, index) => index === 0 || order[index - 1] < seq), 'persisted insertion order survives hydration, refresh and paging');
   assert.equal(await page.eval("document.querySelectorAll('#messages .router-message .source-reference').length > 0"), true, 'replies carry clickable source references');
   await page.eval(() => [...document.querySelectorAll('#messages .user-message .message-actions button')].at(-1).click());
-  assert.match(await page.eval("document.querySelector('#routing-detail').innerText"), /本次 Router 分配/);
+  await page.eval(() => { const facts = document.querySelector('#routing-detail details.routing-facts'); if (facts) facts.open = true; });
+  assert.match(await page.eval("document.querySelector('#routing-detail').innerText"), /分配记录与当时上下文/);
   checks.push('all message blocks remain in durable sequence order after reload; source references and routing context survive');
 
   for (const [width, height, name] of [[768, 1024, 'tablet'], [390, 844, 'mobile']]) {
