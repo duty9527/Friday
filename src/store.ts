@@ -94,12 +94,16 @@ export class Store {
     return this.transaction(() => {
       const events = this.db.prepare("SELECT * FROM events WHERE task_id=? AND state='pending' ORDER BY rowid").all(taskId);
       this.db.prepare("UPDATE events SET state='processing' WHERE task_id=? AND state='pending'").run(taskId);
+      for (const row of events) this.conversation.followupState(String(row.id), 'processing');
       return events.map(row => ({ id: String(row.id), taskId, text: String(row.text), state: 'processing' }));
     });
   }
   finishEvents(events: TaskEvent[]) {
     this.transaction(() => {
-      for (const event of events) this.db.prepare("UPDATE events SET state='done' WHERE id=?").run(event.id);
+      for (const event of events) {
+        this.db.prepare("UPDATE events SET state='done' WHERE id=?").run(event.id);
+        this.conversation.followupState(event.id, 'done');
+      }
     });
   }
   /** A taken follow-up whose delivery failed must stay visible instead of vanishing in `processing`. */
@@ -109,6 +113,7 @@ export class Store {
         const row = this.db.prepare('SELECT state FROM events WHERE id=?').get(event.id);
         if (row?.state !== 'processing') continue;
         this.db.prepare("UPDATE events SET state='failed' WHERE id=?").run(event.id);
+        this.conversation.followupState(event.id, 'failed');
         this.notice(event.taskId, 'followup_failed', `补充要求未送达 Worker：${reason}`);
       }
     });
@@ -124,6 +129,7 @@ export class Store {
     this.transaction(() => {
       for (const event of this.db.prepare("SELECT id FROM events WHERE task_id=? AND state='pending' ORDER BY rowid").all(taskId)) {
         this.db.prepare("UPDATE events SET state='failed' WHERE id=?").run(String(event.id));
+        this.conversation.followupState(String(event.id), 'failed');
         this.notice(taskId, 'followup_failed', `补充要求未被处理：${reason}`);
       }
     });
@@ -161,6 +167,7 @@ export class Store {
       // Follow-ups taken by a worker whose progress cannot be proven are never silently dropped.
       for (const row of this.db.prepare("SELECT id, task_id FROM events WHERE state='processing'").all()) {
         this.db.prepare("UPDATE events SET state='failed' WHERE id=?").run(String(row.id));
+        this.conversation.followupState(String(row.id), 'failed');
         this.notice(String(row.task_id), 'followup_failed', '服务重启时该补充要求仍在处理中，无法证明已送达；不会自动重发。');
       }
       for (const task of this.list()) {

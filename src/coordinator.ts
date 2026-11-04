@@ -2,11 +2,12 @@ import { createHash, randomUUID } from 'node:crypto';
 import { rm, stat, realpath } from 'node:fs/promises';
 import { isAbsolute, join, dirname } from 'node:path';
 import { performance } from 'node:perf_hooks';
-import type { AgentFactory, AgentPort } from './agent.js';
+import type { AgentFactory, AgentPort, AgentTool } from './agent.js';
 import { readSnapshot, snapshot, type InputFile } from './files.js';
 import { PromptTrace } from './trace.js';
 import { integer, text } from './protocol.js';
-import type { ChatMessage, MainView } from './view.js';
+import type { ChatMessage, MainView, RouteAction, RouteKind } from './view.js';
+import { publicData } from './conversation.js';
 import { Executor } from './executor.js';
 import { Store, type Operation, type Task, type TaskStatus } from './store.js';
 
@@ -53,7 +54,7 @@ export class Coordinator {
   health() { return { executorPid: this.executor.pid, executorAvailable: this.executor.available }; }
   async ready() {
     await this.executor.ready;
-    this.router = await this.factory.create('router', 'router', [{
+    this.router = await this.factory.create('router', 'router', ([{
       name: 'dispatch_worker', description: 'Dispatch the host-selected task to its isolated Worker. Input is a confirmation, not a replacement task.',
       execute: async () => {
         if (!this.dispatch) throw new Error('No task is eligible for dispatch');
@@ -63,7 +64,7 @@ export class Coordinator {
       name: 'start_work', description: 'Start an isolated background task; returns immediately. Input JSON: {instruction, cwd?, sourceMessageId?, sourceTaskId?}. For native work cwd is an optional absolute existing working directory; paths named in conversation are enough, attachments are NOT required. Omit cwd to reuse the source work directory, first hint path directory, or service cwd. Native Workers have full local tools, not a sandbox. Snapshot/offline work still uses explicitly supplied source files. Do not use both sources.',
       execute: async (input, callId) => {
         const context = this.requireChat();
-        const args = toolInput(input, ['instruction', 'cwd', 'sourceMessageId', 'sourceTaskId']);
+        const args = toolInput(input, ['instruction', 'cwd', 'sourceMessageId', 'sourceTaskId', 'summary']);
         const instruction = text(args.instruction, 'instruction');
         if (args.sourceMessageId && args.sourceTaskId) throw new Error('Use one authorized source');
         const source = args.sourceTaskId ? this.chatWork(context, text(args.sourceTaskId, 'sourceTaskId', 128)) : undefined;
@@ -83,7 +84,7 @@ export class Coordinator {
       name: 'continue_work', description: 'Input JSON {taskId,instruction,cwd?}. Append a follow-up to queued/running work; completed/failed/cancelled work starts a related isolated execution using the CURRENT service execution capabilities and prior report. In native mode, even a legacy snapshot source creates a full-tool Worker in the current working directory, never another snapshot-only Worker. Optional cwd selects an absolute working directory. Paused or unknown work cannot be resumed automatically.',
       execute: async (input, callId) => {
         const context = this.requireChat();
-        const args = toolInput(input, ['taskId', 'instruction', 'cwd']);
+        const args = toolInput(input, ['taskId', 'instruction', 'cwd', 'summary']);
         const task = this.chatWork(context, text(args.taskId, 'taskId', 128));
         const instruction = text(args.instruction, 'instruction');
         if (['queued', 'running'].includes(task.status)) {
@@ -102,7 +103,7 @@ export class Coordinator {
       name: 'inspect_work', description: 'Read persisted work status and prior report. Input JSON {taskId}. This does not run a Worker or read new host files.',
       execute: async input => {
         const context = this.requireChat();
-        const args = toolInput(input, ['taskId']);
+        const args = toolInput(input, ['taskId', 'summary']);
         const task = this.store.get(text(args.taskId, 'taskId', 128));
         this.store.conversation.link(context.message.id, task.id);
         return JSON.stringify({ id: task.id, prompt: task.prompt, status: task.status, mode: task.mode, reason: task.reason, report: task.report,
@@ -113,7 +114,7 @@ export class Coordinator {
       name: 'recall_messages', description: 'Read older pages of the SAME continuous transcript, without a new session. Input JSON {beforeSeq?} for a bounded page, or {messageId} for one full message. Page previews are truncated explicitly; use the returned message ID for full text. Source messages remain the only file authorization.',
       execute: async input => {
         this.requireChat();
-        const args = toolInput(input, ['beforeSeq', 'messageId']);
+        const args = toolInput(input, ['beforeSeq', 'messageId', 'summary']);
         const compact = (message: ChatMessage, full: boolean) => ({ id: message.id, seq: message.seq, role: message.role, mode: message.mode, status: message.status,
           text: full ? message.text : message.text.slice(0, 4096), truncated: !full && message.text.length > 4096, taskIds: message.taskIds, fileCount: message.paths.length });
         if (args.messageId) return JSON.stringify(compact(this.store.conversation.get(text(args.messageId, 'messageId', 128)), true));
@@ -124,13 +125,55 @@ export class Coordinator {
       name: 'stop_work', description: 'Request cancellation of a specific work. Input JSON {taskId}. A stop request is not proof of completed cancellation; report the returned state faithfully.',
       execute: async input => {
         const context = this.requireChat();
-        const args = toolInput(input, ['taskId']);
+        const args = toolInput(input, ['taskId', 'summary']);
         const selected = this.chatWork(context, text(args.taskId, 'taskId', 128));
         this.store.conversation.link(context.message.id, selected.id);
         const task = this.stop(selected.id);
         return JSON.stringify({ taskId: task.id, state: task.status, reason: task.reason });
       },
-    }], { restore: this.store.conversation.meta('router_checkpoint'), onEvent: event => this.routerTrace?.observe(event) });
+    }] satisfies AgentTool[]).map((tool: AgentTool) => ({ ...tool, description: `${tool.description} Optional summary: one short public explanation of this action, not private reasoning.`,
+      execute: (input: string, callId?: string) => {
+        const stableId = callId ?? randomUUID();
+        return this.routeTool(tool.name, input, stableId, () => tool.execute(input, stableId));
+      } })),
+      { restore: this.store.conversation.meta('router_checkpoint'), onEvent: event => this.routerTrace?.observe(event) });
+  }
+  private async routeTool(name: string, input: string, callId: string | undefined, execute: () => Promise<string>): Promise<string> {
+    const kinds: Record<string, RouteKind> = { start_work: 'new_work', continue_work: 'followup', inspect_work: 'inspect', stop_work: 'stop', recall_messages: 'recall' };
+    const context = this.chatContext;
+    if (!context || !kinds[name]) return execute();
+    let args: Record<string, unknown> = {};
+    try { args = JSON.parse(input); } catch { /* Original tool validates its input. */ }
+    if (!args || typeof args !== 'object' || Array.isArray(args)) args = {};
+    const action: RouteAction = { id: randomUUID(), kind: kinds[name]!, status: 'pending', at: Date.now(),
+      taskId: typeof args.taskId === 'string' ? args.taskId : undefined };
+    this.store.conversation.routeAction(context.message.id, action);
+    try {
+      if (args.summary !== undefined) action.summary = String(publicData(text(args.summary, 'summary', 240)));
+      const result = await execute();
+      const value = JSON.parse(result) as Record<string, unknown>;
+      action.status = 'accepted';
+      action.taskId = typeof value.taskId === 'string' ? value.taskId : typeof value.id === 'string' && name === 'inspect_work' ? value.id : action.taskId;
+      if (action.taskId) action.taskLabel = String(publicData(this.store.get(action.taskId).prompt.slice(0, 240)));
+      if (typeof value.parentTaskId === 'string' || (name === 'start_work' && args.sourceTaskId)) {
+        action.kind = 'related_work'; action.parentTaskId = String(value.parentTaskId ?? args.sourceTaskId);
+      }
+      if (name === 'continue_work' && value.state === 'followup_accepted' && action.taskId) {
+        action.followupId = this.toolRequest(context.message.id, callId, 'followup');
+        action.delivery = this.store.events(action.taskId).find(event => event.id === action.followupId)?.state ?? 'pending';
+      }
+      if (name === 'recall_messages') {
+        action.messageIds = typeof value.id === 'string' ? [value.id] : Array.isArray(value.items)
+          ? value.items.map(item => item && typeof item === 'object' && 'id' in item ? String(item.id) : '').filter(Boolean) : [];
+      }
+      this.store.conversation.routeAction(context.message.id, action);
+      return result;
+    } catch (error) {
+      action.status = context.controller.signal.aborted ? 'interrupted' : 'failed';
+      action.error = String(publicData(error instanceof Error ? error.message : 'Router tool failed'));
+      this.store.conversation.routeAction(context.message.id, action);
+      throw error;
+    }
   }
   private requireChat(): ChatRun {
     if (!this.chatContext || this.chatContext.controller.signal.aborted || this.closing) throw new Error('No active main conversation request');
@@ -172,20 +215,27 @@ export class Coordinator {
       if (context.controller.signal.aborted || this.closing) { chat.update(message.id, { status: 'interrupted', reason: 'Router 处理前已停止；不会自动重发。' }); return; }
       context.revisions = new Map(this.store.list().map(task => [task.id, task.revision]));
       this.chatContext = context;
-      chat.update(message.id, { status: 'processing' });
+      const recentContext = chat.recentContext();
+      const knownWorks = this.store.list();
+      chat.update(message.id, { status: 'processing', routing: { at: Date.now(), status: 'processing', actions: [],
+        context: { execution: this.factory.nativeTools ? 'native' : 'snapshot', cwd: process.cwd(), totalWorks: knownWorks.length,
+          truncated: knownWorks.length > 40, works: knownWorks.slice(-40).map(({ id, prompt, status, revision }) => ({ id, prompt: String(publicData(prompt.slice(0, 240))), status, revision })),
+          messages: chat.history(undefined, 12).items.map(item => ({ id: item.id, role: item.role, preview: String(publicData(item.text.slice(-160))) })) } } });
       const reply = chat.create({ id: randomUUID(), replyTo: message.id, role: 'assistant', text: '', status: 'streaming', mode: this.factory.mode, paths: [] });
       context.replyId = reply.id;
       const trace = new PromptTrace(chat, { rootId: message.id, messageId: message.id, parentSpanId: message.id }, 'router', this.factory.mode, reply.id);
       this.routerTrace = trace;
       context.clock = { lastTick: performance.now(), lastWall: Date.now(), activeMs: 0 };
       try {
-        const result = await trace.run(this.router!, JSON.stringify({ kind: 'CHAT', message, context: chat.recentContext(),
+        const result = await trace.run(this.router!, JSON.stringify({ kind: 'CHAT', message, context: recentContext,
           execution: this.factory.nativeTools ? 'native' : 'snapshot', cwd: process.cwd(),
-          works: this.store.list().slice(-40).map(({ id, prompt, status, revision, mode, reason, report, files, originMessageId, execution, cwd }) => ({ execution: execution ?? 'snapshot', cwd, id, prompt: prompt.slice(0, 512), status, revision, mode, reason, reportPreview: report?.slice(0, 1024), fileCount: files.length, originMessageId })) }), context.controller.signal);
+          works: knownWorks.slice(-40).map(({ id, prompt, status, revision, mode, reason, report, files, originMessageId, execution, cwd }) => ({ execution: execution ?? 'snapshot', cwd, id, prompt: prompt.slice(0, 512), status, revision, mode, reason, reportPreview: report?.slice(0, 1024), fileCount: files.length, originMessageId })) }), context.controller.signal);
         this.accrueChat(context);
         if (context.controller.signal.aborted) throw context.controller.signal.reason;
         this.store.transaction(() => {
           chat.update(reply.id, { text: result, status: 'completed' });
+          if (!chat.get(message.id).routing?.actions.length) chat.routeAction(message.id, { id: randomUUID(), kind: 'reply', status: 'accepted', at: Date.now() });
+          chat.routeState(message.id, 'completed');
           chat.update(message.id, { status: 'completed' });
           for (const id of chat.get(message.id).taskIds) chat.link(reply.id, id);
           this.checkpoint();
@@ -193,6 +243,7 @@ export class Coordinator {
       } catch (error) {
         const status = context.controller.signal.aborted ? 'interrupted' : 'failed';
         chat.update(reply.id, { status, reason: 'Router 回复未完成；已保留公开输出和真实错误轨迹，不自动重放。' });
+        chat.routeState(message.id, status);
         chat.update(message.id, { status, reason: error instanceof Error ? '处理未完成，可查看执行轨迹。' : '处理失败。' });
       } finally { this.routerTrace = undefined; this.chatContext = undefined; }
     }).finally(() => { this.chatRuns.delete(message.id); this.chatJobs.delete(pending); });
@@ -424,7 +475,11 @@ export class Coordinator {
         }
         const delivered = await this.serialRouter(run, async () => {
           const text = await this.prompt(run, this.router!, JSON.stringify({ kind: 'WORKER_REPORT', taskId: task.id, report }));
-          if (this.store.hasPending(task.id)) return undefined;
+          if (this.store.hasPending(task.id)) {
+            if (run.replyId) this.store.conversation.update(run.replyId, { text, status: 'completed', reason: '阶段回复：工作仍在继续，将处理新补充要求。' });
+            run.replyId = undefined;
+            return undefined;
+          }
           if (text.length > 65_536) throw new Error('Router report exceeds delivery limit');
           return text;
         });

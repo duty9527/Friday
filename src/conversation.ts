@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import type { ChatMessage, MessagePage, TraceContext, TraceEvent } from './view.js';
+import type { ChatMessage, MessagePage, TraceContext, TraceEvent, RouteAction, RoutingRecord } from './view.js';
 
 export function publicData(value: unknown, depth = 0): unknown {
   if (depth > 6) return '[nested value omitted]';
@@ -67,7 +67,7 @@ export class Conversation {
       return this.get(body.id);
     });
   }
-  update(id: string, patch: Partial<Pick<ChatMessage, 'text' | 'status' | 'reason'>>) {
+  update(id: string, patch: Partial<Pick<ChatMessage, 'text' | 'status' | 'reason' | 'routing'>>) {
     return this.atomic(() => {
       const message = { ...this.get(id), ...patch };
       if (message.text.length > 65_536) throw new Error('Message exceeds 65536 character limit');
@@ -77,6 +77,33 @@ export class Conversation {
         actor: message.role === 'user' ? 'user' : 'router', label: message.role === 'user' ? '用户消息' : 'Router 公开回复', status: message.status });
       return message;
     });
+  }
+  routeAction(messageId: string, action: RouteAction) {
+    this.atomic(() => {
+      const message = this.get(messageId);
+      if (!message.routing) return;
+      const actions = [...message.routing.actions];
+      const index = actions.findIndex(item => item.id === action.id);
+      if (index < 0) actions.push(action); else actions[index] = action;
+      const omitted = Math.max(0, actions.length - 40);
+      this.update(messageId, { routing: { ...message.routing, actions: actions.slice(-40), omittedActions: (message.routing.omittedActions ?? 0) + omitted } });
+      this.emit({ type: 'trace', kind: 'route_action', rootId: messageId, messageId, taskId: action.taskId,
+        spanId: action.id, parentSpanId: messageId, actor: 'router', label: action.kind, status: action.status, data: action });
+    });
+  }
+  routeState(messageId: string, status: RoutingRecord['status']) {
+    const message = this.get(messageId);
+    if (message.routing) this.update(messageId, { routing: { ...message.routing, status,
+      actions: message.routing.actions.map(action => action.status === 'pending' && (status === 'failed' || status === 'interrupted') ? { ...action, status: 'interrupted' } : action) } });
+  }
+  followupState(id: string, state: string) {
+    const rows = this.db.prepare(`SELECT id FROM messages WHERE EXISTS (
+      SELECT 1 FROM json_each(messages.body, '$.routing.actions') WHERE json_extract(value, '$.followupId')=?)`).all(id);
+    for (const row of rows) {
+      const message = this.get(String(row.id));
+      if (message.routing) this.update(message.id, { routing: { ...message.routing,
+        actions: message.routing.actions.map(action => action.followupId === id ? { ...action, delivery: state } : action) } });
+    }
   }
   link(messageId: string, taskId: string) {
     this.atomic(() => {
@@ -111,7 +138,8 @@ export class Conversation {
       for (const row of rows) {
         const message = this.decode(row);
         if (['queued', 'processing', 'streaming'].includes(message.status)) {
-          this.update(message.id, { status: 'interrupted', reason: '服务中断，处理进度未确认；已保留内容，不自动重发或重放。' });
+          this.update(message.id, { status: 'interrupted', reason: '服务中断，处理进度未确认；已保留内容，不自动重发或重放。',
+            routing: message.routing ? { ...message.routing, status: 'interrupted', actions: message.routing.actions.map(action => action.status === 'pending' ? { ...action, status: 'interrupted' } : action) } : undefined });
         }
       }
       const latestSpans = this.db.prepare(`SELECT body FROM journal WHERE seq IN (
