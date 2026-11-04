@@ -26,11 +26,16 @@ test('file copies are independent, UTF-8 and integrity checked; links and oversi
     await symlink(input, join(f.root, 'link'));
     await assert.rejects(snapshot(f.home, randomUUID(), [join(f.root, 'link')]), /Symbolic/);
     await mkdir(join(f.root, 'directory'));
-    await assert.rejects(snapshot(f.home, randomUUID(), [join(f.root, 'directory')]), /regular/);
+    await assert.rejects(snapshot(f.home, randomUUID(), [join(f.root, 'directory')]), /No regular files/);
     await writeFile(input, Buffer.alloc(FILE_LIMIT + 1, 65));
     await assert.rejects(snapshot(f.home, randomUUID(), [input]), /exceeds/);
     await writeFile(input, Buffer.alloc(FILE_LIMIT, 65));
-    await assert.rejects(snapshot(f.home, randomUUID(), Array(5).fill(input)), /Total input/);
+    const largeInputs = await Promise.all(Array.from({ length: 5 }, async (_, index) => {
+      const path = join(f.root, `large-${index}.txt`);
+      await writeFile(path, Buffer.alloc(FILE_LIMIT, 65));
+      return path;
+    }));
+    await assert.rejects(snapshot(f.home, randomUUID(), largeInputs), /Total input/);
     await assert.rejects(snapshot(f.home, randomUUID(), []), /between 1 and 32/);
     await writeFile(input, Buffer.from([0xff, 0xfe]));
     await assert.rejects(snapshot(f.home, randomUUID(), [input]));

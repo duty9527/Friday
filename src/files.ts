@@ -1,6 +1,6 @@
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, realpath, writeFile, chmod, rm } from 'node:fs/promises';
-import { basename, dirname, join, parse, resolve } from 'node:path';
+import { lstat, mkdir, open, opendir, realpath, writeFile, chmod, rm } from 'node:fs/promises';
+import { basename, dirname, join, parse, resolve, relative } from 'node:path';
 import { createHash } from 'node:crypto';
 
 export const FILE_LIMIT = 256 * 1024;
@@ -52,19 +52,56 @@ export async function readRegular(path: string, limit = FILE_LIMIT): Promise<Buf
   } finally { await handle.close(); }
 }
 
+async function expandInputs(paths: string[]): Promise<Array<{ path: string; name: string }>> {
+  const files: Array<{ path: string; name: string }> = [];
+  const seen = new Set<string>();
+  let entries = 0;
+  async function visit(path: string, root: string, depth: number): Promise<void> {
+    if (++entries > 4096 || depth > 64) throw new Error('Directory scan limit exceeded (4096 entries / 64 levels)');
+    await noSymlinkAncestors(path);
+    const before = await lstat(path);
+    if (seen.has(path)) return;
+    seen.add(path);
+    if (before.isFile()) {
+      files.push({ path, name: path === root ? basename(path) : join(basename(root), relative(root, path)) });
+      if (files.length > 32) throw new Error('Expanded input exceeds 32 file limit; choose a smaller directory');
+      return;
+    }
+    if (!before.isDirectory()) throw new Error(`Only regular files and directories are accepted: ${path}`);
+    const children: string[] = [];
+    const directory = await opendir(path);
+    for await (const child of directory) {
+      if (children.length + entries >= 4096) throw new Error('Directory scan limit exceeded (4096 entries)');
+      children.push(child.name);
+    }
+    children.sort();
+    for (const child of children) await visit(join(path, child), root, depth + 1);
+    await noSymlinkAncestors(path);
+    const after = await lstat(path);
+    if (after.ino !== before.ino || after.dev !== before.dev || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) {
+      throw new Error(`Directory changed while creating snapshot; submit again: ${path}`);
+    }
+  }
+  for (const input of paths) { const path = resolve(input); await visit(path, path, 0); }
+  if (!files.length) throw new Error('No regular files found in the authorized input paths');
+  return files;
+}
+
 export async function snapshot(home: string, taskId: string, paths: string[]): Promise<InputFile[]> {
-  if (paths.length < 1 || paths.length > 32) throw new Error('Provide between 1 and 32 input files');
+  if (paths.length < 1 || paths.length > 32) throw new Error('Provide between 1 and 32 input paths (files or directories)');
   const root = join(home, 'tasks', taskId, 'inputs');
   await mkdir(root, { recursive: true, mode: 0o700 });
   const files: InputFile[] = [];
   let total = 0;
   try {
-    for (const [index, input] of paths.entries()) {
-      const path = resolve(input);
-      const data = await readRegular(path);
+    const inputs = await expandInputs(paths);
+    for (const [index, input] of inputs.entries()) {
+      let data: Buffer;
+      try { data = await readRegular(input.path); }
+      catch (error) { throw new Error(`Cannot read authorized input ${input.path}: ${error instanceof Error ? error.message : String(error)}`); }
       total += data.length;
       if (total > TOTAL_LIMIT) throw new Error(`Total input exceeds ${TOTAL_LIMIT} byte limit`);
-      const file = { id: `f${index}`, name: basename(path), bytes: data.length, sha256: createHash('sha256').update(data).digest('hex') };
+      const file = { id: `f${index}`, name: input.name, bytes: data.length, sha256: createHash('sha256').update(data).digest('hex') };
       await writeFile(join(root, file.id), data, { flag: 'wx', mode: 0o400 });
       files.push(file);
     }
