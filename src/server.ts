@@ -9,6 +9,7 @@ import { integer, REQUEST_LIMIT, RESPONSE_LIMIT, socketPath, text, type Response
 export interface ServiceOptions {
   home: string; mode: 'real' | 'offline'; offlineDelayMs?: number;
   provider?: string; model?: string; apiKey?: string;
+  baseUrl?: string; routerModel?: string; workerModel?: string;
 }
 export async function serve(options: ServiceOptions): Promise<{ home: string; close(): Promise<void> }> {
   if (process.platform === 'win32') throw new Error('This implementation requires Unix sockets (macOS/Linux)');
@@ -39,11 +40,12 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
       if (handled) return;
       buffer = Buffer.concat([buffer, chunk]);
       if (buffer.length > REQUEST_LIMIT) { handled = true; reply({ ok: false, error: 'Request exceeds limit' }); return; }
-      if (!buffer.includes(10)) return;
+      const newline = buffer.indexOf(10);
+      if (newline === -1) return;
       handled = true;
       void (async () => {
         if (compromised || !coordinator) throw new Error('Service does not own its instance lock');
-        const message: unknown = JSON.parse(buffer.toString('utf8').split('\n')[0]!);
+        const message: unknown = JSON.parse(buffer.subarray(0, newline).toString('utf8'));
         if (!message || typeof message !== 'object' || !('command' in message)) throw new Error('Invalid command');
         const command = message as Record<string, unknown>;
         const store = coordinator.store;
@@ -71,7 +73,7 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
           case 'operation': {
             const taskId = text(command.taskId, 'taskId', 128);
             store.get(taskId);
-            const operation = store.operations(taskId).find(op => op.id === text(command.operationId, 'operationId', 128));
+            const operation = store.operationById(text(command.operationId, 'operationId', 128), taskId);
             if (!operation) throw new Error('Operation not found');
             return operation;
           }
@@ -83,12 +85,18 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
           }
           case 'followup': return coordinator.followup(text(command.taskId, 'taskId', 128), text(command.requestId, 'requestId', 128), text(command.text, 'text'));
           case 'stop': return coordinator.stop(text(command.taskId, 'taskId', 128));
+          case 'resume': return coordinator.resume(text(command.taskId, 'taskId', 128), integer(command.limitMs, 600_000, 100, 86_400_000));
+          case 'timer-list': return store.listTimers();
+          case 'timer-add': return coordinator.addTimer(text(command.name ?? '定时任务', 'name', 120), text(command.instruction, 'instruction'),
+            integer(command.intervalMs, 60_000, 1_000, 604_800_000), command.cwd === undefined ? undefined : text(command.cwd, 'cwd', 4096));
+          case 'timer-toggle': return coordinator.toggleTimer(text(command.id, 'id', 128), Boolean(command.enabled));
+          case 'timer-remove': return { removed: coordinator.removeTimer(text(command.id, 'id', 128)) };
           case 'get': {
             const task = store.get(text(command.taskId, 'taskId', 128));
             return { ...task, operations: store.operations(task.id).map(({ result: _result, ...metadata }) => metadata),
               followups: store.events(task.id).map(({ id, text, state }) => ({ id, text, state })) };
           }
-          case 'list': return store.list().slice(-100).map(({ id, status, mode, createdAt, reason, activeMs, limitMs }) => ({ id, status, mode, createdAt, reason, activeMs, limitMs }));
+          case 'list': return store.list(100).map(({ id, status, mode, createdAt, reason, activeMs, limitMs }) => ({ id, status, mode, createdAt, reason, activeMs, limitMs }));
           case 'events': return store.notices(integer(command.after, 0, 0, Number.MAX_SAFE_INTEGER));
           case 'shutdown': {
             socket.once('close', () => { void shutdown?.(); });

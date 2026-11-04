@@ -15,6 +15,11 @@ status: active
 
 以 `Super-agent.md` 的架构探索为可信起点，允许根据个人使用场景修正设计；原文是参考资料，不是本项目已经采纳的全部决策。
 
+> **里程碑目标与精神内核（Project FRIDAY）**：
+> - **命名致敬**：灵感源自漫威钢铁侠 Tony Stark 的全天候个人 AI 管家 **F.R.I.D.A.Y.（Female Replacement Intelligent Digital Assistant Youth）**，同时也呼应英语中“Man/Girl Friday”（最可靠、能独当一面打理一切事务的个人全能副手）的经典意象。
+> - **架构映射**：就像 Tony 永远只与 F.R.I.D.A.Y. **同一个声音**自然对话（Single Continuous Router），无需关心后台子系统编号，而 F.R.I.D.A.Y. 在背后并发调度战甲诊断、代码编译、检索分析等多个隔离执行流（Workers），具备深度的本机受信任执行权限，并在关键节点主动汇总交付或请求决策。
+> - **演进节点**：当前阶段以 `Super-agent` 作为原型代号推进核心闭环与稳定性打磨；当系统补齐恢复续跑、定时触发、Watchdog 监护与真实模型日常可用性，达到**完全可用（Production-Ready）**状态后，项目将正式更名为 **FRIDAY（Female Replacement Intelligent Digital Assistant Youth）**。
+
 ## Problem
 
 个人同时推进多个事务时，独立会话要求用户记忆任务上下文、手动跟进后台工作；耗时操作又容易阻塞新请求。本工具将会话管理与任务协调交给系统，让用户集中在提出目标、调整方向和验收结果。

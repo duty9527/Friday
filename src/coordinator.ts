@@ -9,7 +9,7 @@ import { integer, text } from './protocol.js';
 import type { ChatMessage, MainView, RouteAction, RouteKind } from './view.js';
 import { publicData } from './conversation.js';
 import { Executor } from './executor.js';
-import { Store, type Operation, type Task, type TaskStatus } from './store.js';
+import { Store, type Operation, type Task, type TaskStatus, type Timer } from './store.js';
 
 const unsettled = (op: Operation) => ['requested', 'started', 'cancel_requested', 'unknown'].includes(op.status);
 const taskStatusNeedsNotice = (status: TaskStatus) => ['paused', 'cancelled', 'failed'].includes(status);
@@ -78,7 +78,10 @@ export class Coordinator {
         }
         const task = await this.newChatWork(context, instruction, paths, callId, source,
           args.cwd === undefined ? undefined : text(args.cwd, 'cwd', 4096));
-        return JSON.stringify({ taskId: task.id, state: task.status, execution: task.execution, cwd: task.cwd, note: 'Background work accepted, not completed' });
+        const concurrentTaskIds = this.concurrentTasksInCwd(task.cwd, task.id);
+        return JSON.stringify({ taskId: task.id, state: task.status, execution: task.execution, cwd: task.cwd,
+          ...(concurrentTaskIds.length ? { concurrentTaskIds, warning: 'Another active native work is operating in the same cwd' } : {}),
+          note: 'Background work accepted, not completed' });
       },
     }, {
       name: 'continue_work', description: 'Input JSON {taskId,instruction,cwd?}. Append a follow-up to queued/running work; completed/failed/cancelled work starts a related isolated execution using the CURRENT service execution capabilities and prior report. In native mode, even a legacy snapshot source creates a full-tool Worker in the current working directory, never another snapshot-only Worker. Optional cwd selects an absolute working directory. Paused or unknown work cannot be resumed automatically.',
@@ -97,7 +100,9 @@ export class Coordinator {
         if (task.status === 'paused') throw new Error('Work is paused with unconfirmed progress; no automatic replay or resume');
         const next = await this.newChatWork(context, instruction, context.message.paths, callId, task,
           args.cwd === undefined ? undefined : text(args.cwd, 'cwd', 4096));
-        return JSON.stringify({ taskId: next.id, parentTaskId: task.id, state: next.status, execution: next.execution, cwd: next.cwd });
+        const concurrentTaskIds = this.concurrentTasksInCwd(next.cwd, next.id);
+        return JSON.stringify({ taskId: next.id, parentTaskId: task.id, state: next.status, execution: next.execution, cwd: next.cwd,
+          ...(concurrentTaskIds.length ? { concurrentTaskIds, warning: 'Another active native work is operating in the same cwd' } : {}) });
       },
     }, {
       name: 'inspect_work', description: 'Read persisted work status and prior report. Input JSON {taskId}. This does not run a Worker or read new host files.',
@@ -131,6 +136,33 @@ export class Coordinator {
         const task = this.stop(selected.id);
         return JSON.stringify({ taskId: task.id, state: task.status, reason: task.reason });
       },
+    }, {
+      name: 'resume_work', description: 'Resume a paused work after explicit user confirmation. Input JSON {taskId, extendMs?}. Acknowledges unsettled prior operations, extends active execution budget, and resumes the Worker.',
+      execute: async input => {
+        const context = this.requireChat();
+        const args = toolInput(input, ['taskId', 'extendMs', 'summary']);
+        const selected = this.chatWork(context, text(args.taskId, 'taskId', 128));
+        this.store.conversation.link(context.message.id, selected.id);
+        const task = this.resume(selected.id, integer(args.extendMs, 600_000, 100, 86_400_000));
+        context.revisions.set(task.id, task.revision);
+        return JSON.stringify({ taskId: task.id, state: task.status, limitMs: task.limitMs, reason: task.reason });
+      },
+    }, {
+      name: 'manage_timer', description: 'Manage persistent scheduled tasks. Input JSON {action: "add"|"list"|"toggle"|"remove", id?, name?, instruction?, intervalMs?, cwd?, enabled?}.',
+      execute: async input => {
+        this.requireChat();
+        const args = toolInput(input, ['action', 'id', 'name', 'instruction', 'intervalMs', 'cwd', 'enabled', 'summary']);
+        const action = text(args.action, 'action', 32);
+        if (action === 'list') return JSON.stringify({ timers: this.store.listTimers() });
+        if (action === 'add') {
+          const timer = this.addTimer(text(args.name ?? '定时任务', 'name', 120), text(args.instruction, 'instruction'),
+            integer(args.intervalMs, 60_000, 1_000, 604_800_000), args.cwd === undefined ? undefined : text(args.cwd, 'cwd', 4096));
+          return JSON.stringify({ timer });
+        }
+        if (action === 'toggle') return JSON.stringify({ timer: this.toggleTimer(text(args.id, 'id', 128), Boolean(args.enabled)) });
+        if (action === 'remove') return JSON.stringify({ removed: this.removeTimer(text(args.id, 'id', 128)) });
+        throw new Error(`Unknown timer action: ${action}`);
+      },
     }] satisfies AgentTool[]).map((tool: AgentTool) => ({ ...tool, description: `${tool.description} Optional summary: one short public explanation of this action, not private reasoning.`,
       execute: (input: string, callId?: string) => {
         const stableId = callId ?? randomUUID();
@@ -139,7 +171,7 @@ export class Coordinator {
       { restore: this.store.conversation.meta('router_checkpoint'), onEvent: event => this.routerTrace?.observe(event) });
   }
   private async routeTool(name: string, input: string, callId: string | undefined, execute: () => Promise<string>): Promise<string> {
-    const kinds: Record<string, RouteKind> = { start_work: 'new_work', continue_work: 'followup', inspect_work: 'inspect', stop_work: 'stop', recall_messages: 'recall' };
+    const kinds: Record<string, RouteKind> = { start_work: 'new_work', continue_work: 'followup', inspect_work: 'inspect', stop_work: 'stop', resume_work: 'resume', recall_messages: 'recall', manage_timer: 'timer' };
     const context = this.chatContext;
     if (!context || !kinds[name]) return execute();
     let args: Record<string, unknown> = {};
@@ -200,11 +232,19 @@ export class Coordinator {
     context.revisions.set(task.id, task.revision);
     return task;
   }
+  private concurrentTasksInCwd(cwd: string | undefined, excludeTaskId: string): string[] {
+    if (!cwd) return [];
+    return this.store.list().filter(task => task.id !== excludeTaskId && ['queued', 'running'].includes(task.status) && task.execution === 'native' && task.cwd === cwd).map(task => task.id);
+  }
   view(): MainView {
+    const recent = this.store.list(80);
     return { mode: this.factory.mode, health: { status: this.executor.available ? 'ready' : 'degraded', executorAvailable: this.executor.available },
       messages: this.store.conversation.history(), cursor: this.store.conversation.latestSeq(),
-      works: this.store.list().slice(-80).map(({ id, prompt, status, mode, createdAt, activeMs, limitMs, reason, originMessageId, parentTaskId }) =>
-        ({ id, prompt: prompt.slice(0, 240), status, mode, createdAt, activeMs, limitMs, reason, originMessageId, parentTaskId })) };
+      works: recent.map(({ id, prompt, status, mode, createdAt, activeMs, limitMs, reason, originMessageId, parentTaskId, cwd, execution }) => {
+        const concurrentTaskIds = execution === 'native' && ['queued', 'running'].includes(status) ? this.concurrentTasksInCwd(cwd, id) : undefined;
+        return { id, prompt: prompt.slice(0, 240), status, mode, createdAt, activeMs, limitMs, reason, originMessageId, parentTaskId, cwd,
+          ...(concurrentTaskIds?.length ? { concurrentTaskIds } : {}) };
+      }) };
   }
   chat(requestId: string, content: string, paths: string[] = []): ChatMessage {
     if (this.closing) throw new Error('Service is shutting down');
@@ -220,10 +260,10 @@ export class Coordinator {
     this.chatRuns.set(message.id, context);
     const pending = this.routerQueue.then(async () => {
       if (context.controller.signal.aborted || this.closing) { chat.update(message.id, { status: 'interrupted', reason: 'Router 处理前已停止；不会自动重发。' }); return; }
-      context.revisions = new Map(this.store.list().map(task => [task.id, task.revision]));
+      const knownWorks = this.store.list();
+      context.revisions = new Map(knownWorks.map(task => [task.id, task.revision]));
       this.chatContext = context;
       const recentContext = chat.recentContext();
-      const knownWorks = this.store.list();
       chat.update(message.id, { status: 'processing', routing: { at: Date.now(), status: 'processing', actions: [],
         context: { execution: this.factory.nativeTools ? 'native' : 'snapshot', cwd: process.cwd(), totalWorks: knownWorks.length,
           truncated: knownWorks.length > 40, works: knownWorks.slice(-40).map(({ id, prompt, status, revision }) => ({ id, prompt: String(publicData(prompt.slice(0, 240))), status, revision })),
@@ -426,7 +466,7 @@ export class Coordinator {
           this.store.operation({ id, taskId: task.id, revision: run.revision, fileId: `native:${event.name}`,
             status: 'started', parentSpanId: run.trace?.toolSpan(event.id) });
         } else {
-          const previous = this.store.operations(task.id).find(operation => operation.id === id);
+          const previous = this.store.operationById(id, task.id);
           if (!previous) throw new Error('Native tool start record missing');
           this.store.operation({ ...previous, status: event.interrupted ? 'unknown' : event.error ? 'failed' : 'succeeded',
             error: event.interrupted ? '本机工具已中断，副作用结果未经确认；不会自动重放' : event.error ? '本机工具失败，详情见工具轨迹' : undefined });
@@ -525,6 +565,84 @@ export class Coordinator {
     if (!run.jobs) this.finish(run, status, reason);
     return this.store.get(id);
   }
+  resume(id: string, extendMs = 600_000): Task {
+    if (this.closing) throw new Error('Service is shutting down');
+    const task = this.store.get(id);
+    if (task.status !== 'paused' || this.runs.has(id)) throw new Error('Only a settled paused task can be resumed');
+    this.store.transaction(() => {
+      this.store.acknowledgeUnsettledOperations(id);
+      task.revision++;
+      task.limitMs = Math.max(task.limitMs, Math.ceil(task.activeMs) + extendMs);
+      task.status = 'running';
+      task.reason = '用户已确认恢复运行';
+      this.store.save(task);
+      this.store.notice(id, 'running', task.reason);
+    });
+    const run: Run = { id, revision: task.revision, controller: new AbortController(), jobs: 0, activeCalls: 0,
+      clockUncertain: false, reads: new Map(), completions: [], lastTick: performance.now(), lastWall: Date.now() };
+    this.runs.set(id, run);
+    this.launch(run, () => this.work(run));
+    return this.store.get(id);
+  }
+  addTimer(name: string, instruction: string, intervalMs: number, cwd?: string): Timer {
+    const now = Date.now();
+    const timer: Timer = { id: randomUUID(), name, instruction, intervalMs, cwd, enabled: true,
+      createdAt: now, nextRunAt: now + intervalMs, missedRuns: 0 };
+    this.store.saveTimer(timer);
+    this.store.notice('system', 'timer_added', `已配置定时任务「${name}」（每 ${Math.round(intervalMs / 1000)} 秒）`);
+    return timer;
+  }
+  toggleTimer(id: string, enabled: boolean): Timer {
+    const timer = this.store.getTimer(id);
+    timer.enabled = enabled;
+    timer.pendingCatchup = false;
+    if (enabled) timer.nextRunAt = Date.now() + timer.intervalMs;
+    this.store.saveTimer(timer);
+    this.store.notice('system', enabled ? 'timer_enabled' : 'timer_disabled', `定时任务「${timer.name}」已${enabled ? '启用' : '关闭'}`);
+    return timer;
+  }
+  removeTimer(id: string): boolean {
+    return this.store.deleteTimer(id);
+  }
+  private triggerTimer(timer: Timer) {
+    const now = Date.now();
+    timer.lastRunAt = now;
+    timer.pendingCatchup = false;
+    const message = this.store.conversation.create({ id: randomUUID(), role: 'user', source: 'system',
+      text: `[定时触发 · ${timer.name}] ${timer.instruction}`, status: 'completed', paths: [], mode: this.factory.mode });
+    const requestId = `timer:${timer.id}:${now}`;
+    void this.submit(requestId, timer.instruction, [], 600_000,
+      { originMessageId: message.id, cwd: timer.cwd, signal: new AbortController().signal }).then(task => {
+      const current = this.store.listTimers().find(item => item.id === timer.id);
+      if (current) { current.activeTaskId = task.id; this.store.saveTimer(current); }
+    }).catch(() => {});
+    this.store.saveTimer(timer);
+  }
+  private tickTimers() {
+    if (this.closing) return;
+    const now = Date.now();
+    for (const timer of this.store.listTimers()) {
+      let active = false;
+      if (timer.activeTaskId) {
+        try { active = ['queued', 'running'].includes(this.store.get(timer.activeTaskId).status); } catch { active = false; }
+        if (!active) { timer.activeTaskId = undefined; this.store.saveTimer(timer); }
+      }
+      if (!timer.enabled) continue;
+      if (now >= timer.nextRunAt) {
+        const missed = Math.floor((now - timer.nextRunAt) / timer.intervalMs);
+        if (missed > 0) timer.missedRuns += missed;
+        timer.nextRunAt = now + timer.intervalMs;
+        if (active) {
+          timer.pendingCatchup = true;
+          this.store.saveTimer(timer);
+        } else {
+          this.triggerTimer(timer);
+        }
+      } else if (!active && timer.pendingCatchup) {
+        this.triggerTimer(timer);
+      }
+    }
+  }
   private finish(run: Run, status: TaskStatus, reason?: string, report?: string) {
     if (!this.accrue(run) && status === 'completed') {
       status = 'paused'; reason = '交付时检测到时钟或心跳缺口，无法证明活跃用时'; report = undefined;
@@ -620,6 +738,7 @@ export class Coordinator {
         this.stop(task.id, '已达到活跃执行时限；工作暂停。需要继续时请重新提供输入', 'paused');
       }
     }
+    this.tickTimers();
   }
   async close() {
     if (this.closing) return;

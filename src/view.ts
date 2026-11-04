@@ -1,5 +1,5 @@
 export type MessageState = 'queued' | 'processing' | 'streaming' | 'completed' | 'interrupted' | 'failed';
-export type RouteKind = 'new_work' | 'followup' | 'related_work' | 'inspect' | 'stop' | 'recall' | 'reply';
+export type RouteKind = 'new_work' | 'followup' | 'related_work' | 'inspect' | 'stop' | 'resume' | 'recall' | 'timer' | 'reply';
 export interface RouteAction {
   id: string; kind: RouteKind; status: 'pending' | 'accepted' | 'failed' | 'interrupted'; at: number;
   taskId?: string; taskLabel?: string; parentTaskId?: string; summary?: string; error?: string;
@@ -27,6 +27,7 @@ export interface MessagePage { items: ChatMessage[]; hasMore: boolean; before?: 
 export interface WorkView {
   id: string; prompt: string; status: string; mode: 'real' | 'offline'; createdAt: number;
   activeMs: number; limitMs: number; reason?: string; originMessageId?: string; parentTaskId?: string;
+  cwd?: string; concurrentTaskIds?: string[];
 }
 export interface MainView {
   mode: 'real' | 'offline'; health: { status: string; executorAvailable: boolean };

@@ -19,6 +19,12 @@ export interface Operation {
   result?: string; error?: string; parentSpanId?: string;
 }
 export interface Notice { seq: number; taskId: string; kind: string; text: string; at: number }
+export interface Timer {
+  id: string; name: string; instruction: string; intervalMs: number;
+  cwd?: string; enabled: boolean; createdAt: number;
+  nextRunAt: number; lastRunAt?: number; activeTaskId?: string;
+  pendingCatchup?: boolean; missedRuns: number;
+}
 
 export class Store {
   private readonly db: DatabaseSync;
@@ -29,7 +35,10 @@ export class Store {
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
       CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), text TEXT NOT NULL, state TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS events_task ON events(task_id,state);
       CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), body TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS operations_task ON operations(task_id);
+      CREATE TABLE IF NOT EXISTS timers(id TEXT PRIMARY KEY, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS notices(seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL);`);
     this.conversation = new Conversation(this.db, run => this.transaction(run));
   }
@@ -62,8 +71,11 @@ export class Store {
     const row = this.db.prepare('SELECT body FROM tasks WHERE request_id=?').get(requestId);
     return row ? JSON.parse(String(row.body)) as Task : undefined;
   }
-  list(): Task[] {
-    return this.db.prepare('SELECT body FROM tasks ORDER BY rowid').all().map(row => JSON.parse(String(row.body)) as Task);
+  list(limit?: number): Task[] {
+    const rows = limit === undefined
+      ? this.db.prepare('SELECT body FROM tasks ORDER BY rowid').all()
+      : this.db.prepare('SELECT body FROM tasks ORDER BY rowid DESC LIMIT ?').all(limit).reverse();
+    return rows.map(row => JSON.parse(String(row.body)) as Task);
   }
   save(task: Task) {
     this.db.prepare('UPDATE tasks SET body=? WHERE id=?').run(JSON.stringify(task), task.id);
@@ -148,12 +160,45 @@ export class Store {
           resultRef: op.result === undefined ? undefined : op.id, preview: op.result?.slice(0, 512), error: op.error } });
     });
   }
+  operationById(id: string, taskId?: string): Operation | undefined {
+    const row = taskId === undefined
+      ? this.db.prepare('SELECT body FROM operations WHERE id=?').get(id)
+      : this.db.prepare('SELECT body FROM operations WHERE id=? AND task_id=?').get(id, taskId);
+    return row ? JSON.parse(String(row.body)) as Operation : undefined;
+  }
   operations(taskId: string): Operation[] {
     return this.db.prepare('SELECT body FROM operations WHERE task_id=? ORDER BY rowid').all(taskId).map(row => JSON.parse(String(row.body)) as Operation);
   }
+  acknowledgeUnsettledOperations(taskId: string) {
+    this.transaction(() => {
+      for (const op of this.operations(taskId)) {
+        if (['requested', 'started', 'cancel_requested', 'unknown'].includes(op.status)) {
+          op.status = 'cancelled';
+          op.error = op.error ? `${op.error}（用户已确认续跑并核销）` : '用户已确认续跑，核销未确认操作';
+          this.operation(op);
+        }
+      }
+    });
+  }
+  saveTimer(timer: Timer) {
+    this.db.prepare('INSERT INTO timers VALUES(?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body').run(timer.id, JSON.stringify(timer));
+  }
+  getTimer(id: string): Timer {
+    const row = this.db.prepare('SELECT body FROM timers WHERE id=?').get(id);
+    if (!row) throw new Error('Timer not found');
+    return JSON.parse(String(row.body)) as Timer;
+  }
+  listTimers(): Timer[] {
+    return this.db.prepare('SELECT body FROM timers ORDER BY rowid').all().map(row => JSON.parse(String(row.body)) as Timer);
+  }
+  deleteTimer(id: string): boolean {
+    return this.db.prepare('DELETE FROM timers WHERE id=?').run(id).changes > 0;
+  }
   notice(taskId: string, kind: string, text: string) {
     this.db.prepare('INSERT INTO notices(task_id,kind,text,at) VALUES(?,?,?,?)').run(taskId, kind, text.length > 4096 ? text.slice(0, 4096) + '\n[notice truncated; use get for the full task report]' : text, Date.now());
-    const task = this.get(taskId);
+    const row = this.db.prepare('SELECT body FROM tasks WHERE id=?').get(taskId);
+    if (!row) return;
+    const task = JSON.parse(String(row.body)) as Task;
     this.conversation.emit({ type: 'trace', kind: 'task_state', rootId: task.originMessageId ?? taskId,
       messageId: task.originMessageId, taskId, spanId: taskId, parentSpanId: task.parentSpanId,
       actor: 'system', label: task.prompt.slice(0, 100), status: kind, data: { reason: task.reason, mode: task.mode } });
@@ -171,13 +216,12 @@ export class Store {
         this.conversation.followupState(String(row.id), 'failed');
         this.notice(String(row.task_id), 'followup_failed', '服务重启时该补充要求仍在处理中，无法证明已送达；不会自动重发。');
       }
-      for (const task of this.list()) {
-        for (const op of this.operations(task.id)) {
-          if (['requested', 'started', 'cancel_requested'].includes(op.status)) {
-            op.status = 'unknown'; this.operation(op);
-          }
-        }
-        if (task.status !== 'running' && task.status !== 'queued') continue;
+      for (const row of this.db.prepare("SELECT body FROM operations WHERE json_extract(body,'$.status') IN ('requested','started','cancel_requested') ORDER BY rowid").all()) {
+        const op = JSON.parse(String(row.body)) as Operation;
+        op.status = 'unknown'; this.operation(op);
+      }
+      for (const row of this.db.prepare("SELECT body FROM tasks WHERE json_extract(body,'$.status') IN ('running','queued') ORDER BY rowid").all()) {
+        const task = JSON.parse(String(row.body)) as Task;
         task.revision++;
         task.status = 'paused';
         task.reason = '服务已重启：先前模型/交付进度与已用时间无法证明，不会自动重放。';

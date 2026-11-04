@@ -75,6 +75,7 @@ function modelLookupError(runtime: ModelRuntime, provider: string, model: string
 
 export async function realFactory(home: string, config: {
   provider?: string; model?: string; apiKey?: string;
+  baseUrl?: string; routerModel?: string; workerModel?: string;
 }, suppliedRuntime?: ModelRuntime): Promise<AgentFactory> {
   if (!config.provider || !config.model || !config.apiKey) {
     throw new Error('Real mode requires SUPER_AGENT_PROVIDER, SUPER_AGENT_MODEL and SUPER_AGENT_API_KEY; use --mode offline explicitly for simulation');
@@ -85,12 +86,27 @@ export async function realFactory(home: string, config: {
     authPath: join(sdkDir, 'auth.json'), modelsPath: null,
     modelsStorePath: join(sdkDir, 'models-cache.json'), refreshOnCreate: false,
   });
-  const model = runtime.getModel(config.provider, config.model);
-  if (!model) throw new Error(modelLookupError(runtime, config.provider, config.model));
+  const routerModelId = config.routerModel ?? config.model;
+  const workerModelId = config.workerModel ?? config.model;
+  if (config.baseUrl) {
+    let parsedUrl: URL;
+    try { parsedUrl = new URL(config.baseUrl); } catch { throw new Error(`Invalid SUPER_AGENT_BASE_URL: ${config.baseUrl}`); }
+    if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') throw new Error('SUPER_AGENT_BASE_URL must use http or https');
+    const ids = [...new Set([config.model, routerModelId, workerModelId])];
+    runtime.registerProvider(config.provider, {
+      baseUrl: config.baseUrl, api: 'openai-completions', apiKey: config.apiKey,
+      models: ids.map(id => ({ id, name: id, reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128_000, maxTokens: 8192 })),
+    });
+  }
+  const routerModel = runtime.getModel(config.provider, routerModelId);
+  if (!routerModel) throw new Error(modelLookupError(runtime, config.provider, routerModelId));
+  const workerModel = runtime.getModel(config.provider, workerModelId);
+  if (!workerModel) throw new Error(modelLookupError(runtime, config.provider, workerModelId));
   await runtime.setRuntimeApiKey(config.provider, config.apiKey);
   return {
     mode: 'real', nativeTools: true,
     async create(role, id, tools, options) {
+      const model = role === 'router' ? routerModel : workerModel;
       const sessionDir = join(sdkDir, id);
       await mkdir(sessionDir, { recursive: true, mode: 0o700 });
       const native = role === 'worker' && options?.execution === 'native';
@@ -272,6 +288,11 @@ export function offlineFactory(delayMs = 100): AgentFactory {
                 return respond('[OFFLINE SIMULATION] 已关联你明确提供的文件，并启动后台分析。你可以继续在这里补充要求。');
               }
               const candidates = works.filter(work => ['queued', 'running'].includes(work.status));
+              const paused = works.filter(work => work.status === 'paused');
+              if (/恢复|续跑|resume/i.test(message.text) && paused.length === 1) {
+                await call('resume_work', JSON.stringify({ taskId: paused[0]!.id }));
+                return respond('[OFFLINE SIMULATION] 已恢复暂停中的工作。');
+              }
               if (/停止|取消/.test(message.text) && candidates.length === 1) {
                 await call('stop_work', JSON.stringify({ taskId: candidates[0]!.id }));
                 return respond('[OFFLINE SIMULATION] 已请求停止相关工作，等待执行器确认。');

@@ -27,9 +27,10 @@ export async function request(home: string, message: unknown): Promise<unknown> 
     socket.on('data', chunk => {
       buffer = Buffer.concat([buffer, chunk]);
       if (buffer.length > RESPONSE_LIMIT) { fail(new Error('Response too large')); return; }
-      if (!buffer.includes(10)) return;
+      const newline = buffer.indexOf(10);
+      if (newline === -1) return;
       try {
-        const response = JSON.parse(buffer.toString('utf8').split('\n')[0]!) as Response;
+        const response = JSON.parse(buffer.subarray(0, newline).toString('utf8')) as Response;
         socket.destroy();
         if (!response.ok) reject(new Error(response.error ?? 'Service request failed'));
         else resolve(response.result);

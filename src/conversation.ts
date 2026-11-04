@@ -146,7 +146,7 @@ export class Conversation {
     const scope = filter.taskId ? (origin ? '(task_id=? OR (message_id=? AND task_id IS NULL))' : 'task_id=?')
       : filter.messageId
         ? `(root_id=? OR message_id IN (${listed}) OR task_id IN (SELECT task_id FROM message_tasks WHERE message_id=?))
-          AND (json_extract(body,'$.messageId') IS NULL OR json_extract(body,'$.messageId') IN (${listed}))` : '';
+          AND (message_id IS NULL OR message_id IN (${listed}))` : '';
     const args = filter.taskId ? origin ? [filter.taskId, origin] : [filter.taskId]
       : filter.messageId ? [filter.messageId, ...own, filter.messageId, ...own] : [];
     const where = [scope, after !== undefined ? 'seq>?' : 'seq<?']
@@ -170,13 +170,11 @@ export class Conversation {
   latestSeq(): number { return Number(this.db.prepare('SELECT coalesce(max(seq),0) AS seq FROM journal').get()!.seq); }
   recover() {
     this.atomic(() => {
-      const rows = this.db.prepare('SELECT seq,body FROM messages').all();
+      const rows = this.db.prepare("SELECT seq,body FROM messages WHERE json_extract(body,'$.status') IN ('queued','processing','streaming')").all();
       for (const row of rows) {
         const message = this.decode(row);
-        if (['queued', 'processing', 'streaming'].includes(message.status)) {
-          this.update(message.id, { status: 'interrupted', reason: '服务中断，处理进度未确认；已保留内容，不自动重发或重放。',
-            routing: message.routing ? { ...message.routing, status: 'interrupted', actions: message.routing.actions.map(action => action.status === 'pending' ? { ...action, status: 'interrupted' } : action) } : undefined });
-        }
+        this.update(message.id, { status: 'interrupted', reason: '服务中断，处理进度未确认；已保留内容，不自动重发或重放。',
+          routing: message.routing ? { ...message.routing, status: 'interrupted', actions: message.routing.actions.map(action => action.status === 'pending' ? { ...action, status: 'interrupted' } : action) } : undefined });
       }
       const latestSpans = this.db.prepare(`SELECT body FROM journal WHERE seq IN (
         SELECT max(seq) FROM journal WHERE json_extract(body,'$.spanId') IS NOT NULL GROUP BY json_extract(body,'$.spanId'))`).all();

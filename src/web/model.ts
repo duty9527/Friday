@@ -19,7 +19,7 @@ export function orderConversation<T extends Pick<ChatMessage, 'seq'>>(items: Ite
 
 export function routeLabel(action: Pick<RouteAction, 'kind'>): string {
   return { new_work: '新建工作', followup: '补充已有工作（未新建）', related_work: '关联新执行（新建工作）',
-    inspect: '查询工作', stop: '请求停止工作', recall: '回看历史', reply: '仅回复（未派发后台工作）' }[action.kind];
+    inspect: '查询工作', stop: '请求停止工作', resume: '恢复暂停工作', recall: '回看历史', timer: '管理定时任务', reply: '仅回复（未派发后台工作）' }[action.kind];
 }
 export function routeState(action: Pick<RouteAction, 'status' | 'kind' | 'delivery'>): string {
   if (action.status !== 'accepted') return { pending: '正在处理，尚未受理', failed: '动作失败', interrupted: '进度未确认' }[action.status];
@@ -40,7 +40,7 @@ const WORKER_TOOLS: Record<string, string> = {
   read: '读取文件', ls: '列出目录', find: '查找文件', grep: '搜索内容', bash: '执行命令',
   edit: '修改文件', write: '写入文件', start_read: '读取文件副本',
 };
-const ROUTER_TOOLS = new Set(['start_work', 'continue_work', 'inspect_work', 'stop_work', 'recall_messages', 'dispatch_worker']);
+const ROUTER_TOOLS = new Set(['start_work', 'continue_work', 'inspect_work', 'stop_work', 'resume_work', 'recall_messages', 'manage_timer', 'dispatch_worker']);
 const NOT_A_STEP = new Set(['visible_text', 'thinking', 'work_linked']);
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};

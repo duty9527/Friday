@@ -792,6 +792,20 @@ function renderWorkDetail() {
   const generation = selectionGeneration;
   const task = record(workData);
   ui.workDetail.replaceChildren(node('h3', '工作详情 · 诊断'), button('刷新工作详情', () => { void loadWork(taskId, generation); }));
+  if (task.status === 'paused') {
+    const resumeBtn = button('确认继续运行此工作', () => {
+      resumeBtn.disabled = true;
+      void api<unknown>('/api/resume', { taskId }).then(updated => {
+        if (generation === selectionGeneration) { workData = updated; renderWorkDetail(); }
+        connection('已确认恢复运行工作。');
+        scheduleRefresh();
+      }).catch(error => {
+        resumeBtn.disabled = false;
+        connection(`恢复工作失败：${errorText(error)}`, true);
+      });
+    });
+    ui.workDetail.append(resumeBtn);
+  }
   if (typeof task.status === 'string') detailRow(ui.workDetail, '状态', statusText(task.status));
   if (typeof task.reason === 'string') ui.workDetail.append(node('p', task.reason, 'message-reason'));
   if (task.report !== undefined) {
@@ -937,12 +951,16 @@ ui.draft.addEventListener('keydown', event => {
   }
 });
 let resizeTimer: ReturnType<typeof setTimeout> | undefined;
+let resizePinned = true;
+ui.scroll.addEventListener('scroll', () => {
+  resizePinned = ui.scroll.scrollHeight - ui.scroll.scrollTop - ui.scroll.clientHeight < 90;
+}, { passive: true });
 window.addEventListener('resize', () => {
-  // A viewport change must not leave the newest reply clipped under the composer.
+  // A viewport change must not leave the newest reply clipped under the composer when already near bottom.
   if (resizeTimer) clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => {
     resizeTimer = undefined;
-    ui.scroll.scrollTop = ui.scroll.scrollHeight;
+    if (resizePinned) ui.scroll.scrollTop = ui.scroll.scrollHeight;
   }, 120);
 });
 ui.older.addEventListener('click', () => { void loadOlder(); });

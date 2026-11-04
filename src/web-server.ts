@@ -83,7 +83,13 @@ export async function startWeb(options: { home: string; port?: number }): Promis
   const home = resolve(options.home);
   const port = integer(options.port, 0, 0, 65535);
   await bridge(home, { command: 'health' });
-  await readFile(new URL('./web/index.html', import.meta.url));
+  const assetCache = new Map<string, Buffer>();
+  const loadAsset = async (file: string) => {
+    let cached = assetCache.get(file);
+    if (!cached) { cached = await readFile(new URL(`./web/${file}`, import.meta.url)); assetCache.set(file, cached); }
+    return cached;
+  };
+  await loadAsset('index.html');
   const token = randomBytes(32).toString('hex');
   const credential = Buffer.from(`Bearer ${token}`);
   let host = '';
@@ -103,7 +109,7 @@ export async function startWeb(options: { home: string; port?: number }): Promis
       if (!url.pathname.startsWith('/api/')) {
         const asset = Object.hasOwn(assets, url.pathname) ? assets[url.pathname] : undefined;
         if (!asset || !['GET', 'HEAD'].includes(incoming.method ?? '')) throw new HttpFailure(404, 'Not found');
-        const bytes = await readFile(new URL(`./web/${asset.file}`, import.meta.url));
+        const bytes = await loadAsset(asset.file);
         response.writeHead(200, { 'content-type': asset.mime });
         response.end(incoming.method === 'HEAD' ? undefined : bytes);
         return;
@@ -127,12 +133,13 @@ export async function startWeb(options: { home: string; port?: number }): Promis
           case '/api/history': command = { command: 'history', before: numeric('before') }; break;
           case '/api/trace': command = { command: 'trace', messageId: search.get('messageId') ?? undefined, taskId: search.get('taskId') ?? undefined, after: numeric('after'), before: numeric('before') }; break;
           case '/api/work': command = { command: 'get', taskId: search.get('taskId') }; break;
+          case '/api/timers': command = { command: 'timer-list' }; break;
           case '/api/operation': command = { command: 'operation', taskId: search.get('taskId'), operationId: search.get('operationId') }; break;
           default: throw new HttpFailure(404, 'Unknown API endpoint');
         }
         send(response, 200, await bridge(home, command));
       } else if (incoming.method === 'POST') {
-        const commands: Record<string, string> = { '/api/chat': 'chat', '/api/stop': 'stop', '/api/chat-stop': 'chat-stop' };
+        const commands: Record<string, string> = { '/api/chat': 'chat', '/api/stop': 'stop', '/api/resume': 'resume', '/api/chat-stop': 'chat-stop' };
         const command = Object.hasOwn(commands, url.pathname) ? commands[url.pathname] : undefined;
         if (!command) throw new HttpFailure(404, 'Unknown API endpoint');
         const input = await body(incoming);
