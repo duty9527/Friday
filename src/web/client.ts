@@ -315,8 +315,8 @@ async function send() {
     const text = ui.draft.value.trim();
     if (!text) return;
     const files = ui.paths.value.split(/\r?\n/).map(path => path.trim()).filter(Boolean);
-    if (files.length > 32 || files.some(path => path.length > 4096 || !path.startsWith('/') || path.endsWith('/') || path.includes('\0')))  {
-      ui.sendError.textContent = '最多提供 32 个本机绝对文件路径（以 / 开头、每个不超过 4096 字符），不能是目录；文件由服务进一步校验。';
+    if (files.length > 32 || files.some(path => path.length > 4096 || !path.startsWith('/') || path.includes('\0')))  {
+      ui.sendError.textContent = '最多提供 32 个本机绝对路径（文件或文件夹，以 / 开头、每个不超过 4096 字符）；目录展开后最多 32 个文件，由服务进一步校验。';
       return;
     }
     pending = { requestId: crypto.randomUUID(), text, files };

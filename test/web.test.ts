@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { request as httpRequest } from 'node:http';
-import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, realpath, rm, writeFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -136,3 +136,31 @@ test('every module the page imports is actually served, so the UI cannot silentl
   } finally { await f.close(); }
 });
 
+
+
+test('Web chat accepts a folder path and completes reads for every nested file', { timeout: 15000 }, async () => {
+  const f = await fixture();
+  try {
+    const folder = join(f.home, 'authorized');
+    await mkdir(join(folder, 'src'), { recursive: true });
+    await writeFile(join(folder, 'README.md'), 'folder readme');
+    await writeFile(join(folder, 'src', 'app.ts'), 'nested authorized code');
+    const response = await fetch(`${f.base}/api/chat`, { method: 'POST', headers: f.headers,
+      body: JSON.stringify({ requestId: randomUUID(), text: '分析这个文件夹', files: [folder + '/'] }) });
+    assert.equal(response.status, 200);
+    let view: MainView | undefined;
+    for (let i = 0; i < 200; i++) {
+      view = await (await fetch(`${f.base}/api/view`, { headers: f.headers })).json() as MainView;
+      if (view.works[0]?.status === 'completed') break;
+      await delay(30);
+    }
+    assert.equal(view?.works[0]?.status, 'completed');
+    const work = await (await fetch(`${f.base}/api/work?taskId=${view!.works[0]!.id}`, { headers: f.headers })).json();
+    assert.deepEqual(work.files.map((file: { name: string }) => file.name), ['authorized/README.md', 'authorized/src/app.ts']);
+    assert.equal(work.operations.length, 2);
+    assert.ok(work.operations.every((operation: { status: string }) => operation.status === 'succeeded'));
+    const html = await (await fetch(f.base)).text();
+    assert.match(html, /文件或文件夹/);
+    assert.doesNotMatch(html, /不接受目录/);
+  } finally { await f.close(); }
+});

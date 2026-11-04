@@ -42,7 +42,7 @@
           <form id="composer" class="composer">
             <label for="draft">发送给 Super-agent</label>
             <textarea id="draft" rows="3" maxlength="16384" placeholder="直接说你的目标、补充要求，或问问之前那件事…" disabled></textarea>
-            <details id="paths-disclosure" class="paths-disclosure"><summary>附加本地文件路径（可选）</summary><label for="paths">本机绝对文件路径，每行一个</label><textarea id="paths" rows="3" spellcheck="false" placeholder="/Users/你的用户名/项目/README.md" disabled></textarea><p class="meta">仅限明确指定的普通文件，不接受目录。服务会建立本机只读副本；真实模式会将内容发送给已配置的模型供应商。最多 32 个文件，每个 256 KiB，合计 1 MiB。</p></details>
+            <details id="paths-disclosure" class="paths-disclosure"><summary>附加本地文件路径（可选）</summary><label for="paths">本机文件或文件夹绝对路径，每行一个</label><textarea id="paths" rows="3" spellcheck="false" placeholder="/Users/你的用户名/项目/README.md" disabled></textarea><p class="meta">文件夹授权包含全部子目录文件，不逐个确认、不自动排除隐藏文件；不接受符号链接或二进制文件。服务会建立只读副本；真实模式会将内容发送给模型供应商，请勿选择包含密钥的目录。展开后最多 32 个文件，每个 256 KiB，合计 1 MiB；超限报错，不截断。</p></details>
             <p id="send-error" class="error" role="alert"></p>
             <div class="composer-bottom"><span class="meta">Enter 发送 · Shift + Enter 换行</span><button id="send" class="primary" type="submit" disabled>发送 ↑</button></div>
           </form>

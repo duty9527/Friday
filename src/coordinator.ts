@@ -155,7 +155,7 @@ export class Coordinator {
   }
   chat(requestId: string, content: string, paths: string[] = []): ChatMessage {
     if (this.closing) throw new Error('Service is shutting down');
-    if (paths.length > 32 || paths.some(path => !isAbsolute(path))) throw new Error('Provide at most 32 explicit absolute file paths; do not use ~ or environment variables');
+    if (paths.length > 32 || paths.some(path => !isAbsolute(path))) throw new Error('Provide at most 32 explicit absolute paths (files or directories); do not use ~ or environment variables');
     const chat = this.store.conversation;
     const previous = chat.byRequest(requestId);
     if (previous) {

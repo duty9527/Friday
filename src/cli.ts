@@ -20,6 +20,8 @@ const help = `super-agent — read-only Router/Worker prototype (macOS/Linux)
 
 All commands accept --home DIR (default: ~/.super-agent).
 Real mode requires SUPER_AGENT_PROVIDER, SUPER_AGENT_MODEL, SUPER_AGENT_API_KEY.
+--file accepts a file or directory; directories are recursively snapshotted.
+Expanded inputs: at most 32 UTF-8 files, 256 KiB each, 1 MiB total; no links or binary files.
 Offline mode is explicit simulation, not a real model. No shell or file writes are exposed.
 The serve command stays in the foreground; use another terminal for web/client commands.
 Web binds only 127.0.0.1, connects to the same --home daemon, and prints a private entry link.
