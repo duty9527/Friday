@@ -659,9 +659,10 @@ function renderSteps(contents: DocumentFragment) {
  */
 async function fillProcessStart() {
   if (traceMode !== 'steps') return;
+  const generation = selectionGeneration;
   const starts = new Set(['Router 处理新输入', 'Router 派发任务', 'Worker 接收任务', '后台工作状态变化']);
   for (let page = 0; page < 4; page++) {
-    if (!traceHasEarlier || traceBusy) return;
+    if (generation !== selectionGeneration || !traceHasEarlier || traceBusy) return;
     const steps = timelineSteps(traceEvents);
     if (!steps.length || starts.has(steps[0]!.title)) return;
     await loadTrace('earlier');

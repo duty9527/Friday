@@ -111,13 +111,11 @@ export function timelineSteps(events: TraceEvent[]): TimelineStep[] {
       own.events.push(row); groups.set(own.id, own);
     }
   }
-  const mergedInto = new Set<string>();
   const hasRouteAction = new Set([...groups.values()]
     .filter(group => group.events.every(event => event.kind === 'route_action') && group.parent)
     .map(group => group.parent!));
   const steps: TimelineStep[] = [];
   for (const group of groups.values()) {
-    if (mergedInto.has(group.id)) continue;
     const ordered = group.events.slice().sort((a, b) => a.seq - b.seq);
     const latest = ordered.at(-1)!;
     if (ROUTER_TOOLS.has(latest.label) && hasRouteAction.has(group.id) && latest.kind !== 'route_action') continue;
