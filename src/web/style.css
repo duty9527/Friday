@@ -318,6 +318,62 @@ label {
   border-radius:8px;
   padding:14px 18px;
 }
+.routing-summary {
+  margin-top:12px;
+  padding:10px 12px;
+  background:var(--raised);
+  border-radius:6px;
+}
+.route-action + .route-action {
+  margin-top:12px;
+}
+.route-action strong {
+  font-size:13px;
+}
+.source-reference,.route-target {
+  display:block;
+  max-width:100%;
+  min-height:32px;
+  padding:4px 0;
+  border:0;
+  background:transparent;
+  text-align:left;
+  color:var(--accent);
+  font-size:12px;
+  overflow-wrap:anywhere;
+  white-space:pre-wrap;
+}
+.route-target {
+  font-size:13px;
+  font-weight:600;
+}
+.source-reference:hover:not(:disabled),.route-target:hover:not(:disabled) {
+  text-decoration:underline;
+}
+.message-highlight {
+  outline:2px solid var(--accent);
+  outline-offset:-2px;
+}
+.routing-detail {
+  margin-bottom:24px;
+  padding:12px;
+  background:var(--raised);
+  border-radius:6px;
+  overflow-wrap:anywhere;
+}
+.routing-detail h4 {
+  margin:16px 0 4px;
+  font-size:13px;
+}
+.routing-detail details {
+  margin-top:16px;
+}
+.routing-work {
+  padding:4px 0;
+}
+@media (max-width:640px) {
+  .source-reference,.route-target { min-height:44px; }
+}
 .message-path {
   display:block;
   width:fit-content;

@@ -1,4 +1,4 @@
-import type { ChatMessage, TraceEvent } from '../view.js';
+import type { ChatMessage, TraceEvent, RouteAction } from '../view.js';
 
 export const activeStatus = (value: string) => ['queued', 'processing', 'streaming', 'running', 'started', 'requested'].includes(value);
 export const settledStatus = (value: string) => ['completed', 'failed', 'interrupted', 'succeeded', 'paused', 'cancelled', 'stopped'].includes(value);
@@ -12,25 +12,20 @@ export function mergeMessages<T extends Pick<ChatMessage, 'id' | 'version'>>(map
   }
 }
 
-/**
- * Causal order, not insertion order: each reply stays with the message that asked for it, so a burst
- * of submissions cannot separate a reply from its user message.
- */
-export function orderConversation<T extends Pick<ChatMessage, 'id' | 'seq' | 'role' | 'replyTo'>>(items: Iterable<T>): T[] {
-  const all = [...items].sort((a, b) => a.seq - b.seq);
-  const users = all.filter(message => message.role === 'user');
-  const children = new Map<string, T[]>();
-  const orphans: T[] = [];
-  for (const message of all) {
-    if (message.role === 'user') continue;
-    const parent = message.replyTo;
-    if (parent && users.some(user => user.id === parent)) {
-      const list = children.get(parent) ?? [];
-      list.push(message);
-      children.set(parent, list);
-    } else orphans.push(message);
-  }
-  return [...users.flatMap(user => [user, ...(children.get(user.id) ?? [])]), ...orphans];
+/** New messages stay where they arrived; causal links are references, not sorting instructions. */
+export function orderConversation<T extends Pick<ChatMessage, 'seq'>>(items: Iterable<T>): T[] {
+  return [...items].sort((a, b) => a.seq - b.seq);
+}
+
+export function routeLabel(action: Pick<RouteAction, 'kind'>): string {
+  return { new_work: '新建工作', followup: '补充已有工作（未新建）', related_work: '关联新执行（新建工作）',
+    inspect: '查询工作', stop: '请求停止工作', recall: '回看历史', reply: '仅回复（未派发后台工作）' }[action.kind];
+}
+export function routeState(action: Pick<RouteAction, 'status' | 'kind' | 'delivery'>): string {
+  if (action.status !== 'accepted') return { pending: '正在处理，尚未受理', failed: '动作失败', interrupted: '进度未确认' }[action.status];
+  if (action.kind === 'followup') return { pending: '已受理，等待 Worker 处理', processing: 'Worker 正在处理补充',
+    done: 'Worker 已处理补充，结果另行交付', failed: '补充要求未确认处理' }[action.delivery ?? 'pending'] ?? '已受理，处理状态未记录';
+  return action.kind === 'reply' ? 'Router 已回复' : action.kind === 'inspect' || action.kind === 'recall' ? '查询已完成' : '已受理';
 }
 
 export interface SpanNode { id: string; parent?: string; events: TraceEvent[] }

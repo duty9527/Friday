@@ -75,12 +75,17 @@ try {
   await sleep(250);
   assert.equal(await count(), before, 'an IME composition Enter must not send');
   await pressEnter();
-  await until(() => page.eval("[...document.querySelectorAll('#messages .router-message')].some(x => x.innerText.includes('我们始终在同一个对话中'))"), 'ordinary reply');
+  await until(() => page.eval("[...document.querySelectorAll('#messages .router-message .message-text')].some(x => x.innerText.includes('我们始终在同一个对话中'))"), 'ordinary reply');
   checks.push('ordinary conversation without files, IME Enter suppressed');
+  await until(() => page.eval("document.querySelector('#messages .routing-summary')?.innerText.includes('仅回复')"), 'direct reply routing summary');
+  await page.eval(() => document.querySelector('#messages .user-message .message-actions button').click());
+  await until(() => page.eval("document.querySelector('#routing-detail')?.innerText.includes('当时没有后台工作')"), 'routing-time context');
+  assert.match(await page.eval("document.querySelector('#routing-detail').innerText"), /当时的近期对话引用/);
+  checks.push('direct-reply decision is explicit; per-message route context opens without inspecting raw JSON');
 
   await fill('<img src=x onerror="window.__xss=1">');
   await pressEnter();
-  await until(() => page.eval("[...document.querySelectorAll('#messages .router-message')].some(x => x.innerText.includes('onerror'))"), 'literal reply');
+  await until(() => page.eval("[...document.querySelectorAll('#messages .router-message .message-text')].some(x => x.innerText.includes('onerror'))"), 'literal reply');
   assert.equal(await page.eval('window.__xss'), undefined, 'model/user text is never executed');
   assert.equal(await page.eval("document.querySelectorAll('#messages img').length"), 0);
   checks.push('user and model text is rendered as text, never as HTML');
@@ -93,7 +98,8 @@ try {
     await page.eval(() => document.querySelector('.work-row').click());
     await until(() => page.eval("document.querySelector('#trace-content').innerText.includes('读取文件副本')"), 'operation node');
     assert.match(await page.eval("document.querySelector('#trace-content').innerText"), /worker/);
-    checks.push('explicit absolute path analysis, causal nodes, no task-ID entry');
+    assert.match(await page.eval("document.querySelector('#messages').innerText"), /新建工作/);
+    checks.push('explicit absolute path analysis, persisted new-work routing summary, causal nodes, no task-ID entry');
   } else checks.push('skipped path analysis (no --sample given)');
 
   await page.eval(() => document.querySelector('#trace-content .node-button')?.click());
@@ -127,6 +133,13 @@ try {
   }
   assert.equal(await page.eval("[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('连续消息')).length"), beforeReload);
   checks.push('refresh keeps the same main history and load-older restores it');
+  await until(() => page.eval("[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('连续消息')).every(x => x.querySelector('.speaker').innerText.includes('Router 已处理'))"), 'burst replies settled');
+  const order = await page.eval(() => [...document.querySelectorAll('#messages article')].map(item => Number(item.dataset.seq)));
+  assert.ok(order.every((seq, index) => index === 0 || order[index - 1] < seq), 'persisted insertion order survives hydration, refresh and paging');
+  assert.equal(await page.eval("document.querySelectorAll('#messages .router-message .source-reference').length > 0"), true, 'replies carry clickable source references');
+  await page.eval(() => [...document.querySelectorAll('#messages .user-message .message-actions button')].at(-1).click());
+  assert.match(await page.eval("document.querySelector('#routing-detail').innerText"), /本次 Router 分配/);
+  checks.push('all message blocks remain in durable sequence order after reload; source references and routing context survive');
 
   for (const [width, height, name] of [[768, 1024, 'tablet'], [390, 844, 'mobile']]) {
     await page.setViewport({ width, height, mobile: width < 600 });

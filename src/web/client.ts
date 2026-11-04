@@ -1,5 +1,5 @@
-import type { ChatMessage, MainView, MessagePage, TraceEvent, WorkView } from '../view.js';
-import { mergeMessages as mergeInto, orderConversation, spanDuration, spanNodes as buildSpans, spanTree, usageSummary, type SpanNode } from './model.js';
+import type { ChatMessage, MainView, MessagePage, TraceEvent, WorkView, RouteAction } from '../view.js';
+import { mergeMessages as mergeInto, orderConversation, routeLabel, routeState, spanDuration, spanNodes as buildSpans, spanTree, usageSummary, type SpanNode } from './model.js';
 
 function element<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -30,14 +30,14 @@ const ui = {
   traceScope: element('trace-scope'), traceContent: element('trace-content'), traceMore: element<HTMLButtonElement>('trace-more'),
   traceError: element('trace-error'), traceRetry: element<HTMLButtonElement>('trace-retry'),
   graphMode: element<HTMLButtonElement>('graph-mode'), timelineMode: element<HTMLButtonElement>('timeline-mode'),
-  eventDetail: element('event-detail'), workDetail: element('work-detail'),
+  eventDetail: element('event-detail'), workDetail: element('work-detail'), routingDetail: element('routing-detail'),
 };
 const statusNames: Record<string, string> = {
   queued: '排队中', processing: '处理中', streaming: '回复中', completed: '已完成', interrupted: '已中断',
   failed: '失败', running: '运行中', started: '已开始', requested: '已请求', succeeded: '成功',
   paused: '已暂停', cancelled: '已取消', stopped: '已停止', stopping: '正在请求停止',
   stop_requested: '已请求停止', cancel_requested: '已请求取消', unknown: '结果未知',
-  linked: '已关联', ready: '就绪', degraded: '服务降级',
+  linked: '已关联', ready: '就绪', degraded: '服务降级', pending: '处理中', accepted: '已受理',
 };
 const statusText = (value: string) => statusNames[value] ?? value;
 import { activeStatus as active, settledStatus as terminal } from './model.js';
@@ -170,6 +170,7 @@ function renderMessages() {
     const systemNotice = message.source === 'system';
     const article = node('article', '', `message ${message.role === 'user' ? 'user-message' : 'router-message'}`);
     article.dataset.messageId = message.id;
+    article.dataset.seq = String(message.seq);
     if (message.replyTo) article.dataset.replyTo = message.replyTo;
     const speaker = node('div', '', 'speaker');
     speaker.append(node('span', message.role === 'user' ? '你' : systemNotice ? '系统 · 工作状态（非模型回复）' : 'Super-agent · Router'));
@@ -181,7 +182,19 @@ function renderMessages() {
     const full = message.text || (active(message.status) ? '等待公开回复…' : '没有公开文本。');
     const visible = full.slice(0, 4000);
     const textBlock = node('div', visible, 'message-text');
-    article.append(speaker, textBlock);
+    article.append(speaker);
+    if (message.replyTo) {
+      const source = messages.get(message.replyTo);
+      article.append(button(`回应：${source?.text.slice(0, 80) ?? '查看原消息'}`, () => { void jumpMessage(message.replyTo!); }, 'source-reference'));
+    }
+    article.append(textBlock);
+    if (message.role === 'user') article.append(routingSummary(message));
+    for (const id of message.role === 'assistant' || !message.routing ? message.taskIds : []) {
+      const work = view?.works.find(item => item.id === id);
+      article.append(button(`关联工作：${work?.prompt ?? '查看工作'}`, () => {
+        selectTrace({ type: 'task', id, label: work?.prompt ?? '关联工作' }); showPanel(true);
+      }, 'source-reference'));
+    }
     if (full.length > visible.length) {
       const more = node('details');
       more.append(node('summary', `展开剩余 ${full.length - visible.length} 个字符`), node('pre', full.slice(visible.length)));
@@ -190,7 +203,7 @@ function renderMessages() {
     for (const path of message.paths) article.append(node('span', path, 'message-path'));
     if (message.reason) article.append(node('p', message.reason, 'message-reason'));
     const actions = node('div', '', 'message-actions');
-    const trace = button('查看本轮轨迹', () => {
+    const trace = button(message.role === 'user' ? '查看本次路由与上下文' : '查看来源轨迹', () => {
       selectTrace({ type: 'message', id: message.replyTo ?? message.id, label: '本轮消息' });
       showPanel(true);
     });
@@ -218,6 +231,73 @@ function renderMessages() {
     replacement?.focus({ preventScroll: true });
   }
   ui.scroll.scrollTop = nearBottom ? ui.scroll.scrollHeight : previousTop;
+  renderRoutingDetail();
+}
+async function jumpMessage(id: string) {
+  try {
+    if (!messages.has(id)) { mergeMessages([await api<ChatMessage>(`/api/message?${new URLSearchParams({ messageId: id })}`)]); renderMessages(); }
+    showPanel(false);
+    const target = [...ui.messages.querySelectorAll<HTMLElement>('[data-message-id]')].find(item => item.dataset.messageId === id);
+    if (target) {
+      ui.scroll.scrollTop += target.getBoundingClientRect().top - ui.scroll.getBoundingClientRect().top - 16;
+      target.classList.add('message-highlight'); setTimeout(() => target.classList.remove('message-highlight'), 2000);
+    }
+  } catch (error) { connection(`来源消息读取失败：${errorText(error)}`, true); }
+}
+function actionRow(action: RouteAction): HTMLElement {
+  const row = node('div', '', 'route-action');
+  const title = `${routeLabel(action)}${action.taskLabel ? ` · ${action.taskLabel}` : ''}`;
+  if (action.taskId) row.append(button(title, () => {
+    selectTrace({ type: 'task', id: action.taskId!, label: action.taskLabel ?? '目标工作' }); showPanel(true);
+  }, 'route-target'));
+  else row.append(node('strong', title));
+  row.append(node('p', routeState(action), action.status === 'failed' || action.status === 'interrupted' || action.delivery === 'failed' ? 'error' : 'meta'));
+  if (action.parentTaskId) row.append(button('来源工作：查看原执行（本次是新执行）', () => {
+    selectTrace({ type: 'task', id: action.parentTaskId!, label: '来源工作' }); showPanel(true);
+  }, 'source-reference'));
+  if (action.messageIds?.length) row.append(node('p', `已读取 ${action.messageIds.length} 条历史消息引用`, 'meta'));
+  if (action.summary) row.append(node('p', `Router 公开说明：${action.summary}`, 'meta'));
+  if (action.error) row.append(node('p', action.error, 'error'));
+  return row;
+}
+function routingSummary(message: ChatMessage): HTMLElement {
+  const area = node('div', '', 'routing-summary');
+  if (!message.routing) {
+    area.append(node('p', active(message.status) ? '等待 Router 处理并记录分配结果…' : '此历史消息未采集路由摘要；不从回复正文猜测。', 'meta'));
+    return area;
+  }
+  for (const action of message.routing.actions) area.append(actionRow(action));
+  if (!message.routing.actions.length) area.append(node('p', message.routing.status === 'processing' ? 'Router 正在处理，尚无已受理动作。' : '本次路由未确认完成，没有可确认的分配动作。', 'meta'));
+  if (message.routing.omittedActions) area.append(node('p', `另有 ${message.routing.omittedActions} 条较早动作，请在事件时间线查看。`, 'meta'));
+  if (message.routing.status === 'failed' || message.routing.status === 'interrupted') area.append(node('p', 'Router 处理未完成；已受理的动作保留，不代表已撤销。', 'meta'));
+  return area;
+}
+function renderRoutingDetail() {
+  ui.routingDetail.hidden = selection.type !== 'message';
+  if (selection.type !== 'message') return;
+  const message = messages.get(selection.id);
+  const referencesOpen = ui.routingDetail.querySelector('details')?.open ?? false;
+  ui.routingDetail.replaceChildren(node('h3', '本次 Router 分配'));
+  if (!message?.routing) {
+    ui.routingDetail.append(node('p', '此消息尚无已记录的路由上下文。旧历史不会补造。', 'meta')); return;
+  }
+  const routing = message.routing;
+  ui.routingDetail.append(node('p', `路由处理时：${timestamp(routing.at)} · ${statusText(routing.status)}`, 'meta'));
+  ui.routingDetail.append(node('h4', '当时可见的工作'));
+  for (const work of routing.context.works) {
+    const row = node('div', '', 'routing-work');
+    row.append(button(work.prompt || '后台工作', () => { selectTrace({ type: 'task', id: work.id, label: work.prompt }); showPanel(true); }, 'source-reference'),
+      node('span', `当时${statusText(work.status)}`, 'meta'));
+    ui.routingDetail.append(row);
+  }
+  if (!routing.context.works.length) ui.routingDetail.append(node('p', '当时没有后台工作。', 'meta'));
+  if (routing.context.truncated) ui.routingDetail.append(node('p', `当时共 ${routing.context.totalWorks} 项工作，Router 仅收到最近 ${routing.context.works.length} 项摘要。`, 'meta'));
+  ui.routingDetail.append(node('p', '以上是处理当时的状态，不随当前工作状态改写。', 'meta'), node('h4', '已记录动作'));
+  for (const action of routing.actions) ui.routingDetail.append(actionRow(action));
+  if (!routing.actions.length) ui.routingDetail.append(node('p', '尚无已确认的路由动作。', 'meta'));
+  const refs = node('details'); refs.open = referencesOpen; refs.append(node('summary', '当时的近期对话引用'));
+  for (const reference of routing.context.messages) refs.append(button(`${reference.role === 'user' ? '你' : 'Router'}：${reference.preview || '无公开文本'}`, () => { void jumpMessage(reference.id); }, 'source-reference'));
+  ui.routingDetail.append(refs, node('p', `执行环境：${routing.context.execution} · ${routing.context.cwd}`, 'meta'));
 }
 function renderWorks() {
   const filter = ui.workFilter.value;
@@ -409,6 +489,7 @@ function selectTrace(next: Selection) {
   ui.eventDetail.replaceChildren(node('h3', '节点详情'), node('p', '选择节点查看公开数据与记录时间。', 'meta'));
   renderWorks();
   renderWorkDetail();
+  renderRoutingDetail();
   void loadTrace();
   if (next.type === 'task') void loadWork(next.id, selectionGeneration);
 }

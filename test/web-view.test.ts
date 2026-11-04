@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mergeMessages, orderConversation, spanDuration, spanNodes, spanTree, usageSummary } from '../src/web/model.js';
+import { mergeMessages, orderConversation, routeLabel, routeState, spanDuration, spanNodes, spanTree, usageSummary } from '../src/web/model.js';
 import type { ChatMessage, TraceEvent } from '../src/view.js';
 
 const message = (id: string, seq: number, role: 'user' | 'assistant', replyTo?: string, version = seq): ChatMessage =>
@@ -10,17 +10,30 @@ const event = (seq: number, overrides: Partial<TraceEvent>): TraceEvent => ({
   at: 1_000 + seq, rootId: 'root', ...overrides,
 });
 
-test('replies stay attached to their own user message even when a burst arrives out of insertion order', () => {
+test('late replies and notices stay in insertion order; replyTo never moves them back into old conversation', () => {
   // A burst of submissions lands all user rows first, then replies as they are processed.
   const items = [
     message('u1', 1, 'user'), message('u2', 2, 'user'), message('u3', 3, 'user'),
     message('r2', 4, 'assistant', 'u2'), message('r3', 5, 'assistant', 'u3'), message('r1', 6, 'assistant', 'u1'),
   ];
-  assert.deepEqual(orderConversation(items).map(item => item.id), ['u1', 'r1', 'u2', 'r2', 'u3', 'r3']);
+  assert.deepEqual(orderConversation(items).map(item => item.id), ['u1', 'u2', 'u3', 'r2', 'r3', 'r1']);
   const notice = { ...message('n1', 7, 'assistant', 'u1'), source: 'system' as const };
+  assert.deepEqual(orderConversation([...items, notice]).map(item => item.id), ['u1', 'u2', 'u3', 'r2', 'r3', 'r1', 'n1']);
+  assert.deepEqual(orderConversation([...items].reverse()).map(item => item.id), ['u1', 'u2', 'u3', 'r2', 'r3', 'r1'], 'hydration and paging use durable order, not network response order');
   assert.deepEqual(orderConversation([...items, notice]).filter(item => item.id === 'u1' || item.replyTo === 'u1').map(item => item.id), ['u1', 'r1', 'n1'],
     'children of one message keep their recorded order');
   assert.deepEqual(orderConversation([message('orphan', 9, 'assistant', 'missing')]).map(item => item.id), ['orphan']);
+});
+
+test('routing labels distinguish acceptance, delivery and uncertainty without deriving actions from prose', () => {
+  assert.match(routeLabel({ kind: 'followup' }), /未新建/);
+  assert.match(routeLabel({ kind: 'related_work' }), /新建工作/);
+  assert.match(routeLabel({ kind: 'reply' }), /未派发/);
+  assert.match(routeState({ kind: 'followup', status: 'accepted', delivery: 'pending' }), /等待 Worker/);
+  assert.match(routeState({ kind: 'followup', status: 'accepted', delivery: 'done' }), /结果另行交付/);
+  assert.match(routeState({ kind: 'followup', status: 'accepted', delivery: 'failed' }), /未确认/);
+  assert.equal(routeState({ kind: 'stop', status: 'accepted' }), '已受理', 'a stop request is not a confirmed stop');
+  assert.match(routeState({ kind: 'new_work', status: 'failed' }), /失败/);
 });
 
 test('message merge never regresses to an older journal version', () => {
