@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, execFile, type ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtemp, realpath, writeFile, rm, stat, utimes, readdir } from 'node:fs/promises';
+import { mkdtemp, realpath, writeFile, rm, stat, utimes, readdir, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -161,4 +161,19 @@ test('real service startup fails without explicit credentials rather than simula
     delete env.SUPER_AGENT_PROVIDER; delete env.SUPER_AGENT_MODEL; delete env.SUPER_AGENT_API_KEY;
     await assert.rejects(exec(process.execPath, [cli, 'serve', '--home', f.home], { env }), /requires SUPER_AGENT_PROVIDER/);
   } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+
+test('CLI --file accepts a directory and returns nested immutable file records', { timeout: 15000 }, async () => {
+  const f = await fixture(); let child: ChildProcess | undefined;
+  try {
+    const folder = join(f.root, 'project');
+    await mkdir(join(folder, 'nested'), { recursive: true });
+    await writeFile(join(folder, 'nested', 'note.txt'), 'authorized directory content');
+    child = await start(f.home, 20);
+    const { stdout } = await exec(process.execPath, [cli, 'submit', '--home', f.home, '--file', folder + '/', 'analyze folder']);
+    const task = JSON.parse(stdout) as Task;
+    assert.deepEqual(task.files.map(file => file.name), ['project/nested/note.txt']);
+    await poll(f.home, task.id, task => task.status === 'completed');
+  } finally { if (child) await stop(f.home, child); await rm(f.root, { recursive: true, force: true }); }
 });
