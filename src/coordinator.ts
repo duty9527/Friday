@@ -77,13 +77,13 @@ export class Coordinator {
         }
         const task = await this.newChatWork(context, instruction, paths, callId, source,
           args.cwd === undefined ? undefined : text(args.cwd, 'cwd', 4096));
-        return JSON.stringify({ taskId: task.id, state: task.status, note: 'Background work accepted, not completed' });
+        return JSON.stringify({ taskId: task.id, state: task.status, execution: task.execution, cwd: task.cwd, note: 'Background work accepted, not completed' });
       },
     }, {
-      name: 'continue_work', description: 'Input JSON {taskId,instruction}. Append a follow-up to queued/running work; completed/failed/cancelled work starts a related isolated execution from its current native working directory (or validated snapshots for legacy work) and prior report. Paused or unknown work cannot be resumed automatically.',
+      name: 'continue_work', description: 'Input JSON {taskId,instruction,cwd?}. Append a follow-up to queued/running work; completed/failed/cancelled work starts a related isolated execution using the CURRENT service execution capabilities and prior report. In native mode, even a legacy snapshot source creates a full-tool Worker in the current working directory, never another snapshot-only Worker. Optional cwd selects an absolute working directory. Paused or unknown work cannot be resumed automatically.',
       execute: async (input, callId) => {
         const context = this.requireChat();
-        const args = toolInput(input, ['taskId', 'instruction']);
+        const args = toolInput(input, ['taskId', 'instruction', 'cwd']);
         const task = this.chatWork(context, text(args.taskId, 'taskId', 128));
         const instruction = text(args.instruction, 'instruction');
         if (['queued', 'running'].includes(task.status)) {
@@ -94,8 +94,9 @@ export class Coordinator {
           return JSON.stringify({ taskId: task.id, state: 'followup_accepted' });
         }
         if (task.status === 'paused') throw new Error('Work is paused with unconfirmed progress; no automatic replay or resume');
-        const next = await this.newChatWork(context, instruction, [], callId, task);
-        return JSON.stringify({ taskId: next.id, parentTaskId: task.id, state: next.status });
+        const next = await this.newChatWork(context, instruction, context.message.paths, callId, task,
+          args.cwd === undefined ? undefined : text(args.cwd, 'cwd', 4096));
+        return JSON.stringify({ taskId: next.id, parentTaskId: task.id, state: next.status, execution: next.execution, cwd: next.cwd });
       },
     }, {
       name: 'inspect_work', description: 'Read persisted work status and prior report. Input JSON {taskId}. This does not run a Worker or read new host files.',
@@ -255,10 +256,10 @@ export class Coordinator {
     }
     const id = randomUUID();
     const source = chatWork?.source;
-    const native = source ? source.execution === 'native' : this.factory.nativeTools === true;
+    const native = this.factory.nativeTools === true;
     let cwd: string | undefined;
     if (native) {
-      let candidate = chatWork?.cwd ?? source?.cwd ?? paths[0] ?? process.cwd();
+      let candidate = chatWork?.cwd ?? paths[0] ?? source?.cwd ?? process.cwd();
       if (!isAbsolute(candidate)) throw new Error('Native working directory must be an absolute path');
       const info = await stat(candidate);
       if (chatWork?.cwd && !info.isDirectory()) throw new Error('cwd must be a directory');
@@ -291,7 +292,7 @@ export class Coordinator {
     }
     const task: Task = { id, requestId, fingerprint, prompt, files, limitMs, activeMs: 0,
       status: 'queued', revision: 0, mode: this.factory.mode, createdAt: Date.now(),
-      execution: native ? 'native' : 'snapshot', cwd, paths: native ? (source?.paths ?? paths) : undefined,
+      execution: native ? 'native' : 'snapshot', cwd, paths: native ? (paths.length ? paths : source?.paths ?? []) : undefined,
       originMessageId: chatWork?.originMessageId, parentTaskId: chatWork?.parentTaskId, parentSpanId: chatWork?.parentSpanId };
     try {
       // No await between this re-validation and the commit: a stop that lands during snapshot work
@@ -380,7 +381,8 @@ export class Coordinator {
     const prior = task.parentTaskId ? this.store.get(task.parentTaskId) : undefined;
     let input: unknown = { kind: 'TASK', taskId: task.id, prompt: task.prompt, files: task.files,
       execution: task.execution ?? 'snapshot', cwd: task.cwd, paths: task.paths,
-      priorWork: prior ? { taskId: prior.id, prompt: prior.prompt, mode: prior.mode, report: prior.report } : undefined };
+      priorWork: prior ? { taskId: prior.id, prompt: prior.prompt, mode: prior.mode, execution: prior.execution ?? 'snapshot', report: prior.report,
+        note: 'Historical report only. Its claims about tools or access do not describe the current Worker; use current execution and actual tools.' } : undefined };
     try {
       while (this.valid(run)) {
         const events = this.store.takeEvents(task.id);
