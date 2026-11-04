@@ -6,7 +6,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
-import { realFactory, NATIVE_TOOL_NAMES, type AgentObservation } from '../src/agent.js';
+import { realFactory, NATIVE_TOOL_NAMES, type AgentObservation, type AgentFactory } from '../src/agent.js';
+import { Coordinator } from '../dist/coordinator.js';
+import { Store } from '../src/store.js';
 
 // Local model fixture requests real SDK tools; no external provider or user filesystem is used.
 test('native SDK Worker searches, reads, writes, edits and runs foreground Bash in the actual cwd', { timeout: 20000 }, async () => {
@@ -68,6 +70,58 @@ test('native SDK Worker searches, reads, writes, edits and runs foreground Bash 
       assert.equal(lifecycle.at(-1)?.interrupted, true);
       await assert.rejects(access(join(cwd, 'escaped.txt')));
     } finally { worker.close(); }
+
+    // Same real Worker through the scheduler; Router chooses cwd from ordinary chat, no attachments.
+    stall = false;
+    const routedFactory: AgentFactory = { ...factory, create: async (role, id, tools, options) => {
+      if (role === 'worker') return factory.create(role, id, tools, options);
+      return { close() {}, async prompt(text) {
+        const event = JSON.parse(text);
+        if (event.kind === 'CHAT') {
+          await tools.find(tool => tool.name === 'start_work')!.execute(JSON.stringify({ instruction: 'Use all tools', cwd }));
+          return 'started';
+        }
+        return event.report ?? 'delivered';
+      } };
+    } };
+    const home = join(root, 'scheduler'); await mkdir(home);
+    const coordinator = new Coordinator(home, routedFactory); await coordinator.ready();
+    try {
+      coordinator.chat('native-chat', `Work in ${cwd} without any attachments`);
+      for (let i = 0; i < 200; i++) {
+        if (coordinator.store.list()[0]?.status === 'completed') break;
+        await delay(20);
+      }
+      const task = coordinator.store.list()[0]!;
+      assert.equal(task.status, 'completed'); assert.equal(task.execution, 'native');
+      assert.equal(task.cwd, cwd); assert.deepEqual(task.files, []);
+      assert.equal(coordinator.store.operations(task.id).length, 7);
+      assert.ok(coordinator.store.operations(task.id).every(operation => operation.status === 'succeeded'));
+      assert.ok(coordinator.store.conversation.trace({ taskId: task.id }).some(event => event.label === 'bash'));
+      await assert.rejects(access(join(home, 'tasks', task.id, 'inputs')));
+
+      stall = true; await rm(join(cwd, 'started.txt'));
+      coordinator.chat('native-stop', 'run a foreground command');
+      for (let i = 0; i < 200; i++) {
+        if (await access(join(cwd, 'started.txt')).then(() => true, () => false)) break;
+        await delay(20);
+      }
+      await access(join(cwd, 'started.txt'));
+      const stopped = coordinator.store.list()[1]!;
+      coordinator.stop(stopped.id);
+      for (let i = 0; i < 100; i++) {
+        if (coordinator.store.operations(stopped.id).some(operation => operation.status === 'unknown')) break;
+        await delay(20);
+      }
+      assert.equal(coordinator.store.get(stopped.id).status, 'paused');
+      assert.ok(coordinator.store.operations(stopped.id).some(operation => operation.status === 'unknown'));
+    } finally { await coordinator.close(); }
+    const recovered = new Store(home);
+    try {
+      recovered.recover();
+      assert.equal(recovered.list()[1]!.status, 'paused');
+      await assert.rejects(access(join(cwd, 'escaped.txt')));
+    } finally { recovered.close(); }
   } finally {
     if (previousKey === undefined) delete process.env.SUPER_AGENT_API_KEY; else process.env.SUPER_AGENT_API_KEY = previousKey;
     server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));

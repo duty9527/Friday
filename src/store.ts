@@ -10,6 +10,7 @@ export interface Task {
   mode: 'real' | 'offline'; createdAt: number; limitMs: number; activeMs: number;
   report?: string; reason?: string; sessionFile?: string;
   originMessageId?: string; parentTaskId?: string; parentSpanId?: string;
+  execution?: 'native' | 'snapshot'; cwd?: string; paths?: string[];
 }
 export interface TaskEvent { id: string; taskId: string; text: string; state: string }
 export interface Operation {
@@ -162,17 +163,17 @@ export class Store {
         this.notice(String(row.task_id), 'followup_failed', '服务重启时该补充要求仍在处理中，无法证明已送达；不会自动重发。');
       }
       for (const task of this.list()) {
+        for (const op of this.operations(task.id)) {
+          if (['requested', 'started', 'cancel_requested'].includes(op.status)) {
+            op.status = 'unknown'; this.operation(op);
+          }
+        }
         if (task.status !== 'running' && task.status !== 'queued') continue;
         task.revision++;
         task.status = 'paused';
         task.reason = '服务已重启：先前模型/交付进度与已用时间无法证明，不会自动重放。';
         this.save(task);
         this.notice(task.id, 'paused', task.reason);
-        for (const op of this.operations(task.id)) {
-          if (['requested', 'started', 'cancel_requested'].includes(op.status)) {
-            op.status = 'unknown'; this.operation(op);
-          }
-        }
       }
       this.conversation.recover();
     });

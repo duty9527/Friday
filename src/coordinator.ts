@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { rm } from 'node:fs/promises';
-import { isAbsolute, join } from 'node:path';
+import { rm, stat, realpath } from 'node:fs/promises';
+import { isAbsolute, join, dirname } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import type { AgentFactory, AgentPort } from './agent.js';
-import { readSnapshot, snapshot } from './files.js';
+import { readSnapshot, snapshot, type InputFile } from './files.js';
 import { PromptTrace } from './trace.js';
 import { integer, text } from './protocol.js';
 import type { ChatMessage, MainView } from './view.js';
@@ -22,7 +22,7 @@ interface Run {
 }
 interface ChatRun { message: ChatMessage; controller: AbortController; revisions: Map<string, number>; replyId?: string;
   clock?: { lastTick: number; lastWall: number; activeMs: number } }
-interface ChatWork { originMessageId: string; parentTaskId?: string; parentSpanId?: string; source?: Task; signal: AbortSignal }
+interface ChatWork { originMessageId: string; parentTaskId?: string; parentSpanId?: string; source?: Task; signal: AbortSignal; cwd?: string }
 class SourceChangedError extends Error {}
 function toolInput(input: string, keys: string[]): Record<string, unknown> {
   const value: unknown = JSON.parse(text(input, 'tool input', 65_536));
@@ -60,10 +60,10 @@ export class Coordinator {
         return this.dispatch();
       },
     }, {
-      name: 'start_work', description: 'Start an isolated background task; returns immediately. Input JSON: {instruction, sourceMessageId? , sourceTaskId?}. File authorization comes ONLY from an existing user message with explicit paths or a settled work snapshot, never an invented path. Omitting both sources uses current message attachments, or text-only work if there are none. Do not use both sources.',
+      name: 'start_work', description: 'Start an isolated background task; returns immediately. Input JSON: {instruction, cwd?, sourceMessageId?, sourceTaskId?}. For native work cwd is an optional absolute existing working directory; paths named in conversation are enough, attachments are NOT required. Omit cwd to reuse the source work directory, first hint path directory, or service cwd. Native Workers have full local tools, not a sandbox. Snapshot/offline work still uses explicitly supplied source files. Do not use both sources.',
       execute: async (input, callId) => {
         const context = this.requireChat();
-        const args = toolInput(input, ['instruction', 'sourceMessageId', 'sourceTaskId']);
+        const args = toolInput(input, ['instruction', 'cwd', 'sourceMessageId', 'sourceTaskId']);
         const instruction = text(args.instruction, 'instruction');
         if (args.sourceMessageId && args.sourceTaskId) throw new Error('Use one authorized source');
         const source = args.sourceTaskId ? this.chatWork(context, text(args.sourceTaskId, 'sourceTaskId', 128)) : undefined;
@@ -75,11 +75,12 @@ export class Coordinator {
           if (message.role !== 'user') throw new Error('Only user messages authorize file paths');
           paths = message.paths;
         }
-        const task = await this.newChatWork(context, instruction, paths, callId, source);
+        const task = await this.newChatWork(context, instruction, paths, callId, source,
+          args.cwd === undefined ? undefined : text(args.cwd, 'cwd', 4096));
         return JSON.stringify({ taskId: task.id, state: task.status, note: 'Background work accepted, not completed' });
       },
     }, {
-      name: 'continue_work', description: 'Input JSON {taskId,instruction}. Append a follow-up to queued/running work; completed/failed/cancelled work starts a related isolated execution from its validated snapshots and prior report. Paused or unknown work cannot be resumed automatically.',
+      name: 'continue_work', description: 'Input JSON {taskId,instruction}. Append a follow-up to queued/running work; completed/failed/cancelled work starts a related isolated execution from its current native working directory (or validated snapshots for legacy work) and prior report. Paused or unknown work cannot be resumed automatically.',
       execute: async (input, callId) => {
         const context = this.requireChat();
         const args = toolInput(input, ['taskId', 'instruction']);
@@ -104,6 +105,7 @@ export class Coordinator {
         const task = this.store.get(text(args.taskId, 'taskId', 128));
         this.store.conversation.link(context.message.id, task.id);
         return JSON.stringify({ id: task.id, prompt: task.prompt, status: task.status, mode: task.mode, reason: task.reason, report: task.report,
+          execution: task.execution ?? 'snapshot', cwd: task.cwd, paths: task.paths,
           files: task.files, followups: this.store.events(task.id).map(({ id, text, state }) => ({ id, text, state })) });
       },
     }, {
@@ -141,9 +143,9 @@ export class Coordinator {
   private toolRequest(messageId: string, callId: string | undefined, kind: string) {
     return createHash('sha256').update(JSON.stringify([messageId, callId ?? randomUUID(), kind])).digest('hex');
   }
-  private async newChatWork(context: ChatRun, instruction: string, paths: string[], callId?: string, source?: Task) {
+  private async newChatWork(context: ChatRun, instruction: string, paths: string[], callId?: string, source?: Task, cwd?: string) {
     const task = await this.submit(this.toolRequest(context.message.id, callId, 'work'), instruction, paths, 600_000,
-      { originMessageId: context.message.id, parentTaskId: source?.id, parentSpanId: this.routerTrace?.toolSpan(callId), source, signal: context.controller.signal });
+      { originMessageId: context.message.id, parentTaskId: source?.id, parentSpanId: this.routerTrace?.toolSpan(callId), source, cwd, signal: context.controller.signal });
     context.revisions.set(task.id, task.revision);
     return task;
   }
@@ -177,7 +179,8 @@ export class Coordinator {
       context.clock = { lastTick: performance.now(), lastWall: Date.now(), activeMs: 0 };
       try {
         const result = await trace.run(this.router!, JSON.stringify({ kind: 'CHAT', message, context: chat.recentContext(),
-          works: this.store.list().slice(-40).map(({ id, prompt, status, revision, mode, reason, report, files, originMessageId }) => ({ id, prompt: prompt.slice(0, 512), status, revision, mode, reason, reportPreview: report?.slice(0, 1024), fileCount: files.length, originMessageId })) }), context.controller.signal);
+          execution: this.factory.nativeTools ? 'native' : 'snapshot', cwd: process.cwd(),
+          works: this.store.list().slice(-40).map(({ id, prompt, status, revision, mode, reason, report, files, originMessageId, execution, cwd }) => ({ execution: execution ?? 'snapshot', cwd, id, prompt: prompt.slice(0, 512), status, revision, mode, reason, reportPreview: report?.slice(0, 1024), fileCount: files.length, originMessageId })) }), context.controller.signal);
         this.accrueChat(context);
         if (context.controller.signal.aborted) throw context.controller.signal.reason;
         this.store.transaction(() => {
@@ -244,7 +247,7 @@ export class Coordinator {
   }
   private async submitTask(requestId: string, prompt: string, paths: string[], limitMs: number, chatWork?: ChatWork): Promise<Task> {
     if (this.closing) throw new Error('Service is shutting down');
-    const fingerprint = createHash('sha256').update(JSON.stringify({ prompt, paths, limitMs, sourceTaskId: chatWork?.source?.id })).digest('hex');
+    const fingerprint = createHash('sha256').update(JSON.stringify({ prompt, paths, limitMs, sourceTaskId: chatWork?.source?.id, cwd: chatWork?.cwd })).digest('hex');
     const previous = this.store.byRequest(requestId);
     if (previous) {
       if (previous.fingerprint !== fingerprint) throw new Error('Request ID already used with different task parameters');
@@ -252,10 +255,21 @@ export class Coordinator {
     }
     const id = randomUUID();
     const source = chatWork?.source;
-    if (source) for (const file of source.files) await readSnapshot(this.home, source.id, file);
+    const native = source ? source.execution === 'native' : this.factory.nativeTools === true;
+    let cwd: string | undefined;
+    if (native) {
+      let candidate = chatWork?.cwd ?? source?.cwd ?? paths[0] ?? process.cwd();
+      if (!isAbsolute(candidate)) throw new Error('Native working directory must be an absolute path');
+      const info = await stat(candidate);
+      if (chatWork?.cwd && !info.isDirectory()) throw new Error('cwd must be a directory');
+      if (info.isFile()) candidate = dirname(candidate);
+      else if (!info.isDirectory()) throw new Error('Native path hint must be a file or directory');
+      cwd = await realpath(candidate);
+    }
+    if (source && !native) for (const file of source.files) await readSnapshot(this.home, source.id, file);
     const authorizedPaths = source ? source.files.map(file => join(this.home, 'tasks', source.id, 'inputs', file.id)) : paths;
-    let files = chatWork && !authorizedPaths.length ? [] : await snapshot(this.home, id, authorizedPaths);
-    if (source) {
+    let files: InputFile[] = native || (chatWork && !authorizedPaths.length) ? [] : await snapshot(this.home, id, authorizedPaths);
+    if (source && !native) {
       if (files.some((file, index) => file.sha256 !== source.files[index]!.sha256)) {
         await rm(join(this.home, 'tasks', id), { recursive: true, force: true });
         throw new Error('Source snapshot changed during continuation');
@@ -277,6 +291,7 @@ export class Coordinator {
     }
     const task: Task = { id, requestId, fingerprint, prompt, files, limitMs, activeMs: 0,
       status: 'queued', revision: 0, mode: this.factory.mode, createdAt: Date.now(),
+      execution: native ? 'native' : 'snapshot', cwd, paths: native ? (source?.paths ?? paths) : undefined,
       originMessageId: chatWork?.originMessageId, parentTaskId: chatWork?.parentTaskId, parentSpanId: chatWork?.parentSpanId };
     try {
       // No await between this re-validation and the commit: a stop that lands during snapshot work
@@ -323,7 +338,7 @@ export class Coordinator {
   }
   private async work(run: Run) {
     const task = this.store.get(run.id);
-    const worker = await this.factory.create('worker', run.id, [{
+    const worker = await this.factory.create('worker', run.id, task.execution === 'native' ? [] : [{
       name: 'start_read', description: 'Start an asynchronous read of a permitted snapshot file. Input must be a listed file ID, such as f0. Returns an operation ID, not file contents.',
       execute: async (fileId, callId) => {
         if (!this.valid(run)) throw new Error('Task is no longer active');
@@ -344,12 +359,26 @@ export class Coordinator {
         });
         return JSON.stringify({ operationId: op.id, state: 'requested' });
       },
-    }], { onEvent: event => run.trace?.observe(event) });
+    }], { execution: task.execution ?? 'snapshot', cwd: task.cwd,
+      nativeTool: event => {
+        const id = `${task.id}:${event.id}`;
+        if (event.phase === 'start') {
+          if (!this.valid(run)) throw new Error('Task is no longer active');
+          this.store.operation({ id, taskId: task.id, revision: run.revision, fileId: `native:${event.name}`,
+            status: 'started', parentSpanId: run.trace?.toolSpan(event.id) });
+        } else {
+          const previous = this.store.operations(task.id).find(operation => operation.id === id);
+          if (!previous) throw new Error('Native tool start record missing');
+          this.store.operation({ ...previous, status: event.interrupted ? 'unknown' : event.error ? 'failed' : 'succeeded',
+            error: event.interrupted ? '本机工具已中断，副作用结果未经确认；不会自动重放' : event.error ? '本机工具失败，详情见工具轨迹' : undefined });
+        }
+      }, onEvent: event => run.trace?.observe(event) });
     run.worker = worker;
     if (!this.valid(run)) { worker.close(); return; }
     const current = this.store.get(task.id); current.sessionFile = worker.sessionFile; this.store.save(current);
     const prior = task.parentTaskId ? this.store.get(task.parentTaskId) : undefined;
     let input: unknown = { kind: 'TASK', taskId: task.id, prompt: task.prompt, files: task.files,
+      execution: task.execution ?? 'snapshot', cwd: task.cwd, paths: task.paths,
       priorWork: prior ? { taskId: prior.id, prompt: prior.prompt, mode: prior.mode, report: prior.report } : undefined };
     try {
       while (this.valid(run)) {
@@ -382,6 +411,9 @@ export class Coordinator {
           input = { kind: 'READ_COMPLETIONS', results }; continue;
         }
         if (this.store.hasPending(task.id)) { input = { kind: 'FOLLOWUP' }; continue; }
+        if (this.store.operations(task.id).some(unsettled)) {
+          this.finish(run, 'paused', '存在结果不明的工具调用；不会自动重放'); return;
+        }
         const successfulReads = new Set(this.store.operations(task.id).filter(op => op.status === 'succeeded').map(op => op.fileId));
         if (task.files.some(file => !successfulReads.has(file.id))) {
           this.finish(run, 'paused', 'Worker 未读取全部明确提供的输入；拒绝交付无依据的成功报告');
@@ -423,7 +455,7 @@ export class Coordinator {
     run.stopping = status;
     run.controller.abort(new Error(reason));
     for (const op of this.store.operations(id)) {
-      if (['requested', 'started'].includes(op.status)) { op.status = 'cancel_requested'; this.store.operation(op); this.executor.stop(op.id); }
+      if (['requested', 'started'].includes(op.status)) { op.status = 'cancel_requested'; this.store.operation(op); if (!op.fileId.startsWith('native:')) this.executor.stop(op.id); }
     }
     if (!run.jobs) this.finish(run, status, reason);
     return this.store.get(id);
