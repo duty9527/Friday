@@ -5,11 +5,11 @@ import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { request } from './protocol.js';
 
-const help = `super-agent — read-only Router/Worker prototype (macOS/Linux)
+const help = `super-agent — trusted local Router/Worker coding agent (macOS/Linux)
 
   serve [--mode real|offline] [--offline-delay-ms 100]
   web [--port 0]   Open the single main conversation via an authenticated local URL
-  submit --file PATH [--file PATH] [--limit-ms 600000] [--request-id ID] "instruction"
+  submit [--file PATH ...] [--limit-ms 600000] [--request-id ID] "instruction"
   followup TASK_ID [--request-id ID] "additional instruction"
   stop TASK_ID
   get TASK_ID
@@ -20,9 +20,10 @@ const help = `super-agent — read-only Router/Worker prototype (macOS/Linux)
 
 All commands accept --home DIR (default: ~/.super-agent).
 Real mode requires SUPER_AGENT_PROVIDER, SUPER_AGENT_MODEL, SUPER_AGENT_API_KEY.
---file accepts a file or directory; directories are recursively snapshotted.
-Expanded inputs: at most 32 UTF-8 files, 256 KiB each, 1 MiB total; no links or binary files.
-Offline mode is explicit simulation, not a real model. No shell or file writes are exposed.
+Real mode: Workers have full local read/search/bash/edit/write tools. NOT a sandbox;
+commands run as your OS account and can modify files, access outside cwd and use the network.
+--file optionally hints a working path; real tasks need no attachment.
+Offline mode remains read-only snapshot simulation (32 files, 256 KiB each, 1 MiB total).
 The serve command stays in the foreground; use another terminal for web/client commands.
 Web binds only 127.0.0.1, connects to the same --home daemon, and prints a private entry link.
 Closing the browser or web bridge does not stop the daemon or its background work.
@@ -64,7 +65,8 @@ async function main() {
       provider: process.env.SUPER_AGENT_PROVIDER, model: process.env.SUPER_AGENT_MODEL, apiKey: process.env.SUPER_AGENT_API_KEY });
     const close = () => { void service.close().catch(() => { process.exitCode = 1; }); };
     process.once('SIGINT', close); process.once('SIGTERM', close);
-    process.stdout.write(JSON.stringify({ status: 'ready', home: service.home, mode, pid: process.pid }) + '\n');
+    process.stdout.write(JSON.stringify({ status: 'ready', home: service.home, mode, execution: mode === 'real' ? 'native' : 'snapshot',
+      cwd: process.cwd(), ...(mode === 'real' ? { sandbox: false, tools: ['read', 'ls', 'find', 'grep', 'bash', 'edit', 'write'] } : {}), pid: process.pid }) + '\n');
     return;
   }
   let message: Record<string, unknown>;

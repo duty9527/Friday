@@ -136,7 +136,8 @@ export class Store {
       const task = this.get(op.taskId);
       this.conversation.emit({ type: 'trace', kind: 'operation', rootId: task.originMessageId ?? task.id,
         messageId: task.originMessageId, taskId: task.id, spanId: op.id, parentSpanId: op.parentSpanId ?? task.id,
-        actor: op.status === 'requested' ? 'worker' : 'executor', label: '读取文件副本', status: op.status,
+        actor: op.fileId.startsWith('native:') || op.status === 'requested' ? 'worker' : 'executor',
+        label: op.fileId.startsWith('native:') ? `本机工具 · ${op.fileId.slice(7)}` : '读取文件副本', status: op.status,
         data: { fileId: op.fileId, resultRef: op.result === undefined ? undefined : op.id, preview: op.result?.slice(0, 512), error: op.error } });
     });
   }

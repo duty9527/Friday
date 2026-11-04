@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Local persistent Router/Worker agent with explicitly scoped read-only inputs",
+  "description": "Local persistent Router/Worker coding agent with trusted native tools",
   "engines": {
     "node": ">=22.19.0"
   },

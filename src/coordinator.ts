@@ -371,6 +371,7 @@ export class Coordinator {
           if (!previous) throw new Error('Native tool start record missing');
           this.store.operation({ ...previous, status: event.interrupted ? 'unknown' : event.error ? 'failed' : 'succeeded',
             error: event.interrupted ? '本机工具已中断，副作用结果未经确认；不会自动重放' : event.error ? '本机工具失败，详情见工具轨迹' : undefined });
+          if (event.interrupted) this.stop(task.id, '本机工具超时或中断，副作用结果未经确认；工作暂停，不会自动重放', 'paused');
         }
       }, onEvent: event => run.trace?.observe(event) });
     run.worker = worker;

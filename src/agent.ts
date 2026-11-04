@@ -8,6 +8,7 @@ import {
   type AgentSession, type ResourceLoader, type ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
 import { obj, str } from '@earendil-works/pi-schema';
+import { nativeShellOperations, NativeCommandInterrupted } from './native-shell.js';
 
 export type Role = 'router' | 'worker';
 export interface AgentTool {
@@ -143,7 +144,7 @@ export function nativeDefinitions(cwd: string, options?: AgentOptions): ToolDefi
   const definitions: ToolDefinition[] = [
     createReadToolDefinition(cwd), createLsToolDefinition(cwd), createFindToolDefinition(cwd),
     createGrepToolDefinition(cwd), createEditToolDefinition(cwd), createWriteToolDefinition(cwd),
-    createBashToolDefinition(cwd, { exposeSessionEnvironment: false, spawnHook: context => {
+    createBashToolDefinition(cwd, { operations: nativeShellOperations(), exposeSessionEnvironment: false, spawnHook: context => {
       const env = { ...context.env };
       for (const key of Object.keys(env)) if (/(?:API_KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i.test(key)) delete env[key];
       return { ...context, env };
@@ -154,10 +155,10 @@ export function nativeDefinitions(cwd: string, options?: AgentOptions): ToolDefi
     options?.nativeTool?.({ id, name: definition.name, phase: 'start' });
     try {
       const result = await definition.execute(id, args, signal, update, context);
-      options?.nativeTool?.({ id, name: definition.name, phase: 'end', interrupted: signal?.aborted });
+      options?.nativeTool?.({ id, name: definition.name, phase: 'end', error: 'isError' in result && result.isError === true, interrupted: signal?.aborted });
       return result;
     } catch (error) {
-      options?.nativeTool?.({ id, name: definition.name, phase: 'end', error: true, interrupted: signal?.aborted });
+      options?.nativeTool?.({ id, name: definition.name, phase: 'end', error: true, interrupted: signal?.aborted || error instanceof NativeCommandInterrupted });
       throw error;
     }
   } }));

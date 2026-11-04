@@ -270,7 +270,7 @@ async function refreshView(initial = false) {
       historyHasMore = result.messages.hasMore;
     }
     if (initial) cursor = result.cursor;
-    ui.mode.textContent = result.mode === 'offline' ? '[OFFLINE SIMULATION] / 离线模拟' : '真实模式';
+    ui.mode.textContent = result.mode === 'offline' ? '[OFFLINE SIMULATION] / 离线模拟' : '真实模式 · 完整本机工具（非沙箱）';
     ui.mode.classList.toggle('offline', result.mode === 'offline');
     renderMessages();
     renderWorks();
@@ -316,7 +316,7 @@ async function send() {
     if (!text) return;
     const files = ui.paths.value.split(/\r?\n/).map(path => path.trim()).filter(Boolean);
     if (files.length > 32 || files.some(path => path.length > 4096 || !path.startsWith('/') || path.includes('\0')))  {
-      ui.sendError.textContent = '最多提供 32 个本机绝对路径（文件或文件夹，以 / 开头、每个不超过 4096 字符）；目录展开后最多 32 个文件，由服务进一步校验。';
+      ui.sendError.textContent = '最多提供 32 个本机绝对路径（文件或文件夹，以 / 开头、每个不超过 4096 字符）；用于提示工作位置，由服务进一步校验。';
       return;
     }
     pending = { requestId: crypto.randomUUID(), text, files };

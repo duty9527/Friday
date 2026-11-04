@@ -75,6 +75,7 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
             return operation;
           }
           case 'submit': {
+            if (command.files === undefined) command.files = [];
             if (!Array.isArray(command.files) || !command.files.every(file => typeof file === 'string')) throw new Error('files must be a string array');
             return coordinator.submit(text(command.requestId, 'requestId', 128), text(command.prompt, 'prompt'),
               command.files.map(file => text(file, 'file path', 4096)), integer(command.limitMs, 600_000, 100, 86_400_000));

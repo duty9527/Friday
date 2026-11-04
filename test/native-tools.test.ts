@@ -9,6 +9,7 @@ import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { realFactory, NATIVE_TOOL_NAMES, type AgentObservation, type AgentFactory } from '../src/agent.js';
 import { Coordinator } from '../dist/coordinator.js';
 import { Store } from '../src/store.js';
+import { nativeShellOperations, NativeCommandInterrupted } from '../src/native-shell.js';
 
 // Local model fixture requests real SDK tools; no external provider or user filesystem is used.
 test('native SDK Worker searches, reads, writes, edits and runs foreground Bash in the actual cwd', { timeout: 20000 }, async () => {
@@ -27,14 +28,17 @@ test('native SDK Worker searches, reads, writes, edits and runs foreground Bash 
   const observed: AgentObservation[] = [];
   const lifecycle: Array<{ id: string; name: string; phase: string; interrupted?: boolean }> = [];
   let stall = false;
+  let timeout = false;
+  let nonzero = false;
+  let requests = 0;
   const server = createServer(async (request, response) => {
     let bytes = ''; for await (const chunk of request) bytes += chunk;
-    const body = JSON.parse(bytes);
+    const body = JSON.parse(bytes); requests++;
     const names = body.tools.map((tool: { function: { name: string } }) => tool.function.name).sort();
     assert.deepEqual(names, [...NATIVE_TOOL_NAMES].sort());
     const results = body.messages.filter((message: { role: string }) => message.role === 'tool');
     if (!stall) for (const result of results) assert.doesNotMatch(JSON.stringify(result), /Error:|ENOENT|not found|failed with exit code/);
-    const step = stall ? ['bash', { command: 'printf started > started.txt; sleep 30; printf escaped > escaped.txt' }] : steps[results.length];
+    const step = nonzero ? (results.length === 0 ? ['bash', { command: 'exit 255' }] : undefined) : timeout ? ['bash', { command: 'printf x >> timeout-effect.txt; sleep 30', timeout: 0.2 }] : stall ? ['bash', { command: 'echo $$ > shell.pid; printf started > started.txt; sleep 30; printf escaped > escaped.txt' }] : steps[results.length];
     const delta = step ? { role: 'assistant', tool_calls: [{ index: 0, id: `call_${results.length}_${stall}`, type: 'function', function: { name: step[0], arguments: JSON.stringify(step[1]) } }] }
       : { role: 'assistant', content: 'All seven native tools verified.' };
     response.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -66,7 +70,9 @@ test('native SDK Worker searches, reads, writes, edits and runs foreground Bash 
       const rejected = assert.rejects(pending);
       for (let i = 0; i < 100; i++) { if (await access(join(cwd, 'started.txt')).then(() => true, () => false)) break; await delay(20); }
       await access(join(cwd, 'started.txt'));
+      const pid = Number((await readFile(join(cwd, 'shell.pid'), 'utf8')).trim());
       controller.abort(); await rejected;
+      assert.throws(() => process.kill(pid, 0), /ESRCH/, 'the foreground shell has actually exited');
       assert.equal(lifecycle.at(-1)?.interrupted, true);
       await assert.rejects(access(join(cwd, 'escaped.txt')));
     } finally { worker.close(); }
@@ -97,6 +103,7 @@ test('native SDK Worker searches, reads, writes, edits and runs foreground Bash 
       assert.equal(task.cwd, cwd); assert.deepEqual(task.files, []);
       assert.equal(coordinator.store.operations(task.id).length, 7);
       assert.ok(coordinator.store.operations(task.id).every(operation => operation.status === 'succeeded'));
+      assert.ok(coordinator.store.conversation.trace({ taskId: task.id }).some(event => event.kind === 'operation' && event.label === '本机工具 · bash' && event.actor === 'worker'));
       assert.ok(coordinator.store.conversation.trace({ taskId: task.id }).some(event => event.label === 'bash'));
       await assert.rejects(access(join(home, 'tasks', task.id, 'inputs')));
 
@@ -113,13 +120,40 @@ test('native SDK Worker searches, reads, writes, edits and runs foreground Bash 
         if (coordinator.store.operations(stopped.id).some(operation => operation.status === 'unknown')) break;
         await delay(20);
       }
+      const stoppedPid = Number((await readFile(join(cwd, 'shell.pid'), 'utf8')).trim());
+      assert.throws(() => process.kill(stoppedPid, 0), /ESRCH/);
       assert.equal(coordinator.store.get(stopped.id).status, 'paused');
       assert.ok(coordinator.store.operations(stopped.id).some(operation => operation.status === 'unknown'));
+
+      stall = false; timeout = true;
+      const beforeTimeout = requests;
+      coordinator.chat('native-timeout', 'a command may commit a side effect before timing out');
+      for (let i = 0; i < 200; i++) {
+        if (coordinator.store.list()[2]?.status === 'paused') break;
+        await delay(20);
+      }
+      const timed = coordinator.store.list()[2]!;
+      assert.equal(timed.status, 'paused');
+      assert.ok(coordinator.store.operations(timed.id).some(operation => operation.status === 'unknown'));
+      await delay(50);
+      assert.equal(requests - beforeTimeout, 1, 'timeout aborts the model loop instead of allowing an automatic retry');
+      assert.equal(await readFile(join(cwd, 'timeout-effect.txt'), 'utf8'), 'x');
+
+      timeout = false; nonzero = true;
+      coordinator.chat('native-failure', 'an ordinary nonzero exit is not a timeout');
+      for (let i = 0; i < 200; i++) {
+        if (coordinator.store.list()[3]?.status === 'completed') break;
+        await delay(20);
+      }
+      const failedCommand = coordinator.store.list()[3]!;
+      assert.equal(failedCommand.status, 'completed', 'the model can handle a settled command error');
+      assert.equal(coordinator.store.operations(failedCommand.id)[0]!.status, 'failed', 'a returned SDK isError result must not be recorded as succeeded');
     } finally { await coordinator.close(); }
     const recovered = new Store(home);
     try {
       recovered.recover();
       assert.equal(recovered.list()[1]!.status, 'paused');
+      assert.equal(recovered.list()[2]!.status, 'paused');
       await assert.rejects(access(join(cwd, 'escaped.txt')));
     } finally { recovered.close(); }
   } finally {
@@ -127,4 +161,33 @@ test('native SDK Worker searches, reads, writes, edits and runs foreground Bash 
     server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
     await rm(root, { recursive: true, force: true });
   }
+});
+
+
+test('recovery marks an unfinished native operation unknown even when its task was already paused', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-native-recover-'));
+  try {
+    const store = new Store(home);
+    store.create({ id: 'paused-native', requestId: 'paused-native', fingerprint: 'native', prompt: 'work', files: [],
+      status: 'paused', revision: 1, mode: 'real', execution: 'native', cwd: home, createdAt: Date.now(), activeMs: 0, limitMs: 600000 });
+    store.operation({ id: 'unfinished', taskId: 'paused-native', revision: 0, fileId: 'native:bash', status: 'cancel_requested' });
+    store.close();
+    const recovered = new Store(home);
+    try {
+      recovered.recover();
+      assert.equal(recovered.get('paused-native').execution, 'native');
+      assert.equal(recovered.get('paused-native').status, 'paused');
+      assert.equal(recovered.operations('paused-native')[0]!.status, 'unknown');
+    } finally { recovered.close(); }
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+
+test('native shell distinguishes explicit exit 255 from actual signal termination and timeout', async () => {
+  const shell = nativeShellOperations();
+  const settings = { onData: () => {}, env: { PATH: process.env.PATH } };
+  assert.deepEqual(await shell.exec('exit 255', process.cwd(), settings), { exitCode: 255 });
+  assert.deepEqual(await shell.exec('exit 1', process.cwd(), settings), { exitCode: 1 });
+  await assert.rejects(shell.exec('kill -TERM $$', process.cwd(), settings), NativeCommandInterrupted);
+  await assert.rejects(shell.exec('sleep 5', process.cwd(), { ...settings, timeout: 0.02 }), NativeCommandInterrupted);
 });
