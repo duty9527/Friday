@@ -1,6 +1,7 @@
 {
   "name": "friday",
   "version": "1.0.0",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "description": "F.R.I.D.A.Y. — Local persistent personal AI assistant with three-tier neural memory, subconscious dreaming, specialist Worker orchestration, and omnichannel IM gateway",
