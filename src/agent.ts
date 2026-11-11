@@ -133,7 +133,7 @@ function modelLookupError(runtime: ModelRuntime, provider: string, model: string
 }
 
 export type AuthInteraction = Parameters<ModelRuntime['login']>[2];
-const REAL_CONFIG_ERROR = 'Real mode requires SUPER_AGENT_PROVIDER, SUPER_AGENT_MODEL and SUPER_AGENT_API_KEY (or OAuth login via "super-agent login"); use --mode offline explicitly for simulation';
+const REAL_CONFIG_ERROR = 'Real mode requires SUPER_AGENT_PROVIDER, SUPER_AGENT_MODEL and SUPER_AGENT_API_KEY (or OAuth login via "friday login"); use --mode offline explicitly for simulation';
 
 export async function loginOAuth(
   home: string,

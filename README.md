@@ -1,37 +1,50 @@
-# FRIDAY · Super-agent 全息记忆主脑与异构子 AI 协同系统
+# F.R.I.D.A.Y. · 全息神经记忆主脑与战术子 AI 协同系统
 
-本地常驻、拥有**三层人脑全局记忆（L0 元记忆目录 + L2 语义记忆卡片 + L1 情景对话/任务全量库）**与完整本机编码工具的 Router/Worker Agent（代号 **FRIDAY**）。用户只面对**一个持续对话**：主脑 Router 自动进行潜意识记忆闪回（Subconscious Memory Flashback）、跨上下文联想检索、编译无歧义的执行简报（Context Brief），并按需调度不同专精画像的后台子 AI（`coding` / `research` / `review` / `general`）并发执行，右侧实时展示可回溯的因果与逐步轨迹。
+本地常驻、拥有**三层人脑全局记忆（L0 元记忆目录 + L2 语义记忆卡片与突触网络 + L1 情景对话/任务全量库）**、**双过程潜意识睡眠与做梦机制**以及完整本机编码工具的个人 AI 战术副手（**F.R.I.D.A.Y.**，*Female Replacement Intelligent Digital Assistant Youth*）。用户只面对**一个持续在线的声音**：主脑 Router 在微信、Web 控制台与终端 TUI 间无缝共享记忆，自动完成潜意识记忆闪回（Subconscious Memory Flashback）、跨上下文联想检索、编译无歧义的执行简报（Context Brief），按任务复杂度与模型能力在多提供商模型中枢（Model Hub）间动态调度专职后台子 AI（`coding` / `research` / `review` / `general`），并在子 AI 交付时扮演质量门禁（Quality Gate）或在中途遇到重大分岔时向老板发起战术请示（`ASK_BOSS`）。
 
-**真实模式默认开放受信任本机工具：read / ls / find / grep / bash / edit / write。** 可以按需搜索读取、修改真实文件、执行命令和测试，无需附件。命令以服务账号运行，工作目录不是沙箱，可访问目录外、联网、安装依赖和执行破坏性操作；没有逐条审批、自动回滚或同目录并发写入保护。离线模拟仍为只读副本流程。已内置持久化全息记忆、自主巡航定时器（Watchdog Timers）、守护进程自愈、终端 TUI 与 MCP/Skill 自动挂载。目标和实现边界见 [目标规格](goal-and-requirements.md) 与 [架构规格](architecture.md)。
+**真实模式默认开放受信任本机工具：read / ls / find / grep / bash / edit / write。** 可以按需搜索读取、修改真实文件、执行命令和测试，无需附件。命令以服务账号运行，工作目录不是沙箱，可访问目录外、联网、安装依赖和执行破坏性操作；没有逐条审批、自动回滚或同目录并发写入保护。离线模拟仍为只读副本流程。已内置持久化全息记忆、潜意识睡眠巩固与只读 REM 做梦、自主巡航与一次性提醒定时器（Timers）、自进化插件工坊（Plugins）、全渠道 IM 网关（微信个人号 iLink 扫码/看图/发附件、钉钉、Telegram）、守护进程自愈与终端 TUI。目标和实现边界见 [目标规格](goal-and-requirements.md) 与 [架构规格](architecture.md)。
 
-## FRIDAY 全息记忆与专职子 AI 体验
+## F.R.I.D.A.Y. 核心能力与体验
 
-在 Web 控制台、TUI 或 CLI 中，你可以直接体验 FRIDAY 的人脑级记忆与协同能力：
+在微信、Web 控制台、TUI 或 CLI 中，你可以直接体验 F.R.I.D.A.Y. 的人脑级记忆与战术协同能力：
 
-- **潜意识记忆闪回（`autoRecalled`）**：每次你发言时，主脑在进入推理前会自动用你的输入检索全局语义记忆、历史 Worker 报告与历史对话，将高置信度命中直接注入本轮上下文，并在右侧“分配记录与当时上下文”中公开展示。
-- **主动记忆刻印与新陈代谢（`save_memory`）**：主脑可随时将架构约定、用户偏好、关键修复结论沉淀为持久化 `MemoryCard`。同一 `topic + cwd` 更新时自动标记旧卡片 `supersededBy`，实现记忆新陈代谢（不篡改旧账本，同时避免过期结论污染检索）。
-- **跨源联想检索与局部性展开（`search_memory`）**：混合检索（CJK 2-gram + 关键词 + `cwd` 空间亲和度 + 时间衰减）跨 `memories`、`works`、`messages` 统一打分，命中历史对话时自动附带前后相邻消息（Neighbors）与关联工作 ID。
-- **上下文编译器与异构专职子 AI（Context Compiler & Specialist Profiles）**：主脑派发任务时支持指定 `profile`（`coding` 编码专精 / `research` 深度调研 / `review` 安全与代码审查 / `general` 通用）、异构 `model` 覆盖、`contextBrief` 与 `memoryIds`，将检索到的记忆精准编译注入给子 AI，并在同目录并发执行时实时注入同伴态势（`concurrentPeers`）。
-- **战术中途请示与原会话拍板续跑（`ASK_BOSS`）**：后台子 AI 遇到高危不可逆操作或重大业务分岔时可原地挂起向老板请示（挂起期间不消耗活跃执行时限预算，自动经由微信/Telegram/钉钉同步送达），老板在主对话随口回复拍板即可唤醒同一会话无缝推进。
-- **双过程潜意识睡眠与做梦（Subconscious Sleep & Dreaming）**：静默空闲且积累未消化经历时按昼夜节律随机进入浅睡突触稳态修剪或只读 REM 跨领域联想，随时可被老板消息瞬时惊醒。
-- **一次性准点提醒与自进化插件工坊（`system-pulse` & `<home>/plugins`）**：内置零外部依赖主机/Git 脉搏诊断与异常静默巡航插件 `system-pulse`，支持 `--delay-ms` / `--once` 零 Token 准点提醒，并支持在数据目录动态锻造与凭据隔离运行新插件。
+- **三层全息神经记忆与突触可塑性（`memoryDirectory` / `save_memory` / `search_memory`）**：
+  - **潜意识记忆闪回（`autoRecalled`）**：每次发言时，主脑在进入推理前自动跨全局语义记忆、历史 Worker 报告与历史对话混合检索（CJK 2-gram + 关键词 + `cwd` 空间亲和度 + 艾宾浩斯遗忘衰减 + 突触激活扩散），将高置信度命中直接注入本轮上下文。
+  - **赫布突触连接与海马体任务巩固**：共同激活或同链路产出的记忆卡片自动建立带权突触（`synapses`），每个后台任务完成时自动沉淀结构化经验卡片；同一 `topic + cwd` 更新时自动标记旧卡片 `supersededBy` 实现新陈代谢。
+- **双过程潜意识睡眠与做梦（Subconscious Sleep & Dreaming）**：
+  - 采用人类睡眠的双过程模型（Borbély `S × C`：稳态睡眠压力 × 昼夜节律），仅在系统静默空闲且积累了未消化经历时自然入睡，老板永远无需也无法手动触发。
+  - **两阶段睡眠**：第一阶段 NREM 慢波睡眠执行纯本地突触稳态修剪与记忆去重；第二阶段 REM 快速眼动期在只读白名单（`read`/`ls`/`find`/`grep`）与内存临时会话中漫游真实代码库，将白天的对话/报错与真实源码跨领域印证。
+  - **瞬时惊醒与梦境遗忘曲线**：老板一旦发来消息，50ms 内中断做梦；仅在产出高价值洞见时保留半衰期 12 分钟、最多 2 轮对话的潜意识余温，绝不在看板或轨迹中刷屏。
+- **异构模型中枢与专职子 AI 协同（Model Hub & Specialist Workers）**：
+  - 支持 `openai`、`deepseek`、`anthropic`、`google`、`dashscope`、`openrouter` 等多提供商动态路由，按 `fast` / `balanced` / `strong` 三档自动匹配任务复杂度。
+  - 同目录并发执行的多个子 AI 自动获知同伴态势（`concurrentPeers`），避免踩踏同一文件。
+  - 主脑在 `WORKER_REPORT` 阶段担任老板的**质量门禁（Quality Gate）**：若子 AI 漏查关键位置或结论存疑，主脑自动在后台打回补查（`autoDispatchesRemaining`），验收合格后才向老板呈交。
+- **战术中途请示与原会话拍板续跑（`ASK_BOSS` ↔ `BOSS_DECISION`）**：后台子 AI 遇到高危不可逆操作或重大业务分岔时可原地挂起向老板请示（挂起期间零活跃时限损耗，自动经由微信/Telegram/钉钉同步送达），老板在主对话随口回复拍板即可唤醒同一 Worker 会话无缝继续。
+- **全渠道 IM 网关与微信个人号深度集成**：支持终端/Web 直接扫码绑定微信个人号（iLink 协议），支持微信端拆条消息与慢速图片智能聚合（Coalescing）、真实视觉看图（AES-128-ECB 解密直通模型视觉输入）、文档生成后自动通过 `send_file` 发送微信附件，以及严格的来源会话隔离路由（Exact-Origin Routing）。
+- **一次性准点提醒与自进化插件工坊（`system-pulse` / `fund-tracker` / `<home>/plugins`）**：内置零外部依赖主机/Git 脉搏诊断与异常静默巡航插件 `system-pulse` 及基金持仓估值结算插件 `fund-tracker`，支持 `--delay-ms` / `--daily-at` / `--once` 零 Token 准点执行，并支持在数据目录动态锻造与凭据隔离运行新插件。
 - **离线模拟快捷指令**：在 `--mode offline` 下，直接发送 `记住：主题=内容`、`搜索记忆：关键词`、`派发：任务描述`、`提醒：5秒后 事项`、`定时：指令` 即可端到端体验记忆刻印、联想闪回、专职子 AI 派发、一次性提醒与自主巡航定时器。
 
 ```sh
-# CLI 全息记忆管理
+# CLI 全息态势简报与记忆管理（支持 npx friday 或 node dist/cli.js）
+node dist/cli.js brief --home "$HOME/.super-agent-demo"
 node dist/cli.js memory save --topic "鉴权规范" "统一采用 Ed25519 双令牌机制" --tag auth --pinned --home "$HOME/.super-agent-demo"
 node dist/cli.js memory list --home "$HOME/.super-agent-demo"
 node dist/cli.js memory search "Ed25519 鉴权" --home "$HOME/.super-agent-demo"
 node dist/cli.js memory remove MEMORY_ID --home "$HOME/.super-agent-demo"
 
-# OpenClaw 风格全渠道 IM 接入（钉钉 / 微信 / Telegram，共享同一个主脑与全局记忆）
+# 微信个人号扫码绑定与全渠道 IM 接入（微信 / 钉钉 / Telegram，共享同一个主脑与全局记忆）
+node dist/cli.js im login --home "$HOME/.super-agent-demo"
 node dist/cli.js im add --platform dingtalk --name "钉钉随身管家" --webhook-url "https://oapi.dingtalk.com/robot/send?access_token=..." --secret "SEC..." --allow "staffId" --home "$HOME/.super-agent-demo"
-node dist/cli.js im add --platform wechat --name "微信随身副手" --webhook-url "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..." --secret "TOKEN..." --home "$HOME/.super-agent-demo"
 node dist/cli.js im add --platform telegram --name "Telegram 管家" --bot-token "123456:ABC..." --allow "@your_username" --home "$HOME/.super-agent-demo"
 node dist/cli.js im list --home "$HOME/.super-agent-demo"
 node dist/cli.js im test CHANNEL_ID "你好，我是 FRIDAY" --home "$HOME/.super-agent-demo"
 
-# 启动 FRIDAY 交互式终端 TUI（支持 /memories, /search, /remember, /im, /works, /timers）
+# 插件运行与异构模型中枢管理
+node dist/cli.js plugin list --home "$HOME/.super-agent-demo"
+node dist/cli.js plugin run system-pulse status --home "$HOME/.super-agent-demo"
+node dist/cli.js model list --home "$HOME/.super-agent-demo"
+
+# 启动 F.R.I.D.A.Y. 交互式终端 TUI（支持 /brief, /memories, /search, /remember, /im, /works, /timers）
 node dist/cli.js tui --home "$HOME/.super-agent-demo"
 ```
 

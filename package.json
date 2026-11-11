@@ -1,9 +1,9 @@
 {
-  "name": "super-agent",
-  "version": "0.1.0",
+  "name": "friday",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Local persistent Router/Worker coding agent with trusted native tools",
+  "description": "F.R.I.D.A.Y. — Local persistent personal AI assistant with three-tier neural memory, subconscious dreaming, specialist Worker orchestration, and omnichannel IM gateway",
   "engines": {
     "node": ">=22.19.0"
   },

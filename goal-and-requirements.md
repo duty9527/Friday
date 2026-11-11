@@ -1,24 +1,24 @@
 ---
 id: super-agent-goals
 type: goal-and-requirements
-title: Super-agent 个人自主协作工具
+title: F.R.I.D.A.Y. 个人全天候 AI 战术副手与自主协作系统
 status: active
 ---
 
-# Super-agent
+# F.R.I.D.A.Y.
 
-面向个人、以本机 CLI/TUI 为交互入口的持续运行、多任务自主协作工具。
+面向个人、以微信/Web/TUI/CLI 为统一交互入口的持续运行、全息记忆、多任务自主协作 AI 副手。
 
 ## Overview
 
-从零实现可运行的 Super-agent 原型，首个使用者是项目创建者本人。通过本机 CLI/TUI 统一处理文件、资料研究和脚本自动化等个人事务，后台可并行推进多个任务。
+实现可长期常驻运行的个人 AI 副手 **F.R.I.D.A.Y.**，首个使用者是项目创建者本人。通过单一持续在线的主脑（Router）统一处理代码研发、资料研究、持仓监控和本机自动化等个人事务，后台可并行调度多个专职子 AI（Workers）推进任务。
 
-以 `Super-agent.md` 的架构探索为可信起点，允许根据个人使用场景修正设计；原文是参考资料，不是本项目已经采纳的全部决策。
+以 [Super-agent.md](Super-agent.md) 的架构探索为可信起点，结合个人全天候副手场景演进设计；原文是参考资料，不是本项目已经采纳的全部决策。
 
-> **里程碑目标与精神内核（Project FRIDAY）**：
-> - **命名致敬**：灵感源自漫威钢铁侠 Tony Stark 的全天候个人 AI 管家 **F.R.I.D.A.Y.（Female Replacement Intelligent Digital Assistant Youth）**，同时也呼应英语中“Man/Girl Friday”（最可靠、能独当一面打理一切事务的个人全能副手）的经典意象。
-> - **架构映射**：就像 Tony 永远只与 F.R.I.D.A.Y. **同一个声音**自然对话（Single Continuous Router），无需关心后台子系统编号，而 F.R.I.D.A.Y. 在背后并发调度战甲诊断、代码编译、检索分析等多个隔离执行流（Workers），具备深度的本机受信任执行权限，并在关键节点主动汇总交付或请求决策。
-> - **演进节点**：当前系统已补齐三层全息记忆（元记忆目录 + 语义记忆卡片 + 情景对话/任务全量库）、潜意识记忆闪回、上下文编译器、异构专职子 AI 调度、恢复续跑（`resume`）、定时触发（`timers`）、Watchdog 自主监护与 TUI/Web 全息控制台，正式达成 **FRIDAY（Female Replacement Intelligent Digital Assistant Youth）** 里程碑。
+> **项目名称与精神内核（F.R.I.D.A.Y.）**：
+> - **命名致敬**：源自漫威钢铁侠 Tony Stark 的全天候个人 AI 战术副手 **F.R.I.D.A.Y.（Female Replacement Intelligent Digital Assistant Youth）**，同时也呼应英语中“Man/Girl Friday”（最可靠、能独当一面打理一切事务的个人全能副手）的经典意象。
+> - **架构映射**：就像 Tony 永远只与 F.R.I.D.A.Y. **同一个声音**自然对话（Single Continuous Router），无需关心后台子系统编号，而 F.R.I.D.A.Y. 在背后并发调度战甲诊断、代码编译、检索分析等多个隔离执行流（Workers），具备深度的本机受信任执行权限，并在关键节点主动汇总交付、担任质量门禁或发起战术请示（`ASK_BOSS`）。
+> - **完整形态**：系统已具备三层全息记忆（L0 元记忆目录 + L2 语义记忆卡片与突触网络 + L1 情景对话/任务全量库）、潜意识记忆闪回、双过程潜意识睡眠巩固与只读 REM 联想做梦、上下文编译器、多提供商模型中枢（Model Hub）、专职子 AI 调度与同工作区并发感知、盘中战术请示与原会话拍板续跑、恢复续跑（`resume`）、周期与一次性定时触发（`timers`）、自进化插件工坊（`plugins`）、全渠道 IM 网关（微信个人号 iLink 多模态收发 / 钉钉 / Telegram）、Watchdog 自主监护与 TUI/Web 全息控制台。
 
 ## Problem
 

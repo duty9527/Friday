@@ -5,7 +5,7 @@ import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { request } from './protocol.js';
 
-const help = `super-agent — trusted local Router/Worker coding agent (macOS/Linux)
+const help = `F.R.I.D.A.Y. (friday) — Local persistent personal AI assistant & tactical Router/Worker orchestrator (macOS/Linux)
 
   serve [--mode real|offline] [--offline-delay-ms 100]
   login [provider]   Authenticate via PI OAuth (default: openai Sign in with ChatGPT)
@@ -31,7 +31,7 @@ const help = `super-agent — trusted local Router/Worker coding agent (macOS/Li
 
 All commands accept --home DIR (default: ~/.super-agent).
 Real mode requires SUPER_AGENT_PROVIDER, SUPER_AGENT_MODEL, SUPER_AGENT_API_KEY
-(or prior OAuth login via "super-agent login"; optional: SUPER_AGENT_BASE_URL, SUPER_AGENT_ROUTER_MODEL, SUPER_AGENT_WORKER_MODEL).
+(or prior OAuth login via "friday login"; optional: SUPER_AGENT_BASE_URL, SUPER_AGENT_ROUTER_MODEL, SUPER_AGENT_WORKER_MODEL).
 Real mode: Workers have full local read/search/bash/edit/write tools. NOT a sandbox;
 commands run as your OS account and can modify files, access outside cwd and use the network.
 --file optionally hints a working path; real tasks need no attachment.
@@ -198,7 +198,7 @@ async function main() {
       }
       if (sub === 'run') {
         const pluginName = args[1] ?? values.plugin;
-        if (!pluginName) throw new Error('Plugin name is required: super-agent plugin run <name> [action]');
+        if (!pluginName) throw new Error('Plugin name is required: friday plugin run <name> [action]');
         const pluginAction = args[2] ?? values.action ?? 'status';
         const parsedArgs = values.args ? JSON.parse(values.args) as Record<string, unknown> : {};
         const res = await runPlugin(home, pluginName, pluginAction, parsedArgs);
@@ -322,6 +322,6 @@ async function main() {
   process.stdout.write(JSON.stringify(result, null, 2) + '\n');
 }
 main().catch(error => {
-  process.stderr.write(`super-agent: ${error instanceof Error ? error.message : 'Command failed'}\n`);
+  process.stderr.write(`friday: ${error instanceof Error ? error.message : 'Command failed'}\n`);
   process.exitCode = 1;
 });

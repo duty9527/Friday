@@ -1,13 +1,13 @@
 ---
 id: super-agent-architecture
 type: architecture-design
-title: Super-agent 本地常驻架构
+title: F.R.I.D.A.Y. 本地常驻架构
 status: active
 parent: super-agent-goals
 implements: [super-agent-goals]
 ---
 
-# Super-agent 本地常驻架构
+# F.R.I.D.A.Y. 本地常驻架构
 
 本规格落实 `super-agent-goals`，不重述产品范围。架构及协议已经用户审阅确认，作为实现约束生效。除“当前实现边界”外，各节描述目标架构与约束，不表示全部能力已经实现。
 
