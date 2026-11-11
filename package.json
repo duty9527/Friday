@@ -8,6 +8,7 @@
     "node": ">=22.19.0"
   },
   "bin": {
+    "friday": "dist/cli.js",
     "super-agent": "dist/cli.js"
   },
   "scripts": {

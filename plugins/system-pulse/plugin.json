@@ -1,0 +1,27 @@
+{
+  "name": "system-pulse",
+  "title": "主机与工作区脉搏诊断",
+  "description": "零外部依赖的本机遥测、Git 工作区状态快照、异常阈值静默巡航与零 Token 准点提醒插件。",
+  "entry": "index.mjs",
+  "actions": ["status", "patrol", "remind"],
+  "actionSpecs": [
+    {
+      "name": "status",
+      "label": "实时系统与仓库状态",
+      "description": "毫秒级读取本机 CPU 负载、内存占用、磁盘剩余空间及指定目录 Git 分支与未提交变更状态。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "patrol",
+      "label": "静默健康巡航（仅异常告警）",
+      "description": "检查负载、内存与磁盘余量阈值；一切正常时 notify:false 静默跳过不打扰老板，越界时主动推送告警。",
+      "defaultArgs": { "maxLoadPerCore": 2.5, "maxMemUsedPct": 94, "minDiskFreeGb": 2 }
+    },
+    {
+      "name": "remind",
+      "label": "零 Token 准点提醒",
+      "description": "直接推送老板设定的提醒事项，不启动重型编码 Worker。",
+      "defaultArgs": { "text": "请查看待办事项" }
+    }
+  ]
+}

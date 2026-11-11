@@ -40,14 +40,14 @@ test('a round shows its own routing decision; a later follow-up does not leak in
     });
 
     const firstSteps = timelineSteps(coordinator.store.conversation.trace({ messageId: first.id }));
-    assert.equal(firstSteps[0]!.title, 'Router 处理新输入', 'the round reads from its own Router turn');
+    assert.equal(firstSteps[0]!.title, 'F.R.I.D.A.Y. 处理新输入', 'the round reads from its own Router turn');
     assert.equal(firstSteps[1]!.title, '新建工作');
     assert.ok(firstSteps.some(step => step.title === 'Worker 接收任务'), 'the work it created stays part of the round');
     assert.ok(!firstSteps.some(step => step.title === '补充已有工作（未新建）'),
       'a later message\'s routing decision never appears inside an earlier round');
 
     const secondSteps = timelineSteps(coordinator.store.conversation.trace({ messageId: second.id }));
-    assert.equal(secondSteps[0]!.title, 'Router 处理新输入');
+    assert.equal(secondSteps[0]!.title, 'F.R.I.D.A.Y. 处理新输入');
     assert.ok(secondSteps.some(step => step.title === '补充已有工作（未新建）'), 'the follow-up round shows its own decision');
     assert.ok(secondSteps.some(step => step.title === '处理补充要求'), 'and the recorded delivery state');
     assert.ok(!secondSteps.some(step => step.title === '新建工作'), 'it did not create a second work');

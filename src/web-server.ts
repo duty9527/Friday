@@ -23,10 +23,9 @@ function send(response: ServerResponse, status: number, result: unknown) {
   response.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
   response.end(JSON.stringify(result));
 }
-async function body(request: IncomingMessage): Promise<Record<string, unknown>> {
-  if (request.headers['content-type']?.split(';')[0]?.trim().toLowerCase() !== 'application/json') throw new HttpFailure(415, 'Use application/json');
+async function rawBytes(request: IncomingMessage): Promise<Buffer> {
   if (Number(request.headers['content-length']) > REQUEST_LIMIT) throw new HttpFailure(413, 'Request exceeds 64 KiB limit');
-  const bytes = await new Promise<Buffer>((resolve, reject) => {
+  return new Promise<Buffer>((resolve, reject) => {
     let size = 0; const chunks: Buffer[] = [];
     const cleanup = () => { request.off('data', onData); request.off('end', onEnd); request.off('error', onError); request.off('aborted', onAborted); };
     const onError = (error: Error) => { cleanup(); reject(error); };
@@ -39,6 +38,10 @@ async function body(request: IncomingMessage): Promise<Record<string, unknown>> 
     };
     request.on('data', onData); request.once('end', onEnd); request.once('error', onError); request.once('aborted', onAborted);
   });
+}
+async function body(request: IncomingMessage): Promise<Record<string, unknown>> {
+  if (request.headers['content-type']?.split(';')[0]?.trim().toLowerCase() !== 'application/json') throw new HttpFailure(415, 'Use application/json');
+  const bytes = await rawBytes(request);
   let value: unknown;
   try { value = JSON.parse(bytes.toString('utf8')); }
   catch { throw new HttpFailure(400, 'Invalid JSON'); }
@@ -106,6 +109,22 @@ export async function startWeb(options: { home: string; port?: number }): Promis
       const origin = `http://${host}`;
       const url = new URL(incoming.url ?? '/', origin);
       if (url.origin !== origin) throw new HttpFailure(403, 'Invalid request origin');
+      if (url.pathname.startsWith('/im/webhook/')) {
+        const channelId = decodeURIComponent(url.pathname.slice('/im/webhook/'.length));
+        if (!channelId) throw new HttpFailure(404, 'Missing IM channel ID');
+        const raw = incoming.method === 'GET' ? '' : (await rawBytes(incoming)).toString('utf8');
+        const result = await bridge(home, {
+          command: 'im-webhook',
+          channelId,
+          method: incoming.method ?? 'POST',
+          query: url.searchParams.toString(),
+          headers: incoming.headers,
+          rawBody: raw,
+        }) as { status: number; body: string; contentType: string };
+        response.writeHead(result.status, { 'content-type': result.contentType });
+        response.end(result.body);
+        return;
+      }
       if (!url.pathname.startsWith('/api/')) {
         const asset = Object.hasOwn(assets, url.pathname) ? assets[url.pathname] : undefined;
         if (!asset || !['GET', 'HEAD'].includes(incoming.method ?? '')) throw new HttpFailure(404, 'Not found');
@@ -134,12 +153,28 @@ export async function startWeb(options: { home: string; port?: number }): Promis
           case '/api/trace': command = { command: 'trace', messageId: search.get('messageId') ?? undefined, taskId: search.get('taskId') ?? undefined, after: numeric('after'), before: numeric('before') }; break;
           case '/api/work': command = { command: 'get', taskId: search.get('taskId') }; break;
           case '/api/timers': command = { command: 'timer-list' }; break;
+          case '/api/plugins': command = { command: 'plugin-list' }; break;
+          case '/api/im-channels': command = { command: 'im-list' }; break;
+          case '/api/models': command = { command: 'model-hub' }; break;
+          case '/api/memories':
+            command = search.get('query')
+              ? { command: 'memory-search', query: search.get('query'), scope: search.get('scope') ?? undefined, cwd: search.get('cwd') ?? undefined, limit: numeric('limit') }
+              : { command: 'memory-list', cwd: search.get('cwd') ?? undefined, topic: search.get('topic') ?? undefined, limit: numeric('limit') };
+            break;
           case '/api/operation': command = { command: 'operation', taskId: search.get('taskId'), operationId: search.get('operationId') }; break;
           default: throw new HttpFailure(404, 'Unknown API endpoint');
         }
         send(response, 200, await bridge(home, command));
       } else if (incoming.method === 'POST') {
-        const commands: Record<string, string> = { '/api/chat': 'chat', '/api/stop': 'stop', '/api/resume': 'resume', '/api/chat-stop': 'chat-stop' };
+        const commands: Record<string, string> = {
+          '/api/chat': 'chat', '/api/stop': 'stop', '/api/resume': 'resume', '/api/chat-stop': 'chat-stop',
+          '/api/memory-save': 'memory-save', '/api/memory-link': 'memory-link', '/api/memory-pin': 'memory-pin', '/api/memory-remove': 'memory-remove',
+          '/api/timer-add': 'timer-add', '/api/timer-toggle': 'timer-toggle', '/api/timer-remove': 'timer-remove',
+          '/api/plugin-run': 'plugin-run',
+          '/api/im-save': 'im-save', '/api/im-toggle': 'im-toggle', '/api/im-remove': 'im-remove', '/api/im-test': 'im-test',
+          '/api/im-wechat-qr-start': 'im-wechat-qr-start', '/api/im-wechat-qr-status': 'im-wechat-qr-status',
+          '/api/model-configure': 'model-configure', '/api/model-probe': 'model-probe', '/api/model-fetch': 'model-fetch',
+        };
         const command = Object.hasOwn(commands, url.pathname) ? commands[url.pathname] : undefined;
         if (!command) throw new HttpFailure(404, 'Unknown API endpoint');
         const input = await body(incoming);

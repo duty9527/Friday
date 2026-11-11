@@ -4,6 +4,7 @@ import lockfile from 'proper-lockfile';
 import { privateHome } from './files.js';
 import { realFactory, offlineFactory } from './agent.js';
 import { Coordinator } from './coordinator.js';
+import { listPlugins, runPlugin } from './plugin.js';
 import { integer, REQUEST_LIMIT, RESPONSE_LIMIT, socketPath, text, type Response } from './protocol.js';
 
 export interface ServiceOptions {
@@ -51,7 +52,35 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
         const store = coordinator.store;
         switch (command.command) {
           case 'health': return { mode: options.mode, pid: process.pid, status: coordinator.health().executorAvailable ? 'ready' : 'degraded', ...coordinator.health() };
-          case 'view': return coordinator.view();
+          case 'view': return { ...coordinator.view(), modelHub: await coordinator.modelHub.getView() };
+          case 'model-hub': return await coordinator.modelHub.getView();
+          case 'model-configure': return await coordinator.configureModels({
+            providerId: command.providerId === undefined ? undefined : text(command.providerId, 'providerId', 64),
+            providerName: command.providerName === undefined ? undefined : text(command.providerName, 'providerName', 80),
+            enabled: command.enabled === undefined ? undefined : Boolean(command.enabled),
+            apiKey: command.apiKey === undefined ? undefined : String(command.apiKey),
+            clearApiKey: command.clearApiKey === undefined ? undefined : Boolean(command.clearApiKey),
+            baseUrl: command.baseUrl === undefined ? undefined : String(command.baseUrl),
+            customModels: Array.isArray(command.customModels) ? command.customModels.map(m => text(m, 'customModel', 128)) : undefined,
+            routerProvider: command.routerProvider === undefined ? undefined : text(command.routerProvider, 'routerProvider', 64),
+            routerModel: command.routerModel === undefined ? undefined : text(command.routerModel, 'routerModel', 128),
+            workerProvider: command.workerProvider === undefined ? undefined : text(command.workerProvider, 'workerProvider', 64),
+            fastModel: command.fastModel === undefined ? undefined : String(command.fastModel),
+            balancedModel: command.balancedModel === undefined ? undefined : String(command.balancedModel),
+            strongModel: command.strongModel === undefined ? undefined : String(command.strongModel),
+          });
+          case 'model-probe': return await coordinator.modelHub.probe({
+            provider: command.provider === undefined ? undefined : text(command.provider, 'provider', 64),
+            model: text(command.model, 'model', 128),
+            prompt: command.prompt === undefined ? undefined : text(command.prompt, 'prompt', 1024),
+            apiKey: command.apiKey === undefined ? undefined : String(command.apiKey),
+            baseUrl: command.baseUrl === undefined ? undefined : String(command.baseUrl),
+          });
+          case 'model-fetch': return await coordinator.modelHub.fetchModels({
+            providerId: text(command.providerId ?? command.provider, 'providerId', 64),
+            apiKey: command.apiKey === undefined ? undefined : String(command.apiKey),
+            baseUrl: command.baseUrl === undefined ? undefined : String(command.baseUrl),
+          });
           case 'chat': {
             const files = command.files ?? [];
             if (!Array.isArray(files) || !files.every(file => typeof file === 'string')) throw new Error('files must be a string array');
@@ -87,10 +116,105 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
           case 'stop': return coordinator.stop(text(command.taskId, 'taskId', 128));
           case 'resume': return coordinator.resume(text(command.taskId, 'taskId', 128), integer(command.limitMs, 600_000, 100, 86_400_000));
           case 'timer-list': return store.listTimers();
-          case 'timer-add': return coordinator.addTimer(text(command.name ?? '定时任务', 'name', 120), text(command.instruction, 'instruction'),
-            integer(command.intervalMs, 60_000, 1_000, 604_800_000), command.cwd === undefined ? undefined : text(command.cwd, 'cwd', 4096));
+          case 'timer-add': return coordinator.addTimer(
+            text(command.name ?? (command.once || command.delayMs !== undefined ? '定时提醒' : '定时任务'), 'name', 120),
+            text(command.instruction ?? (command.plugin ? `执行插件 ${String(command.plugin)}/${String(command.pluginAction ?? 'status')}` : '定时巡检'), 'instruction'),
+            integer(command.intervalMs ?? (typeof command.intervalSeconds === 'number' ? Math.round(command.intervalSeconds * 1000) : undefined), 60_000, 500, 604_800_000),
+            command.cwd === undefined ? undefined : text(command.cwd, 'cwd', 4096),
+            undefined,
+            {
+              dailyAt: command.dailyAt === undefined ? undefined : text(command.dailyAt, 'dailyAt', 16),
+              delayMs: command.delayMs === undefined ? undefined : integer(command.delayMs, 60_000, 500, 604_800_000),
+              once: command.once === undefined ? undefined : Boolean(command.once),
+              plugin: command.plugin === undefined ? undefined : text(command.plugin, 'plugin', 64),
+              pluginAction: command.pluginAction === undefined ? undefined : text(command.pluginAction, 'pluginAction', 64),
+              deliverChannelId: command.deliverChannelId === undefined ? undefined : text(command.deliverChannelId, 'deliverChannelId', 128),
+              deliverTarget: command.deliverTarget === undefined ? undefined : text(command.deliverTarget, 'deliverTarget', 128),
+            },
+          );
           case 'timer-toggle': return coordinator.toggleTimer(text(command.id, 'id', 128), Boolean(command.enabled));
           case 'timer-remove': return { removed: coordinator.removeTimer(text(command.id, 'id', 128)) };
+          case 'plugin-list': return await listPlugins(home);
+          case 'plugin-run': return await runPlugin(
+            home,
+            text(command.plugin, 'plugin', 64),
+            command.action === undefined ? 'status' : text(command.action, 'action', 64),
+            command.args && typeof command.args === 'object' && !Array.isArray(command.args) ? command.args as Record<string, unknown> : {},
+          );
+          case 'memory-list': return store.listMemories({
+            includeSuperseded: Boolean(command.includeSuperseded),
+            cwd: command.cwd === undefined ? undefined : text(command.cwd, 'cwd', 4096),
+            topic: command.topic === undefined ? undefined : text(command.topic, 'topic', 160),
+            limit: integer(command.limit, 100, 1, 500),
+          });
+          case 'memory-search': {
+            const scope = command.scope === undefined ? 'all' : text(command.scope, 'scope', 32);
+            if (!['all', 'memories', 'works', 'messages'].includes(scope)) throw new Error('Invalid search scope');
+            return store.searchContext({
+              query: text(command.query, 'query', 512),
+              scope: scope as 'all' | 'memories' | 'works' | 'messages',
+              cwd: command.cwd === undefined ? undefined : text(command.cwd, 'cwd', 4096),
+              limit: integer(command.limit, 12, 1, 50),
+              includeSuperseded: Boolean(command.includeSuperseded),
+            });
+          }
+          case 'memory-save': return store.saveMemory({
+            id: command.id === undefined ? undefined : text(command.id, 'id', 128),
+            topic: text(command.topic, 'topic', 160),
+            content: text(command.content, 'content', 8192),
+            tags: Array.isArray(command.tags) ? command.tags.map(tag => text(tag, 'tag', 64)) : undefined,
+            cwd: command.cwd === undefined ? undefined : text(command.cwd, 'cwd', 4096),
+            sourceTaskId: command.sourceTaskId === undefined ? undefined : text(command.sourceTaskId, 'sourceTaskId', 128),
+            supersedeId: command.supersedeId === undefined ? undefined : text(command.supersedeId, 'supersedeId', 128),
+            pinned: command.pinned === undefined ? undefined : Boolean(command.pinned),
+            linkedMemoryIds: Array.isArray(command.linkedMemoryIds) ? command.linkedMemoryIds.map(id => text(id, 'linkedMemoryId', 128)) : undefined,
+          });
+          case 'memory-link': return store.linkMemories(
+            text(command.id, 'id', 128),
+            text(command.targetId, 'targetId', 128),
+            'explicit',
+          );
+          case 'memory-pin': return store.pinMemory(text(command.id, 'id', 128), command.pinned === undefined ? true : Boolean(command.pinned));
+          case 'memory-remove': return { removed: store.deleteMemory(text(command.id, 'id', 128)) };
+          case 'im-list': return coordinator.im.listChannels();
+          case 'im-save': {
+            const platform = text(command.platform, 'platform', 32);
+            if (!['telegram', 'dingtalk', 'wechat'].includes(platform)) throw new Error('Invalid IM platform');
+            return coordinator.im.saveChannel({
+              id: command.id === undefined ? undefined : text(command.id, 'id', 128),
+              platform: platform as 'telegram' | 'dingtalk' | 'wechat',
+              name: text(command.name, 'name', 120),
+              enabled: command.enabled === undefined ? undefined : Boolean(command.enabled),
+              notifyAll: command.notifyAll === undefined ? undefined : Boolean(command.notifyAll),
+              botToken: command.botToken === undefined ? undefined : String(command.botToken),
+              webhookUrl: command.webhookUrl === undefined ? undefined : String(command.webhookUrl),
+              secret: command.secret === undefined ? undefined : String(command.secret),
+              defaultTarget: command.defaultTarget === undefined ? undefined : String(command.defaultTarget),
+              allowedSenders: Array.isArray(command.allowedSenders) ? command.allowedSenders.map(s => String(s)) : undefined,
+              apiBase: command.apiBase === undefined ? undefined : String(command.apiBase),
+              pollIntervalMs: command.pollIntervalMs === undefined ? undefined : integer(command.pollIntervalMs, 1500, 100, 300_000),
+            });
+          }
+          case 'im-toggle': return coordinator.im.toggleChannel(text(command.id, 'id', 128), Boolean(command.enabled));
+          case 'im-remove': return { removed: coordinator.im.removeChannel(text(command.id, 'id', 128)) };
+          case 'im-test': return await coordinator.im.testChannel(text(command.id, 'id', 128), command.text === undefined ? undefined : String(command.text));
+          case 'im-wechat-qr-start': return await coordinator.im.startWechatQrLogin({
+            id: command.id === undefined ? undefined : text(command.id, 'id', 128),
+            name: command.name === undefined ? undefined : text(command.name, 'name', 120),
+            apiBase: command.apiBase === undefined ? undefined : String(command.apiBase),
+            notifyAll: command.notifyAll === undefined ? undefined : Boolean(command.notifyAll),
+            allowedSenders: Array.isArray(command.allowedSenders) ? command.allowedSenders.map(s => String(s)) : undefined,
+          });
+          case 'im-wechat-qr-status': return await coordinator.im.pollWechatQrLogin(
+            text(command.sessionId ?? command.id, 'sessionId', 256),
+          );
+          case 'im-webhook': return await coordinator.im.handleWebhook(
+            text(command.channelId, 'channelId', 128),
+            text(command.method ?? 'POST', 'method', 16),
+            new URLSearchParams(typeof command.query === 'string' ? command.query : ''),
+            (command.headers && typeof command.headers === 'object' && !Array.isArray(command.headers) ? command.headers : {}) as Record<string, string | string[] | undefined>,
+            typeof command.rawBody === 'string' ? command.rawBody : '',
+          );
           case 'get': {
             const task = store.get(text(command.taskId, 'taskId', 128));
             return { ...task, operations: store.operations(task.id).map(({ result: _result, ...metadata }) => metadata),

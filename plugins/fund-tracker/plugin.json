@@ -1,0 +1,39 @@
+{
+  "name": "fund-tracker",
+  "title": "基金持仓与收益监控",
+  "description": "独立基金持仓管理、盘中多源实时估值（12:00）与晚间正式净值结算（21:30）插件。使用 Node 22 内置 node:sqlite 与 fetch，零外部依赖。",
+  "entry": "index.mjs",
+  "actions": ["status", "noon", "settle", "init", "set-holding"],
+  "actionSpecs": [
+    {
+      "name": "status",
+      "label": "实时持仓状态",
+      "description": "随时拉取最新正式净值与盘中指数/ETF行情，计算当前总资产、当日预估盈亏与累计收益（不受周末静默限制）。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "noon",
+      "label": "12:00 午间盘中估值",
+      "description": "交易日 12:00 触发：基于上一交易日正式净值 + 腾讯实时行情（恒生科技/卫星ETF/标普500/黄金ETF/有色ETF/纳指100 × 0.95 仓位系数）计算盘中估值；周末默认静默跳过，传 force:true 可强制输出。",
+      "defaultArgs": { "force": true }
+    },
+    {
+      "name": "settle",
+      "label": "21:30 晚间正式结算",
+      "description": "交易日 21:30 触发：从东方财富拉取当日最新正式单位净值入库结算，区分已出当日净值基金与 QDII 待更新基金；周末默认静默跳过，传 force:true 可强制输出。",
+      "defaultArgs": { "force": true }
+    },
+    {
+      "name": "init",
+      "label": "初始化/同步净值库",
+      "description": "初始化 7 只基金默认持仓（总成本 29,020 元，其中 018168 成本 720 元）并同步东方财富近期历史净值。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "set-holding",
+      "label": "修改单只基金份额/成本",
+      "description": "按基金代码更新持仓成本 (cost)、持有份额 (shares) 或基准净值日期 (navDate，传入后自动反推份额)。",
+      "defaultArgs": { "code": "018168", "cost": 720, "shares": 322.779, "navDate": "2026-11-09" }
+    }
+  ]
+}

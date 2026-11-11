@@ -249,7 +249,7 @@ test('a stop during Router delivery keeps the public text already shown and mark
     let workId = '';
     await until(() => (workId = coordinator.store.list()[0]?.id ?? '', Boolean(workId) && coordinator.store.get(workId).status === 'running'));
     const conversation = coordinator.store.conversation;
-    await until(() => conversation.history(undefined, 20).items.some(item => item.replyTo === message.id && item.text.length > 0));
+    await until(() => conversation.history(undefined, 20).items.some(item => item.replyTo === message.id && item.text === streamed));
     coordinator.stop(workId);
     await until(() => coordinator.store.get(workId).status === 'cancelled');
     const reply = conversation.history(undefined, 20).items.find(item => item.replyTo === message.id && item.text === streamed);

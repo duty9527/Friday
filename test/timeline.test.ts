@@ -32,7 +32,7 @@ test('a readable step exists for every recorded call, with same-named tools kept
     event({ spanId: 't3', parentSpanId: 'turn', kind: 'operation', label: '本机工具 · bash', actor: 'worker', status: 'failed', data: { error: '命令退出码 255' } }),
   ]);
   assert.deepEqual(steps.map(step => step.title), [
-    'Router 处理新输入', 'Router 判断', '搜索内容', '搜索内容', '执行命令',
+    'F.R.I.D.A.Y. 处理新输入', 'F.R.I.D.A.Y. 判断', '搜索内容', '搜索内容', '执行命令',
   ]);
   const toolEnd = steps[0]!;
   assert.equal(toolEnd.summary, undefined, 'a request start records no invented reasoning');
@@ -52,7 +52,7 @@ test('the model round carries its public statement, folded stream text and its o
     event({ spanId: 'followup', parentSpanId: 'route', kind: 'followup_state', label: '处理补充要求', actor: 'worker',
       status: 'done', data: { state: 'done', taskLabel: 'artex 架构对比' } }),
   ]);
-  assert.deepEqual(steps.map(step => step.title), ['Router 判断', '新建工作', '处理补充要求'],
+  assert.deepEqual(steps.map(step => step.title), ['F.R.I.D.A.Y. 判断', '新建工作', '处理补充要求'],
     'the raw tool call and its confirmed routing action are one readable step');
   assert.equal(steps[1]!.taskLabel, 'artex 架构对比');
   assert.equal(steps[1]!.summary, '按路径新建执行');
@@ -93,9 +93,9 @@ test('a work\'s process starts at the Router decision that created it', async ()
     assert.deepEqual(scoped.filter(event => event.kind === 'span' || event.kind === 'route_action').map(event => event.spanId),
       ['router-turn', 'route', 'worker-turn'], 'the work view includes the Router turn that created it, in recorded order');
     const steps = timelineSteps(scoped);
-    assert.equal(steps[0]!.title, 'Router 判断');
+    assert.equal(steps[0]!.title, 'F.R.I.D.A.Y. 判断');
     assert.equal(steps[1]!.title, '新建工作');
-    assert.deepEqual(steps.map(step => step.title), ['Router 判断', '新建工作', '后台工作状态变化', 'Worker 推理']);
+    assert.deepEqual(steps.map(step => step.title), ['F.R.I.D.A.Y. 判断', '新建工作', '后台工作状态变化', 'Worker 推理']);
     assert.equal(steps.at(-1)!.actor, 'worker');
     store.close();
   } finally { await rm(home, { recursive: true, force: true }); }

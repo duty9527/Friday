@@ -59,7 +59,8 @@ export class Conversation {
   }
   create(message: Omit<ChatMessage, 'seq' | 'version' | 'at' | 'taskIds'>): ChatMessage {
     return this.atomic(() => {
-      const body = { ...message, at: Date.now() };
+      const origin = message.origin ?? (message.replyTo ? this.get(message.replyTo).origin : undefined);
+      const body = { ...message, origin, at: Date.now() };
       this.db.prepare('INSERT INTO messages(id,request_id,body) VALUES(?,?,?)').run(body.id, body.requestId ?? null, JSON.stringify(body));
       this.emit({ type: 'message', kind: 'message_created', rootId: body.replyTo ?? body.id, messageId: body.id,
         spanId: body.role === 'user' ? body.id : undefined,
@@ -67,7 +68,7 @@ export class Conversation {
       return this.get(body.id);
     });
   }
-  update(id: string, patch: Partial<Pick<ChatMessage, 'text' | 'status' | 'reason' | 'routing'>>) {
+  update(id: string, patch: Partial<Pick<ChatMessage, 'text' | 'status' | 'reason' | 'routing' | 'origin' | 'paths' | 'attachments'>>) {
     return this.atomic(() => {
       const message = { ...this.get(id), ...patch };
       if (message.text.length > 65_536) throw new Error('Message exceeds 65536 character limit');
@@ -76,6 +77,12 @@ export class Conversation {
         spanId: message.role === 'user' ? id : undefined,
         actor: message.role === 'user' ? 'user' : 'router', label: message.role === 'user' ? '用户消息' : 'Router 公开回复', status: message.status });
       return message;
+    });
+  }
+  delete(id: string) {
+    this.atomic(() => {
+      this.db.prepare('DELETE FROM message_tasks WHERE message_id=?').run(id);
+      this.db.prepare('DELETE FROM messages WHERE id=?').run(id);
     });
   }
   routeAction(messageId: string, action: RouteAction, parentSpanId?: string) {
@@ -126,6 +133,18 @@ export class Conversation {
   }
   recentContext(): unknown[] {
     return this.history(undefined, 12).items.map(({ id, role, text, mode, status, taskIds, paths }) => ({ id, role, mode, text: text.slice(-4096), truncated: text.length > 4096, status, taskIds, fileCount: paths.length }));
+  }
+  allMessages(limit = 500): ChatMessage[] {
+    const rows = this.db.prepare('SELECT seq,body FROM messages ORDER BY seq DESC LIMIT ?').all(limit);
+    return rows.map(row => this.decode(row));
+  }
+  neighbors(seq: number, radius = 1): Array<{ id: string; seq: number; role: 'user' | 'assistant'; preview: string }> {
+    const prev = this.db.prepare('SELECT seq,body FROM messages WHERE seq<? ORDER BY seq DESC LIMIT ?').all(seq, radius).reverse();
+    const next = this.db.prepare('SELECT seq,body FROM messages WHERE seq>? ORDER BY seq ASC LIMIT ?').all(seq, radius);
+    return [...prev, ...next].map(row => {
+      const msg = this.decode(row);
+      return { id: msg.id, seq: msg.seq, role: msg.role, preview: String(publicData(msg.text.slice(0, 240))) };
+    });
   }
   /**
    * `after` reads forward for live updates, `before` reads the window that precedes a known event,

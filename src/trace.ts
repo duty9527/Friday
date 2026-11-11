@@ -64,7 +64,11 @@ export class PromptTrace {
   }
   async run(agent: AgentPort, input: string, signal: AbortSignal): Promise<string> {
     this.active = true;
-    this.chat.span({ ...this.context, spanId: this.id }, this.actor, 'Agent 请求', 'started', { mode: this.mode, input: boundedTraceData(JSON.parse(input)), trigger: this.trigger(input) });
+    const rawInput = JSON.parse(input);
+    const publicInput = rawInput && typeof rawInput === 'object' && !Array.isArray(rawInput) && 'subconscious' in rawInput
+      ? (({ subconscious: _subconscious, ...rest }) => rest)(rawInput as Record<string, unknown>)
+      : rawInput;
+    this.chat.span({ ...this.context, spanId: this.id }, this.actor, 'Agent 请求', 'started', { mode: this.mode, input: boundedTraceData(publicInput), trigger: this.trigger(input) });
     try {
       const result = await agent.prompt(input, signal);
       if (signal.aborted) throw signal.reason;

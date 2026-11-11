@@ -33,7 +33,7 @@ implements: [super-agent-goals]
 
 本地 Web 由 CLI 的 `web` 子命令启动，只绑定 127.0.0.1，通过随机访问令牌（URL 片段引导、会话存储、请求头携带）和 Host/Origin/同站校验限制访问，静态资源受 CSP 约束，模型凭据不进入浏览器；Web 只是 Unix Socket 的桥接客户端，关闭浏览器或桥接进程不停止协调服务与后台工作。
 
-定时器、Watchdog、受控副本自动回写、敏感审批、TUI 和外部信道未实现；native 的直接文件修改已开放，不等于实现下文的冲突检测和原子发布协议。
+已实现三层全息记忆（L0 元记忆目录、L2 语义记忆卡片与新陈代谢/置顶/艾宾浩斯提取强化/海马体自动任务巩固、L1 情景对话与任务混合检索）、潜意识记忆闪回（`autoRecalled`）、双过程潜意识睡眠巩固与只读 REM 联想做梦、上下文编译器与同目录多 Worker 态势感知（`concurrentPeers`）、战术中途请示与零时限损耗原会话拍板续跑（`ASK_BOSS` / `WORKER_QUESTION`）、异构专职子 AI 画像（`coding` / `research` / `review` / `general`）、暂停恢复（`resume`）、持久化周期与一次性倒计时定时器（`timers`，含 `once` / `delayMs`）、凭据隔离插件运行时（内置 `system-pulse` 与 `fund-tracker`，支持 `<home>/plugins` 自进化扩展）、独立 Watchdog 监护、交互式 TUI、多信道带宽自适应的 OpenClaw 风格全渠道 IM 接入（钉钉 `dingtalk` / 微信 `wechat` / Telegram `telegram` 双向对话与后台结果主动推送）。受控副本自动回写和 OS 级沙箱尚未实现；native 的直接文件修改已开放，不等于实现下文的冲突检测和原子发布协议。
 
 ## 运行拓扑与依赖
 

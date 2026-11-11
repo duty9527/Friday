@@ -1,8 +1,39 @@
-# Super-agent
+# FRIDAY · Super-agent 全息记忆主脑与异构子 AI 协同系统
 
-本地常驻、具有完整本机编码工具的 Router/Worker Agent。用户只面对**一个持续对话**：交流、追加要求、派发新工作都在同一处，后台多个 Worker 并发执行，右侧展示可回看的执行轨迹。
+本地常驻、拥有**三层人脑全局记忆（L0 元记忆目录 + L2 语义记忆卡片 + L1 情景对话/任务全量库）**与完整本机编码工具的 Router/Worker Agent（代号 **FRIDAY**）。用户只面对**一个持续对话**：主脑 Router 自动进行潜意识记忆闪回（Subconscious Memory Flashback）、跨上下文联想检索、编译无歧义的执行简报（Context Brief），并按需调度不同专精画像的后台子 AI（`coding` / `research` / `review` / `general`）并发执行，右侧实时展示可回溯的因果与逐步轨迹。
 
-**真实模式默认开放受信任本机工具：read / ls / find / grep / bash / edit / write。** 可以按需搜索读取、修改真实文件、执行命令和测试，无需附件。命令以服务账号运行，工作目录不是沙箱，可访问目录外、联网、安装依赖和执行破坏性操作；没有逐条审批、自动回滚或同目录并发写入保护。离线模拟仍为只读副本流程。尚无定时任务、Watchdog、TUI 或自动发现 MCP/扩展。目标和实现边界见 [目标规格](goal-and-requirements.md) 与 [架构规格](architecture.md)。
+**真实模式默认开放受信任本机工具：read / ls / find / grep / bash / edit / write。** 可以按需搜索读取、修改真实文件、执行命令和测试，无需附件。命令以服务账号运行，工作目录不是沙箱，可访问目录外、联网、安装依赖和执行破坏性操作；没有逐条审批、自动回滚或同目录并发写入保护。离线模拟仍为只读副本流程。已内置持久化全息记忆、自主巡航定时器（Watchdog Timers）、守护进程自愈、终端 TUI 与 MCP/Skill 自动挂载。目标和实现边界见 [目标规格](goal-and-requirements.md) 与 [架构规格](architecture.md)。
+
+## FRIDAY 全息记忆与专职子 AI 体验
+
+在 Web 控制台、TUI 或 CLI 中，你可以直接体验 FRIDAY 的人脑级记忆与协同能力：
+
+- **潜意识记忆闪回（`autoRecalled`）**：每次你发言时，主脑在进入推理前会自动用你的输入检索全局语义记忆、历史 Worker 报告与历史对话，将高置信度命中直接注入本轮上下文，并在右侧“分配记录与当时上下文”中公开展示。
+- **主动记忆刻印与新陈代谢（`save_memory`）**：主脑可随时将架构约定、用户偏好、关键修复结论沉淀为持久化 `MemoryCard`。同一 `topic + cwd` 更新时自动标记旧卡片 `supersededBy`，实现记忆新陈代谢（不篡改旧账本，同时避免过期结论污染检索）。
+- **跨源联想检索与局部性展开（`search_memory`）**：混合检索（CJK 2-gram + 关键词 + `cwd` 空间亲和度 + 时间衰减）跨 `memories`、`works`、`messages` 统一打分，命中历史对话时自动附带前后相邻消息（Neighbors）与关联工作 ID。
+- **上下文编译器与异构专职子 AI（Context Compiler & Specialist Profiles）**：主脑派发任务时支持指定 `profile`（`coding` 编码专精 / `research` 深度调研 / `review` 安全与代码审查 / `general` 通用）、异构 `model` 覆盖、`contextBrief` 与 `memoryIds`，将检索到的记忆精准编译注入给子 AI，并在同目录并发执行时实时注入同伴态势（`concurrentPeers`）。
+- **战术中途请示与原会话拍板续跑（`ASK_BOSS`）**：后台子 AI 遇到高危不可逆操作或重大业务分岔时可原地挂起向老板请示（挂起期间不消耗活跃执行时限预算，自动经由微信/Telegram/钉钉同步送达），老板在主对话随口回复拍板即可唤醒同一会话无缝推进。
+- **双过程潜意识睡眠与做梦（Subconscious Sleep & Dreaming）**：静默空闲且积累未消化经历时按昼夜节律随机进入浅睡突触稳态修剪或只读 REM 跨领域联想，随时可被老板消息瞬时惊醒。
+- **一次性准点提醒与自进化插件工坊（`system-pulse` & `<home>/plugins`）**：内置零外部依赖主机/Git 脉搏诊断与异常静默巡航插件 `system-pulse`，支持 `--delay-ms` / `--once` 零 Token 准点提醒，并支持在数据目录动态锻造与凭据隔离运行新插件。
+- **离线模拟快捷指令**：在 `--mode offline` 下，直接发送 `记住：主题=内容`、`搜索记忆：关键词`、`派发：任务描述`、`提醒：5秒后 事项`、`定时：指令` 即可端到端体验记忆刻印、联想闪回、专职子 AI 派发、一次性提醒与自主巡航定时器。
+
+```sh
+# CLI 全息记忆管理
+node dist/cli.js memory save --topic "鉴权规范" "统一采用 Ed25519 双令牌机制" --tag auth --pinned --home "$HOME/.super-agent-demo"
+node dist/cli.js memory list --home "$HOME/.super-agent-demo"
+node dist/cli.js memory search "Ed25519 鉴权" --home "$HOME/.super-agent-demo"
+node dist/cli.js memory remove MEMORY_ID --home "$HOME/.super-agent-demo"
+
+# OpenClaw 风格全渠道 IM 接入（钉钉 / 微信 / Telegram，共享同一个主脑与全局记忆）
+node dist/cli.js im add --platform dingtalk --name "钉钉随身管家" --webhook-url "https://oapi.dingtalk.com/robot/send?access_token=..." --secret "SEC..." --allow "staffId" --home "$HOME/.super-agent-demo"
+node dist/cli.js im add --platform wechat --name "微信随身副手" --webhook-url "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..." --secret "TOKEN..." --home "$HOME/.super-agent-demo"
+node dist/cli.js im add --platform telegram --name "Telegram 管家" --bot-token "123456:ABC..." --allow "@your_username" --home "$HOME/.super-agent-demo"
+node dist/cli.js im list --home "$HOME/.super-agent-demo"
+node dist/cli.js im test CHANNEL_ID "你好，我是 FRIDAY" --home "$HOME/.super-agent-demo"
+
+# 启动 FRIDAY 交互式终端 TUI（支持 /memories, /search, /remember, /im, /works, /timers）
+node dist/cli.js tui --home "$HOME/.super-agent-demo"
+```
 
 ## 主对话与执行轨迹
 
@@ -87,6 +118,16 @@ node dist/cli.js stop TASK_ID --home "$HOME/.super-agent-demo"
 
 ```sh
 node dist/cli.js serve --mode real --home "$HOME/.super-agent-real"
+```
+
+也可以使用 PI SDK 内置的官方 `Sign in with ChatGPT`（`openai` OAuth）授权登录，无需配置 `SUPER_AGENT_API_KEY`（凭据与设备 ID 保存在对应 `--home` 下的 `sdk/auth.json` 和 `sdk/settings.json`）：
+
+```sh
+node dist/cli.js login openai --home "$HOME/.super-agent-real"
+# 登录成功后直接启动（默认使用 openai / gpt-6.1-sol，也可通过 SUPER_AGENT_MODEL 指定如 gpt-6.1-terra）
+node dist/cli.js serve --mode real --home "$HOME/.super-agent-real"
+# 退出登录
+node dist/cli.js logout openai --home "$HOME/.super-agent-real"
 ```
 
 真实模式中，明确指定的文件内容会发送给配置的模型供应商。请只选择你允许发送的文件；不要把凭据或隐私文件当演示输入。

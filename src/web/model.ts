@@ -19,13 +19,17 @@ export function orderConversation<T extends Pick<ChatMessage, 'seq'>>(items: Ite
 
 export function routeLabel(action: Pick<RouteAction, 'kind'>): string {
   return { new_work: '新建工作', followup: '补充已有工作（未新建）', related_work: '关联新执行（新建工作）',
-    inspect: '查询工作', stop: '请求停止工作', resume: '恢复暂停工作', recall: '回看历史', timer: '管理定时任务', reply: '仅回复（未派发后台工作）' }[action.kind];
+    inspect: '查询工作', stop: '请求停止工作', resume: '恢复暂停工作', recall: '回看历史',
+    search_memory: '检索全局记忆', save_memory: '沉淀长期记忆', timer: '管理定时任务', plugin: '执行功能插件', send_file: '发送微信附件', switch_channel: '切换回复通道', reply: '仅回复（未派发后台工作）' }[action.kind];
 }
 export function routeState(action: Pick<RouteAction, 'status' | 'kind' | 'delivery'>): string {
   if (action.status !== 'accepted') return { pending: '正在处理，尚未受理', failed: '动作失败', interrupted: '进度未确认' }[action.status];
   if (action.kind === 'followup') return { pending: '已受理，等待 Worker 处理', processing: 'Worker 正在处理补充',
     done: 'Worker 已处理补充，结果另行交付', failed: '补充要求未确认处理' }[action.delivery ?? 'pending'] ?? '已受理，处理状态未记录';
-  return action.kind === 'reply' ? 'Router 已回复' : action.kind === 'inspect' || action.kind === 'recall' ? '查询已完成' : '已受理';
+  return action.kind === 'reply' ? 'F.R.I.D.A.Y. 已回复'
+    : action.kind === 'inspect' || action.kind === 'recall' || action.kind === 'search_memory' ? '查询已完成'
+    : action.kind === 'save_memory' ? '记忆已更新'
+    : '已受理';
 }
 
 export interface TimelineStep {
@@ -40,15 +44,16 @@ const WORKER_TOOLS: Record<string, string> = {
   read: '读取文件', ls: '列出目录', find: '查找文件', grep: '搜索内容', bash: '执行命令',
   edit: '修改文件', write: '写入文件', start_read: '读取文件副本',
 };
-const ROUTER_TOOLS = new Set(['start_work', 'continue_work', 'inspect_work', 'stop_work', 'resume_work', 'recall_messages', 'manage_timer', 'dispatch_worker']);
+const ROUTER_TOOLS = new Set(['start_work', 'continue_work', 'inspect_work', 'stop_work', 'resume_work', 'recall_messages', 'search_memory', 'save_memory', 'manage_timer', 'run_plugin', 'send_file', 'switch_channel', 'dispatch_worker']);
 const NOT_A_STEP = new Set(['visible_text', 'thinking', 'work_linked']);
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 const TRIGGER_TITLES: Record<string, [string, string]> = {
-  CHAT: ['Router 处理新输入', 'Worker 接收任务'], WORKER_REPORT: ['Router 汇总 Worker 结果', 'Worker 汇报结果'],
-  NEW_TASK: ['Router 派发任务', 'Worker 接收任务'], FOLLOWUP: ['Router 汇总后台变化', 'Worker 处理补充要求'],
-  READ_COMPLETIONS: ['Router 汇总后台变化', 'Worker 处理读取结果'], TASK: ['Router 派发任务', 'Worker 接收任务'],
+  CHAT: ['F.R.I.D.A.Y. 处理新输入', 'Worker 接收任务'], WORKER_REPORT: ['F.R.I.D.A.Y. 汇总 Worker 结果', 'Worker 汇报结果'],
+  WORKER_QUESTION: ['F.R.I.D.A.Y. 转达关键请示', 'Worker 请求老板拍板'], BOSS_DECISION: ['F.R.I.D.A.Y. 传达老板拍板', 'Worker 接收拍板继续执行'],
+  NEW_TASK: ['F.R.I.D.A.Y. 派发任务', 'Worker 接收任务'], FOLLOWUP: ['F.R.I.D.A.Y. 汇总后台变化', 'Worker 处理补充要求'],
+  READ_COMPLETIONS: ['F.R.I.D.A.Y. 汇总后台变化', 'Worker 处理读取结果'], TASK: ['F.R.I.D.A.Y. 派发任务', 'Worker 接收任务'],
 };
 function triggerKind(data: unknown): string | undefined {
   const trigger = record(record(data).trigger).kind;
@@ -57,18 +62,18 @@ function triggerKind(data: unknown): string | undefined {
 function stepTitle(event: TraceEvent, trigger?: string): string {
   if (event.kind === 'route_action') {
     const action = record(event.data) as unknown as RouteAction;
-    return action.kind ? routeLabel(action) : 'Router 调度动作';
+    return action.kind ? routeLabel(action) : 'F.R.I.D.A.Y. 调度动作';
   }
   if (event.kind === 'followup_state') return '处理补充要求';
   if (event.label === 'Agent 请求') {
     const titles = trigger ? TRIGGER_TITLES[trigger] : undefined;
     if (titles) return event.actor === 'router' ? titles[0] : titles[1];
-    return event.actor === 'router' ? 'Router 处理输入' : 'Worker 执行任务';
+    return event.actor === 'router' ? 'F.R.I.D.A.Y. 处理输入' : 'Worker 执行任务';
   }
   if (event.kind === 'task_state') return '后台工作状态变化';
-  if (event.label === '模型推理调用') return event.actor === 'router' ? 'Router 判断' : 'Worker 推理';
+  if (event.label === '模型推理调用') return event.actor === 'router' ? 'F.R.I.D.A.Y. 判断' : 'Worker 推理';
   if (event.kind === 'operation') return event.label;
-  if (ROUTER_TOOLS.has(event.label)) return event.actor === 'router' ? 'Router 调度后台工作' : event.label;
+  if (ROUTER_TOOLS.has(event.label)) return event.actor === 'router' ? 'F.R.I.D.A.Y. 调度后台工作' : event.label;
   return WORKER_TOOLS[event.label] ?? event.label;
 }
 function stepError(event: TraceEvent): string | undefined {

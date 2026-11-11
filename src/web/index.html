@@ -4,67 +4,484 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>Super-agent · 持续对话</title>
+  <title>F.R.I.D.A.Y. · 持续对话</title>
   <link rel="stylesheet" href="/style.css">
   <script type="module" src="/client.js"></script>
 </head>
 <body>
   <header class="topbar">
-    <div class="brand"><span class="mark" aria-hidden="true">↳</span> Super-agent</div>
-    <button id="work-toggle" class="fold-control" type="button" aria-expanded="false" aria-controls="work-sidebar">后台工作</button>
-    <span class="workspace meta">本机工作区 · 编码 Agent</span>
+    <div class="brand"><span class="mark" aria-hidden="true">↳</span> F.R.I.D.A.Y.</div>
+    <button id="work-toggle" class="fold-control" type="button" aria-expanded="false" aria-controls="work-sidebar">任务列表</button>
+    <div class="topbar-hub-bar" role="toolbar" aria-label="系统功能中心">
+      <button id="open-memory-hub-top" class="hub-pill-btn" type="button">
+        <span class="hub-pill-icon" aria-hidden="true">🧠</span>
+        <span>全息记忆</span>
+        <span id="memory-top-badge" class="hub-pill-badge">0</span>
+      </button>
+      <button id="open-timer-hub-top" class="hub-pill-btn" type="button">
+        <span class="hub-pill-icon" aria-hidden="true">⏱️</span>
+        <span>定时巡检</span>
+        <span id="timer-top-badge" class="hub-pill-badge">0</span>
+      </button>
+      <button id="open-plugin-hub-top" class="hub-pill-btn" type="button">
+        <span class="hub-pill-icon" aria-hidden="true">🔌</span>
+        <span>功能插件</span>
+        <span id="plugin-top-badge" class="hub-pill-badge">0</span>
+      </button>
+      <button id="open-im-hub-top" class="hub-pill-btn" type="button">
+        <span class="hub-pill-icon" aria-hidden="true">📱</span>
+        <span>IM 接入</span>
+        <span id="im-top-badge" class="hub-pill-badge">0</span>
+      </button>
+      <button id="open-model-hub-top" class="hub-pill-btn" type="button">
+        <span class="hub-pill-icon" aria-hidden="true">⚙️</span>
+        <span>模型与提供方</span>
+        <span id="model-top-badge" class="hub-pill-badge">—</span>
+      </button>
+    </div>
     <span id="mode" class="mode meta">正在连接</span>
   </header>
   <div class="app">
-    <aside id="work-sidebar" class="sidebar" aria-label="后台工作">
-      <div class="sidebar-intro"><strong>一个持续在线的 Agent</strong><p class="meta">上下文由系统维护</p></div>
-      <h2 class="sidebar-label">后台工作 · 最近 80 项</h2>
-      <p class="meta sidebar-hint">查看只改变轨迹，不切换对话</p>
-      <label class="filter-label" for="work-filter">工作筛选</label>
-      <select id="work-filter"><option value="all">全部工作</option><option value="active">进行中</option><option value="settled">已结束 / 暂停</option></select>
-      <div id="works" class="works"><p class="empty">正在读取后台工作…</p></div>
-      <p class="sidebar-bottom meta">本机持久化 · 断开页面不停止工作<br>模型以实际配置为准<br>页面不接收 SDK 凭据</p>
+    <aside id="work-sidebar" class="sidebar" aria-label="任务列表">
+      <h2 class="sidebar-label">任务列表</h2>
+      <select id="work-filter" aria-label="任务筛选"><option value="all">全部任务</option><option value="active">进行中</option><option value="settled">已结束 / 暂停</option></select>
+      <div id="works" class="works"><p class="empty">正在读取任务…</p></div>
     </aside>
     <main class="sheet">
       <div class="titlebar">
-        <div><h1>与 Super-agent 对话</h1><p class="meta">同一个 Agent · 多项工作并行推进</p></div>
-        <button id="stop-work" type="button" disabled>停止选中的工作</button>
+        <h1>与 F.R.I.D.A.Y. 对话</h1>
+        <button id="stop-work" type="button" disabled>停止选中任务</button>
       </div>
-      <div class="connection-bar" role="status" aria-live="polite"><span id="connection">正在连接本机服务…</span><button id="reconnect" type="button">重新连接</button></div>
+      <div class="connection-bar" role="status" aria-live="polite"><span id="connection">正在连接…</span><button id="reconnect" type="button">重新连接</button></div>
       <div class="panel-nav" aria-label="面板导航"><button id="show-chat" type="button" aria-pressed="true">主对话</button><button id="show-trace" type="button" aria-pressed="false">执行轨迹</button></div>
       <div id="panels" class="panels">
-        <section class="conversation" aria-label="持续主对话">
+        <section class="conversation" aria-label="主对话">
           <div id="messages-scroll" class="messages-scroll" tabindex="0" aria-label="消息记录">
             <button id="older" class="older" type="button" hidden>加载更早消息</button>
             <div id="history-error" class="error" role="status"></div>
             <div id="messages"><p class="empty">正在读取对话…</p></div>
           </div>
           <form id="composer" class="composer">
-            <label for="draft">发送给 Super-agent</label>
-            <textarea id="draft" rows="3" maxlength="16384" placeholder="直接说你的目标、补充要求，或问问之前那件事…" disabled></textarea>
-            <details id="paths-disclosure" class="paths-disclosure"><summary>工作路径提示（可选，无需附件）</summary><label for="paths">本机文件或文件夹绝对路径，每行一个</label><textarea id="paths" rows="3" spellcheck="false" placeholder="/Users/你的用户名/项目/README.md" disabled></textarea><p class="meta">可直接在对话中说明目标路径。真实模式按需读取、搜索、修改文件和执行命令，路径不是沙箱，可访问目录外，无逐条审批或自动回滚；读取的内容可能发送给模型供应商。这里仅提示初始工作位置。离线模拟仍使用只读副本，展开后最多 32 个文本文件、每个 256 KiB、合计 1 MiB。</p></details>
+            <textarea id="draft" rows="3" maxlength="16384" placeholder="输入指令或问题…" aria-label="消息输入" disabled></textarea>
+            <details id="paths-disclosure" class="paths-disclosure"><summary>工作路径（可选）</summary><label for="paths">文件或文件夹绝对路径（每行一个）</label><textarea id="paths" rows="2" spellcheck="false" placeholder="/Users/用户名/项目/README.md" disabled></textarea></details>
             <p id="send-error" class="error" role="alert"></p>
             <div class="composer-bottom"><span class="meta">Enter 发送 · Shift + Enter 换行</span><button id="send" class="primary" type="submit" disabled>发送 ↑</button></div>
           </form>
         </section>
-        <aside class="trace" aria-label="诊断执行轨迹">
+        <aside class="trace" aria-label="执行轨迹">
           <div class="trace-heading"><h2>执行轨迹</h2><button id="clear-filter" type="button">全部轨迹</button></div>
-          <p id="trace-scope" class="meta trace-scope">全部已记录事件</p>
+          <p id="trace-scope" class="meta trace-scope">全部事件</p>
           <div class="trace-tabs" aria-label="轨迹显示方式"><button id="step-mode" class="tab active" type="button" aria-pressed="true">逐步过程</button><button id="graph-mode" class="tab" type="button" aria-pressed="false">因果线路</button><button id="timeline-mode" class="tab" type="button" aria-pressed="false">原始事件</button></div>
           <div class="trace-scroll">
             <p id="trace-error" class="error" role="status"></p>
-            <button id="trace-retry" type="button" hidden>重试读取轨迹</button>
-            <div id="trace-content" class="trace-content"><p class="empty">等待服务连接后读取实际过程。</p></div>
-            <button id="trace-more" class="trace-more" type="button" hidden>加载更多事件</button>
+            <button id="trace-retry" type="button" hidden>重试</button>
+            <div id="trace-content" class="trace-content"><p class="empty">等待读取轨迹…</p></div>
+            <button id="trace-more" class="trace-more" type="button" hidden>加载更多</button>
             <section id="routing-detail" class="routing-detail" aria-label="本次路由上下文" hidden></section>
-            <section id="event-detail" class="event-detail" aria-label="选中节点详情"><h3>节点详情</h3><p class="meta">选择节点查看公开数据与记录时间。</p></section>
-            <section id="work-detail" class="work-detail" aria-label="后台工作详情" hidden></section>
+            <section id="event-detail" class="event-detail" aria-label="选中节点详情"><h3>节点详情</h3></section>
+            <section id="work-detail" class="work-detail" aria-label="任务详情" hidden></section>
           </div>
-          <p class="trace-help meta">逐步过程按记录顺序展示 Router 的调用、公开说明与调度，以及 Worker 的每个工具动作。公开说明是模型主动给出的简短结论，不是私有思维链；未记录的说明或数据明确标为缺失。「因果线路」和「原始事件」用于核对原始记录。</p>
         </aside>
       </div>
     </main>
   </div>
-  <noscript>此本机界面需要 JavaScript。请启用后使用当前服务生成的本地启动链接。</noscript>
+  <!-- 1. 全息记忆弹窗 -->
+  <div id="memory-hub-backdrop" class="modal-backdrop" hidden>
+    <div id="memory-hub-modal" class="model-modal hub-modal" role="dialog" aria-modal="true" aria-labelledby="memory-modal-title">
+      <div class="model-modal-header">
+        <h2 id="memory-modal-title">🧠 全息记忆</h2>
+        <button id="memory-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
+      </div>
+      <div class="model-modal-body">
+        <div id="memory-kpi-grid" class="hub-kpi-grid"></div>
+
+        <section class="model-modal-section">
+          <div class="hub-toolbar">
+            <div class="hub-search-group">
+              <select id="memory-search-scope" class="hub-scope-select" aria-label="检索范围">
+                <option value="all">🌐 全部范围</option>
+                <option value="memories">🧠 仅记忆</option>
+                <option value="works">🔧 仅任务</option>
+                <option value="messages">💬 仅对话</option>
+              </select>
+              <input id="memory-search-input" type="search" placeholder="搜索记忆、任务或对话…" aria-label="搜索全局上下文">
+              <button id="memory-search-btn" class="primary" type="button">搜索</button>
+            </div>
+            <div class="hub-filter-pills" role="tablist" aria-label="记忆筛选">
+              <button id="memory-filter-all" class="hub-filter-pill active" type="button" data-filter="all">全部</button>
+              <button id="memory-filter-pinned" class="hub-filter-pill" type="button" data-filter="pinned">★ 已置顶</button>
+              <button id="memory-filter-synapse" class="hub-filter-pill" type="button" data-filter="synapse">⚡ 含突触</button>
+            </div>
+          </div>
+          <div id="memory-search-results" class="hub-search-results" hidden></div>
+        </section>
+
+        <section class="model-modal-section">
+          <details id="memory-add-details" class="hub-compose-details">
+            <summary class="hub-compose-summary">
+              <span>+ 新增 / 编辑记忆</span>
+            </summary>
+            <div class="hub-compose-body">
+              <div class="modal-form-grid">
+                <label>
+                  <span class="meta">主题</span>
+                  <input id="memory-topic-input" type="text" maxlength="160" placeholder="如：鉴权架构方案" aria-label="记忆主题">
+                </label>
+                <label>
+                  <span class="meta">标签（逗号分隔）</span>
+                  <input id="memory-tags-input" type="text" maxlength="256" placeholder="如：架构, 后端" aria-label="记忆标签">
+                </label>
+              </div>
+              <label>
+                <span class="meta">内容</span>
+                <textarea id="memory-content-input" rows="3" maxlength="4096" placeholder="输入需记住的结论、规范或偏好…" aria-label="记忆内容"></textarea>
+              </label>
+              <div class="modal-row-head">
+                <label class="hub-checkbox-label">
+                  <input id="memory-pinned-input" type="checkbox">
+                  <span>★ 置顶记忆</span>
+                </label>
+                <div class="modal-btn-group">
+                  <button id="memory-cancel-edit-btn" class="mini-button" type="button" hidden>取消</button>
+                  <button id="memory-save-btn" class="primary" type="button">保存</button>
+                </div>
+              </div>
+            </div>
+          </details>
+        </section>
+
+        <section class="model-modal-section">
+          <div class="modal-row-head">
+            <h3>记忆列表</h3>
+            <span id="memory-list-subtitle" class="meta"></span>
+          </div>
+          <div id="memories-list" class="hub-cards-grid"><p class="empty">暂无记忆。</p></div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- 2. 定时巡检弹窗 -->
+  <div id="timer-hub-backdrop" class="modal-backdrop" hidden>
+    <div id="timer-hub-modal" class="model-modal hub-modal" role="dialog" aria-modal="true" aria-labelledby="timer-modal-title">
+      <div class="model-modal-header">
+        <h2 id="timer-modal-title">⏱️ 定时巡检</h2>
+        <button id="timer-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
+      </div>
+      <div class="model-modal-body">
+        <div id="timer-kpi-grid" class="hub-kpi-grid"></div>
+
+        <section class="model-modal-section">
+          <details id="timer-add-details" class="hub-compose-details" open>
+            <summary class="hub-compose-summary">
+              <span>+ 新建定时任务</span>
+            </summary>
+            <div class="hub-compose-body">
+              <div class="hub-preset-bar">
+                <span class="meta">模板：</span>
+                <button type="button" class="hub-preset-chip" data-timer-name="基金午间持仓估值" data-timer-daily="12:00" data-timer-plugin="fund-tracker" data-timer-action="noon" data-timer-channel="auto" data-timer-cmd="每日12:00执行基金盘中多源估值并推送持仓状态">☀️ 基金午间估值 (12:00)</button>
+                <button type="button" class="hub-preset-chip" data-timer-name="基金晚间正式结算" data-timer-daily="21:30" data-timer-plugin="fund-tracker" data-timer-action="settle" data-timer-channel="auto" data-timer-cmd="每日21:30拉取东方财富正式净值结算并推送持仓日报">🌙 基金晚间结算 (21:30)</button>
+                <button type="button" class="hub-preset-chip" data-timer-name="Git 工作区巡检" data-timer-sec="1800" data-timer-cmd="检查当前仓库的 git status 与最近改动，如有未提交的重要变更或冲突风险请简要汇报。">🔍 Git 巡检 (30m)</button>
+                <button type="button" class="hub-preset-chip" data-timer-name="自动化测试健康巡检" data-timer-sec="3600" data-timer-cmd="运行项目核心测试套件，若发现失败用例请定位根因并汇报。">🧪 测试巡检 (1h)</button>
+              </div>
+              <div class="modal-form-grid">
+                <label>
+                  <span class="meta">名称</span>
+                  <input id="timer-name-input" type="text" maxlength="120" placeholder="如：基金午间持仓估值" aria-label="定时任务名称">
+                </label>
+                <label>
+                  <span class="meta">每日定点 (HH:mm，优先于秒数)</span>
+                  <input id="timer-daily-input" type="text" maxlength="5" placeholder="如：12:00 或 21:30（留空则按间隔秒数）" aria-label="每日定点时间">
+                </label>
+                <label>
+                  <span class="meta">间隔（秒）</span>
+                  <div class="hub-interval-row">
+                    <input id="timer-interval-input" type="number" min="5" max="604800" value="300" placeholder="秒" aria-label="间隔秒数">
+                    <div class="hub-interval-Quick">
+                      <button type="button" class="mini-button" data-interval-sec="60">1m</button>
+                      <button type="button" class="mini-button" data-interval-sec="300">5m</button>
+                      <button type="button" class="mini-button" data-interval-sec="900">15m</button>
+                      <button type="button" class="mini-button" data-interval-sec="1800">30m</button>
+                      <button type="button" class="mini-button" data-interval-sec="3600">1h</button>
+                    </div>
+                  </div>
+                </label>
+                <label>
+                  <span class="meta">插件直通 (可选，格式 plugin/action)</span>
+                  <input id="timer-plugin-input" type="text" maxlength="120" placeholder="如：fund-tracker/noon（留空则走大模型 Worker）" aria-label="插件与动作">
+                </label>
+                <label>
+                  <span class="meta">投递端口 (任务侧配置 IM 通道)</span>
+                  <input id="timer-channel-input" type="text" maxlength="120" placeholder="如：auto、wechat、dingtalk、telegram 或通道ID" aria-label="投递端口">
+                </label>
+              </div>
+              <label>
+                <span class="meta">执行指令</span>
+                <textarea id="timer-instruction-input" rows="2" maxlength="4096" placeholder="触发时执行的指令…" aria-label="定时任务指令"></textarea>
+              </label>
+              <div class="modal-row-head">
+                <span></span>
+                <button id="timer-save-btn" class="primary" type="button">添加任务</button>
+              </div>
+            </div>
+          </details>
+        </section>
+
+        <section class="model-modal-section">
+          <div class="modal-row-head">
+            <h3>定时任务列表</h3>
+            <span id="timer-list-subtitle" class="meta"></span>
+          </div>
+          <div id="timers-list" class="hub-cards-grid"><p class="empty">暂无定时任务。</p></div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- 3. IM 远端接入弹窗 -->
+  <div id="im-hub-backdrop" class="modal-backdrop" hidden>
+    <div id="im-hub-modal" class="model-modal hub-modal" role="dialog" aria-modal="true" aria-labelledby="im-modal-title">
+      <div class="model-modal-header">
+        <h2 id="im-modal-title">📱 IM 远端接入</h2>
+        <button id="im-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
+      </div>
+      <div class="model-modal-body">
+        <div id="im-kpi-grid" class="hub-kpi-grid"></div>
+
+        <section class="model-modal-section">
+          <div class="wechat-hero-card">
+            <div class="wechat-hero-info">
+              <h3>💬 微信个人号扫码绑定 (iLink)</h3>
+            </div>
+            <div class="wechat-hero-action">
+              <button id="im-wechat-qr-btn" class="primary wechat-qr-trigger" type="button">📱 微信扫码绑定</button>
+            </div>
+          </div>
+
+          <div id="im-wechat-qr-box" class="wechat-qr-showcase" hidden>
+            <div class="wechat-qr-visual">
+              <img id="im-wechat-qr-img" class="wechat-qr-img" alt="微信扫码登录二维码" />
+            </div>
+            <div class="wechat-qr-guide">
+              <strong id="im-wechat-qr-title" class="wechat-qr-heading">微信扫码绑定</strong>
+              <p id="im-wechat-qr-status" class="wechat-qr-status-text">正在获取二维码…</p>
+              <div class="modal-btn-group">
+                <button id="im-wechat-qr-refresh" type="button">🔄 刷新二维码</button>
+                <button id="im-wechat-qr-close" class="mini-button" type="button">关闭</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="model-modal-section">
+          <details id="im-add-details" class="hub-compose-details">
+            <summary id="im-form-summary" class="hub-compose-summary">
+              <span>+ 手动配置通道（微信 / 钉钉 / Telegram）</span>
+            </summary>
+            <div class="hub-compose-body">
+              <div class="modal-form-grid">
+                <label>
+                  <span class="meta">平台</span>
+                  <select id="im-platform-input" aria-label="IM 平台">
+                    <option value="wechat">💬 微信 (WeChat)</option>
+                    <option value="dingtalk">🟦 钉钉 (DingTalk)</option>
+                    <option value="telegram">✈️ Telegram</option>
+                  </select>
+                </label>
+                <label>
+                  <span class="meta">名称</span>
+                  <input id="im-name-input" type="text" maxlength="120" placeholder="如：随身管家" aria-label="IM 通道名称">
+                </label>
+                <label>
+                  <span class="meta">Webhook URL（可选）</span>
+                  <input id="im-webhook-input" type="text" maxlength="1024" placeholder="https://..." aria-label="Webhook URL">
+                </label>
+                <label>
+                  <span class="meta">Bot Token（可选）</span>
+                  <input id="im-token-input" type="password" maxlength="512" placeholder="留空保持已存 Token" aria-label="Bot Token">
+                </label>
+                <label>
+                  <span class="meta">签名密钥 Secret（可选）</span>
+                  <input id="im-secret-input" type="password" maxlength="512" placeholder="留空保持已存密钥" aria-label="签名密钥">
+                </label>
+                <label>
+                  <span class="meta">默认接收目标（可选）</span>
+                  <input id="im-target-input" type="text" maxlength="256" placeholder="Chat ID / 账号 ID" aria-label="默认接收目标">
+                </label>
+              </div>
+              <label>
+                <span class="meta">发送方白名单（逗号分隔，可选）</span>
+                <input id="im-allow-input" type="text" maxlength="512" placeholder="如：user_01, 12345678" aria-label="发送方白名单">
+              </label>
+              <div class="modal-row-head">
+                <span></span>
+                <div class="modal-btn-group">
+                  <button id="im-cancel-edit-btn" class="mini-button" type="button" hidden>取消</button>
+                  <button id="im-save-btn" class="primary" type="button">保存通道</button>
+                </div>
+              </div>
+            </div>
+          </details>
+        </section>
+
+        <section class="model-modal-section">
+          <div class="modal-row-head">
+            <h3>通道列表</h3>
+            <span id="im-list-subtitle" class="meta"></span>
+          </div>
+          <div id="im-list" class="hub-cards-grid"><p class="empty">暂未配置通道。</p></div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- 4. 模型与提供方弹窗 -->
+  <div id="model-hub-backdrop" class="modal-backdrop" hidden>
+    <div id="model-hub-modal" class="model-modal hub-modal" role="dialog" aria-modal="true" aria-labelledby="model-modal-title">
+      <div class="model-modal-header">
+        <h2 id="model-modal-title">⚙️ 模型与提供方</h2>
+        <button id="model-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
+      </div>
+      <div class="model-modal-body">
+        <div id="model-current-status" class="hub-kpi-grid"></div>
+
+        <section class="model-modal-section">
+          <div class="modal-row-head">
+            <h3>1. 接入模型提供方</h3>
+          </div>
+          <div id="modal-provider-tabs" class="modal-provider-tabs" role="tablist"></div>
+          <div class="modal-auth-card">
+            <div class="modal-row-head">
+              <div class="modal-provider-title-group">
+                <strong id="modal-auth-provider-title" class="modal-provider-heading">DeepSeek</strong>
+                <span id="modal-auth-status-badge" class="hub-status-pill">读取中…</span>
+              </div>
+              <button id="modal-auth-toggle-btn" class="mini-button" type="button">⏸ 禁用提供方</button>
+            </div>
+            <div class="modal-form-grid">
+              <label>
+                <span class="meta">API Key（留空保持已存凭据）</span>
+                <input id="modal-auth-key-input" type="password" maxlength="512" placeholder="sk-...">
+              </label>
+              <label>
+                <span class="meta">Base URL（可选）</span>
+                <input id="modal-auth-baseurl-input" type="text" maxlength="512" placeholder="https://api.deepseek.com/v1">
+              </label>
+            </div>
+            <label>
+              <span class="meta">自定义附加模型 ID（逗号分隔，可选）</span>
+              <input id="modal-auth-custom-models-input" type="text" maxlength="512" placeholder="如：deepseek-r1, qwen-coder-plus">
+            </label>
+            <div class="modal-inline-test-bar">
+              <label class="modal-select-grow">
+                <span id="modal-auth-model-source" class="meta">可用模型</span>
+                <select id="modal-auth-test-model-select" aria-label="提供方测试模型选择"></select>
+              </label>
+              <div class="modal-btn-group">
+                <button id="modal-auth-fetch-btn" type="button">🔄 拉取模型</button>
+                <button id="modal-auth-test-btn" type="button">⚡ 测试</button>
+                <button id="modal-auth-save-test-btn" class="primary" type="button">💾 保存并接入</button>
+                <button id="modal-auth-clear-btn" class="mini-button" type="button">清除 Key</button>
+              </div>
+            </div>
+            <div id="modal-auth-probe-result" class="model-probe-result" hidden></div>
+          </div>
+
+          <details id="modal-custom-provider-details" class="hub-compose-details">
+            <summary class="hub-compose-summary">
+              <span>+ 新增自定义提供方（OpenAI 兼容接口）</span>
+            </summary>
+            <div class="hub-compose-body">
+              <div class="modal-form-grid">
+                <label>
+                  <span class="meta">提供方标识 (ID)</span>
+                  <input id="custom-prov-id-input" type="text" maxlength="64" placeholder="如：groq / together / my-gateway">
+                </label>
+                <label>
+                  <span class="meta">显示名称</span>
+                  <input id="custom-prov-name-input" type="text" maxlength="80" placeholder="如：Groq Cloud">
+                </label>
+                <label>
+                  <span class="meta">Base URL</span>
+                  <input id="custom-prov-url-input" type="text" maxlength="512" placeholder="https://api.groq.com/openai/v1">
+                </label>
+                <label>
+                  <span class="meta">API Key（可选）</span>
+                  <input id="custom-prov-key-input" type="password" maxlength="512" placeholder="gsk_...">
+                </label>
+              </div>
+              <label>
+                <span class="meta">默认模型 ID（逗号分隔，保存后也可从 /models 自动拉取）</span>
+                <input id="custom-prov-models-input" type="text" maxlength="512" placeholder="如：llama-3.3-70b-versatile, deepseek-r1-distill-llama-70b">
+              </label>
+              <div class="modal-row-head">
+                <span></span>
+                <button id="custom-prov-save-btn" class="primary" type="button">💾 添加提供方</button>
+              </div>
+            </div>
+          </details>
+        </section>
+
+        <section class="model-modal-section">
+          <div class="modal-row-head">
+            <h3>2. F.R.I.D.A.Y. 主控与 Worker 智能调度池</h3>
+          </div>
+
+          <div class="modal-tier-card router-tier-card">
+            <div class="modal-tier-row">
+              <div class="modal-tier-label">
+                <div class="tier-title-line">
+                  <span class="tier-badge router-badge">主控</span>
+                  <strong>🤖 F.R.I.D.A.Y. 主控模型</strong>
+                </div>
+              </div>
+              <div class="modal-tier-controls">
+                <select id="modal-router-provider-select" aria-label="F.R.I.D.A.Y. 提供方"></select>
+                <select id="modal-router-model-select" class="modal-model-select" aria-label="F.R.I.D.A.Y. 模型"></select>
+                <button id="modal-test-router-btn" class="mini-button" type="button">⚡ 测试</button>
+                <button id="modal-save-routing-btn" class="primary mini-button" type="button">💾 设定主控</button>
+              </div>
+            </div>
+            <div id="modal-router-probe-result" class="model-probe-result" hidden></div>
+          </div>
+
+          <div class="modal-row-head">
+            <h3>Worker 跨提供方可用模型池</h3>
+            <span id="model-pool-subtitle" class="meta"></span>
+          </div>
+          <div id="model-pool-matrix" class="hub-cards-grid hub-providers-grid"></div>
+        </section>
+
+        <section class="model-modal-section">
+          <div class="modal-row-head">
+            <h3>3. 提供方列表</h3>
+          </div>
+          <div id="model-providers-list" class="hub-cards-grid hub-providers-grid"><p class="meta">正在读取…</p></div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- 5. 功能插件中心弹窗 -->
+  <div id="plugin-hub-backdrop" class="modal-backdrop" hidden>
+    <div id="plugin-hub-modal" class="model-modal hub-modal" role="dialog" aria-modal="true" aria-labelledby="plugin-modal-title">
+      <div class="model-modal-header">
+        <h2 id="plugin-modal-title">🔌 功能插件中心</h2>
+        <button id="plugin-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
+      </div>
+      <div class="model-modal-body">
+        <div id="plugin-kpi-grid" class="hub-kpi-grid"></div>
+
+        <section class="model-modal-section">
+          <div class="modal-row-head">
+            <h3>已安装插件（执行脚本、参数规格与源码）</h3>
+            <span id="plugin-list-subtitle" class="meta"></span>
+          </div>
+          <div id="plugins-list" class="hub-cards-grid"><p class="empty">正在读取插件…</p></div>
+        </section>
+      </div>
+    </div>
+  </div>
+  <noscript>此本机界面需要 JavaScript。</noscript>
 </body>
 </html>
