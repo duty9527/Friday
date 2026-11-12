@@ -6,6 +6,7 @@ import { realFactory, offlineFactory } from './agent.js';
 import { Coordinator } from './coordinator.js';
 import { listPlugins, runPlugin } from './plugin.js';
 import { integer, REQUEST_LIMIT, RESPONSE_LIMIT, socketPath, text, type Response } from './protocol.js';
+import type { ModelTier } from './view.js';
 
 export interface ServiceOptions {
   home: string; mode: 'real' | 'offline'; offlineDelayMs?: number;
@@ -62,6 +63,12 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
             clearApiKey: command.clearApiKey === undefined ? undefined : Boolean(command.clearApiKey),
             baseUrl: command.baseUrl === undefined ? undefined : String(command.baseUrl),
             customModels: Array.isArray(command.customModels) ? command.customModels.map(m => text(m, 'customModel', 128)) : undefined,
+            selectedModels: Array.isArray(command.selectedModels)
+              ? command.selectedModels.map(item => {
+                  const entry = (item ?? {}) as Record<string, unknown>;
+                  return { id: text(entry.id, 'selectedModel.id', 128), tier: text(entry.tier, 'selectedModel.tier', 16) as ModelTier };
+                })
+              : undefined,
             routerProvider: command.routerProvider === undefined ? undefined : text(command.routerProvider, 'routerProvider', 64),
             routerModel: command.routerModel === undefined ? undefined : text(command.routerModel, 'routerModel', 128),
             workerProvider: command.workerProvider === undefined ? undefined : text(command.workerProvider, 'workerProvider', 64),

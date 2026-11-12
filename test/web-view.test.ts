@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mergeMessages, orderConversation, routeLabel, routeState, spanDuration, spanNodes, spanTree, usageSummary } from '../src/web/model.js';
+import { layoutBrainGraph } from '../src/web/brain.js';
 import type { ChatMessage, TraceEvent } from '../src/view.js';
 
 const message = (id: string, seq: number, role: 'user' | 'assistant', replyTo?: string, version = seq): ChatMessage =>
@@ -88,4 +89,38 @@ test('usage is reported only from recorded data', () => {
   assert.equal(usageSummary({ usage: { input: 1200, output: 40 } }), '1,200 / 40 tokens');
   assert.equal(usageSummary({ usage: { input: 1200 } }), '1,200 / — tokens');
   assert.equal(usageSummary({ tokensBefore: 90_000, estimatedTokensAfter: 12_000 }), '90,000 → 12,000 tokens');
+});
+
+test('golden brain 3D layout places pinned beliefs in the inner mantle and deduplicates bidirectional synapses', () => {
+  const cards = [
+    {
+      id: 'core-1',
+      topic: '奥创旁边那个大脑',
+      preview: '不是工具，是大脑',
+      tags: ['persona'],
+      pinned: true,
+      accessCount: 4,
+      updatedAt: 100,
+      synapses: [{ targetId: 'outer-1', weight: 0.65, relation: 'shared_tag' as const, updatedAt: 100 }],
+    },
+    {
+      id: 'outer-1',
+      topic: 'IM 回复风格',
+      preview: '短对话，不长报告',
+      tags: ['style'],
+      pinned: false,
+      accessCount: 1,
+      updatedAt: 90,
+      synapses: [{ targetId: 'core-1', weight: 0.82, relation: 'co_activated' as const, updatedAt: 95 }],
+    },
+  ];
+  const graph = layoutBrainGraph(cards);
+  assert.equal(graph.nodes.length, 2);
+  const coreRadius = Math.hypot(graph.nodes[0]!.x, graph.nodes[0]!.y, graph.nodes[0]!.z);
+  const outerRadius = Math.hypot(graph.nodes[1]!.x, graph.nodes[1]!.y, graph.nodes[1]!.z);
+  assert.ok(coreRadius >= 0.44 && coreRadius <= 0.62, 'pinned core memory occupies inner golden mantle');
+  assert.ok(outerRadius >= 0.67 && outerRadius <= 0.96, 'regular memory occupies outer cortex shell');
+  assert.equal(graph.edges.length, 1, 'bidirectional synapse pairs collapse to a single filament');
+  assert.equal(graph.edges[0]!.weight, 0.82, 'merged synapse retains the stronger weight');
+  assert.deepEqual(layoutBrainGraph(cards).nodes.map(n => [n.x, n.y, n.z]), graph.nodes.map(n => [n.x, n.y, n.z]), 'coordinates stay deterministic across renders');
 });

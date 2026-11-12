@@ -13,8 +13,8 @@
     <div class="brand"><span class="mark" aria-hidden="true">↳</span> F.R.I.D.A.Y.</div>
     <button id="work-toggle" class="fold-control" type="button" aria-expanded="false" aria-controls="work-sidebar">任务列表</button>
     <div class="topbar-hub-bar" role="toolbar" aria-label="系统功能中心">
-      <button id="open-memory-hub-top" class="hub-pill-btn" type="button">
-        <span class="hub-pill-icon" aria-hidden="true">🧠</span>
+      <button id="open-memory-hub-top" class="hub-pill-btn memory-amber-pill" type="button">
+        <span class="amber-core-dot" aria-hidden="true"></span>
         <span>全息记忆</span>
         <span id="memory-top-badge" class="hub-pill-badge">0</span>
       </button>
@@ -87,12 +87,32 @@
   </div>
   <!-- 1. 全息记忆弹窗 -->
   <div id="memory-hub-backdrop" class="modal-backdrop" hidden>
-    <div id="memory-hub-modal" class="model-modal hub-modal" role="dialog" aria-modal="true" aria-labelledby="memory-modal-title">
-      <div class="model-modal-header">
-        <h2 id="memory-modal-title">🧠 全息记忆</h2>
+    <div id="memory-hub-modal" class="model-modal hub-modal memory-brain-modal" role="dialog" aria-modal="true" aria-labelledby="memory-modal-title">
+      <div class="model-modal-header memory-modal-header">
+        <div class="memory-header-brand">
+          <span class="amber-core-dot large" aria-hidden="true"></span>
+          <div>
+            <h2 id="memory-modal-title">F.R.I.D.A.Y. · 全息神经记忆矩阵</h2>
+            <p class="memory-header-sub">三维琥珀全息皮层 · 核心信条内环与赫布突触扩散网络</p>
+          </div>
+        </div>
         <button id="memory-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
       </div>
       <div class="model-modal-body">
+        <section class="brain-stage-shell" aria-label="三维全息记忆大脑">
+          <div id="memory-brain-viewport" class="brain-viewport-wrap">
+            <canvas id="memory-brain-canvas" class="brain-canvas" aria-label="F.R.I.D.A.Y. 金色全息记忆球体"></canvas>
+            <div class="brain-stage-controls">
+              <button id="memory-brain-spin-btn" class="brain-ctrl-btn active" type="button">⟳ 自转中</button>
+              <button id="memory-brain-reset-btn" class="brain-ctrl-btn" type="button">⌖ 重置视角</button>
+              <button id="memory-brain-fullscreen-btn" class="brain-ctrl-btn" type="button">⛶ 全屏大脑</button>
+            </div>
+          </div>
+          <aside id="memory-brain-inspector" class="brain-inspector" aria-live="polite">
+            <p class="brain-inspector-empty">点击左侧全息球体中的发光神经元检视记忆详情</p>
+          </aside>
+        </section>
+
         <div id="memory-kpi-grid" class="hub-kpi-grid"></div>
 
         <section class="model-modal-section">
@@ -385,6 +405,18 @@
               </div>
             </div>
             <div id="modal-auth-probe-result" class="model-probe-result" hidden></div>
+            <details id="modal-auth-pool-details" class="hub-compose-details">
+              <summary class="hub-compose-summary">
+                <span id="modal-auth-pool-summary">Worker 模型池：勾选启用的模型并指定等级</span>
+              </summary>
+              <div class="hub-compose-body">
+                <p class="meta">只有勾选的模型（以及当前 Worker 提供方的三档模型）会进入 F.R.I.D.A.Y. 的 Worker 调度池。</p>
+                <div id="modal-auth-pool-list" class="modal-pool-select-list"></div>
+                <div class="modal-btn-group">
+                  <button id="modal-auth-pool-save-btn" class="primary" type="button">💾 保存模型池勾选</button>
+                </div>
+              </div>
+            </details>
           </div>
 
           <details id="modal-custom-provider-details" class="hub-compose-details">

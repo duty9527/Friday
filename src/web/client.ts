@@ -1,6 +1,7 @@
-import type { ChatMessage, ContextSearchHit, ImChannelView, MainView, MemoryCard, MessagePage, ModelHubView, ModelProbeResult, ModelProviderView, PluginActionSpec, PluginView, TimerView, TraceEvent, WechatQrLoginSession, WorkView, RouteAction } from '../view.js';
+import type { ChatMessage, ContextSearchHit, ImChannelView, MainView, MemoryCard, MessagePage, ModelHubView, ModelProbeResult, ModelProviderView, ModelTier, PluginActionSpec, PluginView, TimerView, TraceEvent, WechatQrLoginSession, WorkView, RouteAction } from '../view.js';
 import { mergeMessages as mergeInto, orderConversation, routeLabel, routeState, spanDuration, spanNodes as buildSpans,
   spanTree, timelineSteps, usageSummary, type SpanNode, type TimelineStep } from './model.js';
+import { GoldenBrainStage, type BrainMemoryItem } from './brain.js';
 
 function element<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -37,6 +38,12 @@ const ui = {
   openMemoryHubTop: element<HTMLButtonElement>('open-memory-hub-top'),
   memoryHubBackdrop: element('memory-hub-backdrop'),
   memoryModalClose: element<HTMLButtonElement>('memory-modal-close'),
+  memoryBrainViewport: element('memory-brain-viewport'),
+  memoryBrainCanvas: element<HTMLCanvasElement>('memory-brain-canvas'),
+  memoryBrainSpinBtn: element<HTMLButtonElement>('memory-brain-spin-btn'),
+  memoryBrainResetBtn: element<HTMLButtonElement>('memory-brain-reset-btn'),
+  memoryBrainFullscreenBtn: element<HTMLButtonElement>('memory-brain-fullscreen-btn'),
+  memoryBrainInspector: element('memory-brain-inspector'),
   memoryKpiGrid: element('memory-kpi-grid'),
   memorySearchScope: element<HTMLSelectElement>('memory-search-scope'),
   memorySearchInput: element<HTMLInputElement>('memory-search-input'),
@@ -122,6 +129,9 @@ const ui = {
   modalAuthSaveTestBtn: element<HTMLButtonElement>('modal-auth-save-test-btn'),
   modalAuthClearBtn: element<HTMLButtonElement>('modal-auth-clear-btn'),
   modalAuthProbeResult: element('modal-auth-probe-result'),
+  modalAuthPoolSummary: element('modal-auth-pool-summary'),
+  modalAuthPoolList: element('modal-auth-pool-list'),
+  modalAuthPoolSaveBtn: element<HTMLButtonElement>('modal-auth-pool-save-btn'),
   modalCustomProviderDetails: element<HTMLDetailsElement>('modal-custom-provider-details'),
   customProvIdInput: element<HTMLInputElement>('custom-prov-id-input'),
   customProvNameInput: element<HTMLInputElement>('custom-prov-name-input'),
@@ -526,17 +536,113 @@ function formatIntervalText(ms: number): string {
   return `每 ${sec} 秒`;
 }
 function closeAllHubModals() {
+  if (brainStage?.isImmersive()) setBrainImmersive(false);
   ui.memoryHubBackdrop.hidden = true;
   ui.timerHubBackdrop.hidden = true;
   ui.pluginHubBackdrop.hidden = true;
   ui.imHubBackdrop.hidden = true;
   ui.modelHubBackdrop.hidden = true;
+  brainStage?.stop();
   stopWechatQrPoll();
 }
 
 let fullMemoriesCache: MemoryCard[] | undefined;
 let memoryFilterMode: 'all' | 'pinned' | 'synapse' = 'all';
 let editingMemoryId: string | undefined;
+let searchMatchedMemoryIds: Set<string> | undefined;
+
+function syncBrainCardSelectionClass(selectedId?: string) {
+  for (const el of ui.memoriesList.querySelectorAll<HTMLElement>('.memory-card')) {
+    el.classList.toggle('is-brain-selected', Boolean(selectedId && el.dataset.memoryId === selectedId));
+  }
+}
+
+function renderBrainInspector(item: BrainMemoryItem | undefined) {
+  if (!item) {
+    ui.memoryBrainInspector.replaceChildren(
+      node('p', '当前全息皮层暂无神经元，新增或对话沉淀后将自动点亮琥珀神经核。', 'brain-inspector-empty'),
+    );
+    syncBrainCardSelectionClass(undefined);
+    return;
+  }
+
+  const frag = document.createDocumentFragment();
+  const kicker = node('div', '', 'brain-insp-kicker');
+  kicker.append(
+    node('span', `NEURON · ${item.id.slice(0, 8)}`),
+    node('span', `提取 ${item.accessCount ?? 0} 次`),
+  );
+  frag.append(kicker);
+
+  const titleRow = node('div', '', 'brain-insp-title-row');
+  if (item.pinned) titleRow.append(node('span', '★ 核心信条', 'brain-insp-pin-badge'));
+  titleRow.append(node('strong', item.topic, 'brain-insp-title'));
+  frag.append(titleRow);
+
+  const scrollBody = node('div', '', 'brain-insp-scroll');
+  const bodyText = 'content' in item ? item.content : item.preview;
+  scrollBody.append(node('div', bodyText, 'brain-insp-body'));
+
+  if (item.tags.length) {
+    const tagsWrap = node('div', '', 'brain-insp-tags');
+    for (const tag of item.tags) {
+      tagsWrap.append(node('span', `#${tag}`, 'brain-tag-chip'));
+    }
+    scrollBody.append(tagsWrap);
+  }
+
+  const metaParts = [`更新于 ${timestamp(item.updatedAt)}`];
+  if (item.cwd) metaParts.push(item.cwd);
+  scrollBody.append(node('div', metaParts.join(' · '), 'brain-meta-line'));
+
+  if (item.synapses?.length) {
+    const synSec = node('div', '', 'brain-synapse-section');
+    synSec.append(node('span', `⚡ 突触共振网络 (${item.synapses.length}) · 点击跃迁聚焦`, 'brain-synapse-heading'));
+    const synList = node('div', '', 'brain-synapse-list');
+    const basePool = fullMemoriesCache ?? view?.memoryDirectory?.items ?? [];
+    for (const syn of item.synapses.slice(0, 8)) {
+      const targetMem = basePool.find(m => m.id === syn.targetId);
+      const targetTitle = syn.targetTopic ?? targetMem?.topic ?? syn.targetId.slice(0, 8);
+      const relText = synapseRelationNames[syn.relation] ?? syn.relation;
+      synList.append(button(
+        `⚡ ${targetTitle} · ${Math.round(syn.weight * 100)}% (${relText})`,
+        () => {
+          if (basePool.some(m => m.id === syn.targetId)) {
+            brainStage.focusMemory(syn.targetId, true);
+          } else {
+            ui.memorySearchInput.value = targetTitle;
+            void searchMemories();
+          }
+        },
+        'brain-synapse-jump',
+      ));
+    }
+    synSec.append(synList);
+    scrollBody.append(synSec);
+  }
+  frag.append(scrollBody);
+
+  const actions = node('div', '', 'brain-insp-actions');
+  const pinBtn = button(item.pinned ? '取消置顶' : '★ 置顶', () => { void pinMemoryFromUi(item.id, !item.pinned); }, 'brain-action-btn');
+  const editBtn = button('✏️ 编辑', () => { editMemoryFromUi(item); }, 'brain-action-btn');
+  const locateBtn = button('↓ 定位卡片', () => {
+    const cardEl = ui.memoriesList.querySelector<HTMLElement>(`.memory-card[data-memory-id="${item.id}"]`);
+    cardEl?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, 'brain-action-btn');
+  const forgetBtn = button('🗑️ 遗忘', () => { void removeMemoryFromUi(item.id); }, 'brain-action-btn danger');
+  pinBtn.disabled = authExpired || !ready;
+  editBtn.disabled = authExpired || !ready;
+  forgetBtn.disabled = authExpired || !ready;
+  actions.append(pinBtn, editBtn, locateBtn, forgetBtn);
+  frag.append(actions);
+
+  ui.memoryBrainInspector.replaceChildren(frag);
+  syncBrainCardSelectionClass(item.id);
+}
+
+const brainStage = new GoldenBrainStage(ui.memoryBrainCanvas, {
+  onSelect: item => renderBrainInspector(item),
+});
 
 async function fetchFullMemories() {
   if (!ready || authExpired) return;
@@ -551,14 +657,36 @@ async function fetchFullMemories() {
   }
 }
 
+let enteredNativeFullscreen = false;
+function setBrainImmersive(active: boolean, syncBrowserFullscreen = true) {
+  ui.memoryBrainViewport.classList.toggle('is-immersive', active);
+  ui.memoryBrainFullscreenBtn.classList.toggle('active', active);
+  ui.memoryBrainFullscreenBtn.textContent = active ? '✕ 退出全屏' : '⛶ 全屏大脑';
+  brainStage.setImmersive(active);
+  if (!syncBrowserFullscreen) return;
+  if (active) {
+    if (document.fullscreenElement !== ui.memoryBrainViewport && typeof ui.memoryBrainViewport.requestFullscreen === 'function') {
+      void ui.memoryBrainViewport.requestFullscreen()
+        .then(() => { enteredNativeFullscreen = true; })
+        .catch(() => { enteredNativeFullscreen = false; });
+    }
+  } else if (document.fullscreenElement) {
+    enteredNativeFullscreen = false;
+    void document.exitFullscreen().catch(() => {});
+  }
+}
+
 function openMemoryHubModal() {
   closeAllHubModals();
-  renderMemories();
   ui.memoryHubBackdrop.hidden = false;
+  renderMemories();
+  brainStage.start();
   void fetchFullMemories();
 }
 function closeMemoryHubModal() {
+  if (brainStage.isImmersive()) setBrainImmersive(false);
   ui.memoryHubBackdrop.hidden = true;
+  brainStage.stop();
 }
 function setMemoryFilter(mode: 'all' | 'pinned' | 'synapse') {
   memoryFilterMode = mode;
@@ -617,10 +745,20 @@ function renderMemories() {
   });
   ui.memoryListSubtitle.textContent = `${filtered.length} / ${baseItems.length}`;
 
+  const hasFilterOrSearch = memoryFilterMode !== 'all' || Boolean(searchMatchedMemoryIds);
+  const highlightedIds = searchMatchedMemoryIds
+    ? [...searchMatchedMemoryIds]
+    : memoryFilterMode !== 'all'
+      ? filtered.map(i => i.id)
+      : undefined;
+  brainStage.setData(baseItems, highlightedIds, hasFilterOrSearch);
+
+  const activeBrainId = brainStage.getSelectedId();
   const contents = document.createDocumentFragment();
   for (const item of filtered) {
     const bodyText = 'content' in item ? item.content : item.preview;
-    const card = node('article', '', `hub-entity-card memory-card${item.pinned ? ' is-pinned' : ''}`);
+    const card = node('article', '', `hub-entity-card memory-card${item.pinned ? ' is-pinned' : ''}${item.id === activeBrainId ? ' is-brain-selected' : ''}`);
+    card.dataset.memoryId = item.id;
 
     const head = node('div', '', 'hub-card-head');
     const titleWrap = node('div', '', 'hub-card-title-group');
@@ -629,13 +767,17 @@ function renderMemories() {
     head.append(titleWrap);
 
     const actions = node('div', '', 'timer-actions');
+    const focusBtn = button('🎯 全息聚焦', () => {
+      brainStage.focusMemory(item.id, true);
+      ui.memoryBrainCanvas.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }, 'mini-button');
     const pinBtn = button(item.pinned ? '取消置顶' : '★ 置顶', () => { void pinMemoryFromUi(item.id, !item.pinned); }, 'mini-button');
     const editBtn = button('✏️ 编辑', () => { editMemoryFromUi(item); }, 'mini-button');
     const forgetBtn = button('🗑️ 遗忘', () => { void removeMemoryFromUi(item.id); }, 'mini-button danger-btn');
     pinBtn.disabled = authExpired || !ready;
     editBtn.disabled = authExpired || !ready;
     forgetBtn.disabled = authExpired || !ready;
-    actions.append(pinBtn, editBtn, forgetBtn);
+    actions.append(focusBtn, pinBtn, editBtn, forgetBtn);
     head.append(actions);
     card.append(head);
 
@@ -687,8 +829,10 @@ async function searchMemories() {
   const query = ui.memorySearchInput.value.trim();
   const scope = ui.memorySearchScope.value || 'all';
   if (!query) {
+    searchMatchedMemoryIds = undefined;
     ui.memorySearchResults.hidden = true;
     ui.memorySearchResults.replaceChildren();
+    renderMemories();
     return;
   }
   ui.memorySearchResults.hidden = false;
@@ -696,14 +840,25 @@ async function searchMemories() {
   try {
     const res = await api<{ hits?: ContextSearchHit[] } | ContextSearchHit[]>(`/api/memories?${new URLSearchParams({ query, scope })}`);
     const hits = Array.isArray(res) ? res : (res.hits ?? []);
+    const matchedIds = hits
+      .filter(h => h.kind === 'memory')
+      .map(h => h.memoryId ?? h.id)
+      .filter(Boolean);
+    searchMatchedMemoryIds = new Set(matchedIds);
+    renderMemories();
+    if (matchedIds[0]) {
+      brainStage.focusMemory(matchedIds[0], true);
+    }
     const frag = document.createDocumentFragment();
     const header = node('div', '', 'hub-card-head');
     header.append(
       node('strong', `🔍 联想检索命中 ${hits.length} 条结果`, 'hub-card-title'),
       button('✕ 清空检索', () => {
         ui.memorySearchInput.value = '';
+        searchMatchedMemoryIds = undefined;
         ui.memorySearchResults.hidden = true;
         ui.memorySearchResults.replaceChildren();
+        renderMemories();
       }, 'mini-button'),
     );
     frag.append(header);
@@ -712,7 +867,7 @@ async function searchMemories() {
       const row = node('div', '', 'hub-entity-card search-hit-card');
       const hitHead = node('div', '', 'hub-card-head');
       const kindBadge = hit.kind === 'memory'
-        ? node('span', '🧠 记忆神经元', 'hub-badge badge-teal')
+        ? node('span', '🧠 记忆神经元', 'hub-badge badge-amber')
         : hit.kind === 'work'
           ? node('span', '🔧 历史工作', 'hub-badge badge-blue')
           : node('span', '💬 历史对话', 'hub-badge badge-slate');
@@ -720,7 +875,13 @@ async function searchMemories() {
       titleGroup.append(kindBadge, node('strong', hit.title, 'hub-card-title'));
       hitHead.append(titleGroup);
 
-      if (hit.kind === 'message' && hit.messageId) {
+      if (hit.kind === 'memory') {
+        const memId = hit.memoryId ?? hit.id;
+        hitHead.append(button('🎯 全息聚焦', () => {
+          brainStage.focusMemory(memId, true);
+          ui.memoryBrainCanvas.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }, 'mini-button'));
+      } else if (hit.kind === 'message' && hit.messageId) {
         hitHead.append(button('↗ 定位到此对话', () => {
           closeAllHubModals();
           closeSidebar();
@@ -1530,6 +1691,62 @@ function renderModalAuthSection() {
     ? 'deepseek-flash'
     : (currentProv.defaultBalanced ?? currentProv.models[0]?.id);
   populateModelSelect(ui.modalAuthTestModelSelect, currentProv, defaultTestModel);
+  renderModalPoolSelection(currentProv);
+}
+const POOL_TIER_LABELS: Array<[ModelTier, string]> = [['fast', '⚡ 极速'], ['balanced', '⚖️ 均衡'], ['strong', '🧠 强力']];
+function renderModalPoolSelection(prov: ModelProviderView) {
+  const selected = new Map((prov.selectedModels ?? []).map(item => [item.id, item.tier]));
+  ui.modalAuthPoolSummary.textContent = `Worker 模型池：已勾选 ${selected.size} 款（勾选启用的模型并指定等级）`;
+  const ids = [...new Set([...prov.models.map(m => m.id), ...selected.keys()])];
+  const frag = document.createDocumentFragment();
+  for (const id of ids) {
+    const row = node('div', '', 'modal-pool-select-row');
+    row.dataset.modelId = id;
+    const label = node('label', '', 'hub-checkbox-label');
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = selected.has(id);
+    const name = prov.models.find(m => m.id === id)?.name;
+    label.append(checkbox, node('span', name && name !== id ? `${id} — ${name}` : id));
+    const tierSelect = document.createElement('select');
+    tierSelect.setAttribute('aria-label', `${id} 等级`);
+    const tier = selected.get(id) ?? prov.suggestedTiers?.[id] ?? 'balanced';
+    for (const [value, text] of POOL_TIER_LABELS) {
+      const opt = document.createElement('option');
+      opt.value = value;
+      opt.textContent = text;
+      if (value === tier) opt.selected = true;
+      tierSelect.append(opt);
+    }
+    tierSelect.value = tier;
+    row.append(label, tierSelect);
+    frag.append(row);
+  }
+  if (!ids.length) frag.append(node('p', '该提供方暂无可选模型，请先接入并拉取模型', 'empty hub-empty-state'));
+  ui.modalAuthPoolList.replaceChildren(frag);
+  ui.modalAuthPoolSaveBtn.disabled = authExpired || !ready || !ids.length;
+}
+async function saveModalPoolSelectionFromUi() {
+  const providerId = activeAuthProviderTab;
+  const selectedModels: Array<{ id: string; tier: ModelTier }> = [];
+  for (const row of ui.modalAuthPoolList.querySelectorAll<HTMLElement>('.modal-pool-select-row')) {
+    const checkbox = row.querySelector<HTMLInputElement>('input[type="checkbox"]');
+    const tierSelect = row.querySelector<HTMLSelectElement>('select');
+    const id = row.dataset.modelId;
+    if (id && checkbox?.checked) selectedModels.push({ id, tier: (tierSelect?.value ?? 'balanced') as ModelTier });
+  }
+  ui.modalAuthPoolSaveBtn.disabled = true;
+  try {
+    const updated = await api<ModelHubView>('/api/model-configure', { providerId, selectedModels });
+    if (view) { view.modelHub = updated; view.modelTiers = updated.tiers; }
+    renderModelHub();
+    renderModalAuthSection();
+    connection(`✅ 已保存「${updated.providers.find(p => p.id === providerId)?.name ?? providerId}」的 Worker 模型池勾选（${selectedModels.length} 款）`);
+  } catch (error) {
+    connection(`保存模型池勾选失败：${errorText(error)}`, true);
+  } finally {
+    ui.modalAuthPoolSaveBtn.disabled = false;
+  }
 }
 function syncModalRouterModels(preferredModel?: string) {
   const hub = view?.modelHub;
@@ -2542,6 +2759,25 @@ ui.memoryModalClose.addEventListener('click', closeMemoryHubModal);
 ui.memoryHubBackdrop.addEventListener('click', event => {
   if (event.target === ui.memoryHubBackdrop) closeMemoryHubModal();
 });
+ui.memoryBrainSpinBtn.addEventListener('click', () => {
+  const spinning = brainStage.setAutoRotate(!brainStage.isAutoRotating());
+  ui.memoryBrainSpinBtn.classList.toggle('active', spinning);
+  ui.memoryBrainSpinBtn.textContent = spinning ? '⟳ 自转中' : '⏸ 已定格';
+});
+ui.memoryBrainResetBtn.addEventListener('click', () => {
+  brainStage.resetView();
+  ui.memoryBrainSpinBtn.classList.add('active');
+  ui.memoryBrainSpinBtn.textContent = '⟳ 自转中';
+});
+ui.memoryBrainFullscreenBtn.addEventListener('click', () => {
+  setBrainImmersive(!brainStage.isImmersive());
+});
+document.addEventListener('fullscreenchange', () => {
+  if (!document.fullscreenElement && enteredNativeFullscreen) {
+    enteredNativeFullscreen = false;
+    setBrainImmersive(false, false);
+  }
+});
 
 ui.openTimerHubTop.addEventListener('click', () => openTimerHubModal());
 ui.timerModalClose.addEventListener('click', closeTimerHubModal);
@@ -2579,6 +2815,7 @@ ui.modalAuthFetchBtn.addEventListener('click', () => { void fetchAuthProviderMod
 ui.modalAuthTestBtn.addEventListener('click', () => { void testAuthProviderFromModal(false); });
 ui.modalAuthSaveTestBtn.addEventListener('click', () => { void testAuthProviderFromModal(true); });
 ui.modalAuthClearBtn.addEventListener('click', () => { void clearAuthProviderFromModal(); });
+ui.modalAuthPoolSaveBtn.addEventListener('click', () => { void saveModalPoolSelectionFromUi(); });
 ui.customProvSaveBtn.addEventListener('click', () => { void addCustomProviderFromModal(); });
 ui.modalTestRouterBtn.addEventListener('click', () => {
   void runInlineProbe(ui.modalRouterProviderSelect.value, ui.modalRouterModelSelect.value, ui.modalRouterProbeResult, ui.modalTestRouterBtn);
@@ -2611,6 +2848,11 @@ ui.workToggle.addEventListener('click', () => {
   if (open) ui.workFilter.focus();
 });
 document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && brainStage.isImmersive()) {
+    event.preventDefault();
+    setBrainImmersive(false);
+    return;
+  }
   if (event.key === 'Escape' && (!ui.memoryHubBackdrop.hidden || !ui.timerHubBackdrop.hidden || !ui.pluginHubBackdrop.hidden || !ui.imHubBackdrop.hidden || !ui.modelHubBackdrop.hidden)) {
     closeAllHubModals();
     return;

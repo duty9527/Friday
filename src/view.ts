@@ -36,6 +36,10 @@ export interface ModelProviderView {
   defaultBalanced?: string;
   defaultStrong?: string;
   models: ModelCatalogEntry[];
+  /** 用户显式勾选进入 Worker 模型池的模型及等级 */
+  selectedModels?: Array<{ id: string; tier: ModelTier }>;
+  /** 按模型 ID 推断的建议等级（供控制台勾选时作为默认值） */
+  suggestedTiers?: Record<string, ModelTier>;
 }
 export interface ModelProbeResult {
   ok: boolean;

@@ -67,6 +67,9 @@ test('real SDK streams through a local OpenAI-compatible fixture and executes on
     try {
       const signal = new AbortController().signal;
       await router.prompt(JSON.stringify({ kind: 'NEW_TASK' }), signal);
+      const routerSystemPrompt = JSON.stringify((requests[0] as { messages?: unknown })?.messages ?? '');
+      assert.match(routerSystemPrompt, /WECHAT EXPRESSION HYGIENE/);
+      assert.match(routerSystemPrompt, /\[旺柴\].*\[捂脸\]/);
       await worker.prompt(JSON.stringify({ kind: 'TASK', files: [{ id: 'f0' }] }), signal);
       const report = await worker.prompt(JSON.stringify({ kind: 'READ_COMPLETIONS', content: 'fixture file' }), signal);
       assert.match(report, /Verified SDK report/);

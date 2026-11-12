@@ -2,9 +2,10 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, rm, stat, realpath, writeFile } from 'node:fs/promises';
 import { basename, isAbsolute, join, dirname } from 'node:path';
 import { performance } from 'node:perf_hooks';
-import { inferModelTier, type AgentFactory, type AgentPort, type AgentTool } from './agent.js';
+import { inferModelTier, isRetryableModelError, type AgentFactory, type AgentPort, type AgentTool } from './agent.js';
 import { readSnapshot, snapshot, type InputFile } from './files.js';
 import { PromptTrace } from './trace.js';
+import { sanitizePublicReply } from './reply-filter.js';
 import { integer, text } from './protocol.js';
 import type { ChatMessage, MainView, ModelTier, ModelTierConfig, RouteAction, RouteKind, WorkerProfile } from './view.js';
 import { publicData } from './conversation.js';
@@ -131,6 +132,8 @@ interface Run {
   reads: Map<string, Promise<Operation>>; completions: Operation[];
   stopping?: 'paused' | 'cancelled' | 'failed'; lastTick: number; lastWall: number;
   trace?: PromptTrace; replyId?: string; wakeFollowup?: () => void;
+  /** The Router already spoke about this failure (WORKER_FAILED turn); no system notice is needed. */
+  failureRouted?: boolean;
 }
 interface ChatRun {
   message: ChatMessage; controller: AbortController; revisions: Map<string, number>; replyId?: string;
@@ -733,7 +736,8 @@ export class Coordinator {
       const parsed = Number(process.env.FRIDAY_IM_COALESCE_MS);
       if (Number.isFinite(parsed) && parsed >= 0) return parsed;
     }
-    return this.factory.mode === 'real' ? 1800 : 40;
+    // WeChat users often send the text first and the photo a few seconds later; 1.8s missed those pairs.
+    return this.factory.mode === 'real' ? 3500 : 40;
   }
   private attachmentCoalesceMs(): number {
     if (process.env.FRIDAY_IM_ATTACHMENT_COALESCE_MS !== undefined) {
@@ -958,7 +962,7 @@ export class Coordinator {
           }
           context.settled = true;
           this.store.transaction(() => {
-            chat.update(reply.id, { text: result, status: 'completed' });
+            chat.update(reply.id, { text: this.publicText(result), status: 'completed' });
             if (!chat.get(message.id).routing?.actions.length) chat.routeAction(message.id, { id: randomUUID(), kind: 'reply', status: 'accepted', at: Date.now() });
             chat.routeState(message.id, 'completed');
             chat.update(message.id, { status: 'completed' });
@@ -974,7 +978,13 @@ export class Coordinator {
           }
           context.settled = true;
           const status = context.controller.signal.aborted ? 'interrupted' : 'failed';
-          chat.update(reply.id, { status, reason: 'F.R.I.D.A.Y. 回复未完成；已保留公开输出和真实错误轨迹，不自动重放。' });
+          const detail = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').trim();
+          const failReason = status === 'interrupted'
+            ? 'F.R.I.D.A.Y. 回复未完成；已保留公开输出和真实错误轨迹，不自动重放。'
+            : isRetryableModelError(error)
+              ? `这条我没答上：模型那边暂时过载或限流（${detail.slice(0, 120)}），备用模型也没接住。过一会儿再发我一次。`
+              : `这条我没答上：${detail.slice(0, 200) || '未知错误'}`;
+          chat.update(reply.id, { status, reason: failReason });
           chat.routeState(message.id, status);
           chat.update(message.id, { status, reason: error instanceof Error ? '处理未完成，可查看执行轨迹。' : '处理失败。' });
           break;
@@ -1003,8 +1013,11 @@ export class Coordinator {
   }
   private launch(run: Run, work: () => Promise<void>) {
     run.jobs++;
-    const job = work().catch(() => {
-      if (!run.controller.signal.aborted) this.stop(run.id, '模型或执行器请求失败：已撤销派发，正在等待在途操作结算', 'failed');
+    const job = work().catch(async (error: unknown) => {
+      if (run.controller.signal.aborted) return;
+      const detail = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').trim().slice(0, 600) || '未知错误';
+      if (await this.routeWorkerFailure(run, detail)) return;
+      if (!run.controller.signal.aborted) this.stop(run.id, `模型或执行器请求失败：${detail}`, 'failed');
     }).finally(async () => {
       if (run.stopping && run.reads.size) await Promise.all([...run.reads.values()]);
       run.jobs--; this.jobs.delete(job);
@@ -1019,9 +1032,74 @@ export class Coordinator {
     });
     this.jobs.add(job);
   }
+  /**
+   * Host-level circuit breaker: if at least two recent works on the same provider crashed with the identical
+   * error, another dispatch to that provider is a retry of a known environment fault, not new work.
+   */
+  private failureCircuitBreaker(workerModel: string | undefined): string | undefined {
+    const provider = workerModel?.includes('/') ? workerModel.slice(0, workerModel.indexOf('/')) : undefined;
+    const sameProvider = (model?: string) => provider
+      ? model?.startsWith(`${provider}/`) === true
+      : !model?.includes('/');
+    const since = Date.now() - 30 * 60_000;
+    const counts = new Map<string, number>();
+    for (const task of this.store.list()) {
+      if (task.status !== 'failed' || task.createdAt < since || !task.reason || !sameProvider(task.workerModel)) continue;
+      counts.set(task.reason, (counts.get(task.reason) ?? 0) + 1);
+    }
+    for (const [reason, count] of counts) {
+      if (count >= 2) {
+        return `熔断：最近 30 分钟内已有 ${count} 个${provider ? ` ${provider} ` : ''}任务以相同错误失败（${reason.slice(0, 300)}）。这是环境/工具故障，不要再换花样派发；改用其他提供方的模型，或直接把错误原文告诉老板。`;
+      }
+    }
+    return undefined;
+  }
+  /** Router text is spoken to the Boss: strip task IDs and internal staging paths the model leaked. */
+  private publicText(text: string): string {
+    return sanitizePublicReply(text, this.store.list().map(task => task.id));
+  }
   private valid(run: Run): boolean {
     const task = this.store.get(run.id);
     return !run.controller.signal.aborted && task.revision === run.revision && ['queued', 'running'].includes(task.status);
+  }
+  /**
+   * A Worker crashed (model/executor request failed). Instead of posting a raw system notice, hand the real
+   * error to the Router first: she decides whether to retry on another model/route (within the autonomous
+   * dispatch budget) or to tell the Boss plainly. Returns false when the Router could not take the turn,
+   * in which case the caller falls back to the system failure notice.
+   */
+  private async routeWorkerFailure(run: Run, detail: string): Promise<boolean> {
+    const task = this.store.get(run.id);
+    if (!this.router || !task.originMessageId || !this.valid(run)) return false;
+    try {
+      const handled = await this.serialRouter(run, async () => {
+        const chainKey = task.originMessageId ?? task.id;
+        const text = await this.prompt(run, this.router!, JSON.stringify({
+          kind: 'WORKER_FAILED',
+          taskId: task.id,
+          prompt: task.prompt,
+          cwd: task.cwd,
+          ...(task.workerModel ? { workerModel: task.workerModel } : {}),
+          error: detail,
+          deliveryChannel: task.origin?.channel ?? 'local',
+          autoDispatchesRemaining: Math.max(0, 2 - (this.reportAutoDispatches.get(chainKey) ?? 0)),
+        }));
+        if (!this.valid(run)) return false;
+        const isHandoffText = /^(?:\[OFFLINE SIMULATION\]\s*)?(?:好的老板[，,、\s]*)?任务已下发[。！!.\s]*$/i.test(text.trim());
+        if (run.replyId) {
+          if (this.reportTurnDispatched && !this.reportTurnSentFile && isHandoffText) this.store.conversation.delete(run.replyId);
+          else this.store.conversation.update(run.replyId, { text, status: 'completed' });
+          run.replyId = undefined;
+        }
+        return true;
+      });
+      if (!handled) return false;
+    } catch {
+      return false;
+    }
+    run.failureRouted = true;
+    this.finish(run, 'failed', `模型或执行器请求失败：${detail}`);
+    return true;
   }
   private serialRouter<T>(run: Run, work: () => Promise<T>): Promise<T> {
     const next = this.routerQueue.then(async () => {
@@ -1105,6 +1183,11 @@ export class Coordinator {
               ? inferModelTier(resolutionInput)
               : undefined),
           };
+    const breaker = chatWork ? this.failureCircuitBreaker(resolvedModel.model) : undefined;
+    if (breaker) {
+      await rm(join(this.home, 'tasks', id), { recursive: true, force: true });
+      throw new Error(breaker);
+    }
     const task: Task = { id, requestId, fingerprint, prompt, files, limitMs, activeMs: 0,
       status: 'queued', revision: 0, mode: this.factory.mode, createdAt: Date.now(),
       execution: native ? 'native' : 'snapshot', cwd, paths: native ? (paths.length ? paths : source?.paths ?? []) : undefined,
@@ -1305,6 +1388,7 @@ export class Coordinator {
           continue;
         }
         let silentHandoff = false;
+        let acceptedByRouter = false;
         const delivered = await this.serialRouter(run, async () => {
           const preReport = this.store.get(task.id);
           preReport.report = report;
@@ -1340,13 +1424,15 @@ export class Coordinator {
             }
             silentHandoff = true;
           }
+          // The Router dispatched a supplement from this report: she did not accept it as a finished result.
+          acceptedByRouter = !this.reportTurnDispatched;
           if (text.length > 65_536) throw new Error('Router report exceeds delivery limit');
           return text;
         });
         if (!this.valid(run)) return;
         if (delivered === undefined) { input = { kind: 'FOLLOWUP' }; continue; }
         this.finish(run, 'completed', undefined, silentHandoff ? report : delivered);
-        if (task.originMessageId) this.store.consolidateTaskMemory(this.store.get(task.id));
+        if (task.originMessageId && acceptedByRouter) this.store.consolidateTaskMemory(this.store.get(task.id));
         return;
       }
     } finally { worker.close(); }
@@ -1543,12 +1629,15 @@ export class Coordinator {
         timerId: timer.id,
         timerName: timer.name,
         instruction: timer.instruction,
-      }).then(res => {
+      }).then(async res => {
         if (this.closing) return;
         if (!res.notify) {
           this.store.notice('system', 'timer_plugin_silent', `定时插件「${timer.name}」(${pluginName}/${pluginAction}) 已执行（静默跳过通知）`);
           return;
         }
+        // Scheduled plugin reports travel as one plain text message. WeChat renders the markdown
+        // the plugin itself emits (headings, bold, lists, quotes, inline code), so no attachment
+        // or digest rewrite is needed. See `src/fund-report.ts` for the retired adapter.
         const userMsg = this.store.conversation.create({
           id: randomUUID(), role: 'user', source: 'system', origin,
           text: `[定时触发 · ${timer.name}] ${timer.instruction}`,
@@ -1629,7 +1718,7 @@ export class Coordinator {
       if (status === 'completed' || status === 'failed') {
         this.modelHub.recordTaskOutcome(current.workerModel, status === 'completed', current.activeMs);
       }
-      if (!run.replyId && taskStatusNeedsNotice(status) && current.originMessageId) {
+      if (!run.replyId && !run.failureRouted && taskStatusNeedsNotice(status) && current.originMessageId) {
         const message = this.store.conversation.create({ id: randomUUID(), role: 'assistant', source: 'system',
           replyTo: current.originMessageId, text: '', status: status === 'failed' ? 'failed' : 'interrupted',
           reason: `后台工作${status === 'cancelled' ? '已取消' : status === 'failed' ? '失败' : '暂停'}：${reason ?? '未确认完成，可查看执行轨迹；没有自动重放。'}`,
@@ -1653,7 +1742,7 @@ export class Coordinator {
     const task = this.store.get(run.id);
     const router = agent === this.router;
     const event = JSON.parse(input) as { kind?: string; report?: string };
-    const routerTaskReply = event.kind === 'WORKER_REPORT' || event.kind === 'WORKER_QUESTION';
+    const routerTaskReply = event.kind === 'WORKER_REPORT' || event.kind === 'WORKER_QUESTION' || event.kind === 'WORKER_FAILED';
     if (router && task.originMessageId && routerTaskReply && !run.replyId) {
       const reply = this.store.conversation.create({ id: randomUUID(), replyTo: task.originMessageId, role: 'assistant',
         text: '', status: 'streaming', mode: this.factory.mode, paths: [] });
@@ -1698,7 +1787,7 @@ export class Coordinator {
     try {
       const result = await trace.run(agent, input, run.controller.signal);
       if (router) this.checkpoint();
-      return result;
+      return router ? this.publicText(result) : result;
     } finally {
       if (router) {
         this.routerTrace = undefined;

@@ -374,31 +374,38 @@ async function computeValuation(db, mode = 'noon', offline = false) {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `).run(mode, today, totalCost, totalAsset, totalDailyPnl, totalPnl, JSON.stringify(rows), Date.now());
 
+  // 文案面向微信个人号渲染：标题、粗体、无序列表、引用、行内代码均已验证可用。
   const title = mode === 'settle'
-    ? `🌙【基金晚间正式结算 · ${today} 21:30】`
+    ? `# 🌙 基金晚间正式结算 · ${today} 21:30`
     : mode === 'noon'
-      ? `☀️【基金午间持仓估值 · ${today} 12:00】`
-      : `📊【基金实时持仓与收益状态 · ${today}】`;
+      ? `# ☀️ 基金午间持仓估值 · ${today} 12:00`
+      : `# 📊 基金实时持仓与收益状态 · ${today}`;
+  const dailyLabel = mode === 'settle' ? '结算' : '预估';
 
   const lines = [
     title,
-    `━━━━━━━━━━━━━━━━━━━━`,
-    `💰 当前持仓总资产：${totalAsset.toFixed(2)} 元（总成本 ${totalCost.toFixed(2)} 元）`,
-    `📈 当日${mode === 'settle' ? '结算' : '预估'}收益：${signNum(totalDailyPnl)} 元 (${signNum(dailyPnlPct)}%)`,
-    `🏦 累计持仓总盈亏：${signNum(totalPnl)} 元 (${signNum(totalPnlPct)}%)`,
-    `━━━━━━━━━━━━━━━━━━━━`,
-    `📋 持仓明细（共 ${rows.length} 只）：`,
+    '',
+    `💰 **总资产** ${totalAsset.toFixed(2)} 元 ｜ **成本** ${totalCost.toFixed(2)} 元`,
+    `📈 **当日${dailyLabel}** ${signNum(totalDailyPnl)} 元（**${signNum(dailyPnlPct)}%**）`,
+    `🏦 **累计** ${signNum(totalPnl)} 元（**${signNum(totalPnlPct)}%**）`,
+    '',
+    `## 📋 明细（${rows.length} 只）`,
+    '',
   ];
 
   for (const r of rows) {
     const icon = r.dailyPnl > 0 ? '🔴' : r.dailyPnl < 0 ? '🟢' : '⚪';
     lines.push(
-      `${icon} ${r.name} (${r.code})`,
-      `   • 资产/成本：${r.currentAsset.toFixed(2)} / ${r.cost.toFixed(2)} 元（份额 ${r.shares.toFixed(2)}）`,
-      `   • 当日盈亏：${signNum(r.dailyPnl)} 元 (${signNum(r.changePct)}%) | 累计：${signNum(r.totalPnl)} 元 (${signNum(r.totalPnlPct)}%)`,
-      `   • 净值口径：${r.currentNav.toFixed(4)} [${r.navSource}]`,
+      `- ${icon} **${r.name}** \`${r.code}\`：资产 ${r.currentAsset.toFixed(2)}（成本 ${r.cost.toFixed(2)} / ${r.shares.toFixed(2)} 份）｜当日 ${signNum(r.dailyPnl)}（${signNum(r.changePct)}%）｜累计 ${signNum(r.totalPnl)}（${signNum(r.totalPnlPct)}%）｜净值 ${r.currentNav.toFixed(4)} · ${r.navSource}`,
     );
   }
+
+  lines.push(
+    '',
+    mode === 'settle'
+      ? '> 🌙 晚间结算：尚未公布当日正式净值的基金按跟踪标的最新涨跌幅预估，以晚间官方披露为准。'
+      : '> ⚠️ 盘中估值，锚定对应指数，以晚间官方披露为准。',
+  );
 
   return {
     today,

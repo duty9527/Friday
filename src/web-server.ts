@@ -13,6 +13,7 @@ const assets: Record<string, { file: string; mime: string }> = {
   '/index.html': { file: 'index.html', mime: 'text/html; charset=utf-8' },
   '/client.js': { file: 'client.js', mime: 'application/javascript; charset=utf-8' },
   '/model.js': { file: 'model.js', mime: 'application/javascript; charset=utf-8' },
+  '/brain.js': { file: 'brain.js', mime: 'application/javascript; charset=utf-8' },
   '/style.css': { file: 'style.css', mime: 'text/css; charset=utf-8' },
   '/plex-sans.woff2': { file: 'plex-sans.woff2', mime: 'font/woff2' },
   '/plex-mono.woff2': { file: 'plex-mono.woff2', mime: 'font/woff2' },

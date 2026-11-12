@@ -12,10 +12,20 @@ export interface PersistedProviderConfig {
   apiKey?: string;
   baseUrl?: string;
   customModels?: string[];
+  /** 用户显式勾选进入 Worker 模型池的模型及其等级 */
+  selectedModels?: SelectedModelConfig[];
   fetchedModels?: ModelCatalogEntry[];
   modelsFetchedAt?: number;
   fetchError?: string;
 }
+
+export interface SelectedModelConfig {
+  id: string;
+  tier: ModelTier;
+}
+
+const MODEL_TIER_VALUES: readonly ModelTier[] = ['fast', 'balanced', 'strong'];
+const MAX_SELECTED_MODELS = 64;
 
 export interface ModelEffectStats {
   successCount: number;
@@ -45,6 +55,7 @@ export interface ModelHubConfigureInput {
   clearApiKey?: boolean;
   baseUrl?: string;
   customModels?: string[];
+  selectedModels?: SelectedModelConfig[];
   routerProvider?: string;
   routerModel?: string;
   workerProvider?: string;
@@ -177,6 +188,28 @@ function classifyModelEntry(
   return { tier, specialties };
 }
 
+function normalizeSelectedModels(input: unknown): SelectedModelConfig[] {
+  if (!Array.isArray(input)) throw new Error('selectedModels 必须是数组');
+  const result: SelectedModelConfig[] = [];
+  const seen = new Set<string>();
+  for (const raw of input) {
+    const item = (raw ?? {}) as { id?: unknown; tier?: unknown };
+    const id = typeof item.id === 'string' ? item.id.trim() : '';
+    if (!id) throw new Error('selectedModels 中的模型 ID 不能为空');
+    if (id.length > 128) throw new Error(`模型 ID 过长: ${id.slice(0, 32)}…`);
+    if (typeof item.tier !== 'string' || !MODEL_TIER_VALUES.includes(item.tier as ModelTier)) {
+      throw new Error(`模型 "${id}" 的等级无效：${String(item.tier)}（应为 fast / balanced / strong）`);
+    }
+    if (seen.has(id)) continue;
+    seen.add(id);
+    result.push({ id, tier: item.tier as ModelTier });
+  }
+  if (result.length > MAX_SELECTED_MODELS) {
+    throw new Error(`每个提供方最多勾选 ${MAX_SELECTED_MODELS} 个模型，当前 ${result.length} 个`);
+  }
+  return result;
+}
+
 function maskKey(key: string | undefined): string | undefined {
   if (!key) return undefined;
   const trimmed = key.trim();
@@ -219,6 +252,8 @@ export class ModelHub {
   private runtime?: ModelRuntime;
   private readonly baseModelsByProvider = new Map<string, ReturnType<ModelRuntime['getModels']>>();
   private cachedPool: PooledModelEntry[] = [];
+  /** 所有已配置且启用的 provider 的完整模型目录（仅用于禁用 provider 时的回退选择，不作为 Worker 模型池） */
+  private cachedCatalog: PooledModelEntry[] = [];
 
   constructor(
     private readonly home: string,
@@ -662,21 +697,21 @@ export class ModelHub {
     let workerProvider = normalizeProviderId(this.state.workerProvider) ?? this.currentTiers.provider;
     let routerProvider = normalizeProviderId(this.state.routerProvider) ?? this.currentRouterProvider;
     let routerModel = this.state.routerModel ?? this.currentTiers.router;
-    if (workerProvider !== 'offline' && !this.isProviderEnabled(workerProvider) && this.cachedPool.length > 0) {
-      workerProvider = this.cachedPool[0]!.providerId;
+    if (workerProvider !== 'offline' && !this.isProviderEnabled(workerProvider) && this.cachedCatalog.length > 0) {
+      workerProvider = this.cachedCatalog[0]!.providerId;
       this.state.workerProvider = workerProvider;
       delete this.state.fastModel;
       delete this.state.balancedModel;
       delete this.state.strongModel;
     }
-    if (routerProvider !== 'offline' && !this.isProviderEnabled(routerProvider) && this.cachedPool.length > 0) {
-      routerProvider = this.cachedPool[0]!.providerId;
-      routerModel = this.cachedPool.find(p => p.providerId === routerProvider && p.tier === 'balanced')?.modelId ?? this.cachedPool[0]!.modelId;
+    if (routerProvider !== 'offline' && !this.isProviderEnabled(routerProvider) && this.cachedCatalog.length > 0) {
+      routerProvider = this.cachedCatalog[0]!.providerId;
+      routerModel = this.cachedCatalog.find(p => p.providerId === routerProvider && p.tier === 'balanced')?.modelId ?? this.cachedCatalog[0]!.modelId;
       this.state.routerProvider = routerProvider;
       this.state.routerModel = routerModel;
     }
     if (workerProvider !== 'offline') {
-      const workerPoolDefault = this.cachedPool.find(p => p.providerId === workerProvider)?.modelId;
+      const workerPoolDefault = this.cachedCatalog.find(p => p.providerId === workerProvider)?.modelId;
       const defaultWorker = this.state.strongModel ?? this.state.balancedModel ?? workerPoolDefault ?? this.currentTiers.strong;
       this.currentTiers = buildModelTiers(runtime, workerProvider, routerModel, defaultWorker, {
         fastModel: this.state.fastModel,
@@ -694,6 +729,8 @@ export class ModelHub {
       };
     }
     this.currentRouterProvider = routerProvider;
+    // 模型池依赖最新的 Worker 档位，档位更新后重建一次
+    await this.rebuildPoolCache(runtime);
     this.onTiersUpdated?.(this.currentTiers, this.currentRouterProvider, this.currentTiers.router, this.disabledProviders());
   }
 
@@ -706,6 +743,7 @@ export class ModelHub {
     if (this.currentRouterProvider && this.currentRouterProvider !== 'offline') providerIds.add(this.currentRouterProvider);
 
     const pool: PooledModelEntry[] = [];
+    const catalog: PooledModelEntry[] = [];
     for (const id of providerIds) {
       const featured = FEATURED_PROVIDERS.find(p => p.id === id);
       const catalogProvider = runtime.getProvider(id);
@@ -739,11 +777,10 @@ export class ModelHub {
         hasCustomBaseUrl: Boolean(persisted?.baseUrl),
       });
 
-      for (const m of models) {
+      const toEntry = (m: ModelCatalogEntry, tier: ModelTier, specialties: string[]): PooledModelEntry => {
         const spec = `${id}/${m.id}`;
-        const { tier, specialties } = classifyModelEntry(id, m, sampleTiers);
         const stats = this.state.modelStats?.[spec];
-        pool.push({
+        return {
           spec,
           providerId: id,
           providerName,
@@ -757,9 +794,42 @@ export class ModelHub {
           latencyMs: stats?.lastLatencyMs,
           successCount: stats?.successCount,
           failCount: stats?.failCount,
-        });
+        };
+      };
+      const lookup = (modelId: string): ModelCatalogEntry => models.find(m => m.id === modelId) ?? {
+        id: modelId,
+        name: modelId,
+        supportsImages: false,
+        reasoning: false,
+        contextWindow: 128_000,
+        costInput: 0,
+        costOutput: 0,
+      };
+
+      for (const m of models) {
+        const { tier, specialties } = classifyModelEntry(id, m, sampleTiers);
+        catalog.push(toEntry(m, tier, specialties));
+      }
+
+      // Worker 模型池：仅包含用户显式勾选的模型（等级由用户指定）+ 当前 Worker provider 的三档模型
+      const added = new Set<string>();
+      const addToPool = (modelId: string, tier: ModelTier) => {
+        if (!modelId || added.has(modelId)) return;
+        added.add(modelId);
+        const m = lookup(modelId);
+        const inferred = classifyModelEntry(id, m, sampleTiers).specialties.filter(s => s !== '极速响应');
+        if (tier === 'fast') inferred.push('极速响应');
+        pool.push(toEntry(m, tier, inferred.length ? inferred : ['通用执行']));
+      };
+      for (const sel of persisted?.selectedModels ?? []) {
+        if (typeof sel?.id === 'string' && MODEL_TIER_VALUES.includes(sel.tier)) addToPool(sel.id, sel.tier);
+      }
+      if (id === this.currentTiers.provider) {
+        // 同一模型占据多个档位时优先视为 balanced（与 classifyModelEntry 的约定一致）
+        for (const tierName of ['balanced', 'strong', 'fast'] as const) addToPool(this.currentTiers[tierName], tierName);
       }
     }
+    this.cachedCatalog = catalog;
     this.cachedPool = pool;
     return pool;
   }
@@ -795,6 +865,13 @@ export class ModelHub {
     void this.saveState().catch(() => {});
   }
 
+  private modelNotInPoolError(rawModel: string): Error {
+    const limit = 12;
+    const specs = this.cachedPool.map(p => p.spec);
+    const listed = specs.slice(0, limit).join(', ') + (specs.length > limit ? ` 等 ${specs.length} 个` : '');
+    return new Error(`模型 "${rawModel}" 未在模型中心启用；当前可用：${listed || '无'}`);
+  }
+
   selectWorkerModel(input: WorkerModelResolutionInput): { model: string; tier: ModelTier } {
     const rawModel = input.model?.trim();
     const tier = inferModelTier(input);
@@ -807,7 +884,9 @@ export class ModelHub {
         if (explicitProv && !this.isProviderEnabled(explicitProv)) {
           throw new Error(`提供方 "${explicitProv}" 已禁用，无法调用模型 "${rawModel}"`);
         }
-        const entry = this.cachedPool.find(p => p.spec === rawModel);
+        const normalizedSpec = `${explicitProv}/${rawModel.slice(slash + 1)}`;
+        const entry = this.cachedPool.find(p => p.spec === rawModel || p.spec === normalizedSpec);
+        if (!entry && this.cachedPool.length > 0) throw this.modelNotInPoolError(rawModel);
         return { model: rawModel, tier: entry?.tier ?? tier };
       }
       const poolHit = this.cachedPool.find(p => p.modelId === rawModel);
@@ -832,6 +911,7 @@ export class ModelHub {
       if (!this.isProviderEnabled(this.currentTiers.provider)) {
         throw new Error(`提供方 "${this.currentTiers.provider}" 已禁用，无法调用模型 "${rawModel}"`);
       }
+      if (this.cachedPool.length > 0) throw this.modelNotInPoolError(rawModel);
       return resolveWorkerModelFromTiers(this.currentTiers, input);
     }
 
@@ -980,6 +1060,8 @@ export class ModelHub {
         defaultBalanced: sampleTiers.balanced,
         defaultStrong: sampleTiers.strong,
         models,
+        selectedModels: persisted?.selectedModels ?? [],
+        suggestedTiers: Object.fromEntries(models.map(m => [m.id, classifyModelEntry(id, m, sampleTiers).tier])),
       });
     }
 
@@ -1031,6 +1113,11 @@ export class ModelHub {
       }
       if (Array.isArray(input.customModels)) {
         next.customModels = input.customModels.map(m => m.trim()).filter(Boolean);
+      }
+      if (input.selectedModels !== undefined) {
+        const selected = normalizeSelectedModels(input.selectedModels);
+        if (selected.length) next.selectedModels = selected;
+        else delete next.selectedModels;
       }
       this.state.providers[targetProvider] = next;
       if (this.mode === 'real' && next.enabled !== false && !input.clearApiKey && (next.apiKey || next.baseUrl)) {
