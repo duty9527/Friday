@@ -36,11 +36,16 @@ export interface Task {
   id: string; requestId: string; fingerprint: string; prompt: string;
   status: TaskStatus; revision: number; files: InputFile[];
   mode: 'real' | 'offline'; createdAt: number; limitMs: number; activeMs: number;
-  report?: string; reason?: string; sessionFile?: string;
+  report?: string; reason?: string; sessionFile?: string; sessionId?: string;
   originMessageId?: string; parentTaskId?: string; parentSpanId?: string;
   execution?: 'native' | 'snapshot'; cwd?: string; paths?: string[];
   contextBrief?: string; memoryIds?: string[];
   profile?: WorkerProfile; workerModel?: string; modelTier?: import('./view.js').ModelTier;
+  thinkingLevel?: import('./view.js').ThinkingLevel;
+  decisionSource?: import('./view.js').DecisionSource;
+  decisionConfidence?: number;
+  skipQualityGate?: boolean;
+  qualityGate?: import('./view.js').QualityGateAssessment;
   pendingQuestion?: import('./view.js').PendingQuestion;
 }
 export interface TaskEvent { id: string; taskId: string; text: string; state: string }
@@ -299,7 +304,11 @@ export class Store {
       hasBotToken: Boolean(channel.botToken),
       hasSecret: Boolean(channel.secret),
       accountId: channel.accountId,
-      loginStatus: channel.platform === 'wechat' ? (channel.botToken ? 'bound' : 'unbound') : undefined,
+      loginStatus: channel.platform === 'wechat'
+        ? (channel.botToken ? 'bound' : 'unbound')
+        : channel.platform === 'xiaoai'
+          ? (Boolean(channel.botToken || channel.webhookUrl || channel.apiBase?.startsWith('ssh://')) ? 'bound' : 'unbound')
+          : undefined,
       webhookUrlMasked,
       defaultTarget: channel.defaultTarget,
       allowedSenders: channel.allowedSenders,

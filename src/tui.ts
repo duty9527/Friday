@@ -62,9 +62,17 @@ export async function startTui(home: string): Promise<void> {
           const view = await request(home, { command: 'view' }) as MainView;
           for (const work of view.works) {
             const profileTag = work.profile ? `[${work.profile}] ` : '';
-            const modelTag = work.modelTier || work.workerModel ? `[${[work.modelTier, work.workerModel].filter(Boolean).join(':')}] ` : '';
+            const modelDisplay = work.workerModel
+              ? `${work.workerModel}${work.thinkingLevel ? `@${work.thinkingLevel}` : ''}`
+              : (work.modelTier ?? '');
+            const modelTag = modelDisplay ? `[${modelDisplay}] ` : '';
+            const qualityTag = work.qualityGate
+              ? (work.qualityGate.skippedByRoute
+                  ? ' [质检:免评]'
+                  : ` [质检:${work.qualityGate.score.toFixed(1)}/${work.qualityGate.maxScore}]`)
+              : '';
             const pendingTag = work.pendingQuestion ? ` [\x1b[33m⏳待拍板: ${work.pendingQuestion.question.slice(0, 48)}\x1b[0m]` : '';
-            process.stdout.write(`  - ${work.id.slice(0, 8)} [${work.status}] ${profileTag}${modelTag}${work.prompt}${work.concurrentTaskIds?.length ? ' (同目录并发)' : ''}${pendingTag}\n`);
+            process.stdout.write(`  - ${work.id.slice(0, 8)} [${work.status}] ${profileTag}${modelTag}${work.prompt}${work.concurrentTaskIds?.length ? ' (同目录并发)' : ''}${qualityTag}${pendingTag}\n`);
           }
         } else if (input === '/memories') {
           const memories = await request(home, { command: 'memory-list' }) as MemoryCard[];

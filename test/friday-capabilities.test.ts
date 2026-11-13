@@ -228,7 +228,7 @@ test('Step 6: Dynamic Worker model tiering (fast/balanced/strong) from single OA
     assert.equal(hybrid.modelTiers.strong, 'gpt-6.1-sol');
 
     // 2. End-to-end Coordinator routing with hybrid explicit tier + automatic complexity heuristic
-    const observedWorkers: Array<{ instruction: string; tier?: string; model?: string }> = [];
+    const observedWorkers: Array<{ instruction: string; tier?: string; thinkingLevel?: string; model?: string }> = [];
     const baseOffline = offlineFactory(10);
     const factory: AgentFactory = {
       mode: 'offline',
@@ -244,6 +244,7 @@ test('Step 6: Dynamic Worker model tiering (fast/balanced/strong) from single OA
               observedWorkers.push({
                 instruction: String(event.prompt ?? ''),
                 tier: options?.tier,
+                thinkingLevel: options?.thinkingLevel,
                 model: options?.model,
               });
               return 'done';
@@ -277,21 +278,22 @@ test('Step 6: Dynamic Worker model tiering (fast/balanced/strong) from single OA
       assert.equal(observedWorkers.length, 4);
       const byPrompt = (substr: string) => observedWorkers.find(w => w.instruction.includes(substr))!;
       assert.deepEqual(
-        { tier: byPrompt('查看状态').tier, model: byPrompt('查看状态').model },
-        { tier: 'fast', model: 'gpt-6-luna' },
+        { tier: byPrompt('查看状态').tier, thinkingLevel: byPrompt('查看状态').thinkingLevel, model: byPrompt('查看状态').model },
+        { tier: 'fast', thinkingLevel: 'low', model: 'gpt-6-luna' },
       );
       assert.deepEqual(
-        { tier: byPrompt('分页参数').tier, model: byPrompt('分页参数').model },
-        { tier: 'balanced', model: 'gpt-6.1-terra' },
+        { tier: byPrompt('分页参数').tier, thinkingLevel: byPrompt('分页参数').thinkingLevel, model: byPrompt('分页参数').model },
+        { tier: 'balanced', thinkingLevel: 'medium', model: 'gpt-6.1-terra' },
       );
       assert.deepEqual(
-        { tier: byPrompt('重构跨进程锁').tier, model: byPrompt('重构跨进程锁').model },
-        { tier: 'strong', model: 'gpt-6.1-sol' },
+        { tier: byPrompt('重构跨进程锁').tier, thinkingLevel: byPrompt('重构跨进程锁').thinkingLevel, model: byPrompt('重构跨进程锁').model },
+        { tier: 'strong', thinkingLevel: 'high', model: 'gpt-6.1-sol' },
       );
       assert.deepEqual(
-        { tier: byPrompt('修改一行注释').tier, model: byPrompt('修改一行注释').model },
-        { tier: 'fast', model: 'gpt-6-luna' },
+        { tier: byPrompt('修改一行注释').tier, thinkingLevel: byPrompt('修改一行注释').thinkingLevel, model: byPrompt('修改一行注释').model },
+        { tier: 'fast', thinkingLevel: 'low', model: 'gpt-6-luna' },
       );
+      assert.ok(coordinator.view().works.every(w => typeof w.thinkingLevel === 'string' && w.thinkingLevel.length > 0));
     } finally {
       await coordinator.close();
     }
@@ -374,11 +376,12 @@ test('Step 7: Model Provider Hub manages credentials, hot-switches F.R.I.D.A.Y. 
     await coordinator.configureModels({ providerId: 'anthropic', apiKey: 'sk-ant-test' });
     await coordinator.configureModels({ providerId: 'google', apiKey: 'sk-goog-test' });
     const unselectedHub = await coordinator.configureModels({ providerId: 'dashscope', apiKey: 'sk-qwen-test' });
-    // 未勾选任何模型时，Worker 模型池只包含当前 Worker provider 的三档模型
+    // 未勾选任何模型时，Worker 模型池只包含当前 Worker provider 的默认模型，并保留各自原生思考等级
     assert.deepEqual(
-      (unselectedHub.modelPool ?? []).map(m => `${m.spec}:${m.tier}`).sort(),
-      ['google/gemini-3.8-flash:balanced', 'google/gemini-4-argon:strong'],
+      (unselectedHub.modelPool ?? []).map(m => m.spec).sort(),
+      ['google/gemini-3.8-flash', 'google/gemini-4-argon'],
     );
+    assert.ok((unselectedHub.modelPool ?? []).every(m => Array.isArray(m.thinkingLevels) && m.thinkingLevels.length >= 1));
     assert.throws(
       () => coordinator.modelHub.selectWorkerModel({ model: 'dashscope/not-enabled-model' }),
       /未在模型中心启用；当前可用：google\/gemini-3\.8-flash, google\/gemini-4-argon/,
@@ -388,48 +391,50 @@ test('Step 7: Model Provider Hub manages credentials, hot-switches F.R.I.D.A.Y. 
       coordinator.configureModels({ providerId: 'anthropic', selectedModels: [{ id: 'x', tier: 'ultra' as never }] }),
       /等级无效/,
     );
+    await assert.rejects(
+      coordinator.configureModels({ providerId: 'anthropic', selectedModels: [{ id: 'x', thinkingLevels: ['turbo' as never] }] }),
+      /原生思考等级无效/,
+    );
 
-    // 显式勾选模型并指定等级后进入池子，tier 以用户指定为准
+    // 显式勾选模型后保留其自身原生思考等级进入池子（支持字符串与对象格式、自动去重，不锁死人工档位）
     const antModels = unselectedHub.providers.find(p => p.id === 'anthropic')!.models.map(m => m.id);
     const qwenModels = unselectedHub.providers.find(p => p.id === 'dashscope')!.models.map(m => m.id);
     assert.ok(antModels.length >= 2 && qwenModels.length >= 2);
     await coordinator.configureModels({
       providerId: 'anthropic',
-      selectedModels: [{ id: antModels[0]!, tier: 'strong' }, { id: antModels[1]!, tier: 'fast' }, { id: antModels[0]!, tier: 'fast' }],
+      selectedModels: [antModels[0]!, { id: antModels[1]! }, antModels[0]!],
     });
     const multiHub = await coordinator.configureModels({
       providerId: 'dashscope',
-      selectedModels: [{ id: qwenModels[0]!, tier: 'fast' }, { id: qwenModels[1]!, tier: 'strong' }],
+      selectedModels: [{ id: qwenModels[0]! }, { id: qwenModels[1]! }],
     });
-    assert.equal(multiHub.modelPool?.length, 6, 'pool = 2 tier models + 4 explicitly selected models');
-    const poolTier = (spec: string) => multiHub.modelPool?.find(m => m.spec === spec)?.tier;
-    assert.equal(poolTier(`anthropic/${antModels[0]}`), 'strong', 'duplicate selection keeps the first tier');
-    assert.equal(poolTier(`anthropic/${antModels[1]}`), 'fast');
-    assert.equal(poolTier(`dashscope/${qwenModels[0]}`), 'fast');
-    assert.equal(poolTier(`dashscope/${qwenModels[1]}`), 'strong');
+    assert.equal(multiHub.modelPool?.length, 6, 'pool = 2 default provider models + 4 explicitly selected models');
+    assert.ok(multiHub.modelPool?.every(m => Array.isArray(m.thinkingLevels) && m.thinkingLevels.length >= 1));
     assert.deepEqual(multiHub.providers.find(p => p.id === 'dashscope')?.selectedModels, [
-      { id: qwenModels[0], tier: 'fast' }, { id: qwenModels[1], tier: 'strong' },
+      { id: qwenModels[0] }, { id: qwenModels[1] },
     ]);
     const persistedHub = JSON.parse(await readFile(join(home, 'sdk', 'model-hub.json'), 'utf8')) as { providers: Record<string, { selectedModels?: unknown }> };
     assert.deepEqual(persistedHub.providers.anthropic?.selectedModels, [
-      { id: antModels[0], tier: 'strong' }, { id: antModels[1], tier: 'fast' },
-    ], 'selectedModels are persisted to model-hub.json');
-    assert.deepEqual(
-      coordinator.modelHub.selectWorkerModel({ model: `dashscope/${qwenModels[1]}` }),
-      { model: `dashscope/${qwenModels[1]}`, tier: 'strong' },
-    );
+      { id: antModels[0] }, { id: antModels[1] },
+    ], 'selectedModels are persisted to model-hub.json without forced tier locking');
+    const qwenSecondEntry = multiHub.modelPool!.find(m => m.spec === `dashscope/${qwenModels[1]}`)!;
+    const qwenPicked = coordinator.modelHub.selectWorkerModel({ model: `dashscope/${qwenModels[1]}` });
+    assert.equal(qwenPicked.model, `dashscope/${qwenModels[1]}`);
+    assert.ok(qwenSecondEntry.thinkingLevels.includes(qwenPicked.thinkingLevel), 'picked thinkingLevel belongs to model native levels');
 
-    // Fast inspection picks a fast model across the pool
+    // Fast inspection picks a lightweight model + low native thinkingLevel across the pool
     const fastPick = coordinator.modelHub.selectWorkerModel({ instruction: '查看状态', isTimer: true });
     assert.equal(fastPick.tier, 'fast');
+    assert.ok(['off', 'minimal', 'low'].includes(fastPick.thinkingLevel));
     assert.match(fastPick.model, /\//, 'multi-provider selection returns qualified provider/model spec');
 
-    // Deep refactoring/review picks a strong reasoning/coding model across the pool
+    // Deep refactoring/review picks a strong reasoning/coding model + high native thinkingLevel across the pool
     const strongPick = coordinator.modelHub.selectWorkerModel({
       instruction: '重构核心架构并审计并发死锁与安全漏洞',
       profile: 'review',
     });
     assert.equal(strongPick.tier, 'strong');
+    assert.ok(['high', 'xhigh', 'max'].includes(strongPick.thinkingLevel));
     assert.match(strongPick.model, /\//);
   } finally {
     await coordinator.close();

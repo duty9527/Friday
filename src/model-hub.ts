@@ -4,7 +4,35 @@ import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { buildModelTiers, inferModelTier, resolveWorkerModelFromTiers, type WorkerModelResolutionInput } from './agent.js';
-import type { ModelCatalogEntry, ModelHubView, ModelProbeResult, ModelProviderView, ModelTier, ModelTierConfig, PooledModelEntry } from './view.js';
+import {
+  clampNativeThinkingLevel,
+  decideWorkerRoute,
+  DEFAULT_GEMINI_DECISION_BASE_URL,
+  evaluateSessionContinuity,
+  evaluateWorkCompletion,
+  GEMINI_DECISION_MODEL,
+  getNativeThinkingLevels,
+  isThinkingLevel,
+  selectHeuristicRoute,
+  type CompletionEvaluationInput,
+  type CompletionEvaluationResult,
+  type DecisionCredentials,
+  type DecisionRouteCandidate,
+  type DecisionSource,
+  type SessionContinuityInput,
+  type SessionContinuityResult,
+  type ThinkingLevel,
+} from './decision.js';
+import type {
+  DecisionEngineView,
+  ModelCatalogEntry,
+  ModelHubView,
+  ModelProbeResult,
+  ModelProviderView,
+  ModelTier,
+  ModelTierConfig,
+  PooledModelEntry,
+} from './view.js';
 
 export interface PersistedProviderConfig {
   name?: string;
@@ -12,7 +40,7 @@ export interface PersistedProviderConfig {
   apiKey?: string;
   baseUrl?: string;
   customModels?: string[];
-  /** 用户显式勾选进入 Worker 模型池的模型及其等级 */
+  /** 用户显式勾选进入 Worker 模型池的模型（保留各自原生思考等级） */
   selectedModels?: SelectedModelConfig[];
   fetchedModels?: ModelCatalogEntry[];
   modelsFetchedAt?: number;
@@ -21,18 +49,30 @@ export interface PersistedProviderConfig {
 
 export interface SelectedModelConfig {
   id: string;
-  tier: ModelTier;
+  thinkingLevels?: ThinkingLevel[];
+  /** 向后兼容旧配置文件字段 */
+  tier?: ModelTier;
 }
 
 const MODEL_TIER_VALUES: readonly ModelTier[] = ['fast', 'balanced', 'strong'];
 const MAX_SELECTED_MODELS = 64;
+const DECISION_STATS_EPOCH = 'jev-era-v1';
 
 export interface ModelEffectStats {
   successCount: number;
   failCount: number;
   lastLatencyMs?: number;
   lastProbeOk?: boolean;
+  qualityScoreSum?: number;
+  qualityCount?: number;
+  avgQualityScore?: number;
   updatedAt: number;
+}
+
+export interface PersistedDecisionConfig {
+  enabled?: boolean;
+  apiKey?: string;
+  baseUrl?: string;
 }
 
 export interface PersistedModelHubState {
@@ -42,8 +82,10 @@ export interface PersistedModelHubState {
   fastModel?: string;
   balancedModel?: string;
   strongModel?: string;
+  decision?: PersistedDecisionConfig;
   providers: Record<string, PersistedProviderConfig>;
   modelStats?: Record<string, ModelEffectStats>;
+  statsEpoch?: string;
   lastProbe?: ModelProbeResult;
 }
 
@@ -55,13 +97,17 @@ export interface ModelHubConfigureInput {
   clearApiKey?: boolean;
   baseUrl?: string;
   customModels?: string[];
-  selectedModels?: SelectedModelConfig[];
+  selectedModels?: Array<string | SelectedModelConfig>;
   routerProvider?: string;
   routerModel?: string;
   workerProvider?: string;
   fastModel?: string;
   balancedModel?: string;
   strongModel?: string;
+  decisionEnabled?: boolean;
+  decisionApiKey?: string;
+  clearDecisionApiKey?: boolean;
+  decisionBaseUrl?: string;
 }
 
 export interface ModelHubFetchInput {
@@ -167,7 +213,7 @@ function classifyModelEntry(
   }
 
   const specialties: string[] = [];
-  if (/(?:claude|codex|gpt-6|gpt-5|gpt-4\.1|o3|coder|deepseek|glm-4\.5|kimi-k2)/i.test(id) || providerId === 'anthropic' || providerId === 'openai-codex') {
+  if (/(?:claude|codex|gemini|gpt-6|gpt-5|gpt-4\.1|o3|coder|deepseek|glm-4\.5|kimi-k2)/i.test(id) || providerId === 'anthropic' || providerId === 'openai-codex') {
     specialties.push('代码工程');
   }
   if (model.reasoning || /(?:opus|sol|argon|o1|o3|reasoner|r1|thinking|grok-4|qwen-max)/i.test(id)) {
@@ -193,21 +239,58 @@ function normalizeSelectedModels(input: unknown): SelectedModelConfig[] {
   const result: SelectedModelConfig[] = [];
   const seen = new Set<string>();
   for (const raw of input) {
-    const item = (raw ?? {}) as { id?: unknown; tier?: unknown };
+    const item = typeof raw === 'string'
+      ? { id: raw }
+      : (raw ?? {}) as { id?: unknown; thinkingLevels?: unknown; tier?: unknown };
     const id = typeof item.id === 'string' ? item.id.trim() : '';
     if (!id) throw new Error('selectedModels 中的模型 ID 不能为空');
     if (id.length > 128) throw new Error(`模型 ID 过长: ${id.slice(0, 32)}…`);
-    if (typeof item.tier !== 'string' || !MODEL_TIER_VALUES.includes(item.tier as ModelTier)) {
+    if (item.tier !== undefined && (typeof item.tier !== 'string' || !MODEL_TIER_VALUES.includes(item.tier as ModelTier))) {
       throw new Error(`模型 "${id}" 的等级无效：${String(item.tier)}（应为 fast / balanced / strong）`);
+    }
+    let thinkingLevels: ThinkingLevel[] | undefined;
+    if (item.thinkingLevels !== undefined) {
+      if (!Array.isArray(item.thinkingLevels) || !item.thinkingLevels.every(isThinkingLevel)) {
+        throw new Error(`模型 "${id}" 的原生思考等级无效`);
+      }
+      const dedup = [...new Set(item.thinkingLevels)];
+      if (dedup.length) thinkingLevels = dedup;
     }
     if (seen.has(id)) continue;
     seen.add(id);
-    result.push({ id, tier: item.tier as ModelTier });
+    result.push({
+      id,
+      ...(thinkingLevels ? { thinkingLevels } : {}),
+    });
   }
   if (result.length > MAX_SELECTED_MODELS) {
     throw new Error(`每个提供方最多勾选 ${MAX_SELECTED_MODELS} 个模型，当前 ${result.length} 个`);
   }
   return result;
+}
+
+function tierToPreferredThinkingLevel(tier: ModelTier | undefined): ThinkingLevel | undefined {
+  if (tier === 'fast') return 'low';
+  if (tier === 'balanced') return 'medium';
+  if (tier === 'strong') return 'high';
+  return undefined;
+}
+
+function thinkingLevelToTier(level: ThinkingLevel): ModelTier {
+  if (level === 'off' || level === 'minimal' || level === 'low') return 'fast';
+  if (level === 'high' || level === 'xhigh' || level === 'max') return 'strong';
+  return 'balanced';
+}
+
+function splitModelAndLevel(raw: string): { model: string; explicitLevel?: ThinkingLevel } {
+  const at = raw.lastIndexOf('@');
+  if (at > 0) {
+    const suffix = raw.slice(at + 1).trim();
+    if (isThinkingLevel(suffix)) {
+      return { model: raw.slice(0, at).trim(), explicitLevel: suffix };
+    }
+  }
+  return { model: raw.trim() };
 }
 
 function maskKey(key: string | undefined): string | undefined {
@@ -254,6 +337,7 @@ export class ModelHub {
   private cachedPool: PooledModelEntry[] = [];
   /** 所有已配置且启用的 provider 的完整模型目录（仅用于禁用 provider 时的回退选择，不作为 Worker 模型池） */
   private cachedCatalog: PooledModelEntry[] = [];
+  private cachedCosts = new Map<string, { costInput: number; costOutput: number }>();
 
   constructor(
     private readonly home: string,
@@ -291,8 +375,10 @@ export class ModelHub {
           fastModel: raw.fastModel,
           balancedModel: raw.balancedModel,
           strongModel: raw.strongModel,
+          decision: raw.decision && typeof raw.decision === 'object' ? raw.decision : undefined,
           providers: raw.providers && typeof raw.providers === 'object' ? raw.providers : {},
           modelStats: raw.modelStats && typeof raw.modelStats === 'object' ? raw.modelStats : {},
+          statsEpoch: typeof raw.statsEpoch === 'string' ? raw.statsEpoch : undefined,
           lastProbe: raw.lastProbe,
         };
       } catch {
@@ -734,6 +820,92 @@ export class ModelHub {
     this.onTiersUpdated?.(this.currentTiers, this.currentRouterProvider, this.currentTiers.router, this.disabledProviders());
   }
 
+  private resolveCatalogThinkingLevels(
+    runtime: ModelRuntime,
+    providerId: string,
+    modelId: string,
+    reasoning: boolean,
+  ): ThinkingLevel[] {
+    const sdkModel = this.getBaseModels(runtime, providerId).find(m => m.id === modelId)
+      ?? runtime.getModel(providerId, modelId);
+    if (sdkModel) {
+      return getNativeThinkingLevels(sdkModel as { reasoning?: boolean; thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>> });
+    }
+    return getNativeThinkingLevels({ reasoning });
+  }
+
+  private async resolveDecisionInfo(runtime: ModelRuntime): Promise<{ credentials?: DecisionCredentials; view: DecisionEngineView }> {
+    const enabled = this.state.decision?.enabled !== false;
+    const baseUrl = this.state.decision?.baseUrl?.trim()
+      || process.env.SUPER_AGENT_DECISION_BASE_URL?.trim()
+      || this.state.providers.google?.baseUrl?.trim()
+      || DEFAULT_GEMINI_DECISION_BASE_URL;
+    if (!enabled) {
+      return {
+        view: {
+          model: GEMINI_DECISION_MODEL,
+          enabled: false,
+          configured: false,
+          credentialSource: 'none',
+          baseUrl,
+        },
+      };
+    }
+
+    const explicitKey = this.state.decision?.apiKey?.trim();
+    const envDecisionKey = process.env.SUPER_AGENT_DECISION_API_KEY?.trim();
+    const googleEnabled = this.isProviderEnabled('google');
+    const googleProviderKey = googleEnabled ? await this.resolveProviderApiKey(runtime, 'google') : undefined;
+    const envGoogleKey = googleEnabled ? (process.env.GEMINI_API_KEY?.trim() || process.env.GOOGLE_API_KEY?.trim()) : undefined;
+
+    let apiKey: string | undefined;
+    let credentialSource: DecisionEngineView['credentialSource'] = 'none';
+    if (explicitKey) {
+      apiKey = explicitKey;
+      credentialSource = 'decision_config';
+    } else if (envDecisionKey) {
+      apiKey = envDecisionKey;
+      credentialSource = 'environment';
+    } else if (googleProviderKey) {
+      apiKey = googleProviderKey;
+      credentialSource = 'google_provider';
+    } else if (envGoogleKey) {
+      apiKey = envGoogleKey;
+      credentialSource = 'environment';
+    }
+
+    // 离线模式下默认不发外网请求；仅当显式配置了独立 decisionApiKey / decisionBaseUrl（如测试桩）时才启用远端决策请求
+    const allowInCurrentMode = this.mode === 'real' || Boolean(explicitKey || this.state.decision?.baseUrl?.trim());
+    const configured = Boolean(apiKey && allowInCurrentMode);
+
+    return {
+      credentials: configured && apiKey ? { apiKey, baseUrl } : undefined,
+      view: {
+        model: GEMINI_DECISION_MODEL,
+        enabled: true,
+        configured,
+        credentialSource: configured ? credentialSource : 'none',
+        keyHint: configured ? maskKey(apiKey) : undefined,
+        baseUrl,
+      },
+    };
+  }
+
+  hasDecisionEngine(): boolean {
+    if (this.state.decision?.enabled === false) return false;
+    if (this.state.decision?.apiKey?.trim()) return true;
+    if (this.mode === 'offline' && !this.state.decision?.baseUrl?.trim()) return false;
+    return Boolean(
+      process.env.SUPER_AGENT_DECISION_API_KEY?.trim()
+      || (this.isProviderEnabled('google') && (
+        this.state.providers.google?.apiKey?.trim()
+        || process.env.GEMINI_API_KEY?.trim()
+        || process.env.GOOGLE_API_KEY?.trim()
+        || this.runtime?.getProviderAuthStatus('google').configured
+      )),
+    );
+  }
+
   private async rebuildPoolCache(runtime: ModelRuntime): Promise<PooledModelEntry[]> {
     const creds = await runtime.listCredentials();
     const oauthSet = new Set(creds.filter(c => c.type === 'oauth').map(c => c.providerId));
@@ -744,6 +916,7 @@ export class ModelHub {
 
     const pool: PooledModelEntry[] = [];
     const catalog: PooledModelEntry[] = [];
+    const costs = new Map<string, { costInput: number; costOutput: number }>();
     for (const id of providerIds) {
       const featured = FEATURED_PROVIDERS.find(p => p.id === id);
       const catalogProvider = runtime.getProvider(id);
@@ -758,10 +931,10 @@ export class ModelHub {
       const providerName = persisted?.name ?? featured?.name ?? catalogProvider?.name ?? id;
       const hasRemoteModels = Boolean(persisted?.fetchedModels?.length);
       const rawModels = runtime.getModels(id);
-      const models: ModelCatalogEntry[] = hasRemoteModels
+      const models: ModelCatalogEntry[] = (hasRemoteModels
         ? persisted!.fetchedModels!
         : rawModels.length
-          ? rawModels.map(m => ({
+          ? rawModels.map((m): ModelCatalogEntry => ({
               id: m.id,
               name: m.name || m.id,
               supportsImages: m.input.includes('image'),
@@ -771,15 +944,34 @@ export class ModelHub {
               costInput: m.cost?.input ?? 0,
               costOutput: m.cost?.output ?? 0,
             }))
-          : (FALLBACK_PROVIDER_MODELS[id] ?? []);
+          : (FALLBACK_PROVIDER_MODELS[id] ?? [])
+      ).map(m => ({
+        ...m,
+        thinkingLevels: m.thinkingLevels?.length
+          ? m.thinkingLevels
+          : this.resolveCatalogThinkingLevels(runtime, id, m.id, m.reasoning),
+      }));
       const sampleDefault = models[0]?.id ?? 'default';
       const sampleTiers = buildModelTiers(runtime, id, sampleDefault, sampleDefault, {
         hasCustomBaseUrl: Boolean(persisted?.baseUrl),
       });
 
-      const toEntry = (m: ModelCatalogEntry, tier: ModelTier, specialties: string[]): PooledModelEntry => {
+      const toEntry = (
+        m: ModelCatalogEntry,
+        tier: ModelTier,
+        specialties: string[],
+        overrideLevels?: ThinkingLevel[],
+      ): PooledModelEntry => {
         const spec = `${id}/${m.id}`;
         const stats = this.state.modelStats?.[spec];
+        const nativeLevels = m.thinkingLevels?.length
+          ? m.thinkingLevels
+          : this.resolveCatalogThinkingLevels(runtime, id, m.id, m.reasoning);
+        const filteredLevels = overrideLevels?.length
+          ? nativeLevels.filter(lvl => overrideLevels.includes(lvl))
+          : nativeLevels;
+        const thinkingLevels = filteredLevels.length ? filteredLevels : nativeLevels;
+        costs.set(spec, { costInput: m.costInput ?? 0, costOutput: m.costOutput ?? 0 });
         return {
           spec,
           providerId: id,
@@ -787,6 +979,7 @@ export class ModelHub {
           modelId: m.id,
           modelName: m.name || m.id,
           tier,
+          thinkingLevels,
           specialties,
           supportsImages: m.supportsImages,
           reasoning: m.reasoning,
@@ -794,6 +987,7 @@ export class ModelHub {
           latencyMs: stats?.lastLatencyMs,
           successCount: stats?.successCount,
           failCount: stats?.failCount,
+          avgQualityScore: stats?.avgQualityScore,
         };
       };
       const lookup = (modelId: string): ModelCatalogEntry => models.find(m => m.id === modelId) ?? {
@@ -804,6 +998,7 @@ export class ModelHub {
         contextWindow: 128_000,
         costInput: 0,
         costOutput: 0,
+        thinkingLevels: ['off'],
       };
 
       for (const m of models) {
@@ -811,26 +1006,27 @@ export class ModelHub {
         catalog.push(toEntry(m, tier, specialties));
       }
 
-      // Worker 模型池：仅包含用户显式勾选的模型（等级由用户指定）+ 当前 Worker provider 的三档模型
+      // Worker 模型池：保留各模型的原生思考等级，不锁死人工自定义单一等级
       const added = new Set<string>();
-      const addToPool = (modelId: string, tier: ModelTier) => {
+      const addToPool = (modelId: string, overrideLevels?: ThinkingLevel[]) => {
         if (!modelId || added.has(modelId)) return;
         added.add(modelId);
         const m = lookup(modelId);
-        const inferred = classifyModelEntry(id, m, sampleTiers).specialties.filter(s => s !== '极速响应');
-        if (tier === 'fast') inferred.push('极速响应');
-        pool.push(toEntry(m, tier, inferred.length ? inferred : ['通用执行']));
+        const classified = classifyModelEntry(id, m, sampleTiers);
+        pool.push(toEntry(m, classified.tier, classified.specialties, overrideLevels));
       };
       for (const sel of persisted?.selectedModels ?? []) {
-        if (typeof sel?.id === 'string' && MODEL_TIER_VALUES.includes(sel.tier)) addToPool(sel.id, sel.tier);
+        const selId = typeof sel === 'string' ? sel : sel?.id;
+        const selLevels = typeof sel === 'string' ? undefined : sel?.thinkingLevels;
+        if (typeof selId === 'string' && selId.trim()) addToPool(selId.trim(), selLevels);
       }
       if (id === this.currentTiers.provider) {
-        // 同一模型占据多个档位时优先视为 balanced（与 classifyModelEntry 的约定一致）
-        for (const tierName of ['balanced', 'strong', 'fast'] as const) addToPool(this.currentTiers[tierName], tierName);
+        for (const tierName of ['balanced', 'strong', 'fast'] as const) addToPool(this.currentTiers[tierName]);
       }
     }
     this.cachedCatalog = catalog;
     this.cachedPool = pool;
+    this.cachedCosts = costs;
     return pool;
   }
 
@@ -838,9 +1034,9 @@ export class ModelHub {
     return this.cachedPool;
   }
 
-  recordTaskOutcome(workerModel: string | undefined, ok: boolean, durationMs?: number): void {
+  recordTaskOutcome(workerModel: string | undefined, ok: boolean, durationMs?: number, qualityScore?: number): void {
     if (!workerModel) return;
-    let spec = workerModel.trim();
+    let spec = splitModelAndLevel(workerModel).model;
     if (!spec) return;
     if (!spec.includes('/')) {
       const matched = this.cachedPool.find(item => item.modelId === spec);
@@ -848,11 +1044,21 @@ export class ModelHub {
     }
     const stats = this.state.modelStats ?? (this.state.modelStats = {});
     const prev = stats[spec] ?? { successCount: 0, failCount: 0, updatedAt: Date.now() };
+    let qualityScoreSum = prev.qualityScoreSum ?? 0;
+    let qualityCount = prev.qualityCount ?? 0;
+    if (typeof qualityScore === 'number' && Number.isFinite(qualityScore)) {
+      qualityScoreSum += Math.max(0, Math.min(3, qualityScore));
+      qualityCount += 1;
+    }
+    const avgQualityScore = qualityCount > 0
+      ? Number((qualityScoreSum / qualityCount).toFixed(2))
+      : prev.avgQualityScore;
     const updated: ModelEffectStats = {
       ...prev,
       successCount: prev.successCount + (ok ? 1 : 0),
       failCount: prev.failCount + (ok ? 0 : 1),
       ...(durationMs && durationMs > 0 ? { lastLatencyMs: Math.round(durationMs) } : {}),
+      ...(qualityCount > 0 ? { qualityScoreSum: Number(qualityScoreSum.toFixed(2)), qualityCount, avgQualityScore } : {}),
       updatedAt: Date.now(),
     };
     stats[spec] = updated;
@@ -861,8 +1067,72 @@ export class ModelHub {
       poolEntry.successCount = updated.successCount;
       poolEntry.failCount = updated.failCount;
       if (updated.lastLatencyMs) poolEntry.latencyMs = updated.lastLatencyMs;
+      if (updated.avgQualityScore !== undefined) poolEntry.avgQualityScore = updated.avgQualityScore;
     }
     void this.saveState().catch(() => {});
+  }
+
+  async syncDecisionEraStats(
+    tasks: readonly {
+      id: string;
+      workerModel?: string;
+      status: string;
+      activeMs: number;
+      createdAt: number;
+      parentTaskId?: string;
+      decisionSource?: DecisionSource;
+      qualityGate?: { score: number; source: DecisionSource };
+    }[],
+  ): Promise<void> {
+    if (this.state.statsEpoch === DECISION_STATS_EPOCH) return;
+    const supplementedIds = new Set(
+      tasks.map(t => t.parentTaskId).filter((id): id is string => Boolean(id)),
+    );
+    const jevTasks = tasks
+      .filter(t => Boolean(t.decisionSource) && (t.status === 'completed' || t.status === 'failed') && Boolean(t.workerModel))
+      .sort((a, b) => a.createdAt - b.createdAt);
+
+    const nextStats: Record<string, ModelEffectStats> = {};
+    for (const task of jevTasks) {
+      let spec = splitModelAndLevel(task.workerModel!).model;
+      if (!spec) continue;
+      if (!spec.includes('/')) {
+        const matched = this.cachedPool.find(item => item.modelId === spec);
+        spec = matched ? matched.spec : `${this.currentTiers.provider}/${spec}`;
+      }
+      const ok = task.status === 'completed';
+      const prev = nextStats[spec] ?? { successCount: 0, failCount: 0, updatedAt: task.createdAt || Date.now() };
+      let qualityScoreSum = prev.qualityScoreSum ?? 0;
+      let qualityCount = prev.qualityCount ?? 0;
+      if (ok && task.qualityGate?.source === 'gemini-decision-1' && Number.isFinite(task.qualityGate.score)) {
+        const clamped = Math.max(0, Math.min(3, task.qualityGate.score));
+        const effective = supplementedIds.has(task.id) ? Math.min(clamped, 1.2) : clamped;
+        qualityScoreSum += effective;
+        qualityCount += 1;
+      }
+      const avgQualityScore = qualityCount > 0
+        ? Number((qualityScoreSum / qualityCount).toFixed(2))
+        : prev.avgQualityScore;
+      nextStats[spec] = {
+        ...prev,
+        successCount: prev.successCount + (ok ? 1 : 0),
+        failCount: prev.failCount + (ok ? 0 : 1),
+        ...(task.activeMs > 0 ? { lastLatencyMs: Math.round(task.activeMs) } : {}),
+        ...(qualityCount > 0 ? { qualityScoreSum: Number(qualityScoreSum.toFixed(2)), qualityCount, avgQualityScore } : {}),
+        updatedAt: task.createdAt || Date.now(),
+      };
+    }
+
+    this.state.modelStats = nextStats;
+    this.state.statsEpoch = DECISION_STATS_EPOCH;
+    for (const entry of [...this.cachedPool, ...this.cachedCatalog]) {
+      const st = nextStats[entry.spec];
+      entry.successCount = st?.successCount;
+      entry.failCount = st?.failCount;
+      entry.latencyMs = st?.lastLatencyMs;
+      entry.avgQualityScore = st?.avgQualityScore;
+    }
+    await this.saveState();
   }
 
   private modelNotInPoolError(rawModel: string): Error {
@@ -872,124 +1142,263 @@ export class ModelHub {
     return new Error(`模型 "${rawModel}" 未在模型中心启用；当前可用：${listed || '无'}`);
   }
 
-  selectWorkerModel(input: WorkerModelResolutionInput): { model: string; tier: ModelTier } {
-    const rawModel = input.model?.trim();
-    const tier = inferModelTier(input);
+  private toDecisionCandidates(entries: readonly PooledModelEntry[]): DecisionRouteCandidate[] {
+    return entries.map(entry => {
+      const cost = this.cachedCosts.get(entry.spec);
+      return {
+        spec: entry.spec,
+        providerId: entry.providerId,
+        providerName: entry.providerName,
+        modelId: entry.modelId,
+        modelName: entry.modelName,
+        thinkingLevels: entry.thinkingLevels.length ? entry.thinkingLevels : ['off'],
+        supportsImages: entry.supportsImages,
+        reasoning: entry.reasoning,
+        contextWindow: entry.contextWindow,
+        specialties: entry.specialties,
+        costInput: cost?.costInput ?? 0,
+        costOutput: cost?.costOutput ?? 0,
+        latencyMs: entry.latencyMs,
+        successCount: entry.successCount,
+        failCount: entry.failCount,
+        avgQualityScore: entry.avgQualityScore,
+      };
+    });
+  }
 
-    // 1. Explicit model specification from F. (e.g. "anthropic/claude-sonnet-5-5" or "gemini-4-argon")
-    if (rawModel && !['fast', 'balanced', 'strong'].includes(rawModel)) {
-      if (rawModel.includes('/')) {
-        const slash = rawModel.indexOf('/');
-        const explicitProv = normalizeProviderId(rawModel.slice(0, slash));
-        if (explicitProv && !this.isProviderEnabled(explicitProv)) {
-          throw new Error(`提供方 "${explicitProv}" 已禁用，无法调用模型 "${rawModel}"`);
-        }
-        const normalizedSpec = `${explicitProv}/${rawModel.slice(slash + 1)}`;
-        const entry = this.cachedPool.find(p => p.spec === rawModel || p.spec === normalizedSpec);
-        if (!entry && this.cachedPool.length > 0) throw this.modelNotInPoolError(rawModel);
-        return { model: rawModel, tier: entry?.tier ?? tier };
+  private validateExplicitModel(rawModelInput: string): {
+    poolEntry?: PooledModelEntry;
+    spec: string;
+    explicitLevel?: ThinkingLevel;
+  } {
+    const { model: rawModel, explicitLevel } = splitModelAndLevel(rawModelInput);
+    if (rawModel.includes('/')) {
+      const slash = rawModel.indexOf('/');
+      const explicitProv = normalizeProviderId(rawModel.slice(0, slash));
+      if (explicitProv && !this.isProviderEnabled(explicitProv)) {
+        throw new Error(`提供方 "${explicitProv}" 已禁用，无法调用模型 "${rawModel}"`);
       }
-      const poolHit = this.cachedPool.find(p => p.modelId === rawModel);
-      if (poolHit) {
-        const readyProviders = new Set(this.cachedPool.map(p => p.providerId));
+      const normalizedSpec = `${explicitProv}/${rawModel.slice(slash + 1)}`;
+      const entry = this.cachedPool.find(p => p.spec === rawModel || p.spec === normalizedSpec);
+      if (!entry && this.cachedPool.length > 0) throw this.modelNotInPoolError(rawModel);
+      return { poolEntry: entry, spec: rawModel, explicitLevel };
+    }
+    const poolHit = this.cachedPool.find(p => p.modelId === rawModel);
+    if (poolHit) {
+      const readyProviders = new Set(this.cachedPool.map(p => p.providerId));
+      return {
+        poolEntry: poolHit,
+        spec: readyProviders.size > 1 ? poolHit.spec : poolHit.modelId,
+        explicitLevel,
+      };
+    }
+    for (const disProv of this.disabledProviders()) {
+      const disCfg = this.state.providers[disProv];
+      const inDisabled = Boolean(
+        this.runtime?.getModel(disProv, rawModel)
+        || disCfg?.fetchedModels?.some(m => m.id === rawModel)
+        || disCfg?.customModels?.includes(rawModel),
+      );
+      if (inDisabled) {
+        throw new Error(`提供方 "${disProv}" 已禁用，无法调用模型 "${rawModel}"`);
+      }
+    }
+    if (!this.isProviderEnabled(this.currentTiers.provider)) {
+      throw new Error(`提供方 "${this.currentTiers.provider}" 已禁用，无法调用模型 "${rawModel}"`);
+    }
+    if (this.cachedPool.length > 0) throw this.modelNotInPoolError(rawModel);
+    return { spec: rawModel, explicitLevel };
+  }
+
+  selectWorkerModel(input: WorkerModelResolutionInput): { model: string; tier: ModelTier; thinkingLevel: ThinkingLevel } {
+    const rawModel = input.model?.trim();
+    const isTierAlias = Boolean(rawModel && MODEL_TIER_VALUES.includes(rawModel as ModelTier));
+
+    if (rawModel && !isTierAlias) {
+      const { poolEntry, spec, explicitLevel } = this.validateExplicitModel(rawModel);
+      if (poolEntry) {
+        const picked = selectHeuristicRoute(this.toDecisionCandidates([poolEntry]), {
+          instruction: input.instruction ?? '',
+          contextBrief: input.contextBrief,
+          profile: input.profile,
+          fileCount: input.fileCount,
+          hasImages: input.hasImages,
+          isTimer: input.isTimer,
+          preferredLevel: explicitLevel ?? input.thinkingLevel ?? tierToPreferredThinkingLevel(input.tier),
+        });
         return {
-          model: readyProviders.size > 1 ? poolHit.spec : poolHit.modelId,
-          tier: poolHit.tier,
+          model: spec,
+          tier: poolEntry.tier,
+          thinkingLevel: explicitLevel ?? picked.thinkingLevel,
         };
       }
-      for (const disProv of this.disabledProviders()) {
-        const disCfg = this.state.providers[disProv];
-        const inDisabled = Boolean(
-          this.runtime?.getModel(disProv, rawModel)
-          || disCfg?.fetchedModels?.some(m => m.id === rawModel)
-          || disCfg?.customModels?.includes(rawModel),
-        );
-        if (inDisabled) {
-          throw new Error(`提供方 "${disProv}" 已禁用，无法调用模型 "${rawModel}"`);
-        }
-      }
-      if (!this.isProviderEnabled(this.currentTiers.provider)) {
-        throw new Error(`提供方 "${this.currentTiers.provider}" 已禁用，无法调用模型 "${rawModel}"`);
-      }
-      if (this.cachedPool.length > 0) throw this.modelNotInPoolError(rawModel);
-      return resolveWorkerModelFromTiers(this.currentTiers, input);
+      const fallback = resolveWorkerModelFromTiers(this.currentTiers, { ...input, model: spec });
+      return {
+        model: fallback.model,
+        tier: fallback.tier,
+        thinkingLevel: explicitLevel ?? input.thinkingLevel ?? tierToPreferredThinkingLevel(fallback.tier) ?? 'medium',
+      };
     }
 
-    // 2. If fewer than 2 providers are in the pool and no custom multi-provider pool is active, use standard tier resolution
-    const readyProviders = new Set(this.cachedPool.map(p => p.providerId));
     if (this.cachedPool.length === 0) {
       if (!this.isProviderEnabled(this.currentTiers.provider)) {
         throw new Error(`提供方 "${this.currentTiers.provider}" 已禁用，当前无可用模型提供方`);
       }
-      return resolveWorkerModelFromTiers(this.currentTiers, input);
-    }
-    if (readyProviders.size === 1 && readyProviders.has(this.currentTiers.provider) && !Object.keys(this.state.modelStats ?? {}).length) {
-      return resolveWorkerModelFromTiers(this.currentTiers, input);
-    }
-
-    // 3. Cross-provider intelligent scoring based on task content, model capabilities, and empirical effect
-    const text = (input.instruction ?? '').trim();
-    const needsVision = /图片|截图|看图|视觉|二维码|照片|设计稿|OCR|image|screenshot|vision|photo|diagram/i.test(text);
-    const needsDeepReasoning = input.profile === 'review'
-      || tier === 'strong'
-      || /重构|架构|根因|并发|竞态|死锁|安全|漏洞|审计|复杂|迁移|设计|证明|性能瓶颈|refactor|architecture|root\s*cause|security|vulnerability|audit|concurrency|race|deadlock/i.test(text);
-    const needsCoding = input.profile === 'coding'
-      || /代码|实现|修改|组件|接口|函数|测试|构建|修复|报错|脚本|编译|类型|bug|fix|implement|code|typescript|javascript|python|rust|go|css|html/i.test(text);
-    const needsLongContext = input.profile === 'research'
-      || (input.fileCount ?? 0) >= 4
-      || /调研|搜索|全局|通读|多文件|汇总|对比|长文|文档|全库|research|investigate|summarize\s+all/i.test(text);
-    const needsFast = tier === 'fast' || Boolean(input.isTimer);
-
-    let bestEntry = this.cachedPool[0]!;
-    let bestScore = -Infinity;
-
-    for (const entry of this.cachedPool) {
-      let score = 0;
-      if (entry.tier === tier) score += 45;
-      else if (tier === 'balanced' && entry.tier === 'strong') score += 20;
-      else if (tier === 'balanced' && entry.tier === 'fast') score += 15;
-
-      if (needsVision) {
-        score += entry.supportsImages ? 55 : -120;
-      }
-      if (needsDeepReasoning) {
-        if (entry.reasoning) score += 35;
-        if (entry.tier === 'strong') score += 25;
-        if (entry.specialties.includes('深度推理')) score += 20;
-      }
-      if (needsCoding) {
-        if (entry.specialties.includes('代码工程')) score += 30;
-        if (/(?:claude-sonnet|claude-opus|gpt-6|gpt-5|gpt-4\.1|codex|deepseek|qwen.*coder)/i.test(entry.modelId)) score += 20;
-      }
-      if (needsLongContext) {
-        if (entry.contextWindow >= 500_000) score += 35;
-        else if (entry.contextWindow >= 200_000) score += 20;
-      }
-      if (needsFast) {
-        if (entry.tier === 'fast') score += 40;
-        if (entry.tier === 'strong') score -= 20;
-      }
-
-      const stats = this.state.modelStats?.[entry.spec];
-      if (stats) {
-        if (stats.lastProbeOk === true) score += 15;
-        if (stats.lastProbeOk === false) score -= 70;
-        if (stats.successCount > 0) score += Math.min(24, stats.successCount * 4);
-        if (stats.failCount > stats.successCount) score -= 45;
-        if (stats.lastLatencyMs && stats.lastLatencyMs < 2500) score += 10;
-      }
-
-      if (score > bestScore) {
-        bestScore = score;
-        bestEntry = entry;
-      }
+      const resolved = resolveWorkerModelFromTiers(this.currentTiers, input);
+      return {
+        model: resolved.model,
+        tier: resolved.tier,
+        thinkingLevel: input.thinkingLevel ?? tierToPreferredThinkingLevel(resolved.tier) ?? 'medium',
+      };
     }
 
-    const useQualifiedSpec = readyProviders.size > 1 || bestEntry.providerId !== this.currentTiers.provider;
+    const preferredTier = input.tier ?? (isTierAlias ? rawModel as ModelTier : undefined);
+    const heuristic = selectHeuristicRoute(this.toDecisionCandidates(this.cachedPool), {
+      instruction: input.instruction ?? '',
+      contextBrief: input.contextBrief,
+      profile: input.profile,
+      fileCount: input.fileCount,
+      hasImages: input.hasImages,
+      isTimer: input.isTimer,
+      preferredLevel: input.thinkingLevel ?? tierToPreferredThinkingLevel(preferredTier),
+      excludedSpecs: input.excludedSpecs,
+      excludedProviders: input.excludedProviders,
+    });
+    const readyProviders = new Set(this.cachedPool.map(p => p.providerId));
+    const useQualifiedSpec = readyProviders.size > 1 || heuristic.candidate.providerId !== this.currentTiers.provider;
     return {
-      model: useQualifiedSpec ? bestEntry.spec : bestEntry.modelId,
-      tier,
+      model: useQualifiedSpec ? heuristic.candidate.spec : heuristic.candidate.modelId,
+      tier: thinkingLevelToTier(heuristic.thinkingLevel),
+      thinkingLevel: heuristic.thinkingLevel,
     };
+  }
+
+  async decideWorkerModel(input: WorkerModelResolutionInput): Promise<{
+    model: string;
+    thinkingLevel: ThinkingLevel;
+    tier: ModelTier;
+    confidence?: number;
+    needsQualityGate?: boolean;
+    needsQualityGateProb?: number;
+    source: DecisionSource;
+    attempted: boolean;
+    usage?: { inputTokens: number; totalTokens: number };
+    fallbackReason?: string;
+  }> {
+    const runtime = await this.ensureRuntime();
+    const { credentials } = await this.resolveDecisionInfo(runtime);
+    const rawModel = input.model?.trim();
+    const isTierAlias = Boolean(rawModel && MODEL_TIER_VALUES.includes(rawModel as ModelTier));
+
+    if (rawModel && !isTierAlias) {
+      const { poolEntry, spec, explicitLevel } = this.validateExplicitModel(rawModel);
+      if (explicitLevel) {
+        const clamped = poolEntry
+          ? clampNativeThinkingLevel(poolEntry.thinkingLevels, explicitLevel)
+          : explicitLevel;
+        return {
+          model: spec,
+          thinkingLevel: clamped,
+          tier: poolEntry?.tier ?? thinkingLevelToTier(clamped),
+          source: 'heuristic',
+          attempted: false,
+        };
+      }
+      if (poolEntry) {
+        const picked = await decideWorkerRoute(
+          this.toDecisionCandidates([poolEntry]),
+          {
+            instruction: input.instruction ?? '',
+            contextBrief: input.contextBrief,
+            profile: input.profile,
+            fileCount: input.fileCount,
+            hasImages: input.hasImages,
+            isTimer: input.isTimer,
+            preferredLevel: input.thinkingLevel ?? tierToPreferredThinkingLevel(input.tier),
+          },
+          credentials,
+        );
+        return {
+          model: spec,
+          thinkingLevel: picked.thinkingLevel,
+          tier: poolEntry.tier,
+          confidence: picked.confidence,
+          needsQualityGate: picked.needsQualityGate,
+          needsQualityGateProb: picked.needsQualityGateProb,
+          source: picked.source,
+          attempted: picked.attempted,
+          usage: picked.usage,
+          fallbackReason: picked.fallbackReason,
+        };
+      }
+      const fallback = resolveWorkerModelFromTiers(this.currentTiers, { ...input, model: spec });
+      const level = input.thinkingLevel ?? tierToPreferredThinkingLevel(fallback.tier) ?? 'medium';
+      return {
+        model: fallback.model,
+        thinkingLevel: level,
+        tier: fallback.tier,
+        source: 'heuristic',
+        attempted: false,
+      };
+    }
+
+    if (this.cachedPool.length === 0) {
+      if (!this.isProviderEnabled(this.currentTiers.provider)) {
+        throw new Error(`提供方 "${this.currentTiers.provider}" 已禁用，当前无可用模型提供方`);
+      }
+      const resolved = resolveWorkerModelFromTiers(this.currentTiers, input);
+      const level = input.thinkingLevel ?? tierToPreferredThinkingLevel(resolved.tier) ?? 'medium';
+      return {
+        model: resolved.model,
+        thinkingLevel: level,
+        tier: resolved.tier,
+        source: 'heuristic',
+        attempted: false,
+      };
+    }
+
+    const preferredTier = input.tier ?? (isTierAlias ? rawModel as ModelTier : undefined);
+    const picked = await decideWorkerRoute(
+      this.toDecisionCandidates(this.cachedPool),
+      {
+        instruction: input.instruction ?? '',
+        contextBrief: input.contextBrief,
+        profile: input.profile,
+        fileCount: input.fileCount,
+        hasImages: input.hasImages,
+        isTimer: input.isTimer,
+        preferredLevel: input.thinkingLevel ?? tierToPreferredThinkingLevel(preferredTier),
+        excludedSpecs: input.excludedSpecs,
+        excludedProviders: input.excludedProviders,
+      },
+      credentials,
+    );
+    const readyProviders = new Set(this.cachedPool.map(p => p.providerId));
+    const useQualifiedSpec = readyProviders.size > 1 || picked.providerId !== this.currentTiers.provider;
+    return {
+      model: useQualifiedSpec ? picked.spec : picked.modelId,
+      thinkingLevel: picked.thinkingLevel,
+      tier: thinkingLevelToTier(picked.thinkingLevel),
+      confidence: picked.confidence,
+      needsQualityGate: picked.needsQualityGate,
+      needsQualityGateProb: picked.needsQualityGateProb,
+      source: picked.source,
+      attempted: picked.attempted,
+      usage: picked.usage,
+      fallbackReason: picked.fallbackReason,
+    };
+  }
+
+  async evaluateCompletion(input: CompletionEvaluationInput): Promise<CompletionEvaluationResult> {
+    const runtime = await this.ensureRuntime();
+    const { credentials } = await this.resolveDecisionInfo(runtime);
+    return evaluateWorkCompletion(input, credentials);
+  }
+
+  async decideSessionContinuity(input: SessionContinuityInput): Promise<SessionContinuityResult> {
+    const runtime = await this.ensureRuntime();
+    const { credentials } = await this.resolveDecisionInfo(runtime);
+    return evaluateSessionContinuity(input, credentials);
   }
 
   private async saveState(): Promise<void> {
@@ -1026,10 +1435,10 @@ export class ModelHub {
       const configured = authType !== 'none' || Boolean(persisted?.baseUrl);
       const hasRemoteModels = Boolean(persisted?.fetchedModels?.length);
       const rawModels = runtime.getModels(id);
-      const models: ModelCatalogEntry[] = hasRemoteModels
+      const models: ModelCatalogEntry[] = (hasRemoteModels
         ? persisted!.fetchedModels!
         : rawModels.length
-          ? rawModels.map(m => ({
+          ? rawModels.map((m): ModelCatalogEntry => ({
               id: m.id,
               name: m.name || m.id,
               supportsImages: m.input.includes('image'),
@@ -1039,11 +1448,22 @@ export class ModelHub {
               costInput: m.cost?.input ?? 0,
               costOutput: m.cost?.output ?? 0,
             }))
-          : (FALLBACK_PROVIDER_MODELS[id] ?? []);
+          : (FALLBACK_PROVIDER_MODELS[id] ?? [])
+      ).map(m => ({
+        ...m,
+        thinkingLevels: m.thinkingLevels?.length
+          ? m.thinkingLevels
+          : this.resolveCatalogThinkingLevels(runtime, id, m.id, m.reasoning),
+      }));
       const sampleDefault = models[0]?.id ?? 'default';
       const sampleTiers = buildModelTiers(runtime, id, sampleDefault, sampleDefault, {
         hasCustomBaseUrl: Boolean(persisted?.baseUrl),
       });
+      const selectedEntries = (persisted?.selectedModels ?? [])
+        .map(sel => (typeof sel === 'string'
+          ? { id: sel }
+          : { id: sel.id, ...(sel.thinkingLevels?.length ? { thinkingLevels: sel.thinkingLevels } : {}) }))
+        .filter(sel => typeof sel.id === 'string' && Boolean(sel.id));
       providers.push({
         id,
         name: persisted?.name ?? featured?.name ?? catalogProvider?.name ?? id,
@@ -1060,12 +1480,13 @@ export class ModelHub {
         defaultBalanced: sampleTiers.balanced,
         defaultStrong: sampleTiers.strong,
         models,
-        selectedModels: persisted?.selectedModels ?? [],
+        selectedModels: selectedEntries,
         suggestedTiers: Object.fromEntries(models.map(m => [m.id, classifyModelEntry(id, m, sampleTiers).tier])),
       });
     }
 
     await this.rebuildPoolCache(runtime);
+    const { view: decisionEngine } = await this.resolveDecisionInfo(runtime);
 
     return {
       mode: this.mode,
@@ -1075,12 +1496,41 @@ export class ModelHub {
       tiers: this.currentTiers,
       providers,
       modelPool: this.cachedPool,
+      decisionEngine,
       lastProbe: this.state.lastProbe,
     };
   }
 
   async configure(input: ModelHubConfigureInput): Promise<ModelHubView> {
     const runtime = await this.ensureRuntime();
+    if (
+      input.decisionEnabled !== undefined
+      || input.decisionApiKey !== undefined
+      || input.clearDecisionApiKey
+      || input.decisionBaseUrl !== undefined
+    ) {
+      const nextDecision: PersistedDecisionConfig = { ...(this.state.decision ?? {}) };
+      if (input.decisionEnabled !== undefined) {
+        nextDecision.enabled = Boolean(input.decisionEnabled);
+      }
+      if (input.clearDecisionApiKey) {
+        delete nextDecision.apiKey;
+      } else if (input.decisionApiKey !== undefined && input.decisionApiKey.trim()) {
+        nextDecision.apiKey = input.decisionApiKey.trim();
+      }
+      if (input.decisionBaseUrl !== undefined) {
+        const trimmedUrl = input.decisionBaseUrl.trim();
+        if (trimmedUrl) {
+          let parsed: URL;
+          try { parsed = new URL(trimmedUrl); } catch { throw new Error(`无效的决策引擎 Base URL: ${trimmedUrl}`); }
+          if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('决策引擎 Base URL 必须使用 http 或 https');
+          nextDecision.baseUrl = trimmedUrl;
+        } else {
+          delete nextDecision.baseUrl;
+        }
+      }
+      this.state.decision = nextDecision;
+    }
     const targetProvider = normalizeProviderId(input.providerId);
     if (targetProvider) {
       const prev = this.state.providers[targetProvider] ?? {};

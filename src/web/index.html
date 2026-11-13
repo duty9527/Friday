@@ -5,12 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>F.R.I.D.A.Y. · 持续对话</title>
+  <link rel="icon" type="image/png" href="/logo.png">
   <link rel="stylesheet" href="/style.css">
   <script type="module" src="/client.js"></script>
 </head>
 <body>
   <header class="topbar">
-    <div class="brand"><span class="mark" aria-hidden="true">↳</span> F.R.I.D.A.Y.</div>
+    <div class="brand"><span class="brand-logo" aria-hidden="true"></span> F.R.I.D.A.Y.</div>
     <button id="work-toggle" class="fold-control" type="button" aria-expanded="false" aria-controls="work-sidebar">任务列表</button>
     <div class="topbar-hub-bar" role="toolbar" aria-label="系统功能中心">
       <button id="open-memory-hub-top" class="hub-pill-btn memory-amber-pill" type="button">
@@ -38,6 +39,10 @@
         <span>模型与提供方</span>
         <span id="model-top-badge" class="hub-pill-badge">—</span>
       </button>
+      <a id="open-mindmap-top" class="hub-pill-btn mindmap-pill-link" href="/mindmap">
+        <span class="hub-pill-icon" aria-hidden="true">🧭</span>
+        <span>思考流程图</span>
+      </a>
     </div>
     <span id="mode" class="mode meta">正在连接</span>
   </header>
@@ -232,7 +237,7 @@
                 </label>
                 <label>
                   <span class="meta">投递端口 (任务侧配置 IM 通道)</span>
-                  <input id="timer-channel-input" type="text" maxlength="120" placeholder="如：auto、wechat、dingtalk、telegram 或通道ID" aria-label="投递端口">
+                  <input id="timer-channel-input" type="text" maxlength="120" placeholder="如：auto、wechat、xiaoai、dingtalk、telegram 或通道ID" aria-label="投递端口">
                 </label>
               </div>
               <label>
@@ -296,7 +301,7 @@
         <section class="model-modal-section">
           <details id="im-add-details" class="hub-compose-details">
             <summary id="im-form-summary" class="hub-compose-summary">
-              <span>+ 手动配置通道（微信 / 钉钉 / Telegram）</span>
+              <span>+ 手动配置通道（微信 / 小爱音箱 / 钉钉 / Telegram）</span>
             </summary>
             <div class="hub-compose-body">
               <div class="modal-form-grid">
@@ -304,6 +309,7 @@
                   <span class="meta">平台</span>
                   <select id="im-platform-input" aria-label="IM 平台">
                     <option value="wechat">💬 微信 (WeChat)</option>
+                    <option value="xiaoai">🔊 小爱音箱 (XiaoAI)</option>
                     <option value="dingtalk">🟦 钉钉 (DingTalk)</option>
                     <option value="telegram">✈️ Telegram</option>
                   </select>
@@ -327,6 +333,14 @@
                 <label>
                   <span class="meta">默认接收目标（可选）</span>
                   <input id="im-target-input" type="text" maxlength="256" placeholder="Chat ID / 账号 ID" aria-label="默认接收目标">
+                </label>
+                <label>
+                  <span class="meta">账号 / 小米 ID（可选）</span>
+                  <input id="im-account-input" type="text" maxlength="256" placeholder="小米账号（云端轮询时填写）" aria-label="账号或小米 ID">
+                </label>
+                <label>
+                  <span class="meta">API / SSH 地址（可选）</span>
+                  <input id="im-apibase-input" type="text" maxlength="1024" placeholder="ssh://oh2p=root@192.168.31.101,lx06=root@192.168.31.102" aria-label="API 或 SSH 地址">
                 </label>
               </div>
               <label>

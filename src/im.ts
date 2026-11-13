@@ -7,6 +7,13 @@ import type { Coordinator } from './coordinator.js';
 import { renderQrSvgDataUrl, renderQrTerminal } from './qrcode.js';
 import type { ImChannelConfig } from './store.js';
 import type { ChatMessage, ImChannelView, ImPlatform, WechatQrLoginSession } from './view.js';
+import {
+  isXiaoaiPollable,
+  parseXiaoaiWebhookPayload,
+  pollXiaoaiChannel,
+  sendXiaoaiSpeech,
+  type XiaoaiSshRunner,
+} from './xiaoai.js';
 
 export const DEFAULT_WECHAT_ILINK_BASE = 'https://ilinkai.weixin.qq.com';
 const WECHAT_TYPING_KEEPALIVE_MS = 5_000;
@@ -78,6 +85,7 @@ function buildWechatIlinkHeaders(botToken: string): Record<string, string> {
 }
 
 export class ImGateway {
+  xiaoaiDeps?: { sshRunner?: XiaoaiSshRunner; fetchImpl?: typeof fetch };
   private trustedFileRequests = new WeakSet<ImInboundMessage>();
   private trustedMediaRequests = new WeakSet<ImInboundMessage>();
   private cursor = 0;
@@ -139,8 +147,8 @@ export class ImGateway {
     apiBase?: string;
     pollIntervalMs?: number;
   }): ImChannelView {
-    if (!['telegram', 'dingtalk', 'wechat'].includes(input.platform)) {
-      throw new Error('Invalid IM platform: must be "telegram", "dingtalk", or "wechat"');
+    if (!['telegram', 'dingtalk', 'wechat', 'xiaoai'].includes(input.platform)) {
+      throw new Error('Invalid IM platform: must be "telegram", "dingtalk", "wechat", or "xiaoai"');
     }
     const name = input.name.trim().slice(0, 120);
     if (!name) throw new Error('IM channel name must not be empty');
@@ -166,7 +174,7 @@ export class ImGateway {
         ? [...new Set(input.allowedSenders.map(s => s.trim()).filter(Boolean))]
         : (existing?.allowedSenders ?? []),
       apiBase: input.apiBase !== undefined ? (input.apiBase.trim() || undefined) : existing?.apiBase,
-      pollIntervalMs: input.pollIntervalMs ?? existing?.pollIntervalMs ?? 1500,
+      pollIntervalMs: input.pollIntervalMs ?? existing?.pollIntervalMs ?? (input.platform === 'xiaoai' ? 800 : 1500),
       pollOffset: existing?.pollOffset,
       inboundCount: existing?.inboundCount ?? 0,
       outboundCount: existing?.outboundCount ?? 0,
@@ -400,7 +408,9 @@ export class ImGateway {
 
   async testChannel(id: string, customText?: string): Promise<{ ok: boolean; channel: ImChannelView }> {
     const channel = this.coordinator.store.getImChannel(id);
-    const text = customText?.trim() || `🤖 [FRIDAY 神经链路自检] 通道「${channel.name}」(${channel.platform}) 已成功连接至 F.R.I.D.A.Y.。`;
+    const text = customText?.trim() || (channel.platform === 'xiaoai'
+      ? `星期五语音链路自检成功，通道${channel.name}已连接。`
+      : `🤖 [FRIDAY 神经链路自检] 通道「${channel.name}」(${channel.platform}) 已成功连接至 F.R.I.D.A.Y.。`);
     await this.sendToChannel(channel.id, text);
     return { ok: true, channel: this.coordinator.store.toImChannelView(this.coordinator.store.getImChannel(id)) };
   }
@@ -514,6 +524,13 @@ export class ImGateway {
           });
           if (!res.ok) throw new Error(`微信发送失败: HTTP ${res.status}`);
         }
+      } else if (channel.platform === 'xiaoai') {
+        await sendXiaoaiSpeech(channel, text, {
+          target,
+          replyToMessageId: options?.replyToMessageId,
+          replyWebhook: options?.replyWebhook,
+          ...this.xiaoaiDeps,
+        });
       }
       const latest = this.coordinator.store.getImChannel(channelId);
       latest.outboundCount++;
@@ -595,6 +612,14 @@ export class ImGateway {
       if (!validHeader && !validSha1) {
         return { status: 403, body: JSON.stringify({ error: 'Invalid WeChat webhook secret or signature' }), contentType: 'application/json; charset=utf-8' };
       }
+    } else if (channel.platform === 'xiaoai' && channel.secret) {
+      const headerSecret = headerStr('x-xiaoai-secret')
+        ?? headerStr('authorization')?.replace(/^Bearer\s+/i, '').trim()
+        ?? query.get('secret')
+        ?? '';
+      if (!headerSecret || !safeEqual(headerSecret, channel.secret)) {
+        return { status: 403, body: JSON.stringify({ error: 'Invalid XiaoAI webhook secret' }), contentType: 'application/json; charset=utf-8' };
+      }
     }
 
     let inbound: ImInboundMessage | undefined;
@@ -649,6 +674,8 @@ export class ImGateway {
           }
         }
       }
+    } else if (channel.platform === 'xiaoai') {
+      inbound = parseXiaoaiWebhookPayload(channel.id, rawBody);
     }
 
     if (!inbound || !inbound.text.trim()) {
@@ -1328,7 +1355,11 @@ export class ImGateway {
     const channels = this.coordinator.store.listImChannels();
     const activePollIds = new Set(
       channels
-        .filter(ch => ch.enabled && (ch.platform === 'telegram' || ch.platform === 'wechat') && Boolean(ch.botToken))
+        .filter(ch => ch.enabled && (
+          ch.platform === 'xiaoai'
+            ? isXiaoaiPollable(ch)
+            : ((ch.platform === 'telegram' || ch.platform === 'wechat') && Boolean(ch.botToken))
+        ))
         .map(ch => ch.id),
     );
     for (const [id, timer] of this.pollTimers.entries()) {
@@ -1362,11 +1393,16 @@ export class ImGateway {
     } catch {
       return;
     }
-    if (!channel.enabled || !channel.botToken) return;
+    if (!channel.enabled) return;
     if (channel.platform === 'telegram') {
+      if (!channel.botToken) return;
       await this.pollTelegramChannel(channel);
     } else if (channel.platform === 'wechat') {
+      if (!channel.botToken) return;
       await this.pollWechatChannel(channel);
+    } else if (channel.platform === 'xiaoai') {
+      if (!isXiaoaiPollable(channel)) return;
+      await this.pollXiaoaiChannelInternal(channel);
     }
   }
 
@@ -1464,6 +1500,43 @@ export class ImGateway {
         const latest = this.coordinator.store.getImChannel(channelId);
         if (latest.enabled && latest.platform === 'wechat' && latest.botToken && !this.closing) {
           const baseInterval = latest.pollIntervalMs ?? 1200;
+          this.scheduleChannelPoll(channelId, receivedAny ? Math.min(baseInterval, 80) : baseInterval);
+        }
+      } catch { /* channel removed */ }
+    }
+  }
+
+  private async pollXiaoaiChannelInternal(channel: ImChannelConfig) {
+    const channelId = channel.id;
+    this.pollingActive.add(channelId);
+    let receivedAny = false;
+    try {
+      const result = await pollXiaoaiChannel(channel, this.xiaoaiDeps);
+      receivedAny = result.messages.length > 0;
+      if (
+        (result.nextPollOffset !== undefined && result.nextPollOffset !== channel.pollOffset)
+        || (result.nextSyncBuf !== undefined && result.nextSyncBuf !== channel.syncBuf)
+      ) {
+        const current = this.coordinator.store.getImChannel(channelId);
+        if (result.nextPollOffset !== undefined) current.pollOffset = result.nextPollOffset;
+        if (result.nextSyncBuf !== undefined) current.syncBuf = result.nextSyncBuf;
+        this.coordinator.store.saveImChannel(current);
+      }
+      for (const inbound of result.messages) {
+        await this.ingestMessage(inbound);
+      }
+    } catch (error) {
+      try {
+        const latest = this.coordinator.store.getImChannel(channelId);
+        latest.lastError = error instanceof Error ? error.message : 'XiaoAI poll error';
+        this.coordinator.store.saveImChannel(latest);
+      } catch { /* channel removed */ }
+    } finally {
+      this.pollingActive.delete(channelId);
+      try {
+        const latest = this.coordinator.store.getImChannel(channelId);
+        if (latest.enabled && latest.platform === 'xiaoai' && isXiaoaiPollable(latest) && !this.closing) {
+          const baseInterval = latest.pollIntervalMs ?? 800;
           this.scheduleChannelPoll(channelId, receivedAny ? Math.min(baseInterval, 80) : baseInterval);
         }
       } catch { /* channel removed */ }

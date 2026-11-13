@@ -45,7 +45,7 @@ const WORKER_TOOLS: Record<string, string> = {
   edit: '修改文件', write: '写入文件', start_read: '读取文件副本',
 };
 const ROUTER_TOOLS = new Set(['start_work', 'continue_work', 'inspect_work', 'stop_work', 'resume_work', 'recall_messages', 'search_memory', 'save_memory', 'manage_timer', 'run_plugin', 'send_file', 'switch_channel', 'dispatch_worker']);
-const NOT_A_STEP = new Set(['visible_text', 'thinking', 'work_linked']);
+const NOT_A_STEP = new Set(['visible_text', 'thinking', 'work_linked', 'session_assigned']);
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }

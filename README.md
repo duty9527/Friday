@@ -1,4 +1,4 @@
-# F.R.I.D.A.Y.
+# <img src="assets/logo.png" width="36" align="top" alt="F.R.I.D.A.Y. Logo"> F.R.I.D.A.Y.
 
 **本地常驻的个人全天候 AI 战术副手（Router / Worker 协同系统）**
 

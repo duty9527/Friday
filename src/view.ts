@@ -1,5 +1,32 @@
+import type { DecisionSource, MissingAspect, QualityGateAssessment, ThinkingLevel } from './decision.js';
+export type { DecisionSource, MissingAspect, QualityGateAssessment, ThinkingLevel };
+
 export type MessageState = 'queued' | 'processing' | 'streaming' | 'completed' | 'interrupted' | 'failed';
 export type RouteKind = 'new_work' | 'followup' | 'related_work' | 'inspect' | 'stop' | 'resume' | 'recall' | 'search_memory' | 'save_memory' | 'timer' | 'plugin' | 'send_file' | 'switch_channel' | 'reply';
+export type SessionLinkKind =
+  | 'task_link'
+  | 'msg_link'
+  | 'switch_channel'
+  | 'in_flight'
+  | 'explicit_backref'
+  | 'ai_context_synthesis'
+  | 'answer_clarification'
+  | 'post_task_discussion'
+  | 'dialogue_followup'
+  | 'topic_continuity'
+  | 'rapid_exchange';
+
+export interface SessionTurnLink {
+  kind: SessionLinkKind;
+  source: 'causal' | 'gemini-decision-1' | 'heuristic';
+  gapSec: number;
+  confidence?: number;
+  label: string;
+  detail?: string;
+  evaluatedAt?: number;
+  usage?: { inputTokens: number; totalTokens: number };
+  fallbackReason?: string;
+}
 export type WorkerProfile = 'general' | 'coding' | 'research' | 'review';
 export type ModelTier = 'fast' | 'balanced' | 'strong';
 export interface ModelTierConfig {
@@ -19,6 +46,15 @@ export interface ModelCatalogEntry {
   maxTokens?: number;
   costInput: number;
   costOutput: number;
+  /** 模型自身支持的原生思考/推理等级列表 */
+  thinkingLevels?: ThinkingLevel[];
+}
+export interface SelectedModelEntry {
+  id: string;
+  /** 可选指定保留的原生等级子集；留空表示保留该模型全部原生等级 */
+  thinkingLevels?: ThinkingLevel[];
+  /** 向后兼容旧配置文件字段（不再锁定单一自定义档位） */
+  tier?: ModelTier;
 }
 export interface ModelProviderView {
   id: string;
@@ -36,9 +72,9 @@ export interface ModelProviderView {
   defaultBalanced?: string;
   defaultStrong?: string;
   models: ModelCatalogEntry[];
-  /** 用户显式勾选进入 Worker 模型池的模型及等级 */
-  selectedModels?: Array<{ id: string; tier: ModelTier }>;
-  /** 按模型 ID 推断的建议等级（供控制台勾选时作为默认值） */
+  /** 用户显式勾选进入 Worker 模型池的模型（保留各自原生等级） */
+  selectedModels?: SelectedModelEntry[];
+  /** 按模型 ID 推断的建议等级（供控制台勾选时作为参考标签） */
   suggestedTiers?: Record<string, ModelTier>;
 }
 export interface ModelProbeResult {
@@ -60,6 +96,7 @@ export interface PooledModelEntry {
   modelId: string;
   modelName: string;
   tier: ModelTier;
+  thinkingLevels: ThinkingLevel[];
   specialties: string[];
   supportsImages: boolean;
   reasoning: boolean;
@@ -67,6 +104,15 @@ export interface PooledModelEntry {
   latencyMs?: number;
   successCount?: number;
   failCount?: number;
+  avgQualityScore?: number;
+}
+export interface DecisionEngineView {
+  model: string;
+  enabled: boolean;
+  configured: boolean;
+  credentialSource: 'decision_config' | 'google_provider' | 'environment' | 'none';
+  keyHint?: string;
+  baseUrl?: string;
 }
 export interface ModelHubView {
   mode: 'real' | 'offline';
@@ -76,6 +122,7 @@ export interface ModelHubView {
   tiers: ModelTierConfig;
   providers: ModelProviderView[];
   modelPool?: PooledModelEntry[];
+  decisionEngine?: DecisionEngineView;
   lastProbe?: ModelProbeResult;
 }
 export type SynapseRelation = 'explicit' | 'co_activated' | 'shared_tag' | 'task_chain';
@@ -118,6 +165,7 @@ export interface RouteAction {
   taskId?: string; taskLabel?: string; parentTaskId?: string; summary?: string; error?: string;
   followupId?: string; delivery?: string; messageIds?: string[];
   memoryIds?: string[]; searchQuery?: string; workerProfile?: WorkerProfile; workerModel?: string; modelTier?: ModelTier;
+  thinkingLevel?: ThinkingLevel; decisionSource?: DecisionSource;
 }
 export interface RoutingRecord {
   at: number; status: 'processing' | 'completed' | 'failed' | 'interrupted'; omittedActions?: number;
@@ -129,13 +177,15 @@ export interface RoutingRecord {
   actions: RouteAction[];
 }
 export interface MessageOrigin {
-  channel: 'local' | 'telegram' | 'wechat' | 'dingtalk';
+  channel: 'local' | 'telegram' | 'wechat' | 'dingtalk' | 'xiaoai';
   channelId?: string; accountId?: string; conversationId?: string; senderId?: string;
   replyToMessageId?: string; replyWebhook?: string; contextToken?: string;
 }
 export interface ChatMessage {
   attachments?: import('./wechat-inbound.js').ReceivedAttachment[];
   origin?: MessageOrigin;
+  sessionId?: string;
+  sessionLink?: SessionTurnLink;
   seq: number; version: number; id: string; requestId?: string; role: 'user' | 'assistant'; text: string;
   status: MessageState; at: number; mode: 'real' | 'offline'; paths: string[];
   replyTo?: string; taskIds: string[]; reason?: string; source?: 'router' | 'system'; routing?: RoutingRecord;
@@ -154,8 +204,9 @@ export interface PendingQuestion {
 export interface MessagePage { items: ChatMessage[]; hasMore: boolean; before?: number }
 export interface WorkView {
   id: string; prompt: string; status: string; mode: 'real' | 'offline'; createdAt: number;
-  activeMs: number; limitMs: number; reason?: string; originMessageId?: string; parentTaskId?: string;
+  activeMs: number; limitMs: number; reason?: string; sessionId?: string; originMessageId?: string; parentTaskId?: string;
   cwd?: string; concurrentTaskIds?: string[]; profile?: WorkerProfile; workerModel?: string; modelTier?: ModelTier;
+  thinkingLevel?: ThinkingLevel; decisionSource?: DecisionSource; skipQualityGate?: boolean; qualityGate?: QualityGateAssessment;
   pendingQuestion?: PendingQuestion;
 }
 export interface TimerView {
@@ -166,7 +217,7 @@ export interface TimerView {
   nextRunAt: number; lastRunAt?: number; activeTaskId?: string;
   pendingCatchup?: boolean; missedRuns: number;
 }
-export type ImPlatform = 'telegram' | 'dingtalk' | 'wechat';
+export type ImPlatform = 'telegram' | 'dingtalk' | 'wechat' | 'xiaoai';
 export interface ImChannelView {
   id: string;
   platform: ImPlatform;

@@ -60,6 +60,11 @@ test('Web is authenticated, same-origin and loopback only with restrictive stati
     assert.match(page.headers.get('content-security-policy')!, /frame-ancestors 'none'/);
     assert.equal(page.headers.get('referrer-policy'), 'no-referrer');
     assert.doesNotMatch(await page.text(), new RegExp(f.home));
+    for (const icon of ['/logo.png', '/favicon.ico', '/avatar.png']) {
+      const res = await fetch(`${f.base}${icon}`);
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get('content-type'), 'image/png');
+    }
     assert.equal((await fetch(`${f.base}/api/view`)).status, 401);
     assert.equal((await fetch(`${f.base}/api/view?token=${f.web.url.split('token=')[1]}`)).status, 401);
     assert.equal((await fetch(`${f.base}/api/view`, { headers: { ...f.headers, origin: 'https://malicious.example' } })).status, 403);
@@ -162,5 +167,137 @@ test('Web chat accepts a folder path and completes reads for every nested file',
     const html = await (await fetch(f.base)).text();
     assert.match(html, /文件或文件夹/);
     assert.doesNotMatch(html, /不接受目录/);
+  } finally { await f.close(); }
+});
+
+test('Mindmap standalone page serves strict CSP assets and aggregates real task flows via /api/mindmap', { timeout: 15000 }, async () => {
+  const f = await fixture();
+  try {
+    const indexHtml = await (await fetch(f.base)).text();
+    assert.match(indexHtml, /href="\/mindmap"/, 'main page links to /mindmap');
+
+    for (const route of ['/mindmap', '/mindmap.html']) {
+      const page = await fetch(`${f.base}${route}`);
+      assert.equal(page.status, 200);
+      assert.equal(page.headers.get('content-type'), 'text/html; charset=utf-8');
+      const csp = page.headers.get('content-security-policy') ?? '';
+      assert.match(csp, /script-src 'self'/);
+      assert.match(csp, /style-src 'self'/);
+      const html = await page.text();
+      assert.match(html, /F\.R\.I\.D\.A\.Y\. · 会话思考流程图/);
+      assert.doesNotMatch(html, /\sstyle="/i, 'strict CSP forbids inline style attributes');
+      assert.doesNotMatch(html, /<script(?![^>]*\bsrc=)[^>]*>/i, 'strict CSP forbids inline script tags');
+    }
+
+    const css = await fetch(`${f.base}/mindmap.css`);
+    assert.equal(css.status, 200);
+    assert.equal(css.headers.get('content-type'), 'text/css; charset=utf-8');
+
+    const mindmapJsRes = await fetch(`${f.base}/mindmap.js`);
+    assert.equal(mindmapJsRes.status, 200);
+    assert.match(mindmapJsRes.headers.get('content-type') ?? '', /javascript/);
+    const mindmapJs = await mindmapJsRes.text();
+    assert.doesNotMatch(mindmapJs, /\.style\./, 'mindmap.ts must not mutate element.style under strict CSP');
+    assert.doesNotMatch(mindmapJs, /setAttribute\(\s*['"]style['"]/, 'mindmap.ts must not set style attributes');
+
+    const imported = [...mindmapJs.matchAll(/from\s+'(\.[^']+)'/g)].map(match => match[1]!);
+    assert.ok(imported.includes('./mindmap-data.js'), 'mindmap.js imports mindmap-data.js');
+    for (const path of new Set(imported)) {
+      const modRes = await fetch(`${f.base}/${path.replace(/^\.\//, '')}`);
+      assert.equal(modRes.status, 200, `module ${path} must be served to the browser`);
+      assert.match(modRes.headers.get('content-type') ?? '', /javascript/);
+    }
+
+    const dataJs = await (await fetch(`${f.base}/mindmap-data.js`)).text();
+    for (const symbol of ['buildSessionFlowchart', 'buildOverviewFlowchart', 'buildAllTasksTree', 'buildSingleTaskTree', 'buildTaskFlowSubtree']) {
+      assert.ok(dataJs.includes(symbol), `mindmap-data.js must export ${symbol}`);
+    }
+
+    // 未认证请求应返回 401
+    assert.equal((await fetch(`${f.base}/api/mindmap`)).status, 401);
+
+    // 发起一条触发后台工作的真实对话，随后紧跟一条关联追问并验证 /api/mindmap 会话聚合与阶段流程
+    const folder = join(f.home, 'mm-sample');
+    await mkdir(folder, { recursive: true });
+    await writeFile(join(folder, 'spec.md'), 'mindmap verification file');
+    const chatRes = await fetch(`${f.base}/api/chat`, {
+      method: 'POST',
+      headers: f.headers,
+      body: JSON.stringify({ requestId: randomUUID(), text: '请分析这个思维导图样本目录', files: [folder + '/'] }),
+    });
+    assert.equal(chatRes.status, 200);
+
+    let view: MainView | undefined;
+    for (let i = 0; i < 200; i++) {
+      view = await (await fetch(`${f.base}/api/view`, { headers: f.headers })).json() as MainView;
+      if (view.works[0]?.status === 'completed' && view.messages.items.some(m => m.role === 'assistant' && m.status === 'completed')) break;
+      await delay(30);
+    }
+    assert.equal(view?.works[0]?.status, 'completed');
+
+    const followupRes = await fetch(`${f.base}/api/chat`, {
+      method: 'POST',
+      headers: f.headers,
+      body: JSON.stringify({ requestId: randomUUID(), text: '刚才那个目录里的 spec.md 具体写了什么？' }),
+    });
+    assert.equal(followupRes.status, 200);
+    for (let i = 0; i < 200; i++) {
+      const latestView = await (await fetch(`${f.base}/api/view`, { headers: f.headers })).json() as MainView;
+      const userCount = latestView.messages.items.filter(m => m.role === 'user').length;
+      const doneAssistantCount = latestView.messages.items.filter(m => m.role === 'assistant' && m.status === 'completed').length;
+      if (userCount >= 2 && doneAssistantCount >= 2) break;
+      await delay(30);
+    }
+
+    const mmRes = await fetch(`${f.base}/api/mindmap`, { headers: f.headers });
+    assert.equal(mmRes.status, 200);
+    const snapshot = await mmRes.json() as {
+      summary: { totalFlows: number; totalTasks: number; totalSessions: number; multiTurnSessions: number };
+      sessions: Array<{
+        id: string;
+        turnCount: number;
+        turnFlowIds: string[];
+        turnSummaries: Array<{ textPreview: string; link?: { kind: string; source: string; label: string } }>;
+      }>;
+      flows: Array<{
+        id: string;
+        sessionId?: string;
+        turnIndex?: number;
+        turnCount?: number;
+        sessionLink?: { kind: string; source: string; label: string };
+        ingress: { sourceKind: string; text: string };
+        routerTurns: unknown[];
+        tasks: Array<{
+          id: string;
+          status: string;
+          executionPhases: Array<{ index: number; isFollowup: boolean; llmCount: number; toolCount: number }>;
+          jevRoute?: { request: { decisionModel: string; fileCount: number }; response: Record<string, unknown> };
+          workerSteps: Array<{ kind: string; phaseIndex?: number }>;
+        }>;
+        deliveries: Array<{ text: string; status: string }>;
+        imPush: { channel: string; delivered: boolean };
+      }>;
+    };
+    assert.ok(snapshot.summary.totalFlows >= 2);
+    assert.ok(snapshot.summary.totalTasks >= 1);
+    assert.ok(snapshot.summary.totalSessions >= 1);
+    assert.ok(snapshot.sessions.length >= 1);
+    const flow = snapshot.flows.find(item => item.ingress.text.includes('请分析这个思维导图样本目录'));
+    const followupFlow = snapshot.flows.find(item => item.ingress.text.includes('刚才那个目录里的 spec.md'));
+    assert.ok(flow && followupFlow, 'both related user turns must be present in snapshot.flows');
+    assert.equal(flow.ingress.sourceKind, 'local');
+    assert.ok(flow.routerTurns.length >= 1, 'flow includes router decision turns');
+    assert.equal(flow.tasks.length, 1);
+    assert.equal(flow.tasks[0]!.status, 'completed');
+    assert.ok(flow.tasks[0]!.executionPhases.length >= 1, 'task includes executionPhases breakdown');
+    assert.ok(flow.tasks[0]!.jevRoute?.request.decisionModel, 'task includes JEV route request info');
+    assert.ok(flow.tasks[0]!.workerSteps.length >= 1, 'task includes worker execution steps');
+    assert.ok(flow.deliveries.length >= 1 && flow.imPush.delivered, 'flow includes final delivery and IM push target');
+
+    assert.equal(flow.sessionId, followupFlow.sessionId, 'consecutive related turns must aggregate into the same AI session');
+    assert.ok((followupFlow.turnCount ?? 0) >= 2 && followupFlow.turnIndex === 2);
+    assert.ok(followupFlow.sessionLink?.label, 'followup turn records contextual session link');
+    const groupedSession = snapshot.sessions.find(s => s.id === flow.sessionId);
+    assert.ok(groupedSession && groupedSession.turnCount >= 2 && groupedSession.turnFlowIds.includes(flow.id) && groupedSession.turnFlowIds.includes(followupFlow.id));
   } finally { await f.close(); }
 });

@@ -20,7 +20,7 @@ const help = `F.R.I.D.A.Y. (friday) — Local persistent personal AI assistant &
   timer list | add [--name NAME] [--every-ms 60000] [--delay-ms MS] [--daily-at HH:MM] [--once] [--plugin NAME] [--action ACTION] [--channel ID] [--target TARGET] [--cwd DIR] ["instruction"] | toggle ID [--enabled] | remove ID
   plugin list | run NAME [ACTION] [--args JSON]
   memory list | search [--scope all|memories|works|messages] [--cwd DIR] "query" | save --topic TOPIC [--tag TAG ...] [--link ID ...] [--pinned] [--cwd DIR] "content" | link ID TARGET_ID | pin ID [--unpin] | remove ID
-  im list | login [CHANNEL_ID] [--name NAME] [--api-base URL] [--no-wait] | add --platform telegram|dingtalk|wechat --name NAME [--bot-token TOKEN] [--webhook-url URL] [--secret SECRET] [--target CHAT_ID] [--allow SENDER ...] [--api-base URL] | toggle ID [--enabled] | test ID ["message"] | remove ID
+  im list | login [CHANNEL_ID] [--name NAME] [--api-base URL] [--no-wait] | add --platform telegram|dingtalk|wechat|xiaoai --name NAME [--bot-token TOKEN] [--account-id ID] [--webhook-url URL] [--secret SECRET] [--target CHAT_ID] [--allow SENDER ...] [--api-base URL] [--every-ms MS] | toggle ID [--enabled] | test ID ["message"] | remove ID
   model list | probe [PROVIDER/]MODEL ["prompt"] | set [--router MODEL] [--provider PROVIDER] [--fast MODEL] [--balanced MODEL] [--strong MODEL] [--api-key KEY]
   brief            FRIDAY holographic situation report (health, active works, memory cortex, timers, IM channels)
   get TASK_ID
@@ -53,7 +53,7 @@ async function main() {
       cwd: { type: 'string' },
       topic: { type: 'string' }, scope: { type: 'string' }, tag: { type: 'string', multiple: true },
       link: { type: 'string', multiple: true }, pinned: { type: 'boolean' }, unpin: { type: 'boolean' },
-      platform: { type: 'string' }, 'bot-token': { type: 'string' }, 'webhook-url': { type: 'string' },
+      platform: { type: 'string' }, 'bot-token': { type: 'string' }, 'account-id': { type: 'string' }, 'webhook-url': { type: 'string' },
       secret: { type: 'string' }, target: { type: 'string' }, allow: { type: 'string', multiple: true }, 'api-base': { type: 'string' },
       router: { type: 'string' }, provider: { type: 'string' }, fast: { type: 'string' }, balanced: { type: 'string' }, strong: { type: 'string' }, 'api-key': { type: 'string' },
       enabled: { type: 'boolean' }, 'no-wait': { type: 'boolean' }, 'interval-ms': { type: 'string' }, 'max-retries': { type: 'string' },
@@ -265,11 +265,13 @@ async function main() {
         platform: values.platform,
         name: values.name ?? `${values.platform ?? 'im'}-channel`,
         botToken: values['bot-token'],
+        accountId: values['account-id'],
         webhookUrl: values['webhook-url'],
         secret: values.secret,
         defaultTarget: values.target,
         allowedSenders: values.allow,
         apiBase: values['api-base'],
+        pollIntervalMs: number(values['every-ms']),
         enabled: values.enabled ?? true,
       };
       else if (sub === 'toggle') message = { command: 'im-toggle', id: args[1], enabled: values.enabled ?? true };

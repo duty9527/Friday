@@ -11,12 +11,20 @@ class HttpFailure extends Error { constructor(readonly status: number, message: 
 const assets: Record<string, { file: string; mime: string }> = {
   '/': { file: 'index.html', mime: 'text/html; charset=utf-8' },
   '/index.html': { file: 'index.html', mime: 'text/html; charset=utf-8' },
+  '/mindmap': { file: 'mindmap.html', mime: 'text/html; charset=utf-8' },
+  '/mindmap.html': { file: 'mindmap.html', mime: 'text/html; charset=utf-8' },
+  '/mindmap.css': { file: 'mindmap.css', mime: 'text/css; charset=utf-8' },
+  '/mindmap.js': { file: 'mindmap.js', mime: 'application/javascript; charset=utf-8' },
+  '/mindmap-data.js': { file: 'mindmap-data.js', mime: 'application/javascript; charset=utf-8' },
   '/client.js': { file: 'client.js', mime: 'application/javascript; charset=utf-8' },
   '/model.js': { file: 'model.js', mime: 'application/javascript; charset=utf-8' },
   '/brain.js': { file: 'brain.js', mime: 'application/javascript; charset=utf-8' },
   '/style.css': { file: 'style.css', mime: 'text/css; charset=utf-8' },
   '/plex-sans.woff2': { file: 'plex-sans.woff2', mime: 'font/woff2' },
   '/plex-mono.woff2': { file: 'plex-mono.woff2', mime: 'font/woff2' },
+  '/logo.png': { file: 'logo.png', mime: 'image/png' },
+  '/favicon.ico': { file: 'logo.png', mime: 'image/png' },
+  '/avatar.png': { file: 'avatar.png', mime: 'image/png' },
 };
 const policy = "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
 function send(response: ServerResponse, status: number, result: unknown) {
@@ -149,6 +157,7 @@ export async function startWeb(options: { home: string; port?: number }): Promis
         let command: Record<string, unknown>;
         switch (url.pathname) {
           case '/api/view': command = { command: 'view' }; break;
+          case '/api/mindmap': command = { command: 'mindmap', before: numeric('before'), limit: numeric('limit') }; break;
           case '/api/message': command = { command: 'message', messageId: search.get('messageId') }; break;
           case '/api/history': command = { command: 'history', before: numeric('before') }; break;
           case '/api/trace': command = { command: 'trace', messageId: search.get('messageId') ?? undefined, taskId: search.get('taskId') ?? undefined, after: numeric('after'), before: numeric('before') }; break;

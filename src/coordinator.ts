@@ -7,12 +7,20 @@ import { readSnapshot, snapshot, type InputFile } from './files.js';
 import { PromptTrace } from './trace.js';
 import { sanitizePublicReply } from './reply-filter.js';
 import { integer, text } from './protocol.js';
-import type { ChatMessage, MainView, ModelTier, ModelTierConfig, RouteAction, RouteKind, WorkerProfile } from './view.js';
+import type { ChatMessage, DecisionSource, MainView, ModelTier, ModelTierConfig, QualityGateAssessment, RouteAction, RouteKind, ThinkingLevel, WorkerProfile } from './view.js';
 import { publicData } from './conversation.js';
 import { Executor } from './executor.js';
 import { ImGateway } from './im.js';
 import { ModelHub, type ModelHubConfigureInput } from './model-hub.js';
 import { listPlugins, listPluginsSync, runPlugin } from './plugin.js';
+import {
+  assignInitialMessageSessionSync,
+  backfillPersistedSessions,
+  formatFlowSessionId,
+  formatTaskSessionId,
+  reconcileRuntimeSessionAfterTool,
+  resolveRuntimeMessageSession,
+} from './session.js';
 import { Store, type Operation, type Task, type TaskStatus, type Timer } from './store.js';
 
 export function nextDailyRunAt(dailyAt: string, now = Date.now()): number {
@@ -134,6 +142,7 @@ interface Run {
   trace?: PromptTrace; replyId?: string; wakeFollowup?: () => void;
   /** The Router already spoke about this failure (WORKER_FAILED turn); no system notice is needed. */
   failureRouted?: boolean;
+  acceptedByRouter?: boolean;
 }
 interface ChatRun {
   message: ChatMessage; controller: AbortController; revisions: Map<string, number>; replyId?: string;
@@ -144,7 +153,7 @@ interface ChatRun {
 }
 interface ChatWork {
   originMessageId?: string; origin?: import('./view.js').MessageOrigin; parentTaskId?: string; parentSpanId?: string; source?: Task; signal: AbortSignal; cwd?: string;
-  contextBrief?: string; memoryIds?: string[]; profile?: WorkerProfile; workerModel?: string; modelTier?: ModelTier;
+  contextBrief?: string; memoryIds?: string[]; profile?: WorkerProfile; workerModel?: string; modelTier?: ModelTier; thinkingLevel?: ThinkingLevel;
 }
 class SourceChangedError extends Error {}
 function toolInput(input: string, keys: string[]): Record<string, unknown> {
@@ -186,6 +195,7 @@ export class Coordinator {
   private chatContext?: ChatRun;
   private reportChatContext?: ChatRun;
   private activeReportTask?: Task;
+  private activeFailureTask?: { id: string; reason: string; workerModel?: string; originMessageId?: string };
   private reportTurnDispatched = false;
   private reportTurnSentFile = false;
   private readonly reportAutoDispatches = new Map<string, number>();
@@ -232,6 +242,8 @@ export class Coordinator {
         ? { [this.factory.modelTiers.provider]: this.factory.initialApiKey }
         : undefined,
     );
+    await this.modelHub.syncDecisionEraStats(this.store.list());
+    backfillPersistedSessions(this.store);
     this.router = await this.createRouter(true);
     this.im.start();
   }
@@ -243,7 +255,7 @@ export class Coordinator {
         return this.dispatch();
       },
     }, {
-      name: 'start_work', description: 'Start an isolated background task; returns immediately. Input JSON: {instruction, cwd?, sourceMessageId?, sourceTaskId?, contextBrief?, memoryIds?, profile?: "general"|"coding"|"research"|"review", tier?: "fast"|"balanced"|"strong", model?}. For native work cwd is an optional absolute existing working directory; paths named in conversation are enough, attachments are NOT required. Omit cwd to reuse the source work directory, first hint path directory, or service cwd. Use contextBrief and memoryIds to compile recalled global memories for the Worker AI, profile to select a specialist Worker AI, and tier ("fast" for simple quick checks/summaries, "balanced" for standard work, "strong" for complex multi-file refactoring/deep review) or model to dynamically select model capability/cost. Native Workers have full local tools, not a sandbox. Snapshot/offline work still uses explicitly supplied source files. Do not use both sources.',
+      name: 'start_work', description: 'Start an isolated background task; returns immediately. Input JSON: {instruction, cwd?, sourceMessageId?, sourceTaskId?, contextBrief?, memoryIds?, profile?: "general"|"coding"|"research"|"review"}. For native work cwd is an optional absolute existing working directory; paths named in conversation are enough, attachments are NOT required. Omit cwd to reuse the source work directory, first hint path directory, or service cwd. Use contextBrief and memoryIds to compile recalled global memories for the Worker AI and profile to select a specialist Worker AI; the host Gemini Decision 1 engine automatically selects the optimal model and native thinkingLevel. Native Workers have full local tools, not a sandbox. Snapshot/offline work still uses explicitly supplied source files. Do not use both sources.',
       execute: async (input, callId) => {
         const context = this.requireChat();
         const inReportTurn = !this.chatContext && Boolean(this.activeReportTask);
@@ -287,13 +299,15 @@ export class Coordinator {
         return JSON.stringify({ taskId: task.id, ...(task.parentTaskId ? { parentTaskId: task.parentTaskId } : {}), state: task.status, execution: task.execution, cwd: task.cwd,
           ...(task.profile ? { profile: task.profile } : {}),
           ...(task.modelTier ? { modelTier: task.modelTier } : {}),
+          ...(task.thinkingLevel ? { thinkingLevel: task.thinkingLevel } : {}),
+          ...(task.decisionSource ? { decisionSource: task.decisionSource } : {}),
           ...(task.workerModel ? { workerModel: task.workerModel } : {}),
           ...(task.memoryIds?.length ? { memoryIds: task.memoryIds } : {}),
           ...(concurrentTaskIds.length ? { concurrentTaskIds, warning: 'Another active native work is operating in the same cwd' } : {}),
           note: 'Background work accepted, not completed' });
       },
     }, {
-      name: 'continue_work', description: 'Input JSON {taskId, instruction, cwd?, contextBrief?, memoryIds?, profile?: "general"|"coding"|"research"|"review", tier?: "fast"|"balanced"|"strong", model?}. Append a follow-up to queued/running work; completed/failed/cancelled work starts a related isolated execution using the CURRENT service execution capabilities and prior report. In native mode, even a legacy snapshot source creates a full-tool Worker in the current working directory, never another snapshot-only Worker. Optional cwd selects an absolute working directory; optional contextBrief/memoryIds compile global memory into the Worker context. Paused or unknown work cannot be resumed automatically.',
+      name: 'continue_work', description: 'Input JSON {taskId, instruction, cwd?, contextBrief?, memoryIds?, profile?: "general"|"coding"|"research"|"review"}. Append a follow-up to queued/running work; completed/failed/cancelled work starts a related isolated execution using the CURRENT service execution capabilities and prior report, with model and native thinkingLevel chosen dynamically by Gemini Decision 1. In native mode, even a legacy snapshot source creates a full-tool Worker in the current working directory, never another snapshot-only Worker. Optional cwd selects an absolute working directory; optional contextBrief/memoryIds compile global memory into the Worker context. Paused or unknown work cannot be resumed automatically.',
       execute: async (input, callId) => {
         const context = this.requireChat();
         const inReportTurn = !this.chatContext && Boolean(this.activeReportTask);
@@ -328,18 +342,14 @@ export class Coordinator {
           return JSON.stringify({ taskId: task.id, state: 'followup_accepted', ...(memoryIds?.length ? { memoryIds } : {}) });
         }
         if (task.status === 'paused') throw new Error('Work is paused with unconfirmed progress; no automatic replay or resume');
-        const inheritedModel = task.workerModel && task.workerModel.includes('/')
-          && !this.modelHub.isProviderEnabled(task.workerModel.slice(0, task.workerModel.indexOf('/')))
-          ? undefined
-          : task.workerModel;
         const next = await this.newChatWork(context, instruction, context.message.paths, callId, task,
           args.cwd === undefined ? undefined : text(args.cwd, 'cwd', 4096),
           {
             contextBrief: contextBrief ?? task.contextBrief,
             memoryIds: memoryIds ?? task.memoryIds,
             profile: parseWorkerProfile(args.profile) ?? task.profile,
-            modelTier: parseModelTier(args.tier) ?? task.modelTier,
-            workerModel: args.model === undefined ? inheritedModel : text(args.model, 'model', 160),
+            modelTier: parseModelTier(args.tier),
+            workerModel: args.model === undefined ? undefined : text(args.model, 'model', 160),
           });
         if (reportChainKey) {
           this.reportAutoDispatches.set(reportChainKey, (this.reportAutoDispatches.get(reportChainKey) ?? 0) + 1);
@@ -349,6 +359,8 @@ export class Coordinator {
         return JSON.stringify({ taskId: next.id, parentTaskId: task.id, state: next.status, execution: next.execution, cwd: next.cwd,
           ...(next.profile ? { profile: next.profile } : {}),
           ...(next.modelTier ? { modelTier: next.modelTier } : {}),
+          ...(next.thinkingLevel ? { thinkingLevel: next.thinkingLevel } : {}),
+          ...(next.decisionSource ? { decisionSource: next.decisionSource } : {}),
           ...(next.workerModel ? { workerModel: next.workerModel } : {}),
           ...(next.memoryIds?.length ? { memoryIds: next.memoryIds } : {}),
           ...(concurrentTaskIds.length ? { concurrentTaskIds, warning: 'Another active native work is operating in the same cwd' } : {}) });
@@ -364,7 +376,8 @@ export class Coordinator {
         }
         return JSON.stringify({ id: task.id, prompt: task.prompt, status: task.status, mode: task.mode, reason: task.reason, report: task.report,
           execution: task.execution ?? 'snapshot', cwd: task.cwd, paths: task.paths,
-          profile: task.profile, modelTier: task.modelTier, workerModel: task.workerModel, contextBrief: task.contextBrief, memoryIds: task.memoryIds,
+          profile: task.profile, modelTier: task.modelTier, thinkingLevel: task.thinkingLevel, decisionSource: task.decisionSource,
+          workerModel: task.workerModel, qualityGate: task.qualityGate, contextBrief: task.contextBrief, memoryIds: task.memoryIds,
           ...(task.pendingQuestion ? { pendingQuestion: task.pendingQuestion } : {}),
           files: task.files, followups: this.store.events(task.id).map(({ id, text, state }) => ({ id, text, state })) });
       },
@@ -542,7 +555,7 @@ export class Coordinator {
         return JSON.stringify({ sent: true, name: fileName, target: origin.senderId });
       },
     }, {
-      name: 'switch_channel', description: 'Route the current turn reply (and any tasks started in this turn) to a target channel when the Boss asks to reply on WeChat/Telegram/DingTalk or move the conversation across devices. Input JSON {channel: "wechat"|"telegram"|"dingtalk"|"local"|"auto"|string, target?}.',
+      name: 'switch_channel', description: 'Route the current turn reply (and any tasks started in this turn) to a target channel when the Boss asks to reply on WeChat/Telegram/DingTalk/XiaoAI or move the conversation across devices. Input JSON {channel: "wechat"|"telegram"|"dingtalk"|"xiaoai"|"local"|"auto"|string, target?}.',
       execute: async input => {
         if (this.closing) throw new Error('Service is shutting down');
         const args = toolInput(input, ['channel', 'target', 'summary']);
@@ -645,6 +658,12 @@ export class Coordinator {
       if (typeof value.modelTier === 'string' && MODEL_TIERS.has(value.modelTier as ModelTier)) {
         action.modelTier = value.modelTier as ModelTier;
       }
+      if (typeof value.thinkingLevel === 'string') {
+        action.thinkingLevel = value.thinkingLevel as ThinkingLevel;
+      }
+      if (value.decisionSource === 'gemini-decision-1' || value.decisionSource === 'heuristic') {
+        action.decisionSource = value.decisionSource;
+      }
       if (typeof value.workerModel === 'string') action.workerModel = value.workerModel;
       if (Array.isArray(value.memoryIds)) {
         action.memoryIds = value.memoryIds.map(id => String(id)).filter(Boolean);
@@ -670,6 +689,10 @@ export class Coordinator {
         if (id) action.memoryIds = [id];
       }
       this.store.conversation.routeAction(context.message.id, action, routeParent);
+      if (this.chatContext?.message.id === context.message.id) {
+        reconcileRuntimeSessionAfterTool(this.store, context.message.id, name, action);
+        this.chatContext.message = this.store.conversation.get(context.message.id);
+      }
       return result;
     } catch (error) {
       action.status = context.controller.signal.aborted ? 'interrupted' : 'failed';
@@ -723,10 +746,12 @@ export class Coordinator {
       timers: this.store.listTimers(),
       plugins: listPluginsSync(this.home),
       imChannels: this.store.listImChannelViews(),
-      works: recent.map(({ id, prompt, status, mode, createdAt, activeMs, limitMs, reason, originMessageId, parentTaskId, cwd, execution, profile, workerModel, modelTier, pendingQuestion }) => {
+      works: recent.map(({ id, prompt, status, mode, createdAt, activeMs, limitMs, reason, sessionId, originMessageId, parentTaskId, cwd, execution, profile, workerModel, modelTier, thinkingLevel, decisionSource, skipQualityGate, qualityGate, pendingQuestion }) => {
         const concurrentTaskIds = execution === 'native' && ['queued', 'running'].includes(status) ? this.concurrentTasksInCwd(cwd, id) : undefined;
-        return { id, prompt: prompt.slice(0, 240), status, mode, createdAt, activeMs, limitMs, reason, originMessageId, parentTaskId, cwd,
-          ...(profile ? { profile } : {}), ...(modelTier ? { modelTier } : {}), ...(workerModel ? { workerModel } : {}),
+        return { id, prompt: prompt.slice(0, 240), status, mode, createdAt, activeMs, limitMs, reason, ...(sessionId ? { sessionId } : {}), originMessageId, parentTaskId, cwd,
+          ...(profile ? { profile } : {}), ...(modelTier ? { modelTier } : {}), ...(thinkingLevel ? { thinkingLevel } : {}),
+          ...(decisionSource ? { decisionSource } : {}), ...(skipQualityGate ? { skipQualityGate: true } : {}), ...(qualityGate ? { qualityGate } : {}),
+          ...(workerModel ? { workerModel } : {}),
           ...(pendingQuestion ? { pendingQuestion } : {}),
           ...(concurrentTaskIds?.length ? { concurrentTaskIds } : {}) };
       }) };
@@ -883,7 +908,27 @@ export class Coordinator {
       mergeTarget.attemptController?.abort(new Error('Superseded by incoming message in same IM session'));
       return mergeTarget.message;
     }
-    const message = chat.create({ id: randomUUID(), requestId, role: 'user', origin, attachments, text: content, status: 'queued', paths, mode: this.factory.mode });
+    const msgId = randomUUID();
+    const initialAt = Date.now();
+    const initialSession = assignInitialMessageSessionSync(
+      this.store,
+      { id: msgId, text: content, origin, source: 'router', at: initialAt },
+      this.store.list(),
+    );
+    const message = chat.create({
+      id: msgId,
+      requestId,
+      role: 'user',
+      origin,
+      attachments,
+      sessionId: initialSession.sessionId,
+      ...(initialSession.sessionLink ? { sessionLink: initialSession.sessionLink } : {}),
+      text: content,
+      status: 'queued',
+      paths,
+      mode: this.factory.mode,
+      at: initialAt,
+    });
     this.requestFingerprints.set(requestId, { messageId: message.id, text: content, pathsJson });
     const now = Date.now();
     const initialWindowMs = this.computeCoalesceWindowMs(message);
@@ -906,9 +951,15 @@ export class Coordinator {
         }
         const attemptVersion = context.mergeVersion;
         context.activeAttemptVersion = attemptVersion;
-        context.message = chat.get(message.id);
-        const currentMessage = context.message;
+        let currentMessage = chat.get(message.id);
         const knownWorks = this.store.list();
+        const resolvedSession = await resolveRuntimeMessageSession(this.store, this.modelHub, currentMessage, knownWorks);
+        if (attemptVersion === 0
+          || currentMessage.sessionId !== resolvedSession.sessionId
+          || JSON.stringify(currentMessage.sessionLink ?? null) !== JSON.stringify(resolvedSession.sessionLink ?? null)) {
+          currentMessage = chat.assignSession(message.id, resolvedSession.sessionId, resolvedSession.sessionLink, attemptVersion === 0);
+        }
+        context.message = currentMessage;
         const memoryDirectory = this.store.memoryDirectory(24);
         const autoRecalled = currentMessage.text.trim()
           ? this.store.searchContext({ query: currentMessage.text, limit: 5, touch: true }).hits.filter(hit => !(hit.kind === 'message' && hit.messageId === message.id))
@@ -924,8 +975,8 @@ export class Coordinator {
             memoryDirectory,
             ...(autoRecalled.length ? { autoRecalled } : {}) } } });
         const reply = context.replyId
-          ? chat.update(context.replyId, { text: '', status: 'streaming', reason: undefined, origin: currentMessage.origin })
-          : chat.create({ id: randomUUID(), replyTo: message.id, role: 'assistant', text: '', status: 'streaming', mode: this.factory.mode, paths: [] });
+          ? chat.update(context.replyId, { text: '', status: 'streaming', reason: undefined, origin: currentMessage.origin, sessionId: currentMessage.sessionId })
+          : chat.create({ id: randomUUID(), replyTo: message.id, role: 'assistant', text: '', status: 'streaming', mode: this.factory.mode, paths: [], sessionId: currentMessage.sessionId });
         context.replyId = reply.id;
         const trace = new PromptTrace(chat, { rootId: message.id, messageId: message.id, parentSpanId: message.id }, 'router', this.factory.mode, reply.id);
         this.routerTrace = trace;
@@ -936,7 +987,6 @@ export class Coordinator {
         context.controller.signal.addEventListener('abort', onUserAbort, { once: true });
         const preTurnLeafId = this.router?.leafId;
         try {
-          const availableWorkerModels = this.modelHub.getModelPool();
           const deliveryChannel = currentMessage.origin?.channel ?? 'local';
           const imChannels = this.store.listImChannelViews()
             .filter(c => c.enabled)
@@ -949,11 +999,9 @@ export class Coordinator {
             execution: this.factory.nativeTools ? 'native' : 'snapshot', cwd: process.cwd(),
             memoryDirectory,
             ...(imChannels.length ? { imChannels } : {}),
-            ...(this.factory.modelTiers ? { modelTiers: this.factory.modelTiers } : {}),
-            ...(availableWorkerModels.length ? { availableWorkerModels } : {}),
             ...(autoRecalled.length ? { autoRecalled } : {}),
             ...(subconscious ? { subconscious } : {}),
-            works: knownWorks.slice(-40).map(({ id, prompt, status, revision, mode, reason, report, files, originMessageId, execution, cwd, profile, workerModel, modelTier, pendingQuestion }) => ({ execution: execution ?? 'snapshot', cwd, id, prompt: prompt.slice(0, 512), status, revision, mode, reason, reportPreview: report?.slice(0, 1024), fileCount: files.length, originMessageId, ...(profile ? { profile } : {}), ...(modelTier ? { modelTier } : {}), ...(workerModel ? { workerModel } : {}), ...(pendingQuestion ? { pendingQuestion } : {}) })) }), attemptController.signal);
+            works: knownWorks.slice(-40).map(({ id, prompt, status, revision, mode, reason, report, files, originMessageId, execution, cwd, profile, workerModel, modelTier, thinkingLevel, pendingQuestion }) => ({ execution: execution ?? 'snapshot', cwd, id, prompt: prompt.slice(0, 512), status, revision, mode, reason, reportPreview: report?.slice(0, 1024), fileCount: files.length, originMessageId, ...(profile ? { profile } : {}), ...(modelTier ? { modelTier } : {}), ...(thinkingLevel ? { thinkingLevel } : {}), ...(workerModel ? { workerModel } : {}), ...(pendingQuestion ? { pendingQuestion } : {}) })) }), attemptController.signal);
           this.accrueChat(context);
           if (context.controller.signal.aborted) throw context.controller.signal.reason;
           if ((context.mergeVersion !== attemptVersion || this.hasInboundHold(currentMessage.origin)) && !context.hasSideEffectTool && !this.closing) {
@@ -1044,7 +1092,7 @@ export class Coordinator {
     const since = Date.now() - 30 * 60_000;
     const counts = new Map<string, number>();
     for (const task of this.store.list()) {
-      if (task.status !== 'failed' || task.createdAt < since || !task.reason || !sameProvider(task.workerModel)) continue;
+      if (!task.decisionSource || task.status !== 'failed' || task.createdAt < since || !task.reason || !sameProvider(task.workerModel)) continue;
       counts.set(task.reason, (counts.get(task.reason) ?? 0) + 1);
     }
     for (const [reason, count] of counts) {
@@ -1074,24 +1122,34 @@ export class Coordinator {
     try {
       const handled = await this.serialRouter(run, async () => {
         const chainKey = task.originMessageId ?? task.id;
-        const text = await this.prompt(run, this.router!, JSON.stringify({
-          kind: 'WORKER_FAILED',
-          taskId: task.id,
-          prompt: task.prompt,
-          cwd: task.cwd,
-          ...(task.workerModel ? { workerModel: task.workerModel } : {}),
-          error: detail,
-          deliveryChannel: task.origin?.channel ?? 'local',
-          autoDispatchesRemaining: Math.max(0, 2 - (this.reportAutoDispatches.get(chainKey) ?? 0)),
-        }));
-        if (!this.valid(run)) return false;
-        const isHandoffText = /^(?:\[OFFLINE SIMULATION\]\s*)?(?:好的老板[，,、\s]*)?任务已下发[。！!.\s]*$/i.test(text.trim());
-        if (run.replyId) {
-          if (this.reportTurnDispatched && !this.reportTurnSentFile && isHandoffText) this.store.conversation.delete(run.replyId);
-          else this.store.conversation.update(run.replyId, { text, status: 'completed' });
-          run.replyId = undefined;
+        this.activeFailureTask = {
+          id: task.id,
+          reason: `模型或执行器请求失败：${detail}`,
+          workerModel: task.workerModel,
+          originMessageId: task.originMessageId,
+        };
+        try {
+          const text = await this.prompt(run, this.router!, JSON.stringify({
+            kind: 'WORKER_FAILED',
+            taskId: task.id,
+            prompt: task.prompt,
+            cwd: task.cwd,
+            ...(task.workerModel ? { workerModel: task.workerModel } : {}),
+            error: detail,
+            deliveryChannel: task.origin?.channel ?? 'local',
+            autoDispatchesRemaining: Math.max(0, 2 - (this.reportAutoDispatches.get(chainKey) ?? 0)),
+          }));
+          if (!this.valid(run)) return false;
+          const isHandoffText = /^(?:\[OFFLINE SIMULATION\]\s*)?(?:好的老板[，,、\s]*)?任务已下发[。！!.\s]*$/i.test(text.trim());
+          if (run.replyId) {
+            if (this.reportTurnDispatched && !this.reportTurnSentFile && isHandoffText) this.store.conversation.delete(run.replyId);
+            else this.store.conversation.update(run.replyId, { text, status: 'completed' });
+            run.replyId = undefined;
+          }
+          return true;
+        } finally {
+          this.activeFailureTask = undefined;
         }
-        return true;
       });
       if (!handled) return false;
     } catch {
@@ -1165,38 +1223,135 @@ export class Coordinator {
       if (duplicate!.fingerprint !== fingerprint) throw new Error('Request ID already used with different task parameters');
       return duplicate!;
     }
+    const imageFilePattern = /\.(png|jpe?g|gif|webp|bmp|heic|heif)$/i;
+    const originMessage = chatWork?.originMessageId ? this.store.conversation.get(chatWork.originMessageId) : undefined;
+    const hasImages = paths.some(p => imageFilePattern.test(p))
+      || files.some(f => imageFilePattern.test(f.name))
+      || (originMessage?.attachments?.some(a => a.kind === 'image' || a.mimeType?.startsWith('image/')) ?? false)
+      || imageFilePattern.test(prompt);
+    const pool = this.modelHub.getModelPool();
+    const excludedSpecs: string[] = [];
+    const excludedProviders: string[] = [];
+    if (chatWork && !chatWork.workerModel) {
+      const recentSince = Date.now() - 30 * 60_000;
+      const failedSpecSet = new Set<string>();
+      const providerFailureCounts = new Map<string, number>();
+      const addFailedSpec = (spec: string) => {
+        failedSpecSet.add(spec);
+        for (const entry of pool) {
+          if (entry.modelId === spec || entry.spec === spec) failedSpecSet.add(entry.spec);
+        }
+      };
+      const recordProviderFailure = (spec: string | undefined, reason: string | undefined) => {
+        if (!reason || !spec?.includes('/')) return;
+        const provider = spec.slice(0, spec.indexOf('/'));
+        const key = `${provider}\u0000${reason}`;
+        const count = (providerFailureCounts.get(key) ?? 0) + 1;
+        providerFailureCounts.set(key, count);
+        if (count >= 2 && !excludedProviders.includes(provider)) excludedProviders.push(provider);
+      };
+      for (const prev of this.store.list()) {
+        if (!prev.decisionSource || prev.status !== 'failed') continue;
+        if (chatWork.originMessageId && prev.originMessageId === chatWork.originMessageId && prev.workerModel) {
+          addFailedSpec(prev.workerModel);
+        }
+        if (prev.createdAt >= recentSince) {
+          recordProviderFailure(prev.workerModel, prev.reason);
+        }
+      }
+      if (this.activeFailureTask) {
+        if (this.activeFailureTask.workerModel
+          && (!chatWork.originMessageId || !this.activeFailureTask.originMessageId || this.activeFailureTask.originMessageId === chatWork.originMessageId)) {
+          addFailedSpec(this.activeFailureTask.workerModel);
+        }
+        recordProviderFailure(this.activeFailureTask.workerModel, this.activeFailureTask.reason);
+      }
+      excludedSpecs.push(...failedSpecSet);
+    }
     const resolutionInput = {
       model: chatWork?.workerModel,
       tier: chatWork?.modelTier,
+      thinkingLevel: chatWork?.thinkingLevel,
       profile: chatWork?.profile,
       instruction: prompt,
+      contextBrief: chatWork?.contextBrief,
       fileCount: paths.length || files.length,
+      hasImages,
       isTimer: requestId.startsWith('timer:'),
+      ...(excludedSpecs.length ? { excludedSpecs } : {}),
+      ...(excludedProviders.length ? { excludedProviders } : {}),
     };
-    const resolvedModel = (this.modelHub.getModelPool().length > 0 || this.modelHub.disabledProviders().length > 0)
-      ? this.modelHub.selectWorkerModel(resolutionInput)
-      : this.factory.resolveWorkerModel
-        ? this.factory.resolveWorkerModel(resolutionInput)
-        : {
-            model: chatWork?.workerModel,
-            tier: chatWork?.modelTier ?? (chatWork?.workerModel || chatWork?.profile
-              ? inferModelTier(resolutionInput)
-              : undefined),
-          };
+    const fallbackLevelForTier = (tier: ModelTier | undefined): ThinkingLevel | undefined => (
+      tier === 'fast' ? 'low' : tier === 'strong' ? 'high' : tier === 'balanced' ? 'medium' : undefined
+    );
+    let resolvedModel: {
+      model?: string;
+      tier?: ModelTier;
+      thinkingLevel?: ThinkingLevel;
+      confidence?: number;
+      needsQualityGate?: boolean;
+      needsQualityGateProb?: number;
+      source?: DecisionSource;
+      attempted?: boolean;
+      usage?: { inputTokens: number; totalTokens: number };
+      fallbackReason?: string;
+    };
+    try {
+      if (pool.length > 0 || this.modelHub.disabledProviders().length > 0) {
+        resolvedModel = await this.modelHub.decideWorkerModel(resolutionInput);
+      } else if (this.factory.resolveWorkerModel) {
+        const custom = this.factory.resolveWorkerModel(resolutionInput);
+        resolvedModel = {
+          ...custom,
+          thinkingLevel: chatWork?.thinkingLevel ?? fallbackLevelForTier(custom.tier),
+          source: 'heuristic',
+          attempted: false,
+        };
+      } else {
+        const tier = chatWork?.modelTier ?? (chatWork?.workerModel || chatWork?.profile
+          ? inferModelTier(resolutionInput)
+          : undefined);
+        resolvedModel = {
+          model: chatWork?.workerModel,
+          tier,
+          thinkingLevel: chatWork?.thinkingLevel ?? fallbackLevelForTier(tier),
+          source: 'heuristic',
+          attempted: false,
+        };
+      }
+    } catch (error) {
+      await rm(join(this.home, 'tasks', id), { recursive: true, force: true });
+      throw error;
+    }
+    if (this.closing || chatWork?.signal.aborted) {
+      await rm(join(this.home, 'tasks', id), { recursive: true, force: true });
+      if (this.closing) throw new Error('Service is shutting down');
+      throw new Error('Router request stopped before dispatch');
+    }
     const breaker = chatWork ? this.failureCircuitBreaker(resolvedModel.model) : undefined;
     if (breaker) {
       await rm(join(this.home, 'tasks', id), { recursive: true, force: true });
       throw new Error(breaker);
     }
+    const sourceOriginSession = chatWork?.source?.sessionId
+      ?? (chatWork?.source?.originMessageId
+        ? (() => { try { return this.store.conversation.get(chatWork.source.originMessageId!).sessionId; } catch { return undefined; } })()
+        : undefined);
+    const taskSessionId = originMessage?.sessionId ?? sourceOriginSession ?? formatTaskSessionId(id);
     const task: Task = { id, requestId, fingerprint, prompt, files, limitMs, activeMs: 0,
       status: 'queued', revision: 0, mode: this.factory.mode, createdAt: Date.now(),
+      sessionId: taskSessionId,
       execution: native ? 'native' : 'snapshot', cwd, paths: native ? (paths.length ? paths : source?.paths ?? []) : undefined,
       origin: chatWork
         ? (chatWork.origin ?? (chatWork.originMessageId ? this.store.conversation.get(chatWork.originMessageId).origin : chatWork.source?.origin))
         : undefined,
       originMessageId: chatWork?.originMessageId, parentTaskId: chatWork?.parentTaskId, parentSpanId: chatWork?.parentSpanId,
       contextBrief: chatWork?.contextBrief, memoryIds: chatWork?.memoryIds,
-      profile: chatWork?.profile, modelTier: resolvedModel.tier, workerModel: resolvedModel.model };
+      profile: chatWork?.profile, modelTier: resolvedModel.tier, workerModel: resolvedModel.model,
+      thinkingLevel: resolvedModel.thinkingLevel,
+      decisionSource: resolvedModel.source,
+      decisionConfidence: resolvedModel.confidence,
+      ...(resolvedModel.needsQualityGate === false ? { skipQualityGate: true } : {}) };
     try {
       // No await between this re-validation and the commit: a stop that lands during snapshot work
       // cannot be overtaken by a related execution derived from a stale revision.
@@ -1215,6 +1370,43 @@ export class Coordinator {
     } catch (error) {
       await rm(join(this.home, 'tasks', id), { recursive: true, force: true });
       throw error;
+    }
+    if (resolvedModel.attempted) {
+      this.store.conversation.span(
+        {
+          rootId: chatWork?.originMessageId ?? task.id,
+          ...(chatWork?.originMessageId ? { messageId: chatWork.originMessageId } : {}),
+          taskId: task.id,
+          spanId: `${task.id}:decision:route`,
+          parentSpanId: task.id,
+        },
+        'system',
+        'Gemini Decision 1 选模定级',
+        resolvedModel.source === 'gemini-decision-1' ? 'completed' : 'fallback',
+        {
+          request: {
+            endpoint: '/v1beta/decisions',
+            decisionModel: 'gemini-decision-1',
+            profile: resolutionInput.profile ?? 'general',
+            ...(resolutionInput.tier ? { preferredTier: resolutionInput.tier } : {}),
+            ...(resolutionInput.thinkingLevel ? { preferredLevel: resolutionInput.thinkingLevel } : {}),
+            fileCount: resolutionInput.fileCount,
+            hasImages: resolutionInput.hasImages,
+            isTimer: resolutionInput.isTimer,
+            candidateCount: pool.length,
+            ...(resolutionInput.excludedSpecs ? { excludedSpecs: resolutionInput.excludedSpecs } : {}),
+            ...(resolutionInput.excludedProviders ? { excludedProviders: resolutionInput.excludedProviders } : {}),
+            instructionPreview: prompt.slice(0, 320),
+          },
+          model: resolvedModel.model,
+          thinkingLevel: resolvedModel.thinkingLevel,
+          source: resolvedModel.source,
+          ...(resolvedModel.confidence !== undefined ? { confidence: resolvedModel.confidence } : {}),
+          ...(resolvedModel.needsQualityGate !== undefined ? { needsQualityGate: resolvedModel.needsQualityGate, needsQualityGateProb: resolvedModel.needsQualityGateProb } : {}),
+          ...(resolvedModel.usage ? { usage: resolvedModel.usage } : {}),
+          ...(resolvedModel.fallbackReason ? { fallbackReason: resolvedModel.fallbackReason } : {}),
+        },
+      );
     }
     const run: Run = { id, revision: 0, controller: new AbortController(), jobs: 0, activeCalls: 0, clockUncertain: false, reads: new Map(), completions: [], lastTick: performance.now(), lastWall: Date.now() };
     this.runs.set(id, run);
@@ -1264,7 +1456,7 @@ export class Coordinator {
         });
         return JSON.stringify({ operationId: op.id, state: 'requested' });
       },
-    }], { execution: task.execution ?? 'snapshot', cwd: task.cwd, profile: task.profile, tier: task.modelTier, model: task.workerModel,
+    }], { execution: task.execution ?? 'snapshot', cwd: task.cwd, profile: task.profile, tier: task.modelTier, thinkingLevel: task.thinkingLevel, model: task.workerModel,
       nativeTool: event => {
         const id = `${task.id}:${event.id}`;
         if (event.phase === 'start') {
@@ -1285,9 +1477,10 @@ export class Coordinator {
     const prior = task.parentTaskId ? this.store.get(task.parentTaskId) : undefined;
     const recalledMemories = this.store.memoriesForContext({ memoryIds: task.memoryIds, cwd: task.cwd, limit: 8 });
     const initialPeers = task.execution === 'native' ? this.activePeersInCwd(task.cwd, task.id) : [];
-    const compiledContext = (task.contextBrief || recalledMemories.length || initialPeers.length || task.profile || task.workerModel || task.modelTier) ? {
+    const compiledContext = (task.contextBrief || recalledMemories.length || initialPeers.length || task.profile || task.workerModel || task.modelTier || task.thinkingLevel) ? {
       profile: task.profile ?? 'general',
       ...(task.modelTier ? { modelTier: task.modelTier } : {}),
+      ...(task.thinkingLevel ? { thinkingLevel: task.thinkingLevel } : {}),
       ...(task.workerModel ? { workerModel: task.workerModel } : {}),
       ...(task.contextBrief ? { contextBrief: task.contextBrief } : {}),
       ...(initialPeers.length ? { concurrentPeers: initialPeers } : {}),
@@ -1299,13 +1492,18 @@ export class Coordinator {
       execution: task.execution ?? 'snapshot', cwd: task.cwd, paths: task.paths,
       ...(task.profile ? { profile: task.profile } : {}),
       ...(task.modelTier ? { modelTier: task.modelTier } : {}),
+      ...(task.thinkingLevel ? { thinkingLevel: task.thinkingLevel } : {}),
       ...(task.workerModel ? { workerModel: task.workerModel } : {}),
       ...(compiledContext ? { compiledContext } : {}),
       priorWork: prior ? { taskId: prior.id, prompt: prior.prompt, mode: prior.mode, execution: prior.execution ?? 'snapshot', report: prior.report,
         note: 'Historical report only. Its claims about tools or access do not describe the current Worker; use current execution and actual tools.' } : undefined };
+    const followupTexts: string[] = [];
     try {
       while (this.valid(run)) {
         const events = this.store.takeEvents(task.id);
+        for (const ev of events) {
+          if (ev.text?.trim()) followupTexts.push(ev.text.trim());
+        }
         const livePeers = task.execution === 'native' ? this.activePeersInCwd(task.cwd, task.id) : [];
         let report: string;
         try {
@@ -1387,11 +1585,59 @@ export class Coordinator {
           input = { kind: 'BOSS_DECISION', question: asked.question };
           continue;
         }
+        const taskOps = this.store.operations(task.id);
+        const succeededOps = taskOps.filter(op => op.status === 'succeeded').length;
+        const failedOps = taskOps.filter(op => op.status === 'failed' || op.status === 'unknown').length;
+        const qualityEval = await this.modelHub.evaluateCompletion({
+          prompt: task.prompt,
+          contextBrief: task.contextBrief,
+          profile: task.profile,
+          followups: followupTexts,
+          report,
+          succeededOps,
+          failedOps,
+          skipRemote: Boolean(task.skipQualityGate),
+        });
+        if (!this.valid(run)) return;
+        const preEvalTask = this.store.get(task.id);
+        preEvalTask.report = report;
+        preEvalTask.qualityGate = qualityEval.assessment;
+        this.store.save(preEvalTask);
+        if (qualityEval.attempted) {
+          this.store.conversation.span(
+            {
+              rootId: task.originMessageId ?? task.id,
+              ...(task.originMessageId ? { messageId: task.originMessageId } : {}),
+              taskId: task.id,
+              spanId: `${task.id}:decision:quality`,
+              parentSpanId: task.id,
+            },
+            'system',
+            'Gemini Decision 1 完成度评估',
+            qualityEval.assessment.source === 'gemini-decision-1' ? 'completed' : 'fallback',
+            {
+              request: {
+                endpoint: '/v1beta/decisions',
+                decisionModel: 'gemini-decision-1',
+                profile: task.profile ?? 'general',
+                succeededOps,
+                failedOps,
+                followupCount: followupTexts.length,
+                reportLength: report.length,
+                skipRemote: Boolean(task.skipQualityGate),
+              },
+              ...qualityEval.assessment,
+              ...(qualityEval.usage ? { usage: qualityEval.usage } : {}),
+              ...(qualityEval.fallbackReason ? { fallbackReason: qualityEval.fallbackReason } : {}),
+            },
+          );
+        }
         let silentHandoff = false;
         let acceptedByRouter = false;
         const delivered = await this.serialRouter(run, async () => {
           const preReport = this.store.get(task.id);
           preReport.report = report;
+          preReport.qualityGate = qualityEval.assessment;
           this.store.save(preReport);
           const chainKey = task.originMessageId ?? task.id;
           const autoDispatchesRemaining = Math.max(0, 2 - (this.reportAutoDispatches.get(chainKey) ?? 0));
@@ -1401,6 +1647,7 @@ export class Coordinator {
             prompt: task.prompt,
             cwd: task.cwd,
             report,
+            qualityGate: qualityEval.assessment,
             deliveryChannel: task.origin?.channel ?? 'local',
             autoDispatchesRemaining,
             memoryDirectory: this.store.memoryDirectory(16),
@@ -1426,6 +1673,7 @@ export class Coordinator {
           }
           // The Router dispatched a supplement from this report: she did not accept it as a finished result.
           acceptedByRouter = !this.reportTurnDispatched;
+          run.acceptedByRouter = acceptedByRouter;
           if (text.length > 65_536) throw new Error('Router report exceeds delivery limit');
           return text;
         });
@@ -1587,11 +1835,25 @@ export class Coordinator {
     return this.store.deleteTimer(id);
   }
   private resolveChannelOrigin(channelSpec: string, deliverTarget?: string): import('./view.js').MessageOrigin | undefined {
+    const trimmed = channelSpec.trim();
+    const normalizedSpec = ({
+      '小爱': 'xiaoai',
+      '小爱同学': 'xiaoai',
+      '小爱音箱': 'xiaoai',
+      '音箱': 'xiaoai',
+      'xiaoai': 'xiaoai',
+      '微信': 'wechat',
+      'wechat': 'wechat',
+      '钉钉': 'dingtalk',
+      'dingtalk': 'dingtalk',
+      'telegram': 'telegram',
+      'auto': 'auto',
+    } as Record<string, string>)[trimmed.toLowerCase()] ?? trimmed;
     const channels = this.store.listImChannels();
-    const ch = channelSpec === 'auto'
+    const ch = normalizedSpec === 'auto'
       ? (channels.find(c => c.enabled) ?? channels[0])
-      : (channels.find(c => c.enabled && (c.id === channelSpec || c.platform === channelSpec))
-        ?? channels.find(c => c.id === channelSpec || c.platform === channelSpec));
+      : (channels.find(c => c.enabled && (c.id === normalizedSpec || c.platform === normalizedSpec))
+        ?? channels.find(c => c.id === normalizedSpec || c.platform === normalizedSpec));
     if (ch && ch.enabled) {
       const target = deliverTarget
         ?? ch.defaultTarget
@@ -1638,13 +1900,15 @@ export class Coordinator {
         // Scheduled plugin reports travel as one plain text message. WeChat renders the markdown
         // the plugin itself emits (headings, bold, lists, quotes, inline code), so no attachment
         // or digest rewrite is needed. See `src/fund-report.ts` for the retired adapter.
+        const timerMsgId = randomUUID();
+        const timerSessionId = formatFlowSessionId(timerMsgId);
         const userMsg = this.store.conversation.create({
-          id: randomUUID(), role: 'user', source: 'system', origin,
+          id: timerMsgId, role: 'user', source: 'system', origin, sessionId: timerSessionId,
           text: `[定时触发 · ${timer.name}] ${timer.instruction}`,
           status: 'completed', paths: [], mode: this.factory.mode,
         });
         this.store.conversation.create({
-          id: randomUUID(), replyTo: userMsg.id, role: 'assistant', source: 'system', origin,
+          id: randomUUID(), replyTo: userMsg.id, role: 'assistant', source: 'system', origin, sessionId: timerSessionId,
           text: res.message, status: 'completed', paths: [], mode: this.factory.mode,
         });
         this.store.notice('system', 'timer_plugin_completed', `定时插件「${timer.name}」(${pluginName}/${pluginAction}) 已执行并推送通知`);
@@ -1659,7 +1923,9 @@ export class Coordinator {
       this.store.saveTimer(timer);
       return;
     }
-    const message = this.store.conversation.create({ id: randomUUID(), role: 'user', source: 'system', origin,
+    const timerMsgId = randomUUID();
+    const message = this.store.conversation.create({ id: timerMsgId, role: 'user', source: 'system', origin,
+      sessionId: formatFlowSessionId(timerMsgId),
       text: `[定时触发 · ${timer.name}] ${timer.instruction}`, status: 'completed', paths: [], mode: this.factory.mode });
     const requestId = `timer:${timer.id}:${now}`;
     void this.submit(requestId, timer.instruction, [], 600_000,
@@ -1716,7 +1982,15 @@ export class Coordinator {
         this.store.failPendingEvents(run.id, status === 'cancelled' ? '工作已取消' : '工作已结束');
       }
       if (status === 'completed' || status === 'failed') {
-        this.modelHub.recordTaskOutcome(current.workerModel, status === 'completed', current.activeMs);
+        const calibratedScore = current.qualityGate?.source === 'gemini-decision-1'
+          ? current.qualityGate.score
+          : undefined;
+        const effectiveQualityScore = status === 'completed'
+          ? (run.acceptedByRouter === false
+              ? Math.min(calibratedScore ?? 1.2, 1.2)
+              : calibratedScore)
+          : undefined;
+        this.modelHub.recordTaskOutcome(current.workerModel, status === 'completed', current.activeMs, effectiveQualityScore);
       }
       if (!run.replyId && !run.failureRouted && taskStatusNeedsNotice(status) && current.originMessageId) {
         const message = this.store.conversation.create({ id: randomUUID(), role: 'assistant', source: 'system',
@@ -1937,11 +2211,11 @@ export class Coordinator {
       }
       if (controller.signal.aborted || this.closing) return;
 
-      const resolvedModel = this.modelHub.getModelPool().length > 0
-        ? this.modelHub.selectWorkerModel({ tier: 'balanced', profile: 'research', instruction: '记忆巩固与跨上下文关联分析' })
+      const resolvedModel: { model?: string; tier?: ModelTier; thinkingLevel?: ThinkingLevel } = this.modelHub.getModelPool().length > 0
+        ? await this.modelHub.decideWorkerModel({ profile: 'research', instruction: '潜意识记忆巩固与跨上下文突触关联分析' })
         : this.factory.resolveWorkerModel
           ? this.factory.resolveWorkerModel({ tier: 'balanced', profile: 'research' })
-          : { model: undefined, tier: 'balanced' as ModelTier };
+          : { model: undefined, tier: 'balanced' as ModelTier, thinkingLevel: 'medium' as ThinkingLevel };
 
       const sanitizeTags = (tags?: string[]) => (tags ?? [])
         .map(t => t.trim())
@@ -1990,6 +2264,7 @@ export class Coordinator {
         execution: this.factory.nativeTools ? 'native' : 'snapshot',
         cwd: dreamCwd,
         tier: resolvedModel.tier,
+        thinkingLevel: resolvedModel.thinkingLevel,
         model: resolvedModel.model,
       });
       const timeoutSignal = AbortSignal.timeout(90_000);

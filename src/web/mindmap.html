@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>F.R.I.D.A.Y. · 会话思考流程图</title>
+  <link rel="icon" type="image/png" href="/logo.png">
+  <link rel="stylesheet" href="/mindmap.css">
+  <script type="module" src="/mindmap.js"></script>
+</head>
+<body>
+  <header class="mm-topbar">
+    <div class="mm-brand-group">
+      <a id="mm-back-link" class="mm-back-btn" href="/">← 返回对话控制台</a>
+      <button id="mm-toggle-sidebar" class="mm-mini-btn" type="button" title="收起或展开左侧会话目录">☰ 会话目录</button>
+      <div class="mm-brand">
+        <span class="mm-brand-logo" aria-hidden="true"></span>
+        <span>F.R.I.D.A.Y. 会话思考流程图</span>
+      </div>
+    </div>
+
+    <div class="mm-view-tabs" role="tablist" aria-label="视图模式切换">
+      <button id="view-session-btn" class="mm-tab-btn active" type="button" role="tab" aria-selected="true">🔀 会话思考流程图</button>
+      <button id="view-overview-btn" class="mm-tab-btn" type="button" role="tab" aria-selected="false">🗺️ 全局会话脉络图</button>
+      <button id="view-list-btn" class="mm-tab-btn" type="button" role="tab" aria-selected="false">📋 全景数据清单</button>
+    </div>
+
+    <div class="mm-toolbar-actions">
+      <div class="mm-search-wrap">
+        <input id="mm-search-input" type="search" placeholder="搜会话、微信内容、记忆、JEV、bash…" aria-label="搜索会话与思考流程图节点">
+        <button id="mm-search-clear" class="mm-mini-btn" type="button" hidden>✕</button>
+      </div>
+      <div id="mm-canvas-controls" class="mm-canvas-controls">
+        <button id="mm-expand-all" class="mm-mini-btn" type="button">全部展开</button>
+        <button id="mm-collapse-all" class="mm-mini-btn" type="button">仅看主干</button>
+        <button id="mm-zoom-out" class="mm-mini-btn" type="button" aria-label="缩小画布">－</button>
+        <span id="mm-zoom-label" class="mm-zoom-label">100%</span>
+        <button id="mm-zoom-in" class="mm-mini-btn" type="button" aria-label="放大画布">＋</button>
+        <button id="mm-fit-width-btn" class="mm-mini-btn" type="button">适宽置顶</button>
+        <button id="mm-fit-btn" class="mm-mini-btn" type="button">适应全图</button>
+        <button id="mm-refresh-btn" class="mm-mini-btn" type="button">↻ 刷新</button>
+      </div>
+      <span id="mm-conn-pill" class="mm-conn-pill">正在连接…</span>
+    </div>
+  </header>
+
+  <section id="mm-kpi-strip" class="mm-kpi-strip" aria-label="全局实时运行指标">
+    <span class="mm-kpi-chip">🧠 AI会话: <strong id="kpi-sessions">0</strong></span>
+    <span class="mm-kpi-chip">原始消息: <strong id="kpi-flows">0</strong></span>
+    <span class="mm-kpi-chip">💬 微信: <strong id="kpi-wechat">0</strong></span>
+    <span class="mm-kpi-chip">🖥️ 本地: <strong id="kpi-local">0</strong></span>
+    <span class="mm-kpi-chip">⏱️ 定时: <strong id="kpi-timer">0</strong></span>
+    <span class="mm-kpi-chip">🤖 后台Worker: <strong id="kpi-tasks">0</strong></span>
+    <span class="mm-kpi-chip">🎯 JEV决策调用: <strong id="kpi-jev">0</strong></span>
+    <span class="mm-kpi-chip">📚 活跃记忆: <strong id="kpi-memories">0</strong></span>
+    <span id="kpi-model-badge" class="mm-kpi-chip mm-kpi-model">主控: — · 决策: gemini-decision-1</span>
+  </section>
+
+  <main class="mm-workspace">
+    <aside id="mm-flow-sidebar" class="mm-sidebar" aria-label="AI 会话与任务流目录">
+      <div class="mm-sidebar-head">
+        <div class="mm-sidebar-mode-toggle" role="group" aria-label="目录粒度切换">
+          <button id="sidebar-mode-sessions" class="mm-mode-btn active" type="button">🗂️ AI 会话脉络</button>
+          <button id="sidebar-mode-turns" class="mm-mode-btn" type="button">💬 逐句消息</button>
+        </div>
+        <div class="mm-filter-pills" id="mm-filter-pills" role="group" aria-label="按来源筛选">
+          <button class="mm-filter-btn active" type="button" data-filter="all">全部</button>
+          <button class="mm-filter-btn" type="button" data-filter="multiturn">🔗 多轮会话</button>
+          <button class="mm-filter-btn" type="button" data-filter="wechat">💬 微信</button>
+          <button class="mm-filter-btn" type="button" data-filter="local">🖥️ 本地</button>
+          <button class="mm-filter-btn" type="button" data-filter="timer">⏱️ 定时</button>
+          <button class="mm-filter-btn" type="button" data-filter="jev">🎯 含JEV/Worker</button>
+        </div>
+        <div id="mm-sidebar-count" class="mm-sidebar-count">等待数据…</div>
+      </div>
+      <div id="mm-flow-list" class="mm-flow-list"></div>
+      <div id="mm-load-more-wrap" class="mm-load-more-wrap" hidden>
+        <button id="mm-load-more-btn" class="mm-mini-btn mm-full-btn" type="button">加载更早的历史会话消息…</button>
+      </div>
+    </aside>
+
+    <section id="mm-canvas-panel" class="mm-canvas-panel" aria-label="交互式会话思考流程图画布">
+      <div id="mm-auth-banner" class="mm-auth-banner" hidden>
+        <div class="mm-auth-card">
+          <h2>🔐 需要本地访问令牌以读取思考流程图</h2>
+          <p>出于安全隔离策略，`/api/mindmap` 仅向持有本地随机 Bearer Token 的请求开放。</p>
+          <p class="mm-muted">请从主控制台顶部点击 <strong>🧭 思考流程图</strong> 进入，或使用服务启动日志输出的带 <code>#token=...</code> 完整地址。</p>
+          <a class="mm-primary-link" href="/">返回主控制台进入</a>
+        </div>
+      </div>
+
+      <svg id="mm-svg" class="mm-svg" tabindex="0" aria-label="F.R.I.D.A.Y. 会话思考流程图画布">
+        <defs>
+          <marker id="fc-arrow-default" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M 0 1 L 8 5 L 0 9 z" class="fc-marker fc-marker-default"></path>
+          </marker>
+          <marker id="fc-arrow-accent" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M 0 1 L 8 5 L 0 9 z" class="fc-marker fc-marker-accent"></path>
+          </marker>
+          <marker id="fc-arrow-warn" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M 0 1 L 8 5 L 0 9 z" class="fc-marker fc-marker-warn"></path>
+          </marker>
+          <marker id="fc-arrow-success" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M 0 1 L 8 5 L 0 9 z" class="fc-marker fc-marker-success"></path>
+          </marker>
+        </defs>
+        <g id="mm-viewport">
+          <g id="mm-frames"></g>
+          <g id="mm-edges"></g>
+          <g id="mm-nodes"></g>
+        </g>
+      </svg>
+
+      <div class="mm-legend" aria-label="流程图图例">
+        <div class="mm-legend-chips">
+          <span class="mm-leg-chip cat-ingress">⬭ 老板输入</span>
+          <span class="mm-leg-chip cat-memory">▭ 记忆/上下文</span>
+          <span class="mm-leg-chip cat-router">❖ Router 决策</span>
+          <span class="mm-leg-chip cat-jev">❖ JEV 选模请求/响应</span>
+          <span class="mm-leg-chip cat-worker">⊞ Worker 执行阶段</span>
+          <span class="mm-leg-chip cat-quality">↺ JEV 质检与打回闭环</span>
+          <span class="mm-leg-chip cat-im">▱ IM 原路推送</span>
+        </div>
+        <p class="mm-legend-hint">滚轮上下滑动长流程图 · Ctrl/Cmd+滚轮或捏合缩放 · 拖拽平移 · 点击节点在右侧看完整真实数据</p>
+      </div>
+    </section>
+
+    <section id="mm-list-panel" class="mm-list-panel" hidden aria-label="全任务流数据清单">
+      <div class="mm-list-panel-head">
+        <h2>📋 全系统真实任务流全景明细</h2>
+        <span id="mm-matrix-subtitle" class="mm-muted"></span>
+      </div>
+      <div id="mm-matrix-grid" class="mm-matrix-grid"></div>
+    </section>
+
+    <aside id="mm-inspector" class="mm-inspector" aria-label="节点真实数据详情面板">
+      <div id="mm-inspector-body" class="mm-inspector-body">
+        <p class="mm-muted">正在加载任务流数据…</p>
+      </div>
+    </aside>
+  </main>
+
+  <noscript>此真实任务全流程思维导图页面需要启用 JavaScript。</noscript>
+</body>
+</html>

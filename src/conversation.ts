@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import type { ChatMessage, MessagePage, TraceContext, TraceEvent, RouteAction, RoutingRecord } from './view.js';
+import type { ChatMessage, MessagePage, TraceContext, TraceEvent, RouteAction, RoutingRecord, SessionTurnLink } from './view.js';
 
 export function publicData(value: unknown, depth = 0): unknown {
   if (depth > 6) return '[nested value omitted]';
@@ -57,10 +57,12 @@ export class Conversation {
     const row = this.db.prepare('SELECT seq,body FROM messages WHERE request_id=?').get(requestId);
     return row ? this.decode(row) : undefined;
   }
-  create(message: Omit<ChatMessage, 'seq' | 'version' | 'at' | 'taskIds'>): ChatMessage {
+  create(message: Omit<ChatMessage, 'seq' | 'version' | 'at' | 'taskIds'> & { at?: number }): ChatMessage {
     return this.atomic(() => {
-      const origin = message.origin ?? (message.replyTo ? this.get(message.replyTo).origin : undefined);
-      const body = { ...message, origin, at: Date.now() };
+      const parent = message.replyTo ? this.get(message.replyTo) : undefined;
+      const origin = message.origin ?? parent?.origin;
+      const sessionId = message.sessionId ?? parent?.sessionId;
+      const body = { ...message, origin, ...(sessionId ? { sessionId } : {}), at: message.at ?? Date.now() };
       this.db.prepare('INSERT INTO messages(id,request_id,body) VALUES(?,?,?)').run(body.id, body.requestId ?? null, JSON.stringify(body));
       this.emit({ type: 'message', kind: 'message_created', rootId: body.replyTo ?? body.id, messageId: body.id,
         spanId: body.role === 'user' ? body.id : undefined,
@@ -68,15 +70,68 @@ export class Conversation {
       return this.get(body.id);
     });
   }
-  update(id: string, patch: Partial<Pick<ChatMessage, 'text' | 'status' | 'reason' | 'routing' | 'origin' | 'paths' | 'attachments'>>) {
+  update(id: string, patch: Partial<Pick<ChatMessage, 'text' | 'status' | 'reason' | 'routing' | 'origin' | 'paths' | 'attachments' | 'sessionId' | 'sessionLink'>>) {
     return this.atomic(() => {
       const message = { ...this.get(id), ...patch };
+      if ('sessionLink' in patch && patch.sessionLink === undefined) delete message.sessionLink;
       if (message.text.length > 65_536) throw new Error('Message exceeds 65536 character limit');
       this.db.prepare('UPDATE messages SET body=? WHERE id=?').run(JSON.stringify(message), id);
       this.emit({ type: 'message', kind: 'message_updated', rootId: message.replyTo ?? id, messageId: id,
         spanId: message.role === 'user' ? id : undefined,
         actor: message.role === 'user' ? 'user' : 'router', label: message.role === 'user' ? '用户消息' : 'Router 公开回复', status: message.status });
       return message;
+    });
+  }
+  /** Persist resolved runtime sessionId/sessionLink on a user message and its replies without breaking timeline step invariants. */
+  assignSession(id: string, sessionId: string, sessionLink?: SessionTurnLink, emitTrace = false): ChatMessage {
+    return this.atomic(() => {
+      const message = { ...this.get(id), sessionId };
+      if (sessionLink) message.sessionLink = sessionLink;
+      else delete message.sessionLink;
+      this.db.prepare('UPDATE messages SET body=? WHERE id=?').run(JSON.stringify(message), id);
+      for (const replyId of this.replyIds(id)) {
+        const reply = { ...this.get(replyId), sessionId };
+        this.db.prepare('UPDATE messages SET body=? WHERE id=?').run(JSON.stringify(reply), replyId);
+      }
+      if (emitTrace) {
+        this.emit({
+          type: 'trace',
+          kind: 'session_assigned',
+          rootId: id,
+          messageId: id,
+          actor: 'system',
+          label: sessionLink?.label ?? '会话归属判定',
+          status: 'completed',
+          data: { sessionId, ...(sessionLink ? { sessionLink } : {}) },
+        });
+      }
+      return this.get(id);
+    });
+  }
+  recentHumanUserMessages(beforeSeq: number, limit = 8): ChatMessage[] {
+    const safeLimit = Math.max(1, Math.min(limit, 50));
+    const rows = this.db.prepare(
+      `SELECT seq,body FROM messages WHERE seq<? AND json_extract(body,'$.role')='user' AND coalesce(json_extract(body,'$.source'),'')!='system' ORDER BY seq DESC LIMIT ?`,
+    ).all(beforeSeq, safeLimit);
+    return rows.map(row => this.decode(row)).reverse();
+  }
+  hasUnassignedUserMessages(): boolean {
+    return Boolean(this.db.prepare(`SELECT 1 FROM messages WHERE json_extract(body,'$.role')='user' AND json_extract(body,'$.sessionId') IS NULL LIMIT 1`).get());
+  }
+  allUserMessagesChronological(): ChatMessage[] {
+    const rows = this.db.prepare(`SELECT seq,body FROM messages WHERE json_extract(body,'$.role')='user' ORDER BY seq ASC`).all();
+    return rows.map(row => this.decode(row));
+  }
+  quietSetMessageSession(id: string, sessionId: string, sessionLink?: SessionTurnLink): void {
+    this.atomic(() => {
+      const message = { ...this.get(id), sessionId };
+      if (sessionLink) message.sessionLink = sessionLink;
+      else delete message.sessionLink;
+      this.db.prepare('UPDATE messages SET body=? WHERE id=?').run(JSON.stringify(message), id);
+      for (const replyId of this.replyIds(id)) {
+        const reply = { ...this.get(replyId), sessionId };
+        this.db.prepare('UPDATE messages SET body=? WHERE id=?').run(JSON.stringify(reply), replyId);
+      }
     });
   }
   delete(id: string) {
@@ -187,6 +242,46 @@ export class Conversation {
     return typeof origin === 'string' ? origin : undefined;
   }
   latestSeq(): number { return Number(this.db.prepare('SELECT coalesce(max(seq),0) AS seq FROM journal').get()!.seq); }
+  userTurnsPage(beforeSeq?: number, limit = 120): { items: ChatMessage[]; hasMore: boolean; before?: number; totalUsers: number } {
+    const safeLimit = Math.max(1, Math.min(limit, 200));
+    const totalUsers = Number(this.db.prepare("SELECT count(*) AS cnt FROM messages WHERE json_extract(body,'$.role')='user'").get()!.cnt);
+    const rows = beforeSeq === undefined
+      ? this.db.prepare("SELECT seq,body FROM messages WHERE json_extract(body,'$.role')='user' ORDER BY seq DESC LIMIT ?").all(safeLimit + 1)
+      : this.db.prepare("SELECT seq,body FROM messages WHERE json_extract(body,'$.role')='user' AND seq<? ORDER BY seq DESC LIMIT ?").all(beforeSeq, safeLimit + 1);
+    const items = rows.slice(0, safeLimit).map(row => this.decode(row));
+    return { items, hasMore: rows.length > safeLimit, before: items.at(-1)?.seq, totalUsers };
+  }
+  repliesForMessages(messageIds: string[]): ChatMessage[] {
+    if (!messageIds.length) return [];
+    const results: ChatMessage[] = [];
+    for (let i = 0; i < messageIds.length; i += 200) {
+      const chunk = messageIds.slice(i, i + 200);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db.prepare(`SELECT seq,body FROM messages WHERE json_extract(body,'$.replyTo') IN (${placeholders}) ORDER BY seq ASC`).all(...chunk);
+      for (const row of rows) results.push(this.decode(row));
+    }
+    return results.sort((a, b) => a.seq - b.seq);
+  }
+  structuredJournalForScopes(messageIds: string[], taskIds: string[]): TraceEvent[] {
+    const uniqueMsgIds = [...new Set(messageIds.filter(Boolean))];
+    const uniqueTaskIds = [...new Set(taskIds.filter(Boolean))];
+    if (!uniqueMsgIds.length && !uniqueTaskIds.length) return [];
+    const conditions: string[] = [];
+    const args: string[] = [];
+    if (uniqueMsgIds.length) {
+      const p1 = uniqueMsgIds.map(() => '?').join(',');
+      conditions.push(`root_id IN (${p1})`, `message_id IN (${p1})`);
+      args.push(...uniqueMsgIds, ...uniqueMsgIds);
+    }
+    if (uniqueTaskIds.length) {
+      const p2 = uniqueTaskIds.map(() => '?').join(',');
+      conditions.push(`root_id IN (${p2})`, `task_id IN (${p2})`);
+      args.push(...uniqueTaskIds, ...uniqueTaskIds);
+    }
+    const sql = `SELECT seq,body FROM journal WHERE (${conditions.join(' OR ')}) AND json_extract(body,'$.kind') NOT IN ('visible_text','message_updated') ORDER BY seq ASC`;
+    const rows = this.db.prepare(sql).all(...args) as Array<Record<string, unknown>>;
+    return rows.map(row => ({ ...JSON.parse(String(row.body)), seq: Number(row.seq) } as TraceEvent));
+  }
   recover() {
     this.atomic(() => {
       const rows = this.db.prepare("SELECT seq,body FROM messages WHERE json_extract(body,'$.status') IN ('queued','processing','streaming')").all();

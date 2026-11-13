@@ -4,9 +4,10 @@ import lockfile from 'proper-lockfile';
 import { privateHome } from './files.js';
 import { realFactory, offlineFactory } from './agent.js';
 import { Coordinator } from './coordinator.js';
+import { buildMindmapSnapshot } from './mindmap-flow.js';
 import { listPlugins, runPlugin } from './plugin.js';
 import { integer, REQUEST_LIMIT, RESPONSE_LIMIT, socketPath, text, type Response } from './protocol.js';
-import type { ModelTier } from './view.js';
+import type { ModelTier, ThinkingLevel } from './view.js';
 
 export interface ServiceOptions {
   home: string; mode: 'real' | 'offline'; offlineDelayMs?: number;
@@ -54,6 +55,11 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
         switch (command.command) {
           case 'health': return { mode: options.mode, pid: process.pid, status: coordinator.health().executorAvailable ? 'ready' : 'degraded', ...coordinator.health() };
           case 'view': return { ...coordinator.view(), modelHub: await coordinator.modelHub.getView() };
+          case 'mindmap': return await buildMindmapSnapshot(coordinator, {
+            home,
+            beforeSeq: command.before === undefined ? undefined : integer(command.before, 0, 1, Number.MAX_SAFE_INTEGER),
+            limit: command.limit === undefined ? undefined : integer(command.limit, 120, 1, 200),
+          });
           case 'model-hub': return await coordinator.modelHub.getView();
           case 'model-configure': return await coordinator.configureModels({
             providerId: command.providerId === undefined ? undefined : text(command.providerId, 'providerId', 64),
@@ -65,8 +71,15 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
             customModels: Array.isArray(command.customModels) ? command.customModels.map(m => text(m, 'customModel', 128)) : undefined,
             selectedModels: Array.isArray(command.selectedModels)
               ? command.selectedModels.map(item => {
+                  if (typeof item === 'string') return text(item, 'selectedModel', 128);
                   const entry = (item ?? {}) as Record<string, unknown>;
-                  return { id: text(entry.id, 'selectedModel.id', 128), tier: text(entry.tier, 'selectedModel.tier', 16) as ModelTier };
+                  return {
+                    id: text(entry.id, 'selectedModel.id', 128),
+                    ...(entry.tier === undefined ? {} : { tier: text(entry.tier, 'selectedModel.tier', 16) as ModelTier }),
+                    ...(Array.isArray(entry.thinkingLevels)
+                      ? { thinkingLevels: entry.thinkingLevels.map(level => text(level, 'selectedModel.thinkingLevel', 16) as ThinkingLevel) }
+                      : {}),
+                  };
                 })
               : undefined,
             routerProvider: command.routerProvider === undefined ? undefined : text(command.routerProvider, 'routerProvider', 64),
@@ -75,6 +88,10 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
             fastModel: command.fastModel === undefined ? undefined : String(command.fastModel),
             balancedModel: command.balancedModel === undefined ? undefined : String(command.balancedModel),
             strongModel: command.strongModel === undefined ? undefined : String(command.strongModel),
+            decisionEnabled: command.decisionEnabled === undefined ? undefined : Boolean(command.decisionEnabled),
+            decisionApiKey: command.decisionApiKey === undefined ? undefined : String(command.decisionApiKey).slice(0, 512),
+            clearDecisionApiKey: command.clearDecisionApiKey === undefined ? undefined : Boolean(command.clearDecisionApiKey),
+            decisionBaseUrl: command.decisionBaseUrl === undefined ? undefined : String(command.decisionBaseUrl).slice(0, 512),
           });
           case 'model-probe': return await coordinator.modelHub.probe({
             provider: command.provider === undefined ? undefined : text(command.provider, 'provider', 64),
@@ -186,14 +203,15 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
           case 'im-list': return coordinator.im.listChannels();
           case 'im-save': {
             const platform = text(command.platform, 'platform', 32);
-            if (!['telegram', 'dingtalk', 'wechat'].includes(platform)) throw new Error('Invalid IM platform');
+            if (!['telegram', 'dingtalk', 'wechat', 'xiaoai'].includes(platform)) throw new Error('Invalid IM platform');
             return coordinator.im.saveChannel({
               id: command.id === undefined ? undefined : text(command.id, 'id', 128),
-              platform: platform as 'telegram' | 'dingtalk' | 'wechat',
+              platform: platform as 'telegram' | 'dingtalk' | 'wechat' | 'xiaoai',
               name: text(command.name, 'name', 120),
               enabled: command.enabled === undefined ? undefined : Boolean(command.enabled),
               notifyAll: command.notifyAll === undefined ? undefined : Boolean(command.notifyAll),
               botToken: command.botToken === undefined ? undefined : String(command.botToken),
+              accountId: command.accountId === undefined ? undefined : String(command.accountId),
               webhookUrl: command.webhookUrl === undefined ? undefined : String(command.webhookUrl),
               secret: command.secret === undefined ? undefined : String(command.secret),
               defaultTarget: command.defaultTarget === undefined ? undefined : String(command.defaultTarget),

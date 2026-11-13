@@ -1,4 +1,4 @@
-import type { ChatMessage, ContextSearchHit, ImChannelView, MainView, MemoryCard, MessagePage, ModelHubView, ModelProbeResult, ModelProviderView, ModelTier, PluginActionSpec, PluginView, TimerView, TraceEvent, WechatQrLoginSession, WorkView, RouteAction } from '../view.js';
+import type { ChatMessage, ContextSearchHit, ImChannelView, MainView, MemoryCard, MessagePage, ModelHubView, ModelProbeResult, ModelProviderView, PluginActionSpec, PluginView, TimerView, TraceEvent, WechatQrLoginSession, WorkView, RouteAction } from '../view.js';
 import { mergeMessages as mergeInto, orderConversation, routeLabel, routeState, spanDuration, spanNodes as buildSpans,
   spanTree, timelineSteps, usageSummary, type SpanNode, type TimelineStep } from './model.js';
 import { GoldenBrainStage, type BrainMemoryItem } from './brain.js';
@@ -103,6 +103,8 @@ const ui = {
   imTokenInput: element<HTMLInputElement>('im-token-input'),
   imSecretInput: element<HTMLInputElement>('im-secret-input'),
   imTargetInput: element<HTMLInputElement>('im-target-input'),
+  imAccountInput: element<HTMLInputElement>('im-account-input'),
+  imApibaseInput: element<HTMLInputElement>('im-apibase-input'),
   imAllowInput: element<HTMLInputElement>('im-allow-input'),
   imCancelEditBtn: element<HTMLButtonElement>('im-cancel-edit-btn'),
   imSaveBtn: element<HTMLButtonElement>('im-save-btn'),
@@ -296,6 +298,11 @@ function renderMessages() {
     article.dataset.seq = String(message.seq);
     if (message.replyTo) article.dataset.replyTo = message.replyTo;
     const speaker = node('div', '', 'speaker');
+    if (message.role === 'assistant' && !systemNotice) {
+      const avatar = node('span', '', 'speaker-avatar');
+      avatar.setAttribute('aria-hidden', 'true');
+      speaker.append(avatar);
+    }
     speaker.append(node('span', message.role === 'user' ? '你' : systemNotice ? '系统 · 工作状态（非模型回复）' : 'F.R.I.D.A.Y.'));
     speaker.append(node('span', message.role === 'user' && message.status === 'completed' ? 'F.R.I.D.A.Y. 已处理' : statusText(message.status), active(message.status) ? 'running' : ''));
     if (message.mode === 'offline') speaker.append(node('span', '离线模拟'));
@@ -381,9 +388,15 @@ function actionRow(action: RouteAction): HTMLElement {
   if (action.messageIds?.length) row.append(node('p', `已读取 ${action.messageIds.length} 条历史消息引用`, 'meta'));
   if (action.searchQuery) row.append(node('p', `检索线索：${action.searchQuery}`, 'meta'));
   if (action.memoryIds?.length) row.append(node('p', `关联全局记忆：${action.memoryIds.length} 条`, 'meta'));
-  if (action.workerProfile || action.modelTier || action.workerModel) {
-    const tierName = action.modelTier ? ({ fast: '极速档', balanced: '均衡档', strong: '强力档' }[action.modelTier] ?? action.modelTier) : undefined;
-    row.append(node('p', `执行子 AI：${[action.workerProfile, tierName, action.workerModel].filter(Boolean).join(' · ')}`, 'meta'));
+  if (action.workerProfile || action.workerModel || action.thinkingLevel || action.modelTier || action.decisionSource) {
+    const tierName = !action.workerModel && action.modelTier
+      ? ({ fast: '极速档', balanced: '均衡档', strong: '强力档' }[action.modelTier] ?? action.modelTier)
+      : undefined;
+    const modelSpec = action.workerModel
+      ? `${action.workerModel}${action.thinkingLevel ? `@${action.thinkingLevel}` : ''}`
+      : (action.thinkingLevel ? `@${action.thinkingLevel}` : undefined);
+    const decisionTag = action.decisionSource === 'gemini-decision-1' ? 'Jev 决策' : undefined;
+    row.append(node('p', `执行子 AI：${[action.workerProfile, modelSpec ?? tierName, decisionTag].filter(Boolean).join(' · ')}`, 'meta'));
   }
   if (action.summary) row.append(node('p', `F.R.I.D.A.Y. 公开说明：${action.summary}`, 'meta'));
   if (action.error) row.append(node('p', action.error, 'error'));
@@ -497,9 +510,11 @@ function renderWorks() {
     entry.setAttribute('aria-pressed', String(selected));
     entry.title = work.prompt;
     entry.append(node('span', work.prompt || '后台工作', 'work-title'));
-    const tierLabel = work.modelTier ? `${tierBadges[work.modelTier] ?? work.modelTier}${work.workerModel ? `·${work.workerModel}` : ''}` : work.workerModel;
-    const profilePrefix = (work.profile || tierLabel)
-      ? `${profileBadges[work.profile ?? 'general'] ?? (work.profile || '子 AI')}${tierLabel ? ` (${tierLabel})` : ''} · `
+    const modelLabel = work.workerModel
+      ? `${work.workerModel}${work.thinkingLevel ? `@${work.thinkingLevel}` : ''}`
+      : (work.modelTier ? (tierBadges[work.modelTier] ?? work.modelTier) : undefined);
+    const profilePrefix = (work.profile || modelLabel)
+      ? `${profileBadges[work.profile ?? 'general'] ?? (work.profile || '子 AI')}${modelLabel ? ` (${modelLabel})` : ''} · `
       : '';
     const statusLabel = work.pendingQuestion ? '⏳ 等待拍板' : statusText(work.status);
     entry.append(node('span', `${profilePrefix}${statusLabel} · ${timestamp(work.createdAt)}`, `meta${active(work.status) ? ' running' : ''}`));
@@ -1337,7 +1352,7 @@ function renderPlugins() {
   }
   ui.pluginsList.replaceChildren(contents);
 }
-const imPlatformLabels: Record<string, string> = { dingtalk: '🟦 钉钉机器人', wechat: '💬 微信 iLink', telegram: '✈️ Telegram Bot' };
+const imPlatformLabels: Record<string, string> = { dingtalk: '🟦 钉钉机器人', wechat: '💬 微信 iLink', telegram: '✈️ Telegram Bot', xiaoai: '🔊 小爱音箱' };
 let wechatQrPollTimer: ReturnType<typeof setInterval> | undefined;
 let activeWechatQrChannelId: string | undefined;
 let editingImChannelId: string | undefined;
@@ -1473,6 +1488,21 @@ function renderImChannels() {
           ? `🔗 企微/网桥 Webhook: ${ch.webhookUrlMasked}`
           : '⚠️ 尚未完成微信扫码授权，请点击右上角「📱 扫码绑定」获取登录二维码';
       endpointBox.append(node('span', bindText, ch.hasBotToken ? 'hub-endpoint-text ok' : 'hub-endpoint-text warn'));
+    } else if (ch.platform === 'xiaoai') {
+      if (ch.apiBase?.startsWith('ssh://')) {
+        endpointBox.append(node('span', `⚡ 局域网 SSH 直连: ${ch.apiBase}`, 'hub-endpoint-text ok'));
+      } else if (ch.accountId) {
+        endpointBox.append(node('span', `☁️ 小米云轮询账号: ${ch.accountId}`, 'hub-endpoint-text ok'));
+      } else {
+        endpointBox.append(node('code', `回调 Webhook: ${webhookPath}`, 'hub-endpoint-code'));
+        const copyBtn = button('📋 复制地址', () => {
+          void navigator.clipboard?.writeText(webhookPath).then(() => {
+            copyBtn.textContent = '✅ 已复制';
+            setTimeout(() => { copyBtn.textContent = '📋 复制地址'; }, 1800);
+          });
+        }, 'mini-button');
+        endpointBox.append(copyBtn);
+      }
     } else {
       endpointBox.append(node('code', `回调 Webhook: ${webhookPath}`, 'hub-endpoint-code'));
       const copyBtn = button('📋 复制地址', () => {
@@ -1514,6 +1544,8 @@ function resetImChannelForm() {
   ui.imTokenInput.value = '';
   ui.imSecretInput.value = '';
   ui.imTargetInput.value = '';
+  ui.imAccountInput.value = '';
+  ui.imApibaseInput.value = '';
   ui.imAllowInput.value = '';
   ui.imCancelEditBtn.hidden = true;
   ui.imSaveBtn.textContent = '💾 保存 IM 通道配置';
@@ -1523,6 +1555,8 @@ function editImChannelFromUi(ch: ImChannelView) {
   ui.imPlatformInput.value = ch.platform;
   ui.imNameInput.value = ch.name;
   ui.imTargetInput.value = ch.defaultTarget ?? '';
+  ui.imAccountInput.value = ch.accountId ?? '';
+  ui.imApibaseInput.value = ch.apiBase ?? '';
   ui.imAllowInput.value = ch.allowedSenders.join(', ');
   ui.imCancelEditBtn.hidden = false;
   ui.imSaveBtn.textContent = `💾 更新通道「${ch.name}」`;
@@ -1530,12 +1564,14 @@ function editImChannelFromUi(ch: ImChannelView) {
   ui.imNameInput.focus();
 }
 async function saveImChannelFromUi() {
-  const platform = ui.imPlatformInput.value as 'dingtalk' | 'wechat' | 'telegram';
+  const platform = ui.imPlatformInput.value as 'dingtalk' | 'wechat' | 'telegram' | 'xiaoai';
   const name = ui.imNameInput.value.trim() || `${imPlatformLabels[platform] ?? platform}助手`;
   const webhookUrl = ui.imWebhookInput.value.trim() || undefined;
   const botToken = ui.imTokenInput.value.trim() || undefined;
   const secret = ui.imSecretInput.value.trim() || undefined;
   const defaultTarget = ui.imTargetInput.value.trim() || undefined;
+  const accountId = ui.imAccountInput.value.trim() || undefined;
+  const apiBase = ui.imApibaseInput.value.trim() || undefined;
   const allowedSenders = ui.imAllowInput.value.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean);
   ui.imSaveBtn.disabled = true;
   try {
@@ -1546,6 +1582,8 @@ async function saveImChannelFromUi() {
       ...(botToken !== undefined ? { botToken } : {}),
       ...(secret !== undefined ? { secret } : {}),
       ...(defaultTarget !== undefined ? { defaultTarget } : {}),
+      ...(accountId !== undefined ? { accountId } : {}),
+      ...(apiBase !== undefined ? { apiBase } : {}),
       ...(editingImChannelId || allowedSenders.length ? { allowedSenders } : {}),
     });
     resetImChannelForm();
@@ -1693,11 +1731,10 @@ function renderModalAuthSection() {
   populateModelSelect(ui.modalAuthTestModelSelect, currentProv, defaultTestModel);
   renderModalPoolSelection(currentProv);
 }
-const POOL_TIER_LABELS: Array<[ModelTier, string]> = [['fast', '⚡ 极速'], ['balanced', '⚖️ 均衡'], ['strong', '🧠 强力']];
 function renderModalPoolSelection(prov: ModelProviderView) {
-  const selected = new Map((prov.selectedModels ?? []).map(item => [item.id, item.tier]));
-  ui.modalAuthPoolSummary.textContent = `Worker 模型池：已勾选 ${selected.size} 款（勾选启用的模型并指定等级）`;
-  const ids = [...new Set([...prov.models.map(m => m.id), ...selected.keys()])];
+  const selected = new Set((prov.selectedModels ?? []).map(item => item.id));
+  ui.modalAuthPoolSummary.textContent = `Worker 模型池：已勾选 ${selected.size} 款（保留模型原生思考等级，由 Jev 动态决策）`;
+  const ids = [...new Set([...prov.models.map(m => m.id), ...selected])];
   const frag = document.createDocumentFragment();
   for (const id of ids) {
     const row = node('div', '', 'modal-pool-select-row');
@@ -1706,20 +1743,12 @@ function renderModalPoolSelection(prov: ModelProviderView) {
     const checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
     checkbox.checked = selected.has(id);
-    const name = prov.models.find(m => m.id === id)?.name;
+    const modelInfo = prov.models.find(m => m.id === id);
+    const name = modelInfo?.name;
     label.append(checkbox, node('span', name && name !== id ? `${id} — ${name}` : id));
-    const tierSelect = document.createElement('select');
-    tierSelect.setAttribute('aria-label', `${id} 等级`);
-    const tier = selected.get(id) ?? prov.suggestedTiers?.[id] ?? 'balanced';
-    for (const [value, text] of POOL_TIER_LABELS) {
-      const opt = document.createElement('option');
-      opt.value = value;
-      opt.textContent = text;
-      if (value === tier) opt.selected = true;
-      tierSelect.append(opt);
-    }
-    tierSelect.value = tier;
-    row.append(label, tierSelect);
+    const nativeLevels = modelInfo?.thinkingLevels?.length ? modelInfo.thinkingLevels : ['off'];
+    const levelsChip = node('span', `原生等级: ${nativeLevels.join(' / ')}`, 'hub-meta-chip');
+    row.append(label, levelsChip);
     frag.append(row);
   }
   if (!ids.length) frag.append(node('p', '该提供方暂无可选模型，请先接入并拉取模型', 'empty hub-empty-state'));
@@ -1728,12 +1757,11 @@ function renderModalPoolSelection(prov: ModelProviderView) {
 }
 async function saveModalPoolSelectionFromUi() {
   const providerId = activeAuthProviderTab;
-  const selectedModels: Array<{ id: string; tier: ModelTier }> = [];
+  const selectedModels: Array<{ id: string }> = [];
   for (const row of ui.modalAuthPoolList.querySelectorAll<HTMLElement>('.modal-pool-select-row')) {
     const checkbox = row.querySelector<HTMLInputElement>('input[type="checkbox"]');
-    const tierSelect = row.querySelector<HTMLSelectElement>('select');
     const id = row.dataset.modelId;
-    if (id && checkbox?.checked) selectedModels.push({ id, tier: (tierSelect?.value ?? 'balanced') as ModelTier });
+    if (id && checkbox?.checked) selectedModels.push({ id });
   }
   ui.modalAuthPoolSaveBtn.disabled = true;
   try {
@@ -1798,9 +1826,16 @@ function renderModelHub() {
   const routerShort = hub?.routerModel ?? tiers?.router ?? '—';
   ui.modelTopBadge.textContent = `${configuredCount}方·${pool.length}模`;
 
+  const engine = hub?.decisionEngine;
+  const engineActive = Boolean(engine?.enabled && engine?.configured);
+  const engineTitle = engineActive ? engine!.model : '启发式回退';
+  const engineSub = engineActive
+    ? `${engine!.credentialSource === 'google_provider' ? '复用 Google Key' : engine!.credentialSource === 'decision_config' ? '独立 Key' : '环境变量'}${engine!.keyHint ? ` · ${engine!.keyHint}` : ''}`
+    : (engine?.enabled === false ? '已手动停用' : '接入 Google Key 后启用');
   const statusFrag = document.createDocumentFragment();
   statusFrag.append(
     kpiCard('🤖 F.R.I.D.A.Y. 主控', routerShort, hub?.routerProvider ?? '', 'accent'),
+    kpiCard('🎯 Jev 决策引擎', engineTitle, engineSub, engineActive ? 'positive' : 'default'),
     kpiCard('🟢 已启用提供方', `${configuredCount} / ${totalProviders}`, disabledCount > 0 ? `已禁用 ${disabledCount} 个` : '', configuredCount > 0 ? 'positive' : 'warning'),
     kpiCard('🧩 跨方调度池', `${pool.length} 款模型`, '', pool.length > 0 ? 'positive' : 'default'),
     kpiCard('🧠 推理 / 🖼️ 看图', `${reasoningCount} / ${visionCount}`, '', 'default'),
@@ -1840,12 +1875,18 @@ function renderModelHub() {
     for (const specTag of item.specialties) {
       badgesRow.append(node('span', specTag, 'hub-tag-chip'));
     }
+    if (item.thinkingLevels?.length) {
+      badgesRow.append(node('span', `🎚️ ${item.thinkingLevels.join('/')}`, 'hub-meta-chip'));
+    }
     badgesRow.append(node('span', `📐 ${Math.round(item.contextWindow / 1000)}K 上下文`, 'hub-meta-chip'));
     if (item.latencyMs) {
       badgesRow.append(node('span', `⏱️ ${item.latencyMs}ms`, 'hub-meta-chip'));
     }
     if (item.successCount || item.failCount) {
       badgesRow.append(node('span', `📊 成 ${item.successCount ?? 0} / 败 ${item.failCount ?? 0}`, 'hub-meta-chip'));
+    }
+    if (item.avgQualityScore !== undefined) {
+      badgesRow.append(node('span', `⭐ 均分 ${item.avgQualityScore.toFixed(2)}/3`, 'hub-meta-chip'));
     }
     card.append(badgesRow, probeBox);
     poolFrag.append(card);
@@ -2549,7 +2590,23 @@ function renderWorkDetail() {
   }
   if (typeof task.profile === 'string') detailRow(ui.workDetail, '子 AI 专精画像', profileBadges[task.profile] ?? task.profile);
   if (typeof task.modelTier === 'string') detailRow(ui.workDetail, '动态模型档位', tierBadges[task.modelTier] ?? task.modelTier);
+  if (typeof task.thinkingLevel === 'string' && task.thinkingLevel) detailRow(ui.workDetail, '原生思考等级', task.thinkingLevel);
+  if (typeof task.decisionSource === 'string' && task.decisionSource) {
+    detailRow(ui.workDetail, '选模决策来源', task.decisionSource === 'gemini-decision-1' ? 'Gemini Decision 1 (Jev)' : task.decisionSource);
+  }
   if (typeof task.workerModel === 'string' && task.workerModel) detailRow(ui.workDetail, '指定模型', task.workerModel);
+  if (task.qualityGate && typeof task.qualityGate === 'object') {
+    const qg = record(task.qualityGate);
+    if (qg.skippedByRoute === true) {
+      detailRow(ui.workDetail, '任务完成度评估', '免评直通（Jev 选模预判轻量任务）');
+    } else {
+      const score = typeof qg.score === 'number' ? qg.score.toFixed(2) : String(qg.score ?? '—');
+      const maxScore = typeof qg.maxScore === 'number' ? qg.maxScore : 3;
+      const confidencePct = Math.round(Number(qg.confidence ?? 0) * 100);
+      const gateStatus = qg.shouldSupplement ? `建议补做 (${String(qg.missingAspect ?? 'incomplete')})` : '达标';
+      detailRow(ui.workDetail, '任务完成度评估', `${score}/${maxScore} · 置信度 ${confidencePct}% · ${gateStatus}`);
+    }
+  }
   if (typeof task.contextBrief === 'string' && task.contextBrief) detailRow(ui.workDetail, 'F.R.I.D.A.Y. 编译背景', task.contextBrief);
   if (Array.isArray(task.memoryIds) && task.memoryIds.length) detailRow(ui.workDetail, '挂载记忆卡片', task.memoryIds.map(String).join(', '));
   if (typeof task.reason === 'string') ui.workDetail.append(node('p', task.reason, 'message-reason'));
