@@ -171,6 +171,7 @@ export function layoutBrainGraph(items: BrainMemoryItem[]): BrainGraph {
     const source = nodes[sourceIdx]!;
     const synapses: MemorySynapse[] = source.item.synapses ?? [];
     for (const syn of synapses) {
+      if (syn.weight < 0.30) continue;
       const targetIdx = indexById.get(syn.targetId);
       if (targetIdx === undefined || targetIdx === sourceIdx) continue;
       const a = Math.min(sourceIdx, targetIdx);

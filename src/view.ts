@@ -125,7 +125,7 @@ export interface ModelHubView {
   decisionEngine?: DecisionEngineView;
   lastProbe?: ModelProbeResult;
 }
-export type SynapseRelation = 'explicit' | 'co_activated' | 'shared_tag' | 'task_chain';
+export type SynapseRelation = 'explicit' | 'semantic' | 'co_activated' | 'shared_tag' | 'task_chain';
 export interface MemorySynapse {
   targetId: string;
   targetTopic?: string;
@@ -138,6 +138,7 @@ export interface MemoryCard {
   cwd?: string; sourceMessageId?: string; sourceTaskId?: string;
   supersededBy?: string; supersedes?: string;
   pinned?: boolean; accessCount?: number; lastAccessedAt?: number;
+  lastReinforcedAt?: number; importance?: number;
   synapses?: MemorySynapse[];
   createdAt: number; updatedAt: number;
 }
@@ -179,6 +180,7 @@ export interface RoutingRecord {
 export interface MessageOrigin {
   channel: 'local' | 'telegram' | 'wechat' | 'dingtalk' | 'xiaoai';
   channelId?: string; accountId?: string; conversationId?: string; senderId?: string;
+  speakerId?: string; speakerName?: string;
   replyToMessageId?: string; replyWebhook?: string; contextToken?: string;
 }
 export interface ChatMessage {
@@ -274,6 +276,23 @@ export interface PluginView {
   manifestJson?: string;
   sourceCode?: string;
 }
+export interface VoiceprintProfileView {
+  id: string;
+  name: string;
+  role: 'owner' | 'member';
+  dim: number;
+  sampleCount: number;
+  createdAt: number;
+  updatedAt: number;
+}
+export interface VoiceprintStatusView {
+  enabled: boolean;
+  threshold: number;
+  wakePrecheck: boolean;
+  active: boolean;
+  modelReady: boolean;
+  profiles: VoiceprintProfileView[];
+}
 export interface MainView {
   mode: 'real' | 'offline'; health: { status: string; executorAvailable: boolean };
   messages: MessagePage; works: WorkView[]; cursor: number;
@@ -283,4 +302,5 @@ export interface MainView {
   timers?: TimerView[];
   plugins?: PluginView[];
   imChannels?: ImChannelView[];
+  voiceprint?: VoiceprintStatusView;
 }

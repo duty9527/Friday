@@ -39,6 +39,11 @@
         <span>模型与提供方</span>
         <span id="model-top-badge" class="hub-pill-badge">—</span>
       </button>
+      <button id="open-health-hub-top" class="hub-pill-btn health-pill-btn" type="button">
+        <span class="hub-pill-icon" aria-hidden="true">❤️</span>
+        <span>健康管理</span>
+        <span id="health-top-badge" class="hub-pill-badge">—</span>
+      </button>
       <a id="open-mindmap-top" class="hub-pill-btn mindmap-pill-link" href="/mindmap">
         <span class="hub-pill-icon" aria-hidden="true">🧭</span>
         <span>思考流程图</span>
@@ -299,6 +304,25 @@
         </section>
 
         <section class="model-modal-section">
+          <div class="voiceprint-hero-card">
+            <div class="modal-row-head">
+              <div class="hub-card-title-group">
+                <h3>🎙️ 小爱声纹识别与抗电视串音</h3>
+                <span id="im-voice-status-badge" class="hub-badge badge-slate">读取中…</span>
+              </div>
+              <div class="modal-btn-group">
+                <button id="im-voice-refresh-btn" class="mini-button" type="button">🔄 刷新</button>
+                <button id="im-voice-toggle-btn" class="mini-button" type="button">⏸ 暂停门控</button>
+                <button id="im-voice-clear-btn" class="mini-button danger-btn" type="button" hidden>🧹 清空全部</button>
+              </div>
+            </div>
+            <p class="voiceprint-guide-tip">💡 声纹录入直接通过语音完成：对小爱音箱说「你好星期五，录入我的声纹」或「你好星期五，帮老婆录入声纹」。</p>
+            <div id="im-voice-meta-row" class="hub-badges-row"></div>
+            <div id="im-voice-list" class="hub-cards-grid"><p class="empty">暂未录入声纹。</p></div>
+          </div>
+        </section>
+
+        <section class="model-modal-section">
           <details id="im-add-details" class="hub-compose-details">
             <summary id="im-form-summary" class="hub-compose-summary">
               <span>+ 手动配置通道（微信 / 小爱音箱 / 钉钉 / Telegram）</span>
@@ -524,6 +548,215 @@
             <span id="plugin-list-subtitle" class="meta"></span>
           </div>
           <div id="plugins-list" class="hub-cards-grid"><p class="empty">正在读取插件…</p></div>
+        </section>
+      </div>
+    </div>
+  </div>
+  <!-- 6. 健康管理弹窗 (沃莱 A1 体脂与健康中心) -->
+  <div id="health-hub-backdrop" class="modal-backdrop" hidden>
+    <div id="health-hub-modal" class="model-modal hub-modal health-modal" role="dialog" aria-modal="true" aria-labelledby="health-modal-title">
+      <div class="model-modal-header health-modal-header">
+        <div>
+          <h2 id="health-modal-title">❤️ 健康管理 · 沃莱 A1 体脂中心</h2>
+          <p class="health-header-sub">AFU-WL-TZ-A1 实时称重、双频生物电阻抗、全身成分分析与多成员健康档案</p>
+        </div>
+        <div class="health-header-actions">
+          <select id="health-profile-select" aria-label="切换成员档案"></select>
+          <div class="hub-filter-pills health-unit-pills" role="group" aria-label="体重显示单位">
+            <button id="health-unit-kg" class="hub-filter-pill active" type="button" data-unit="kg">kg</button>
+            <button id="health-unit-jin" class="hub-filter-pill" type="button" data-unit="jin">斤</button>
+          </div>
+          <button id="health-refresh-btn" class="mini-button" type="button">🔄 刷新</button>
+          <button id="health-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
+        </div>
+      </div>
+      <div class="model-modal-body">
+        <p id="health-action-status" class="health-status-banner" hidden></p>
+
+        <section class="model-modal-section health-hero-grid" aria-label="实时上秤与硬件状态总览">
+          <div class="health-hero-card health-live-card">
+            <div class="modal-row-head">
+              <span id="health-live-phase" class="hub-badge badge-slate">待机中</span>
+              <span id="health-live-source" class="meta">—</span>
+            </div>
+            <div id="health-hero-weight" class="health-hero-weight">--</div>
+            <div id="health-hero-multiunit" class="hint health-hero-multiunit">— 斤 · — lb · — g</div>
+            <p id="health-live-message" class="hint health-live-message">点击「开始上秤测量」并赤脚站上沃莱 A1，自动同步实测与秤端离线记录。</p>
+            <div class="modal-btn-group">
+              <button id="health-measure-start-btn" class="primary" type="button">⚡ 开始上秤测量</button>
+              <button id="health-measure-stop-btn" class="mini-button danger-btn" type="button" hidden>⏹ 停止测量</button>
+              <button id="health-scan-btn" class="mini-button" type="button">📡 扫描体脂秤</button>
+            </div>
+          </div>
+
+          <div class="health-hero-card health-score-card">
+            <div class="modal-row-head">
+              <h3>综合身体评估</h3>
+              <span id="health-score-badge" class="hub-badge badge-slate">待测量</span>
+            </div>
+            <div class="health-score-layout">
+              <div id="health-score-ring" class="health-score-ring-wrap"></div>
+              <div class="health-score-info">
+                <div id="health-body-type" class="health-body-type">体型：—</div>
+                <div id="health-score-meta" class="hint">BMI：— · 身体年龄：—</div>
+                <div id="health-formula-meta" class="hint">算法模型：— · 阻抗：—</div>
+                <div id="health-target-summary" class="health-target-summary">目标体重：未设定</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="health-hero-card health-device-card">
+            <div class="modal-row-head">
+              <h3>体脂秤硬件遥测</h3>
+              <span id="health-device-seen" class="meta">未扫描</span>
+            </div>
+            <div id="health-device-telemetry" class="health-device-kv">
+              <p class="empty">尚未发现沃莱 A1 设备广播，请踩亮秤面或点击扫描。</p>
+            </div>
+          </div>
+        </section>
+
+        <div id="health-kpi-grid" class="hub-kpi-grid"></div>
+
+        <section class="model-modal-section" aria-label="多指标历史趋势图">
+          <div class="modal-row-head">
+            <h3>多维趋势变化</h3>
+            <div class="modal-btn-group">
+              <div id="health-trend-metrics" class="hub-filter-pills" role="tablist" aria-label="趋势指标选择">
+                <button class="hub-filter-pill active" type="button" data-metric="weight">体重</button>
+                <button class="hub-filter-pill" type="button" data-metric="fat">体脂率</button>
+                <button class="hub-filter-pill" type="button" data-metric="bmi">BMI</button>
+                <button class="hub-filter-pill" type="button" data-metric="muscle">骨骼肌率</button>
+                <button class="hub-filter-pill" type="button" data-metric="bmr">基础代谢</button>
+                <button class="hub-filter-pill" type="button" data-metric="impedance">生物电阻抗</button>
+              </div>
+              <div id="health-trend-ranges" class="hub-filter-pills" role="tablist" aria-label="趋势条数筛选">
+                <button class="hub-filter-pill" type="button" data-range="7">近 7 次</button>
+                <button class="hub-filter-pill active" type="button" data-range="30">近 30 次</button>
+                <button class="hub-filter-pill" type="button" data-range="120">全部</button>
+              </div>
+            </div>
+          </div>
+          <div class="health-chart-shell">
+            <canvas id="health-trend-canvas" class="health-trend-canvas" width="920" height="220" aria-label="健康指标趋势折线图"></canvas>
+            <div id="health-trend-caption" class="meta health-trend-caption">暂无足够数据绘制趋势。</div>
+          </div>
+        </section>
+
+        <section class="model-modal-section" aria-label="全量身体成分与原始遥测">
+          <div class="modal-row-head">
+            <h3>全量人体成分、九宫格体型与电生理遥测</h3>
+            <div id="health-inspect-bar" class="modal-btn-group">
+              <span id="health-inspect-label" class="meta">当前显示：最新测量</span>
+              <button id="health-inspect-latest-btn" class="mini-button" type="button" hidden>↩ 返回最新记录</button>
+            </div>
+          </div>
+          <div id="health-bodytype-grid" class="health-bodytype-grid" aria-label="九宫格体型定位"></div>
+          <div id="health-metrics-grid" class="health-metrics-grid">
+            <p class="empty">完成一次测量或补录后，这里将展示全部 16+ 项身体成分指标与正常区间尺。</p>
+          </div>
+          <h4 class="health-subhead">秤端电生理、换算单位与蓝牙帧遥测</h4>
+          <div id="health-raw-grid" class="health-raw-grid"></div>
+          <details class="hub-compose-details">
+            <summary class="hub-compose-summary">🔬 查看完整底层数据与协议载荷 (JSON)</summary>
+            <div class="hub-compose-body">
+              <pre id="health-raw-json" class="hub-code-block">{}</pre>
+            </div>
+          </details>
+        </section>
+
+        <section class="model-modal-section health-forms-section" aria-label="成员档案与手动补录">
+          <details id="health-profile-details" class="hub-compose-details">
+            <summary class="hub-compose-summary">👤 成员档案管理、参数校准与家庭成员切换</summary>
+            <div class="hub-compose-body">
+              <div id="health-profiles-bar" class="health-profiles-bar"></div>
+              <div class="modal-form-grid">
+                <input id="health-profile-id" type="hidden">
+                <label>成员昵称
+                  <input id="health-profile-name" type="text" placeholder="如：默认档案 / 张三">
+                </label>
+                <label>性别（BIA 算法模型）
+                  <select id="health-profile-sex">
+                    <option value="male">男 (male)</option>
+                    <option value="female">女 (female)</option>
+                  </select>
+                </label>
+                <label>年龄 (岁)
+                  <input id="health-profile-age" type="number" min="5" max="120" value="28">
+                </label>
+                <label>身高 (cm)
+                  <input id="health-profile-height" type="number" min="80" max="230" step="0.5" value="172">
+                </label>
+                <label>目标体重 (kg，可空)
+                  <input id="health-profile-target" type="number" min="20" max="250" step="0.1" placeholder="如：65">
+                </label>
+                <label>秤面显示单位
+                  <select id="health-profile-unit">
+                    <option value="kg">公斤 (kg)</option>
+                    <option value="jin">市斤 (斤)</option>
+                  </select>
+                </label>
+              </div>
+              <div class="modal-row-head">
+                <label class="hub-checkbox-label">
+                  <input id="health-profile-default" type="checkbox"> 设为默认健康成员
+                </label>
+                <div class="modal-btn-group">
+                  <button id="health-profile-new-btn" class="mini-button" type="button">＋ 新建空白档案</button>
+                  <button id="health-profile-save-btn" class="primary" type="button">💾 保存并应用档案</button>
+                </div>
+              </div>
+            </div>
+          </details>
+
+          <details id="health-manual-details" class="hub-compose-details">
+            <summary class="hub-compose-summary">📝 手动补录历史体重 / 阻抗记录</summary>
+            <div class="hub-compose-body">
+              <div class="modal-form-grid">
+                <label>体重数值
+                  <input id="health-manual-weight" type="number" min="5" max="500" step="0.05" placeholder="如：68.5">
+                </label>
+                <label>输入单位
+                  <select id="health-manual-unit">
+                    <option value="kg">公斤 (kg)</option>
+                    <option value="jin">市斤 (斤)</option>
+                  </select>
+                </label>
+                <label>生物电阻抗 (Ω，可选)
+                  <input id="health-manual-impedance" type="number" min="100" max="1500" step="0.1" placeholder="可选，如 510">
+                </label>
+                <label>静息心率 (bpm，可选)
+                  <input id="health-manual-hr" type="number" min="30" max="220" step="1" placeholder="可选">
+                </label>
+                <label>测量时间（留空为当前）
+                  <input id="health-manual-time" type="datetime-local">
+                </label>
+                <label>备注
+                  <input id="health-manual-note" type="text" placeholder="如：晨起空腹">
+                </label>
+              </div>
+              <div class="modal-row-head">
+                <span class="hint">填写阻抗值时采用 Segal 双频 BIA 方程，否则自动按身高/年龄/性别 Deurenberg 公式推算全部体成分。</span>
+                <button id="health-manual-add-btn" class="primary" type="button">＋ 写入健康档案</button>
+              </div>
+            </div>
+          </details>
+        </section>
+
+        <section class="model-modal-section" aria-label="历史测量记录">
+          <div class="modal-row-head">
+            <div>
+              <h3>历史测量明细</h3>
+              <span id="health-records-subtitle" class="meta">共 0 条记录 · 点击任意一行查看全量成分详情</span>
+            </div>
+            <div id="health-source-filters" class="hub-filter-pills" role="tablist" aria-label="记录来源筛选">
+              <button class="hub-filter-pill active" type="button" data-source="all">全部</button>
+              <button class="hub-filter-pill" type="button" data-source="live">蓝牙实测</button>
+              <button class="hub-filter-pill" type="button" data-source="history">秤端缓存</button>
+              <button class="hub-filter-pill" type="button" data-source="manual">手动补录</button>
+            </div>
+          </div>
+          <div id="health-records-list" class="health-records-list"><p class="empty">尚无测量记录。</p></div>
         </section>
       </div>
     </div>

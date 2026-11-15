@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { serve } from '../dist/server.js';
 import { startWeb } from '../dist/web-server.js';
+import { XiaoaiSpeakerManager } from '../dist/xiaoai-speaker.js';
 import { request } from '../src/protocol.js';
 import type { MainView, TraceEvent } from '../src/view.js';
 
@@ -299,5 +300,122 @@ test('Mindmap standalone page serves strict CSP assets and aggregates real task 
     assert.ok(followupFlow.sessionLink?.label, 'followup turn records contextual session link');
     const groupedSession = snapshot.sessions.find(s => s.id === flow.sessionId);
     assert.ok(groupedSession && groupedSession.turnCount >= 2 && groupedSession.turnFlowIds.includes(flow.id) && groupedSession.turnFlowIds.includes(followupFlow.id));
+  } finally { await f.close(); }
+});
+
+test('Web console exposes XiaoAI voiceprint status, listing, gate toggling, removal, and strict CSP compliance', { timeout: 15000 }, async () => {
+  const f = await fixture();
+  try {
+    assert.equal((await fetch(`${f.base}/api/voiceprints`)).status, 401);
+    assert.equal((await fetch(`${f.base}/api/voice-remove`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).status, 401);
+
+    const html = await (await fetch(f.base)).text();
+    assert.match(html, /id="im-voice-list"/);
+    assert.match(html, /id="im-voice-toggle-btn"/);
+    assert.match(html, /id="im-voice-clear-btn"/);
+    assert.doesNotMatch(html, /\sstyle="/i, 'strict CSP forbids inline style attributes in index.html');
+
+    const css = await (await fetch(`${f.base}/style.css`)).text();
+    assert.ok(css.includes('.voiceprint-hero-card') && css.includes('.origin-speaker-badge'));
+
+    const clientJs = await (await fetch(`${f.base}/client.js`)).text();
+    assert.doesNotMatch(clientJs, /\.style\./, 'client.ts must not mutate element.style under strict CSP');
+    assert.doesNotMatch(clientJs, /setAttribute\(\s*['"]style['"]/, 'client.ts must not set style attributes');
+
+    const manager = new XiaoaiSpeakerManager({ homeDir: f.home });
+    manager.enrollEmbeddings({ name: '主人', role: 'owner', embeddings: [new Float32Array([1, 0, 0, 0])] });
+    manager.enrollEmbeddings({ name: '老婆', role: 'member', embeddings: [new Float32Array([0, 1, 0, 0])] });
+
+    const viewRes = await (await fetch(`${f.base}/api/view`, { headers: f.headers })).json() as MainView;
+    assert.equal(viewRes.voiceprint?.enabled, true);
+    assert.equal(viewRes.voiceprint?.profiles.length, 2);
+    assert.equal(viewRes.voiceprint?.profiles[0]?.name, '主人');
+    assert.equal(viewRes.voiceprint?.profiles[0]?.role, 'owner');
+    assert.doesNotMatch(JSON.stringify(viewRes.voiceprint), new RegExp(f.home));
+
+    const listRes = await (await fetch(`${f.base}/api/voiceprints`, { headers: f.headers })).json() as Record<string, unknown>;
+    assert.equal((listRes.profiles as Array<{ name: string }>).length, 2);
+    assert.equal('modelPath' in listRes, false);
+    assert.doesNotMatch(JSON.stringify(listRes), new RegExp(f.home));
+
+    const pauseRes = await (await fetch(`${f.base}/api/voice-config`, {
+      method: 'POST',
+      headers: f.headers,
+      body: JSON.stringify({ enabled: false }),
+    })).json() as Record<string, unknown>;
+    assert.equal(pauseRes.enabled, false);
+    assert.equal(pauseRes.active, false);
+    assert.equal('modelPath' in pauseRes, false);
+
+    const resumeRes = await (await fetch(`${f.base}/api/voice-config`, {
+      method: 'POST',
+      headers: f.headers,
+      body: JSON.stringify({ enabled: true }),
+    })).json() as Record<string, unknown>;
+    assert.equal(resumeRes.enabled, true);
+
+    const removeRes = await (await fetch(`${f.base}/api/voice-remove`, {
+      method: 'POST',
+      headers: f.headers,
+      body: JSON.stringify({ target: '主人' }),
+    })).json() as { removed: boolean; name?: string; remaining: number };
+    assert.equal(removeRes.removed, true);
+    assert.equal(removeRes.name, '主人');
+    assert.equal(removeRes.remaining, 1);
+
+    const afterRemove = await (await fetch(`${f.base}/api/voiceprints`, { headers: f.headers })).json() as { profiles: Array<{ name: string; role: string }> };
+    assert.equal(afterRemove.profiles.length, 1);
+    assert.equal(afterRemove.profiles[0]?.name, '老婆');
+    assert.equal(afterRemove.profiles[0]?.role, 'owner');
+
+    const clearRes = await (await fetch(`${f.base}/api/voice-clear`, {
+      method: 'POST',
+      headers: f.headers,
+      body: JSON.stringify({}),
+    })).json() as { cleared: number };
+    assert.equal(clearRes.cleared, 1);
+
+    const afterClear = await (await fetch(`${f.base}/api/voiceprints`, { headers: f.headers })).json() as { profiles: unknown[] };
+    assert.equal(afterClear.profiles.length, 0);
+  } finally { await f.close(); }
+});
+
+test('Web console exposes topbar 健康管理 button, modal markup, strict CSP, and health-scale /api/plugin-run', { timeout: 15000 }, async () => {
+  const f = await fixture();
+  try {
+    const html = await (await fetch(f.base)).text();
+    assert.match(html, /id="open-health-hub-top"/);
+    assert.match(html, /id="health-hub-modal"/);
+    assert.match(html, /id="health-trend-canvas"/);
+    assert.doesNotMatch(html, /\sstyle="/i);
+    assert.doesNotMatch(html, /<input[^>]+type=["']file["']/i);
+
+    const clientJs = await (await fetch(`${f.base}/client.js`)).text();
+    assert.match(clientJs, /openHealthHubModal/);
+    assert.doesNotMatch(clientJs, /\.style\./);
+    assert.doesNotMatch(clientJs, /setAttribute\(\s*['"]style['"]/);
+
+    const addRes = await (await fetch(`${f.base}/api/plugin-run`, {
+      method: 'POST',
+      headers: f.headers,
+      body: JSON.stringify({
+        plugin: 'health-scale',
+        action: 'record-add',
+        args: { weightKg: 68.4, impedanceOhm: 495, note: 'web-test' },
+      }),
+    })).json() as { ok: boolean; plugin: string; data?: { latest?: { weightKg: number; metrics?: { estimationMode: string; items: unknown[] } } } };
+    assert.equal(addRes.ok, true);
+    assert.equal(addRes.plugin, 'health-scale');
+    assert.equal(addRes.data?.latest?.weightKg, 68.4);
+    assert.equal(addRes.data?.latest?.metrics?.estimationMode, 'bia');
+    assert.ok((addRes.data?.latest?.metrics?.items.length ?? 0) >= 16);
+
+    const dashRes = await (await fetch(`${f.base}/api/plugin-run`, {
+      method: 'POST',
+      headers: f.headers,
+      body: JSON.stringify({ plugin: 'health-scale', action: 'dashboard', args: {} }),
+    })).json() as { ok: boolean; data?: { records: unknown[] } };
+    assert.equal(dashRes.ok, true);
+    assert.equal(dashRes.data?.records.length, 1);
   } finally { await f.close(); }
 });

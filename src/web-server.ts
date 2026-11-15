@@ -152,8 +152,17 @@ export async function startWeb(options: { home: string; port?: number }): Promis
         try { return integer(Number(search.get(name)), 0, 0, Number.MAX_SAFE_INTEGER); }
         catch { throw new HttpFailure(400, `Invalid ${name} cursor`); }
       };
+      const sanitizeVoiceprint = (raw: unknown): unknown => {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw;
+        const { modelPath: _omit, ...rest } = raw as Record<string, unknown>;
+        return rest;
+      };
       if (incoming.method === 'GET') {
         if (url.pathname === '/api/stream') { await stream(home, response, numeric('after') ?? 0); return; }
+        if (url.pathname === '/api/voiceprints') {
+          send(response, 200, sanitizeVoiceprint(await bridge(home, { command: 'voice-status' })));
+          return;
+        }
         let command: Record<string, unknown>;
         switch (url.pathname) {
           case '/api/view': command = { command: 'view' }; break;
@@ -183,12 +192,14 @@ export async function startWeb(options: { home: string; port?: number }): Promis
           '/api/plugin-run': 'plugin-run',
           '/api/im-save': 'im-save', '/api/im-toggle': 'im-toggle', '/api/im-remove': 'im-remove', '/api/im-test': 'im-test',
           '/api/im-wechat-qr-start': 'im-wechat-qr-start', '/api/im-wechat-qr-status': 'im-wechat-qr-status',
+          '/api/voice-remove': 'voice-remove', '/api/voice-clear': 'voice-clear', '/api/voice-config': 'voice-config',
           '/api/model-configure': 'model-configure', '/api/model-probe': 'model-probe', '/api/model-fetch': 'model-fetch',
         };
         const command = Object.hasOwn(commands, url.pathname) ? commands[url.pathname] : undefined;
         if (!command) throw new HttpFailure(404, 'Unknown API endpoint');
         const input = await body(incoming);
-        send(response, 200, await bridge(home, { ...input, command }));
+        const res = await bridge(home, { ...input, command });
+        send(response, 200, command === 'voice-config' ? sanitizeVoiceprint(res) : res);
       } else throw new HttpFailure(405, 'Method not allowed');
     })().catch(error => {
       if (response.headersSent) { response.end(); return; }
