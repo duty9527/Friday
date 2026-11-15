@@ -247,6 +247,7 @@ export interface XiaoaiKwsMonitorOptions {
   shouldBypassFollowUpCancel?: (channelId: string, targetId: string, text: string) => boolean;
   onUtterance?: (event: XiaoaiKwsUtteranceEvent) => Promise<void> | void;
   onError?: (channelId: string, error: unknown) => void;
+  streamSpawn?: typeof spawn;
   streamFactory?: (target: XiaoaiSshTarget, device: string) => XiaoaiKwsStreamHandle;
   spotterFactory?: (config: { modelsDir: string; keywordsFile: string }) => XiaoaiKwsSpotter;
   recognizerFactory?: (config: { asrModelsDir: string }) => Promise<XiaoaiAsrRecognizer> | XiaoaiAsrRecognizer;
@@ -568,28 +569,32 @@ function buildStreamSshBaseArgs(target: XiaoaiSshTarget): string[] {
   ];
 }
 
-function defaultStreamFactory(target: XiaoaiSshTarget, device: string): XiaoaiKwsStreamHandle {
+function defaultStreamFactory(
+  target: XiaoaiSshTarget,
+  device: string,
+  spawnImpl: typeof spawn = spawn,
+): XiaoaiKwsStreamHandle {
   const safeDevice = /^[a-zA-Z0-9_.:,-]+$/.test(device) ? device : 'noop';
   const safeKey = `${target.id}_${safeDevice}`.replace(/[^a-zA-Z0-9_-]/g, '_');
   const pidFile = `/tmp/friday_arecord_${safeKey}.pid`;
   const sessionTag = `${process.pid}_${Date.now()}_${++nextStreamSessionSeq}`;
-  const qPidFile = escapeShellSingleQuote(pidFile);
-  const qTag = escapeShellSingleQuote(sessionTag);
+  const qPidFile = `'${escapeShellSingleQuote(pidFile)}'`;
+  const qTag = `'${escapeShellSingleQuote(sessionTag)}'`;
   // Track per-session remote `arecord` PID so cleanup never kills unrelated `arecord` processes.
   const killPrevSession = [
-    `PIDFILE=${qPidFile}`,
+    `PIDFILE=${qPidFile};`,
     `if [ -f "$PIDFILE" ] && [ ! -L "$PIDFILE" ]; then`,
     `set -- $(cat "$PIDFILE" 2>/dev/null || true);`,
     `case "$1" in ''|*[!0-9]*) ;; *) [ "$1" != "$$" ] && kill "$1" 2>/dev/null || true ;; esac;`,
     `fi`,
   ].join(' ');
-  const recordPid = `if [ ! -L "$PIDFILE" ]; then echo "$$ ${qTag.slice(1, -1)}" > "$PIDFILE"; fi`;
+  const recordPid = `if [ ! -L "$PIDFILE" ]; then printf '%s %s\\n' "$$" ${qTag} > "$PIDFILE"; fi`;
   const singleMicCmd = `if [ "${safeDevice}" = "noop" ] && [ -r /usr/share/alsa/alsa.conf ] && grep -q 'pcm.Capture' /etc/asound.conf 2>/dev/null; then printf '%s\\n' '</usr/share/alsa/alsa.conf>' 'pcm.friday_mic {' '  type plug' '  slave {' '    pcm "Capture"' '    channels 8' '  }' '  ttable.0.0 0.34' '  ttable.0.2 0.33' '  ttable.0.4 0.33' '}' >/tmp/friday_asound.conf && ALSA_CONFIG_PATH=/tmp/friday_asound.conf exec arecord -D friday_mic -f S32_LE -r ${SAMPLE_RATE} -c 1 -t raw -q; fi`;
   const fallbackCmd = `exec arecord -D ${safeDevice} -f S32_LE -r ${SAMPLE_RATE} -c 1 -t raw -q`;
   const remoteCmd = [killPrevSession, recordPid, singleMicCmd, fallbackCmd].join('; ');
 
   const args = [...buildStreamSshBaseArgs(target), remoteCmd];
-  const child = spawn('ssh', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawnImpl('ssh', args, { stdio: ['ignore', 'pipe', 'pipe'] });
   let exited = false;
   let killEscalationTimer: ReturnType<typeof setTimeout> | undefined;
   let remoteCleanupStarted = false;
@@ -632,14 +637,14 @@ function defaultStreamFactory(target: XiaoaiSshTarget, device: string): XiaoaiKw
       if (!remoteCleanupStarted && child.pid) {
         remoteCleanupStarted = true;
         const cleanupCmd = [
-          `PIDFILE=${qPidFile}`,
+          `PIDFILE=${qPidFile};`,
           `if [ -f "$PIDFILE" ] && [ ! -L "$PIDFILE" ]; then`,
           `set -- $(cat "$PIDFILE" 2>/dev/null || true);`,
           `if [ "$2" = ${qTag} ]; then rm -f "$PIDFILE"; case "$1" in ''|*[!0-9]*) ;; *) kill "$1" 2>/dev/null || true ;; esac; fi;`,
           `fi`,
         ].join(' ');
         try {
-          const cleanup = spawn('ssh', [...buildStreamSshBaseArgs(target), cleanupCmd], { stdio: 'ignore' });
+          const cleanup = spawnImpl('ssh', [...buildStreamSshBaseArgs(target), cleanupCmd], { stdio: 'ignore' });
           cleanup.on('error', () => {});
           cleanup.unref();
         } catch {
@@ -1269,7 +1274,9 @@ export class XiaoaiKwsMonitor {
   private startWorkerStream(worker: ActiveWorker, spotter: XiaoaiKwsSpotter): void {
     if (this.closed || worker.stopped) return;
 
-    const streamFactory = this.options.streamFactory ?? defaultStreamFactory;
+    const streamFactory = this.options.streamFactory
+      ?? ((target: XiaoaiSshTarget, device: string) =>
+        defaultStreamFactory(target, device, this.options.streamSpawn));
     let streamHandle: XiaoaiKwsStreamHandle;
     try {
       streamHandle = streamFactory(worker.target, worker.device);

@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync, type spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -19,7 +21,10 @@ import {
   resetXiaoaiRuntimeState,
   parseXiaoaiWebhookPayload,
   pollXiaoaiChannel,
+  handleXiaoaiKeywordWake,
   sendXiaoaiSpeech,
+  setXiaoaiSpeakerLed,
+  SSH_PAUSE_COMMAND,
   type XiaoaiSshRunner,
 } from '../src/xiaoai.js';
 import {
@@ -2823,6 +2828,135 @@ test('XiaoAI KWS ASR wake rescue catches missed bare "星期五" and one-breath 
       explicitWake: true,
     });
     monitor.close();
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('XiaoaiKwsMonitor remote SSH and ash commands pass sh -n with valid PIDFILE separators and session tag matching', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-ash-'));
+  try {
+    const spawnedSshCalls: Array<{ cmd: string; args: string[]; remoteCmd: string }> = [];
+    const sshRunnerCalls: Array<{ targetId: string; remoteCmd: string }> = [];
+
+    const streamSpawn = ((cmd: string, args: readonly string[]) => {
+      const remoteCmd = args[args.length - 1] ?? '';
+      spawnedSshCalls.push({ cmd, args: [...args], remoteCmd });
+      const proc = new EventEmitter() as EventEmitter & {
+        pid: number;
+        stdout: PassThrough;
+        stderr: PassThrough;
+        kill: () => boolean;
+        unref: () => void;
+      };
+      proc.pid = 42424 + spawnedSshCalls.length;
+      proc.stdout = new PassThrough();
+      proc.stderr = new PassThrough();
+      proc.kill = () => {
+        proc.stdout.end();
+        proc.emit('exit', 0);
+        proc.emit('close', 0);
+        return true;
+      };
+      proc.unref = () => {};
+      return proc;
+    }) as unknown as typeof spawn;
+
+    const sshRunner: XiaoaiSshRunner = async (target, remoteCommand) => {
+      sshRunnerCalls.push({ targetId: target.id, remoteCmd: remoteCommand });
+      if (remoteCommand.includes('instruction.log')) {
+        return { stdout: '星期五，现在几点\n', stderr: '', code: 0 };
+      }
+      return { stdout: '', stderr: '', code: 0 };
+    };
+
+    const channel = makeChannel({
+      id: 'xiaoai-ash-check',
+      apiBase: 'ssh://lx06=root@192.0.2.104?prefix=星期五',
+      defaultTarget: 'lx06',
+      syncBuf: JSON.stringify({ mode: 'ssh', cursors: { lx06: '' } }),
+    });
+
+    const monitor = new XiaoaiKwsMonitor({
+      homeDir: home,
+      sshRunner,
+      streamSpawn,
+      spotterFactory: () => ({
+        createStream: () => ({}),
+        acceptWaveform: () => {},
+        isReady: () => false,
+        decode: () => {},
+        getResult: () => '',
+        reset: () => {},
+      }),
+    });
+
+    monitor.sync([channel]);
+    await until(() => spawnedSshCalls.length >= 1);
+    monitor.close();
+    await until(() => spawnedSshCalls.length >= 2);
+
+    const streamStart = spawnedSshCalls[0]!;
+    const streamCleanup = spawnedSshCalls[1]!;
+    assert.equal(streamStart.cmd, 'ssh');
+    assert.equal(streamCleanup.cmd, 'ssh');
+
+    // Exercise sshRunner commands (poll, pause, wake, LED, TTS) and verify POSIX sh -n syntax across src/xiaoai/*.ts
+    const target = parseXiaoaiSshTargets(channel.apiBase)[0]!;
+    await pollXiaoaiChannel(channel, { sshRunner });
+    await handleXiaoaiKeywordWake({ channel, target, keyword: '你好星期五', chime: true, sshRunner });
+    await handleXiaoaiKeywordWake({ channel, target, keyword: '你好星期五', chime: false, sshRunner });
+    await setXiaoaiSpeakerLed(target, 'listen', sshRunner);
+    await setXiaoaiSpeakerLed(target, 'think', sshRunner);
+    await setXiaoaiSpeakerLed(target, 'off', sshRunner);
+    await sendXiaoaiSpeech(channel, "测试'单引号'播报", { target: 'lx06', sshRunner });
+
+    const allRemoteCmds = [
+      streamStart.remoteCmd,
+      streamCleanup.remoteCmd,
+      SSH_PAUSE_COMMAND,
+      ...sshRunnerCalls.map(c => c.remoteCmd),
+    ];
+    for (const remoteCmd of allRemoteCmds) {
+      execFileSync('sh', ['-n', '-c', remoteCmd], { stdio: 'pipe' });
+    }
+
+    // Verify statement separator (`;` or `\n`) between PIDFILE assignment and `if`
+    const pidfileIfRegex = /PIDFILE='\/tmp\/friday_arecord_lx06_noop\.pid'(?:;|\n)\s*if \[ -f "\$PIDFILE" \]/;
+    assert.match(streamStart.remoteCmd, pidfileIfRegex);
+    assert.match(streamCleanup.remoteCmd, pidfileIfRegex);
+
+    // Verify recordPid and cleanupCmd use the exact same session tag (no truncated .slice(1, -1))
+    const recordMatch = /printf '%s %s\\n' "\$\$" '([^']+)' > "\$PIDFILE"/.exec(streamStart.remoteCmd);
+    assert.ok(recordMatch?.[1], `Expected printf session tag in start command: ${streamStart.remoteCmd}`);
+    const recordedTag = recordMatch[1];
+    assert.ok(
+      streamCleanup.remoteCmd.includes(`if [ "$2" = '${recordedTag}' ];`),
+      `Expected cleanup command to match recorded tag "${recordedTag}": ${streamCleanup.remoteCmd}`,
+    );
+
+    // Execute PIDFILE setup + cleanup snippets against a real temp PIDFILE in POSIX sh
+    const pidFile = join(home, 'test_arecord.pid');
+    const setupSnippet = streamStart.remoteCmd
+      .split('; if [ "noop"')[0]!
+      .replace('/tmp/friday_arecord_lx06_noop.pid', pidFile);
+    const cleanupSnippet = streamCleanup.remoteCmd
+      .replace('/tmp/friday_arecord_lx06_noop.pid', pidFile);
+    const mismatchedCleanup = cleanupSnippet.replace(recordedTag, `${recordedTag}_mismatch`);
+
+    execFileSync('sh', ['-c', setupSnippet], { stdio: 'pipe' });
+    const written = (await readFile(pidFile, 'utf8')).trim();
+    const parts = written.split(/\s+/);
+    assert.match(parts[0] ?? '', /^\d+$/);
+    assert.equal(parts[1], recordedTag);
+
+    // Mismatched tag must not delete the active session's PIDFILE
+    execFileSync('sh', ['-c', mismatchedCleanup], { stdio: 'pipe' });
+    assert.equal((await readFile(pidFile, 'utf8')).trim(), written);
+
+    // Matching tag deletes PIDFILE cleanly
+    execFileSync('sh', ['-c', cleanupSnippet], { stdio: 'pipe' });
+    await assert.rejects(() => readFile(pidFile, 'utf8'), { code: 'ENOENT' });
   } finally {
     await rm(home, { recursive: true, force: true });
   }
