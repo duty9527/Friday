@@ -1706,5 +1706,21 @@ test('37. handleVoiceFastpath executes AC (16..31°C), fryer, switches, enforces
       sessionState: { tvRemoteActive: true },
     }, ctx);
     assert.equal(yieldRemote.handled, false);
+
+    // Yields on UI/media phrases, unknown non-device targets (using disk hub-cache without SSH), and DEVICE_NOT_FOUND
+    const yieldHistory = await handleVoiceFastpath({ text: '打开历史记录。' }, { pluginDataDir: ctx.pluginDataDir });
+    assert.equal(yieldHistory.handled, false);
+
+    const yieldAppHistory = await handleVoiceFastpath({ text: '打开尹志仓的历史播放记录。' }, ctx);
+    assert.equal(yieldAppHistory.handled, false);
+
+    const yieldUnknownApp = await handleVoiceFastpath(
+      { text: '打开小众播放器' },
+      { pluginDataDir: ctx.pluginDataDir },
+    );
+    assert.equal(yieldUnknownApp.handled, false);
+
+    const yieldMissingFan = await handleVoiceFastpath({ text: '打开不存在的卧室风扇' }, ctx);
+    assert.equal(yieldMissingFan.handled, false);
   });
 });

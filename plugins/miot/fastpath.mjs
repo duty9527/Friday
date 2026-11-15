@@ -3,11 +3,14 @@ import {
   clampInt,
   errMsg,
   readConfig,
+  readJsonSafe,
   resolvePluginPaths,
 } from '../_shared/config-store.mjs';
 
 const TV_EXCLUDE_RE = /(?:电视机?|遥控器?)/i;
 const FILLER_PREFIX_RE = /^(?:小爱同学|小爱)[,，。!！?？\s]*/i;
+const NON_MIOT_TARGET_RE = /(?:音乐|歌|歌曲|故事|相声|新闻|天气|闹钟|提醒|蓝牙|wifi|无线网|计时器|手机|电脑|影视仓|饮食仓|尹志仓|tvbox|b站|哔哩|爱奇艺|优酷|腾讯视频|芒果tv|浏览器|历史记录|播放记录|观看记录|记录|选集|详情|弹幕|字幕|全屏|菜单|设置|应用|软件|app|网页|页面|窗口)/i;
+const SMART_DEVICE_NOUN_RE = /(?:灯|照明|台灯|吸顶灯|筒灯|射灯|灯带|开关|插座|插排|排插|插头|通断器|风扇|加湿器|净化器|窗帘|扫地机|饮水机|浴霸|空调|空气炸锅|炸锅)/;
 
 function cleanUtterance(raw) {
   let text = String(raw || '').trim();
@@ -179,7 +182,7 @@ function parseGenericSwitchIntent(text) {
   const queryMatch = text.match(/^(?:请|帮我|麻烦)?(?:查询|查看|查一下|看看|看下)?\s*(.+?)(?:是)?(?:开着吗|开了吗|关着吗|关了吗|状态(?:怎么样)?)[吗嘛呢]?$/);
   if (queryMatch?.[1]) {
     const dev = queryMatch[1].replace(/^(?:请|帮我|麻烦|把|将|给)+/, '').trim();
-    if (dev && dev.length <= 32) {
+    if (dev && dev.length <= 32 && !TV_EXCLUDE_RE.test(dev) && !NON_MIOT_TARGET_RE.test(dev)) {
       return { kind: 'get', device: dev };
     }
   }
@@ -203,12 +206,10 @@ function parseGenericSwitchIntent(text) {
   }
 
   if (!actionWord || !target) return null;
-  if (TV_EXCLUDE_RE.test(target)) return null;
-  // Filter non-device phrases like "音乐", "天气", "提醒", "空调" handled elsewhere.
-  if (/(?:音乐|歌|故事|相声|新闻|天气|闹钟|提醒|蓝牙|wifi|无线网|计时器|手机|电脑)/i.test(target)) {
+  if (TV_EXCLUDE_RE.test(target) || NON_MIOT_TARGET_RE.test(target)) {
     return null;
   }
-  if (!/(?:灯|照明|台灯|吸顶灯|筒灯|射灯|灯带|开关|插座|插排|排插|插头|通断器|风扇|加湿器|净化器|窗帘|扫地机|饮水机|浴霸)/.test(target) && target.length > 16) {
+  if (!SMART_DEVICE_NOUN_RE.test(target) && target.length > 16) {
     return null;
   }
 
@@ -378,6 +379,53 @@ async function executeSingleIntent(intent, cfg, deps, runActionFn) {
   return { ok: false, speech: '未识别的米家语音指令。' };
 }
 
+function matchesCustomAlias(customAliases, intent) {
+  if (!customAliases || typeof customAliases !== 'object') return false;
+  const queries = new Set();
+  const q = normalizeProtectedKey(intent?.device);
+  if (q) queries.add(q);
+  if (intent?.room && intent?.device) {
+    const rq = normalizeProtectedKey(`${intent.room}${intent.device}`);
+    if (rq) queries.add(rq);
+  }
+  if (queries.size === 0) return false;
+  for (const [key, val] of Object.entries(customAliases)) {
+    if (Array.isArray(val)) {
+      if (val.some(alias => queries.has(normalizeProtectedKey(alias)))) return true;
+    } else if (typeof val === 'string' && queries.has(normalizeProtectedKey(key))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function deviceMatchesQuery(device, query, room) {
+  if (!device || typeof device !== 'object') return false;
+  const q = normalizeProtectedKey(query);
+  if (!q) return false;
+  const rq = room ? normalizeProtectedKey(`${room}${query}`) : '';
+  const did = normalizeProtectedKey(device.did);
+  if (did && (did === q || (rq && did === rq))) return true;
+  const name = normalizeProtectedKey(device.dev_name ?? device.name);
+  const roomName = normalizeProtectedKey(device.room_name ?? device.room);
+  const fullName = normalizeProtectedKey(device.fullName) || (roomName && name ? `${roomName}${name}` : '');
+  const modelName = normalizeProtectedKey(device.model_name ?? device.modelName);
+  const fields = [name, fullName, modelName].filter(Boolean);
+  return fields.some(
+    field => field.includes(q) || q.includes(field) || (rq && (field.includes(rq) || rq.includes(field))),
+  );
+}
+
+function isDeviceNotFoundOutcome(outcome) {
+  if (!outcome || outcome.ok || outcome.protectedBlocked) return false;
+  const code = outcome.result?.data?.code;
+  if (code === 'DEVICE_NOT_FOUND' || code === 'DEVICE_REQUIRED') {
+    return true;
+  }
+  const speech = String(outcome.speech ?? '');
+  return speech.includes('未找到') || speech.includes('找不到');
+}
+
 /**
  * Handle MiOT voice fastpath queries/commands inside plugins/miot.
  * @param {import('../_shared/types.d.ts').VoiceFastpathRequest} request
@@ -438,6 +486,43 @@ export async function handleMiotVoiceFastpath(request, context = {}, runActionFn
     return { handled: false };
   }
 
+  // Generic targets without a known smart-device noun must match a known device or custom alias
+  // before claiming fastpath execution (reads local cache first to avoid unnecessary hub SSH calls).
+  const unverifiedGenericIntents = intents.filter(
+    i => (i.kind === 'set_power' || i.kind === 'get') && !SMART_DEVICE_NOUN_RE.test(i.device),
+  );
+  if (unverifiedGenericIntents.length > 0) {
+    const customAliases = rawCfg.customAliases;
+    const needsLookup = unverifiedGenericIntents.some(i => !matchesCustomAlias(customAliases, i));
+    if (needsLookup) {
+      let candidateDevices = Array.isArray(context?.devices) ? context.devices : null;
+      if (!candidateDevices) {
+        const cachedSnapshot = readJsonSafe(paths.cachePath, null);
+        if (Array.isArray(cachedSnapshot?.devices)) {
+          candidateDevices = cachedSnapshot.devices;
+        }
+      }
+      if (!candidateDevices) {
+        try {
+          const devRes = await runActionFn('devices', { live: false }, context);
+          if (Array.isArray(devRes?.data?.devices)) {
+            candidateDevices = devRes.data.devices;
+          }
+        } catch {
+          candidateDevices = null;
+        }
+      }
+      if (Array.isArray(candidateDevices)) {
+        const missing = unverifiedGenericIntents.some(
+          i => !matchesCustomAlias(customAliases, i) && !candidateDevices.some(d => deviceMatchesQuery(d, i.device, i.room)),
+        );
+        if (missing) {
+          return { handled: false };
+        }
+      }
+    }
+  }
+
   const speeches = [];
   const results = [];
   let allOk = true;
@@ -451,6 +536,10 @@ export async function handleMiotVoiceFastpath(request, context = {}, runActionFn
       allOk = false;
       speeches.push(errMsg(err));
     }
+  }
+
+  if (results.length > 0 && results.length === intents.length && results.every(isDeviceNotFoundOutcome)) {
+    return { handled: false };
   }
 
   return {

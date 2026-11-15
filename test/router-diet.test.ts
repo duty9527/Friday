@@ -821,6 +821,34 @@ test('Coordinator CHAT payload with 40 completed works + 24 memories shrinks cle
         .every(w => !('reportPreview' in w)),
     );
 
+    // 3. Fastpath turns saved to SQLite while Router leafId exists must be bridged back via compact context
+    coordinator.recordFastpathTurn({
+      channelId: 'xa-1',
+      senderId: 'lx06',
+      userText: '打开客厅灯',
+      replyText: '已打开客厅灯',
+      pluginName: 'miot',
+      action: 'handled',
+      latencyMs: 320,
+    });
+    const msg3 = coordinator.chat('diet-req-3', '打开刚才那个记录', [], {
+      channel: 'xiaoai',
+      channelId: 'xa-1',
+      senderId: 'lx06',
+    });
+    await until(() => coordinator.store.conversation.get(msg3.id).status === 'completed');
+
+    const rawPayload3 = capturedChatPayloads[2]!;
+    const parsed3 = JSON.parse(rawPayload3) as {
+      context?: Array<{ role: string; text: string }>;
+    };
+    assert.ok(
+      Array.isArray(parsed3.context) && parsed3.context.length <= 6,
+      'CHAT bridges recent context when prior fastpath turn exists',
+    );
+    assert.ok(parsed3.context!.some(c => c.role === 'user' && c.text.includes('打开客厅灯')));
+    assert.ok(parsed3.context!.some(c => c.role === 'assistant' && c.text.includes('已打开客厅灯')));
+
     // Pure unit checks for compactRouterChatWorks, L0 compactRouterChatMemoryDirectory, and structured recentContext
     const sixActive = Array.from({ length: 6 }, (_, idx) => ({
       ...coordinator.store.get(activeRunning.id),

@@ -116,7 +116,8 @@ export function compactRouterChatMemoryDirectory(
   };
 }
 
-export function compactRouterChatRecentContext(recentContext: unknown): unknown {
+export function compactRouterChatRecentContext(recentContext: unknown, maxItems = 4): unknown {
+  const limit = Math.max(1, maxItems);
   const compactItem = (entry: unknown): unknown => {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return entry;
     const rec = entry as Record<string, unknown>;
@@ -130,15 +131,15 @@ export function compactRouterChatRecentContext(recentContext: unknown): unknown 
     return entry;
   };
   if (Array.isArray(recentContext)) {
-    return recentContext.slice(-4).map(compactItem);
+    return recentContext.slice(-limit).map(compactItem);
   }
   if (recentContext && typeof recentContext === 'object') {
     const obj = recentContext as Record<string, unknown>;
     if (Array.isArray(obj.items)) {
-      return { ...obj, items: obj.items.slice(-4).map(compactItem) };
+      return { ...obj, items: obj.items.slice(-limit).map(compactItem) };
     }
     if (Array.isArray(obj.recentMessages)) {
-      return { ...obj, recentMessages: obj.recentMessages.slice(-4).map(compactItem) };
+      return { ...obj, recentMessages: obj.recentMessages.slice(-limit).map(compactItem) };
     }
   }
   return recentContext;

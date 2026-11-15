@@ -115,6 +115,15 @@ export interface FastpathTurnInput {
   replyId?: string;
 }
 
+function isFastpathMessage(msg: ChatMessage): boolean {
+  if (msg.requestId?.startsWith('fastpath:')) return true;
+  return Boolean(
+    msg.routing?.actions.some(
+      a => a.kind === 'plugin' && typeof a.summary === 'string' && a.summary.includes('fast path'),
+    ),
+  );
+}
+
 export class Coordinator {
   readonly store: Store;
   readonly semantic: SemanticEmbedder;
@@ -773,9 +782,27 @@ export class Coordinator {
               : {}),
           }));
           const includeRecentContext = !this.router?.leafId;
-          const promptContext = includeRecentContext
+          let promptContext = includeRecentContext
             ? (this.factory.mode === 'real' ? compactRouterChatRecentContext(recentContext) : recentContext)
             : undefined;
+          if (!includeRecentContext) {
+            // Fastpath turns (e.g. MiOT/TV-IR) are recorded in SQLite without entering Router's SDK session;
+            // bridge recent turns whenever any of the last 8 prior messages came from a fastpath turn.
+            const priorItems = chat.history(currentMessage.seq, 8).items;
+            if (priorItems.some(isFastpathMessage)) {
+              const formattedPrior = priorItems.map(({ id, role, text, mode, status, taskIds, paths }) => ({
+                id,
+                role,
+                mode,
+                text: text.slice(-4096),
+                truncated: text.length > 4096,
+                status,
+                taskIds,
+                fileCount: paths.length,
+              }));
+              promptContext = compactRouterChatRecentContext(formattedPrior, 6);
+            }
+          }
           const promptWorks = compactRouterChatWorks(knownWorks, deliveryChannel === 'xiaoai' ? 2 : 3);
           resetChatContextClock(context);
           const result = await trace.run(

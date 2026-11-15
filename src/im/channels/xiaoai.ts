@@ -707,6 +707,11 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
 
     const sessionKey = `${channel.id}:${targetId}`;
     const prevEntry = this.getActiveFastpathSession(channel.id, targetId);
+    // [[LISTEN]] follow-up capture without explicit wake word belongs to Router's active dialog
+    // unless a continuous plugin fastpath session (e.g., tv-ir) is already active.
+    if (inbound.explicitWake === false && !prevEntry) {
+      return undefined;
+    }
     const wasContinuous = Boolean(prevEntry?.state.continuous || prevEntry?.state.tvRemoteActive);
     const sshTarget = resolveSshTarget(channel, targetId);
 

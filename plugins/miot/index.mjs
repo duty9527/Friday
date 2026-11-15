@@ -1471,9 +1471,19 @@ async function resolveFromArgs(ctx, { defaultCategory, refresh, needHotData = fa
 
 function failFromError(title, err) {
   if (err instanceof MiotError && err.code === 'AMBIGUOUS_DEVICE') {
-    return failure('设备指代不明', err.message, { needsClarification: true, ...(err.data ?? {}) });
+    return failure('设备指代不明', err.message, {
+      code: err.code,
+      needsClarification: true,
+      ...(err.data ?? {}),
+    });
   }
-  return failure(title, errMsg(err), err instanceof MiotError && err.data ? err.data : undefined);
+  if (err instanceof MiotError) {
+    const data = err.code || err.data
+      ? { ...(err.code ? { code: err.code } : {}), ...(err.data ?? {}) }
+      : undefined;
+    return failure(title, errMsg(err), data);
+  }
+  return failure(title, errMsg(err), undefined);
 }
 
 async function handleGet(ctx) {

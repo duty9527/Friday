@@ -2961,3 +2961,144 @@ test('XiaoaiKwsMonitor remote SSH and ash commands pass sh -n with valid PIDFILE
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test('Xiaoai inbound fastpath yields on explicitWake=false follow-up unless continuous fastpath session is active', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-fp-wake-'));
+  const pluginDir = join(home, 'plugins', 'test-fp-wake');
+  const callsKey = '__fridayTestFpWakeCalls';
+  const routerPrompts: string[] = [];
+  const g = globalThis as Record<string, unknown>;
+  g[callsKey] = [] as string[];
+  try {
+    await mkdir(pluginDir, { recursive: true });
+    await writeFile(join(pluginDir, 'plugin.json'), JSON.stringify({
+      name: 'test-fp-wake',
+      version: '1.0.0',
+      description: 'Test wake-gating for voice fastpath',
+      enabled: true,
+      runtime: 'in-process',
+      voiceFastpath: true,
+      entry: 'index.mjs',
+      actions: [],
+    }));
+    await writeFile(join(pluginDir, 'index.mjs'), `
+export async function handleVoiceFastpath(req) {
+  if (req.sessionState?.event === 'assistant_reply') return { handled: false };
+  const calls = globalThis[${JSON.stringify(callsKey)}];
+  calls.push(req.text);
+  if (req.text.includes('进入连续')) {
+    return {
+      handled: true,
+      ok: true,
+      speech: '已进入连续模式',
+      followUp: true,
+      sessionState: { continuous: true, idleTtlMs: 5000 },
+      action: 'enter',
+    };
+  }
+  if (req.sessionState?.continuous && req.text.includes('继续')) {
+    return {
+      handled: true,
+      ok: true,
+      speech: '连续动作完成',
+      followUp: true,
+      sessionState: { continuous: true, idleTtlMs: 5000 },
+      action: 'step',
+    };
+  }
+  return { handled: true, ok: true, speech: '快速处理完成' };
+}
+`);
+    const factory: AgentFactory = {
+      mode: 'real',
+      nativeTools: true,
+      async create(role) {
+        if (role !== 'router') return offlineFactory().create(role, role, []);
+        return {
+          close() {},
+          async prompt(text) {
+            const parsed = JSON.parse(text) as { kind?: string; message?: { text?: string } };
+            if (parsed.kind === 'CHAT' && parsed.message?.text) {
+              routerPrompts.push(parsed.message.text);
+            }
+            return '好的，这是路由器回复。';
+          },
+        };
+      },
+    };
+
+    const coordinator = new Coordinator(home, factory, { skipExecutor: true });
+    await coordinator.ready();
+    try {
+      coordinator.im.xiaoaiDeps = {
+        sshRunner: async () => ({ code: 0, stdout: '', stderr: '' }),
+      };
+      coordinator.im.saveChannel({
+        id: 'xa-wake-test',
+        platform: 'xiaoai',
+        name: '小爱测试',
+        enabled: true,
+        notifyAll: false,
+        allowedSenders: [],
+        defaultTarget: 'lx06',
+        pollIntervalMs: 50,
+      });
+
+      // 1. Follow-up capture without explicit wake word and no active fastpath session -> bypasses fastpath, goes to Router
+      const followUpRes = await coordinator.im.ingestMessage({
+        channelId: 'xa-wake-test',
+        externalId: 'ext-1',
+        senderId: 'lx06',
+        target: 'lx06',
+        text: '打开历史记录',
+        explicitWake: false,
+      });
+      assert.equal(followUpRes.action, 'routed_to_chat');
+      await until(() =>
+        routerPrompts.includes('打开历史记录')
+        && coordinator.store.conversation.get(followUpRes.messageId!).status === 'completed',
+      );
+      assert.deepEqual(g[callsKey], []);
+
+      // 2. Explicit wake -> reaches fastpath plugin without hitting Router
+      const wakeRes = await coordinator.im.ingestMessage({
+        channelId: 'xa-wake-test',
+        externalId: 'ext-2',
+        senderId: 'lx06',
+        target: 'lx06',
+        text: '打开卧室灯',
+        explicitWake: true,
+      });
+      assert.equal(wakeRes.action, 'voice_fastpath');
+      assert.deepEqual(g[callsKey], ['打开卧室灯']);
+      assert.equal(routerPrompts.length, 1);
+
+      // 3. Active continuous session -> explicitWake=false still continues fastpath
+      const enterRes = await coordinator.im.ingestMessage({
+        channelId: 'xa-wake-test',
+        externalId: 'ext-3',
+        senderId: 'lx06',
+        target: 'lx06',
+        text: '进入连续',
+        explicitWake: true,
+      });
+      assert.equal(enterRes.action, 'enter');
+
+      const stepRes = await coordinator.im.ingestMessage({
+        channelId: 'xa-wake-test',
+        externalId: 'ext-4',
+        senderId: 'lx06',
+        target: 'lx06',
+        text: '继续',
+        explicitWake: false,
+      });
+      assert.equal(stepRes.action, 'step');
+      assert.deepEqual(g[callsKey], ['打开卧室灯', '进入连续', '继续']);
+    } finally {
+      await coordinator.close();
+    }
+  } finally {
+    delete g[callsKey];
+    await rm(home, { recursive: true, force: true });
+  }
+});
