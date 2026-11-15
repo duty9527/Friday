@@ -156,10 +156,6 @@ export class Conversation {
     const rows = this.db.prepare(`SELECT seq,body FROM messages WHERE json_extract(body,'$.role')='user' ORDER BY seq ASC`).all();
     return this.decodeBatch(rows);
   }
-  /** @deprecated Use `assignSession(id, sessionId, sessionLink, false)` directly. Kept temporarily for cross-slice compatibility. */
-  quietSetMessageSession(id: string, sessionId: string, sessionLink?: SessionTurnLink): void {
-    this.assignSession(id, sessionId, sessionLink, false);
-  }
   delete(id: string) {
     this.atomic(() => {
       this.db.prepare('DELETE FROM message_tasks WHERE message_id=?').run(id);
