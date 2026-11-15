@@ -1,17 +1,13 @@
 /**
- * Zero-LLM XiaoAI → MiOT fast path.
- *
- * Deterministic, high-confidence smart-home utterances (air fryer, IR air conditioner, lights,
- * outlets) are parsed locally and executed straight through `plugins/miot/index.mjs`, skipping the
- * Router LLM round-trip. Anything ambiguous, delayed/scheduled, multi-step, conditional or
- * out of scope returns `undefined` from the parser so `ImGateway` falls through to the Router.
- *
- * This file lives under `rootDir: src`, so the plugin (plain ESM in `plugins/`) is never imported
- * statically; callers inject a `runMiot` runner or use `createDefaultMiotRunner` (lazy import).
+ * @deprecated Lightweight pure phrase-parsing shim for XiaoAI smart-home intents.
+ * Production plugin fastpath routing goes through `tryPluginVoiceFastpath` (`./plugin.js`) and `plugins/miot/`.
+ * This shim contains zero plugin imports, zero disk reads, and zero hardcoded device names.
  */
-import { existsSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import {
+  parseChineseNumber,
+  stripLeadingAssistantWake,
+  stripTrailingPunctuation,
+} from './xiaoai/utterance-utils.js';
 
 export type XiaoaiMiotRunner = (action: string, args: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
@@ -54,12 +50,11 @@ export interface XiaoaiMiotFastResult {
 export const MIOT_AMBIGUOUS_SPEECH = '匹配到多个设备，请带上具体房间名称再说一次。';
 export const MIOT_AC_ROOM_SPEECH = '家里有多台空调，请说具体房间，比如客厅空调。';
 
-// ---------------------------------------------------------------------------
-// Parsing
-// ---------------------------------------------------------------------------
+export { parseChineseNumber };
 
 const MAX_UTTERANCE_CHARS = 36;
-const ROOM_RE = /客厅|主卧|次卧|大卧|小卧|卧室|书房|儿童房|客房|餐厅/g;
+const ROOM_NAMES = '客厅|主卧|次卧|大卧|小卧|卧室|书房|儿童房|客房|餐厅';
+const ROOM_RE = new RegExp(ROOM_NAMES, 'g');
 const FRYER_ALIAS_TEST_RE = /空气炸[锅播国果]|空炸|炸[锅播]/;
 const FRYER_ALIAS_RE = /空气炸[锅播国果]|空炸|炸[锅播]/g;
 const FILLER_RE = /请|帮我|帮忙|麻烦|把|给|一下|吧|呗|哈|呀|呢|啦/g;
@@ -69,7 +64,6 @@ const COMPLEX_RE = /如果|要是|假如|顺便|然后|并且|接着|同时|再�
 const OTHER_DOMAIN_RE = /电视|投影|声纹|遥控|B站|哔哩|投屏|油管|YouTube|节目|电影|动画/i;
 const NEGATION_RE = /别|不要|不用|不能|不可以|能不能|可不可以|是否|除了|除外/;
 
-const CN_DIGITS: Record<string, number> = { 零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
 const CN_NUM = '一二两三四五六七八九十百';
 const NUM_PATTERN = `(?:\\d+|[${CN_NUM}]+)`;
 
@@ -83,50 +77,17 @@ const RECIPES: Array<{ re: RegExp; name: string }> = [
   { re: /酸奶/, name: '酸奶' },
 ];
 
-const SMART_NOUN_RE = /灯|插座|插排|开关|通断器|鱼缸|乌龟|龟缸|风扇|加湿器|净化器|热水器|窗帘/;
+const SMART_NOUN_RE = /灯|插座|插排|开关|通断器|水泵|过滤|加热棒|风扇|加湿器|净化器|热水器|窗帘/;
 const BARE_NOUN_RE = /^(?:灯|插座|插排|开关|通断器)$/;
-
-function parseTens(s: string): number | undefined {
-  if (!s) return undefined;
-  if (s.includes('十')) {
-    const [t = '', u = ''] = s.split('十');
-    if (t.length > 1 || u.length > 1) return undefined;
-    const tens = t ? CN_DIGITS[t] : 1;
-    const units = u ? CN_DIGITS[u] : 0;
-    if (tens === undefined || units === undefined) return undefined;
-    return tens * 10 + units;
-  }
-  if (s.length === 1) return CN_DIGITS[s];
-  return undefined;
-}
-
-/** Parse Arabic or Chinese numerals: 200 / 两百 / 二百 / 一百八 / 一百八十 / 十五 / 三十 / 五. */
-export function parseChineseNumber(raw: string): number | undefined {
-  const s = raw.trim();
-  if (!s) return undefined;
-  if (/^\d+$/.test(s)) return Number(s);
-  if (s.includes('百')) {
-    const [h = '', rest = ''] = s.split('百');
-    if (s.split('百').length > 2) return undefined;
-    const hundreds = h ? CN_DIGITS[h] : 1;
-    if (hundreds === undefined) return undefined;
-    if (!rest) return hundreds * 100;
-    if (rest.length === 1 && CN_DIGITS[rest] !== undefined) return hundreds * 100 + (CN_DIGITS[rest] as number) * 10;
-    const tens = parseTens(rest.startsWith('零') ? rest.slice(1) : rest);
-    return tens === undefined ? undefined : hundreds * 100 + tens;
-  }
-  return parseTens(s);
-}
 
 function uniqueRooms(text: string): string[] {
   return [...new Set(text.match(ROOM_RE) ?? [])];
 }
 
-/** Strip wake prefix, whitespace, trailing punctuation, polite fillers and the particle 的. */
 function normalizeUtterance(raw: string): string {
-  return raw
+  const withoutWake = stripLeadingAssistantWake(raw);
+  return stripTrailingPunctuation(withoutWake)
     .replace(/\s+/g, '')
-    .replace(/^(?:星期五|小爱同学)[,，。.、]*/, '')
     .replace(/^[,，。.、！!？?~…；;：:]+|[,，。.、！!？?~…；;：:]+$/g, '')
     .replace(FILLER_RE, '')
     .replace(/的/g, '');
@@ -144,7 +105,7 @@ function extractFryerParams(text: string): { tempC?: number; minutes?: number; r
     const hours = hourMatch ? parseChineseNumber(hourMatch[1] ?? '') : undefined;
     if (hours !== undefined) minutes = hours * 60;
   }
-  const recipe = RECIPES.find(r => r.re.test(text))?.name;
+  const recipe = RECIPES.find((r) => r.re.test(text))?.name;
   return { tempC, minutes, recipe };
 }
 
@@ -179,7 +140,6 @@ function parseFryer(t: string): XiaoaiMiotFastIntent | undefined {
     }
   }
 
-  // Parameters present: only an explicit start is accepted (stop/pause words alongside numbers are ambiguous).
   if (hasParams && /关掉|关闭|关上|关了|停下|停止|取消|暂停|继续|恢复|吗$|么$/.test(s)) return undefined;
   const effectiveTemp = tempC ?? bareTempC;
   if (effectiveTemp !== undefined && (effectiveTemp < 40 || effectiveTemp > 200)) return undefined;
@@ -284,7 +244,7 @@ function parseAc(t: string): XiaoaiMiotFastIntent | undefined {
       break;
     }
   }
-  const mode = AC_MODE_MAP.find(m => m.re.test(rest))?.value;
+  const mode = AC_MODE_MAP.find((m) => m.re.test(rest))?.value;
 
   let temperature: number | undefined;
   const tempMatch = new RegExp(`(${NUM_PATTERN})\\s*度`).exec(rest)
@@ -312,21 +272,27 @@ function parseAc(t: string): XiaoaiMiotFastIntent | undefined {
   };
 }
 
-function parseLights(t: string): XiaoaiMiotFastIntent | undefined {
+function parseLights(t: string, protectedKeywords: string[] = []): XiaoaiMiotFastIntent | undefined {
   if (!t.includes('灯')) return undefined;
-  if (/鱼缸|乌龟|龟缸/.test(t)) return undefined; // life-support devices are never batch-controlled
+  if (protectedKeywords.some((kw) => kw && t.includes(kw))) return undefined;
   const rooms = uniqueRooms(t);
   if (rooms.length > 1) return undefined;
   const room = rooms[0];
 
   const isQuery = (/(?:哪些|哪个|哪盏|什么|啥|有没有|有哪些)灯/.test(t) && /开着|亮着|没关|没有关|开了|亮了|亮|开启/.test(t))
-    || /灯都?关(?:了|好了|上了|掉了)?(?:吗|没|没有)$/.test(t)
-    || /灯(?:都)?(?:开着|亮着)(?:吗|没|没有)$/.test(t) && /家里|全屋|全家|所有|全部|都/.test(t);
+    || (/灯都?关(?:了|好了|上了|掉了)?(?:吗|没|没有)$/.test(t) && /家里|全屋|全家|所有|全部|都/.test(t))
+    || (/灯(?:都)?(?:开着|亮着)(?:吗|没|没有)$/.test(t) && /家里|全屋|全家|所有|全部|都/.test(t));
   if (isQuery) return { kind: 'lights_query', ...(room ? { room } : {}) };
 
   if (/吗|么|没有?$/.test(t)) return undefined;
   const scoped = /全屋|全家|整个家|家里|家中|所有|全部|每个房间|灯都|灯全|都关|都开|全关|全开/.test(t);
   if (!scoped) return undefined;
+  // Bail out if a specific non-room qualifier precedes "灯" (e.g. "关掉全部生态灯").
+  const nonRoomQualifier = t
+    .replace(new RegExp(ROOM_NAMES, 'g'), '')
+    .replace(/(?:全屋|全家|整个家|家里|家中|每个房间|所有|全部|都|全|关掉|关闭|关上|关了|打开|开启|开|关|熄|亮|了|盏|个|把)/g, '');
+  if (nonRoomQualifier !== '灯') return undefined;
+
   const swapped = t.replace(/开关/g, '');
   const off = /关|熄/.test(swapped);
   const on = /开|亮/.test(swapped);
@@ -369,9 +335,13 @@ function parseDevice(t: string): XiaoaiMiotFastIntent | undefined {
   return { kind: 'device_set', device: parsed.target, on: parsed.verb === 'on' };
 }
 
+/**
+ * @deprecated Pure MiOT fastpath phrase parser shim.
+ */
 export function parseXiaoaiMiotUtterance(
   rawText: string,
   pendingFryer?: XiaoaiFryerPendingSlot,
+  options?: { protectedKeywords?: string[] },
 ): XiaoaiMiotFastIntent | undefined {
   const trimmed = (rawText ?? '').trim();
   if (!trimmed || trimmed.length > MAX_UTTERANCE_CHARS) return undefined;
@@ -381,7 +351,10 @@ export function parseXiaoaiMiotUtterance(
   }
   const t = normalizeUtterance(trimmed);
   if (!t) return undefined;
-  const direct = parseFryer(t) ?? parseAc(t) ?? parseLights(t) ?? parseDevice(t);
+  const direct = parseFryer(t)
+    ?? parseAc(t)
+    ?? parseLights(t, options?.protectedKeywords)
+    ?? parseDevice(t);
   if (direct && direct.kind !== 'cook_clarify') return direct;
   if (pendingFryer) {
     const merged = parseFryerFollowUp(t, pendingFryer, direct);
@@ -389,10 +362,6 @@ export function parseXiaoaiMiotUtterance(
   }
   return direct;
 }
-
-// ---------------------------------------------------------------------------
-// Execution
-// ---------------------------------------------------------------------------
 
 type MiotRecord = Record<string, unknown>;
 type MiotClass = 'ok' | 'ambiguous' | 'not_found' | 'failed';
@@ -488,7 +457,6 @@ function roomMatches(d: MiotRecord, room: string): boolean {
   if (!dr && !full) return false;
   if (dr && (dr.includes(room) || room.includes(dr))) return true;
   if (full.includes(room)) return true;
-  // 卧室 is a generic bedroom alias for 主卧/次卧/大卧/小卧 (and vice-versa).
   const bedroom = /卧/;
   return bedroom.test(room) && (bedroom.test(dr) || bedroom.test(full)) && (room === '卧室' || dr === '卧室');
 }
@@ -499,15 +467,16 @@ const AC_FAN_ZH: Record<string, string> = { auto: '自动风', low: '低风', me
 async function execAc(intent: Extract<XiaoaiMiotFastIntent, { kind: 'ac_control' }>, run: XiaoaiMiotRunner): Promise<XiaoaiMiotFastResult> {
   const listed = await call(run, 'devices', { category: 'air_conditioner' });
   if (listed.cls !== 'ok') return NOT_HANDLED;
-  const acs = deviceList(listed.result).filter(d => d.controllable !== false);
-  const pool = intent.room ? acs.filter(d => roomMatches(d, intent.room as string)) : acs;
+  const acs = deviceList(listed.result).filter((d) => d.controllable !== false);
+  const pool = intent.room ? acs.filter((d) => roomMatches(d, intent.room as string)) : acs;
   if (pool.length === 0) return NOT_HANDLED;
   if (pool.length > 1) {
     return intent.room
       ? HANDLED_AMBIGUOUS('set')
       : { handled: true, ok: true, speech: MIOT_AC_ROOM_SPEECH, followUp: true, actionName: 'devices' };
   }
-  const target = pool[0] as MiotRecord;
+  const target = pool[0];
+  if (!target) return NOT_HANDLED;
   const did = str(target.did);
   const label = deviceLabel(target, `${intent.room ?? ''}空调`);
   const setArgs: MiotRecord = {
@@ -535,9 +504,8 @@ async function execAc(intent: Extract<XiaoaiMiotFastIntent, { kind: 'ac_control'
 async function execLightsBatch(intent: Extract<XiaoaiMiotFastIntent, { kind: 'lights_batch' }>, run: XiaoaiMiotRunner): Promise<XiaoaiMiotFastResult> {
   const listed = await call(run, 'devices', { category: 'light', ...(intent.room ? { room: intent.room } : {}) });
   if (listed.cls !== 'ok') return NOT_HANDLED;
-  // SAFETY: the plugin also files outlets/switches whose name contains 灯 (鱼缸灯/乌龟灯 — aquarium and
-  // turtle life-support power) under "light". A whole-home switch must only ever touch true BT-mesh lights.
-  const targets = deviceList(listed.result).filter(d =>
+  // Only toggle direct controllable BT-mesh lights, never outlets/switches categorized under light.
+  const targets = deviceList(listed.result).filter((d) =>
     d.controllable === true && d.controlChannel === 'bt_mesh' && d.category === 'light' && str(d.did));
   if (targets.length === 0) return NOT_HANDLED;
   let okCount = 0;
@@ -545,7 +513,8 @@ async function execLightsBatch(intent: Extract<XiaoaiMiotFastIntent, { kind: 'li
   for (const d of targets) {
     try {
       const res = await call(run, 'set', { did: str(d.did), on: intent.on });
-      if (res.cls === 'ok') okCount++; else failCount++;
+      if (res.cls === 'ok') okCount++;
+      else failCount++;
     } catch {
       failCount++;
     }
@@ -564,12 +533,12 @@ async function execLightsQuery(intent: Extract<XiaoaiMiotFastIntent, { kind: 'li
   if (listed.cls !== 'ok') return NOT_HANDLED;
   const lights = deviceList(listed.result);
   if (lights.length === 0) return NOT_HANDLED;
-  const known = lights.filter(d => typeof asRecord(d.state)?.on === 'boolean');
+  const known = lights.filter((d) => typeof asRecord(d.state)?.on === 'boolean');
   if (known.length === 0) {
     return { handled: true, ok: false, speech: '暂时读不到灯的状态，请稍后再试。', followUp: false, actionName: 'devices' };
   }
   const scope = intent.room ?? '';
-  const on = known.filter(d => asRecord(d.state)?.on === true).map(d => deviceLabel(d, '未命名灯'));
+  const on = known.filter((d) => asRecord(d.state)?.on === true).map((d) => deviceLabel(d, '未命名灯'));
   let speech: string;
   if (on.length === 0) speech = `${scope || '现在'}没有灯开着。`;
   else {
@@ -581,6 +550,9 @@ async function execLightsQuery(intent: Extract<XiaoaiMiotFastIntent, { kind: 'li
   return { handled: true, ok: true, speech, followUp: false, actionName: 'devices' };
 }
 
+/**
+ * @deprecated Pure execution adapter shim for injected MiOT runners.
+ */
 export async function executeXiaoaiMiotFastpath(
   intent: XiaoaiMiotFastIntent,
   deps: { runMiot: XiaoaiMiotRunner },
@@ -660,35 +632,6 @@ export async function executeXiaoaiMiotFastpath(
     }
   } catch (error) {
     if (error instanceof MiotThrown && error.kind === 'ambiguous') return HANDLED_AMBIGUOUS(actionName);
-    return NOT_HANDLED; // runner crashed / not found → let the Router try
+    return NOT_HANDLED;
   }
-}
-
-// ---------------------------------------------------------------------------
-// Default runner (lazy plugin import, never a static import of ../plugins)
-// ---------------------------------------------------------------------------
-
-type MiotModule = { runAction?: (action: string, args: MiotRecord, deps: MiotRecord) => Promise<MiotRecord> };
-const moduleCache = new Map<string, Promise<MiotModule>>();
-
-export function resolveMiotEntryPath(homeDir: string): string {
-  const custom = join(homeDir, 'plugins', 'miot', 'index.mjs');
-  if (existsSync(custom)) return custom;
-  return resolve(dirname(fileURLToPath(import.meta.url)), '..', 'plugins', 'miot', 'index.mjs');
-}
-
-export function createDefaultMiotRunner(opts: { homeDir: string; dataDir?: string; entryPath?: string }): XiaoaiMiotRunner {
-  const dataDir = opts.dataDir ?? join(opts.homeDir, 'plugins', 'miot');
-  return async (action, args) => {
-    const entryPath = opts.entryPath ?? resolveMiotEntryPath(opts.homeDir);
-    let loading = moduleCache.get(entryPath);
-    if (!loading) {
-      loading = import(pathToFileURL(entryPath).href) as Promise<MiotModule>;
-      moduleCache.set(entryPath, loading);
-      loading.catch(() => moduleCache.delete(entryPath));
-    }
-    const mod = await loading;
-    if (typeof mod.runAction !== 'function') throw new Error('miot plugin does not export runAction');
-    return mod.runAction(action, args, { homeDir: opts.homeDir, dataDir });
-  };
 }

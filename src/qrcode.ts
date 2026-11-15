@@ -91,7 +91,7 @@ function bchFormatInfo(mask: number): number {
   return ((data << 10) | rem) ^ 0x5412;
 }
 
-export function encodeQrMatrix(text: string): boolean[][] {
+function encodeQrMatrix(text: string): boolean[][] {
   const payload = Buffer.from(text, 'utf8');
   const spec: VersionSpec = VERSION_SPECS.find(s => {
     const lenBits = s.version <= 9 ? 8 : 16;

@@ -7,9 +7,10 @@ import { join } from 'node:path';
 import { createCipheriv } from 'node:crypto';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { realFactory } from '../src/agent.js';
-import { Coordinator } from '../dist/coordinator.js';
+import { Coordinator } from '../src/coordinator.js';
 import { Store } from '../src/store.js';
 import { ImGateway } from '../src/im.js';
+import { parseWechatIlinkMessage } from '../src/im/channels/wechat-ilink.js';
 
 test('authorized pure/mixed iLink image -> persisted current message -> SDK image_url bytes; no cross-turn image replay', async () => {
   const root = await mkdtemp(join(tmpdir(), 'wx-vision-')); const store = new Store(root);
@@ -37,11 +38,11 @@ test('authorized pure/mixed iLink image -> persisted current message -> SDK imag
       return store.conversation.create({ id: requestId, requestId, role: 'user', text, paths, origin, attachments, status: 'queued', mode: 'real' });
     } } as any);
     for (const caption of ['', '参考形象']) {
-      const inbound = (gateway as any).parseWechatIlinkMessage('wx', { from_user_id: 'A', msg_id: caption || 'pure', item_list: [{ type: 2, image_item: { media: { aes_key: key.toString('base64'), encrypt_query_param: 'mock' } } }, { type: 1, text_item: { text: caption } }] });
+      const inbound = parseWechatIlinkMessage('wx', { from_user_id: 'A', msg_id: caption || 'pure', item_list: [{ type: 2, image_item: { media: { aes_key: key.toString('base64'), encrypt_query_param: 'mock' } } }, { type: 1, text_item: { text: caption } }] })!;
       // Simulate the provenance mark set only by authenticated getupdates polling.
       (gateway as any).trustedMediaRequests.add(inbound);
       const result = await gateway.ingestMessage(inbound); const message = store.conversation.get(result.messageId!);
-      assert.equal(message.attachments?.[0].status, 'ready'); if (caption) assert.match(message.text, /参考形象/);
+      assert.equal(message.attachments?.[0]?.status, 'ready'); if (caption) assert.match(message.text, /参考形象/);
       await agent.prompt(JSON.stringify({ kind: 'CHAT', message }), new AbortController().signal);
       const imageBlocks = requests.at(-1).messages.flatMap((m: any) => Array.isArray(m.content) ? m.content.filter((c: any) => c.type === 'image_url') : []);
       assert.equal(imageBlocks.length, 1); assert.equal(imageBlocks[0].image_url.url, `data:image/png;base64,${png.toString('base64')}`);
@@ -140,12 +141,12 @@ test('WeChat split message coalescing: image-then-text, text-then-slow-image, mu
       if (text) {
         itemList.push({ type: 1, text_item: { text } });
       }
-      const inbound = (coordinator!.im as any).parseWechatIlinkMessage('wx', {
+      const inbound = parseWechatIlinkMessage('wx', {
         from_user_id: senderId,
         msg_id: msgId,
         context_token: `ctx-${msgId}`,
         item_list: itemList,
-      });
+      })!;
       if (withImage) (coordinator!.im as any).trustedMediaRequests.add(inbound);
       return coordinator!.im.ingestMessage(inbound);
     };

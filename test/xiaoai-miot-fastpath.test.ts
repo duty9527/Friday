@@ -4,8 +4,8 @@ import { mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { randomUUID } from 'node:crypto';
 import {
-  createDefaultMiotRunner,
   executeXiaoaiMiotFastpath,
   parseChineseNumber,
   parseXiaoaiMiotUtterance,
@@ -84,19 +84,22 @@ test('parser: lights batch / query and outlet device set/get', () => {
   for (const t of ['家里哪些灯开着', '还有什么灯没关', '看看哪些灯亮着']) {
     assert.deepEqual(parseXiaoaiMiotUtterance(t), { kind: 'lights_query' }, t);
   }
-  assert.deepEqual(parseXiaoaiMiotUtterance('打开鱼缸灯'), { kind: 'device_set', device: '鱼缸灯', on: true });
-  assert.deepEqual(parseXiaoaiMiotUtterance('把乌龟灯关掉'), { kind: 'device_set', device: '乌龟灯', on: false });
+  assert.deepEqual(parseXiaoaiMiotUtterance('打开生态灯'), { kind: 'device_set', device: '生态灯', on: true });
+  assert.deepEqual(parseXiaoaiMiotUtterance('把植物灯关掉'), { kind: 'device_set', device: '植物灯', on: false });
   assert.deepEqual(parseXiaoaiMiotUtterance('关闭客厅灯'), { kind: 'device_set', device: '客厅灯', on: false });
   assert.deepEqual(parseXiaoaiMiotUtterance('关闭客厅开关'), { kind: 'device_set', device: '客厅开关', on: false });
   assert.deepEqual(parseXiaoaiMiotUtterance('切换书房插座'), { kind: 'device_set', device: '书房插座', toggle: true });
-  assert.deepEqual(parseXiaoaiMiotUtterance('鱼缸灯开着吗'), { kind: 'device_get', device: '鱼缸灯' });
-  assert.deepEqual(parseXiaoaiMiotUtterance('乌龟灯关了吗'), { kind: 'device_get', device: '乌龟灯' });
-  // A bare "灯" is never guessed (could hit a life-support light)
+  assert.deepEqual(parseXiaoaiMiotUtterance('生态灯开着吗'), { kind: 'device_get', device: '生态灯' });
+  assert.deepEqual(parseXiaoaiMiotUtterance('植物灯关了吗'), { kind: 'device_get', device: '植物灯' });
+  // A bare "灯" is never guessed (could hit a protected outlet)
   assert.equal(parseXiaoaiMiotUtterance('关灯'), undefined);
   assert.equal(parseXiaoaiMiotUtterance('开灯'), undefined);
-  assert.equal(parseXiaoaiMiotUtterance('关掉所有灯鱼缸灯除外'), undefined);
-  // The life-support lights are never part of a batch intent
-  assert.notEqual(parseXiaoaiMiotUtterance('关掉全部鱼缸灯')?.kind, 'lights_batch');
+  assert.equal(parseXiaoaiMiotUtterance('关掉所有灯生态灯除外'), undefined);
+  // Protected device names passed by caller/plugin are excluded from batch intents
+  assert.notEqual(
+    parseXiaoaiMiotUtterance('关掉全部生态灯', undefined, { protectedKeywords: ['生态灯'] })?.kind,
+    'lights_batch',
+  );
 });
 
 test('parser bailouts: timers, multi-step, TV/voiceprint, unsafe numbers, non-smart-home', () => {
@@ -155,11 +158,11 @@ test('parser & executor: partial air fryer utterances clarify locally and merge 
   assert.equal(calls.length, 0);
 
   // End-to-end ImGateway two-turn slot continuation: "空气炸锅200。" -> asks minutes -> "五分钟" -> starts fryer
-  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-miot-slot-'));
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-miot-slot-'));
   const gw = makeRunner([], {
     cook: args => ({ ok: true, message: 'x', data: { tempC: args.tempC, minutes: args.minutes } }),
   });
-  const h = makeGatewayHarness(home, 'xiaoai-slot', gw.runner);
+  const h = await makeGatewayHarness(home, 'xiaoai-slot', gw.runner);
   try {
     await delay(30);
     h.sshCalls.length = 0;
@@ -167,7 +170,7 @@ test('parser & executor: partial air fryer utterances clarify locally and merge 
     const turn1 = await h.gateway.ingestMessage({
       channelId: 'xiaoai-slot', externalId: 'slot-1', senderId: 'lx06', target: 'lx06', text: '空气炸锅200。',
     });
-    assert.equal(turn1.action, 'xiaoai_miot_fastpath');
+    assert.equal(turn1.action, 'cook_clarify');
     assert.equal(h.routed.length, 0);
     assert.equal(gw.calls.length, 0);
     await until(() => h.sshCalls.some(c => isTts(c) && c.includes('200度要烤几分钟')));
@@ -176,7 +179,7 @@ test('parser & executor: partial air fryer utterances clarify locally and merge 
     const turn2 = await h.gateway.ingestMessage({
       channelId: 'xiaoai-slot', externalId: 'slot-2', senderId: 'lx06', target: 'lx06', text: '五分钟',
     });
-    assert.equal(turn2.action, 'xiaoai_miot_fastpath');
+    assert.equal(turn2.action, 'cook');
     assert.equal(h.routed.length, 0);
     assert.deepEqual(gw.calls, [{ action: 'cook', args: { device: '空气炸锅', op: 'start', tempC: 200, minutes: 5 } }]);
     await until(() => h.sshCalls.some(c => isTts(c) && c.includes('200度5分钟')));
@@ -273,7 +276,7 @@ test('executor: AMBIGUOUS_DEVICE speaks a clarification; DEVICE_NOT_FOUND / cras
     handled: true, ok: true, speech: '匹配到多个设备，请带上具体房间名称再说一次。', followUp: true, actionName: 'cook',
   });
 
-  const notFound = await executeXiaoaiMiotFastpath({ kind: 'device_set', device: '鱼缸灯', on: true }, {
+  const notFound = await executeXiaoaiMiotFastpath({ kind: 'device_set', device: '生态灯', on: true }, {
     runMiot: makeRunner([]).runner,
   });
   assert.deepEqual(notFound, { handled: false });
@@ -320,23 +323,23 @@ test('executor: AC without a room asks for one when several ACs exist; unique AC
   assert.deepEqual(none, { handled: false });
 });
 
-test('executor: whole-home lights-off only touches real BT-mesh lights, never 鱼缸灯/乌龟灯 outlets', async () => {
+test('executor: whole-home lights-off only touches real BT-mesh lights, never life-support outlets', async () => {
   const devices = [
     light('l1', '客厅', '灯', true), light('l2', '卧室', '灯', true),
     { ...light('l3', '书房', '灯'), controllable: false },       // not controllable
     { ...light('l4', '餐厅', '灯'), controlChannel: 'miio_udp' }, // not BT mesh
-    lifeSupport('fish', '鱼缸灯'), lifeSupport('turtle', '乌龟灯'),
+    lifeSupport('outlet1', '生态灯'), lifeSupport('outlet2', '植物灯'),
   ];
   const { runner, calls } = makeRunner(devices);
   const res = await executeXiaoaiMiotFastpath({ kind: 'lights_batch', on: false }, { runMiot: runner });
   assert.deepEqual(res, { handled: true, ok: true, speech: '已关闭2盏灯。', followUp: false, actionName: 'set' });
   const switched = calls.filter(c => c.action === 'set').map(c => c.args);
   assert.deepEqual(switched, [{ did: 'l1', on: false }, { did: 'l2', on: false }]);
-  assert.ok(!switched.some(a => a.did === 'fish' || a.did === 'turtle'));
+  assert.ok(!switched.some(a => a.did === 'outlet1' || a.did === 'outlet2'));
   assert.deepEqual(calls[0], { action: 'devices', args: { category: 'light' } });
 
-  // room-scoped + only life-support devices in scope → nothing to do, Router decides
-  const only = makeRunner([lifeSupport('fish', '鱼缸灯')]);
+  // room-scoped + only protected devices in scope → nothing to do, Router decides
+  const only = makeRunner([lifeSupport('outlet1', '生态灯')]);
   assert.deepEqual(await executeXiaoaiMiotFastpath({ kind: 'lights_batch', room: '客厅', on: false }, { runMiot: only.runner }), { handled: false });
   assert.equal(only.calls.some(c => c.action === 'set'), false);
 
@@ -350,10 +353,10 @@ test('executor: whole-home lights-off only touches real BT-mesh lights, never �
 });
 
 test('executor: lights query uses live state; device_set / device_get speech', async () => {
-  const devices = [light('l1', '客厅', '灯', true), light('l2', '卧室', '灯', false), lifeSupport('fish', '鱼缸灯')];
+  const devices = [light('l1', '客厅', '灯', true), light('l2', '卧室', '灯', false), lifeSupport('outlet1', '生态灯')];
   const q = makeRunner(devices);
   const res = await executeXiaoaiMiotFastpath({ kind: 'lights_query' }, { runMiot: q.runner });
-  assert.equal(res.speech, '开着的灯有：客厅灯、客厅鱼缸灯。');
+  assert.equal(res.speech, '开着的灯有：客厅灯、客厅生态灯。');
   assert.ok((res.speech ?? '').length <= 35);
   assert.deepEqual(q.calls[0], { action: 'devices', args: { category: 'light', live: true } });
 
@@ -361,9 +364,9 @@ test('executor: lights query uses live state; device_set / device_get speech', a
   assert.equal((await executeXiaoaiMiotFastpath({ kind: 'lights_query' }, { runMiot: allOff.runner })).speech, '现在没有灯开着。');
 
   const set = makeRunner(devices);
-  const on = await executeXiaoaiMiotFastpath({ kind: 'device_set', device: '客厅鱼缸灯', on: true }, { runMiot: set.runner });
-  assert.equal(on.speech, '已打开客厅鱼缸灯。');
-  assert.deepEqual(set.calls[0], { action: 'set', args: { device: '客厅鱼缸灯', on: true } });
+  const on = await executeXiaoaiMiotFastpath({ kind: 'device_set', device: '客厅生态灯', on: true }, { runMiot: set.runner });
+  assert.equal(on.speech, '已打开客厅生态灯。');
+  assert.deepEqual(set.calls[0], { action: 'set', args: { device: '客厅生态灯', on: true } });
   const off = await executeXiaoaiMiotFastpath({ kind: 'device_set', device: '客厅灯', on: false }, { runMiot: set.runner });
   assert.equal(off.speech, '已关闭客厅灯。');
 
@@ -371,26 +374,56 @@ test('executor: lights query uses live state; device_set / device_get speech', a
   assert.equal(get.speech, '客厅灯开着。');
 });
 
-test('createDefaultMiotRunner lazily imports the plugin once and passes homeDir/dataDir', async () => {
-  const dir = await mkdtemp(join(await realpath(tmpdir()), 'sa-miot-runner-'));
-  try {
-    await mkdir(join(dir, 'p'), { recursive: true });
-    const entry = join(dir, 'p', 'index.mjs');
-    await writeFile(entry, `
-globalThis.__miotLoads = (globalThis.__miotLoads ?? 0) + 1;
-export async function runAction(action, args, deps) { return { ok: true, message: action, data: { args, deps } }; }
-`);
-    const runner = createDefaultMiotRunner({ homeDir: dir, entryPath: entry });
-    const a = await runner('status', { x: 1 });
-    const b = await runner('cook', {});
-    assert.equal(a.ok, true);
-    assert.deepEqual((a.data as { deps: unknown }).deps, { homeDir: dir, dataDir: join(dir, 'plugins', 'miot') });
-    assert.equal(b.message, 'cook');
-    assert.equal((globalThis as unknown as { __miotLoads: number }).__miotLoads, 1);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
+type VoiceFastpathHandler = (
+  request: {
+    text: string;
+    channelId: string;
+    targetId?: string;
+    senderId?: string;
+    explicitWake?: boolean;
+    sessionState?: Record<string, unknown>;
+  },
+) => Promise<Record<string, unknown>>;
+
+const FASTPATH_REGISTRY_KEY = '__fridayTestVoiceFastpath';
+
+function getFastpathRegistry(): Map<string, VoiceFastpathHandler> {
+  const g = globalThis as Record<string, unknown>;
+  let map = g[FASTPATH_REGISTRY_KEY] as Map<string, VoiceFastpathHandler> | undefined;
+  if (!map) {
+    map = new Map();
+    g[FASTPATH_REGISTRY_KEY] = map;
   }
-});
+  return map;
+}
+
+async function installVoiceFastpathPlugin(home: string, pluginName: string, handler: VoiceFastpathHandler) {
+  const realHome = await realpath(home);
+  const pluginDir = join(realHome, 'plugins', pluginName);
+  await mkdir(pluginDir, { recursive: true });
+  await writeFile(join(pluginDir, 'plugin.json'), JSON.stringify({
+    name: pluginName,
+    version: '1.0.0',
+    description: 'Test voice fastpath plugin',
+    enabled: true,
+    runtime: 'in-process',
+    voiceFastpath: true,
+    entry: 'index.mjs',
+    actions: [],
+  }));
+  const registryKey = `${realHome}:${pluginName}`;
+  getFastpathRegistry().set(registryKey, handler);
+  await writeFile(join(pluginDir, 'index.mjs'), `
+export async function handleVoiceFastpath(request, context) {
+  const reg = globalThis[${JSON.stringify(FASTPATH_REGISTRY_KEY)}];
+  const fn = reg?.get(${JSON.stringify(registryKey)});
+  return fn ? fn(request, context) : { handled: false };
+}
+`);
+  return () => {
+    getFastpathRegistry().delete(registryKey);
+  };
+}
 
 // ---------------------------------------------------------------------------
 // ImGateway end-to-end
@@ -409,17 +442,98 @@ function makeChannel(id: string): ImChannelConfig {
   return {
     id, platform: 'xiaoai', name: id, enabled: true, notifyAll: false, allowedSenders: [],
     inboundCount: 0, outboundCount: 0, createdAt: now, updatedAt: now,
-    apiBase: 'ssh://lx06=root@192.168.31.104', pollIntervalMs: 60_000,
+    apiBase: 'ssh://lx06=root@192.0.2.104', pollIntervalMs: 60_000,
   };
 }
 
 /** Real SQLite Store + minimal Coordinator surface (the full Coordinator spawns a compiled executor child). */
-function makeGatewayHarness(home: string, channelId: string, miotRunner: XiaoaiMiotRunner) {
+async function makeGatewayHarness(home: string, channelId: string, miotRunner: XiaoaiMiotRunner) {
   const store = new Store(home);
   const routed: Array<{ requestId: string; text: string }> = [];
+  const sessionIds = new Map<string, string>();
+  const uninstallPlugin = await installVoiceFastpathPlugin(home, 'test-miot', async (req) => {
+    if (req.sessionState?.tvRemoteActive) return { handled: false };
+    const pending = req.sessionState?.pendingCook as { tempC?: number; minutes?: number } | undefined;
+    const intent = parseXiaoaiMiotUtterance(req.text, pending);
+    if (!intent) return { handled: false };
+    const out = await executeXiaoaiMiotFastpath(intent, { runMiot: miotRunner });
+    if (!out.handled) return { handled: false };
+    const nextSession = intent.kind === 'cook_clarify'
+      ? {
+          sessionState: {
+            pendingCook: {
+              ...(intent.tempC !== undefined ? { tempC: intent.tempC } : {}),
+              ...(intent.minutes !== undefined ? { minutes: intent.minutes } : {}),
+            },
+          },
+        }
+      : { clearSessionState: true };
+    return {
+      handled: true,
+      ok: out.ok,
+      speech: out.speech,
+      followUp: out.followUp,
+      ...nextSession,
+      plugin: 'test-miot',
+      action: out.actionName ?? 'xiaoai_miot_fastpath',
+    };
+  });
   const coordinator = {
+    homeDir: home,
     store,
     view: () => ({ mode: 'offline' }),
+    subscribeOutbound: () => () => {},
+    recordFastpathTurn: (input: {
+      channelId: string;
+      senderId: string;
+      senderName?: string;
+      userText: string;
+      replyText: string;
+      pluginName: string;
+      action: string;
+      latencyMs?: number;
+      sessionId?: string;
+      requestId?: string;
+      replyId?: string;
+      origin?: Record<string, unknown>;
+    }) => {
+      const now = Date.now();
+      const key = `${input.channelId}:${input.senderId}`;
+      const sessionId = input.sessionId ?? sessionIds.get(key) ?? randomUUID();
+      sessionIds.set(key, sessionId);
+      const userId = randomUUID();
+      const userMessage = store.conversation.create({
+        id: userId,
+        requestId: input.requestId,
+        role: 'user',
+        text: input.userText,
+        origin: input.origin as never,
+        status: 'completed',
+        paths: [],
+        mode: 'offline',
+        sessionId,
+        routing: {
+          at: now,
+          status: 'completed',
+          context: { execution: 'native', cwd: home, totalWorks: 0, truncated: false, works: [], messages: [] },
+          actions: [{ id: randomUUID(), kind: 'plugin', status: 'accepted', at: now, summary: input.pluginName }],
+        },
+        at: now,
+      });
+      const replyMessage = store.conversation.create({
+        id: input.replyId ?? randomUUID(),
+        role: 'assistant',
+        text: input.replyText,
+        replyTo: userId,
+        origin: input.origin as never,
+        status: 'completed',
+        paths: [],
+        mode: 'offline',
+        sessionId,
+        at: now + 1,
+      });
+      return { userMessage, replyMessage };
+    },
     chat: (requestId: string, text: string, _paths: string[], origin: Record<string, unknown>) => {
       routed.push({ requestId, text });
       return store.conversation.create({
@@ -435,9 +549,10 @@ function makeGatewayHarness(home: string, channelId: string, miotRunner: XiaoaiM
   };
   store.saveImChannel(makeChannel(channelId));
   const gateway = new ImGateway(coordinator as never);
-  gateway.xiaoaiDeps = { sshRunner, miotRunner };
+  gateway.xiaoaiDeps = { sshRunner };
   gateway.start();
   const close = async () => {
+    uninstallPlugin();
     await gateway.close();
     store.close();
   };
@@ -447,13 +562,13 @@ function makeGatewayHarness(home: string, channelId: string, miotRunner: XiaoaiM
 const isTts = (cmd: string) => cmd.includes('text_to_speech') || cmd.includes('tts_play.sh');
 
 test('ImGateway: MiOT fast path persists history, speaks exactly once, and never wakes the Router', async () => {
-  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-miot-'));
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-miot-'));
   const { runner, calls } = makeRunner([], {
     cook: args => (args.op === 'status'
       ? { ok: true, message: 'x', data: { fryer: { statusCode: 4, statusText: '烹饪中', leftTimeMin: 5 } } }
       : { ok: true, message: 'x', data: { tempC: args.tempC, minutes: args.minutes } }),
   });
-  const h = makeGatewayHarness(home, 'xiaoai-fast', runner);
+  const h = await makeGatewayHarness(home, 'xiaoai-fast', runner);
   try {
     await delay(30);
     h.sshCalls.length = 0;
@@ -462,7 +577,7 @@ test('ImGateway: MiOT fast path persists history, speaks exactly once, and never
       channelId: 'xiaoai-fast', externalId: 'fast-1', senderId: 'lx06', target: 'lx06', text: '空气炸锅200度5分钟',
     });
     assert.equal(res.ok, true);
-    assert.equal(res.action, 'xiaoai_miot_fastpath');
+    assert.equal(res.action, 'cook');
     assert.ok(res.messageId);
     assert.deepEqual(calls.filter(c => c.action === 'cook').map(c => c.args), [{ device: '空气炸锅', op: 'start', tempC: 200, minutes: 5 }]);
     assert.equal(h.routed.length, 0, 'Router must not be involved');
@@ -490,7 +605,7 @@ test('ImGateway: MiOT fast path persists history, speaks exactly once, and never
     const seen = (h.gateway as unknown as { seenMessageVersions: Map<string, number> }).seenMessageVersions;
     assert.equal(seen.get(reply.id), Number.MAX_SAFE_INTEGER);
 
-    // Exactly one spoken reply, even after several outbound flush ticks (150ms interval)
+    // Exactly one spoken reply, even after outbound flush ticks
     await until(() => h.sshCalls.some(isTts));
     await delay(600);
     const spoken = h.sshCalls.filter(isTts);
@@ -509,7 +624,7 @@ test('ImGateway: MiOT fast path persists history, speaks exactly once, and never
     const status = await h.gateway.ingestMessage({
       channelId: 'xiaoai-fast', externalId: 'fast-2', senderId: 'lx06', target: 'lx06', text: '空气炸锅还剩多久',
     });
-    assert.equal(status.action, 'xiaoai_miot_fastpath');
+    assert.equal(status.action, 'cook');
     await until(() => h.sshCalls.some(c => isTts(c) && c.includes('剩余5分钟')));
   } finally {
     await h.close();
@@ -518,15 +633,27 @@ test('ImGateway: MiOT fast path persists history, speaks exactly once, and never
 });
 
 test('ImGateway: ambiguous fast path replies with [[LISTEN]] follow-up; TV remote mode and unrelated chatter skip it', async () => {
-  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-miot-amb-'));
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-miot-amb-'));
   const { runner, calls } = makeRunner([ac('ac1', '客厅'), ac('ac2', '卧室')]);
-  const h = makeGatewayHarness(home, 'xiaoai-amb', runner);
+  const uninstallTvGate = await installVoiceFastpathPlugin(home, 'a-tv-gate', async (req) => {
+    if (req.text === '进入遥控测试') {
+      return {
+        handled: true,
+        followUp: true,
+        speech: '进入测试遥控。',
+        sessionState: { continuous: true, tvRemoteActive: true },
+        action: 'tv_gate',
+      };
+    }
+    return { handled: false };
+  });
+  const h = await makeGatewayHarness(home, 'xiaoai-amb', runner);
   try {
     await delay(30);
     const res = await h.gateway.ingestMessage({
       channelId: 'xiaoai-amb', externalId: 'amb-1', senderId: 'lx06', target: 'lx06', text: '把空调调到26度',
     });
-    assert.equal(res.action, 'xiaoai_miot_fastpath');
+    assert.equal(res.action, 'devices');
     const reply = h.store.conversation.history(undefined, 10).items.find(m => m.role === 'assistant')!;
     assert.equal(reply.text, '家里有多台空调，请说具体房间，比如客厅空调。 [[LISTEN]]');
     assert.equal(calls.some(c => c.action === 'set'), false);
@@ -538,25 +665,28 @@ test('ImGateway: ambiguous fast path replies with [[LISTEN]] follow-up; TV remot
     assert.deepEqual(h.routed.map(r => r.text), ['今天天气怎么样']);
     assert.equal(calls.length, 1, 'non smart-home chatter never reaches the MiOT runner');
 
-    // While the TV remote mode owns the dialog the fast path stays out of the way
-    const tv = (h.gateway as unknown as { xiaoaiTvRemote: { isActive: (c: string, t: string) => boolean } }).xiaoaiTvRemote;
-    tv.isActive = () => true;
+    // While a continuous TV remote fastpath session owns the dialog, MiOT runner stays out of the way
+    const enterTv = await h.gateway.ingestMessage({
+      channelId: 'xiaoai-amb', externalId: 'amb-tv-enter', senderId: 'lx06', target: 'lx06', text: '进入遥控测试',
+    });
+    assert.equal(enterTv.action, 'tv_gate');
     const callsBefore = calls.length;
     const tvTurn = await h.gateway.ingestMessage({
       channelId: 'xiaoai-amb', externalId: 'amb-3', senderId: 'lx06', target: 'lx06', text: '关闭客厅空调',
-    }).catch(() => undefined);
+    });
+    assert.equal(tvTurn.action, 'voice_fastpath_ignored');
     assert.equal(calls.length, callsBefore, 'MiOT runner untouched while TV remote mode is active');
-    void tvTurn;
   } finally {
+    uninstallTvGate();
     await h.close();
     await rm(home, { recursive: true, force: true });
   }
 });
 
 test('ImGateway: DEVICE_NOT_FOUND falls through to the Router seamlessly', async () => {
-  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-miot-fb-'));
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-miot-fb-'));
   const { runner, calls } = makeRunner([], { cook: () => ({ ok: false, message: '未找到设备 "空气炸锅"。可用设备：（无）。' }) });
-  const h = makeGatewayHarness(home, 'xiaoai-fb', runner);
+  const h = await makeGatewayHarness(home, 'xiaoai-fb', runner);
   try {
     await delay(30);
     const miss = await h.gateway.ingestMessage({
@@ -569,8 +699,8 @@ test('ImGateway: DEVICE_NOT_FOUND falls through to the Router seamlessly', async
     assert.equal(h.store.conversation.history(undefined, 10).items.filter(m => m.role === 'assistant').length, 0);
 
     // A crashing runner also degrades to the Router
-    const crashHome = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-miot-fb2-'));
-    const crash = makeGatewayHarness(crashHome, 'xiaoai-crash', async () => { throw new Error('plugin exploded'); });
+    const crashHome = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-miot-fb2-'));
+    const crash = await makeGatewayHarness(crashHome, 'xiaoai-crash', async () => { throw new Error('plugin exploded'); });
     try {
       await delay(30);
       const r = await crash.gateway.ingestMessage({
@@ -593,7 +723,7 @@ test('ImGateway: DEVICE_NOT_FOUND falls through to the Router seamlessly', async
 // ---------------------------------------------------------------------------
 
 test('verifyAndTrimUtterance relaxes the threshold for ≤2.0s clips but still rejects strangers and honours overrides', async () => {
-  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-spk-short-'));
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-spk-short-'));
   try {
     let score = 1;
     const factory = (): XiaoaiSpeakerExtractor => ({

@@ -72,7 +72,9 @@ export async function receiveMedia(root: string, item: Record<string, unknown>, 
     await mkdir(root, { recursive: true, mode: 0o700 });
     let stat = await lstat(root);
     if (stat.isDirectory() && !stat.isSymbolicLink() && (stat.mode & 0o077)) {
-      await chmod(root, 0o700).catch(() => {});
+      await chmod(root, 0o700).catch((err: unknown) => {
+        console.warn(`[wechat-inbound] chmod 0700 failed: ${err instanceof Error ? err.message : 'unknown'}`);
+      });
       stat = await lstat(root);
     }
     if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077)) throw new Error('Unsafe media directory');
@@ -80,5 +82,11 @@ export async function receiveMedia(root: string, item: Record<string, unknown>, 
     const file = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
     try { await file.writeFile(bytes); } finally { await file.close(); }
     return { ...result, status: 'ready', path, mimeType, bytes: bytes.length };
-  } catch { return { ...result, error: '附件接收失败（下载、大小、安全校验或解密失败）；请重新发送。' }; }
+  } catch (error) {
+    const safeReason = error instanceof Error
+      ? error.message.replace(/https?:\/\/\S+/g, '[url]')
+      : 'unknown error';
+    console.warn(`[wechat-inbound] media receive failed (${kind}): ${safeReason}`);
+    return { ...result, error: '附件接收失败（下载、大小、安全校验或解密失败）；请重新发送。' };
+  }
 }
