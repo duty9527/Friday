@@ -482,6 +482,7 @@ export async function handleTvIrVoiceFastpath(request, context = {}, actionExecu
     if (!cleaned || FILLER_NOISE_RE.test(cleaned) || cleaned.length <= 24) {
       return {
         handled: true,
+        action: 'voice_fastpath_ignored',
         speech: '',
         followUp: true,
         followUpWaitMs: TV_REMOTE_FOLLOW_UP_WAIT_MS,

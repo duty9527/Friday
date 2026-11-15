@@ -435,6 +435,7 @@ test('tv-ir handleVoiceFastpath manages continuous remote mode, noise filtering,
       sessionState: { tvRemoteActive: true },
     }, ctx);
     assert.equal(noiseRes.handled, true);
+    assert.equal(noiseRes.action, 'voice_fastpath_ignored');
     assert.equal(noiseRes.speech, '');
     assert.equal((noiseRes.data as Record<string, unknown>)?.extendTtl, false);
     assert.equal((noiseRes.data as Record<string, unknown>)?.recordTurn, false);
