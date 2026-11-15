@@ -1,0 +1,57 @@
+{
+  "name": "miot",
+  "title": "全屋米家设备发现与控制 (BE6500 Pro 中枢 + 局域网 MiIO)",
+  "description": "通过小米 BE6500 Pro 路由器中枢（SSH 读取 central 设备库 devInfo.db / hot_data_v2.db）发现全屋米家设备与缓存状态，并用三条本地通道直控：① 蓝牙 Mesh 灯/开关/插座经中枢内部 MIPS MQTT 总线（local/bt/rpcReq）读写；② Wi-Fi 设备（如空气炸锅 careli.fryer.maf01）经局域网 MiIO UDP :54321 加密直连，支持定温定时烹饪；③ 红外虚拟空调经 LX06 小爱 mibrain 静默 NLP 指令，电视电源委托 tv-agent。所有设备 token 仅保存在本机 0600 缓存中，绝不出现在任何输出里。",
+  "entry": "index.mjs",
+  "actions": ["status", "devices", "get", "set", "cook", "action", "command", "config"],
+  "actionSpecs": [
+    {
+      "name": "status",
+      "label": "检查中枢与音箱连通性",
+      "description": "探测路由器中枢 SSH（并确认 central_service 进程）与 LX06 小爱音箱 SSH（确认 mibrain 可用），并返回本机设备缓存的数量与新鲜度及当前配置。不读取设备库、不控制任何设备。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "devices",
+      "label": "发现全屋设备与状态",
+      "description": "读取中枢设备库并返回全屋设备清单（did、名称、房间、品类、控制通道 controlChannel、controllable、是否在线、hasToken 等，不含 token）。可选 room（如 \"卧室\"）、category（light/灯、outlet/插座、switch/开关、air_fryer/空气炸锅、air_conditioner/空调、tv/电视、speaker/音箱，名称含“灯”的插座/开关同时归入灯）、controllableOnly。默认使用中枢缓存状态；live=true 时实时读取蓝牙 Mesh 开关状态与空气炸锅工作状态（如“家里哪些灯开着”）。结果缓存 cacheTtlMs（默认 15 秒），refresh=true 强制重新读取。",
+      "defaultArgs": { "live": true }
+    },
+    {
+      "name": "get",
+      "label": "查询单个设备实时状态",
+      "description": "按 device（如 \"卧室灯\"、\"鱼缸灯\"、\"乌龟灯\"、\"空气炸锅\"、\"卧室空调\"、\"电视\"）、did 与可选 room 解析设备并读取实时状态：蓝牙 Mesh 灯/插座返回开/关；空气炸锅返回工作状态、目标温度/时长、剩余分钟、故障码；电视委托 tv-agent；红外空调无状态回读。名称匹配多个设备（如仅说“空调”）会报错并列出候选，需补充 room。",
+      "defaultArgs": { "device": "卧室灯" }
+    },
+    {
+      "name": "set",
+      "label": "控制灯/开关/插座/空调/电视",
+      "description": "设备由 device/did/room 指定。蓝牙 Mesh 灯、开关、插座：on=true|false 或 toggle=true（先读实时状态再取反）；或通用属性写入 siid+piid+value。红外空调（必须区分客厅/卧室）：on、temperature(16-30)、mode(cool/heat/auto/dry/fan)、fanSpeed(auto/low/medium/high)，会组合成带房间前缀的中文指令（如“打开卧室空调”“把卧室空调调到26度”）经 LX06 小爱静默执行，speakReply=true 时朗读回复。电视：on=true|false|toggle 委托 tv-agent 幂等开关机。dryRun=true 仅返回计划不执行。",
+      "defaultArgs": { "device": "卧室灯", "on": true }
+    },
+    {
+      "name": "cook",
+      "label": "空气炸锅烹饪控制",
+      "description": "控制空气炸锅 careli.fryer.maf01（局域网 MiIO UDP 直连）。op=status|start|pause|resume|stop（cancel 同 stop）。start 支持 tempC（40-200，默认 180）、minutes（1-1440，默认 15）、recipe（手动/M0、薯条/M1、鸡翅/M2、红薯/M3、蛋挞/M4、解冻/M5、果干/M6、酸奶/M7，未给温度时长时使用菜单推荐值）、preheat、appointMinutes（预约分钟）、foodQuantity（0-4）；通过 start-custom-cook 点火并回读状态，抽锅暂停（炸篮被拉出）时会提示物理互锁并不下发。dryRun=true 仅返回计划。",
+      "defaultArgs": { "op": "status" }
+    },
+    {
+      "name": "action",
+      "label": "调用 MIoT 动作",
+      "description": "低层 MIoT action：device/did/room 指定设备（蓝牙 Mesh 或 Wi-Fi MiIO 设备），siid、aiid 为必填整数，in 为可选输入参数数组。dryRun=true 仅返回将发送的请求。日常控制请优先使用 set / cook。",
+      "defaultArgs": { "siid": 2, "aiid": 1, "in": [], "dryRun": true }
+    },
+    {
+      "name": "command",
+      "label": "小爱自然语言指令",
+      "description": "把任意自然语言指令（如 \"打开客厅空调\"）经 LX06 小爱音箱 ubus mibrain ai_service 静默执行（nlp_execute，默认不出声；speakReply=true 时朗读回复）。可用 speakerSsh（[id=]user@host[:port]）覆盖音箱 SSH 目标，dryRun=true 仅返回将发送的命令。",
+      "defaultArgs": { "text": "打开客厅空调" }
+    },
+    {
+      "name": "config",
+      "label": "读取或设置米家配置",
+      "description": "查看或更新 routerSsh（默认 root@192.168.31.1，支持 id=user@host:port）、speakerSsh（留空则自动发现：config → state.sqlite 的 xiaoai 通道 → 默认 root@192.168.31.104）、cacheTtlMs（设备库缓存毫秒，默认 15000）、udpTimeoutMs（局域网 MiIO 超时毫秒，默认 3500），持久化到插件数据目录 config.json。",
+      "defaultArgs": {}
+    }
+  ]
+}

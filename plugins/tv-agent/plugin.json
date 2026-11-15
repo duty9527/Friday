@@ -1,0 +1,69 @@
+{
+  "name": "tv-agent",
+  "title": "红米/小米电视智能 Agent (无障碍 + DLNA + Gemini 决策)",
+  "description": "通过电视端 local.friday.tvagent (:8989) 无障碍 HTTP Agent 与 DLNA (:49152) 精确控制红米/小米电视：幂等开关机（仅必要时才发红外电源键）、精确音量/静音、DLNA 投屏、应用别名启动、界面树/截图读取，以及基于 gemini-decision-1 的多步（文本树 + 截图多模态回退）自主界面导航。",
+  "entry": "index.mjs",
+  "actions": ["status", "power", "volume", "cast", "open_app", "tree", "screenshot", "act", "navigate", "config"],
+  "actionSpecs": [
+    {
+      "name": "status",
+      "label": "查看电视状态",
+      "description": "探测 :8989/status 与 :49152/description.xml 判定在线(online)/关机待机(standby_or_off)，并通过 UPnP RenderingControl 读取精确音量与静音，返回前台应用包名/名称、a11yBound、已安装应用列表。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "power",
+      "label": "幂等开关机",
+      "description": "state=on|off|toggle。已开机时 on 只发 wake 不发红外；已关机/待机时 off 不发红外；仅在状态不符时才通过 tv-ir 发送电源键，开机后轮询等待上线（waitMs，默认 22000）。",
+      "defaultArgs": { "state": "on", "waitMs": 22000 }
+    },
+    {
+      "name": "volume",
+      "label": "精确音量/静音",
+      "description": "通过 DLNA RenderingControl SOAP 读取/设置音量：level 绝对值、delta 相对增减（先读后设，0-100 夹紧）、mute 静音开关；无参数仅读取。仅在 DLNA 失败时回退红外 vol_up/vol_down。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "cast",
+      "label": "DLNA 投屏控制",
+      "description": "op=play|pause|resume|stop|seek|info。play 带 url（可选 title 生成 DIDL-Lite 元数据）时执行 SetAVTransportURI + Play；seek 用 position（秒或 mm:ss/hh:mm:ss）；info 返回传输状态与播放进度。",
+      "defaultArgs": { "op": "info" }
+    },
+    {
+      "name": "open_app",
+      "label": "打开应用",
+      "description": "按别名/包名/已安装应用名模糊匹配启动：bili(B站)、youtube/smarttube(油管)、live(直播/我的电视)、tvbox(影视仓)、hdbox(久久影视)、home(桌面/Projectivy)。传 uri 时通过 open_uri 打开链接。",
+      "defaultArgs": { "app": "home" }
+    },
+    {
+      "name": "tree",
+      "label": "读取界面树",
+      "description": "GET :8989/tree，返回前台界面无障碍节点（文字、viewId、焦点/可点击/可输入/可滚动标记与坐标）。maxNodes 默认 80。",
+      "defaultArgs": { "maxNodes": 80 }
+    },
+    {
+      "name": "screenshot",
+      "label": "电视截图",
+      "description": "GET :8989/screenshot，返回截图尺寸与大小；savePath 可保存 JPEG 到本地，includeBase64=true 时返回 base64。",
+      "defaultArgs": { "maxWidth": 960, "quality": 70 }
+    },
+    {
+      "name": "act",
+      "label": "执行界面动作",
+      "description": "直接 POST :8989/act：wake、global(name=back/home/recents/notifications/quick_settings)、click(id 或 x,y)、focus、set_text(id?,text)、scroll(id?,direction)、launch_app(package)、open_uri(uri,package?)。",
+      "defaultArgs": { "action": "wake" }
+    },
+    {
+      "name": "navigate",
+      "label": "智能界面导航",
+      "description": "用自然语言 goal 驱动多步导航（maxSteps 默认 8，范围 1-12；settleMs 默认 900）：唤醒电视、必要时先启动 app，循环读取界面树（信息不足/重复状态时自动附带截图走多模态），由 gemini-decision-1 判断目标是否达成并选择点击/输入搜索词/滚动/返回等动作，达成、阻塞或重复无效时自动停止并返回步骤轨迹。",
+      "defaultArgs": { "goal": "打开 B 站", "app": "bili", "maxSteps": 8, "settleMs": 900 }
+    },
+    {
+      "name": "config",
+      "label": "读取或设置电视配置",
+      "description": "查看或更新 tvHost（默认 192.168.31.182）、agentPort（8989）、dlnaPort（49152）、sshTarget（可选），持久化到插件数据目录 config.json。",
+      "defaultArgs": {}
+    }
+  ]
+}

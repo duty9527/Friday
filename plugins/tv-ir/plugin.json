@@ -1,0 +1,45 @@
+{
+  "name": "tv-ir",
+  "title": "红米/小米电视红外遥控 (LX06)",
+  "description": "通过小爱音箱 Pro (LX06) 内置万能红外 (ubus ir_agent) 毫秒级操控红米/小米电视：支持上下左右、确认(点击)、返回、菜单、主页、音量加减、电源、组合按键序列与物理遥控红外自学习。",
+  "entry": "index.mjs",
+  "actions": ["status", "keys", "press", "sequence", "learn", "config"],
+  "actionSpecs": [
+    {
+      "name": "status",
+      "label": "检查红外发射状态",
+      "description": "自动从本地配置或已绑定小爱通道解析 LX06 音箱 SSH 地址，检查 ubus ir_agent 服务与红外发射硬件是否就绪，并列出已学习按键。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "keys",
+      "label": "查看支持按键列表",
+      "description": "列出红米/小米电视全量预设按键（含 20-bit 4-PPM 编码与中文别名）以及已通过遥控器自学习的按键。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "press",
+      "label": "发送单个遥控按键",
+      "description": "向电视发送指定遥控按键（支持 up/down/left/right/ok/back/menu/home/vol_up/vol_down/power 及中文别名），支持 count 连发与 dryRun 预演。",
+      "defaultArgs": { "key": "ok", "count": 1 }
+    },
+    {
+      "name": "sequence",
+      "label": "执行组合按键序列",
+      "description": "按顺序依次发送多个遥控按键（支持 [\"down\",\"down\",\"ok\"]、\"down*2,ok\" 或中文序列），自动加入帧间保护延时防驱动缓冲覆盖。",
+      "defaultArgs": { "keys": ["down", "ok"], "intervalMs": 240 }
+    },
+    {
+      "name": "learn",
+      "label": "学习物理遥控红外码",
+      "description": "开启 LX06 红外接收窗口，对着音箱按下物理遥控器按键，自动捕获脉冲并保存覆盖同名按键或新增自定义按键（如 source/mute）。",
+      "defaultArgs": { "key": "custom_key", "timeoutMs": 12000 }
+    },
+    {
+      "name": "config",
+      "label": "读取或设置遥控配置",
+      "description": "查看或更新默认音箱 SSH 目标（sshTarget）、连续按键间隔（defaultIntervalMs）及默认发码帧数（defaultFrames）。",
+      "defaultArgs": {}
+    }
+  ]
+}

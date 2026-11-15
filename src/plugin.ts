@@ -1,8 +1,8 @@
 import { execFile } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import type { PluginActionSpec, PluginView } from './view.js';
 
@@ -91,6 +91,109 @@ export async function listPlugins(home: string): Promise<PluginManifest[]> {
   return listPluginsSync(home);
 }
 
+interface InProcessPluginModule {
+  runAction?: (
+    action: string,
+    args: Record<string, unknown>,
+    deps?: Record<string, unknown>,
+  ) => Promise<unknown>;
+  executeMiotAction?: (
+    action: string,
+    args: Record<string, unknown>,
+    deps?: Record<string, unknown>,
+  ) => Promise<unknown>;
+}
+
+const IN_PROCESS_MODULE_CACHE = new Map<string, { mtimeMs: number; promise: Promise<InProcessPluginModule> }>();
+
+function loadInProcessPluginModule(entryPath: string): Promise<InProcessPluginModule> {
+  let mtimeMs = 0;
+  try {
+    mtimeMs = Math.trunc(statSync(entryPath).mtimeMs);
+  } catch {
+    mtimeMs = 0;
+  }
+  const existing = IN_PROCESS_MODULE_CACHE.get(entryPath);
+  if (existing && existing.mtimeMs === mtimeMs) {
+    return existing.promise;
+  }
+  const baseHref = pathToFileURL(entryPath).href;
+  const spec = existing ? `${baseHref}?mtime=${mtimeMs}` : baseHref;
+  const promise = import(spec) as Promise<InProcessPluginModule>;
+  IN_PROCESS_MODULE_CACHE.set(entryPath, { mtimeMs, promise });
+  return promise;
+}
+
+export async function runPluginInProcess(
+  home: string,
+  name: string,
+  action = 'status',
+  args: Record<string, unknown> = {},
+  timeoutMs = 30_000,
+): Promise<PluginRunResult> {
+  const cleanName = name.trim();
+  if (!VALID_PLUGIN_NAME.test(cleanName)) {
+    throw new Error(`Invalid plugin name: ${cleanName}`);
+  }
+  const plugins = listPluginsSync(home);
+  const manifest = plugins.find(p => p.name === cleanName);
+  if (!manifest) {
+    throw new Error(`Plugin "${cleanName}" not found`);
+  }
+  const entryPath = manifest.entryPath;
+  const dataDir = manifest.dataDir;
+  await mkdir(dataDir, { recursive: true, mode: 0o700 });
+
+  const cleanEnv: Record<string, string | undefined> = { ...process.env };
+  for (const key of Object.keys(cleanEnv)) {
+    if (/(?:API_KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i.test(key)) delete cleanEnv[key];
+  }
+  cleanEnv.SUPER_AGENT_HOME = home;
+  cleanEnv.PLUGIN_DATA_DIR = dataDir;
+
+  const mod = await loadInProcessPluginModule(entryPath);
+  const runner = typeof mod.runAction === 'function' ? mod.runAction : mod.executeMiotAction;
+  if (typeof runner !== 'function') {
+    throw new Error(`Plugin "${cleanName}" does not export runAction`);
+  }
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const rawResult = await Promise.race([
+    runner(action, args, { homeDir: home, dataDir, env: cleanEnv }),
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`Plugin "${cleanName}" action "${action}" timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+    }),
+  ]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+
+  if (rawResult && typeof rawResult === 'object') {
+    const parsed = rawResult as Record<string, unknown>;
+    return {
+      ok: parsed.ok === undefined ? true : Boolean(parsed.ok),
+      plugin: cleanName,
+      action,
+      notify: parsed.notify === undefined ? true : Boolean(parsed.notify),
+      title: typeof parsed.title === 'string' ? parsed.title : undefined,
+      message: typeof parsed.message === 'string' ? parsed.message : JSON.stringify(parsed),
+      data: parsed.data,
+    };
+  }
+  const trimmed = rawResult === undefined || rawResult === null ? '' : String(rawResult).trim();
+  if (!trimmed) {
+    return { ok: true, plugin: cleanName, action, notify: false, message: '' };
+  }
+  return {
+    ok: true,
+    plugin: cleanName,
+    action,
+    notify: true,
+    message: trimmed,
+  };
+}
+
 export async function runPlugin(
   home: string,
   name: string,
@@ -106,6 +209,13 @@ export async function runPlugin(
   const manifest = plugins.find(p => p.name === cleanName);
   if (!manifest) {
     throw new Error(`Plugin "${cleanName}" not found`);
+  }
+  const normalizedEntry = manifest.entryPath.replace(/\\/g, '/');
+  if (
+    (cleanName === 'miot' && normalizedEntry.endsWith('plugins/miot/index.mjs')) ||
+    (cleanName === 'health-scale' && normalizedEntry.endsWith('plugins/health-scale/index.mjs'))
+  ) {
+    return runPluginInProcess(home, cleanName, action, args, timeoutMs);
   }
   const entryPath = manifest.entryPath;
   const dataDir = manifest.dataDir;
