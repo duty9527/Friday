@@ -8,8 +8,6 @@ import {
   shortText,
   sourceIcon,
   statusLabel,
-  type FlowchartEdge,
-  type FlowchartFrame,
   type FlowchartGraph,
   type FlowchartNode,
   type InspectorPayload,
@@ -17,8 +15,6 @@ import {
   type MindmapJevQualityGateItem,
   type MindmapJevRouteInfo,
   type MindmapRecalledItem,
-  type MindmapRouterToolCall,
-  type MindmapRouterTurn,
   type MindmapSession,
   type MindmapSnapshot,
   type MindmapTaskDetail,
@@ -26,8 +22,8 @@ import {
   type MindmapWorkerPhase,
   type MindmapWorkerStep,
 } from './mindmap-data.js';
+import { ApiError, consumeSseStream, createHttpClient, resolveBootstrapToken } from './shared/auth-http.js';
 
-const TOKEN_STORAGE_KEY = 'super-agent.local-access-token';
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
 type ViewMode = 'session' | 'overview' | 'list';
@@ -57,24 +53,9 @@ function domEl<K extends keyof HTMLElementTagNameMap>(
   return node;
 }
 
-function extractBootstrapToken(): string {
-  const hash = new URLSearchParams(location.hash.startsWith('#') ? location.hash.slice(1) : location.hash);
-  const hashToken = hash.get('token')?.trim();
-  if (hashToken) {
-    try { sessionStorage.setItem(TOKEN_STORAGE_KEY, hashToken); } catch { /* ignore */ }
-    hash.delete('token');
-    const cleanHash = hash.toString();
-    history.replaceState(null, '', `${location.pathname}${location.search}${cleanHash ? `#${cleanHash}` : ''}`);
-    return hashToken;
-  }
-  try {
-    return sessionStorage.getItem(TOKEN_STORAGE_KEY)?.trim() ?? '';
-  } catch {
-    return '';
-  }
-}
-
-let accessToken = extractBootstrapToken();
+const accessToken = resolveBootstrapToken().token;
+let authExpired = false;
+let sseRetryDelay = 1000;
 let snapshot: MindmapSnapshot | null = null;
 let loadedFlows: MindmapTaskFlow[] = [];
 let viewMode: ViewMode = 'session';
@@ -101,7 +82,6 @@ let dragPanStartX = 0;
 let dragPanStartY = 0;
 
 const workspaceEl = el<HTMLElement>('mm-canvas-panel').parentElement!;
-const backLinkEl = el<HTMLAnchorElement>('mm-back-link');
 const toggleSidebarBtn = el<HTMLButtonElement>('mm-toggle-sidebar');
 const viewSessionBtn = el<HTMLButtonElement>('view-session-btn');
 const viewOverviewBtn = el<HTMLButtonElement>('view-overview-btn');
@@ -150,21 +130,27 @@ const edgesLayerEl = el<SVGGElement>('mm-edges');
 const nodesLayerEl = el<SVGGElement>('mm-nodes');
 const inspectorBodyEl = el<HTMLElement>('mm-inspector-body');
 
+function markAuthExpired() {
+  authExpired = true;
+  sseAbort?.abort();
+  sseAbort = null;
+  if (refreshTimer) {
+    clearTimeout(refreshTimer);
+    refreshTimer = undefined;
+  }
+  authBannerEl.hidden = false;
+  setConnState('error', '需要令牌认证');
+}
+
+const http = createHttpClient({
+  token: accessToken,
+  isExpired: () => authExpired,
+  onAuthExpired: markAuthExpired,
+  missingTokenMessage: 'Unauthorized',
+});
+
 async function apiGet<T>(path: string): Promise<T> {
-  const headers: Record<string, string> = {};
-  if (accessToken) headers.authorization = `Bearer ${accessToken}`;
-  const res = await fetch(path, { headers });
-  if (res.status === 401) {
-    authBannerEl.hidden = false;
-    connPillEl.textContent = '需要令牌认证';
-    connPillEl.className = 'mm-conn-pill error';
-    throw new Error('Unauthorized');
-  }
-  if (!res.ok) {
-    const errText = await res.text().catch(() => '');
-    throw new Error(`HTTP ${res.status}: ${errText}`);
-  }
-  return res.json() as Promise<T>;
+  return http.api<T>(path);
 }
 
 function setConnState(state: 'live' | 'error' | 'loading', label: string) {
@@ -565,6 +551,7 @@ function renderFlowchartCanvas() {
       btnG.appendChild(btnLabel);
       btnG.addEventListener('click', ev => {
         ev.stopPropagation();
+        if (dragMoved) return;
         collapseOverride.set(frame.toggleKey!, !frame.collapsed);
         rebuildAndRenderCanvas(false);
       });
@@ -572,6 +559,7 @@ function renderFlowchartCanvas() {
     }
 
     fg.addEventListener('click', () => {
+      if (dragMoved) return;
       if (currentGraph?.mode === 'overview') {
         selectedSessionId = frame.sessionId;
         switchViewMode('session');
@@ -645,6 +633,7 @@ function renderFlowchartCanvas() {
       tg.appendChild(tt);
       tg.addEventListener('click', ev => {
         ev.stopPropagation();
+        if (dragMoved) return;
         collapseOverride.set(n.toggleKey!, !n.collapsed);
         selectedNodeId = n.id;
         renderSidebar();
@@ -655,6 +644,7 @@ function renderFlowchartCanvas() {
 
     g.addEventListener('click', ev => {
       ev.stopPropagation();
+      if (dragMoved) return;
       if (n.kind === 'worker_more' && n.toggleKey) {
         collapseOverride.set(n.toggleKey, false);
         rebuildAndRenderCanvas(false);
@@ -1359,13 +1349,24 @@ function switchViewMode(next: ViewMode) {
 }
 
 async function refreshMindmap(fitOnFirst = false) {
+  if (authExpired) return;
   try {
     setConnState('loading', '同步中…');
     const data = await apiGet<MindmapSnapshot>('/api/mindmap?limit=120');
     authBannerEl.hidden = true;
-    snapshot = data;
-    loadedFlows = data.flows;
-    const sessCount = data.summary.totalSessions ?? getEffectiveSessions(data, data.flows).length;
+    const latestIds = new Set(data.flows.map(flow => flow.id));
+    const olderPreserved = loadedFlows.filter(flow => !latestIds.has(flow.id));
+    loadedFlows = [...data.flows, ...olderPreserved];
+    const hasOlderPreserved = olderPreserved.length > 0;
+    snapshot = hasOlderPreserved && snapshot
+      ? {
+          ...data,
+          flows: loadedFlows,
+          hasMore: snapshot.hasMore,
+          beforeSeq: snapshot.beforeSeq,
+        }
+      : data;
+    const sessCount = data.summary.totalSessions ?? getEffectiveSessions(data, loadedFlows).length;
     setConnState('live', `已连接实时库 (${sessCount} 会话 · ${data.summary.totalFlows} 句)`);
     renderKpis();
     renderSidebar();
@@ -1373,14 +1374,14 @@ async function refreshMindmap(fitOnFirst = false) {
     else rebuildAndRenderCanvas(fitOnFirst);
     ensureSseConnected(data.cursor);
   } catch (err) {
-    if ((err as Error).message !== 'Unauthorized') {
+    if (!(err instanceof ApiError && err.status === 401)) {
       setConnState('error', '读取失败');
     }
   }
 }
 
 async function loadMoreFlows() {
-  if (!snapshot?.hasMore || !snapshot.beforeSeq) return;
+  if (!snapshot?.hasMore || !snapshot.beforeSeq || authExpired) return;
   loadMoreBtn.disabled = true;
   loadMoreBtn.textContent = '加载中…';
   try {
@@ -1405,60 +1406,40 @@ async function loadMoreFlows() {
 
 function ensureSseConnected(initialCursor: number) {
   sseCursor = Math.max(sseCursor, initialCursor);
-  if (sseAbort || !accessToken) return;
+  if (sseAbort || !accessToken || authExpired) return;
   const startStream = async () => {
     const controller = new AbortController();
     sseAbort = controller;
     try {
-      const response = await fetch(`/api/stream?after=${sseCursor}`, {
+      const response = await http.request(`/api/stream?after=${sseCursor}`, {
         signal: controller.signal,
-        headers: {
-          authorization: `Bearer ${accessToken}`,
-          Accept: 'text/event-stream',
+        headers: { Accept: 'text/event-stream' },
+      });
+      sseRetryDelay = 1000;
+      await consumeSseStream(response, {
+        shouldContinue: () => !controller.signal.aborted && !authExpired,
+        onEvent: (kind, raw) => {
+          if (kind === 'updates' && raw) {
+            sseRetryDelay = 1000;
+            try {
+              const batch = JSON.parse(raw) as { cursor?: number };
+              if (typeof batch.cursor === 'number') sseCursor = Math.max(sseCursor, batch.cursor);
+            } catch { /* ignore */ }
+            if (refreshTimer) clearTimeout(refreshTimer);
+            refreshTimer = window.setTimeout(() => { void refreshMindmap(false); }, 450);
+          }
         },
       });
-      if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let eventName = 'message';
-      let dataLines: string[] = [];
-      const dispatch = () => {
-        const raw = dataLines.join('\n');
-        dataLines = [];
-        const kind = eventName;
-        eventName = 'message';
-        if (kind === 'updates' && raw) {
-          try {
-            const batch = JSON.parse(raw) as { cursor?: number };
-            if (typeof batch.cursor === 'number') sseCursor = Math.max(sseCursor, batch.cursor);
-          } catch { /* ignore */ }
-          if (refreshTimer) clearTimeout(refreshTimer);
-          refreshTimer = window.setTimeout(() => { void refreshMindmap(false); }, 450);
-        }
-      };
-      try {
-        while (!controller.signal.aborted) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          let nl: number;
-          while ((nl = buffer.indexOf('\n')) !== -1) {
-            const line = buffer.slice(0, nl).replace(/\r$/, '');
-            buffer = buffer.slice(nl + 1);
-            if (!line) dispatch();
-            else if (line.startsWith('event:')) eventName = line.slice(6).trim();
-            else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
-          }
-        }
-      } finally {
-        await reader.cancel().catch(() => {});
-        reader.releaseLock();
-      }
-    } catch {
+    } catch (err) {
       if (sseAbort === controller) sseAbort = null;
-      if (!controller.signal.aborted && accessToken) {
-        window.setTimeout(() => ensureSseConnected(sseCursor), 3000);
+      if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+        markAuthExpired();
+        return;
+      }
+      if (!controller.signal.aborted && accessToken && !authExpired) {
+        const waitMs = sseRetryDelay;
+        sseRetryDelay = Math.min(sseRetryDelay * 2, 10_000);
+        window.setTimeout(() => ensureSseConnected(sseCursor), waitMs);
       }
     }
   };
@@ -1466,10 +1447,6 @@ function ensureSseConnected(initialCursor: number) {
 }
 
 /* ==================== 交互事件绑定 ==================== */
-
-if (accessToken) {
-  backLinkEl.href = `/#token=${encodeURIComponent(accessToken)}`;
-}
 
 toggleSidebarBtn.addEventListener('click', () => {
   workspaceEl.classList.toggle('sidebar-collapsed');
@@ -1571,6 +1548,9 @@ window.addEventListener('mousemove', ev => {
 
 window.addEventListener('mouseup', () => {
   isDragging = false;
+  if (dragMoved) {
+    window.setTimeout(() => { dragMoved = false; }, 0);
+  }
 });
 
 svgElRoot.addEventListener('wheel', ev => {

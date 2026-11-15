@@ -161,14 +161,6 @@ label {
   background:url("/logo.png") center/contain no-repeat;
   flex-shrink:0;
 }
-.mark {
-  color:var(--accent);
-  font-size:22px;
-  margin-right:4px;
-}
-.workspace {
-  margin-left:auto;
-}
 .mode {
   white-space:nowrap;
 }
@@ -319,9 +311,6 @@ label {
 }
 .running {
   color:var(--accent);
-}
-.sidebar-bottom {
-  padding:16px 8px 0;
 }
 .sheet {
   margin:0 8px 8px 0;
@@ -530,11 +519,6 @@ label {
   border:1px solid #bcc3c6;
   border-radius:8px;
 }
-.composer>label {
-  font-size:12px;
-  font-weight:400;
-  color:var(--muted);
-}
 .composer #draft {
   border:0;
   padding:2px 0 8px;
@@ -558,9 +542,6 @@ label {
 }
 .paths-disclosure textarea {
   font:12px/1.6 "IBM Plex Mono",monospace;
-}
-.paths-disclosure p {
-  margin-top:6px;
 }
 .composer-bottom {
   display:flex;
@@ -857,10 +838,6 @@ pre {
   max-height:340px;
   overflow:auto;
   margin:10px 0;
-}
-.trace-help {
-  padding:14px 20px;
-  border-top:1px solid var(--border);
 }
 .trace-more {
   width:100%;
@@ -1165,7 +1142,7 @@ pre {
   width:110px;
   flex:0 0 110px;
 }
-.hub-interval-Quick {
+.hub-interval-quick {
   display:flex;
   gap:4px;
   flex-wrap:wrap;
@@ -1266,6 +1243,10 @@ pre {
   background:var(--raised);
   color:var(--muted);
 }
+.badge-purple {
+  background:#f3e8ff;
+  color:#6b21a8;
+}
 .hub-tag-chip {
   display:inline-flex;
   align-items:center;
@@ -1346,16 +1327,6 @@ pre {
   flex-direction:column;
   gap:4px;
 }
-.wechat-hero-badge {
-  display:inline-flex;
-  width:fit-content;
-  padding:2px 8px;
-  border-radius:999px;
-  background:#dcfce7;
-  color:#166534;
-  font-size:11px;
-  font-weight:600;
-}
 .wechat-hero-action .wechat-qr-trigger {
   padding:8px 16px;
   font-size:13px;
@@ -1390,11 +1361,6 @@ pre {
   font-size:13px;
   font-weight:600;
   color:#166534;
-}
-.wechat-qr-steps {
-  margin:0;
-  padding-left:18px;
-  line-height:1.7;
 }
 .voiceprint-hero-card {
   background:linear-gradient(135deg,#f3f9fb 0%,#ffffff 68%);
@@ -1503,13 +1469,6 @@ pre {
 .router-tier-card {
   border-left:3px solid var(--accent);
 }
-.worker-tiers-card {
-  border-left:3px solid #1f8849;
-}
-.worker-provider-row {
-  padding-bottom:10px;
-  border-bottom:1px dashed var(--border);
-}
 .tier-title-line {
   display:flex;
   align-items:center;
@@ -1527,22 +1486,6 @@ pre {
 .router-badge {
   background:#e6f4f7;
   color:#145869;
-}
-.worker-badge {
-  background:#e7f7ed;
-  color:#166534;
-}
-.fast-badge {
-  background:#fef3c7;
-  color:#92400e;
-}
-.balanced-badge {
-  background:#e8f1ff;
-  color:#1d4ed8;
-}
-.strong-badge {
-  background:#f3e8ff;
-  color:#6b21a8;
 }
 .modal-provider-title-group {
   display:flex;
@@ -1956,9 +1899,6 @@ pre {
   .topbar-hub-bar {
     max-width:100%;
   }
-  .workspace {
-    display:none;
-  }
   .mode {
     margin-left:auto;
   }
@@ -2002,9 +1942,6 @@ pre {
   }
   .brand {
     font-size:15px;
-  }
-  .mark {
-    margin-right:0;
   }
   .topbar button,.topbar .hub-pill-btn {
     font-size:12px;
@@ -2093,9 +2030,6 @@ pre {
   }
   .trace-heading {
     padding-top:12px;
-  }
-  .trace-help {
-    padding:10px 20px;
   }
   .sidebar {
     width:calc(100% - 16px);

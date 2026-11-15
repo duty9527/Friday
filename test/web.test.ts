@@ -1,11 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { request as httpRequest } from 'node:http';
-import { mkdtemp, realpath, rm, writeFile, mkdir } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, realpath, rm, writeFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, posix } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import { serve } from '../dist/server.js';
 import { startWeb } from '../dist/web-server.js';
 import { XiaoaiSpeakerManager } from '../dist/xiaoai-speaker.js';
@@ -127,19 +128,119 @@ test('Web reports unavailable daemon rather than fabricating successful response
   } finally { await f.close(); }
 });
 
-test('every module the page imports is actually served, so the UI cannot silently fail to boot', async () => {
+async function collectDistWebJsFiles(): Promise<Array<{ rel: string; text: string }>> {
+  const webRoot = fileURLToPath(new URL('../dist/web/', import.meta.url));
+  const out: Array<{ rel: string; text: string }> = [];
+  async function walk(dir: string, prefix: string): Promise<void> {
+    const entries = await readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) await walk(full, rel);
+      else if (entry.isFile() && entry.name.endsWith('.js')) out.push({ rel, text: await readFile(full, 'utf8') });
+    }
+  }
+  await walk(webRoot, '');
+  return out;
+}
+
+test('every nested module the page or mindmap imports is served and path escapes are rejected', async () => {
   const f = await fixture();
   try {
-    const client = await (await fetch(`${f.base}/client.js`)).text();
-    const imported = [...client.matchAll(/from\s+'(\.[^']+)'/g)].map(match => match[1]!);
-    assert.ok(imported.length >= 1, 'the client imports its shared view logic');
-    for (const path of new Set(imported)) {
-      const response = await fetch(`${f.base}/${path.replace(/^\.\//, '')}`);
-      assert.equal(response.status, 200, `module ${path} must be served to the browser`);
+    const visited = new Set<string>();
+    const queue = ['/client.js', '/mindmap.js'];
+    while (queue.length) {
+      const modPath = queue.shift()!;
+      if (visited.has(modPath)) continue;
+      visited.add(modPath);
+      const response = await fetch(`${f.base}${modPath}`);
+      assert.equal(response.status, 200, `module ${modPath} must be served to the browser`);
       assert.match(response.headers.get('content-type') ?? '', /javascript/);
+      const source = await response.text();
+      const baseDir = posix.dirname(modPath);
+      const specs = [
+        ...[...source.matchAll(/\bfrom\s+['"](\.[^'"]+)['"]/g)].map(m => m[1]!),
+        ...[...source.matchAll(/\bimport\(\s*['"](\.[^'"]+)['"]\s*\)/g)].map(m => m[1]!),
+      ];
+      for (const relSpec of specs) {
+        const resolved = posix.normalize(posix.join(baseDir, relSpec));
+        if (!resolved.startsWith('..')) queue.push(resolved.startsWith('/') ? resolved : `/${resolved}`);
+      }
     }
-    assert.equal((await fetch(`${f.base}/../src/agent.ts`)).status, 404, 'the asset map is a fixed allowlist');
+    assert.ok(visited.has('/shared/auth-http.js'), 'nested shared module must be reached and served');
+    assert.ok(visited.has('/hubs/memory-hub.js'), 'nested hub module must be reached and served');
+    assert.ok(visited.has('/panels/chat.js'), 'nested panel module must be reached and served');
+    assert.ok(visited.has('/plugins/health-scale-ui.js'), 'lazy plugin UI module must be reached and served');
+    assert.equal((await fetch(`${f.base}/../src/agent.ts`)).status, 404, 'path escape must return 404');
+    assert.equal((await fetch(`${f.base}/shared/%2e%2e/%2e%2e/package.json`)).status, 404, 'encoded traversal must return 404');
+    assert.equal((await fetch(`${f.base}/client.ts`)).status, 404, 'non-allowlisted extension must return 404');
   } finally { await f.close(); }
+});
+
+test('SSE broadcaster coalesces concurrent clients cleanly without per-client daemon stalls', async () => {
+  const f = await fixture();
+  const c1 = new AbortController();
+  const c2 = new AbortController();
+  const readNextUpdate = async (response: Response) => {
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) throw new Error('Stream ended unexpectedly');
+        buffer += decoder.decode(value, { stream: true });
+        let end: number;
+        while ((end = buffer.indexOf('\n\n')) >= 0) {
+          const frame = buffer.slice(0, end);
+          buffer = buffer.slice(end + 2);
+          if (frame.startsWith('event: updates')) {
+            return JSON.parse(frame.split('\ndata: ')[1]!) as { events: TraceEvent[]; cursor: number; head: number };
+          }
+          if (frame.startsWith('event: problem')) throw new Error(frame);
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  };
+  try {
+    const initial = await (await fetch(`${f.base}/api/view`, { headers: f.headers })).json() as MainView;
+    const [r1, r2] = await Promise.all([
+      fetch(`${f.base}/api/stream?after=${initial.cursor}`, { headers: f.headers, signal: c1.signal }),
+      fetch(`${f.base}/api/stream?after=${initial.cursor}`, { headers: f.headers, signal: c2.signal }),
+    ]);
+    assert.equal(r1.status, 200);
+    assert.equal(r2.status, 200);
+
+    const p1 = readNextUpdate(r1);
+    const p2 = readNextUpdate(r2);
+    const sent = await fetch(`${f.base}/api/chat`, {
+      method: 'POST',
+      headers: f.headers,
+      body: JSON.stringify({ requestId: randomUUID(), text: '广播聚合测试', files: [] }),
+    });
+    assert.equal(sent.status, 200);
+    const [u1, u2] = await Promise.all([p1, p2]);
+    assert.ok(u1.cursor > initial.cursor && u2.cursor > initial.cursor);
+
+    // Closing the first SSE client leaves the second client actively receiving further batches
+    c1.abort();
+    const r2Again = await fetch(`${f.base}/api/stream?after=${u2.cursor}`, { headers: f.headers, signal: c2.signal });
+    assert.equal(r2Again.status, 200);
+    const p2Again = readNextUpdate(r2Again);
+    await fetch(`${f.base}/api/chat`, {
+      method: 'POST',
+      headers: f.headers,
+      body: JSON.stringify({ requestId: randomUUID(), text: '第二个流继续收包', files: [] }),
+    });
+    const u2Again = await p2Again;
+    assert.ok(u2Again.cursor > u2.cursor);
+  } finally {
+    c1.abort();
+    c2.abort();
+    await f.close();
+  }
 });
 
 
@@ -186,6 +287,7 @@ test('Mindmap standalone page serves strict CSP assets and aggregates real task 
       assert.match(csp, /style-src 'self'/);
       const html = await page.text();
       assert.match(html, /F\.R\.I\.D\.A\.Y\. · 会话思考流程图/);
+      assert.doesNotMatch(html, /id="mm-flow-sidebar"/, 'dead #mm-flow-sidebar removed');
       assert.doesNotMatch(html, /\sstyle="/i, 'strict CSP forbids inline style attributes');
       assert.doesNotMatch(html, /<script(?![^>]*\bsrc=)[^>]*>/i, 'strict CSP forbids inline script tags');
     }
@@ -203,6 +305,8 @@ test('Mindmap standalone page serves strict CSP assets and aggregates real task 
 
     const imported = [...mindmapJs.matchAll(/from\s+'(\.[^']+)'/g)].map(match => match[1]!);
     assert.ok(imported.includes('./mindmap-data.js'), 'mindmap.js imports mindmap-data.js');
+    assert.ok(imported.includes('./shared/auth-http.js'), 'mindmap.js imports shared/auth-http.js');
+    assert.doesNotMatch(mindmapJs, /#token=/, 'mindmap must not rewrite back links with #token=');
     for (const path of new Set(imported)) {
       const modRes = await fetch(`${f.base}/${path.replace(/^\.\//, '')}`);
       assert.equal(modRes.status, 200, `module ${path} must be served to the browser`);
@@ -210,8 +314,11 @@ test('Mindmap standalone page serves strict CSP assets and aggregates real task 
     }
 
     const dataJs = await (await fetch(`${f.base}/mindmap-data.js`)).text();
-    for (const symbol of ['buildSessionFlowchart', 'buildOverviewFlowchart', 'buildAllTasksTree', 'buildSingleTaskTree', 'buildTaskFlowSubtree']) {
+    for (const symbol of ['buildSessionFlowchart', 'buildOverviewFlowchart']) {
       assert.ok(dataJs.includes(symbol), `mindmap-data.js must export ${symbol}`);
+    }
+    for (const dead of ['buildAllTasksTree', 'buildSingleTaskTree', 'buildTaskFlowSubtree']) {
+      assert.ok(!dataJs.includes(dead), `dead v1 tree builder ${dead} must be removed`);
     }
 
     // 未认证请求应返回 401
@@ -303,7 +410,7 @@ test('Mindmap standalone page serves strict CSP assets and aggregates real task 
   } finally { await f.close(); }
 });
 
-test('Web console exposes XiaoAI voiceprint status, listing, gate toggling, removal, and strict CSP compliance', { timeout: 15000 }, async () => {
+test('Web console exposes XiaoAI voiceprint status, listing, gate toggling, removal, and strict CSP compliance across all dist/web/*.js', { timeout: 15000 }, async () => {
   const f = await fixture();
   try {
     assert.equal((await fetch(`${f.base}/api/voiceprints`)).status, 401);
@@ -316,11 +423,15 @@ test('Web console exposes XiaoAI voiceprint status, listing, gate toggling, remo
     assert.doesNotMatch(html, /\sstyle="/i, 'strict CSP forbids inline style attributes in index.html');
 
     const css = await (await fetch(`${f.base}/style.css`)).text();
-    assert.ok(css.includes('.voiceprint-hero-card') && css.includes('.origin-speaker-badge'));
+    assert.ok(css.includes('.voiceprint-hero-card') && css.includes('.origin-speaker-badge') && css.includes('.badge-purple'));
 
-    const clientJs = await (await fetch(`${f.base}/client.js`)).text();
-    assert.doesNotMatch(clientJs, /\.style\./, 'client.ts must not mutate element.style under strict CSP');
-    assert.doesNotMatch(clientJs, /setAttribute\(\s*['"]style['"]/, 'client.ts must not set style attributes');
+    const allWebJs = await collectDistWebJsFiles();
+    assert.ok(allWebJs.length >= 10, 'modular build emits client, panels, hubs, shared, plugins, and mindmap modules');
+    for (const file of allWebJs) {
+      assert.doesNotMatch(file.text, /\.style\./, `${file.rel} must not mutate element.style under strict CSP`);
+      assert.doesNotMatch(file.text, /setAttribute\(\s*['"]style['"]/, `${file.rel} must not set style attributes`);
+      assert.doesNotMatch(file.text, /\.innerHTML\b/, `${file.rel} must not assign innerHTML`);
+    }
 
     const manager = new XiaoaiSpeakerManager({ homeDir: f.home });
     manager.enrollEmbeddings({ name: '主人', role: 'owner', embeddings: [new Float32Array([1, 0, 0, 0])] });
@@ -380,7 +491,7 @@ test('Web console exposes XiaoAI voiceprint status, listing, gate toggling, remo
   } finally { await f.close(); }
 });
 
-test('Web console exposes topbar 健康管理 button, modal markup, strict CSP, and health-scale /api/plugin-run', { timeout: 15000 }, async () => {
+test('Web console lazy-loads health-scale UI, serves redacted PluginView metadata, and completes profile-save + record-add', { timeout: 15000 }, async () => {
   const f = await fixture();
   try {
     const html = await (await fetch(f.base)).text();
@@ -389,11 +500,35 @@ test('Web console exposes topbar 健康管理 button, modal markup, strict CSP, 
     assert.match(html, /id="health-trend-canvas"/);
     assert.doesNotMatch(html, /\sstyle="/i);
     assert.doesNotMatch(html, /<input[^>]+type=["']file["']/i);
+    assert.doesNotMatch(html, /018168|192\.168\./, 'index.html must not contain hardcoded personal samples');
 
     const clientJs = await (await fetch(`${f.base}/client.js`)).text();
-    assert.match(clientJs, /openHealthHubModal/);
-    assert.doesNotMatch(clientJs, /\.style\./);
-    assert.doesNotMatch(clientJs, /setAttribute\(\s*['"]style['"]/);
+    assert.match(clientJs, /import\(\s*['"]\.\/plugins\/health-scale-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load health-scale-ui.js');
+    assert.doesNotMatch(clientJs, /healthDashboard/, 'health-scale dashboard logic must not be eagerly bundled into client.js');
+
+    const healthUiJs = await (await fetch(`${f.base}/plugins/health-scale-ui.js`)).text();
+    assert.match(healthUiJs, /initHealthScaleUi/);
+
+    const viewRes = await (await fetch(`${f.base}/api/view`, { headers: f.headers })).json() as MainView;
+    for (const plugin of viewRes.plugins ?? []) {
+      const rec = plugin as unknown as Record<string, unknown>;
+      assert.equal('entryPath' in rec, false, 'redacted PluginView must not expose entryPath');
+      assert.equal('dir' in rec, false, 'redacted PluginView must not expose dir');
+      assert.equal('dataDir' in rec, false, 'redacted PluginView must not expose dataDir');
+      assert.equal('sourceCode' in rec, false, 'redacted PluginView must not expose sourceCode');
+    }
+
+    const profileRes = await (await fetch(`${f.base}/api/plugin-run`, {
+      method: 'POST',
+      headers: f.headers,
+      body: JSON.stringify({
+        plugin: 'health-scale',
+        action: 'profile-save',
+        args: { name: '测试成员', sex: 'male', age: 29, heightCm: 175, setDefault: true },
+      }),
+    })).json() as { ok: boolean; data?: { activeProfile?: { name: string } } };
+    assert.equal(profileRes.ok, true);
+    assert.equal(profileRes.data?.activeProfile?.name, '测试成员');
 
     const addRes = await (await fetch(`${f.base}/api/plugin-run`, {
       method: 'POST',
