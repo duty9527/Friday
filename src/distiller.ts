@@ -3,6 +3,7 @@ import type { AgentFactory } from './agent.js';
 import { publicData } from './conversation.js';
 import type { ThinkingLevel } from './decision.js';
 import type { ModelHub } from './model-hub.js';
+import { normalizeCwd } from './semantic.js';
 import type { Store, Task } from './store.js';
 import type { ChatMessage, MemoryCard, ModelTier } from './view.js';
 
@@ -19,12 +20,7 @@ export type DistillSaveOperation = {
   linkedMemoryIds?: string[];
 };
 
-export type DistillForgetOperation = {
-  action: 'forget';
-  id: string;
-};
-
-export type DistillOperation = DistillSaveOperation | DistillForgetOperation;
+export type DistillOperation = DistillSaveOperation;
 
 export function resolveDistillIdleMs(overrideMs?: number): number {
   if (typeof overrideMs === 'number' && Number.isFinite(overrideMs) && overrideMs >= 0) {
@@ -69,9 +65,8 @@ function sanitizeIdArray(raw: unknown, max = 16): string[] | undefined {
 
 export function parseDistillerOutput(
   raw: string,
-  options?: { allowForget?: boolean; maxOps?: number },
-): DistillOperation[] {
-  const allowForget = Boolean(options?.allowForget);
+  options?: { maxOps?: number },
+): DistillSaveOperation[] {
   const maxOps = Math.max(1, options?.maxOps ?? 3);
   const trimmed = raw.trim();
   if (!trimmed) return [];
@@ -94,20 +89,12 @@ export function parseDistillerOutput(
   const rawOps = (parsed as { operations?: unknown }).operations;
   if (!Array.isArray(rawOps)) return [];
 
-  const ops: DistillOperation[] = [];
+  const ops: DistillSaveOperation[] = [];
   for (const item of rawOps) {
     if (ops.length >= maxOps) break;
     if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
     const obj = item as Record<string, unknown>;
     const action = typeof obj.action === 'string' ? obj.action.trim().toLowerCase() : 'save';
-
-    if (action === 'forget') {
-      if (!allowForget) continue;
-      const id = typeof obj.id === 'string' ? obj.id.trim().slice(0, 128) : '';
-      if (!id) continue;
-      ops.push({ action: 'forget', id });
-      continue;
-    }
 
     if (action !== 'save') continue;
     const rawTopic = typeof obj.topic === 'string' ? obj.topic : '';
@@ -145,7 +132,7 @@ export async function collectRelatedMemoriesForDistill(
   limit = 6,
 ): Promise<MemoryCard[]> {
   const byId = new Map<string, MemoryCard>();
-  const normalizedTargetCwd = cwd?.trim().replace(/\\/g, '/').replace(/\/+$/, '') || '';
+  const normalizedTargetCwd = normalizeCwd(cwd);
 
   for (const rawQuery of queries.map(q => q.trim()).filter(Boolean).slice(0, 2)) {
     try {
@@ -175,7 +162,7 @@ export async function collectRelatedMemoriesForDistill(
     const active = store.listMemories({ includeSuperseded: false, limit: 24 });
     for (const card of active) {
       if (byId.has(card.id)) continue;
-      const cardCwd = card.cwd?.trim().replace(/\\/g, '/').replace(/\/+$/, '') || '';
+      const cardCwd = normalizeCwd(card.cwd);
       if (normalizedTargetCwd ? (cardCwd === normalizedTargetCwd || !cardCwd) : true) {
         byId.set(card.id, card);
         if (byId.size >= limit) break;
@@ -238,12 +225,11 @@ function formatRelatedForPrompt(cards: MemoryCard[]) {
 
 async function applySaveOperations(
   store: Store,
-  ops: DistillOperation[],
+  ops: DistillSaveOperation[],
   defaults: { cwd?: string; sourceTaskId?: string; sourceMessageId?: string },
 ): Promise<MemoryCard[]> {
   const saved: MemoryCard[] = [];
   for (const op of ops) {
-    if (op.action !== 'save') continue;
     const validSupersedeIds = op.supersedeIds?.filter(id => {
       try {
         const card = store.getMemory(id);
@@ -334,7 +320,7 @@ export async function distillCompletedTask(params: {
   }
 
   signal?.throwIfAborted();
-  const ops = parseDistillerOutput(rawOutput, { allowForget: false, maxOps: 3 });
+  const ops = parseDistillerOutput(rawOutput, { maxOps: 3 });
   const saved = await applySaveOperations(store, ops, {
     cwd: task.cwd,
     sourceTaskId: task.id,
@@ -405,87 +391,11 @@ export async function distillIdleConversation(params: {
   }
 
   signal?.throwIfAborted();
-  const ops = parseDistillerOutput(rawOutput, { allowForget: false, maxOps: 3 });
+  const ops = parseDistillerOutput(rawOutput, { maxOps: 3 });
   const latestUserMsg = [...eligible].reverse().find(m => m.role === 'user');
   const saved = await applySaveOperations(store, ops, {
     sourceMessageId: latestUserMsg?.id,
   });
   store.markDistilled({ latestMessageSeq: maxSeq });
   return { saved };
-}
-
-export async function cleanLegacyMemoriesWithModel(params: {
-  store: Store;
-  factory: AgentFactory;
-  modelHub: ModelHub;
-  signal?: AbortSignal;
-}): Promise<{ saved: MemoryCard[]; forgottenIds: string[]; supersededIds: string[] }> {
-  const { store, factory, modelHub, signal } = params;
-  signal?.throwIfAborted();
-
-  const activeMemories = store.listMemories({ includeSuperseded: false, limit: 250 });
-  if (!activeMemories.length) {
-    return { saved: [], forgottenIds: [], supersededIds: [] };
-  }
-
-  const resolved = resolveDistillerModel(modelHub);
-  const agent = await factory.create('distiller', `distill-cleanup-${randomUUID()}`, [], {
-    execution: 'snapshot',
-    cwd: process.cwd(),
-    tier: resolved.tier,
-    thinkingLevel: resolved.thinkingLevel,
-    ...(resolved.model ? { model: resolved.model } : {}),
-  });
-
-  const timeoutSignal = AbortSignal.timeout(90_000);
-  const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-
-  let rawOutput: string;
-  try {
-    rawOutput = await agent.prompt(JSON.stringify({
-      kind: 'DISTILL_LEGACY_CLEANUP',
-      activeMemories: activeMemories.map(card => ({
-        id: card.id,
-        topic: card.topic,
-        content: card.content.slice(0, 1200),
-        tags: card.tags,
-        ...(card.cwd ? { cwd: card.cwd } : {}),
-        pinned: Boolean(card.pinned),
-        importance: card.importance,
-        createdAt: card.createdAt,
-        updatedAt: card.updatedAt,
-      })),
-    }), combinedSignal);
-  } finally {
-    agent.close();
-  }
-
-  signal?.throwIfAborted();
-  const ops = parseDistillerOutput(rawOutput, { allowForget: true, maxOps: 16 });
-  const saved = await applySaveOperations(store, ops, {});
-
-  const supersededIds: string[] = [];
-  for (const op of ops) {
-    if (op.action === 'save' && op.supersedeIds?.length) {
-      for (const sid of op.supersedeIds) {
-        if (!supersededIds.includes(sid)) supersededIds.push(sid);
-      }
-    }
-  }
-
-  const forgottenIds: string[] = [];
-  for (const op of ops) {
-    if (op.action !== 'forget') continue;
-    try {
-      const card = store.getMemory(op.id);
-      if (card.pinned || card.supersededBy) continue;
-      if (store.deleteMemory(op.id)) {
-        forgottenIds.push(op.id);
-      }
-    } catch {
-      // ignore missing/already-removed card
-    }
-  }
-
-  return { saved, forgottenIds, supersededIds };
 }

@@ -18,16 +18,21 @@ export async function privateHome(path: string): Promise<string> {
   return realpath(home);
 }
 
-async function noSymlinkAncestors(path: string): Promise<void> {
-  let current = path;
-  while (current !== parse(current).root) {
+async function noSymlinkAncestors(path: string, stopAt?: string): Promise<void> {
+  const fsRoot = parse(path).root;
+  const bound = stopAt ? resolve(stopAt) : undefined;
+  let current = resolve(path);
+  while (current !== fsRoot) {
     if ((await lstat(current)).isSymbolicLink()) throw new Error('Symbolic links are not accepted as inputs');
-    current = dirname(current);
+    if (bound && current === bound) break;
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
   }
 }
 
-export async function readRegular(path: string, limit = FILE_LIMIT): Promise<Buffer> {
-  await noSymlinkAncestors(path);
+export async function readRegular(path: string, limit = FILE_LIMIT, stopAt?: string): Promise<Buffer> {
+  await noSymlinkAncestors(path, stopAt);
   const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const before = await handle.stat();
@@ -52,18 +57,18 @@ export async function readRegular(path: string, limit = FILE_LIMIT): Promise<Buf
   } finally { await handle.close(); }
 }
 
-async function expandInputs(paths: string[]): Promise<Array<{ path: string; name: string }>> {
-  const files: Array<{ path: string; name: string }> = [];
+async function expandInputs(paths: string[]): Promise<Array<{ path: string; name: string; root: string }>> {
+  const files: Array<{ path: string; name: string; root: string }> = [];
   const seen = new Set<string>();
   let entries = 0;
   async function visit(path: string, root: string, depth: number): Promise<void> {
     if (++entries > 4096 || depth > 64) throw new Error('Directory scan limit exceeded (4096 entries / 64 levels)');
-    await noSymlinkAncestors(path);
+    await noSymlinkAncestors(path, depth === 0 ? undefined : root);
     const before = await lstat(path);
     if (seen.has(path)) return;
     seen.add(path);
     if (before.isFile()) {
-      files.push({ path, name: path === root ? basename(path) : join(basename(root), relative(root, path)) });
+      files.push({ path, root, name: path === root ? basename(path) : join(basename(root), relative(root, path)) });
       if (files.length > 32) throw new Error('Expanded input exceeds 32 file limit; choose a smaller directory');
       return;
     }
@@ -76,7 +81,7 @@ async function expandInputs(paths: string[]): Promise<Array<{ path: string; name
     }
     children.sort();
     for (const child of children) await visit(join(path, child), root, depth + 1);
-    await noSymlinkAncestors(path);
+    await noSymlinkAncestors(path, depth === 0 ? undefined : root);
     const after = await lstat(path);
     if (after.ino !== before.ino || after.dev !== before.dev || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) {
       throw new Error(`Directory changed while creating snapshot; submit again: ${path}`);
@@ -97,7 +102,7 @@ export async function snapshot(home: string, taskId: string, paths: string[]): P
     const inputs = await expandInputs(paths);
     for (const [index, input] of inputs.entries()) {
       let data: Buffer;
-      try { data = await readRegular(input.path); }
+      try { data = await readRegular(input.path, FILE_LIMIT, input.root); }
       catch (error) { throw new Error(`Cannot read authorized input ${input.path}: ${error instanceof Error ? error.message : String(error)}`); }
       total += data.length;
       if (total > TOTAL_LIMIT) throw new Error(`Total input exceeds ${TOTAL_LIMIT} byte limit`);
@@ -114,7 +119,7 @@ export async function snapshot(home: string, taskId: string, paths: string[]): P
 
 export async function readSnapshot(home: string, taskId: string, file: InputFile): Promise<string> {
   if (!/^[a-f0-9-]{36}$/.test(taskId) || !/^f\d+$/.test(file.id)) throw new Error('Invalid snapshot identity');
-  const bytes = await readRegular(join(home, 'tasks', taskId, 'inputs', file.id));
+  const bytes = await readRegular(join(home, 'tasks', taskId, 'inputs', file.id), FILE_LIMIT, home);
   if (createHash('sha256').update(bytes).digest('hex') !== file.sha256) throw new Error('Snapshot integrity check failed');
   return bytes.toString('utf8');
 }

@@ -7,8 +7,8 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { Store } from '../src/store.js';
-import { realFactory, offlineFactory, READONLY_TOOL_NAMES, type AgentFactory } from '../dist/agent.js';
-import { Coordinator, computeSleepDrive } from '../dist/coordinator.js';
+import { realFactory, offlineFactory, READONLY_TOOL_NAMES, type AgentFactory } from '../src/agent.js';
+import { Coordinator, computeSleepDrive } from '../src/coordinator.js';
 
 async function until(predicate: () => boolean | Promise<boolean>, attempts = 300) {
   for (let i = 0; i < attempts; i++) {
@@ -390,6 +390,67 @@ test('Instant arousal preemption: an incoming Boss message immediately aborts an
     assert.equal(stateAfterWake.residues.at(-1)?.interrupted, true, 'interrupted dream leaves only a fleeting half-awake fragment');
   } finally {
     await coordinator.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('Distiller and Dreamer cursors are decoupled and legacy poisoned subconscious_state migrates safely', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-dream-decoupled-'));
+  try {
+    // 1) Decoupling check on fresh Store
+    const store = new Store(home);
+    const msg = store.conversation.create({
+      id: 'm-1',
+      requestId: 'r-1',
+      role: 'user',
+      text: '今天排查了一下午连接池泄露的问题',
+      status: 'completed',
+      mode: 'offline',
+      paths: [],
+    });
+    const task = {
+      id: 'task-decouple-1',
+      requestId: 'req-task-decouple-1',
+      fingerprint: 'fp-d1',
+      prompt: '检查连接池',
+      status: 'running' as const,
+      revision: 0,
+      files: [],
+      mode: 'offline' as const,
+      createdAt: Date.now(),
+      limitMs: 60_000,
+      activeMs: 50,
+    };
+    store.create(task);
+    store.transition(task.id, 'completed', undefined, '已定位连接未关闭的分支并修复。');
+
+    store.markDistilled({ latestMessageSeq: msg.seq, taskIds: [task.id], now: Date.now() });
+    assert.equal(store.distillerState().lastMessageSeq, msg.seq);
+    assert.deepEqual(store.distillerState().distilledTaskIds, [task.id]);
+
+    // Dreamer cursors MUST stay untouched by markDistilled
+    assert.equal(store.subconsciousState().lastMessageSeq, 0);
+    assert.deepEqual(store.subconsciousState().digestedTaskIds, []);
+    const material = store.sampleDreamMaterial(() => 0.5);
+    assert.equal(material.undigestedMessages.some(m => m.id === msg.id), true);
+    assert.equal(material.undigestedTasks.some(t => t.id === task.id), true);
+
+    // 2) Legacy DB migration: simulate poisoned subconscious_state (lastWakeAt=0 yet cursors bumped)
+    store.conversation.setMeta('subconscious_state', {
+      lastWakeAt: 0,
+      lastMessageSeq: 999,
+      digestedTaskIds: [task.id],
+      residues: [{ id: 'res-1', impression: '旧梦境残留', salience: 'faint', createdAt: Date.now(), turnsElapsed: 0 }],
+    });
+    store.close();
+
+    const migrated = new Store(home);
+    const subAfter = migrated.subconsciousState();
+    assert.equal(subAfter.lastMessageSeq, 0, 'legacy never-woken state resets poisoned message cursor');
+    assert.deepEqual(subAfter.digestedTaskIds, [], 'legacy never-woken state resets poisoned task cursor');
+    assert.equal(subAfter.residues.length, 1, 'existing dream residues survive migration');
+    migrated.close();
+  } finally {
     await rm(home, { recursive: true, force: true });
   }
 });

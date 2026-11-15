@@ -7,7 +7,6 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { offlineFactory, type AgentFactory, type AgentOptions, type AgentPort, type AgentTool, type Role } from '../src/agent.js';
 import { Coordinator } from '../src/coordinator.js';
 import {
-  cleanLegacyMemoriesWithModel,
   distillCompletedTask,
   parseDistillerOutput,
   shouldSkipTrivialChatBatch,
@@ -83,7 +82,7 @@ function makeDistillFactory(handlers: {
   };
 }
 
-test('parseDistillerOutput sanitizes prefixes, tags, importance bounds, forget permission, and trivial chat skip rules', () => {
+test('parseDistillerOutput sanitizes prefixes, tags, importance bounds, ignores legacy forget ops, and trivial chat skip rules', () => {
   const raw = [
     '```json',
     JSON.stringify({
@@ -105,22 +104,16 @@ test('parseDistillerOutput sanitizes prefixes, tags, importance bounds, forget p
     '```',
   ].join('\n');
 
-  const noForget = parseDistillerOutput(raw, { allowForget: false, maxOps: 3 });
-  assert.equal(noForget.length, 3);
-  assert.equal(noForget[0]?.action, 'save');
-  if (noForget[0]?.action === 'save') {
-    assert.equal(noForget[0].topic, 'HP1020 打印机防休眠参数');
-    assert.deepEqual(noForget[0].tags, ['HP1020', 'cups']);
-    assert.equal(noForget[0].importance, 95);
-    assert.deepEqual(noForget[0].supersedeIds, ['old-1']);
-  }
-  if (noForget[1]?.action === 'save') {
-    assert.equal(noForget[1].importance, 25);
-  }
-
-  const withForget = parseDistillerOutput(raw, { allowForget: true, maxOps: 4 });
-  assert.equal(withForget.length, 4);
-  assert.deepEqual(withForget[1], { action: 'forget', id: 'noise-1' });
+  const ops = parseDistillerOutput(raw, { maxOps: 3 });
+  assert.equal(ops.length, 3);
+  assert.equal(ops[0]?.action, 'save');
+  assert.equal(ops[0]?.topic, 'HP1020 打印机防休眠参数');
+  assert.deepEqual(ops[0]?.tags, ['HP1020', 'cups']);
+  assert.equal(ops[0]?.importance, 95);
+  assert.deepEqual(ops[0]?.supersedeIds, ['old-1']);
+  assert.equal(ops[1]?.topic, '第二条');
+  assert.equal(ops[1]?.importance, 25);
+  assert.equal(ops[2]?.topic, '第三条');
 
   assert.equal(shouldSkipTrivialChatBatch([]), true);
   assert.equal(shouldSkipTrivialChatBatch([
@@ -133,7 +126,12 @@ test('parseDistillerOutput sanitizes prefixes, tags, importance bounds, forget p
   assert.equal(shouldSkipTrivialChatBatch([
     {
       id: '1', seq: 1, version: 1, at: 1, role: 'user', text: '记住端口是 3210', status: 'completed', mode: 'real', paths: [], taskIds: [],
-      routing: { at: 1, status: 'completed', actions: [{ id: 'a1', kind: 'save_memory', status: 'accepted', at: 1 }] },
+      routing: {
+        at: 1,
+        status: 'completed',
+        context: { execution: 'native', cwd: '/tmp', totalWorks: 0, truncated: false, works: [], messages: [] },
+        actions: [{ id: 'a1', kind: 'save_memory', status: 'accepted', at: 1 }],
+      },
     },
     { id: '2', seq: 2, version: 1, at: 2, role: 'assistant', replyTo: '1', text: '已记住。', status: 'completed', mode: 'real', paths: [], taskIds: [] },
   ]), true);
@@ -199,7 +197,7 @@ test('Post-task distiller skips ephemeral tasks, skips rejected drafts, skips ma
         return JSON.stringify({
           operations: [{
             action: 'save',
-            topic: 'duty-rj HP1020 禁用 usblp 根因方案',
+            topic: 'workstation-a HP1020 禁用 usblp 根因方案',
             content: 'HP1020 掉线根因为 usblp 冲突，blacklist usblp 并用 lpstat 验证生效。',
             tags: ['HP1020', 'cups', 'usblp'],
             cwd: task?.cwd,
@@ -225,7 +223,7 @@ test('Post-task distiller skips ephemeral tasks, skips rejected drafts, skips ma
     coordinator.chat('req-1', '查下打印机');
     await until(() => distillEvents.length === 1 && coordinator.store.listMemories().length === 1);
     const saved = coordinator.store.listMemories()[0]!;
-    assert.equal(saved.topic, 'duty-rj HP1020 禁用 usblp 根因方案');
+    assert.equal(saved.topic, 'workstation-a HP1020 禁用 usblp 根因方案');
     assert.equal(saved.tags.includes('auto-consolidated'), false);
     assert.equal(coordinator.store.distillerState().distilledTaskIds.length, 1);
 
@@ -358,7 +356,7 @@ test('Post-chat idle distiller debounces on 3-minute clock, cancels when new cha
   }
 });
 
-test('Distiller uses semantic pre-retrieval for supersedeIds merge, legacy cleanup protects pinned cards, and handles errors safely', async () => {
+test('Distiller uses semantic pre-retrieval for supersedeIds merge and handles errors safely', async () => {
   const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-distill-merge-'));
   const store = new Store(home);
   const semantic = makeFakeSemanticEmbedder(text => {
@@ -373,7 +371,7 @@ test('Distiller uses semantic pre-retrieval for supersedeIds merge, legacy clean
     // 1) Pre-retrieval surfaces existing same-domain card so distiller merges via supersedeIds
     const existing = await store.saveMemoryAsync({
       topic: 'HP1020 打印机基础信息',
-      content: '打印机队列名 HP1020，连接在 duty-rj 上。',
+      content: '打印机队列名 HP1020，连接在 workstation-a 上。',
       tags: ['HP1020', 'cups'],
       cwd: '/srv/app',
     });
@@ -386,9 +384,9 @@ test('Distiller uses semantic pre-retrieval for supersedeIds merge, legacy clean
         return JSON.stringify({
           operations: [{
             action: 'save',
-            topic: 'duty-rj HP1020 打印机配置与故障方案',
-            content: '队列名 HP1020；连接在 duty-rj；启用防休眠规则后恢复稳定打印。',
-            tags: ['HP1020', 'cups', 'duty-rj'],
+            topic: 'workstation-a HP1020 打印机配置与故障方案',
+            content: '队列名 HP1020；连接在 workstation-a；启用防休眠规则后恢复稳定打印。',
+            tags: ['HP1020', 'cups', 'workstation-a'],
             cwd: '/srv/app',
             importance: 82,
             supersedeIds: related.map(r => r.id),
@@ -427,56 +425,7 @@ test('Distiller uses semantic pre-retrieval for supersedeIds merge, legacy clean
     assert.equal(store.getMemory(existing.id).supersededBy, taskRes.saved[0]!.id);
     assert.equal(store.listMemories({ includeSuperseded: false }).length, 1);
 
-    // 2) Legacy cleanup merges valuable auto-consolidated stub, deletes noise stub, never forgets pinned card
-    const pinned = await store.saveMemoryAsync({
-      topic: '核心规则（置顶）',
-      content: '绝对禁止删除置顶规则。',
-      tags: ['rule'],
-      pinned: true,
-    });
-    const valuableStub = store.saveMemory({
-      topic: '任务经验 · Meizu 17 ADB 调试',
-      content: 'Meizu 17 序列号 Z81QAFWTSE6AQ，通过 adb 连接拍照。',
-      tags: ['auto-consolidated', 'general'],
-      cwd: '/srv/app',
-    });
-    const noiseStub = store.saveMemory({
-      topic: '任务经验 · 查了一下今日天气预报',
-      content: '今天多云 22 度。',
-      tags: ['auto-consolidated', 'general'],
-      cwd: '/srv/app',
-    });
-
-    const cleanupRes = await cleanLegacyMemoriesWithModel({
-      store,
-      factory: makeDistillFactory({
-        async onDistill() {
-          return JSON.stringify({
-            operations: [
-              {
-                action: 'save',
-                topic: 'duty-rj Meizu 17 ADB 设备档案',
-                content: 'Meizu 17 序列号 Z81QAFWTSE6AQ，支持 adb 调起相机。',
-                tags: ['adb', 'meizu'],
-                cwd: '/srv/app',
-                importance: 75,
-                supersedeIds: [valuableStub.id],
-              },
-              { action: 'forget', id: noiseStub.id },
-              { action: 'forget', id: pinned.id },
-            ],
-          });
-        },
-      }),
-      modelHub: mockHub,
-    });
-    assert.equal(cleanupRes.saved.length, 1);
-    assert.deepEqual(cleanupRes.forgottenIds, [noiseStub.id]);
-    assert.ok(store.getMemory(pinned.id), 'pinned memory must survive even if model requests forget');
-    assert.equal(store.getMemory(valuableStub.id).supersededBy, cleanupRes.saved[0]!.id);
-    assert.throws(() => store.getMemory(noiseStub.id));
-
-    // 3) Offline factory distiller fallback + error resilience
+    // 2) Offline factory distiller fallback + error resilience
     const errRes = await distillCompletedTask({
       store,
       factory: makeDistillFactory({
