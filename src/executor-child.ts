@@ -14,7 +14,7 @@ function persist(op: Operation, fingerprint: string) {
   db.prepare('INSERT INTO operations VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body').run(op.id, fingerprint, JSON.stringify(op));
 }
 async function start(op: Operation, file: InputFile) {
-  const fingerprint = JSON.stringify({ taskId: op.taskId, revision: op.revision, file });
+  const fingerprint = JSON.stringify({ op: { ...op, status: undefined, result: undefined, error: undefined }, file });
   const previous = db.prepare('SELECT * FROM operations WHERE id=?').get(op.id);
   if (previous) {
     if (previous.fingerprint !== fingerprint) {
@@ -28,11 +28,13 @@ async function start(op: Operation, file: InputFile) {
     }
     return;
   }
-  persist(op, fingerprint);
   const state = { cancelled: false };
   running.set(op.id, state);
-  op.status = 'started'; persist(op, fingerprint); send(op);
   try {
+    persist(op, fingerprint);
+    op.status = 'started';
+    persist(op, fingerprint);
+    send(op);
     const result = await readSnapshot(home!, op.taskId, file);
     op.status = state.cancelled ? 'cancelled' : 'succeeded';
     if (!state.cancelled) op.result = result;
@@ -40,13 +42,19 @@ async function start(op: Operation, file: InputFile) {
     op.status = state.cancelled ? 'cancelled' : 'failed';
     op.error = state.cancelled ? 'Read cancelled' : 'Snapshot read or integrity check failed';
   } finally {
-    persist(op, fingerprint); send(op); running.delete(op.id);
+    try { persist(op, fingerprint); } catch { /* best-effort persistence */ }
+    send(op);
+    running.delete(op.id);
     if (disconnected && !running.size) { db.close(); process.exit(0); }
   }
 }
 process.on('message', (message: { type?: string; op?: Operation; file?: InputFile; id?: string }) => {
   if (message.type === 'start' && message.op && message.file) {
-    void start(message.op, message.file).catch(() => process.exit(1));
+    const op = message.op;
+    void start(op, message.file).catch(err => {
+      running.delete(op.id);
+      send({ ...op, status: 'failed', error: err instanceof Error ? err.message : String(err) });
+    });
   } else if (message.type === 'stop' && message.id) {
     const state = running.get(message.id);
     if (state) state.cancelled = true;

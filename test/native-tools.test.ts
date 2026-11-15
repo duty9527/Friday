@@ -4,11 +4,14 @@ import { createServer } from 'node:http';
 import { mkdtemp, realpath, mkdir, writeFile, readFile, rm, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
-import { realFactory, NATIVE_TOOL_NAMES, type AgentObservation, type AgentFactory } from '../src/agent.js';
-import { Coordinator } from '../dist/coordinator.js';
-import { Store } from '../src/store.js';
+import { realFactory, offlineFactory, NATIVE_TOOL_NAMES, type AgentObservation, type AgentFactory } from '../src/agent.js';
+import { Coordinator } from '../src/coordinator.js';
+import { Executor } from '../src/executor.js';
+import { snapshot } from '../src/files.js';
+import { Store, type Operation } from '../src/store.js';
 import { nativeShellOperations, NativeCommandInterrupted } from '../src/native-shell.js';
 
 // Local model fixture requests real SDK tools; no external provider or user filesystem is used.
@@ -190,4 +193,55 @@ test('native shell distinguishes explicit exit 255 from actual signal terminatio
   assert.deepEqual(await shell.exec('exit 1', process.cwd(), settings), { exitCode: 1 });
   await assert.rejects(shell.exec('kill -TERM $$', process.cwd(), settings), NativeCommandInterrupted);
   await assert.rejects(shell.exec('sleep 5', process.cwd(), { ...settings, timeout: 0.02 }), NativeCommandInterrupted);
+});
+
+test('Coordinator lazy-starts Executor when nativeTools=true without idle child process', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-lazy-exec-'));
+  const base = offlineFactory(5);
+  const nativeFactory: AgentFactory = { ...base, nativeTools: true };
+  const coordinator = new Coordinator(home, nativeFactory);
+  try {
+    await coordinator.ready();
+    const status = coordinator.health();
+    assert.equal(status.executorPid, undefined, 'no idle executor child is forked in nativeTools mode');
+    assert.equal(status.executorAvailable, true);
+  } finally {
+    await coordinator.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('executor-child reports task failure over IPC and stays alive for subsequent reads', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-exec-child-err-'));
+  const validFile = join(home, 'valid.txt');
+  await writeFile(validFile, 'executor ok content');
+  const errTaskId = randomUUID();
+  const okTaskId = randomUUID();
+  const [validInput] = await snapshot(home, okTaskId, [validFile]);
+  assert.ok(validInput);
+  const seenOps: Operation[] = [];
+  const executor = new Executor(home, op => seenOps.push(op));
+  try {
+    await executor.ready;
+    const pid = executor.pid;
+    assert.ok(pid && pid > 0);
+    const failed = await executor.start(
+      { id: 'op-fail', taskId: errTaskId, revision: 0, fileId: 'f0', status: 'requested' },
+      { id: 'f0', name: 'missing.txt', bytes: 1, sha256: 'deadbeef' },
+    );
+    assert.equal(failed.status, 'failed');
+    assert.equal(executor.pid, pid, 'child process remains alive after a single failed operation');
+    assert.equal(executor.available, true);
+
+    const succeeded = await executor.start(
+      { id: 'op-ok', taskId: okTaskId, revision: 0, fileId: validInput.id, status: 'requested' },
+      validInput,
+    );
+    assert.equal(succeeded.status, 'succeeded');
+    assert.match(succeeded.result ?? '', /executor ok content/);
+    assert.ok(seenOps.some(op => op.id === 'op-fail' && op.status === 'failed'));
+  } finally {
+    await executor.close();
+    await rm(home, { recursive: true, force: true });
+  }
 });

@@ -65,7 +65,7 @@ test('prepareRouterSessionModel preserves real contextWindow while disabling CoT
     thinkingLevelMap: { off: null, high: 'high' },
   });
   assert.equal(missingWindow.contextWindow, 128_000);
-  assert.equal((missingWindow.compat as Record<string, unknown>)?.thinkingFormat, 'deepseek');
+  assert.equal((missingWindow as { compat?: Record<string, unknown> }).compat?.thinkingFormat, 'deepseek');
   assert.equal(missingWindow.thinkingLevelMap?.off, 'off');
 });
 
@@ -540,7 +540,7 @@ test('resolveRuntimeMessageSession skips remote decideSessionContinuity on xiaoa
       at: baseAt + 40_000,
     });
 
-    const xiaoaiResolved = await resolveRuntimeMessageSession(store, mockModelHub, xiaoaiCur, []);
+    const xiaoaiResolved = await resolveRuntimeMessageSession(store, mockModelHub, xiaoaiCur, [], undefined, { skipAiContinuity: true });
     assert.equal(decisionCalls, 0, 'xiaoai must never block on remote decideSessionContinuity');
     assert.equal(xiaoaiResolved.sessionId, 'session:flow:xa-u1');
     assert.equal(xiaoaiResolved.sessionLink?.source, 'heuristic');
@@ -556,7 +556,7 @@ test('resolveRuntimeMessageSession skips remote decideSessionContinuity on xiaoa
       mode: 'real',
       at: baseAt + 190_000,
     });
-    const xiaoaiSplit = await resolveRuntimeMessageSession(store, mockModelHub, xiaoaiNewTopic, []);
+    const xiaoaiSplit = await resolveRuntimeMessageSession(store, mockModelHub, xiaoaiNewTopic, [], undefined, { skipAiContinuity: true });
     assert.equal(decisionCalls, 0, 'unrelated xiaoai utterance still makes 0 remote decision calls');
     assert.equal(xiaoaiSplit.sessionId, 'session:flow:xa-u3');
 

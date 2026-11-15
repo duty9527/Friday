@@ -1,9 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
-import { buildModelTiers, inferModelTier, resolveWorkerModelFromTiers, type WorkerModelResolutionInput } from './agent.js';
 import {
   clampNativeThinkingLevel,
   decideWorkerRoute,
@@ -12,17 +11,16 @@ import {
   evaluateWorkCompletion,
   GEMINI_DECISION_MODEL,
   getNativeThinkingLevels,
-  isThinkingLevel,
   selectHeuristicRoute,
   type CompletionEvaluationInput,
   type CompletionEvaluationResult,
   type DecisionCredentials,
-  type DecisionRouteCandidate,
   type DecisionSource,
   type SessionContinuityInput,
   type SessionContinuityResult,
   type ThinkingLevel,
 } from './decision.js';
+import { resolveEnv } from './paths.js';
 import type {
   DecisionEngineView,
   ModelCatalogEntry,
@@ -33,300 +31,55 @@ import type {
   ModelTierConfig,
   PooledModelEntry,
 } from './view.js';
+import {
+  buildModelTiers,
+  classifyModelEntry,
+  DECISION_STATS_EPOCH,
+  DEFAULT_PROVIDER_ENDPOINTS,
+  ensureRealProviderCatalog,
+  FALLBACK_PROVIDER_MODELS,
+  FEATURED_PROVIDERS,
+  isOfficialOpenCodeUrl,
+  isOpenCodeProvider,
+  maskKey,
+  MODEL_TIER_VALUES,
+  normalizeProviderId,
+  normalizeSelectedModels,
+  resolveWorkerModelFromTiers,
+  splitModelAndLevel,
+  thinkingLevelToTier,
+  tierToPreferredThinkingLevel,
+  type ModelEffectStats,
+  type ModelHubConfigureInput,
+  type ModelHubFetchInput,
+  type ModelHubProbeInput,
+  type PersistedDecisionConfig,
+  type PersistedModelHubState,
+  type PersistedProviderConfig,
+  type SelectedModelConfig,
+  type SelectedModelInput,
+  type WorkerModelResolutionInput,
+} from './models/catalog.js';
+import { fetchRemoteModelsFromEndpoint } from './models/discovery.js';
+import {
+  accumulateDecisionEraStats,
+  formatModelNotInPoolError,
+  toDecisionCandidates,
+  type DecisionEraTaskRecord,
+} from './models/pool-selector.js';
 
-export interface PersistedProviderConfig {
-  name?: string;
-  enabled?: boolean;
-  apiKey?: string;
-  baseUrl?: string;
-  customModels?: string[];
-  /** 用户显式勾选进入 Worker 模型池的模型（保留各自原生思考等级） */
-  selectedModels?: SelectedModelConfig[];
-  fetchedModels?: ModelCatalogEntry[];
-  modelsFetchedAt?: number;
-  fetchError?: string;
-}
-
-export interface SelectedModelConfig {
-  id: string;
-  thinkingLevels?: ThinkingLevel[];
-  /** 向后兼容旧配置文件字段 */
-  tier?: ModelTier;
-}
-
-const MODEL_TIER_VALUES: readonly ModelTier[] = ['fast', 'balanced', 'strong'];
-const MAX_SELECTED_MODELS = 64;
-const DECISION_STATS_EPOCH = 'jev-era-v1';
-
-export interface ModelEffectStats {
-  successCount: number;
-  failCount: number;
-  lastLatencyMs?: number;
-  lastProbeOk?: boolean;
-  qualityScoreSum?: number;
-  qualityCount?: number;
-  avgQualityScore?: number;
-  updatedAt: number;
-}
-
-export interface PersistedDecisionConfig {
-  enabled?: boolean;
-  apiKey?: string;
-  baseUrl?: string;
-}
-
-export interface PersistedModelHubState {
-  routerProvider?: string;
-  routerModel?: string;
-  workerProvider?: string;
-  fastModel?: string;
-  balancedModel?: string;
-  strongModel?: string;
-  decision?: PersistedDecisionConfig;
-  providers: Record<string, PersistedProviderConfig>;
-  modelStats?: Record<string, ModelEffectStats>;
-  statsEpoch?: string;
-  lastProbe?: ModelProbeResult;
-}
-
-export interface ModelHubConfigureInput {
-  providerId?: string;
-  providerName?: string;
-  enabled?: boolean;
-  apiKey?: string;
-  clearApiKey?: boolean;
-  baseUrl?: string;
-  customModels?: string[];
-  selectedModels?: Array<string | SelectedModelConfig>;
-  routerProvider?: string;
-  routerModel?: string;
-  workerProvider?: string;
-  fastModel?: string;
-  balancedModel?: string;
-  strongModel?: string;
-  decisionEnabled?: boolean;
-  decisionApiKey?: string;
-  clearDecisionApiKey?: boolean;
-  decisionBaseUrl?: string;
-}
-
-export interface ModelHubFetchInput {
-  providerId: string;
-  apiKey?: string;
-  baseUrl?: string;
-}
-
-export interface ModelHubProbeInput {
-  provider?: string;
-  model: string;
-  prompt?: string;
-  apiKey?: string;
-  baseUrl?: string;
-}
-
-const FEATURED_PROVIDERS: Array<{ id: string; name: string }> = [
-  { id: 'deepseek', name: 'DeepSeek' },
-  { id: 'openai', name: 'OpenAI' },
-  { id: 'openai-codex', name: 'OpenAI Codex' },
-  { id: 'anthropic', name: 'Anthropic Claude' },
-  { id: 'google', name: 'Google Gemini' },
-  { id: 'opencode-go', name: 'OpenCode Go' },
-  { id: 'opencode', name: 'OpenCode Zen' },
-  { id: 'openrouter', name: 'OpenRouter' },
-  { id: 'dashscope', name: '阿里云百炼 (Qwen)' },
-  { id: 'moonshot', name: 'Moonshot (Kimi)' },
-  { id: 'zhipu', name: '智谱 (GLM)' },
-  { id: 'siliconflow', name: 'SiliconFlow (硅基流动)' },
-  { id: 'xai', name: 'xAI (Grok)' },
-  { id: 'ollama', name: 'Ollama (本地)' },
-];
-
-const DEFAULT_PROVIDER_ENDPOINTS: Record<string, string> = {
-  deepseek: 'https://api.deepseek.com',
-  openai: 'https://api.openai.com/v1',
-  'openai-codex': 'https://api.openai.com/v1',
-  google: 'https://generativelanguage.googleapis.com/v1beta',
-  anthropic: 'https://api.anthropic.com',
-  'opencode-go': 'https://opencode.ai/zen/go/v1',
-  opencode: 'https://opencode.ai/zen/v1',
-  openrouter: 'https://openrouter.ai/api/v1',
-  dashscope: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-  moonshot: 'https://api.moonshot.cn/v1',
-  zhipu: 'https://open.bigmodel.cn/api/paas/v4',
-  siliconflow: 'https://api.siliconflow.cn/v1',
-  xai: 'https://api.x.ai/v1',
-  ollama: 'http://127.0.0.1:11434/v1',
+export type {
+  ModelEffectStats,
+  ModelHubConfigureInput,
+  ModelHubFetchInput,
+  ModelHubProbeInput,
+  PersistedDecisionConfig,
+  PersistedModelHubState,
+  PersistedProviderConfig,
+  SelectedModelConfig,
+  SelectedModelInput,
+  WorkerModelResolutionInput,
 };
-
-const FALLBACK_PROVIDER_MODELS: Record<string, ModelCatalogEntry[]> = {
-  openrouter: [
-    { id: 'anthropic/claude-sonnet-4', name: 'Claude Sonnet 4 (OR)', supportsImages: true, reasoning: true, contextWindow: 200_000, costInput: 3, costOutput: 15 },
-    { id: 'google/gemini-2.5-pro', name: 'Gemini 2.5 Pro (OR)', supportsImages: true, reasoning: true, contextWindow: 1_048_576, costInput: 1.25, costOutput: 10 },
-    { id: 'deepseek/deepseek-chat-v3-0324', name: 'DeepSeek V3 (OR)', supportsImages: false, reasoning: false, contextWindow: 128_000, costInput: 0.2, costOutput: 0.8 },
-  ],
-  dashscope: [
-    { id: 'qwen-max-latest', name: 'Qwen Max', supportsImages: false, reasoning: true, contextWindow: 131_072, costInput: 1.6, costOutput: 6.4 },
-    { id: 'qwen-coder-plus-latest', name: 'Qwen Coder Plus', supportsImages: false, reasoning: false, contextWindow: 131_072, costInput: 0.5, costOutput: 1.5 },
-    { id: 'qwen-vl-max-latest', name: 'Qwen VL Max', supportsImages: true, reasoning: false, contextWindow: 131_072, costInput: 0.8, costOutput: 2.4 },
-    { id: 'qwen-turbo-latest', name: 'Qwen Turbo', supportsImages: false, reasoning: false, contextWindow: 1_000_000, costInput: 0.05, costOutput: 0.2 },
-  ],
-  moonshot: [
-    { id: 'kimi-k2-0711-preview', name: 'Kimi K2', supportsImages: false, reasoning: true, contextWindow: 131_072, costInput: 1, costOutput: 3 },
-    { id: 'moonshot-v1-128k-vision-preview', name: 'Moonshot 128K Vision', supportsImages: true, reasoning: false, contextWindow: 128_000, costInput: 1, costOutput: 3 },
-    { id: 'moonshot-v1-32k', name: 'Moonshot 32K', supportsImages: false, reasoning: false, contextWindow: 32_768, costInput: 0.2, costOutput: 0.6 },
-  ],
-  zhipu: [
-    { id: 'glm-4.5', name: 'GLM-4.5', supportsImages: false, reasoning: true, contextWindow: 128_000, costInput: 0.8, costOutput: 2 },
-    { id: 'glm-4v-plus', name: 'GLM-4V Plus', supportsImages: true, reasoning: false, contextWindow: 128_000, costInput: 0.8, costOutput: 2 },
-    { id: 'glm-4-flash', name: 'GLM-4 Flash', supportsImages: false, reasoning: false, contextWindow: 128_000, costInput: 0, costOutput: 0 },
-  ],
-  siliconflow: [
-    { id: 'deepseek-ai/DeepSeek-R1', name: 'DeepSeek R1 (SF)', supportsImages: false, reasoning: true, contextWindow: 128_000, costInput: 0.5, costOutput: 2 },
-    { id: 'deepseek-ai/DeepSeek-V3', name: 'DeepSeek V3 (SF)', supportsImages: false, reasoning: false, contextWindow: 128_000, costInput: 0.2, costOutput: 0.8 },
-    { id: 'Qwen/Qwen2.5-Coder-32B-Instruct', name: 'Qwen2.5 Coder 32B', supportsImages: false, reasoning: false, contextWindow: 128_000, costInput: 0.15, costOutput: 0.15 },
-  ],
-  xai: [
-    { id: 'grok-4', name: 'Grok 4', supportsImages: true, reasoning: true, contextWindow: 256_000, costInput: 3, costOutput: 15 },
-    { id: 'grok-3-mini', name: 'Grok 3 Mini', supportsImages: false, reasoning: true, contextWindow: 131_072, costInput: 0.3, costOutput: 0.5 },
-  ],
-  ollama: [
-    { id: 'qwen2.5-coder:latest', name: 'Qwen2.5 Coder (Local)', supportsImages: false, reasoning: false, contextWindow: 128_000, costInput: 0, costOutput: 0 },
-    { id: 'deepseek-r1:latest', name: 'DeepSeek R1 (Local)', supportsImages: false, reasoning: true, contextWindow: 128_000, costInput: 0, costOutput: 0 },
-  ],
-};
-
-function classifyModelEntry(
-  providerId: string,
-  model: ModelCatalogEntry,
-  sampleTiers?: { fast?: string; balanced?: string; strong?: string },
-): { tier: ModelTier; specialties: string[] } {
-  const id = model.id.toLowerCase();
-  let tier: ModelTier = 'balanced';
-  if (sampleTiers?.strong === model.id && sampleTiers?.strong !== sampleTiers?.fast) {
-    tier = 'strong';
-  } else if (sampleTiers?.fast === model.id && sampleTiers?.fast !== sampleTiers?.balanced) {
-    tier = 'fast';
-  } else if (/(?:opus|sol|astra|argon|o1|o3|reasoner|deepseek-r1|grok-4|qwen-max|glm-4\.5|pro)/i.test(id)) {
-    tier = 'strong';
-  } else if (/(?:flash|mini|luna|haiku|turbo|nano|lite)/i.test(id)) {
-    tier = 'fast';
-  }
-
-  const specialties: string[] = [];
-  if (/(?:claude|codex|gemini|gpt-6|gpt-5|gpt-4\.1|o3|coder|deepseek|glm-4\.5|kimi-k2)/i.test(id) || providerId === 'anthropic' || providerId === 'openai-codex') {
-    specialties.push('代码工程');
-  }
-  if (model.reasoning || /(?:opus|sol|argon|o1|o3|reasoner|r1|thinking|grok-4|qwen-max)/i.test(id)) {
-    specialties.push('深度推理');
-  }
-  if (model.contextWindow >= 256_000) {
-    specialties.push('超长上下文');
-  }
-  if (model.supportsImages) {
-    specialties.push('多模态看图');
-  }
-  if (tier === 'fast') {
-    specialties.push('极速响应');
-  }
-  if (!specialties.length) {
-    specialties.push('通用执行');
-  }
-  return { tier, specialties };
-}
-
-function normalizeSelectedModels(input: unknown): SelectedModelConfig[] {
-  if (!Array.isArray(input)) throw new Error('selectedModels 必须是数组');
-  const result: SelectedModelConfig[] = [];
-  const seen = new Set<string>();
-  for (const raw of input) {
-    const item = typeof raw === 'string'
-      ? { id: raw }
-      : (raw ?? {}) as { id?: unknown; thinkingLevels?: unknown; tier?: unknown };
-    const id = typeof item.id === 'string' ? item.id.trim() : '';
-    if (!id) throw new Error('selectedModels 中的模型 ID 不能为空');
-    if (id.length > 128) throw new Error(`模型 ID 过长: ${id.slice(0, 32)}…`);
-    if (item.tier !== undefined && (typeof item.tier !== 'string' || !MODEL_TIER_VALUES.includes(item.tier as ModelTier))) {
-      throw new Error(`模型 "${id}" 的等级无效：${String(item.tier)}（应为 fast / balanced / strong）`);
-    }
-    let thinkingLevels: ThinkingLevel[] | undefined;
-    if (item.thinkingLevels !== undefined) {
-      if (!Array.isArray(item.thinkingLevels) || !item.thinkingLevels.every(isThinkingLevel)) {
-        throw new Error(`模型 "${id}" 的原生思考等级无效`);
-      }
-      const dedup = [...new Set(item.thinkingLevels)];
-      if (dedup.length) thinkingLevels = dedup;
-    }
-    if (seen.has(id)) continue;
-    seen.add(id);
-    result.push({
-      id,
-      ...(thinkingLevels ? { thinkingLevels } : {}),
-    });
-  }
-  if (result.length > MAX_SELECTED_MODELS) {
-    throw new Error(`每个提供方最多勾选 ${MAX_SELECTED_MODELS} 个模型，当前 ${result.length} 个`);
-  }
-  return result;
-}
-
-function tierToPreferredThinkingLevel(tier: ModelTier | undefined): ThinkingLevel | undefined {
-  if (tier === 'fast') return 'low';
-  if (tier === 'balanced') return 'medium';
-  if (tier === 'strong') return 'high';
-  return undefined;
-}
-
-function thinkingLevelToTier(level: ThinkingLevel): ModelTier {
-  if (level === 'off' || level === 'minimal' || level === 'low') return 'fast';
-  if (level === 'high' || level === 'xhigh' || level === 'max') return 'strong';
-  return 'balanced';
-}
-
-function splitModelAndLevel(raw: string): { model: string; explicitLevel?: ThinkingLevel } {
-  const at = raw.lastIndexOf('@');
-  if (at > 0) {
-    const suffix = raw.slice(at + 1).trim();
-    if (isThinkingLevel(suffix)) {
-      return { model: raw.slice(0, at).trim(), explicitLevel: suffix };
-    }
-  }
-  return { model: raw.trim() };
-}
-
-function maskKey(key: string | undefined): string | undefined {
-  if (!key) return undefined;
-  const trimmed = key.trim();
-  if (!trimmed) return undefined;
-  if (trimmed.length <= 8) return `${trimmed.slice(0, 2)}***${trimmed.slice(-2)}`;
-  return `${trimmed.slice(0, 4)}…${trimmed.slice(-4)}`;
-}
-
-function normalizeProviderId(id: string | undefined): string | undefined {
-  if (!id) return undefined;
-  const trimmed = id.trim();
-  if (!trimmed) return undefined;
-  return trimmed === 'gemini' ? 'google' : trimmed;
-}
-
-function isOpenCodeProvider(providerId: string, baseUrl?: string): boolean {
-  if (providerId === 'opencode' || providerId === 'opencode-go') return true;
-  if (!baseUrl) return false;
-  try {
-    return new URL(baseUrl).hostname === 'opencode.ai';
-  } catch {
-    return /opencode\.ai/i.test(baseUrl);
-  }
-}
-
-function isOfficialOpenCodeUrl(providerId: string, baseUrl?: string): boolean {
-  if (providerId !== 'opencode' && providerId !== 'opencode-go') return false;
-  if (!baseUrl) return true;
-  try {
-    return new URL(baseUrl).hostname === 'opencode.ai';
-  } catch {
-    return false;
-  }
-}
 
 export class ModelHub {
   private readonly sdkDir: string;
@@ -338,6 +91,9 @@ export class ModelHub {
   /** 所有已配置且启用的 provider 的完整模型目录（仅用于禁用 provider 时的回退选择，不作为 Worker 模型池） */
   private cachedCatalog: PooledModelEntry[] = [];
   private cachedCosts = new Map<string, { costInput: number; costOutput: number }>();
+  private saveQueue: Promise<void> = Promise.resolve();
+  private runtimePromise?: Promise<ModelRuntime>;
+  private closed = false;
 
   constructor(
     private readonly home: string,
@@ -426,18 +182,27 @@ export class ModelHub {
 
   private async ensureRuntime(): Promise<ModelRuntime> {
     if (this.runtime) return this.runtime;
-    this.runtime = this.suppliedRuntime ?? await ModelRuntime.create({
-      authPath: join(this.sdkDir, 'auth.json'),
-      modelsPath: null,
-      modelsStorePath: join(this.sdkDir, 'models-cache.json'),
-      refreshOnCreate: false,
-    });
-    for (const p of FEATURED_PROVIDERS) {
-      if (!this.baseModelsByProvider.has(p.id)) {
-        this.baseModelsByProvider.set(p.id, [...this.runtime.getModels(p.id)]);
-      }
+    if (!this.runtimePromise) {
+      this.runtimePromise = (async () => {
+        const runtime = this.suppliedRuntime ?? await ModelRuntime.create({
+          authPath: join(this.sdkDir, 'auth.json'),
+          modelsPath: null,
+          modelsStorePath: join(this.sdkDir, 'models-cache.json'),
+          refreshOnCreate: false,
+        });
+        ensureRealProviderCatalog(runtime);
+        for (const p of FEATURED_PROVIDERS) {
+          if (!this.baseModelsByProvider.has(p.id)) {
+            this.baseModelsByProvider.set(p.id, [...runtime.getModels(p.id)]);
+          }
+        }
+        this.runtime = runtime;
+        return runtime;
+      })().finally(() => {
+        this.runtimePromise = undefined;
+      });
     }
-    return this.runtime;
+    return this.runtimePromise;
   }
 
   private getBaseModels(runtime: ModelRuntime, providerId: string) {
@@ -463,194 +228,6 @@ export class ModelHub {
     return undefined;
   }
 
-  private async fetchRemoteModelsFromEndpoint(
-    providerId: string,
-    apiKey: string | undefined,
-    baseUrl: string | undefined,
-    baseModels: ReturnType<ModelRuntime['getModels']>,
-  ): Promise<ModelCatalogEntry[]> {
-    const baseById = new Map(baseModels.map(m => [m.id, m]));
-    const cleanBase = (baseUrl?.trim() || DEFAULT_PROVIDER_ENDPOINTS[providerId] || '').replace(/\/+$/, '');
-    if (!cleanBase) {
-      throw new Error(`提供方 "${providerId}" 未配置可用的模型列表接口地址 (Base URL)`);
-    }
-
-    if (providerId === 'google' && !baseUrl?.trim()) {
-      if (!apiKey) throw new Error('拉取 Google Gemini 模型列表需要先提供 API Key');
-      const url = `${cleanBase}/models?pageSize=100&key=${encodeURIComponent(apiKey)}`;
-      const res = await fetch(url, {
-        method: 'GET',
-        headers: { Accept: 'application/json' },
-        signal: AbortSignal.timeout(12_000),
-      });
-      if (!res.ok) {
-        const errBody = await res.text().catch(() => '');
-        throw new Error(`Google /models 接口返回 HTTP ${res.status}: ${errBody.slice(0, 200)}`);
-      }
-      const data = await res.json() as {
-        models?: Array<{
-          name?: string;
-          displayName?: string;
-          inputTokenLimit?: number;
-          outputTokenLimit?: number;
-          supportedGenerationMethods?: string[];
-          thinking?: boolean;
-        }>;
-      };
-      const rawList = Array.isArray(data.models) ? data.models : [];
-      const entries: ModelCatalogEntry[] = [];
-      for (const item of rawList) {
-        if (!item.name) continue;
-        const methods = Array.isArray(item.supportedGenerationMethods) ? item.supportedGenerationMethods : [];
-        if (!methods.includes('generateContent')) continue;
-        const id = item.name.replace(/^models\//, '');
-        if (/(?:tts|image-generation|embedding|aqa|imagen|veo|robotics|computer-use|audio)/i.test(id)) continue;
-        const baseModel = baseById.get(id);
-        entries.push({
-          id,
-          name: item.displayName || baseModel?.name || id,
-          supportsImages: baseModel ? baseModel.input.includes('image') : true,
-          reasoning: Boolean(item.thinking ?? baseModel?.reasoning ?? false),
-          contextWindow: typeof item.inputTokenLimit === 'number' && item.inputTokenLimit > 0
-            ? item.inputTokenLimit
-            : (baseModel?.contextWindow ?? 1_048_576),
-          maxTokens: typeof item.outputTokenLimit === 'number' && item.outputTokenLimit > 0
-            ? item.outputTokenLimit
-            : (baseModel?.maxTokens ?? 65_536),
-          costInput: baseModel?.cost?.input ?? 0,
-          costOutput: baseModel?.cost?.output ?? 0,
-        });
-      }
-      if (!entries.length) {
-        throw new Error('Google /models 接口未返回支持 generateContent 的对话模型');
-      }
-      return entries;
-    }
-
-    if (providerId === 'anthropic' && !baseUrl?.trim()) {
-      if (!apiKey) throw new Error('拉取 Anthropic 模型列表需要先提供 API Key');
-      const url = cleanBase.endsWith('/v1') ? `${cleanBase}/models` : `${cleanBase}/v1/models`;
-      const res = await fetch(url, {
-        method: 'GET',
-        headers: {
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-          Accept: 'application/json',
-        },
-        signal: AbortSignal.timeout(12_000),
-      });
-      if (!res.ok) {
-        const errBody = await res.text().catch(() => '');
-        throw new Error(`Anthropic /v1/models 接口返回 HTTP ${res.status}: ${errBody.slice(0, 200)}`);
-      }
-      const data = await res.json() as {
-        data?: Array<{ id?: string; display_name?: string }>;
-      };
-      const rawList = Array.isArray(data.data) ? data.data : [];
-      const entries: ModelCatalogEntry[] = [];
-      for (const item of rawList) {
-        if (!item.id) continue;
-        const baseModel = baseById.get(item.id);
-        entries.push({
-          id: item.id,
-          name: item.display_name || baseModel?.name || item.id,
-          supportsImages: baseModel ? baseModel.input.includes('image') : true,
-          reasoning: Boolean(baseModel?.reasoning ?? true),
-          contextWindow: baseModel?.contextWindow ?? 200_000,
-          maxTokens: baseModel?.maxTokens ?? 16_384,
-          costInput: baseModel?.cost?.input ?? 0,
-          costOutput: baseModel?.cost?.output ?? 0,
-        });
-      }
-      if (!entries.length) {
-        throw new Error('Anthropic /v1/models 接口返回为空');
-      }
-      return entries;
-    }
-
-    // Standard OpenAI-compatible GET /models (DeepSeek, OpenAI, OpenAI Codex, OpenCode, or custom gateway)
-    const headers: Record<string, string> = { Accept: 'application/json' };
-    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-    if (isOpenCodeProvider(providerId, cleanBase)) {
-      headers['x-opencode-session'] = randomUUID();
-      headers['x-opencode-client'] = 'pi';
-    }
-    const url = `${cleanBase}/models`;
-    const res = await fetch(url, {
-      method: 'GET',
-      headers,
-      signal: AbortSignal.timeout(12_000),
-    });
-    if (!res.ok) {
-      const errBody = await res.text().catch(() => '');
-      throw new Error(`${providerId} /models 接口 (${url}) 返回 HTTP ${res.status}: ${errBody.slice(0, 200)}`);
-    }
-    const data = await res.json() as {
-      data?: Array<{
-        id?: string;
-        slug?: string;
-        name?: string;
-         title?: string;
-        display_name?: string;
-        context_window?: number;
-        max_context_window?: number;
-        max_output_tokens?: number;
-        input_modalities?: string[];
-        reasoning?: boolean;
-        supports_reasoning_effort_updates?: boolean;
-      }>;
-      models?: Array<{
-        id?: string;
-        slug?: string;
-        name?: string;
-        title?: string;
-        display_name?: string;
-        context_window?: number;
-        max_context_window?: number;
-        max_output_tokens?: number;
-        input_modalities?: string[];
-        reasoning?: boolean;
-        supports_reasoning_effort_updates?: boolean;
-      }>;
-    };
-    const rawList = Array.isArray(data.data)
-      ? data.data
-      : Array.isArray(data.models)
-        ? data.models
-        : [];
-    const entries: ModelCatalogEntry[] = [];
-    for (const item of rawList) {
-      const id = (item.id || item.slug || '').trim();
-      if (!id) continue;
-      if (/^(?:tts-|whisper-|dall-e-|text-embedding-|omni-moderation-|babbage-|davinci-)/i.test(id)) continue;
-      const baseModel = baseById.get(id);
-      const supportsImages = Array.isArray(item.input_modalities)
-        ? item.input_modalities.includes('image')
-        : Boolean(baseModel?.input.includes('image'));
-      const ctxWin = typeof item.context_window === 'number' && item.context_window > 0
-        ? item.context_window
-        : typeof item.max_context_window === 'number' && item.max_context_window > 0
-          ? item.max_context_window
-          : (baseModel?.contextWindow ?? 128_000);
-      entries.push({
-        id,
-        name: item.name || item.display_name || item.title || baseModel?.name || id,
-        supportsImages,
-        reasoning: Boolean(item.reasoning ?? item.supports_reasoning_effort_updates ?? baseModel?.reasoning ?? false),
-        contextWindow: ctxWin,
-        maxTokens: typeof item.max_output_tokens === 'number' && item.max_output_tokens > 0
-          ? item.max_output_tokens
-          : (baseModel?.maxTokens ?? 16_384),
-        costInput: baseModel?.cost?.input ?? 0,
-        costOutput: baseModel?.cost?.output ?? 0,
-      });
-    }
-    if (!entries.length) {
-      throw new Error(`${providerId} /models 接口未返回可用模型`);
-    }
-    return entries;
-  }
-
   private async syncProviderModelsFromApi(
     runtime: ModelRuntime,
     providerId: string,
@@ -663,7 +240,7 @@ export class ModelHub {
       ? (inline.baseUrl.trim() || undefined)
       : persisted.baseUrl;
     try {
-      const fetched = await this.fetchRemoteModelsFromEndpoint(providerId, apiKey, baseUrl, baseModels);
+      const fetched = await fetchRemoteModelsFromEndpoint(providerId, apiKey, baseUrl, baseModels);
       this.state.providers[providerId] = {
         ...this.state.providers[providerId],
         fetchedModels: fetched,
@@ -837,7 +414,7 @@ export class ModelHub {
   private async resolveDecisionInfo(runtime: ModelRuntime): Promise<{ credentials?: DecisionCredentials; view: DecisionEngineView }> {
     const enabled = this.state.decision?.enabled !== false;
     const baseUrl = this.state.decision?.baseUrl?.trim()
-      || process.env.SUPER_AGENT_DECISION_BASE_URL?.trim()
+      || resolveEnv('FRIDAY_DECISION_BASE_URL', 'SUPER_AGENT_DECISION_BASE_URL')
       || this.state.providers.google?.baseUrl?.trim()
       || DEFAULT_GEMINI_DECISION_BASE_URL;
     if (!enabled) {
@@ -853,10 +430,10 @@ export class ModelHub {
     }
 
     const explicitKey = this.state.decision?.apiKey?.trim();
-    const envDecisionKey = process.env.SUPER_AGENT_DECISION_API_KEY?.trim();
+    const envDecisionKey = resolveEnv('FRIDAY_DECISION_API_KEY', 'SUPER_AGENT_DECISION_API_KEY');
     const googleEnabled = this.isProviderEnabled('google');
     const googleProviderKey = googleEnabled ? await this.resolveProviderApiKey(runtime, 'google') : undefined;
-    const envGoogleKey = googleEnabled ? (process.env.GEMINI_API_KEY?.trim() || process.env.GOOGLE_API_KEY?.trim()) : undefined;
+    const envGoogleKey = googleEnabled ? resolveEnv('GEMINI_API_KEY', 'GOOGLE_API_KEY') : undefined;
 
     let apiKey: string | undefined;
     let credentialSource: DecisionEngineView['credentialSource'] = 'none';
@@ -896,14 +473,38 @@ export class ModelHub {
     if (this.state.decision?.apiKey?.trim()) return true;
     if (this.mode === 'offline' && !this.state.decision?.baseUrl?.trim()) return false;
     return Boolean(
-      process.env.SUPER_AGENT_DECISION_API_KEY?.trim()
+      resolveEnv('FRIDAY_DECISION_API_KEY', 'SUPER_AGENT_DECISION_API_KEY')
       || (this.isProviderEnabled('google') && (
         this.state.providers.google?.apiKey?.trim()
-        || process.env.GEMINI_API_KEY?.trim()
-        || process.env.GOOGLE_API_KEY?.trim()
+        || resolveEnv('GEMINI_API_KEY', 'GOOGLE_API_KEY')
         || this.runtime?.getProviderAuthStatus('google').configured
       )),
     );
+  }
+
+  private buildProviderCatalogModels(runtime: ModelRuntime, providerId: string, persisted?: PersistedProviderConfig): ModelCatalogEntry[] {
+    const hasRemoteModels = Boolean(persisted?.fetchedModels?.length);
+    const rawModels = runtime.getModels(providerId);
+    return (hasRemoteModels
+      ? persisted!.fetchedModels!
+      : rawModels.length
+        ? rawModels.map((m): ModelCatalogEntry => ({
+            id: m.id,
+            name: m.name || m.id,
+            supportsImages: m.input.includes('image'),
+            reasoning: Boolean(m.reasoning),
+            contextWindow: m.contextWindow ?? 128_000,
+            maxTokens: m.maxTokens ?? 16_384,
+            costInput: m.cost?.input ?? 0,
+            costOutput: m.cost?.output ?? 0,
+          }))
+        : (FALLBACK_PROVIDER_MODELS[providerId] ?? [])
+    ).map(m => ({
+      ...m,
+      thinkingLevels: m.thinkingLevels?.length
+        ? m.thinkingLevels
+        : this.resolveCatalogThinkingLevels(runtime, providerId, m.id, m.reasoning),
+    }));
   }
 
   private async rebuildPoolCache(runtime: ModelRuntime): Promise<PooledModelEntry[]> {
@@ -929,28 +530,7 @@ export class ModelHub {
       if (!configured) continue;
 
       const providerName = persisted?.name ?? featured?.name ?? catalogProvider?.name ?? id;
-      const hasRemoteModels = Boolean(persisted?.fetchedModels?.length);
-      const rawModels = runtime.getModels(id);
-      const models: ModelCatalogEntry[] = (hasRemoteModels
-        ? persisted!.fetchedModels!
-        : rawModels.length
-          ? rawModels.map((m): ModelCatalogEntry => ({
-              id: m.id,
-              name: m.name || m.id,
-              supportsImages: m.input.includes('image'),
-              reasoning: Boolean(m.reasoning),
-              contextWindow: m.contextWindow ?? 128_000,
-              maxTokens: m.maxTokens ?? 16_384,
-              costInput: m.cost?.input ?? 0,
-              costOutput: m.cost?.output ?? 0,
-            }))
-          : (FALLBACK_PROVIDER_MODELS[id] ?? [])
-      ).map(m => ({
-        ...m,
-        thinkingLevels: m.thinkingLevels?.length
-          ? m.thinkingLevels
-          : this.resolveCatalogThinkingLevels(runtime, id, m.id, m.reasoning),
-      }));
+      const models = this.buildProviderCatalogModels(runtime, id, persisted);
       const sampleDefault = models[0]?.id ?? 'default';
       const sampleTiers = buildModelTiers(runtime, id, sampleDefault, sampleDefault, {
         hasCustomBaseUrl: Boolean(persisted?.baseUrl),
@@ -1072,57 +652,9 @@ export class ModelHub {
     void this.saveState().catch(() => {});
   }
 
-  async syncDecisionEraStats(
-    tasks: readonly {
-      id: string;
-      workerModel?: string;
-      status: string;
-      activeMs: number;
-      createdAt: number;
-      parentTaskId?: string;
-      decisionSource?: DecisionSource;
-      qualityGate?: { score: number; source: DecisionSource };
-    }[],
-  ): Promise<void> {
+  async syncDecisionEraStats(tasks: readonly DecisionEraTaskRecord[]): Promise<void> {
     if (this.state.statsEpoch === DECISION_STATS_EPOCH) return;
-    const supplementedIds = new Set(
-      tasks.map(t => t.parentTaskId).filter((id): id is string => Boolean(id)),
-    );
-    const jevTasks = tasks
-      .filter(t => Boolean(t.decisionSource) && (t.status === 'completed' || t.status === 'failed') && Boolean(t.workerModel))
-      .sort((a, b) => a.createdAt - b.createdAt);
-
-    const nextStats: Record<string, ModelEffectStats> = {};
-    for (const task of jevTasks) {
-      let spec = splitModelAndLevel(task.workerModel!).model;
-      if (!spec) continue;
-      if (!spec.includes('/')) {
-        const matched = this.cachedPool.find(item => item.modelId === spec);
-        spec = matched ? matched.spec : `${this.currentTiers.provider}/${spec}`;
-      }
-      const ok = task.status === 'completed';
-      const prev = nextStats[spec] ?? { successCount: 0, failCount: 0, updatedAt: task.createdAt || Date.now() };
-      let qualityScoreSum = prev.qualityScoreSum ?? 0;
-      let qualityCount = prev.qualityCount ?? 0;
-      if (ok && task.qualityGate?.source === 'gemini-decision-1' && Number.isFinite(task.qualityGate.score)) {
-        const clamped = Math.max(0, Math.min(3, task.qualityGate.score));
-        const effective = supplementedIds.has(task.id) ? Math.min(clamped, 1.2) : clamped;
-        qualityScoreSum += effective;
-        qualityCount += 1;
-      }
-      const avgQualityScore = qualityCount > 0
-        ? Number((qualityScoreSum / qualityCount).toFixed(2))
-        : prev.avgQualityScore;
-      nextStats[spec] = {
-        ...prev,
-        successCount: prev.successCount + (ok ? 1 : 0),
-        failCount: prev.failCount + (ok ? 0 : 1),
-        ...(task.activeMs > 0 ? { lastLatencyMs: Math.round(task.activeMs) } : {}),
-        ...(qualityCount > 0 ? { qualityScoreSum: Number(qualityScoreSum.toFixed(2)), qualityCount, avgQualityScore } : {}),
-        updatedAt: task.createdAt || Date.now(),
-      };
-    }
-
+    const nextStats = accumulateDecisionEraStats(tasks, this.cachedPool, this.currentTiers.provider);
     this.state.modelStats = nextStats;
     this.state.statsEpoch = DECISION_STATS_EPOCH;
     for (const entry of [...this.cachedPool, ...this.cachedCatalog]) {
@@ -1133,37 +665,6 @@ export class ModelHub {
       entry.avgQualityScore = st?.avgQualityScore;
     }
     await this.saveState();
-  }
-
-  private modelNotInPoolError(rawModel: string): Error {
-    const limit = 12;
-    const specs = this.cachedPool.map(p => p.spec);
-    const listed = specs.slice(0, limit).join(', ') + (specs.length > limit ? ` 等 ${specs.length} 个` : '');
-    return new Error(`模型 "${rawModel}" 未在模型中心启用；当前可用：${listed || '无'}`);
-  }
-
-  private toDecisionCandidates(entries: readonly PooledModelEntry[]): DecisionRouteCandidate[] {
-    return entries.map(entry => {
-      const cost = this.cachedCosts.get(entry.spec);
-      return {
-        spec: entry.spec,
-        providerId: entry.providerId,
-        providerName: entry.providerName,
-        modelId: entry.modelId,
-        modelName: entry.modelName,
-        thinkingLevels: entry.thinkingLevels.length ? entry.thinkingLevels : ['off'],
-        supportsImages: entry.supportsImages,
-        reasoning: entry.reasoning,
-        contextWindow: entry.contextWindow,
-        specialties: entry.specialties,
-        costInput: cost?.costInput ?? 0,
-        costOutput: cost?.costOutput ?? 0,
-        latencyMs: entry.latencyMs,
-        successCount: entry.successCount,
-        failCount: entry.failCount,
-        avgQualityScore: entry.avgQualityScore,
-      };
-    });
   }
 
   private validateExplicitModel(rawModelInput: string): {
@@ -1180,7 +681,7 @@ export class ModelHub {
       }
       const normalizedSpec = `${explicitProv}/${rawModel.slice(slash + 1)}`;
       const entry = this.cachedPool.find(p => p.spec === rawModel || p.spec === normalizedSpec);
-      if (!entry && this.cachedPool.length > 0) throw this.modelNotInPoolError(rawModel);
+      if (!entry && this.cachedPool.length > 0) throw formatModelNotInPoolError(rawModel, this.cachedPool);
       return { poolEntry: entry, spec: rawModel, explicitLevel };
     }
     const poolHit = this.cachedPool.find(p => p.modelId === rawModel);
@@ -1206,7 +707,7 @@ export class ModelHub {
     if (!this.isProviderEnabled(this.currentTiers.provider)) {
       throw new Error(`提供方 "${this.currentTiers.provider}" 已禁用，无法调用模型 "${rawModel}"`);
     }
-    if (this.cachedPool.length > 0) throw this.modelNotInPoolError(rawModel);
+    if (this.cachedPool.length > 0) throw formatModelNotInPoolError(rawModel, this.cachedPool);
     return { spec: rawModel, explicitLevel };
   }
 
@@ -1217,7 +718,7 @@ export class ModelHub {
     if (rawModel && !isTierAlias) {
       const { poolEntry, spec, explicitLevel } = this.validateExplicitModel(rawModel);
       if (poolEntry) {
-        const picked = selectHeuristicRoute(this.toDecisionCandidates([poolEntry]), {
+        const picked = selectHeuristicRoute(toDecisionCandidates([poolEntry], this.cachedCosts), {
           instruction: input.instruction ?? '',
           contextBrief: input.contextBrief,
           profile: input.profile,
@@ -1253,7 +754,7 @@ export class ModelHub {
     }
 
     const preferredTier = input.tier ?? (isTierAlias ? rawModel as ModelTier : undefined);
-    const heuristic = selectHeuristicRoute(this.toDecisionCandidates(this.cachedPool), {
+    const heuristic = selectHeuristicRoute(toDecisionCandidates(this.cachedPool, this.cachedCosts), {
       instruction: input.instruction ?? '',
       contextBrief: input.contextBrief,
       profile: input.profile,
@@ -1306,7 +807,7 @@ export class ModelHub {
       }
       if (poolEntry) {
         const picked = await decideWorkerRoute(
-          this.toDecisionCandidates([poolEntry]),
+          toDecisionCandidates([poolEntry], this.cachedCosts),
           {
             instruction: input.instruction ?? '',
             contextBrief: input.contextBrief,
@@ -1359,7 +860,7 @@ export class ModelHub {
 
     const preferredTier = input.tier ?? (isTierAlias ? rawModel as ModelTier : undefined);
     const picked = await decideWorkerRoute(
-      this.toDecisionCandidates(this.cachedPool),
+      toDecisionCandidates(this.cachedPool, this.cachedCosts),
       {
         instruction: input.instruction ?? '',
         contextBrief: input.contextBrief,
@@ -1401,10 +902,38 @@ export class ModelHub {
     return evaluateSessionContinuity(input, credentials);
   }
 
-  private async saveState(): Promise<void> {
-    await mkdir(this.sdkDir, { recursive: true, mode: 0o700 });
-    await writeFile(this.statePath, JSON.stringify(this.state, null, 2), { mode: 0o600 });
-    await chmod(this.statePath, 0o600).catch(() => {});
+  private saveState(): Promise<void> {
+    if (this.closed) return this.saveQueue;
+    const run = this.saveQueue.then(async () => {
+      if (this.closed) return;
+      await mkdir(this.sdkDir, { recursive: true, mode: 0o700 });
+      const tmpPath = `${this.statePath}.${randomUUID()}.tmp`;
+      const payload = JSON.stringify(this.state, null, 2);
+      try {
+        await writeFile(tmpPath, payload, { mode: 0o600 });
+        await chmod(tmpPath, 0o600).catch(() => {});
+        await rename(tmpPath, this.statePath);
+      } catch (err) {
+        await rm(tmpPath, { force: true }).catch(() => {});
+        throw err;
+      }
+    });
+    // Swallowing rejection on the tail chain prevents one I/O error from wedging future saves
+    this.saveQueue = run.catch(() => {});
+    return run;
+  }
+
+  /** Wait for all queued model-hub state writes to settle. */
+  async flush(): Promise<void> {
+    await this.saveQueue.catch(() => {});
+  }
+
+  /** Drain pending writes and prevent late background saves during teardown. */
+  async close(): Promise<void> {
+    await this.runtimePromise?.catch(() => {});
+    await this.saveQueue.catch(() => {});
+    this.closed = true;
+    await this.saveQueue.catch(() => {});
   }
 
   async getView(): Promise<ModelHubView> {
@@ -1434,27 +963,7 @@ export class ModelHub {
             : 'none';
       const configured = authType !== 'none' || Boolean(persisted?.baseUrl);
       const hasRemoteModels = Boolean(persisted?.fetchedModels?.length);
-      const rawModels = runtime.getModels(id);
-      const models: ModelCatalogEntry[] = (hasRemoteModels
-        ? persisted!.fetchedModels!
-        : rawModels.length
-          ? rawModels.map((m): ModelCatalogEntry => ({
-              id: m.id,
-              name: m.name || m.id,
-              supportsImages: m.input.includes('image'),
-              reasoning: Boolean(m.reasoning),
-              contextWindow: m.contextWindow ?? 128_000,
-              maxTokens: m.maxTokens ?? 16_384,
-              costInput: m.cost?.input ?? 0,
-              costOutput: m.cost?.output ?? 0,
-            }))
-          : (FALLBACK_PROVIDER_MODELS[id] ?? [])
-      ).map(m => ({
-        ...m,
-        thinkingLevels: m.thinkingLevels?.length
-          ? m.thinkingLevels
-          : this.resolveCatalogThinkingLevels(runtime, id, m.id, m.reasoning),
-      }));
+      const models = this.buildProviderCatalogModels(runtime, id, persisted);
       const sampleDefault = models[0]?.id ?? 'default';
       const sampleTiers = buildModelTiers(runtime, id, sampleDefault, sampleDefault, {
         hasCustomBaseUrl: Boolean(persisted?.baseUrl),
@@ -1656,6 +1165,7 @@ export class ModelHub {
       await this.saveState();
       return result;
     }
+
     const inlineApiKey = input.apiKey?.trim() || undefined;
     const inlineBaseUrl = input.baseUrl?.trim() || undefined;
     if (inlineBaseUrl) {
@@ -1666,39 +1176,48 @@ export class ModelHub {
           supportsImages: false, error: `无效的 Base URL: ${inlineBaseUrl}`, testedAt: Date.now(),
         };
       }
-      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
-        const baseModels = this.getBaseModels(runtime, provider);
-        const baseById = new Map(baseModels.map(m => [m.id, m]));
-        const officialOpenCode = isOfficialOpenCodeUrl(provider, inlineBaseUrl);
-        const existing = runtime.getModels(provider).map(m => m.id);
-        const ids = [...new Set([...existing, modelId])];
-        runtime.registerProvider(provider, {
-          baseUrl: inlineBaseUrl,
-          api: 'openai-completions',
-          ...(inlineApiKey ?? this.state.providers[provider]?.apiKey ? { apiKey: inlineApiKey ?? this.state.providers[provider]?.apiKey } : {}),
-          models: ids.map(id => {
-            const bm = baseById.get(id);
-            const existingModel = runtime.getModel(provider, id) ?? bm;
-            const preserveBuiltinProtocol = Boolean(bm && officialOpenCode);
-            return {
-              ...(existingModel ?? {}),
-              id,
-              name: existingModel?.name ?? id,
-              api: preserveBuiltinProtocol ? bm!.api : 'openai-completions',
-              baseUrl: preserveBuiltinProtocol ? bm!.baseUrl : inlineBaseUrl,
-              reasoning: Boolean(existingModel?.reasoning),
-              input: existingModel?.input.includes('image') ? ['text', 'image'] : ['text'],
-              cost: existingModel?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-              contextWindow: existingModel?.contextWindow ?? 128_000,
-              maxTokens: existingModel?.maxTokens ?? 16_384,
-            };
-          }),
-        });
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        return {
+          ok: false, provider, model: modelId, mode: 'real', latencyMs: 1,
+          supportsImages: false, error: `Base URL 必须使用 http 或 https: ${inlineBaseUrl}`, testedAt: Date.now(),
+        };
       }
     }
-    const catalogModel = runtime.getModel(provider, modelId);
-    const supportsImages = Boolean(catalogModel?.input.includes('image'));
-    const contextWindow = catalogModel?.contextWindow;
+
+    const baseModel = this.getBaseModels(runtime, provider).find(m => m.id === modelId);
+    const runtimeModel = runtime.getModel(provider, modelId) ?? baseModel;
+    const fallbackCatalogEntry = FALLBACK_PROVIDER_MODELS[provider]?.find(m => m.id === modelId);
+
+    // Clone into a probe-local descriptor so live runtime state is never mutated during probe.
+    type RuntimeModelType = NonNullable<ReturnType<ModelRuntime['getModel']>>;
+    let probeModel: RuntimeModelType | undefined;
+    if (inlineBaseUrl) {
+      const preserveBuiltinProtocol = Boolean(baseModel && isOfficialOpenCodeUrl(provider, inlineBaseUrl));
+      const sourceInput = runtimeModel?.input ?? (fallbackCatalogEntry?.supportsImages ? ['text', 'image'] : ['text']);
+      probeModel = {
+        ...(runtimeModel ?? {}),
+        id: modelId,
+        name: runtimeModel?.name ?? fallbackCatalogEntry?.name ?? modelId,
+        provider,
+        api: preserveBuiltinProtocol ? baseModel!.api : 'openai-completions',
+        baseUrl: preserveBuiltinProtocol ? baseModel!.baseUrl : inlineBaseUrl,
+        reasoning: Boolean(runtimeModel?.reasoning ?? fallbackCatalogEntry?.reasoning),
+        input: sourceInput.includes('image') ? ['text', 'image'] : ['text'],
+        cost: runtimeModel?.cost ?? {
+          input: fallbackCatalogEntry?.costInput ?? 0,
+          output: fallbackCatalogEntry?.costOutput ?? 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+        },
+        contextWindow: runtimeModel?.contextWindow ?? fallbackCatalogEntry?.contextWindow ?? 128_000,
+        maxTokens: runtimeModel?.maxTokens ?? fallbackCatalogEntry?.maxTokens ?? 16_384,
+      } as RuntimeModelType;
+    } else if (runtimeModel) {
+      probeModel = { ...runtimeModel };
+    }
+
+    const supportsImages = Boolean(probeModel?.input.includes('image'));
+    const contextWindow = probeModel?.contextWindow;
 
     const creds = await runtime.listCredentials();
     const hasOAuth = creds.some(c => c.type === 'oauth' && c.providerId === provider);
@@ -1741,7 +1260,7 @@ export class ModelHub {
       return result;
     }
 
-    if (!catalogModel) {
+    if (!probeModel) {
       const result: ModelProbeResult = {
         ok: false,
         provider,
@@ -1760,11 +1279,28 @@ export class ModelHub {
     try {
       const promptText = input.prompt?.trim() || '请用简短一句话回复：确认你的模型名称并报告连接正常。';
       const probeSessionId = randomUUID();
-      const openCodeHeaders = isOpenCodeProvider(provider, catalogModel.baseUrl)
+      const openCodeHeaders = isOpenCodeProvider(provider, probeModel.baseUrl)
         ? { 'x-opencode-session': probeSessionId, 'x-opencode-client': 'pi' }
         : undefined;
-      const res = await runtime.completeSimple(
-        catalogModel,
+      const resolvedKey = inlineApiKey ?? await this.resolveProviderApiKey(runtime, provider);
+      // Use an isolated runtime if this provider isn't registered on the live runtime yet.
+      let callRuntime = runtime;
+      if (!runtime.getProvider(provider)) {
+        callRuntime = await ModelRuntime.create({
+          authPath: join(this.sdkDir, 'auth.json'),
+          modelsPath: null,
+          modelsStorePath: join(this.sdkDir, 'models-cache.json'),
+          refreshOnCreate: false,
+        });
+        callRuntime.registerProvider(provider, {
+          baseUrl: probeModel.baseUrl,
+          api: probeModel.api,
+          ...(resolvedKey ? { apiKey: resolvedKey } : {}),
+          models: [probeModel],
+        });
+      }
+      const res = await callRuntime.completeSimple(
+        probeModel,
         {
           systemPrompt: 'You are F.R.I.D.A.Y. (also known as Friday / 星期五) running a quick connectivity probe. Address the human as "老板" and reply in 1 short sentence in Simplified Chinese.',
           messages: [{ role: 'user', content: promptText, timestamp: Date.now() }],
@@ -1773,7 +1309,7 @@ export class ModelHub {
           maxTokens: 512,
           sessionId: probeSessionId,
           ...(openCodeHeaders ? { headers: openCodeHeaders } : {}),
-          ...(inlineApiKey ? { apiKey: inlineApiKey } : {}),
+          ...(resolvedKey ? { apiKey: resolvedKey } : {}),
           signal: AbortSignal.timeout(15_000),
         },
       );

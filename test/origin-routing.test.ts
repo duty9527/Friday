@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Store } from '../src/store.js';
 import { ImGateway } from '../src/im.js';
-import { Coordinator } from '../dist/coordinator.js';
+import { Coordinator } from '../src/coordinator.js';
 import { offlineFactory } from '../src/agent.js';
 
 test('durable exact-origin delivery: local/legacy suppressed, IM sessions isolated, restart inheritance', async () => {

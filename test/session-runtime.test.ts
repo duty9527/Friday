@@ -5,9 +5,9 @@ import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { Coordinator } from '../dist/coordinator.js';
-import { buildMindmapSnapshot } from '../dist/mindmap-flow.js';
-import { Store } from '../dist/store.js';
+import { Coordinator } from '../src/coordinator.js';
+import { buildMindmapSnapshot } from '../src/mindmap-flow.js';
+import { Store } from '../src/store.js';
 import type { AgentFactory } from '../src/agent.js';
 
 async function until(predicate: () => boolean | Promise<boolean>, attempts = 400) {
@@ -138,7 +138,7 @@ test('Runtime session attribution: JEV evaluates same_session on intake executio
     await coordinator.configureModels({
       providerId: 'deepseek',
       apiKey: 'sk-ds-rt',
-      selectedModels: ['deepseek-flash'],
+      selectedModels: ['deepseek-chat'],
       decisionApiKey: 'jev-rt-key',
       decisionBaseUrl: mock.baseUrl,
     });

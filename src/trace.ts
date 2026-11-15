@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { boundedTraceData, tracePreview } from './trace-preview.js';
 import type { AgentObservation, AgentPort } from './agent.js';
 import { Conversation } from './conversation.js';
-import type { TraceContext, TraceEvent } from './view.js';
+import type { TraceContext } from './view.js';
 
 export class PromptTrace {
   readonly id = randomUUID();

@@ -5,12 +5,12 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { Coordinator } from '../dist/coordinator.js';
+import { Coordinator } from '../src/coordinator.js';
 import { privateHome } from '../src/files.js';
 import type { AgentFactory, AgentObservation } from '../src/agent.js';
 import { PromptTrace } from '../src/trace.js';
 import { abortableDelay } from '../src/agent.js';
-import { Store } from '../src/store.js';
+import { Store, type Task } from '../src/store.js';
 
 async function until(predicate: () => boolean | Promise<boolean>, timeout = 8000) {
   const deadline = Date.now() + timeout;

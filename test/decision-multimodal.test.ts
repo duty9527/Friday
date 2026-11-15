@@ -1,5 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+import { offlineFactory, type AgentFactory } from '../src/agent.js';
+import { Coordinator } from '../src/coordinator.js';
+import { messageImages } from '../src/message-images.js';
+import type { AttachmentView } from '../src/view.js';
+import { until } from './helpers/async.js';
 import {
   DEFAULT_GEMINI_DECISION_BASE_URL,
   GEMINI_DECISION_MODEL,
@@ -131,5 +140,106 @@ test('requestGeminiDecisions surfaces HTTP and malformed payload errors cleanly'
     );
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+const TINY_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=',
+  'base64',
+);
+
+test('messageImages loads image attachments for TASK, FOLLOWUP, and BOSS_DECISION when supportsImages=true', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-msg-img-'));
+  const imgPath = join(home, 'shot.png');
+  await writeFile(imgPath, TINY_PNG);
+  const att: AttachmentView = { kind: 'image', name: 'shot.png', status: 'ready', path: imgPath, mimeType: 'image/png', bytes: TINY_PNG.length };
+  try {
+    for (const kind of ['TASK', 'FOLLOWUP', 'BOSS_DECISION'] as const) {
+      const payload = JSON.stringify({ kind, prompt: '请查看图片', attachments: [att] });
+      const withImages = await messageImages(payload, true);
+      assert.ok(withImages.images && withImages.images.length === 1, `${kind} should extract 1 image block`);
+      assert.equal(withImages.images[0]!.mimeType, 'image/png');
+
+      const withoutImages = await messageImages(payload, false);
+      assert.deepEqual(withoutImages.images, [], `${kind} should strip images when model lacks vision`);
+      assert.match(withoutImages.text, /不支持图像输入/);
+    }
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('Coordinator propagates image attachments into Worker TASK and FOLLOWUP events', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-worker-img-'));
+  const img1 = join(home, 'first.png');
+  const img2 = join(home, 'second.png');
+  await writeFile(img1, TINY_PNG);
+  await writeFile(img2, TINY_PNG);
+  const att1: AttachmentView = { kind: 'image', name: 'first.png', status: 'ready', path: img1, mimeType: 'image/png', bytes: TINY_PNG.length };
+  const att2: AttachmentView = { kind: 'image', name: 'second.png', status: 'ready', path: img2, mimeType: 'image/png', bytes: TINY_PNG.length };
+
+  const workerEvents: Array<{ kind: string; attachments?: AttachmentView[] }> = [];
+  let createdTaskId: string | undefined;
+  let routerError: string | undefined;
+  let workerTurn = 0;
+  const baseOffline = offlineFactory(5);
+  const factory: AgentFactory = {
+    mode: 'offline',
+    nativeTools: true,
+    modelTiers: baseOffline.modelTiers,
+    resolveWorkerModel: baseOffline.resolveWorkerModel,
+    async create(role, _id, tools) {
+      return {
+        close() {},
+        async prompt(text) {
+          const event = JSON.parse(text) as { kind: string; message?: { text?: string }; attachments?: AttachmentView[] };
+          if (role === 'worker') {
+            workerEvents.push({ kind: event.kind, attachments: event.attachments });
+            workerTurn += 1;
+            if (workerTurn === 1) await delay(80);
+            return workerTurn === 1 ? 'first pass' : 'second pass';
+          }
+          if (event.kind === 'CHAT') {
+            const msgText = event.message?.text ?? '';
+            if (msgText.includes('第一张')) {
+              const start = tools.find(t => t.name === 'start_work')!;
+              try {
+                const out = JSON.parse(await start.execute(JSON.stringify({ instruction: '分析第一张图', cwd: home }))) as { taskId: string };
+                createdTaskId = out.taskId;
+              } catch (err) {
+                routerError = err instanceof Error ? err.message : String(err);
+                throw err;
+              }
+              return '已派发看图';
+            }
+            if (msgText.includes('第二张') && createdTaskId) {
+              const cont = tools.find(t => t.name === 'continue_work')!;
+              await cont.execute(JSON.stringify({ taskId: createdTaskId, instruction: '补充分析第二张图' }));
+              return '已追加第二张图';
+            }
+          }
+          return '完成汇总';
+        },
+      };
+    },
+  };
+
+  const coordinator = new Coordinator(home, factory);
+  try {
+    await coordinator.ready();
+    coordinator.chat('req-img-1', '看第一张图', [img1], { channel: 'local' }, [att1]);
+    await until(() => Boolean(createdTaskId || routerError));
+    assert.equal(routerError, undefined);
+    coordinator.chat('req-img-2', '追加第二张图', [img2], { channel: 'local' }, [att2]);
+    await until(() => coordinator.store.get(createdTaskId!).status === 'completed');
+
+    assert.ok(workerEvents.length >= 2);
+    assert.equal(workerEvents[0]!.kind, 'TASK');
+    assert.equal(workerEvents[0]!.attachments?.[0]?.path, img1);
+    assert.equal(workerEvents[1]!.kind, 'FOLLOWUP');
+    assert.equal(workerEvents[1]!.attachments?.[0]?.path, img2);
+  } finally {
+    await coordinator.close();
+    await rm(home, { recursive: true, force: true });
   }
 });
