@@ -1,15 +1,15 @@
 ---
-id: super-agent-architecture
+id: friday-architecture
 type: architecture-design
 title: F.R.I.D.A.Y. 本地常驻架构
 status: active
-parent: super-agent-goals
-implements: [super-agent-goals]
+parent: friday-goals
+implements: [friday-goals]
 ---
 
 # F.R.I.D.A.Y. 本地常驻架构
 
-本规格落实 `super-agent-goals`，不重述产品范围。架构及协议已经用户审阅确认，作为实现约束生效。除“当前实现边界”外，各节描述目标架构与约束，不表示全部能力已经实现。
+本规格落实 `friday-goals`，不重述产品范围。架构及协议已经用户审阅确认，作为实现约束生效。除“当前实现边界”外，各节描述目标架构与约束，不表示全部能力已经实现。
 
 ## 当前实现边界
 
@@ -33,15 +33,15 @@ implements: [super-agent-goals]
 
 本地 Web 由 CLI 的 `web` 子命令启动，只绑定 127.0.0.1，通过随机访问令牌（URL 片段引导、会话存储、请求头携带）和 Host/Origin/同站校验限制访问，静态资源受 CSP 约束，模型凭据不进入浏览器；Web 只是 Unix Socket 的桥接客户端，关闭浏览器或桥接进程不停止协调服务与后台工作。
 
-已实现三层全息记忆（L0 元记忆目录、L2 语义记忆卡片与新陈代谢/置顶/艾宾浩斯提取强化/海马体自动任务巩固、L1 情景对话与任务混合检索）、潜意识记忆闪回（`autoRecalled`）、双过程潜意识睡眠巩固与只读 REM 联想做梦、上下文编译器与同目录多 Worker 态势感知（`concurrentPeers`）、战术中途请示与零时限损耗原会话拍板续跑（`ASK_BOSS` / `WORKER_QUESTION`）、异构专职子 AI 画像（`coding` / `research` / `review` / `general`）、暂停恢复（`resume`）、持久化周期与一次性倒计时定时器（`timers`，含 `once` / `delayMs`）、凭据隔离插件运行时（内置 `system-pulse` 与 `fund-tracker`，支持 `<home>/plugins` 自进化扩展）、独立 Watchdog 监护、交互式 TUI、多信道带宽自适应的 OpenClaw 风格全渠道 IM 接入（钉钉 `dingtalk` / 微信 `wechat` / Telegram `telegram` 双向对话与后台结果主动推送）。受控副本自动回写和 OS 级沙箱尚未实现；native 的直接文件修改已开放，不等于实现下文的冲突检测和原子发布协议。
+已实现三层全息记忆（L0 元记忆目录、L2 语义记忆卡片与新陈代谢/置顶/艾宾浩斯提取强化/Distiller 蒸馏巩固、L1 情景对话与本地向量混合语义检索 `semantic`）、潜意识记忆闪回（`autoRecalled`）、全息脑图快照（`mindmap`）、双过程潜意识睡眠巩固与只读 REM 联想做梦、上下文编译器与同目录多 Worker 态势感知（`concurrentPeers`）、战术中途请示与零时限损耗原会话拍板续跑（`ASK_BOSS` / `WORKER_QUESTION`）、异构模型池与动态决策路由（`ModelHub` + `decision`）、专职子 AI 画像（`coding` / `research` / `review` / `general`）、暂停恢复（`resume`）、持久化周期与一次性倒计时定时器（`timers`，含 `once` / `delayMs`）、凭据隔离与视图脱敏插件运行时（内置 `system-pulse`、`fund-tracker`、`tv-ir`、`tv-agent`、`miot`、`health-scale`，支持 `~/.friday/plugins` 自进化扩展）、独立 Watchdog 监护与 `<home>/watchdog.json` 原子状态持久化、交互式 TUI（含跨渠道消息去重渲染与短 ID 控制）、默认 `~/.friday`（主环境变量 `FRIDAY_*`，兼容 `SUPER_AGENT_*`）以及全渠道 IM 与语音栈（微信个人号 `wechat` iLink 扫码与多模态附件 / 钉钉 `dingtalk` / Telegram `telegram` / 小爱音箱 `xiaoai` 含 KWS 连续对话、CAM++ 本地声纹门禁与尾音防串音裁剪）。受控副本自动回写和 OS 级沙箱尚未实现；native 的直接文件修改已开放，不等于实现下文的冲突检测和原子发布协议。
 
 ## 运行拓扑与依赖
 
-系统采用 TypeScript / Node.js，单台机器上运行一个协调服务实例、独立执行器和独立 Watchdog 进程。CLI/TUI 是可断开的客户端，通过仅本机可访问且有当前用户访问控制的 IPC 接入；连接断开不代表取消任务。不得直接暴露未认证的网络监听端口。
+系统采用 TypeScript / Node.js，单台机器上运行一个协调服务实例、独立执行器和独立 Watchdog 进程。CLI/TUI 是可断开的客户端，通过仅本机可访问且有当前用户访问控制的 IPC（`~/.friday/service.sock`，按命令分阶段超时控制且不全局污染守护进程 `umask`）接入；连接断开不代表取消任务。不得直接暴露未认证的网络监听端口。
 
 - **协调服务**拥有任务调度、事件准入、订阅、定时器、审批与业务数据库。它管理 Router 和 Worker 的 SDK 会话，但不在模型推理回调中同步等待耗时执行。每个会话串行调用，多个 Worker 会话可以并行。
 - **执行器**拥有工作副本与后台操作，接收结构化、经过授权的请求。它持有进程句柄与操作状态，协调服务重启不直接导致同一操作重新执行。
-- **Watchdog**有独立心跳循环和受限 SDK 会话。健康探测不依赖模型可用；模型仅辅助判断任务停滞。通过管理接口请求恢复，协调服务失去响应时通过受限进程监护接口重启它，不直接编辑业务数据库。
+- **Watchdog**运行独立健康探测心跳循环，将健康状态与熔断通知原子写入 `<home>/watchdog.json`（不直接无锁打开业务 SQLite）。健康探测不依赖模型可用；协调服务不可用或降级时在退避窗口内通过受控 `serve` 子进程或 `--systemd-unit` 重启，达到失败上限后触发熔断。
 - **SDK 适配层**统一会话创建、事件订阅、上下文压缩、检查点与恢复接口。核心调度依赖本项目的协议，不依赖 SDK 内部实现细节。
 
 依赖方向：客户端 → 协调服务；协调服务 → SDK 适配层、业务存储、执行器；执行器 → 沙箱和受控外部工具。Watchdog → 只读健康接口和受限恢复接口。Router/Worker 只能调用各自注册的工具，不能取得协调服务或数据库的任意执行权限。

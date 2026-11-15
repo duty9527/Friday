@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
 import { existsSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { resolveEnv, resolveFridayHome } from './paths.js';
 import { request, socketPath } from './protocol.js';
 
 const help = `F.R.I.D.A.Y. (friday) — Local persistent personal AI assistant & tactical Router/Worker orchestrator (macOS/Linux)
@@ -13,17 +14,17 @@ const help = `F.R.I.D.A.Y. (friday) — Local persistent personal AI assistant &
   logout [provider]  Remove stored OAuth credentials (default: openai)
   web [--port 0]   Open the single main conversation via an authenticated local URL
   tui              Interactive terminal chat & work monitor
-  watchdog [--interval-ms 2000] [--max-retries 3]
+  watchdog [--mode real|offline] [--interval-ms 2000] [--max-retries 3] [--systemd-unit UNIT]
   submit [--file PATH ...] [--limit-ms 600000] [--request-id ID] "instruction"
   followup TASK_ID [--request-id ID] "additional instruction"
   stop TASK_ID
   resume TASK_ID [--limit-ms 600000]
-  timer list | add [--name NAME] [--every-ms 60000] [--delay-ms MS] [--daily-at HH:MM] [--once] [--plugin NAME] [--action ACTION] [--channel ID] [--target TARGET] [--cwd DIR] ["instruction"] | toggle ID [--enabled] | remove ID
+  timer list | add [--name NAME] [--every-ms 60000] [--delay-ms MS] [--daily-at HH:MM] [--once] [--plugin NAME] [--action ACTION] [--channel ID] [--target TARGET] [--cwd DIR] ["instruction"] | toggle ID [--enabled|--no-enabled] | remove ID
   plugin list | run NAME [ACTION] [--args JSON]
   memory list | search [--scope all|memories|works|messages] [--cwd DIR] "query" | save --topic TOPIC [--tag TAG ...] [--link ID ...] [--pinned] [--cwd DIR] "content" | link ID TARGET_ID | pin ID [--unpin] | remove ID
-  im list | login [CHANNEL_ID] [--name NAME] [--api-base URL] [--no-wait] | add --platform telegram|dingtalk|wechat|xiaoai --name NAME [--bot-token TOKEN] [--account-id ID] [--webhook-url URL] [--secret SECRET] [--target CHAT_ID] [--allow SENDER ...] [--api-base URL] [--every-ms MS] | toggle ID [--enabled] | test ID ["message"] | remove ID | voice ...
+  im list | login [CHANNEL_ID] [--name NAME] [--api-base URL] [--no-wait] | add --platform telegram|dingtalk|wechat|xiaoai --name NAME [--bot-token TOKEN] [--account-id ID] [--webhook-url URL] [--secret SECRET] [--target CHAT_ID] [--allow SENDER ...] [--api-base URL] [--every-ms MS] | toggle ID [--enabled|--no-enabled] | test ID ["message"] | remove ID | voice ...
   voice status | list | model | enroll [NAME] [--role owner|member] [--append] [--channel ID] [--target ID] [--no-wait] | remove NAME_OR_ID | clear | enable | disable | config [--threshold N] [--wake-precheck|--no-wake-precheck] | rename TARGET NEW_NAME | role TARGET owner|member
-  model list | probe [PROVIDER/]MODEL ["prompt"] | set [--router MODEL] [--provider PROVIDER] [--fast MODEL] [--balanced MODEL] [--strong MODEL] [--api-key KEY]
+  model list | probe [PROVIDER/]MODEL ["prompt"] | set [--provider PROVIDER] [--router MODEL] [--router-provider PROVIDER] [--worker-provider PROVIDER] [--fast MODEL] [--balanced MODEL] [--strong MODEL] [--base-url URL] [--api-key KEY]
   brief            FRIDAY holographic situation report (health, active works, memory cortex, timers, IM channels)
   get TASK_ID
   list
@@ -31,9 +32,10 @@ const help = `F.R.I.D.A.Y. (friday) — Local persistent personal AI assistant &
   health
   shutdown
 
-All commands accept --home DIR (default: ~/.super-agent).
-Real mode requires SUPER_AGENT_PROVIDER, SUPER_AGENT_MODEL, SUPER_AGENT_API_KEY
-(or prior OAuth login via "friday login"; optional: SUPER_AGENT_BASE_URL, SUPER_AGENT_ROUTER_MODEL, SUPER_AGENT_WORKER_MODEL).
+All commands accept --home DIR (default: ~/.friday, or FRIDAY_HOME).
+Real mode requires FRIDAY_PROVIDER, FRIDAY_MODEL, FRIDAY_API_KEY
+(or prior OAuth login via "friday login"; legacy SUPER_AGENT_* env vars also supported as fallback;
+optional: FRIDAY_BASE_URL, FRIDAY_ROUTER_MODEL, FRIDAY_WORKER_MODEL).
 Real mode: Workers have full local read/search/bash/edit/write tools. NOT a sandbox;
 commands run as your OS account and can modify files, access outside cwd and use the network.
 --file optionally hints a working path; real tasks need no attachment.
@@ -43,9 +45,32 @@ Web binds only 127.0.0.1, connects to the same --home daemon, and prints a priva
 Closing the browser or web bridge does not stop the daemon or its background work.
 `;
 
+function isDaemonUnavailable(error: unknown): boolean {
+  const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
+  return code === 'ENOENT' || code === 'ECONNREFUSED' || code === 'ENOTSOCK';
+}
+
+function attachGracefulShutdown(closeTarget: () => Promise<void>): void {
+  let closing = false;
+  const close = () => {
+    if (closing) return;
+    closing = true;
+    process.removeListener('SIGINT', close);
+    process.removeListener('SIGTERM', close);
+    const forceExit = setTimeout(() => {
+      process.exit(typeof process.exitCode === 'number' && process.exitCode !== 0 ? process.exitCode : 1);
+    }, 5_000);
+    forceExit.unref();
+    void closeTarget().catch(() => { process.exitCode = 1; });
+  };
+  process.on('SIGINT', close);
+  process.on('SIGTERM', close);
+}
+
 async function main() {
   const { values, positionals } = parseArgs({
     allowPositionals: true,
+    allowNegative: true,
     options: {
       home: { type: 'string' }, mode: { type: 'string' }, file: { type: 'string', multiple: true },
       'limit-ms': { type: 'string' }, 'request-id': { type: 'string' }, after: { type: 'string' },
@@ -57,16 +82,19 @@ async function main() {
       link: { type: 'string', multiple: true }, pinned: { type: 'boolean' }, unpin: { type: 'boolean' },
       platform: { type: 'string' }, 'bot-token': { type: 'string' }, 'account-id': { type: 'string' }, 'webhook-url': { type: 'string' },
       secret: { type: 'string' }, target: { type: 'string' }, allow: { type: 'string', multiple: true }, 'api-base': { type: 'string' },
-      router: { type: 'string' }, provider: { type: 'string' }, fast: { type: 'string' }, balanced: { type: 'string' }, strong: { type: 'string' }, 'api-key': { type: 'string' },
+      router: { type: 'string' }, provider: { type: 'string' },
+      'router-provider': { type: 'string' }, 'worker-provider': { type: 'string' }, 'base-url': { type: 'string' },
+      fast: { type: 'string' }, balanced: { type: 'string' }, strong: { type: 'string' }, 'api-key': { type: 'string' },
       threshold: { type: 'string' }, role: { type: 'string' }, append: { type: 'boolean' },
-      'wake-precheck': { type: 'boolean' }, 'no-wake-precheck': { type: 'boolean' },
-      enabled: { type: 'boolean' }, 'no-wait': { type: 'boolean' }, 'interval-ms': { type: 'string' }, 'max-retries': { type: 'string' },
+      'wake-precheck': { type: 'boolean' },
+      enabled: { type: 'boolean' }, wait: { type: 'boolean' },
+      'interval-ms': { type: 'string' }, 'max-retries': { type: 'string' }, 'systemd-unit': { type: 'string' },
       help: { type: 'boolean', short: 'h' },
     },
   });
   const [command, ...args] = positionals;
   if (values.help || !command) { process.stdout.write(help); return; }
-  const home = resolve(values.home ?? resolve(homedir(), '.super-agent'));
+  const home = resolveFridayHome(values.home);
   const number = (value: string | undefined): number | undefined => {
     if (value === undefined) return undefined;
     const parsed = Number(value);
@@ -74,7 +102,7 @@ async function main() {
     return parsed;
   };
   if (command === 'login' || command === 'logout') {
-    const provider = args[0] ?? process.env.SUPER_AGENT_PROVIDER ?? 'openai';
+    const provider = args[0] ?? resolveEnv('FRIDAY_PROVIDER', 'SUPER_AGENT_PROVIDER') ?? 'openai';
     const { privateHome } = await import('./files.js');
     const verifiedHome = await privateHome(home);
     const { loginOAuth, logoutOAuth } = await import('./agent.js');
@@ -116,7 +144,7 @@ async function main() {
       });
       process.stdout.write(JSON.stringify({
         status: 'logged_in', provider: result.provider, authPath: result.authPath,
-        defaultModel: result.provider === 'openai' || result.provider === 'openai-codex' ? 'gpt-6.1-sol' : result.models[0],
+        defaultModel: result.models[0],
         sampleModels: result.models.slice(0, 12),
       }, null, 2) + '\n');
     } finally {
@@ -128,8 +156,7 @@ async function main() {
   if (command === 'web') {
     const { startWeb } = await import('./web-server.js');
     const web = await startWeb({ home, port: number(values.port) });
-    const close = () => { void web.close().catch(() => { process.exitCode = 1; }); };
-    process.once('SIGINT', close); process.once('SIGTERM', close);
+    attachGracefulShutdown(() => web.close());
     process.stdout.write(JSON.stringify({ status: 'web_ready', url: web.url, home: web.home, pid: process.pid }) + '\n');
     return;
   }
@@ -139,13 +166,40 @@ async function main() {
     return;
   }
   if (command === 'watchdog') {
-    const { Watchdog } = await import('./watchdog.js');
+    const mode = values.mode ?? 'real';
+    if (mode !== 'real' && mode !== 'offline') throw new Error('--mode must be real or offline');
+    const offlineDelayMs = number(values['offline-delay-ms']);
+    if (offlineDelayMs !== undefined && (mode !== 'offline' || offlineDelayMs > 10_000)) {
+      throw new Error('--offline-delay-ms requires offline mode and must be <=10000');
+    }
+    const { Watchdog, createManagedServeRestarter } = await import('./watchdog.js');
     const controller = new AbortController();
     const stop = () => controller.abort();
     process.once('SIGINT', stop); process.once('SIGTERM', stop);
-    const watchdog = new Watchdog({ home, intervalMs: number(values['interval-ms']), maxRetries: number(values['max-retries']) });
-    await watchdog.loop(controller.signal);
-    process.stdout.write(JSON.stringify(watchdog.state(), null, 2) + '\n');
+    const serveArgs: string[] = [];
+    if (offlineDelayMs !== undefined) serveArgs.push('--offline-delay-ms', String(offlineDelayMs));
+    const systemdUnit = values['systemd-unit'] ?? resolveEnv('FRIDAY_SYSTEMD_UNIT');
+    const restarter = createManagedServeRestarter({
+      home,
+      entryScript: fileURLToPath(import.meta.url),
+      mode,
+      systemdUnit,
+      serveArgs,
+    });
+    try {
+      const watchdog = new Watchdog({
+        home,
+        intervalMs: number(values['interval-ms']),
+        maxRetries: number(values['max-retries']),
+        restartService: restarter.restartService,
+      });
+      await watchdog.loop(controller.signal);
+      process.stdout.write(JSON.stringify(watchdog.state(), null, 2) + '\n');
+    } finally {
+      process.removeListener('SIGINT', stop);
+      process.removeListener('SIGTERM', stop);
+      await restarter.stop();
+    }
     return;
   }
   if (command === 'serve') {
@@ -155,10 +209,13 @@ async function main() {
     if (offlineDelayMs !== undefined && (mode !== 'offline' || offlineDelayMs > 10_000)) throw new Error('--offline-delay-ms requires offline mode and must be <=10000');
     const { serve } = await import('./server.js');
     const service = await serve({ home, mode, offlineDelayMs,
-      provider: process.env.SUPER_AGENT_PROVIDER, model: process.env.SUPER_AGENT_MODEL, apiKey: process.env.SUPER_AGENT_API_KEY,
-      baseUrl: process.env.SUPER_AGENT_BASE_URL, routerModel: process.env.SUPER_AGENT_ROUTER_MODEL, workerModel: process.env.SUPER_AGENT_WORKER_MODEL });
-    const close = () => { void service.close().catch(() => { process.exitCode = 1; }); };
-    process.once('SIGINT', close); process.once('SIGTERM', close);
+      provider: resolveEnv('FRIDAY_PROVIDER', 'SUPER_AGENT_PROVIDER'),
+      model: resolveEnv('FRIDAY_MODEL', 'SUPER_AGENT_MODEL'),
+      apiKey: resolveEnv('FRIDAY_API_KEY', 'SUPER_AGENT_API_KEY'),
+      baseUrl: resolveEnv('FRIDAY_BASE_URL', 'SUPER_AGENT_BASE_URL'),
+      routerModel: resolveEnv('FRIDAY_ROUTER_MODEL', 'SUPER_AGENT_ROUTER_MODEL'),
+      workerModel: resolveEnv('FRIDAY_WORKER_MODEL', 'SUPER_AGENT_WORKER_MODEL') });
+    attachGracefulShutdown(() => service.close());
     process.stdout.write(JSON.stringify({ status: 'ready', home: service.home, mode, execution: mode === 'real' ? 'native' : 'snapshot',
       cwd: process.cwd(), ...(mode === 'real' ? { sandbox: false, tools: ['read', 'ls', 'find', 'grep', 'bash', 'edit', 'write'] } : {}), pid: process.pid }) + '\n');
     return;
@@ -188,24 +245,41 @@ async function main() {
         cwd: values.cwd ? resolve(values.cwd) : undefined,
         instruction: args.slice(1).join(' ') || undefined,
       };
-      else if (sub === 'toggle') message = { command: 'timer-toggle', id: args[1], enabled: values.enabled ?? true };
+      else if (sub === 'toggle') message = { command: 'timer-toggle', id: args[1], enabled: values.enabled };
       else if (sub === 'remove') message = { command: 'timer-remove', id: args[1] };
       else throw new Error(`Unknown timer subcommand: ${sub}`);
       break;
     }
     case 'plugin': {
-      const { listPlugins, runPlugin } = await import('./plugin.js');
       const sub = args[0] ?? 'list';
       if (sub === 'list') {
-        process.stdout.write(JSON.stringify(await listPlugins(home), null, 2) + '\n');
+        const res = await requestPluginOrLocal(
+          home,
+          { command: 'plugin-list' },
+          async verifiedHome => {
+            const { listPluginViews } = await import('./plugin.js');
+            return listPluginViews(verifiedHome);
+          },
+        );
+        process.stdout.write(JSON.stringify(res, null, 2) + '\n');
         return;
       }
       if (sub === 'run') {
         const pluginName = args[1] ?? values.plugin;
         if (!pluginName) throw new Error('Plugin name is required: friday plugin run <name> [action]');
         const pluginAction = args[2] ?? values.action ?? 'status';
-        const parsedArgs = values.args ? JSON.parse(values.args) as Record<string, unknown> : {};
-        const res = await runPlugin(home, pluginName, pluginAction, parsedArgs);
+        const parsedArgs: unknown = values.args ? JSON.parse(values.args) : {};
+        if (!parsedArgs || typeof parsedArgs !== 'object' || Array.isArray(parsedArgs)) {
+          throw new Error('--args must be a JSON object');
+        }
+        const res = await requestPluginOrLocal(
+          home,
+          { command: 'plugin-run', plugin: pluginName, action: pluginAction, args: parsedArgs },
+          async verifiedHome => {
+            const { runPlugin } = await import('./plugin.js');
+            return runPlugin(verifiedHome, pluginName, pluginAction, parsedArgs as Record<string, unknown>);
+          },
+        );
         process.stdout.write(JSON.stringify(res, null, 2) + '\n');
         return;
       }
@@ -233,7 +307,7 @@ async function main() {
           apiBase: values['api-base'],
           allowedSenders: values.allow,
         }) as Record<string, unknown>;
-        if (values['no-wait']) {
+        if (values.wait === false) {
           process.stdout.write(JSON.stringify(session, null, 2) + '\n');
           return;
         }
@@ -278,7 +352,7 @@ async function main() {
         pollIntervalMs: number(values['every-ms']),
         enabled: values.enabled ?? true,
       };
-      else if (sub === 'toggle') message = { command: 'im-toggle', id: args[1], enabled: values.enabled ?? true };
+      else if (sub === 'toggle') message = { command: 'im-toggle', id: args[1], enabled: values.enabled };
       else if (sub === 'test') message = { command: 'im-test', id: args[1], text: args.slice(2).join(' ') || undefined };
       else if (sub === 'remove') message = { command: 'im-remove', id: args[1] };
       else if (sub === 'voice') {
@@ -300,8 +374,10 @@ async function main() {
         command: 'model-configure',
         providerId: values.provider,
         apiKey: values['api-key'],
+        baseUrl: values['base-url'],
+        routerProvider: values['router-provider'],
         routerModel: values.router,
-        workerProvider: values.provider,
+        workerProvider: values['worker-provider'],
         fastModel: values.fast,
         balancedModel: values.balanced,
         strongModel: values.strong,
@@ -336,6 +412,25 @@ async function main() {
   process.stdout.write(JSON.stringify(result, null, 2) + '\n');
 }
 
+async function requestPluginOrLocal(
+  home: string,
+  payload: Record<string, unknown>,
+  localFallback: (verifiedHome: string) => Promise<unknown>,
+): Promise<unknown> {
+  if (existsSync(socketPath(home))) {
+    try {
+      return await request(home, payload);
+    } catch (error) {
+      if (!isDaemonUnavailable(error)) {
+        throw error;
+      }
+    }
+  }
+  const { privateHome } = await import('./files.js');
+  const verifiedHome = await privateHome(home);
+  return localFallback(verifiedHome);
+}
+
 async function requestVoiceOrLocal(
   home: string,
   payload: Record<string, unknown>,
@@ -345,14 +440,15 @@ async function requestVoiceOrLocal(
     try {
       return await request(home, payload);
     } catch (error) {
-      const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
-      if (code !== 'ENOENT' && code !== 'ECONNREFUSED') {
+      if (!isDaemonUnavailable(error)) {
         throw error;
       }
     }
   }
+  const { privateHome } = await import('./files.js');
+  const verifiedHome = await privateHome(home);
   const { XiaoaiSpeakerManager } = await import('./xiaoai-speaker.js');
-  const manager = new XiaoaiSpeakerManager({ homeDir: home });
+  const manager = new XiaoaiSpeakerManager({ homeDir: verifiedHome });
   try {
     return localFallback(manager);
   } finally {
@@ -371,8 +467,7 @@ async function runVoiceCli(
     target?: string;
     threshold?: string;
     'wake-precheck'?: boolean;
-    'no-wake-precheck'?: boolean;
-    'no-wait'?: boolean;
+    wait?: boolean;
   },
 ): Promise<void> {
   const sub = args[0] ?? 'status';
@@ -384,9 +479,11 @@ async function runVoiceCli(
   }
 
   if (sub === 'model') {
+    const { privateHome } = await import('./files.js');
+    const verifiedHome = await privateHome(home);
     const { ensureXiaoaiSpeakerModel } = await import('./xiaoai-speaker.js');
     process.stderr.write('⏳ 检查/下载本地声纹模型 (CAM++ zh-cn 16k)...\n');
-    const modelPath = await ensureXiaoaiSpeakerModel({ homeDir: home });
+    const modelPath = await ensureXiaoaiSpeakerModel({ homeDir: verifiedHome });
     process.stdout.write(JSON.stringify({ status: 'ready', modelPath }, null, 2) + '\n');
     return;
   }
@@ -462,9 +559,7 @@ async function runVoiceCli(
     if (threshold !== undefined && (!Number.isFinite(threshold) || threshold < 0.1 || threshold > 0.95)) {
       throw new Error('threshold must be between 0.1 and 0.95');
     }
-    const wakePrecheck = values['no-wake-precheck']
-      ? false
-      : (values['wake-precheck'] ? true : undefined);
+    const wakePrecheck = values['wake-precheck'];
     if (threshold === undefined && wakePrecheck === undefined) {
       throw new Error('Specify --threshold N and/or --wake-precheck|--no-wake-precheck');
     }
@@ -481,9 +576,11 @@ async function runVoiceCli(
     if (values.role !== undefined && values.role !== 'owner' && values.role !== 'member') {
       throw new Error('role must be owner or member');
     }
+    const { privateHome } = await import('./files.js');
+    const verifiedHome = await privateHome(home);
     const { ensureXiaoaiSpeakerModel } = await import('./xiaoai-speaker.js');
     process.stderr.write('⏳ 检查本地声纹模型...\n');
-    await ensureXiaoaiSpeakerModel({ homeDir: home });
+    await ensureXiaoaiSpeakerModel({ homeDir: verifiedHome });
     const started = await request(home, {
       command: 'voice-enroll-start',
       name: args[1] ?? values.name,
@@ -492,7 +589,7 @@ async function runVoiceCli(
       channelId: values.channel,
       targetId: values.target,
     }) as { session: Record<string, unknown>; channelId: string; targetId: string };
-    if (values['no-wait']) {
+    if (values.wait === false) {
       process.stdout.write(JSON.stringify(started, null, 2) + '\n');
       return;
     }

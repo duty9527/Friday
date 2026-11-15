@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { snapshot, readSnapshot } from '../src/files.js';
 
 test('directory authorization includes nested files, preserves names and deduplicates overlapping paths', async () => {
-  const root = await mkdtemp(join(await realpath(tmpdir()), 'sa-dir-'));
+  const root = await mkdtemp(join(await realpath(tmpdir()), 'friday-dir-'));
   try {
     const dir = join(root, 'project'); const home = join(root, 'home');
     await mkdir(join(dir, 'nested'), { recursive: true });
@@ -24,7 +24,7 @@ test('directory authorization includes nested files, preserves names and dedupli
 });
 
 test('directory input refuses links, binary data, empty trees and oversized trees without partial snapshots', async () => {
-  const root = await mkdtemp(join(await realpath(tmpdir()), 'sa-dir-'));
+  const root = await mkdtemp(join(await realpath(tmpdir()), 'friday-dir-'));
   try {
     const home = join(root, 'home'); const dir = join(root, 'input');
     await mkdir(dir); await writeFile(join(root, 'secret'), 'outside');

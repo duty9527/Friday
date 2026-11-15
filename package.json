@@ -9,12 +9,11 @@
     "node": ">=22.19.0"
   },
   "bin": {
-    "friday": "dist/cli.js",
-    "super-agent": "dist/cli.js"
+    "friday": "dist/cli.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/copy-web.mjs",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "test": "npm run build && tsx --test --test-concurrency=1 test/*.test.ts",
     "start": "node dist/cli.js",
     "check": "npm run typecheck && npm test",

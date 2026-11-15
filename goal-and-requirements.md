@@ -1,5 +1,5 @@
 ---
-id: super-agent-goals
+id: friday-goals
 type: goal-and-requirements
 title: F.R.I.D.A.Y. 个人全天候 AI 战术副手与自主协作系统
 status: active
@@ -7,18 +7,18 @@ status: active
 
 # F.R.I.D.A.Y.
 
-面向个人、以微信/Web/TUI/CLI 为统一交互入口的持续运行、全息记忆、多任务自主协作 AI 副手。
+面向个人、以微信/小爱音箱/Web/TUI/CLI 为统一交互入口的持续运行、全息记忆、多任务自主协作 AI 副手。
 
 ## Overview
 
-实现可长期常驻运行的个人 AI 副手 **F.R.I.D.A.Y.**，首个使用者是项目创建者本人。通过单一持续在线的主脑（Router）统一处理代码研发、资料研究、持仓监控和本机自动化等个人事务，后台可并行调度多个专职子 AI（Workers）推进任务。
+实现可长期常驻运行的个人 AI 副手 **F.R.I.D.A.Y.**，通过单一持续在线的主脑（Router）统一处理代码研发、资料研究、持仓监控、智能家居控制、健康体脂分析与本机自动化等个人事务，后台可并行调度多个专职子 AI（Workers）推进任务。
 
-以 [Super-agent.md](Super-agent.md) 的架构探索为可信起点，结合个人全天候副手场景演进设计；原文是参考资料，不是本项目已经采纳的全部决策。
+以 [docs/references/super-agent-article.md](docs/references/super-agent-article.md) 的架构探索为可信起点，结合个人全天候副手场景演进设计；原文是参考资料，不是本项目已经采纳的全部决策。
 
 > **项目名称与精神内核（F.R.I.D.A.Y.）**：
 > - **命名致敬**：源自漫威钢铁侠 Tony Stark 的全天候个人 AI 战术副手 **F.R.I.D.A.Y.（Female Replacement Intelligent Digital Assistant Youth）**，同时也呼应英语中“Man/Girl Friday”（最可靠、能独当一面打理一切事务的个人全能副手）的经典意象。
 > - **架构映射**：就像 Tony 永远只与 F.R.I.D.A.Y. **同一个声音**自然对话（Single Continuous Router），无需关心后台子系统编号，而 F.R.I.D.A.Y. 在背后并发调度战甲诊断、代码编译、检索分析等多个隔离执行流（Workers），具备深度的本机受信任执行权限，并在关键节点主动汇总交付、担任质量门禁或发起战术请示（`ASK_BOSS`）。
-> - **完整形态**：系统已具备三层全息记忆（L0 元记忆目录 + L2 语义记忆卡片与突触网络 + L1 情景对话/任务全量库）、潜意识记忆闪回、双过程潜意识睡眠巩固与只读 REM 联想做梦、上下文编译器、多提供商模型中枢（Model Hub）、专职子 AI 调度与同工作区并发感知、盘中战术请示与原会话拍板续跑、恢复续跑（`resume`）、周期与一次性定时触发（`timers`）、自进化插件工坊（`plugins`）、全渠道 IM 网关（微信个人号 iLink 多模态收发 / 钉钉 / Telegram）、Watchdog 自主监护与 TUI/Web 全息控制台。
+> - **完整形态**：系统已具备三层全息记忆（L0 元记忆目录 + L2 语义记忆卡片与突触网络 + L1 情景对话/任务全量库 + Distiller 蒸馏与本地语义检索）、潜意识记忆闪回、全息脑图、双过程潜意识睡眠巩固与只读 REM 联想做梦、上下文编译器、异构模型池（Model Hub & Pool）、专职子 AI 调度与同工作区并发感知、盘中战术请示与原会话拍板续跑、恢复续跑（`resume`）、周期与一次性定时触发（`timers`）、自进化插件工坊（内置 `system-pulse` / `fund-tracker` / `tv-ir` / `tv-agent` / `miot` / `health-scale`）、全渠道 IM 网关（微信 iLink 多模态收发 / 钉钉 / Telegram / 小爱音箱含声纹门禁与 KWS 连续语音）、Watchdog 自主监护（`watchdog.json`）与 TUI/Web 全息控制台（默认 `~/.friday`，主环境变量 `FRIDAY_*`，兼容 `SUPER_AGENT_*`）。
 
 ## Problem
 
@@ -36,9 +36,9 @@ status: active
 
 ## Tech Notes
 
-采用 TypeScript、Node.js 和完整 pi Coding Agent SDK，优先复用编码工具、会话持久化和上下文压缩，以更快跑通原型；接受 SDK 默认行为的适配成本。Super-agent 的事件调度、订阅、后台任务与恢复机制仍由本项目实现，不将 SDK 的会话能力等同于完整任务恢复。
+采用 TypeScript、Node.js 和完整 pi Coding Agent SDK，优先复用编码工具、会话持久化和上下文压缩，以更快跑通原型；接受 SDK 默认行为的适配成本。F.R.I.D.A.Y. 的事件调度、订阅、后台任务与恢复机制仍由本项目实现，不将 SDK 的会话能力等同于完整任务恢复。
 
-业务状态采用本地 SQLite，记录任务、Trigger、订阅、定时调度和恢复所需的操作状态；SDK 会话记录与业务状态职责分离，避免把两套历史都当成同一状态的权威来源。这是面向单机个人实例的工程选型，不要求分布式数据库。已验证 SDK 1.5.0 的会话创建与本机兼容传输工具调用；外部供应商及通用脚本隔离未实测。当前可运行能力的边界见 `super-agent-architecture` 的“当前实现边界”。
+业务状态采用本地 SQLite，记录任务、Trigger、订阅、定时调度和恢复所需的操作状态；SDK 会话记录与业务状态职责分离，避免把两套历史都当成同一状态的权威来源。这是面向单机个人实例的工程选型，不要求分布式数据库。已验证 SDK 1.5.0 的会话创建与本机兼容传输工具调用；外部供应商及通用脚本隔离边界仍以实际测试集为准。当前可运行能力的边界见 `friday-architecture` 的“当前实现边界”。
 
 ## Success Conditions
 

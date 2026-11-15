@@ -1,17 +1,17 @@
 # F.R.I.D.A.Y. × 小爱音箱（XiaoAI）接入实操手册
 
-本手册面向 **OH2P（免拆机 Type-C）**、**LX06（拆底盖 6 颗螺丝 Micro-USB 免焊接）**、**已 Root 的小米 BE6500 Pro 路由器** 与 **Mac 主机** 的家庭网络环境，提供三种零第三方重依赖的原生接入方案。
+本手册面向 **OH2P（免拆机 Type-C）**、**LX06（拆底盖 6 颗螺丝 Micro-USB 免焊接）**、**已 Root 的小米 BE6500 Pro 路由器** 与 **常驻宿主机（macOS / Linux）** 的局域网环境，提供三种零第三方重依赖的原生接入方案。
 
 ---
 
-## 设备与前置准备
+## 设备与前置准备（RFC 5737 示例网段）
 
-| 设备 | 接入特性 | 建议固定局域网 IP（示例） |
+| 设备 | 接入特性 | 示例局域网 IP |
 | :--- | :--- | :--- |
-| **Mac 主机** | 运行 `friday serve` 常驻守护进程，建议路由器绑定静态 IP 并开启网卡唤醒（WOL） | `192.168.31.100` |
-| **小爱音箱 OH2P** | 机身自带 Type-C 调试口，**免拆机** 刷入/开启 Dropbear SSH | `192.168.31.101` |
-| **小爱音箱 LX06** | 撕开底部防滑垫卸下 **6 颗螺丝**，主板自带 **Micro-USB** 口，**免焊接** 开启 SSH | `192.168.31.102` |
-| **BE6500 Pro 路由器** | 已获取 Root SSH 权限，7×24 小时在线，可承载桥接监听与 Mac 休眠唤醒 | `192.168.31.1` |
+| **宿主机** | 运行 `friday serve` 常驻守护进程，建议绑定静态 IP 并开启网卡唤醒（WOL） | `192.0.2.100` |
+| **小爱音箱 OH2P** | 机身自带 Type-C 调试口，**免拆机** 刷入/开启 Dropbear SSH | `192.0.2.101` |
+| **小爱音箱 LX06** | 撕开底部防滑垫卸下 **6 颗螺丝**，主板自带 **Micro-USB** 口，**免焊接** 开启 SSH | `192.0.2.102` |
+| **BE6500 Pro 路由器** | 已获取 Root SSH 权限，7×24 小时在线，可承载桥接监听与宿主机休眠唤醒 | `192.0.2.1` |
 
 > **音箱原生特性说明**：F.R.I.D.A.Y. 接收到命中指令后会立即通过 `ubus call mediaplayer player_play_operation '{"action":"pause"}'` 打断小爱原生抢答，随后将回复自动清洗为口语文本并分段通过 TTS 精准播报回**发起提问的那台音箱**。
 
@@ -19,16 +19,16 @@
 
 ## 模式一（推荐主力）：双音箱局域网 SSH 直连（低延迟 / 离线可用）
 
-### 1. 配置 Mac 到双音箱的 SSH 免密登录
+### 1. 配置宿主机到双音箱的 SSH 免密登录
 
-音箱开启 SSH 后，将 Mac 本机公钥写入两台音箱的 `/etc/dropbear/authorized_keys`（部分固件为 `/root/.ssh/authorized_keys`）：
+音箱开启 SSH 后，将宿主机公钥写入两台音箱的 `/etc/dropbear/authorized_keys`（部分固件为 `/root/.ssh/authorized_keys`）：
 
 ```bash
-# 若 Mac 尚未生成公钥，先执行：ssh-keygen -t ed25519
+# 若宿主机尚未生成公钥，先执行：ssh-keygen -t ed25519
 PUB_KEY=$(cat ~/.ssh/id_ed25519.pub 2>/dev/null || cat ~/.ssh/id_rsa.pub)
 
 # 写入 OH2P 与 LX06（音箱旧版 Dropbear 需启用 ssh-rsa 兼容参数）
-for host in root@192.168.31.101 root@192.168.31.102; do
+for host in root@192.0.2.101 root@192.0.2.102; do
   ssh -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa "$host" \
     "mkdir -p /etc/dropbear && echo '$PUB_KEY' >> /etc/dropbear/authorized_keys && chmod 600 /etc/dropbear/authorized_keys"
 done
@@ -37,19 +37,19 @@ done
 验证免密连通（不弹窗输密码即成功）：
 
 ```bash
-ssh -o BatchMode=yes -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa root@192.168.31.101 "echo OH2P_OK"
-ssh -o BatchMode=yes -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa root@192.168.31.102 "echo LX06_OK"
+ssh -o BatchMode=yes -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa root@192.0.2.101 "echo OH2P_OK"
+ssh -o BatchMode=yes -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa root@192.0.2.102 "echo LX06_OK"
 ```
 
 ### 2. 一行命令接入 F.R.I.D.A.Y.
 
 ```bash
-friday im add --platform xiaoai --name "家里小爱" --api-base "ssh://oh2p=root@192.168.31.101,lx06=root@192.168.31.102"
+friday im add --platform xiaoai --name "家里小爱" --api-base "ssh://oh2p=root@192.0.2.101,lx06=root@192.0.2.102"
 ```
 
 - **可选触发前缀过滤**：若希望只有说出特定前缀（如“星期五”或“Friday”）才交给 F.R.I.D.A.Y.，其余对话全交回小爱原生助手，可在地址末尾附加 `?prefix=星期五,Friday`：
   ```bash
-  friday im add --platform xiaoai --name "家里小爱" --api-base "ssh://oh2p=root@192.168.31.101,lx06=root@192.168.31.102?prefix=星期五,Friday"
+  friday im add --platform xiaoai --name "家里小爱" --api-base "ssh://oh2p=root@192.0.2.101,lx06=root@192.0.2.102?prefix=星期五,Friday"
   ```
 - **未设前缀时的智能放行**：F.R.I.D.A.Y. 默认放行“音量大一点 / 暂停 / 闭嘴 / 定个闹钟”等本机控制指令，仅拦截自然语言问答与任务指令。
 - 也可在 Web 控制台「📱 IM 远端接入 → 手动配置通道」中选择 **🔊 小爱音箱 (XiaoAI)**，在「API / SSH 地址」栏填入上述 `ssh://...` 字符串保存。
@@ -72,21 +72,21 @@ friday im add --platform xiaoai --name "小爱云端" \
 
 ---
 
-## 模式三：BE6500 Pro 路由器桥接 + Mac 休眠自动唤醒
+## 模式三：BE6500 Pro 路由器桥接 + 宿主机休眠自动唤醒
 
-当 Mac 平时处于休眠省电状态时，可将仓库自带的 [`scripts/xiaoai-router-bridge.sh`](../scripts/xiaoai-router-bridge.sh) 部署到 7×24 小时运行的 **BE6500 Pro 路由器** 上，实现“语音指令触发 → 路由器自动发 WOL 魔术包唤醒 Mac → 音箱播报提示 → 投递给 F.R.I.D.A.Y.”的无缝闭环。
+当宿主机平时处于休眠省电状态时，可将仓库自带的 [`scripts/xiaoai-router-bridge.sh`](../scripts/xiaoai-router-bridge.sh) 部署到 7×24 小时运行的 **BE6500 Pro 路由器** 上，实现“语音指令触发 → 路由器自动发 WOL 魔术包唤醒宿主机 → 音箱播报提示 → 投递给 F.R.I.D.A.Y.”的无缝闭环。
 
 ### 1. 在 F.R.I.D.A.Y. 创建 Webhook 通道
 
 ```bash
 friday im add --platform xiaoai --name "路由器桥接" \
   --secret "你的自定义密钥" \
-  --webhook-url "http://192.168.31.101:18080/tts"
+  --webhook-url "http://192.0.2.101:18080/tts"
 ```
 
 执行 `friday im list` 记下生成的通道 `id`（例如 `im_xxx`），Web 端对应的入站回调路径为 `/im/webhook/<通道ID>`（请求头需携带 `x-xiaoai-secret: 你的自定义密钥`）。
 
-> 若仅需路由器唤醒 Mac 后由 F.R.I.D.A.Y. 本机执行任务、且出站仍通过 SSH 直接向音箱播报，也可配置为由桥接脚本监听并投递，出站由模式一 SSH 通道或路由器本地轻量 HTTP TTS 接收端完成。
+> 若仅需路由器唤醒宿主机后由 F.R.I.D.A.Y. 本机执行任务、且出站仍通过 SSH 直接向音箱播报，也可配置为由桥接脚本监听并投递，出站由模式一 SSH 通道或路由器本地轻量 HTTP TTS 接收端完成。
 
 ### 2. 在 BE6500 Pro 路由器部署桥接脚本
 
@@ -96,24 +96,24 @@ friday im add --platform xiaoai --name "路由器桥接" \
 chmod +x /data/xiaoai-router-bridge.sh
 ```
 
-配置环境变量启动监听（以监听 OH2P 并唤醒 Mac 为例）：
+配置环境变量启动监听（以监听 OH2P 并唤醒宿主机为例）：
 
 ```sh
-FRIDAY_WEBHOOK_URL="http://192.168.31.100:<WEB端口>/im/webhook/<通道ID>" \
+FRIDAY_WEBHOOK_URL="http://192.0.2.100:<WEB端口>/im/webhook/<通道ID>" \
 FRIDAY_SECRET="你的自定义密钥" \
-SPEAKER_HOST="root@192.168.31.101" \
-MAC_WOL_MAC="AA:BB:CC:DD:EE:FF" \
-MAC_PING_HOST="192.168.31.100" \
-TRIGGER_PREFIX="星期五,Friday" \
-POLL_INTERVAL=1 \
+FRIDAY_SPEAKER_HOST="root@192.0.2.101" \
+FRIDAY_WOL_MAC="AA:BB:CC:DD:EE:FF" \
+FRIDAY_HOST_PING="192.0.2.100" \
+FRIDAY_TRIGGER_PREFIX="星期五,Friday" \
+FRIDAY_POLL_INTERVAL=1 \
 /data/xiaoai-router-bridge.sh
 ```
 
-**脚本行为说明**：
+**脚本行为说明**（兼容旧 `SPEAKER_HOST` / `MAC_WOL_MAC` / `MAC_PING_HOST` 等变量名）：
 1. 启动时先读取 `/tmp/mico_aivs_lab/instruction.log` 最新一行建立游标基线，避免重启重复触发历史语音；
-2. 捕获到匹配 `TRIGGER_PREFIX` 的最终语音识别文本后，立刻向音箱发送 `pause` 掐断原生抢答；
-3. 若检测到 `MAC_PING_HOST` 休眠不可达，自动通过 `ether-wake` / `python3` / `nc` 广播 Wake-on-LAN 魔术包唤醒 Mac，并让音箱先播报：**“正在为您唤醒星期五主机，请稍候”**；
-4. 待 Mac 网络恢复（最多等待 15 秒）后，将语音指令连同 `x-xiaoai-secret` 头 POST 到 `FRIDAY_WEBHOOK_URL`。
+2. 捕获到匹配触发前缀的最终语音识别文本后，立刻向音箱发送 `pause` 掐断原生抢答；
+3. 若检测到宿主机 IP 休眠不可达，自动通过 `ether-wake` / `python3` / `nc` 广播 Wake-on-LAN 魔术包唤醒宿主机，并让音箱先播报：**“正在为您唤醒星期五主机，请稍候”**；
+4. 待宿主机网络恢复（最多等待 15 秒）后，将语音指令连同 `x-xiaoai-secret` 头 POST 到 `FRIDAY_WEBHOOK_URL`。
 
 ---
 
@@ -181,7 +181,7 @@ friday timer add --name "每日早报" --daily-at 08:00 --channel xiaoai \
 
 ### 5. 红米/小米电视智能 Agent（tv-agent 插件）
 
-在 `tv-ir` 红外遥控的基础上，配合电视端安装的无障碍 HTTP Agent（`local.friday.tvagent`，监听 `:8989`）与电视自带 DLNA/UPnP 服务（`:49152`），`tv-agent` 可实现应用直达、精确音量控制、DLNA 投屏、幂等开关机（仅状态不符时才回退 `tv-ir` 发电源键）及由 `gemini-decision-1` 驱动的多步界面树 + 截图多模态自主导航：
+在 `tv-ir` 红外遥控的基础上，配合电视端安装的无障碍 HTTP Agent（`local.friday.tvagent`，监听 `:8989`）与电视自带 DLNA/UPnP 服务（`:49152`），`tv-agent` 可实现应用直达、精确音量控制、DLNA 投屏、幂等开关机（仅状态不符时才回退 `tv-ir` 发电源键）及由 Gemini 多模态决策引擎驱动的多步界面树 + 截图自主导航：
 
 - **CLI 快速测试**：
   ```bash
@@ -199,7 +199,7 @@ friday timer add --name "每日早报" --daily-at 08:00 --channel xiaoai \
   friday plugin run tv-agent open_app --args '{"app":"bili"}'
 
   # DLNA 投屏播放与进度控制
-  friday plugin run tv-agent cast --args '{"op":"play","url":"http://192.168.31.100:8080/video.mp4","title":"测试视频"}'
+  friday plugin run tv-agent cast --args '{"op":"play","url":"http://192.0.2.100:8080/video.mp4","title":"测试视频"}'
 
   # 多步自主导航（自动打开应用、读界面树并在必要时截图决策）
   friday plugin run tv-agent navigate --args '{"app":"bili","goal":"搜索周杰伦并播放第一条视频","searchText":"周杰伦"}'
@@ -215,7 +215,7 @@ friday timer add --name "每日早报" --daily-at 08:00 --channel xiaoai \
 
 - **四层本地协同架构**：
   1. **中枢设备发现（BE6500 Pro SQLite）**：通过 SSH 读取小米 BE6500 Pro 路由器中枢数据库，自动发现全屋房间、设备列表与属性映射；
-  2. **BLE Mesh 实时直控（MIPS MQTT `local/bt/rpcReq`）**：在中枢侧通过本地 MQTT RPC 主题读写蓝牙 Mesh 灯具、开关与插座状态（如 `卧室灯`、`鱼缸灯`、`乌龟灯`）；
+  2. **BLE Mesh 实时直控（MIPS MQTT `local/bt/rpcReq`）**：在中枢侧通过本地 MQTT RPC 主题读写蓝牙 Mesh 灯具、开关与插座状态（如 `客厅灯`、`卧室灯`、`书房灯`）；
   3. **局域网 MiIO UDP 直连（`:54321`）**：对支持局域网 MiIO 协议的设备（如空气炸锅 `careli.fryer.maf01`）直接走 UDP `:54321` 查询剩余时间、当前状态并下发烹饪参数；
   4. **小爱静默 NLP 回退（LX06 `mibrain ai_service`）**：针对空调红外码或复合自然语言控制，通过 `LX06` 本地 `mibrain ai_service` 静默执行语义指令（不触发额外音箱抢答）。
 - **CLI 快速测试**：
@@ -231,7 +231,7 @@ friday timer add --name "每日早报" --daily-at 08:00 --channel xiaoai \
 
   # 控制灯具/开关/插座（支持 on/toggle）与带房间前缀的红外空调
   friday plugin run miot set --args '{"device":"卧室灯","on":true}'
-  friday plugin run miot set --args '{"device":"鱼缸灯","on":false}'
+  friday plugin run miot set --args '{"device":"客厅灯","on":false}'
   friday plugin run miot set --args '{"device":"卧室空调","temperature":26}'
 
   # 控制空气炸锅（careli.fryer.maf01：40-200°C、1-1440 分钟、预设 薯条/鸡翅/蛋挞/手动）
@@ -243,9 +243,9 @@ friday timer add --name "每日早报" --daily-at 08:00 --channel xiaoai \
   ```
 - **小爱语音与定时联动示例**：
   - 状态查询：**“星期五，家里哪些灯开着”**、**“星期五，空气炸锅还剩几分钟”**
-  - 设备控制：**“星期五，打开卧室灯”**、**“星期五，关掉鱼缸灯”**、**“星期五，空气炸锅 180 度 10 分钟”**
+  - 设备控制：**“星期五，打开卧室灯”**、**“星期五，关掉客厅灯”**、**“星期五，空气炸锅 180 度 10 分钟”**
   - 房间消歧：**“星期五，把卧室空调调到 26 度”**（若只说“开空调”未指定房间，音箱会简短追问 *“要开客厅空调还是卧室空调？”* 并保持免唤醒监听）
-  - 定时自动化：可在对话中直接要求“每天晚上 11 点关掉鱼缸灯”，Router 会通过 `manage_timer` 绑定 `plugin: "miot"` 自动定时执行。
+  - 定时自动化：可在对话中直接要求“每天晚上 11 点关掉客厅灯”，Router 会通过 `manage_timer` 绑定 `plugin: "miot"` 自动定时执行。
 
 ### 7. 多人音色识别与防电视串音（本地声纹门禁）
 

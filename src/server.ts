@@ -7,7 +7,7 @@ import { Coordinator } from './coordinator.js';
 import { buildMindmapSnapshot } from './mindmap-flow.js';
 import { listPluginViews, runPlugin } from './plugin.js';
 import { integer, REQUEST_LIMIT, RESPONSE_LIMIT, socketPath, text, type Response } from './protocol.js';
-import type { ModelTier, ThinkingLevel } from './view.js';
+import type { ThinkingLevel } from './view.js';
 
 export interface ServiceOptions {
   home: string; mode: 'real' | 'offline'; offlineDelayMs?: number;
@@ -16,7 +16,6 @@ export interface ServiceOptions {
 }
 export async function serve(options: ServiceOptions): Promise<{ home: string; close(): Promise<void> }> {
   if (process.platform === 'win32') throw new Error('This implementation requires Unix sockets (macOS/Linux)');
-  process.umask(0o077);
   const home = await privateHome(options.home);
   const path = socketPath(home);
   if (Buffer.byteLength(path) > 100) throw new Error('Data directory path is too long for a Unix socket; use a shorter --home');
@@ -32,20 +31,28 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
     connections.add(socket); socket.on('close', () => connections.delete(socket));
     let buffer = Buffer.alloc(0);
     let handled = false;
-    socket.setTimeout(15_000, () => socket.destroy());
+    socket.setTimeout(5_000, () => {
+      if (!handled) socket.destroy();
+    });
     socket.on('error', () => {});
     const reply = (response: Response) => {
       let encoded = JSON.stringify(response) + '\n';
       if (Buffer.byteLength(encoded) > RESPONSE_LIMIT) encoded = JSON.stringify({ ok: false, error: 'Response exceeds limit' }) + '\n';
-      socket.end(encoded);
+      if (!socket.destroyed) socket.end(encoded);
     };
     socket.on('data', chunk => {
       if (handled) return;
       buffer = Buffer.concat([buffer, chunk]);
-      if (buffer.length > REQUEST_LIMIT) { handled = true; reply({ ok: false, error: 'Request exceeds limit' }); return; }
+      if (buffer.length > REQUEST_LIMIT) {
+        handled = true;
+        socket.setTimeout(0);
+        reply({ ok: false, error: 'Request exceeds limit' });
+        return;
+      }
       const newline = buffer.indexOf(10);
       if (newline === -1) return;
       handled = true;
+      socket.setTimeout(0);
       void (async () => {
         if (compromised || !coordinator) throw new Error('Service does not own its instance lock');
         const message: unknown = JSON.parse(buffer.subarray(0, newline).toString('utf8'));
@@ -53,7 +60,10 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
         const command = message as Record<string, unknown>;
         const store = coordinator.store;
         switch (command.command) {
-          case 'health': return { mode: options.mode, pid: process.pid, status: coordinator.health().executorAvailable ? 'ready' : 'degraded', ...coordinator.health() };
+          case 'health': {
+            const health = coordinator.health();
+            return { mode: options.mode, pid: process.pid, status: health.executorAvailable ? 'ready' : 'degraded', ...health };
+          }
           case 'view': return { ...coordinator.view(), modelHub: await coordinator.modelHub.getView() };
           case 'mindmap': return await buildMindmapSnapshot(coordinator, {
             home,
@@ -75,7 +85,6 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
                   const entry = (item ?? {}) as Record<string, unknown>;
                   return {
                     id: text(entry.id, 'selectedModel.id', 128),
-                    ...(entry.tier === undefined ? {} : { tier: text(entry.tier, 'selectedModel.tier', 16) as ModelTier }),
                     ...(Array.isArray(entry.thinkingLevels)
                       ? { thinkingLevels: entry.thinkingLevels.map(level => text(level, 'selectedModel.thinkingLevel', 16) as ThinkingLevel) }
                       : {}),
@@ -143,7 +152,7 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
           case 'timer-add': return coordinator.addTimer(
             text(command.name ?? (command.once || command.delayMs !== undefined ? '定时提醒' : '定时任务'), 'name', 120),
             text(command.instruction ?? (command.plugin ? `执行插件 ${String(command.plugin)}/${String(command.pluginAction ?? 'status')}` : '定时巡检'), 'instruction'),
-            integer(command.intervalMs ?? (typeof command.intervalSeconds === 'number' ? Math.round(command.intervalSeconds * 1000) : undefined), 60_000, 500, 604_800_000),
+            integer(command.intervalMs, 60_000, 500, 604_800_000),
             command.cwd === undefined ? undefined : text(command.cwd, 'cwd', 4096),
             undefined,
             {
@@ -156,7 +165,11 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
               deliverTarget: command.deliverTarget === undefined ? undefined : text(command.deliverTarget, 'deliverTarget', 128),
             },
           );
-          case 'timer-toggle': return coordinator.toggleTimer(text(command.id, 'id', 128), Boolean(command.enabled));
+          case 'timer-toggle': {
+            const id = text(command.id, 'id', 128);
+            const enabled = command.enabled === undefined ? !store.getTimer(id).enabled : Boolean(command.enabled);
+            return coordinator.toggleTimer(id, enabled);
+          }
           case 'timer-remove': return { removed: coordinator.removeTimer(text(command.id, 'id', 128)) };
           case 'plugin-list': return listPluginViews(home);
           case 'plugin-run': return await runPlugin(
@@ -164,6 +177,7 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
             text(command.plugin, 'plugin', 64),
             command.action === undefined ? 'status' : text(command.action, 'action', 64),
             command.args && typeof command.args === 'object' && !Array.isArray(command.args) ? command.args as Record<string, unknown> : {},
+            command.timeoutMs === undefined ? undefined : integer(command.timeoutMs, 30_000, 500, 300_000),
           );
           case 'memory-list': return store.listMemories({
             includeSuperseded: Boolean(command.includeSuperseded),
@@ -220,7 +234,11 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
               pollIntervalMs: command.pollIntervalMs === undefined ? undefined : integer(command.pollIntervalMs, 1500, 100, 300_000),
             });
           }
-          case 'im-toggle': return coordinator.im.toggleChannel(text(command.id, 'id', 128), Boolean(command.enabled));
+          case 'im-toggle': {
+            const id = text(command.id, 'id', 128);
+            const enabled = command.enabled === undefined ? !store.getImChannel(id).enabled : Boolean(command.enabled);
+            return coordinator.im.toggleChannel(id, enabled);
+          }
           case 'im-remove': return { removed: coordinator.im.removeChannel(text(command.id, 'id', 128)) };
           case 'im-test': return await coordinator.im.testChannel(text(command.id, 'id', 128), command.text === undefined ? undefined : String(command.text));
           case 'im-wechat-qr-start': return await coordinator.im.startWechatQrLogin({
@@ -231,7 +249,7 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
             allowedSenders: Array.isArray(command.allowedSenders) ? command.allowedSenders.map(s => String(s)) : undefined,
           });
           case 'im-wechat-qr-status': return await coordinator.im.pollWechatQrLogin(
-            text(command.sessionId ?? command.id, 'sessionId', 256),
+            text(command.sessionId, 'sessionId', 256),
           );
           case 'im-webhook': return await coordinator.im.handleWebhook(
             text(command.channelId, 'channelId', 128),
@@ -276,7 +294,7 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
             targetId: command.targetId === undefined ? undefined : text(command.targetId, 'targetId', 128),
           });
           case 'voice-enroll-status': return coordinator.im.getVoiceprintEnrollmentStatus(
-            text(command.sessionId ?? command.id, 'sessionId', 128),
+            text(command.sessionId, 'sessionId', 128),
           );
           case 'voice-enroll-cancel': return coordinator.im.cancelVoiceprintEnrollment(
             command.sessionId === undefined ? undefined : text(command.sessionId, 'sessionId', 128),
