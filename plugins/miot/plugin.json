@@ -3,6 +3,9 @@
   "title": "全屋米家设备发现与控制 (BE6500 Pro 中枢 + 局域网 MiIO)",
   "description": "通过小米 BE6500 Pro 路由器中枢（SSH 读取 central 设备库 devInfo.db / hot_data_v2.db）发现全屋米家设备与缓存状态，并用三条本地通道直控：① 蓝牙 Mesh 灯/开关/插座经中枢内部 MIPS MQTT 总线（local/bt/rpcReq）读写；② Wi-Fi 设备（如空气炸锅 careli.fryer.maf01）经局域网 MiIO UDP :54321 加密直连，支持定温定时烹饪；③ 红外虚拟空调经 LX06 小爱 mibrain 静默 NLP 指令，电视电源委托 tv-agent。所有设备 token 仅保存在本机 0600 缓存中，绝不出现在任何输出里。",
   "entry": "index.mjs",
+  "runtime": "in-process",
+  "voiceFastpath": true,
+  "promptHint": "本地控制小米智能家居设备：通过路由器中枢与局域网 MiIO / MiPS / 小爱语音控制灯、插座、开关、空气炸锅、空调及电视（电视委托 tv-agent），支持 config.json 中的 protectedDevices 语音防误关保护与 customAliases 自定义别名。",
   "actions": ["status", "devices", "get", "set", "cook", "action", "command", "config"],
   "actionSpecs": [
     {
@@ -20,7 +23,7 @@
     {
       "name": "get",
       "label": "查询单个设备实时状态",
-      "description": "按 device（如 \"卧室灯\"、\"鱼缸灯\"、\"乌龟灯\"、\"空气炸锅\"、\"卧室空调\"、\"电视\"）、did 与可选 room 解析设备并读取实时状态：蓝牙 Mesh 灯/插座返回开/关；空气炸锅返回工作状态、目标温度/时长、剩余分钟、故障码；电视委托 tv-agent；红外空调无状态回读。名称匹配多个设备（如仅说“空调”）会报错并列出候选，需补充 room。",
+      "description": "按 device（如 \"卧室灯\"、\"客厅插座\"、\"空气炸锅\"、\"卧室空调\"、\"电视\"）、did 与可选 room 解析设备并读取实时状态：蓝牙 Mesh 灯/插座返回开/关；空气炸锅返回工作状态、目标温度/时长、剩余分钟、故障码；电视委托 tv-agent；红外空调无状态回读。名称匹配多个设备（如仅说“空调”）会报错并列出候选，需补充 room。",
       "defaultArgs": { "device": "卧室灯" }
     },
     {
@@ -50,7 +53,7 @@
     {
       "name": "config",
       "label": "读取或设置米家配置",
-      "description": "查看或更新 routerSsh（默认 root@192.168.31.1，支持 id=user@host:port）、speakerSsh（留空则自动发现：config → state.sqlite 的 xiaoai 通道 → 默认 root@192.168.31.104）、cacheTtlMs（设备库缓存毫秒，默认 15000）、udpTimeoutMs（局域网 MiIO 超时毫秒，默认 3500），持久化到插件数据目录 config.json。",
+      "description": "查看或更新 routerSsh（如 \"root@192.0.2.1\"，默认空）、speakerSsh（留空则自动发现：config → 可选 state.sqlite 的 xiaoai 通道）、protectedDevices（语音保护设备名/DID列表）、customAliases（自定义设备别名映射）、cacheTtlMs（设备库缓存毫秒，默认 15000）、udpTimeoutMs（局域网 MiIO 超时毫秒，默认 3500），持久化到插件数据目录 config.json。",
       "defaultArgs": {}
     }
   ]

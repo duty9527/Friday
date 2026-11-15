@@ -7,6 +7,7 @@ import android.media.AudioManager;
 import android.net.Uri;
 import android.os.PowerManager;
 import android.os.SystemClock;
+import android.util.Base64;
 import android.util.Log;
 
 import org.json.JSONArray;
@@ -14,6 +15,8 @@ import org.json.JSONObject;
 
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -164,7 +167,8 @@ public final class TvAgentHttpServer {
             if ("GET".equals(method) && "/screenshot".equals(path)) {
                 int maxWidth = parseIntParam(parsedUri, "maxWidth", 960);
                 int quality = parseIntParam(parsedUri, "quality", 70);
-                sendJson(client, 200, handleScreenshot(maxWidth, quality));
+                String savePath = parsedUri.getQueryParameter("savePath");
+                sendJson(client, 200, handleScreenshot(maxWidth, quality, savePath));
                 return;
             }
             if ("POST".equals(method) && "/act".equals(path)) {
@@ -176,6 +180,13 @@ public final class TvAgentHttpServer {
             sendJson(client, 404, new JSONObject()
                     .put("ok", false)
                     .put("error", "Not found: " + method + " " + path));
+        } catch (SecurityException se) {
+            try {
+                sendJson(client, 403, new JSONObject()
+                        .put("ok", false)
+                        .put("error", String.valueOf(se.getMessage())));
+            } catch (Throwable ignored) {
+            }
         } catch (Throwable t) {
             try {
                 sendJson(client, 500, new JSONObject()
@@ -198,7 +209,7 @@ public final class TvAgentHttpServer {
 
         boolean awake = isScreenAwake(ctx);
         boolean a11yBound = (svc != null);
-        boolean projectivyEnabled = TvAgentSelfHealer.isProjectivyEnabled(ctx);
+        boolean guardedLauncherEnabled = TvAgentSelfHealer.isGuardedLauncherEnabled(ctx);
 
         String pkg = "";
         String cls = "";
@@ -231,7 +242,7 @@ public final class TvAgentHttpServer {
         res.put("version", VERSION);
         res.put("awake", awake);
         res.put("a11yBound", a11yBound);
-        res.put("projectivyEnabled", projectivyEnabled);
+        res.put("guardedLauncherEnabled", guardedLauncherEnabled);
         res.put("packageName", pkg != null ? pkg : "");
         res.put("className", cls != null ? cls : "");
         res.put("volume", volume);
@@ -259,7 +270,7 @@ public final class TvAgentHttpServer {
         return svc.dumpTreeJson(maxNodes, awake);
     }
 
-    private static JSONObject handleScreenshot(int maxWidth, int quality) throws Exception {
+    private static JSONObject handleScreenshot(int maxWidth, int quality, String savePath) throws Exception {
         Context ctx = appContext;
         TvAgentSelfHealer.ensureAccessibilityEnabled(ctx);
         TvAgentAccessibilityService svc = waitForServiceIfHealing(ctx, 900L);
@@ -269,7 +280,47 @@ public final class TvAgentHttpServer {
             err.put("error", "AccessibilityService is not bound");
             return err;
         }
-        return svc.takeScreenshotJson(maxWidth, quality);
+        Context storageCtx = ctx != null ? ctx : svc;
+        File validatedOut = null;
+        if (savePath != null && !savePath.trim().isEmpty()) {
+            validatedOut = resolveSafeAppStoragePath(storageCtx, savePath.trim());
+            if (validatedOut == null) {
+                throw new SecurityException("savePath must stay within app filesDir or cacheDir");
+            }
+        }
+        JSONObject result = svc.takeScreenshotJson(maxWidth, quality);
+        if (validatedOut != null && result.optBoolean("ok", true) && result.has("base64")) {
+            byte[] jpeg = Base64.decode(result.getString("base64"), Base64.DEFAULT);
+            File parent = validatedOut.getParentFile();
+            if (parent != null && !parent.exists()) {
+                parent.mkdirs();
+            }
+            try (FileOutputStream fos = new FileOutputStream(validatedOut)) {
+                fos.write(jpeg);
+            }
+            result.put("savedTo", validatedOut.getCanonicalPath());
+        }
+        return result;
+    }
+
+    private static File resolveSafeAppStoragePath(Context ctx, String rawSavePath) throws IOException {
+        if (ctx == null || rawSavePath == null || rawSavePath.isEmpty()) return null;
+        File filesDir = ctx.getFilesDir();
+        File cacheDir = ctx.getCacheDir();
+        File requested = new File(rawSavePath);
+        if (!requested.isAbsolute()) {
+            requested = new File(new File(filesDir, "screenshots"), rawSavePath);
+        }
+        String canonicalTarget = requested.getCanonicalPath();
+        if (filesDir != null) {
+            String filesPrefix = filesDir.getCanonicalPath() + File.separator;
+            if (canonicalTarget.startsWith(filesPrefix)) return new File(canonicalTarget);
+        }
+        if (cacheDir != null) {
+            String cachePrefix = cacheDir.getCanonicalPath() + File.separator;
+            if (canonicalTarget.startsWith(cachePrefix)) return new File(canonicalTarget);
+        }
+        return null;
     }
 
     private static JSONObject handleAct(JSONObject body) throws Exception {
@@ -475,9 +526,7 @@ public final class TvAgentHttpServer {
     private static void sendOptions204(Socket client) throws IOException {
         OutputStream out = client.getOutputStream();
         String headers = "HTTP/1.1 204 No Content\r\n"
-                + "Access-Control-Allow-Origin: *\r\n"
-                + "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-                + "Access-Control-Allow-Headers: Content-Type, X-TV-Token\r\n"
+                + "Content-Length: 0\r\n"
                 + "Connection: close\r\n\r\n";
         out.write(headers.getBytes(StandardCharsets.UTF_8));
         out.flush();
@@ -494,7 +543,6 @@ public final class TvAgentHttpServer {
         String headers = "HTTP/1.1 " + statusCode + " " + statusText + "\r\n"
                 + "Content-Type: application/json; charset=utf-8\r\n"
                 + "Content-Length: " + body.length + "\r\n"
-                + "Access-Control-Allow-Origin: *\r\n"
                 + "Connection: close\r\n\r\n";
         OutputStream out = client.getOutputStream();
         out.write(headers.getBytes(StandardCharsets.UTF_8));

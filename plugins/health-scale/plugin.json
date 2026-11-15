@@ -1,11 +1,14 @@
 {
   "name": "health-scale",
   "title": "沃莱 A1 智能体脂与健康管理",
-  "description": "连接沃莱 A1 (AFU-WL-TZ-A1) 蓝牙体脂秤，采集实时体重、双频生物电阻抗、离线历史记录与电池遥测，计算 20+ 项人体成分与代谢指标并持久化趋势档案。",
+  "runtime": "in-process",
+  "promptHint": "管理体脂秤成员档案（profile-save/delete）、启动蓝牙称重（scan/measure-start/status/stop）、手动补录（record-add）或配置设备 MAC 与默认档案（config）。",
+  "description": "连接沃莱 A1 (AFU-WL*) 蓝牙体脂秤，采集实时体重、双频生物电阻抗、离线历史记录与电池遥测，计算人体成分与代谢指标并持久化趋势档案；设备 MAC 与可选默认档案由 <pluginDataDir>/config.json 加载。",
   "entry": "index.mjs",
   "actions": [
     "dashboard",
     "status",
+    "config",
     "scan",
     "measure-start",
     "measure-status",
@@ -19,13 +22,19 @@
     {
       "name": "dashboard",
       "label": "健康看板全量数据",
-      "description": "返回当前成员档案、全部测量历史、最新全量人体成分分析、健康评级、设备遥测及实时测量会话状态。",
+      "description": "返回当前成员档案、全部测量历史、最新人体成分分析、健康评级、设备遥测及实时测量会话状态。",
       "defaultArgs": {}
     },
     {
       "name": "status",
       "label": "健康状态摘要",
       "description": "汇总当前最新体重、BMI、体脂率、骨骼肌、较上次与 7 日均值变化，以及沃莱 A1 设备连接状态。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "config",
+      "label": "设备与默认档案配置",
+      "description": "读取或更新 config.json 中的 targetMac、namePrefix 与可选 defaultProfile（保存在 <pluginDataDir>/config.json）。",
       "defaultArgs": {}
     },
     {
@@ -37,7 +46,7 @@
     {
       "name": "measure-start",
       "label": "启动实时上秤测量",
-      "description": "启动后台 BLE 采集会话，自动连接体脂秤并下发当前成员参数与时间同步帧，等待上秤测脂。",
+      "description": "启动后台 BLE 采集会话，自动连接体脂秤并下发当前成员参数与时间同步帧，等待上秤测脂（需先存在成员档案）。",
       "defaultArgs": { "timeoutSec": 45 }
     },
     {
@@ -55,8 +64,8 @@
     {
       "name": "profile-save",
       "label": "保存/切换成员档案",
-      "description": "新建或更新健康成员档案（昵称、性别、年龄、身高 cm、目标体重 kg、秤面单位 kg/斤），支持多成员切换。",
-      "defaultArgs": { "name": "默认档案", "sex": "male", "age": 28, "heightCm": 172, "targetWeightKg": 65, "unit": "kg", "setDefault": true }
+      "description": "新建或更新健康成员档案（需填写 name、sex、age、heightCm，可选 targetWeightKg、unit），支持多成员切换。",
+      "defaultArgs": { "name": "", "sex": "", "age": null, "heightCm": null, "targetWeightKg": null, "unit": "kg", "setDefault": true }
     },
     {
       "name": "profile-delete",
@@ -68,7 +77,7 @@
       "name": "record-add",
       "label": "手动补录测量记录",
       "description": "手动录入一条体重/阻抗测量记录并自动计算完整人体成分指标。",
-      "defaultArgs": { "weightKg": 65.0, "impedanceOhm": 500, "note": "手动补录" }
+      "defaultArgs": { "weightKg": null, "impedanceOhm": null, "note": "手动补录" }
     },
     {
       "name": "record-delete",

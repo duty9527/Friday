@@ -1,15 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Store } from '../src/store.js';
-import { listPlugins, runPlugin } from '../dist/plugin.js';
+import { listPlugins, runPlugin } from '../src/plugin.js';
 import {
   encodeXiaomiIrFrame,
   executeTvIrAction,
   discoverSpeakerSsh,
+  handleVoiceFastpath,
   parseSequenceSteps,
   resolveKeySpec,
 } from '../plugins/tv-ir/index.mjs';
@@ -77,7 +78,7 @@ test('tv-ir auto-discovers LX06 speaker SSH target from SQLite im_channels', asy
       enabled: true,
       notifyAll: false,
       allowedSenders: [],
-      apiBase: 'ssh://oh2p=root@192.168.31.101,lx06=root@192.168.31.104?prefix=星期五,Friday',
+      apiBase: 'ssh://oh2p=root@192.0.2.101,lx06=root@192.0.2.104?prefix=星期五,Friday',
       defaultTarget: 'oh2p',
       inboundCount: 0,
       outboundCount: 0,
@@ -90,7 +91,7 @@ test('tv-ir auto-discovers LX06 speaker SSH target from SQLite im_channels', asy
     assert.equal(discovered.source, 'sqlite');
     assert.equal(discovered.channelId, 'xiaoai-lx06');
     assert.equal(discovered.target.id, 'lx06');
-    assert.equal(discovered.target.userHost, 'root@192.168.31.104');
+    assert.equal(discovered.target.userHost, 'root@192.0.2.104');
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -109,7 +110,7 @@ test('tv-ir executes status, press, sequence, config, and learn with mock SSH an
       enabled: true,
       notifyAll: false,
       allowedSenders: [],
-      apiBase: 'ssh://lx06=root@192.168.31.104?prefix=星期五',
+      apiBase: 'ssh://lx06=root@192.0.2.104?prefix=星期五',
       defaultTarget: 'lx06',
       inboundCount: 0,
       outboundCount: 0,
@@ -118,11 +119,11 @@ test('tv-ir executes status, press, sequence, config, and learn with mock SSH an
     });
     store.close();
 
-    const commands = [];
-    const sleeps = [];
+    const commands: Array<{ host?: string; cmd: string }> = [];
+    const sleeps: number[] = [];
     let readAttempts = 0;
 
-    const sshRunner = async (target, cmd) => {
+    const sshRunner = async (target: { userHost: string }, cmd: string) => {
       commands.push({ host: target.userHost, cmd });
       if (cmd.includes('ubus list ir_agent')) {
         return { stdout: 'IR_TX_READY\nIR_RX_READY\n', stderr: '', code: 0 };
@@ -154,7 +155,7 @@ test('tv-ir executes status, press, sequence, config, and learn with mock SSH an
       homeDir: home,
       dataDir,
       sshRunner,
-      sleep: async ms => { sleeps.push(ms); },
+      sleep: async (ms: number) => { sleeps.push(ms); },
     };
 
     // 1. status
@@ -181,7 +182,7 @@ test('tv-ir executes status, press, sequence, config, and learn with mock SSH an
     assert.equal(seqRes.ok, true);
     assert.equal(seqRes.data.stepCount, 4);
     assert.deepEqual(
-      seqRes.data.steps.map(s => s.key),
+      seqRes.data.steps.map((s: { key: string }) => s.key),
       ['down', 'down', 'right', 'ok'],
     );
     assert.deepEqual(sleeps, [240, 240, 240]);
@@ -212,7 +213,7 @@ test('tv-ir executes status, press, sequence, config, and learn with mock SSH an
 
     // 5. Timeout still executes learn_stop cleanup
     commands.length = 0;
-    const timeoutRunner = async (_target, cmd) => {
+    const timeoutRunner = async (_target: unknown, cmd: string) => {
       commands.push({ cmd });
       if (cmd.includes('learn_stop') || cmd.includes('learn ')) {
         return { stdout: '{"code":0,"info":""}\n', stderr: '', code: 0 };
@@ -223,10 +224,10 @@ test('tv-ir executes status, press, sequence, config, and learn with mock SSH an
     const timeoutRes = await executeTvIrAction(
       'learn',
       { key: 'mute', timeoutMs: 2000, pollIntervalMs: 500 },
-      { ...deps, sshRunner: timeoutRunner, now: () => fakeNow, sleep: async ms => { fakeNow += ms; } },
+      { ...deps, sshRunner: timeoutRunner, now: () => fakeNow, sleep: async (ms: number) => { fakeNow += ms; } },
     );
     assert.equal(timeoutRes.ok, false);
-    assert.match(timeoutRes.message, /未检测到/);
+    assert.match(timeoutRes.message ?? '', /未检测到/);
     assert.ok(commands.some(c => c.cmd.includes('call ir_agent learn_stop')));
 
     // Error on non-zero ir_agent play response
@@ -239,14 +240,14 @@ test('tv-ir executes status, press, sequence, config, and learn with mock SSH an
     );
 
     // 6. config updates config.json and overrides discovery
-    const cfgRes = await executeTvIrAction('config', { sshTarget: 'custom=root@192.168.31.200:2222', defaultIntervalMs: 280 }, deps);
+    const cfgRes = await executeTvIrAction('config', { sshTarget: 'custom=root@192.0.2.200:2222', defaultIntervalMs: 280 }, deps);
     assert.equal(cfgRes.ok, true);
     const savedCfg = JSON.parse(await readFile(join(dataDir, 'config.json'), 'utf8'));
-    assert.equal(savedCfg.sshTarget, 'custom=root@192.168.31.200:2222');
+    assert.equal(savedCfg.sshTarget, 'custom=root@192.0.2.200:2222');
     assert.equal(savedCfg.defaultIntervalMs, 280);
     const customDiscovery = await discoverSpeakerSsh({ homeDir: home, dataDir });
-    assert.equal(customDiscovery.target.userHost, 'root@192.168.31.200');
-    assert.equal(customDiscovery.target.port, 2222);
+    assert.equal(customDiscovery.target!.userHost, 'root@192.0.2.200');
+    assert.equal(customDiscovery.target!.port, 2222);
 
     // 7. Sequence validation rejects > 30 steps
     assert.throws(() => parseSequenceSteps('down*15, ok*16'), /30/);
@@ -267,7 +268,7 @@ test('tv-ir plugin is discovered and executable via host runPlugin (dryRun)', as
       enabled: true,
       notifyAll: false,
       allowedSenders: [],
-      apiBase: 'ssh://lx06=root@192.168.31.104',
+      apiBase: 'ssh://lx06=root@192.0.2.104',
       inboundCount: 0,
       outboundCount: 0,
       createdAt: now,
@@ -286,16 +287,16 @@ test('tv-ir plugin is discovered and executable via host runPlugin (dryRun)', as
 
     const pressDry = await runPlugin(home, 'tv-ir', 'press', { key: '菜单', dryRun: true });
     assert.equal(pressDry.ok, true);
-    assert.equal(pressDry.data.key, 'menu');
-    assert.equal(pressDry.data.hex20, '0x8604A');
+    assert.equal((pressDry.data as any).key, 'menu');
+    assert.equal((pressDry.data as any).hex20, '0x8604A');
 
     const directKeyDry = await runPlugin(home, 'tv-ir', 'menu', { dryRun: true });
     assert.equal(directKeyDry.ok, true);
-    assert.equal(directKeyDry.data.key, 'menu');
+    assert.equal((directKeyDry.data as any).key, 'menu');
 
     const seqDry = await runPlugin(home, 'tv-ir', 'sequence', { keys: ['下*2', '确认'], dryRun: true });
     assert.equal(seqDry.ok, true);
-    assert.equal(seqDry.data.stepCount, 3);
+    assert.equal((seqDry.data as any).stepCount, 3);
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -397,5 +398,146 @@ test('tv-remote deterministic voice parsers handle entry, directions, counts, co
   }
   for (const noise of ['今天天气不错', '这不是我写的字。', '今天晚上吃什么', '网友们好']) {
     assert.equal(parseTvRemoteInModeUtterance(noise).kind, 'unrecognized', `Expected unrecognized for "${noise}"`);
+  }
+});
+
+test('tv-ir handleVoiceFastpath manages continuous remote mode, noise filtering, assistant_reply activation, and explicitWake yield', async () => {
+  const homeDir = await mkdtemp(join(tmpdir(), 'tv-ir-fp-'));
+  const sentCmds: string[] = [];
+  const ctx: Record<string, unknown> = {
+    homeDir,
+    pluginDataDir: join(homeDir, 'plugins', 'tv-ir'),
+    sshTarget: 'speaker=root@192.0.2.104',
+    sleep: async () => {},
+    sshRunner: async (_target: unknown, cmd: string) => {
+      sentCmds.push(cmd);
+      return { code: 0, stdout: '{}', stderr: '' };
+    },
+  };
+
+  try {
+    const enter = await handleVoiceFastpath({ text: '进入电视遥控模式' }, ctx);
+    assert.equal(enter.handled, true);
+    assert.equal(enter.followUp, true);
+    assert.equal(enter.sessionState?.tvRemoteActive, true);
+
+    const stepRes = await handleVoiceFastpath({
+      text: '向左两下再确认',
+      sessionState: { tvRemoteActive: true },
+    }, ctx);
+    assert.equal(stepRes.handled, true);
+    assert.equal(stepRes.followUp, true);
+    assert.equal(sentCmds.length, 3);
+    assert.equal((stepRes.data as Record<string, unknown>)?.extendTtl, true);
+
+    const noiseRes = await handleVoiceFastpath({
+      text: '今天晚饭吃什么',
+      sessionState: { tvRemoteActive: true },
+    }, ctx);
+    assert.equal(noiseRes.handled, true);
+    assert.equal(noiseRes.action, 'voice_fastpath_ignored');
+    assert.equal(noiseRes.speech, '');
+    assert.equal((noiseRes.data as Record<string, unknown>)?.extendTtl, false);
+    assert.equal((noiseRes.data as Record<string, unknown>)?.recordTurn, false);
+    assert.equal(sentCmds.length, 3);
+
+    const wakeRes = await handleVoiceFastpath({
+      text: '小爱同学打开台灯',
+      explicitWake: true,
+      sessionState: { tvRemoteActive: true },
+    }, ctx);
+    assert.equal(wakeRes.handled, false);
+
+    const exitRes = await handleVoiceFastpath({
+      text: '退出遥控',
+      sessionState: { tvRemoteActive: true },
+    }, ctx);
+    assert.equal(exitRes.handled, true);
+    assert.equal(exitRes.clearSessionState, true);
+    assert.equal(exitRes.followUp, false);
+    assert.equal(exitRes.sessionState, null);
+
+    const replyRes = await handleVoiceFastpath({
+      text: '',
+      sessionState: { event: 'assistant_reply', assistantReply: '已进入电视遥控模式，请直接说按键指令。' },
+    }, ctx);
+    assert.equal(replyRes.handled, true);
+    assert.equal(replyRes.followUp, true);
+    assert.equal(replyRes.sessionState?.tvRemoteActive, true);
+  } finally {
+    await rm(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('tv-ir handleVoiceFastpath resolves TV power conflict: prefers tv-agent when configured and falls back to IR when unconfigured or failing', async () => {
+  const homeDir = await mkdtemp(join(tmpdir(), 'tv-ir-power-'));
+  try {
+    const irCalls: string[] = [];
+    const agentCalls: Array<{ plugin: string; action: string; args: Record<string, unknown> }> = [];
+    const tvAgentCfgDir = join(homeDir, 'plugins', 'tv-agent');
+    await mkdir(tvAgentCfgDir, { recursive: true });
+    await writeFile(join(tvAgentCfgDir, 'config.json'), JSON.stringify({ tvHost: '192.0.2.182' }), 'utf8');
+
+    const resPreferAgent = await handleVoiceFastpath({ text: '打开电视' }, {
+      homeDir,
+      pluginDataDir: join(homeDir, 'plugins', 'tv-ir'),
+      sshTarget: 'speaker=root@192.0.2.104',
+      sleep: async () => {},
+      sshRunner: async (_t: unknown, cmd: string) => {
+        irCalls.push(cmd);
+        return { code: 0, stdout: '{}', stderr: '' };
+      },
+      callPlugin: async (plugin: string, action: string, args: Record<string, unknown>) => {
+        agentCalls.push({ plugin, action, args });
+        return { ok: true, message: '电视已唤醒', data: { irSent: false } };
+      },
+    });
+    assert.equal(resPreferAgent.handled, true);
+    assert.equal(agentCalls.length, 1);
+    assert.deepEqual(agentCalls[0], { plugin: 'tv-agent', action: 'power', args: { state: 'on' } });
+    assert.equal(irCalls.length, 0);
+    assert.equal((resPreferAgent.data as Record<string, unknown>)?.backend, 'tv-agent');
+
+    // Fallback to IR when tv-agent call fails
+    const resFallbackErr = await handleVoiceFastpath({ text: '关电视' }, {
+      homeDir,
+      pluginDataDir: join(homeDir, 'plugins', 'tv-ir'),
+      sshTarget: 'speaker=root@192.0.2.104',
+      sleep: async () => {},
+      sshRunner: async (_t: unknown, cmd: string) => {
+        irCalls.push(cmd);
+        return { code: 0, stdout: '{}', stderr: '' };
+      },
+      callPlugin: async () => {
+        throw new Error('tv-agent unreachable');
+      },
+    });
+    assert.equal(resFallbackErr.handled, true);
+    assert.equal(irCalls.length, 1);
+    assert.equal((resFallbackErr.data as Record<string, unknown>)?.backend, 'tv-ir');
+
+    // Fallback directly to IR when tvHost is empty
+    await writeFile(join(tvAgentCfgDir, 'config.json'), JSON.stringify({ tvHost: '' }), 'utf8');
+    let calledWhenEmpty = false;
+    const resUnconfigured = await handleVoiceFastpath({ text: '打开电视' }, {
+      homeDir,
+      pluginDataDir: join(homeDir, 'plugins', 'tv-ir'),
+      sshTarget: 'speaker=root@192.0.2.104',
+      sleep: async () => {},
+      sshRunner: async (_t: unknown, cmd: string) => {
+        irCalls.push(cmd);
+        return { code: 0, stdout: '{}', stderr: '' };
+      },
+      callPlugin: async () => {
+        calledWhenEmpty = true;
+        return { ok: true };
+      },
+    });
+    assert.equal(resUnconfigured.handled, true);
+    assert.equal(calledWhenEmpty, false);
+    assert.equal(irCalls.length, 2);
+    assert.equal((resUnconfigured.data as Record<string, unknown>)?.backend, 'tv-ir');
+  } finally {
+    await rm(homeDir, { recursive: true, force: true });
   }
 });

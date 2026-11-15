@@ -1,6 +1,8 @@
 {
   "name": "system-pulse",
   "title": "主机与工作区脉搏诊断",
+  "runtime": "in-process",
+  "promptHint": "查看本机 CPU/内存/磁盘与 Git 状态（status）、阈值巡航（patrol）或准点提醒（remind）。",
   "description": "零外部依赖的本机遥测、Git 工作区状态快照、异常阈值静默巡航与零 Token 准点提醒插件。",
   "entry": "index.mjs",
   "actions": ["status", "patrol", "remind"],

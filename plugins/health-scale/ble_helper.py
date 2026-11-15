@@ -311,8 +311,11 @@ class MeasureSession:
         self.overall_timer_id: int | None = None
         self.receivers: list[Any] = []
 
+        self.session_id: str = getattr(args, "session_id", "") or f"meas-{self.started_at}"
+        self.profile_id: str = getattr(args, "profile_id", "") or ""
         self.state: dict[str, Any] = {
-            "sessionId": args.session_id or f"meas-{self.started_at}",
+            "sessionId": self.session_id,
+            "profileId": self.profile_id,
             "pid": os.getpid(),
             "phase": "scanning",
             "startedAt": self.started_at,
@@ -330,10 +333,12 @@ class MeasureSession:
         }
 
     def flush(self) -> None:
+        if self.profile_id and not self.state.get("profileId"):
+            self.state["profileId"] = self.profile_id
         self.state["updatedAt"] = now_ms()
         parent = os.path.dirname(os.path.abspath(self.state_file))
         os.makedirs(parent, exist_ok=True)
-        tmp = f"{self.state_file}.tmp"
+        tmp = f"{self.state_file}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(self.state, fh, ensure_ascii=False)
         os.replace(tmp, self.state_file)
@@ -711,15 +716,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     scan_p = sub.add_parser("scan")
     scan_p.add_argument("--timeout", type=float, default=4.0)
-    scan_p.add_argument("--target-mac", default="D0:5C:00:3A:38:8C")
+    scan_p.add_argument("--target-mac", default="")
     scan_p.add_argument("--name-prefix", default="AFU-WL")
     scan_p.add_argument("--adapter", default="")
 
     meas_p = sub.add_parser("measure")
     meas_p.add_argument("--state-file", required=True)
     meas_p.add_argument("--session-id", default="")
+    meas_p.add_argument("--profile-id", default="")
     meas_p.add_argument("--timeout", type=float, default=45.0)
-    meas_p.add_argument("--target-mac", default="D0:5C:00:3A:38:8C")
+    meas_p.add_argument("--target-mac", default="")
     meas_p.add_argument("--name-prefix", default="AFU-WL")
     meas_p.add_argument("--tx-packet-hex", default="")
     meas_p.add_argument("--adapter", default="")
@@ -741,6 +747,7 @@ def main() -> int:
             try:
                 err_state = {
                     "sessionId": getattr(args, "session_id", "") or f"meas-{now_ms()}",
+                    "profileId": getattr(args, "profile_id", "") or "",
                     "pid": os.getpid(),
                     "phase": "error",
                     "startedAt": now_ms(),
@@ -753,8 +760,10 @@ def main() -> int:
                 }
                 parent = os.path.dirname(os.path.abspath(args.state_file))
                 os.makedirs(parent, exist_ok=True)
-                with open(args.state_file, "w", encoding="utf-8") as fh:
+                tmp = f"{args.state_file}.{os.getpid()}.tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
                     json.dump(err_state, fh, ensure_ascii=False)
+                os.replace(tmp, args.state_file)
             except Exception:
                 pass
             return 1

@@ -1,19 +1,38 @@
-import { execFile, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import dgram from 'node:dgram';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import {
+  clampInt,
+  errMsg,
+  readConfig,
+  resolvePluginPaths,
+  writeConfig,
+  writeJsonAtomic,
+} from '../_shared/config-store.mjs';
+import {
+  buildSshArgs as buildSharedSshArgs,
+  discoverOptionalXiaoaiSshFromSqlite,
+  execSshText,
+  parseSshSpec as sharedParseSshSpec,
+  parseSshTargets as sharedParseSshTargets,
+  shellQuote,
+} from '../_shared/ssh.mjs';
+import { handleMiotVoiceFastpath } from './fastpath.mjs';
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 export const DEFAULT_CONFIG = Object.freeze({
-  routerSsh: 'root@192.168.31.1',
+  routerSsh: '',
   speakerSsh: '',
+  protectedDevices: Object.freeze([]),
+  customAliases: Object.freeze({}),
   cacheTtlMs: 15000,
   topologyTtlMs: 600000,
   udpTimeoutMs: 3500,
@@ -21,7 +40,6 @@ export const DEFAULT_CONFIG = Object.freeze({
 
 export const ACTIONS = ['status', 'devices', 'get', 'set', 'cook', 'action', 'command', 'config'];
 
-const DEFAULT_SPEAKER = Object.freeze({ id: 'lx06', userHost: 'root@192.168.31.104' });
 const HUB_CENTRAL_DIR = '/data/other/central';
 export const HUB_TAR_COMMAND = `tar -C ${HUB_CENTRAL_DIR} -cf - share/custom/devInfo local/hotdatasync`;
 export const HUB_DEVINFO_TAR_COMMAND = `tar -C ${HUB_CENTRAL_DIR} -cf - share/custom/devInfo`;
@@ -33,15 +51,6 @@ const SSH_TIMEOUT_MS = 10_000;
 const HUB_FETCH_TIMEOUT_MS = 25_000;
 const BLE_SSH_TIMEOUT_MS = 12_000;
 const MAX_NLP_TEXT = 200;
-
-export const SSH_BASE_OPTIONS = Object.freeze([
-  '-o', 'BatchMode=yes',
-  '-o', 'ConnectTimeout=5',
-  '-o', 'StrictHostKeyChecking=accept-new',
-  '-o', 'ControlMaster=no',
-  '-o', 'HostKeyAlgorithms=+ssh-rsa',
-  '-o', 'PubkeyAcceptedKeyTypes=+ssh-rsa',
-]);
 
 /** careli.fryer.maf01 `siid=2/piid=1` work-status enum. */
 export const FRYER_STATUS_MAP = Object.freeze({
@@ -95,7 +104,8 @@ const CATEGORY_LABELS = {
   tv: '电视', speaker: '音箱', router: '路由器', other: '其他',
 };
 
-// Built-in device aliases used when exact / room-qualified names do not match.
+// Built-in generic device aliases used when exact / room-qualified names do not match.
+// Personal device aliases belong in `<pluginDataDir>/config.json` (`customAliases`).
 const DEVICE_ALIASES = [
   {
     names: [
@@ -104,8 +114,6 @@ const DEVICE_ALIASES = [
     ],
     match: d => d.category === 'air_fryer',
   },
-  { names: ['鱼缸', '鱼缸灯', '鱼缸插座'], match: d => d.name === '鱼缸灯' },
-  { names: ['乌龟', '乌龟灯', '乌龟缸', '龟缸灯'], match: d => d.name === '乌龟灯' },
   { names: ['电视', '电视机', 'tv', '电视遥控'], match: d => d.category === 'tv' },
 ];
 
@@ -134,10 +142,6 @@ function success(title, message, data) {
 
 function failure(title, message, data) {
   return { ok: false, notify: true, title, message, ...(data === undefined ? {} : { data }) };
-}
-
-function errMsg(err) {
-  return err instanceof Error ? err.message : String(err);
 }
 
 const SECRET_KEYS = new Set(['token', 'tokenbydid', 'tokenmap', 'tokens', 'bindkey', 'bind_key', 'ltmk']);
@@ -172,47 +176,56 @@ class MiotError extends Error {
 // ---------------------------------------------------------------------------
 
 function getRuntimePaths(deps = {}) {
-  const env = deps.env ?? process.env;
-  const home = deps.homeDir ?? env.SUPER_AGENT_HOME ?? join(homedir(), '.super-agent');
-  const homeDir = resolve(home || join(homedir(), '.super-agent'));
-  const dataDir = resolve(deps.dataDir ?? (env.PLUGIN_DATA_DIR || join(homeDir, 'plugins', 'miot')));
-  return {
-    homeDir,
-    dataDir,
-    configPath: join(dataDir, 'config.json'),
-    cachePath: join(dataDir, 'hub-cache.json'),
-  };
-}
-
-function readJsonSafe(path, fallback) {
-  try {
-    if (existsSync(path)) return JSON.parse(readFileSync(path, 'utf8'));
-  } catch {
-    /* ignore */
-  }
-  return fallback;
+  return resolvePluginPaths('miot', deps, {
+    cachePath: 'hub-cache.json',
+  });
 }
 
 function writeSecureJson(path, value) {
-  const dir = dirname(path);
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  try { chmodSync(dir, 0o700); } catch { /* best effort */ }
-  writeFileSync(path, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
-  try { chmodSync(path, 0o600); } catch { /* best effort */ }
+  writeJsonAtomic(path, value, { mode: 0o600 });
 }
 
-function clampInt(value, min, max) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return undefined;
-  return Math.min(max, Math.max(min, Math.round(n)));
+function normalizeProtectedDevices(raw) {
+  const list = Array.isArray(raw)
+    ? raw
+    : typeof raw === 'string'
+      ? raw.split(',')
+      : [];
+  const seen = new Set();
+  const out = [];
+  for (const item of list) {
+    const clean = String(item ?? '').trim();
+    if (clean && !seen.has(clean)) {
+      seen.add(clean);
+      out.push(clean);
+    }
+  }
+  return out;
+}
+
+function normalizeCustomAliases(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const out = {};
+  for (const [k, v] of Object.entries(raw)) {
+    const cleanKey = String(k ?? '').trim();
+    if (!cleanKey) continue;
+    if (Array.isArray(v)) {
+      const list = v.map(x => String(x ?? '').trim()).filter(Boolean);
+      if (list.length) out[cleanKey] = list;
+    } else if (typeof v === 'string' && v.trim()) {
+      out[cleanKey] = v.trim();
+    }
+  }
+  return out;
 }
 
 export function loadConfig(paths) {
-  const raw = readJsonSafe(paths.configPath, {});
-  const safe = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const safe = readConfig(paths.configPath, DEFAULT_CONFIG);
   return {
     routerSsh: typeof safe.routerSsh === 'string' && safe.routerSsh.trim() ? safe.routerSsh.trim() : DEFAULT_CONFIG.routerSsh,
     speakerSsh: typeof safe.speakerSsh === 'string' ? safe.speakerSsh.trim() : DEFAULT_CONFIG.speakerSsh,
+    protectedDevices: normalizeProtectedDevices(safe.protectedDevices),
+    customAliases: normalizeCustomAliases(safe.customAliases),
     cacheTtlMs: clampInt(safe.cacheTtlMs, 0, 3_600_000) ?? DEFAULT_CONFIG.cacheTtlMs,
     topologyTtlMs: clampInt(safe.topologyTtlMs, 0, 3_600_000) ?? DEFAULT_CONFIG.topologyTtlMs,
     udpTimeoutMs: clampInt(safe.udpTimeoutMs, 300, 30_000) ?? DEFAULT_CONFIG.udpTimeoutMs,
@@ -220,7 +233,7 @@ export function loadConfig(paths) {
 }
 
 function saveConfig(paths, cfg) {
-  writeSecureJson(paths.configPath, cfg);
+  writeConfig(paths.configPath, cfg);
 }
 
 // ---------------------------------------------------------------------------
@@ -229,87 +242,78 @@ function saveConfig(paths, cfg) {
 
 /**
  * Parse `[ssh://][id=]user@host[:port][,...]` (first usable entry) into `{ id, userHost, port? }`.
- * Compatible with the xiaoai channel `apiBase` syntax used by src/xiaoai.ts.
  */
 export function parseSshTargets(spec, defaultId = 'default') {
-  const trimmed = typeof spec === 'string' ? spec.trim() : '';
-  if (!trimmed) return [];
-  const withoutScheme = trimmed.startsWith('ssh://') ? trimmed.slice('ssh://'.length) : trimmed;
-  if (!withoutScheme.includes('@')) return [];
-  const qIdx = withoutScheme.indexOf('?');
-  const hostsPart = qIdx >= 0 ? withoutScheme.slice(0, qIdx) : withoutScheme;
-  const entries = hostsPart.split(',').map(s => s.trim()).filter(Boolean);
-  const targets = [];
-  for (const entry of entries) {
-    const eqIdx = entry.indexOf('=');
-    const explicitId = eqIdx > 0 ? entry.slice(0, eqIdx).trim() : '';
-    const addr = eqIdx > 0 ? entry.slice(eqIdx + 1).trim() : entry;
-    if (!addr || !addr.includes('@')) continue;
-    let userHost = addr;
-    let port;
-    const m = /^(.+):(\d+)$/.exec(addr);
-    if (m?.[1] && m[2]) {
-      const p = Number(m[2]);
-      if (Number.isInteger(p) && p > 0 && p <= 65535) {
-        userHost = m[1].trim();
-        port = p;
-      }
-    }
-    if (!/^[A-Za-z0-9._-]+@[A-Za-z0-9._:-]+$/.test(userHost)) continue;
-    const id = explicitId || (entries.length === 1 ? defaultId : userHost);
-    targets.push({ id, userHost, ...(port !== undefined ? { port } : {}) });
-  }
-  return targets;
+  return sharedParseSshTargets(spec, defaultId);
 }
 
 export function parseSshSpec(spec, defaultId = 'default') {
-  const first = parseSshTargets(spec, defaultId)[0];
+  const trimmed = typeof spec === 'string' ? spec.trim() : '';
+  if (!trimmed) {
+    throw new MiotError('未配置 SSH 目标：请先通过 config 动作设置 routerSsh / speakerSsh，或在 config.json 中配置。');
+  }
+  const first = sharedParseSshSpec(trimmed, defaultId);
   if (!first) throw new MiotError(`无效的 SSH 目标 "${String(spec ?? '')}"，格式应为 [id=]user@host[:port]。`);
   return first;
 }
 
 /** Explicit SSH flags (never rely on ~/.ssh/config aliases). */
-export function buildSshArgs(target, remoteCommand) {
+export function buildSshArgs(target, remoteCommand, options = {}) {
   return [
-    ...SSH_BASE_OPTIONS,
+    ...buildSharedSshArgs(target, {
+      connectTimeoutSec: 5,
+      serverAliveInterval: 10,
+      serverAliveCountMax: 2,
+      controlPersistSec: 60,
+      allowLegacyRsa: true,
+      useControlMaster: options.useControlMaster ?? Boolean(options.homeDir),
+      homeDir: options.homeDir,
+    }),
     '-o', 'LogLevel=ERROR',
-    ...(target.port ? ['-p', String(target.port)] : []),
     target.userHost,
     ...(remoteCommand === undefined ? [] : [remoteCommand]),
   ];
 }
 
-/** Default text SSH executor: (target, command, timeoutMs) => { stdout, stderr, code }. */
-export function defaultSshTextExec(target, remoteCommand, timeoutMs = SSH_TIMEOUT_MS) {
-  return new Promise((resolvePromise, rejectPromise) => {
-    execFile('ssh', buildSshArgs(target, remoteCommand), { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
-      if (error) {
-        if (typeof error.code === 'number') {
-          resolvePromise({ stdout: String(stdout ?? ''), stderr: String(stderr ?? ''), code: error.code });
-          return;
-        }
-        rejectPromise(error);
-        return;
-      }
-      resolvePromise({ stdout: String(stdout ?? ''), stderr: String(stderr ?? ''), code: 0 });
-    });
+/** Default text SSH executor: (target, command, timeoutMs, options?) => { stdout, stderr, code }. */
+export function defaultSshTextExec(target, remoteCommand, timeoutMs = SSH_TIMEOUT_MS, options = {}) {
+  return execSshText(target, remoteCommand, {
+    timeoutMs,
+    maxBuffer: 4 * 1024 * 1024,
+    homeDir: options.homeDir,
+    signal: options.signal,
+    controlPersistSec: 60,
+    allowLegacyRsa: true,
+    useControlMaster: options.useControlMaster ?? Boolean(options.homeDir),
   });
 }
 
 /** Default binary SSH executor: (target, command, { input?: Buffer, timeoutMs? }) => { stdout: Buffer, stderr, code }. */
-export function defaultSshBinaryExec(target, remoteCommand, { input, timeoutMs = SSH_TIMEOUT_MS, maxBytes = 64 * 1024 * 1024 } = {}) {
+export function defaultSshBinaryExec(target, remoteCommand, { input, timeoutMs = SSH_TIMEOUT_MS, maxBytes = 64 * 1024 * 1024, homeDir, signal } = {}) {
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn('ssh', buildSshArgs(target, remoteCommand), { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn('ssh', buildSshArgs(target, remoteCommand, { homeDir, useControlMaster: false }), { stdio: ['pipe', 'pipe', 'pipe'] });
     const out = [];
     const err = [];
     let outBytes = 0;
     let settled = false;
+    const onAbort = () => {
+      child.kill('SIGKILL');
+      finish(rejectPromise, new Error('SSH 操作已取消'));
+    };
     const finish = (fn, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
       fn(value);
     };
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
       finish(rejectPromise, new Error(`SSH 执行超时 (${timeoutMs}ms)`));
@@ -337,19 +341,19 @@ export function defaultSshBinaryExec(target, remoteCommand, { input, timeoutMs =
 }
 
 function shQuote(value) {
-  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+  return shellQuote(value);
 }
 
 // ---------------------------------------------------------------------------
-// Speaker (LX06) discovery
+// Speaker discovery
 // ---------------------------------------------------------------------------
 
 /**
- * explicit arg -> config.json speakerSsh -> SUPER_AGENT_HOME/state.sqlite im_channels(platform='xiaoai')
- * -> default lx06 @ 192.168.31.104. Returns `{ id, userHost, port?, source, channelId? }`.
+ * explicit arg -> config.json speakerSsh -> optional homeDir/state.sqlite im_channels(platform='xiaoai').
+ * Returns `{ id, userHost, port?, source, channelId? }`.
  */
-export async function discoverSpeakerSsh({ speakerSsh, dataDir, homeDir } = {}) {
-  const paths = getRuntimePaths({ dataDir, homeDir });
+export async function discoverSpeakerSsh({ speakerSsh, pluginDataDir, dataDir, homeDir } = {}) {
+  const paths = getRuntimePaths({ pluginDataDir, dataDir, homeDir });
   const config = loadConfig(paths);
   const explicit = typeof speakerSsh === 'string' ? speakerSsh.trim() : '';
   const configured = config.speakerSsh;
@@ -363,44 +367,16 @@ export async function discoverSpeakerSsh({ speakerSsh, dataDir, homeDir } = {}) 
     if (parsed.length > 0) return { ...parsed[0], source: 'config' };
   }
 
-  const preferredId = explicit || configured || undefined;
-  const dbPath = join(paths.homeDir, 'state.sqlite');
-  if (existsSync(dbPath)) {
-    let db;
-    try {
-      const { DatabaseSync } = await import('node:sqlite');
-      db = new DatabaseSync(dbPath, { readOnly: true });
-      const rows = db.prepare("SELECT id, body FROM im_channels WHERE platform = 'xiaoai' ORDER BY updated_at DESC").all();
-      const channels = [];
-      for (const row of rows) {
-        try {
-          const ch = JSON.parse(String(row.body));
-          if (ch && typeof ch === 'object') channels.push({ channelId: String(row.id), channel: ch });
-        } catch { /* ignore malformed */ }
-      }
-      channels.sort((a, b) => Number(b.channel.enabled !== false) - Number(a.channel.enabled !== false));
-      const all = [];
-      for (const item of channels) {
-        for (const t of parseSshTargets(item.channel.apiBase, 'default')) {
-          all.push({ target: t, channelId: item.channelId, defaultTarget: item.channel.defaultTarget });
-        }
-      }
-      if (all.length > 0) {
-        let picked;
-        if (preferredId) picked = all.find(x => x.target.id === preferredId || x.target.userHost === preferredId);
-        picked ??= all.find(x => /lx06/i.test(x.target.id));
-        picked ??= all.find(x => /lx06/i.test(x.channelId));
-        picked ??= all.find(x => x.defaultTarget && x.target.id === x.defaultTarget);
-        picked ??= all[0];
-        return { ...picked.target, source: 'sqlite', channelId: picked.channelId };
-      }
-    } catch {
-      /* fall through to default */
-    } finally {
-      try { db?.close(); } catch { /* ignore */ }
-    }
+  const preferredId = explicit || configured || 'lx06';
+  const discovered = discoverOptionalXiaoaiSshFromSqlite({ homeDir: paths.homeDir }, preferredId);
+  if (discovered) {
+    return { ...discovered.target, source: 'sqlite', channelId: discovered.channelId };
   }
-  return { id: DEFAULT_SPEAKER.id, userHost: DEFAULT_SPEAKER.userHost, source: 'default' };
+
+  throw new MiotError(
+    `未找到小爱音箱 SSH 目标（home=${paths.homeDir}）：请先绑定 xiaoai 通道，或在 config 动作 / config.json 中设置 speakerSsh（如 "speaker=root@192.0.2.10"）。`,
+    { code: 'SPEAKER_SSH_REQUIRED' },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +463,8 @@ function parseHotValue(raw) {
 /**
  * Turn raw device_v4 / appMsg rows into `{ homeId, fetchedAt, devices, tokenByDid }`.
  * `devices` never carries the raw token (only `hasToken`); tokens live in `tokenByDid` for MiIO callers.
+ * @param {{ devInfoRows?: any[]; hotDataRows?: any[]; nowMs?: number; hotDataFetchedAt?: number }} [opts]
+ * @returns {{ homeId: string; fetchedAt: number; hotDataFetchedAt: number; devices: any[]; tokenByDid: Record<string, string> }}
  */
 export function parseHubSnapshot({ devInfoRows = [], hotDataRows = [], nowMs, hotDataFetchedAt } = {}) {
   const cachedByDid = new Map();
@@ -507,7 +485,9 @@ export function parseHubSnapshot({ devInfoRows = [], hotDataRows = [], nowMs, ho
     }
   }
 
+  /** @type {any[]} */
   const devices = [];
+  /** @type {Record<string, string>} */
   const tokenByDid = {};
   let homeId = '';
   for (const row of devInfoRows ?? []) {
@@ -628,8 +608,27 @@ function pickUnique(query, list) {
   return undefined;
 }
 
-/** Resolve a device by did / name / room-qualified name / alias / substring. Throws Chinese errors. */
-export function resolveDevice(devices, { device, did, room } = {}) {
+function matchCustomAliasTarget(pool, customAliases, qn) {
+  if (!customAliases || typeof customAliases !== 'object') return undefined;
+  const targets = [];
+  for (const [key, val] of Object.entries(customAliases)) {
+    if (Array.isArray(val)) {
+      if (val.some(alias => norm(alias) === qn)) targets.push(key);
+    } else if (typeof val === 'string' && norm(key) === qn) {
+      targets.push(val);
+    }
+  }
+  if (!targets.length) return undefined;
+  const hits = pool.filter(d => targets.some(t => {
+    const nt = norm(t);
+    const nkt = normKeepDe(t);
+    return String(d.did) === t || normKeepDe(d.dev_name ?? d.name ?? '') === nkt || norm(fullName(d)) === nt;
+  }));
+  return hits;
+}
+
+/** Resolve a device by did / name / room-qualified name / custom alias / built-in alias / substring. Throws Chinese errors. */
+export function resolveDevice(devices, { device, did, room, customAliases } = {}) {
   const list = Array.isArray(devices) ? devices : [];
   if (did !== undefined && did !== null && String(did).trim() !== '') {
     const wanted = String(did).trim();
@@ -671,7 +670,12 @@ export function resolveDevice(devices, { device, did, room } = {}) {
   const qualifiedHit = pickUnique(query, qualified);
   if (qualifiedHit) return qualifiedHit;
 
-  // 4) built-in aliases
+  // 4) customAliases (from config.json) then built-in generic aliases
+  const customHits = matchCustomAliasTarget(pool, customAliases, qn);
+  if (customHits?.length) {
+    const customHit = pickUnique(query, customHits);
+    if (customHit) return customHit;
+  }
   for (const alias of DEVICE_ALIASES) {
     if (alias.names.some(n => norm(n) === qn)) {
       const hits = pool.filter(d => alias.match({ ...d, name: nameOf(d) }));
@@ -686,21 +690,23 @@ export function resolveDevice(devices, { device, did, room } = {}) {
     const rn = normKeepDe(r);
     if (q.startsWith(rn) && q.length > rn.length) {
       const rest = q.slice(rn.length).replace(/^的/, '');
-      const sub = resolveDeviceLoose(list.filter(d => roomMatches(d, r) && roomMatches(d, room ?? r)), rest);
+      const sub = resolveDeviceLoose(list.filter(d => roomMatches(d, r) && roomMatches(d, room ?? r)), rest, customAliases);
       if (sub) return sub(query);
     }
   }
 
   // 6) substring
-  const sub = resolveDeviceLoose(pool, q);
+  const sub = resolveDeviceLoose(pool, q, customAliases);
   if (sub) return sub(query);
   throw notFound();
 }
 
-function resolveDeviceLoose(pool, q) {
+function resolveDeviceLoose(pool, q, customAliases) {
   const qn = String(q).replace(/的/g, '');
   if (!qn) return undefined;
   const nameOf = d => normKeepDe(d.dev_name ?? d.name ?? '');
+  const customHits = matchCustomAliasTarget(pool, customAliases, qn);
+  if (customHits?.length) return query => pickUnique(query, customHits);
   for (const alias of DEVICE_ALIASES) {
     if (alias.names.some(n => norm(n) === qn)) {
       const hits = pool.filter(d => alias.match({ ...d, name: d.dev_name ?? d.name ?? '' }));
@@ -775,7 +781,7 @@ export function buildMipsRemoteScript(nonce) {
     `ROOT="/proc/$MQTT_PID/root"`,
     `IN="$ROOT/tmp/friday_mips_${nonce}.in"`,
     `OUT="$ROOT/tmp/friday_mips_${nonce}.out"`,
-    `trap 'rm -f "$IN" "$OUT"' EXIT`,
+    `trap 'rm -f "$IN" "$OUT"' EXIT INT TERM HUP`,
     `cat > "$IN"`,
     `chroot "$ROOT" /bin/sh -c '`,
     `  /usr/bin/mosquitto_sub --unix /tmp/mosquitto.sock -N -t "local/friday/rpcReply_${nonce}" -C 1 -W 3 > "/tmp/friday_mips_${nonce}.out" 2>/dev/null &`,
@@ -876,7 +882,11 @@ export function encryptMiioPacket({ devId, stamp, tokenHex, payloadObj }) {
   return Buffer.concat([header, enc]);
 }
 
-/** Verify checksum and decrypt a MiIO packet: `{ devId, stamp, payload, text }` (payload undefined for empty/hello packets). */
+/**
+ * Verify checksum and decrypt a MiIO packet: `{ devId, stamp, payload, text }` (payload undefined for empty/hello packets).
+ * @param {{ packet: Buffer | Uint8Array | number[]; tokenHex: string }} opts
+ * @returns {{ devId: number; stamp: number; payload: Record<string, any> | undefined; text: string }}
+ */
 export function decryptMiioPacket({ packet, tokenHex }) {
   const buf = Buffer.isBuffer(packet) ? packet : Buffer.from(packet ?? []);
   if (buf.length < 32 || buf.readUInt16BE(0) !== 0x2131) throw new MiotError('无效的 MiIO 数据包头。');
@@ -919,7 +929,11 @@ function udpExchange(socket, ip, port, packet, timeoutMs, accept = () => true) {
   });
 }
 
-/** Live MiIO call. Returns the decrypted JSON reply (e.g. `{ id, result }`). */
+/**
+ * Live MiIO call. Returns the decrypted JSON reply (e.g. `{ id, result }`).
+ * @param {{ ip: string; tokenHex: string; method: string; params?: any; timeoutMs?: number; port?: number }} [opts]
+ * @returns {Promise<Record<string, any>>}
+ */
 export async function udpCall({ ip, tokenHex, method, params, timeoutMs = DEFAULT_CONFIG.udpTimeoutMs, port = MIIO_PORT } = {}) {
   if (!ip) throw new MiotError('设备缺少局域网 IP。');
   miioKeyIv(tokenHex);
@@ -1048,29 +1062,50 @@ function makeCtx(args, deps) {
   const cfg = {
     ...stored,
     routerSsh: typeof args.routerSsh === 'string' && args.routerSsh.trim() ? args.routerSsh.trim() : stored.routerSsh,
+    speakerSsh: typeof args.speakerSsh === 'string' && args.speakerSsh.trim() ? args.speakerSsh.trim() : stored.speakerSsh,
     cacheTtlMs: clampInt(args.cacheTtlMs, 0, 3_600_000) ?? stored.cacheTtlMs,
     topologyTtlMs: clampInt(args.topologyTtlMs, 0, 3_600_000) ?? stored.topologyTtlMs,
     udpTimeoutMs: clampInt(args.udpTimeoutMs, 300, 30_000) ?? stored.udpTimeoutMs,
   };
-  const sshBin = deps.sshBinaryExec ?? defaultSshBinaryExec;
+  const sshBin = deps.sshBinaryExec
+    ?? ((target, cmd, opts = {}) => defaultSshBinaryExec(target, cmd, {
+      ...opts,
+      homeDir: paths.homeDir,
+      signal: deps.signal,
+    }));
+  const sshText = deps.sshTextExec
+    ?? ((target, cmd, timeoutMs) => defaultSshTextExec(target, cmd, timeoutMs, {
+      homeDir: paths.homeDir,
+      signal: deps.signal,
+    }));
+  const tvRun = deps.tvAgentRunner
+    ?? (typeof deps.callPlugin === 'function'
+      ? (action, tvArgs) => deps.callPlugin('tv-agent', action, tvArgs)
+      : (action, tvArgs) => defaultTvAgentRunner(action, tvArgs, paths, deps));
   return {
     args,
     deps,
     paths,
     cfg,
     sshBin,
-    sshText: deps.sshTextExec ?? defaultSshTextExec,
+    sshText,
     udp: deps.udpCall ?? udpCall,
     sleep: deps.sleepFn ?? delay,
     now: deps.nowFn ?? Date.now,
     fetchRows: deps.fetchHubRawRows ?? (opts => defaultFetchHubRawRows({ ...opts, sshBinaryExec: sshBin })),
-    tvRun: deps.tvAgentRunner ?? defaultTvAgentRunner,
+    tvRun,
     snapshot: undefined,
   };
 }
 
-function defaultTvAgentRunner(action, args) {
-  return import('../tv-agent/index.mjs').then(mod => mod.executeTvAgentAction(action, args));
+function defaultTvAgentRunner(action, args, paths = {}, deps = {}) {
+  return import('../tv-agent/index.mjs').then(mod =>
+    mod.runAction(action, args, {
+      homeDir: paths.homeDir,
+      signal: deps.signal,
+      callPlugin: deps.callPlugin,
+    }),
+  );
 }
 
 function extractTar(tarBuffer, destDir) {
@@ -1088,7 +1123,11 @@ function extractTar(tarBuffer, destDir) {
   });
 }
 
-/** Stream the hub's devInfo.db (+ optional hot_data_v2.db) over SSH into a temp dir and read them with node:sqlite. */
+/**
+ * Stream the hub's devInfo.db (+ optional hot_data_v2.db) over SSH into a temp dir and read them with node:sqlite.
+ * @param {{ target?: any; sshBinaryExec?: Function; timeoutMs?: number; includeHotData?: boolean }} [opts]
+ * @returns {Promise<{ devInfoRows: any[]; hotDataRows: any[] }>}
+ */
 export async function defaultFetchHubRawRows({
   target,
   sshBinaryExec = defaultSshBinaryExec,
@@ -1366,13 +1405,12 @@ async function handleDevices(ctx) {
     return publicDevice(d, extra);
   });
   const rooms = new Map();
-  for (const [i, d] of filtered.entries()) {
+  for (const d of filtered) {
     const room = d.room_name || '未分区';
     const st = stateText(d, live.get(d.did));
     const label = `${d.dev_name}${st ? `(${st})` : ''}${d.controllable ? '' : '[不可控]'}`;
     if (!rooms.has(room)) rooms.set(room, []);
     rooms.get(room).push(label);
-    void i;
   }
   const lines = [...rooms.entries()].map(([room, labels]) => `${room}：${labels.join('、')}`);
   const counts = {};
@@ -1415,7 +1453,7 @@ async function resolveFromArgs(ctx, { defaultCategory, refresh, needHotData = fa
     }
   }
   try {
-    return resolveDevice(snap.devices, { device, did, room });
+    return resolveDevice(snap.devices, { device, did, room, customAliases: ctx.cfg.customAliases });
   } catch (err) {
     if (
       err instanceof MiotError &&
@@ -1425,7 +1463,7 @@ async function resolveFromArgs(ctx, { defaultCategory, refresh, needHotData = fa
       (snap.ageMs ?? 0) > 5_000
     ) {
       snap = await loadSnapshot(ctx, { refresh: true, needHotData });
-      return resolveDevice(snap.devices, { device, did, room });
+      return resolveDevice(snap.devices, { device, did, room, customAliases: ctx.cfg.customAliases });
     }
     throw err;
   }
@@ -1507,8 +1545,8 @@ export function buildAcInstructions(device, { on, toggle, temperature, mode, fan
   if (onValue === true) texts.push(`打开${name}`);
   else if (onValue === false) texts.push(`关闭${name}`);
   if (temperature !== undefined && temperature !== null && temperature !== '') {
-    const t = clampInt(temperature, 16, 30);
-    if (t === undefined) throw new MiotError(`无效的温度 "${temperature}"（16-30）。`);
+    const t = clampInt(temperature, 16, 31);
+    if (t === undefined) throw new MiotError(`无效的温度 "${temperature}"（16-31）。`);
     texts.push(`把${name}调到${t}度`);
   }
   if (mode !== undefined && mode !== null && mode !== '') {
@@ -1921,9 +1959,24 @@ async function handleConfig(ctx) {
   }
   if (args.speakerSsh !== undefined) {
     const v = String(args.speakerSsh ?? '').trim();
-    if (v && parseSshTargets(v, 'lx06').length === 0) errors.push(`speakerSsh "${v}" 格式应为 [id=]user@host[:port]`);
-    else next.speakerSsh = v;
+    if (v && (v.includes('@') ? parseSshTargets(v, 'lx06').length === 0 : !/^[A-Za-z0-9._-]+$/.test(v))) {
+      errors.push(`speakerSsh "${v}" 格式应为 [id=]user@host[:port]`);
+    } else {
+      next.speakerSsh = v;
+    }
     changed = true;
+  }
+  if (args.protectedDevices !== undefined) {
+    next.protectedDevices = normalizeProtectedDevices(args.protectedDevices);
+    changed = true;
+  }
+  if (args.customAliases !== undefined) {
+    if (!args.customAliases || typeof args.customAliases !== 'object' || Array.isArray(args.customAliases)) {
+      errors.push('customAliases 必须是 JSON 对象');
+    } else {
+      next.customAliases = normalizeCustomAliases(args.customAliases);
+      changed = true;
+    }
   }
   if (args.cacheTtlMs !== undefined) {
     const v = clampInt(args.cacheTtlMs, 0, 3_600_000);
@@ -1945,11 +1998,16 @@ async function handleConfig(ctx) {
   }
   if (errors.length) return failure('米家配置无效', errors.join('；'), { config: loadConfig(paths) });
   if (changed) saveConfig(paths, next);
-  const speaker = await discoverSpeakerSsh({ dataDir: paths.dataDir, homeDir: paths.homeDir });
-  const text = `routerSsh=${next.routerSsh}, speakerSsh=${next.speakerSsh || '(自动发现)'}, cacheTtlMs=${next.cacheTtlMs}, topologyTtlMs=${next.topologyTtlMs}, udpTimeoutMs=${next.udpTimeoutMs}`;
+  let speaker = null;
+  try {
+    speaker = await discoverSpeakerSsh({ pluginDataDir: paths.pluginDataDir, dataDir: paths.dataDir, homeDir: paths.homeDir });
+  } catch {
+    speaker = null;
+  }
+  const text = `routerSsh=${next.routerSsh || '(未配置)'}, speakerSsh=${next.speakerSsh || '(自动发现)'}, protectedDevices=${next.protectedDevices.length}, cacheTtlMs=${next.cacheTtlMs}, topologyTtlMs=${next.topologyTtlMs}, udpTimeoutMs=${next.udpTimeoutMs}`;
   return success('米家配置', `${changed ? '✅ 已保存配置：' : '⚙️ 当前配置：'}${text}`, {
     config: next,
-    speakerResolved: { id: speaker.id, userHost: speaker.userHost, source: speaker.source },
+    speakerResolved: speaker ? { id: speaker.id, userHost: speaker.userHost, source: speaker.source } : null,
     configPath: paths.configPath,
   });
 }
@@ -1962,6 +2020,10 @@ async function handleConfig(ctx) {
  * Execute a miot plugin action. deps (all optional, for tests):
  * `{ dataDir, homeDir, env, sshBinaryExec, sshTextExec, fetchHubRawRows, udpCall, tvAgentRunner, sleepFn, nowFn }`.
  */
+export async function handleVoiceFastpath(request, context = {}) {
+  return handleMiotVoiceFastpath(request, context, (action, args, deps) => runAction(action, args, deps ?? context));
+}
+
 export async function runAction(action = 'status', args = {}, deps = {}) {
   const name = String(action || 'status').trim().toLowerCase();
   const safeArgs = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
@@ -1987,8 +2049,6 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
   }
   return sanitizeOutput(result);
 }
-
-export const executeMiotAction = runAction;
 
 async function main() {
   const action = process.argv[2] || 'status';

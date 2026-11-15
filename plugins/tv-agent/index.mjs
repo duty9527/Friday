@@ -1,15 +1,22 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import {
+  errMsg,
+  readConfig as readSharedConfig,
+  resolvePluginPaths,
+  writeConfig as writeSharedConfig,
+} from '../_shared/config-store.mjs';
 
 export const DEFAULT_CONFIG = Object.freeze({
-  tvHost: '192.168.31.182',
+  tvHost: '',
+  tvToken: '',
   agentPort: 8989,
   dlnaPort: 49152,
   sshTarget: '',
+  appAliases: Object.freeze({}),
 });
 
 const DEFAULT_DECISION_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
@@ -26,14 +33,10 @@ const ACTIONS = ['status', 'power', 'volume', 'cast', 'open_app', 'tree', 'scree
 const RENDER_CONTROL = '/smartshare/render/_urn:schemas-upnp-org:service:RenderingControl_control';
 const AV_TRANSPORT = '/smartshare/render/_urn:schemas-upnp-org:service:AVTransport_control';
 
-/** Built-in app aliases -> Android package names. */
+/** Built-in generic app aliases -> Android package names (personal sideload packages go in config.json.appAliases). */
 export const APP_ALIASES = {
   'com.bili.tv.bili_tv_app': ['bili', 'bilibili', 'b站', '哔哩哔哩', 'bilitv'],
   'org.smarttube.stable': ['youtube', '油管', 'smarttube', 'yt'],
-  'com.github.mytv.dv': ['live', '直播', '我的电视', '电视直播', 'mytv'],
-  'com.huawei.himovceie': ['tvbox', '影视', '影视仓'],
-  'com.hdbox.hdhd.tv': ['hdbox', '久久', '久久影视'],
-  'com.spocky.projengmenu': ['home', '桌面', '主页', 'projectivy'],
 };
 
 const ALIAS_MAP = new Map();
@@ -41,15 +44,67 @@ for (const [pkg, names] of Object.entries(APP_ALIASES)) {
   for (const name of names) ALIAS_MAP.set(normalizeAlias(name), pkg);
 }
 
-// Aliases that are safe to auto-detect inside a free-form navigation goal (generic words excluded).
-const GOAL_APP_ALIASES = [
+const BUILTIN_GOAL_APP_ALIASES = [
   'bilibili', 'bilitv', 'bili', 'b站', '哔哩哔哩', 'smarttube', 'youtube', '油管',
-  '我的电视', '电视直播', '直播', 'mytv', 'tvbox', '影视仓', 'hdbox', '久久影视', '久久',
 ].sort((a, b) => b.length - a.length);
 const LAUNCHER_GOAL_RE = /桌面|主页|首页|launcher|home\s*screen/i;
 
 function normalizeAlias(value) {
   return String(value ?? '').trim().toLowerCase().replace(/\s+/g, '');
+}
+
+/**
+ * Normalize custom `appAliases` from config.json.
+ * Accepts `{ pkgName: ['alias1', ...] }` or `{ alias: 'pkgName' }`.
+ */
+function normalizeCustomAliases(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const normalized = {};
+  for (const [key, val] of Object.entries(raw)) {
+    const cleanKey = String(key ?? '').trim();
+    if (!cleanKey) continue;
+    if (Array.isArray(val)) {
+      const list = val.map(v => String(v ?? '').trim()).filter(Boolean);
+      if (list.length) normalized[cleanKey] = list;
+    } else if (typeof val === 'string' && val.trim()) {
+      normalized[cleanKey] = val.trim();
+    }
+  }
+  return normalized;
+}
+
+function buildAliasIndex(customAliases) {
+  const map = new Map(ALIAS_MAP);
+  const goalAliases = new Set(BUILTIN_GOAL_APP_ALIASES);
+  const launcherPackages = new Set();
+  for (const [key, val] of Object.entries(normalizeCustomAliases(customAliases))) {
+    if (Array.isArray(val)) {
+      for (const alias of val) {
+        const norm = normalizeAlias(alias);
+        if (!norm) continue;
+        map.set(norm, key);
+        if (LAUNCHER_GOAL_RE.test(alias) || norm === 'home') {
+          launcherPackages.add(key);
+        } else if (norm.length >= 2) {
+          goalAliases.add(String(alias).trim().toLowerCase());
+        }
+      }
+    } else {
+      const norm = normalizeAlias(key);
+      if (!norm) continue;
+      map.set(norm, val);
+      if (LAUNCHER_GOAL_RE.test(key) || norm === 'home') {
+        launcherPackages.add(val);
+      } else if (norm.length >= 2) {
+        goalAliases.add(key.toLowerCase());
+      }
+    }
+  }
+  return {
+    aliasMap: map,
+    goalAliases: Array.from(goalAliases).sort((a, b) => b.length - a.length),
+    launcherPackages,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -64,23 +119,18 @@ function failure(title, message, data) {
   return { ok: false, notify: true, title, message, ...(data === undefined ? {} : { data }) };
 }
 
-function errMsg(err) {
-  return err instanceof Error ? err.message : String(err);
-}
-
 // ---------------------------------------------------------------------------
 // Paths / config / credentials
 // ---------------------------------------------------------------------------
 
 function getRuntimePaths(deps = {}) {
-  const env = deps.env ?? process.env;
-  const home = deps.homeDir ?? homedir();
-  const superAgentHome = env.SUPER_AGENT_HOME || join(home, '.super-agent');
-  const dataDir = deps.dataDir ?? (env.PLUGIN_DATA_DIR || join(home, '.super-agent', 'plugins', 'tv-agent'));
+  const paths = resolvePluginPaths('tv-agent', deps);
   return {
-    dataDir,
-    configPath: join(dataDir, 'config.json'),
-    modelHubPath: deps.modelHubPath ?? join(superAgentHome, 'sdk', 'model-hub.json'),
+    homeDir: paths.homeDir,
+    dataDir: paths.pluginDataDir,
+    configPath: paths.configPath,
+    screenshotsDir: join(paths.pluginDataDir, 'screenshots'),
+    modelHubPath: deps.modelHubPath ?? join(paths.homeDir, 'sdk', 'model-hub.json'),
   };
 }
 
@@ -95,23 +145,19 @@ function sanitizePort(value) {
 }
 
 function loadConfig(paths) {
-  let raw = {};
-  try {
-    if (existsSync(paths.configPath)) raw = JSON.parse(readFileSync(paths.configPath, 'utf8'));
-  } catch {
-    raw = {};
-  }
+  const raw = readSharedConfig(paths.configPath, DEFAULT_CONFIG);
   return {
     tvHost: sanitizeHost(raw.tvHost) ?? DEFAULT_CONFIG.tvHost,
+    tvToken: typeof raw.tvToken === 'string' ? raw.tvToken.trim() : DEFAULT_CONFIG.tvToken,
     agentPort: sanitizePort(raw.agentPort) ?? DEFAULT_CONFIG.agentPort,
     dlnaPort: sanitizePort(raw.dlnaPort) ?? DEFAULT_CONFIG.dlnaPort,
     sshTarget: typeof raw.sshTarget === 'string' ? raw.sshTarget.trim() : DEFAULT_CONFIG.sshTarget,
+    appAliases: normalizeCustomAliases(raw.appAliases),
   };
 }
 
 function saveConfig(paths, cfg) {
-  mkdirSync(dirname(paths.configPath), { recursive: true, mode: 0o700 });
-  writeFileSync(paths.configPath, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 });
+  writeSharedConfig(paths.configPath, cfg);
 }
 
 /** Per-call effective config: stored config with optional per-call overrides. */
@@ -120,8 +166,13 @@ function effectiveConfig(args, paths) {
   return {
     ...cfg,
     tvHost: sanitizeHost(args.tvHost) ?? cfg.tvHost,
+    tvToken: typeof args.tvToken === 'string' ? args.tvToken.trim() : cfg.tvToken,
     agentPort: sanitizePort(args.agentPort) ?? cfg.agentPort,
     dlnaPort: sanitizePort(args.dlnaPort) ?? cfg.dlnaPort,
+    sshTarget: typeof args.sshTarget === 'string' ? args.sshTarget.trim() : cfg.sshTarget,
+    appAliases: args.appAliases !== undefined
+      ? { ...cfg.appAliases, ...normalizeCustomAliases(args.appAliases) }
+      : cfg.appAliases,
   };
 }
 
@@ -169,18 +220,28 @@ function makeCtx(args, deps) {
     deps,
     paths,
     cfg,
+    aliases: buildAliasIndex(cfg.appAliases),
     fetchFn: deps.fetch ?? globalThis.fetch,
     sleep: deps.sleep ?? delay,
-    agentBase: `http://${cfg.tvHost}:${cfg.agentPort}`,
-    dlnaBase: `http://${cfg.tvHost}:${cfg.dlnaPort}`,
+    agentBase: cfg.tvHost ? `http://${cfg.tvHost}:${cfg.agentPort}` : '',
+    dlnaBase: cfg.tvHost ? `http://${cfg.tvHost}:${cfg.dlnaPort}` : '',
   };
+}
+
+function buildRequestSignal(timeoutMs, externalSignal) {
+  const timerSignal = AbortSignal.timeout(timeoutMs);
+  if (!externalSignal) return timerSignal;
+  if (typeof AbortSignal.any === 'function') {
+    return AbortSignal.any([timerSignal, externalSignal]);
+  }
+  return timerSignal;
 }
 
 async function httpRequest(ctx, url, { method = 'GET', body, headers = {}, timeoutMs = AGENT_TIMEOUT_MS } = {}) {
   const init = {
     method,
     headers: { ...headers },
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: buildRequestSignal(timeoutMs, ctx.deps.signal),
   };
   if (body !== undefined) {
     init.body = typeof body === 'string' ? body : JSON.stringify(body);
@@ -206,12 +267,31 @@ async function tryRequest(ctx, url, opts) {
   }
 }
 
+function agentHeaders(ctx, extra = {}) {
+  if (!ctx.cfg.tvToken) return extra;
+  return { ...extra, 'X-TV-Token': ctx.cfg.tvToken };
+}
+
 async function agentGet(ctx, path, timeoutMs = AGENT_TIMEOUT_MS) {
-  return tryRequest(ctx, `${ctx.agentBase}${path}`, { timeoutMs });
+  if (!ctx.agentBase) {
+    return { ok: false, status: 0, text: '', json: undefined, error: '未配置 tvHost' };
+  }
+  return tryRequest(ctx, `${ctx.agentBase}${path}`, {
+    timeoutMs,
+    headers: agentHeaders(ctx),
+  });
 }
 
 async function agentAct(ctx, body, timeoutMs = AGENT_TIMEOUT_MS) {
-  const res = await tryRequest(ctx, `${ctx.agentBase}/act`, { method: 'POST', body, timeoutMs });
+  if (!ctx.agentBase) {
+    return { ok: false, status: 0, detail: '未配置 tvHost', json: undefined };
+  }
+  const res = await tryRequest(ctx, `${ctx.agentBase}/act`, {
+    method: 'POST',
+    body,
+    timeoutMs,
+    headers: agentHeaders(ctx),
+  });
   const ok = res.ok && res.json?.ok !== false;
   return { ok, status: res.status, detail: res.json?.detail ?? res.error ?? res.text.slice(0, 160), json: res.json };
 }
@@ -334,7 +414,7 @@ async function handleStatus(ctx) {
     dlnaReachable: p.dlnaOk,
     awake: st?.awake,
     a11yBound: st?.a11yBound,
-    projectivyEnabled: st?.projectivyEnabled,
+    guardedLauncherEnabled: st?.guardedLauncherEnabled,
     packageName: pkg,
     appName: appLabel(apps, pkg),
     className: st?.className,
@@ -360,13 +440,25 @@ async function handleStatus(ctx) {
 // power (idempotent)
 // ---------------------------------------------------------------------------
 
-function defaultIrRunner(action, args) {
-  return import('../tv-ir/index.mjs').then(mod => mod.executeTvIrAction(action, args));
+function defaultIrRunner(ctx, action, args) {
+  if (typeof ctx.deps.callPlugin === 'function') {
+    return ctx.deps.callPlugin('tv-ir', action, args);
+  }
+  return import('../tv-ir/index.mjs').then(mod =>
+    mod.executeTvIrAction(action, args, {
+      homeDir: ctx.paths.homeDir,
+      signal: ctx.deps.signal,
+    }),
+  );
 }
 
 async function runIr(ctx, action, args) {
-  const runner = ctx.deps.irRunner ?? defaultIrRunner;
-  return runner(action, args);
+  const sshTarget = String(ctx.args.sshTarget ?? ctx.cfg.sshTarget ?? '').trim();
+  const fullArgs = sshTarget && !args.sshTarget ? { ...args, sshTarget } : args;
+  if (ctx.deps.irRunner) {
+    return ctx.deps.irRunner(action, fullArgs);
+  }
+  return defaultIrRunner(ctx, action, fullArgs);
 }
 
 async function handlePower(ctx) {
@@ -626,15 +718,18 @@ async function handleCast(ctx) {
 // open_app
 // ---------------------------------------------------------------------------
 
-export function resolveAliasPackage(query) {
+export function resolveAliasPackage(query, customAliases = {}) {
   const key = normalizeAlias(query);
-  return ALIAS_MAP.get(key);
+  if (!customAliases || typeof customAliases !== 'object' || Object.keys(customAliases).length === 0) {
+    return ALIAS_MAP.get(key);
+  }
+  return buildAliasIndex(customAliases).aliasMap.get(key);
 }
 
 async function resolveAppPackage(ctx, query) {
   const q = String(query ?? '').trim();
   if (!q) return { error: '缺少 app 参数。' };
-  const alias = resolveAliasPackage(q);
+  const alias = ctx.aliases.aliasMap.get(normalizeAlias(q));
   if (alias) return { package: alias, via: 'alias' };
   if (q.includes('.') && /^[A-Za-z0-9_.]+$/.test(q)) return { package: q, via: 'package' };
   const st = await agentGet(ctx, '/status');
@@ -687,25 +782,63 @@ async function handleTree(ctx) {
   return success('电视界面树', `前台 ${res.json.packageName || '未知'}，${nodes.length} 个节点。`, res.json);
 }
 
+function resolveSafeScreenshotPath(screenshotsDir, rawSavePath) {
+  mkdirSync(screenshotsDir, { recursive: true, mode: 0o700 });
+  const realRoot = realpathSync(screenshotsDir);
+  const trimmed = String(rawSavePath || '').trim();
+  const candidate = isAbsolute(trimmed) ? resolve(trimmed) : resolve(screenshotsDir, trimmed);
+
+  const logicalRel = relative(resolve(screenshotsDir), candidate);
+  if (!logicalRel || logicalRel === '.' || logicalRel.startsWith('..') || isAbsolute(logicalRel)) {
+    return { error: 'savePath 必须位于插件 screenshots 目录内，拒绝越界路径。' };
+  }
+
+  let checkDir = dirname(candidate);
+  while (checkDir !== dirname(checkDir)) {
+    try {
+      const realAncestor = realpathSync(checkDir);
+      const rel = relative(realRoot, realAncestor);
+      if (rel.startsWith('..') || isAbsolute(rel)) {
+        return { error: 'savePath 祖先目录指向沙箱外路径，已拒绝。' };
+      }
+      break;
+    } catch {
+      checkDir = dirname(checkDir);
+    }
+  }
+
+  mkdirSync(dirname(candidate), { recursive: true, mode: 0o700 });
+  const realParent = realpathSync(dirname(candidate));
+  const parentRel = relative(realRoot, realParent);
+  if (parentRel.startsWith('..') || isAbsolute(parentRel)) {
+    return { error: 'savePath 目标目录越界，已拒绝。' };
+  }
+  const safePath = join(realParent, candidate.slice(dirname(candidate).length + 1));
+  return { path: safePath };
+}
+
 async function handleScreenshot(ctx) {
   const maxWidth = Math.max(160, Math.min(1920, Math.round(Number(ctx.args.maxWidth ?? 960)) || 960));
   const quality = Math.max(20, Math.min(95, Math.round(Number(ctx.args.quality ?? 70)) || 70));
+  let safeSave;
+  if (typeof ctx.args.savePath === 'string' && ctx.args.savePath.trim()) {
+    safeSave = resolveSafeScreenshotPath(ctx.paths.screenshotsDir, ctx.args.savePath);
+    if (safeSave.error) return failure('电视截图失败', safeSave.error);
+  }
   const res = await agentGet(ctx, `/screenshot?maxWidth=${maxWidth}&quality=${quality}`, 10_000);
   if (!res.ok || !res.json?.base64) return failure('电视截图失败', `GET /screenshot 失败：${res.error ?? res.json?.error ?? `HTTP ${res.status}`}`);
   const { base64, ...meta } = res.json;
   const data = { ...meta, bytes: Buffer.byteLength(base64, 'base64') };
-  if (typeof ctx.args.savePath === 'string' && ctx.args.savePath.trim()) {
-    const out = resolve(ctx.args.savePath.trim());
-    mkdirSync(dirname(out), { recursive: true });
-    writeFileSync(out, Buffer.from(base64, 'base64'));
-    data.savedTo = out;
+  if (safeSave?.path) {
+    writeFileSync(safeSave.path, Buffer.from(base64, 'base64'), { mode: 0o600 });
+    data.savedTo = safeSave.path;
   }
   if (ctx.args.includeBase64 === true) data.base64 = base64;
   return success('电视截图', `截图 ${meta.width ?? '?'}x${meta.height ?? '?'}，${data.bytes} 字节${data.savedTo ? `，已保存到 ${data.savedTo}` : ''}。`, data);
 }
 
 async function handleAct(ctx) {
-  const { apiKey: _k, tvHost: _h, agentPort: _p, dlnaPort: _d, ...rest } = ctx.args;
+  const { apiKey: _k, tvHost: _h, tvToken: _t, agentPort: _p, dlnaPort: _d, sshTarget: _s, appAliases: _a, ...rest } = ctx.args;
   const body = rest.body && typeof rest.body === 'object' ? rest.body : rest;
   if (!body.action || typeof body.action !== 'string') {
     return failure('电视操作', 'act 需要 action（wake/global/click/focus/set_text/scroll/launch_app/open_uri）。');
@@ -715,16 +848,39 @@ async function handleAct(ctx) {
   return success('电视操作', `${body.action} 成功${res.detail ? `：${res.detail}` : ''}`, res.json);
 }
 
+function redactConfigView(cfg, configPath) {
+  return {
+    tvHost: cfg.tvHost,
+    tvToken: cfg.tvToken ? '***' : '',
+    hasToken: Boolean(cfg.tvToken),
+    agentPort: cfg.agentPort,
+    dlnaPort: cfg.dlnaPort,
+    sshTarget: cfg.sshTarget,
+    appAliases: cfg.appAliases,
+    configPath,
+  };
+}
+
 function handleConfig(ctx) {
   const { args, paths } = ctx;
   const current = loadConfig(paths);
   const next = { ...current };
   const changed = [];
   if (args.tvHost !== undefined) {
-    const host = sanitizeHost(args.tvHost);
-    if (!host) return failure('电视配置', 'tvHost 无效（仅支持主机名或 IP）。');
-    next.tvHost = host;
-    changed.push('tvHost');
+    const rawHost = String(args.tvHost ?? '').trim();
+    if (!rawHost) {
+      next.tvHost = '';
+      changed.push('tvHost');
+    } else {
+      const host = sanitizeHost(rawHost);
+      if (!host) return failure('电视配置', 'tvHost 无效（仅支持主机名或 IP）。');
+      next.tvHost = host;
+      changed.push('tvHost');
+    }
+  }
+  if (args.tvToken !== undefined) {
+    next.tvToken = String(args.tvToken ?? '').trim();
+    changed.push('tvToken');
   }
   for (const key of ['agentPort', 'dlnaPort']) {
     if (args[key] !== undefined) {
@@ -738,8 +894,15 @@ function handleConfig(ctx) {
     next.sshTarget = String(args.sshTarget ?? '').trim();
     changed.push('sshTarget');
   }
+  if (args.appAliases !== undefined) {
+    if (!args.appAliases || typeof args.appAliases !== 'object' || Array.isArray(args.appAliases)) {
+      return failure('电视配置', 'appAliases 必须是 JSON 对象（包名 -> 别名数组，或 别名 -> 包名）。');
+    }
+    next.appAliases = normalizeCustomAliases(args.appAliases);
+    changed.push('appAliases');
+  }
   if (changed.length) saveConfig(paths, next);
-  return success('电视配置', changed.length ? `已更新：${changed.join('、')}` : '当前电视配置', { ...next, configPath: paths.configPath });
+  return success('电视配置', changed.length ? `已更新：${changed.join('、')}` : '当前电视配置', redactConfigView(next, paths.configPath));
 }
 
 // ---------------------------------------------------------------------------
@@ -795,10 +958,10 @@ function extractQuoted(goal) {
 }
 
 /** Package named in the goal (aliases only), regardless of where the goal says to find it. */
-function detectGoalApp(goal) {
+function detectGoalApp(ctx, goal) {
   const lower = goal.toLowerCase();
-  for (const alias of GOAL_APP_ALIASES) {
-    if (lower.includes(alias)) return ALIAS_MAP.get(normalizeAlias(alias));
+  for (const alias of ctx.aliases.goalAliases) {
+    if (lower.includes(alias)) return ctx.aliases.aliasMap.get(normalizeAlias(alias));
   }
   return undefined;
 }
@@ -984,7 +1147,7 @@ async function handleNavigate(ctx) {
 
   const creds = resolveDecisionCredentials(args, ctx.paths);
   if (!creds) {
-    return failure('电视导航失败', '未找到 Gemini Decision API 密钥（args.apiKey 或 ~/.super-agent/sdk/model-hub.json 的 decision.apiKey / providers.google.apiKey）。');
+    return failure('电视导航失败', '未找到 Gemini Decision API 密钥（args.apiKey 或 model-hub.json 的 decision.apiKey / providers.google.apiKey）。');
   }
 
   const wake = await agentAct(ctx, { action: 'wake' });
@@ -993,7 +1156,7 @@ async function handleNavigate(ctx) {
   }
 
   // Optionally launch the target app first.
-  const goalPkg = args.app ? (await resolveAppPackage(ctx, args.app)).package : detectGoalApp(goal);
+  const goalPkg = args.app ? (await resolveAppPackage(ctx, args.app)).package : detectGoalApp(ctx, goal);
   const openOnly = isOpenOnlyGoal(goal);
   // Goals that say "on the desktop" are solved by the model navigating the launcher, so skip the auto-launch only.
   const targetPkg = goalPkg && (args.app || !LAUNCHER_GOAL_RE.test(goal)) ? goalPkg : undefined;
@@ -1015,7 +1178,6 @@ async function handleNavigate(ctx) {
   const executed = new Map(); // `${fingerprint}::${choice}` -> count
   const triedByState = new Map(); // fingerprint -> Set<choice> already executed on that screen
   let prevFp;
-  let prevChoice;
   let prevNeedsShot = false;
   let stepsUsed = 0;
 
@@ -1029,7 +1191,7 @@ async function handleNavigate(ctx) {
     const tree = treeRes.json;
     const nodes = Array.isArray(tree.nodes) ? tree.nodes : [];
     const fp = stateFingerprint(tree);
-    if (goalPkg && openOnly && tree.packageName === goalPkg && goalPkg !== 'com.spocky.projengmenu') {
+    if (goalPkg && openOnly && tree.packageName === goalPkg && !ctx.aliases.launcherPackages.has(goalPkg)) {
       // Deterministic success: the requested app is already in the foreground.
       trace.push({ step, packageName: tree.packageName, nodeCount: nodes.length, fingerprint: fp, goalReached: 'foreground_match' });
       return success('电视导航完成', `目标已达成（第 ${step} 步，${goalPkg} 已在前台）：${goal}`, {
@@ -1103,11 +1265,9 @@ async function handleNavigate(ctx) {
     history.push({ step, choice: decision.choice, unchanged: false });
     if (decision.confidence !== undefined && decision.confidence < LOW_CONFIDENCE) prevNeedsShot = true;
     prevFp = fp;
-    prevChoice = decision.choice;
     await ctx.sleep(settleMs);
   }
 
-  void prevChoice;
   return failure('电视导航未完成', `已执行 ${stepsUsed} 步仍未确认达成目标：${goal}`, {
     goalReached: false, steps: stepsUsed, trace,
   });
@@ -1119,7 +1279,7 @@ async function handleNavigate(ctx) {
 
 /**
  * Execute a tv-agent plugin action with optional injected dependencies for unit tests
- * (deps.fetch, deps.sleep, deps.irRunner, deps.dataDir, deps.modelHubPath, deps.env, deps.pollMs).
+ * (deps.fetch, deps.sleep, deps.irRunner, deps.pluginDataDir, deps.dataDir, deps.modelHubPath, deps.env, deps.pollMs, deps.callPlugin, deps.signal).
  */
 export async function executeTvAgentAction(action = 'status', args = {}, deps = {}) {
   const name = String(action || 'status').trim().toLowerCase();
@@ -1128,6 +1288,12 @@ export async function executeTvAgentAction(action = 'status', args = {}, deps = 
     return failure('电视 Agent 操作失败', `不支持的 tv-agent 动作 "${action}"，可用动作：${ACTIONS.join('、')}。`);
   }
   const ctx = makeCtx(safeArgs, deps);
+  if (name === 'config') {
+    return handleConfig(ctx);
+  }
+  if (!ctx.cfg.tvHost) {
+    return failure('电视 Agent 未配置', '请先调用 config 动作设置 tvHost（电视局域网 IP），或写入插件 config.json。');
+  }
   switch (name) {
     case 'status': return handleStatus(ctx);
     case 'power': return handlePower(ctx);
@@ -1138,9 +1304,12 @@ export async function executeTvAgentAction(action = 'status', args = {}, deps = 
     case 'screenshot': return handleScreenshot(ctx);
     case 'act': return handleAct(ctx);
     case 'navigate': return handleNavigate(ctx);
-    case 'config': return handleConfig(ctx);
     default: return failure('电视 Agent 操作失败', `未实现的动作 ${name}`);
   }
+}
+
+export async function runAction(action = 'status', args = {}, context = {}) {
+  return executeTvAgentAction(action, args, context);
 }
 
 async function main() {

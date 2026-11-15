@@ -51,15 +51,15 @@ function encodeWeightU32(grams: number, { stable = true, dianji = 1, kgDiv = 1 }
 test('parseScaleAdvertisement decodes real AFU-WL-TZ-A1 ManufacturerData and ServiceData 0x27ac', async () => {
   const mod = await loadPluginModule();
   const parsed = mod.parseScaleAdvertisement({
-    address: 'D0:5C:00:3A:38:8C',
+    address: 'AA:BB:CC:DD:EE:FF',
     name: 'AFU-WL-TZ-A1',
     rssi: -76,
     uuids: ['0000ffb0-0000-1000-8000-00805f9b34fb', '000027ac-0000-1000-8000-00805f9b34fb'],
-    manufacturerData: { '0x27ac': '8c383a005cd001' },
-    serviceData: { '000027ac-0000-1000-8000-00805f9b34fb': '8c383a005cd001' },
+    manufacturerData: { '0x27ac': 'ffeeddccbbaa01' },
+    serviceData: { '000027ac-0000-1000-8000-00805f9b34fb': 'ffeeddccbbaa01' },
   });
   assert.ok(parsed);
-  assert.equal(parsed.mac, 'D0:5C:00:3A:38:8C');
+  assert.equal(parsed.mac, 'AA:BB:CC:DD:EE:FF');
   assert.equal(parsed.name, 'AFU-WL-TZ-A1');
   assert.equal(parsed.rssi, -76);
   assert.equal(parsed.communicationType, 'connect');
@@ -68,14 +68,14 @@ test('parseScaleAdvertisement decodes real AFU-WL-TZ-A1 ManufacturerData and Ser
 
   // Even when rotating Apple iBeacon 0x004c replaces ManufacturerData, 0x27ac ServiceData keeps MAC accurate
   const ibeaconTurn = mod.parseScaleAdvertisement({
-    address: 'D0:5C:00:3A:38:8C',
+    address: 'AA:BB:CC:DD:EE:FF',
     name: 'AFU-WL-TZ-A1',
     rssi: -79,
-    manufacturerData: { '0x004c': '0215d05c' },
-    serviceData: { '000027ac-0000-1000-8000-00805f9b34fb': '8c383a005cd001' },
+    manufacturerData: { '0x004c': '0215aabb' },
+    serviceData: { '000027ac-0000-1000-8000-00805f9b34fb': 'ffeeddccbbaa01' },
   });
   assert.ok(ibeaconTurn);
-  assert.equal(ibeaconTurn.mac, 'D0:5C:00:3A:38:8C');
+  assert.equal(ibeaconTurn.mac, 'AA:BB:CC:DD:EE:FF');
   assert.equal(ibeaconTurn.protocolVer, 1);
 });
 
@@ -95,7 +95,7 @@ test('encodeTimeAndUserInfo27 builds valid 20-byte checksummed frame with user b
   assert.equal(frame[9], 165);
   assert.equal(frame[12], 29);
   assert.equal(frame[13], 2); // female
-  assert.equal(frame[16] & 0x03, 0x03); // BIA enabled
+  assert.equal(frame[16]! & 0x03, 0x03); // BIA enabled
   let sum = 0;
   for (let i = 2; i < 19; i++) sum += frame[i] ?? 0;
   assert.equal(frame[19], sum & 0xff);
@@ -198,14 +198,32 @@ test('computeFullHealthReport produces complete BIA & BMI-fallback reports with 
 
 test('health-scale plugin actions handle profiles, manual records, mocked BLE scan/measure lifecycle, and SQLite dedup', async () => {
   const mod = await loadPluginModule();
+  assert.equal(mod.DEFAULT_SCALE_MAC, '');
   const dataDir = mkdtempSync(join(tmpdir(), 'health-scale-test-'));
 
   try {
-    // 1) Initial dashboard seeds default profile
+    // 1) Initial dashboard starts empty (no hardcoded personal profile) and measure-start prompts to create one
     const initRes = await mod.runAction('dashboard', {}, { dataDir, nowFn: () => 1_700_000_000_000 });
     assert.equal(initRes.ok, true);
     const initData = initRes.data as Record<string, unknown>;
-    assert.equal((initData.profiles as unknown[]).length, 1);
+    assert.equal((initData.profiles as unknown[]).length, 0);
+
+    const noProfileMeas = await mod.runAction('measure-start', { timeoutSec: 30 }, { dataDir });
+    assert.equal(noProfileMeas.ok, false);
+    assert.equal((noProfileMeas.data as Record<string, unknown>).needsProfile, true);
+
+    // Seed primary profile via profile-save
+    const ownerSave = await mod.runAction('profile-save', {
+      id: 'owner',
+      name: '默认成员',
+      sex: 'male',
+      age: 30,
+      heightCm: 175,
+      targetWeightKg: 68,
+      unit: 'kg',
+      setDefault: true,
+    }, { dataDir, nowFn: () => 1_700_000_050_000 });
+    assert.equal(ownerSave.ok, true);
 
     // 2) Save second profile and delete later
     const pSave = await mod.runAction('profile-save', {
@@ -243,12 +261,12 @@ test('health-scale plugin actions handle profiles, manual records, mocked BLE sc
       bleRunner: async () => ({
         ok: true,
         devices: [{
-          address: 'D0:5C:00:3A:38:8C',
+          address: 'AA:BB:CC:DD:EE:FF',
           name: 'AFU-WL-TZ-A1',
           rssi: -77,
           uuids: ['000027ac-0000-1000-8000-00805f9b34fb'],
-          manufacturerData: { '0x27ac': '8c383a005cd001' },
-          serviceData: { '000027ac-0000-1000-8000-00805f9b34fb': '8c383a005cd001' },
+          manufacturerData: { '0x27ac': 'ffeeddccbbaa01' },
+          serviceData: { '000027ac-0000-1000-8000-00805f9b34fb': 'ffeeddccbbaa01' },
         }],
       }),
     });
@@ -294,7 +312,7 @@ test('health-scale plugin actions handle profiles, manual records, mocked BLE sc
           startedAt: 1_700_000_400_000,
           updatedAt: 1_700_000_410_000,
           message: '已完成测量与历史同步',
-          device: { address: 'D0:5C:00:3A:38:8C', name: 'AFU-WL-TZ-A1', rssi: -75 },
+          device: { address: 'AA:BB:CC:DD:EE:FF', name: 'AFU-WL-TZ-A1', rssi: -75 },
           deviceInfo: { model: 'AFU-WL-TZ-A1', software: '1.2.3' },
           notifications: [
             { hex: buildScale27Packet(mod.PACKET_WEIGHT, 0x27, weightBody).toString('hex').toUpperCase() },
@@ -326,6 +344,48 @@ test('health-scale plugin actions handle profiles, manual records, mocked BLE sc
     assert.equal(delRec.ok, true);
     const delProf = await mod.runAction('profile-delete', { id: secondProfileId }, { dataDir });
     assert.equal(delProf.ok, true);
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('health-scale config loads external targetMac/defaultProfile and measure-stop ignores unrelated non-ble_helper PID', async () => {
+  const mod = await loadPluginModule();
+  const dataDir = mkdtempSync(join(tmpdir(), 'health-scale-cfg-'));
+  try {
+    const cfgRes = await mod.runAction('config', {
+      targetMac: 'AA:BB:CC:DD:EE:FF',
+      namePrefix: 'AFU-WL',
+      defaultProfile: {
+        id: 'owner',
+        name: '配置成员',
+        sex: 'female',
+        age: 26,
+        heightCm: 165,
+        targetWeightKg: 53,
+        unit: 'kg',
+      },
+    }, { dataDir, nowFn: () => 1_700_000_000_000 });
+    assert.equal(cfgRes.ok, true);
+
+    const dash = await mod.runAction('dashboard', {}, { dataDir, nowFn: () => 1_700_000_001_000 });
+    assert.equal(dash.ok, true);
+    const profiles = ((dash.data as Record<string, unknown>).profiles as Array<Record<string, unknown>>);
+    assert.equal(profiles.length, 1);
+    assert.equal(profiles[0]?.name, '配置成员');
+
+    // Write session file pointing to current test-runner PID (not ble_helper.py); measure-stop must NOT kill it!
+    writeFileSync(join(dataDir, 'measure-session.json'), JSON.stringify({
+      sessionId: 'fake-non-ble',
+      profileId: 'owner',
+      pid: process.pid,
+      phase: 'scanning',
+      startedAt: 1_700_000_001_000,
+      updatedAt: 1_700_000_001_000,
+    }));
+    const stopRes = await mod.runAction('measure-stop', {}, { dataDir, nowFn: () => 1_700_000_002_000 });
+    assert.equal(stopRes.ok, true);
+    assert.doesNotThrow(() => process.kill(process.pid, 0));
   } finally {
     rmSync(dataDir, { recursive: true, force: true });
   }

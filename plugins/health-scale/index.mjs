@@ -1,18 +1,26 @@
 #!/usr/bin/env node
 import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import {
+  ensurePrivateDir,
+  errMsg,
+  readConfig,
+  readJsonSafe,
+  resolvePluginPaths,
+  writeConfig,
+  writeJsonAtomic,
+} from '../_shared/config-store.mjs';
 
 const execFileAsync = promisify(execFile);
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url));
 const HELPER_PATH = join(PLUGIN_DIR, 'ble_helper.py');
 
-export const DEFAULT_SCALE_MAC = 'D0:5C:00:3A:38:8C';
+export const DEFAULT_SCALE_MAC = '';
 export const DEFAULT_NAME_PREFIX = 'AFU-WL';
 export const EXPECTED_SUBTYPE = 7;
 
@@ -24,6 +32,7 @@ export const PACKET_SETTING = 223;
 export const ACTIONS = [
   'dashboard',
   'status',
+  'config',
   'scan',
   'measure-start',
   'measure-status',
@@ -33,6 +42,12 @@ export const ACTIONS = [
   'record-add',
   'record-delete',
 ];
+
+const DEFAULT_CONFIG = {
+  targetMac: '',
+  namePrefix: DEFAULT_NAME_PREFIX,
+  defaultProfile: null,
+};
 
 function roundTo(value, digits = 1) {
   const factor = 10 ** digits;
@@ -85,16 +100,92 @@ function isPidAlive(pid) {
   }
 }
 
-function resolveDataDir(args = {}, deps = {}) {
-  const explicit = deps.dataDir || args.dataDir || process.env.PLUGIN_DATA_DIR || process.env.SUPER_AGENT_PLUGIN_DATA_DIR;
-  if (explicit) return resolve(String(explicit));
-  const home = deps.homeDir || process.env.SUPER_AGENT_HOME || join(homedir(), '.super-agent');
-  return join(resolve(String(home)), 'plugins', 'health-scale');
+function isBleHelperPid(pid) {
+  if (!isPidAlive(pid)) return false;
+  if (process.platform !== 'linux') return true;
+  try {
+    const cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+    const argv = cmdline.split('\0').filter(Boolean);
+    return argv.some(arg => arg.includes('ble_helper.py'));
+  } catch {
+    return false;
+  }
 }
 
-function openDb(dataDir, nowMs) {
-  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-  const dbPath = join(dataDir, 'health.db');
+async function terminateBleHelperPid(pid, { sleepFn = ms => new Promise(r => setTimeout(r, ms)) } = {}) {
+  const numPid = Number(pid);
+  if (!isBleHelperPid(numPid)) return false;
+  try {
+    process.kill(numPid, 'SIGTERM');
+  } catch {
+    return false;
+  }
+  const deadlineMs = 2000;
+  const stepMs = 100;
+  for (let waited = 0; waited < deadlineMs; waited += stepMs) {
+    await sleepFn(stepMs);
+    if (!isPidAlive(numPid)) return true;
+  }
+  if (isBleHelperPid(numPid)) {
+    try {
+      process.kill(numPid, 'SIGKILL');
+    } catch {
+      // ignore ESRCH race
+    }
+  }
+  return true;
+}
+
+function normalizeSexInput(rawSex) {
+  if (rawSex === undefined || rawSex === null) return undefined;
+  const norm = String(rawSex).trim().toLowerCase();
+  if (!norm) return undefined;
+  if (['male', 'm', 'man', '男', '1'].includes(norm)) return 'male';
+  if (['female', 'f', 'woman', '女', '2'].includes(norm)) return 'female';
+  return undefined;
+}
+
+function normalizeDefaultProfile(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const name = String(raw.name || '').trim();
+  const sex = normalizeSexInput(raw.sex);
+  const age = asInt(raw.age);
+  const heightCm = asFiniteNumber(raw.heightCm ?? raw.height);
+  const targetRaw = raw.targetWeightKg;
+  const targetWeightKg =
+    targetRaw === undefined || targetRaw === null || targetRaw === ''
+      ? null
+      : asFiniteNumber(targetRaw);
+  const unitRaw = String(raw.unit || 'kg').trim().toLowerCase();
+  const unit = unitRaw === 'jin' || unitRaw === '斤' ? 'jin' : 'kg';
+  const id = String(raw.id || 'owner').trim() || 'owner';
+
+  if (!name || !sex || age === undefined || age < 5 || age > 120 || heightCm === undefined || heightCm < 80 || heightCm > 230) {
+    return null;
+  }
+  if (targetWeightKg !== null && (targetWeightKg < 20 || targetWeightKg > 250)) {
+    return null;
+  }
+  return { id, name, sex, age, heightCm, targetWeightKg, unit };
+}
+
+function loadScaleConfig(configPath) {
+  const raw = readConfig(configPath, DEFAULT_CONFIG);
+  return {
+    targetMac: normalizeMac(raw.targetMac || ''),
+    namePrefix: String(raw.namePrefix || DEFAULT_NAME_PREFIX).trim() || DEFAULT_NAME_PREFIX,
+    defaultProfile: normalizeDefaultProfile(raw.defaultProfile),
+  };
+}
+
+function resolveScalePaths(args = {}, deps = {}) {
+  const dirOverride = args.dataDir ? { dataDir: String(args.dataDir) } : {};
+  return resolvePluginPaths('health-scale', { ...deps, ...dirOverride });
+}
+
+function openDb(paths, nowMs, config) {
+  ensurePrivateDir(paths.pluginDataDir);
+  const dbPath = join(paths.pluginDataDir, 'health.db');
   const db = new DatabaseSync(dbPath);
   db.exec(`
     PRAGMA journal_mode = WAL;
@@ -166,11 +257,12 @@ function openDb(dataDir, nowMs) {
   `);
 
   const profileCount = db.prepare('SELECT COUNT(*) AS cnt FROM profiles').get().cnt;
-  if (profileCount === 0) {
+  if (profileCount === 0 && config?.defaultProfile) {
+    const dp = config.defaultProfile;
     db.prepare(`
       INSERT INTO profiles (id, name, sex, age, height_cm, target_weight_kg, unit, is_default, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-    `).run('owner', '默认档案', 'male', 28, 172, 65, 'kg', nowMs, nowMs);
+    `).run(dp.id, dp.name, dp.sex, dp.age, dp.heightCm, dp.targetWeightKg, dp.unit, nowMs, nowMs);
   }
 
   return { db, dbPath };
@@ -353,7 +445,7 @@ export function parseScaleAdvertisement(rawDevice) {
     if (manufacturer.length >= 9) {
       protocolVer = manufacturer[8];
     }
-  } else if (!name.startsWith(DEFAULT_NAME_PREFIX) && address !== DEFAULT_SCALE_MAC) {
+  } else if (!name.startsWith(DEFAULT_NAME_PREFIX) && !(DEFAULT_SCALE_MAC && address === DEFAULT_SCALE_MAC)) {
     return undefined;
   }
 
@@ -392,16 +484,17 @@ export function encodeTimeAndUserInfo27({
   const unitStr = String(user.unit ?? 'kg').trim().toLowerCase();
   const unitByte = typeof user.unit === 'number' ? (user.unit & 0xff) : (unitMap[unitStr] ?? 0);
   const userIndex = 1;
-  const heightCm = clamp(Math.round(Number(user.heightCm ?? user.height ?? 172)), 80, 230) & 0xff;
-  const age = clamp(Math.round(Number(user.age ?? 28)), 5, 120) & 0xff;
-  const sexNorm = String(user.sex ?? 'male').trim().toLowerCase();
-  const sexByte = ['male', 'm', 'man', '男', '1'].includes(sexNorm) ? 1 : 2;
-  const peopleType = 0;
-
-  let profileWeight = float2int(0.0, 2);
-  if ((protocolVer === 1 || protocolVer === 2) && peopleType === 1) {
-    profileWeight = setBit(profileWeight, 15);
+  const rawHeight = Number(user.heightCm ?? user.height);
+  const rawAge = Number(user.age);
+  const sexNorm = normalizeSexInput(user.sex);
+  if (!Number.isFinite(rawHeight) || !Number.isFinite(rawAge) || !sexNorm) {
+    throw new Error('encodeTimeAndUserInfo27 requires valid user.sex, user.age, and user.heightCm');
   }
+  const heightCm = clamp(Math.round(rawHeight), 80, 230) & 0xff;
+  const age = clamp(Math.round(rawAge), 5, 120) & 0xff;
+  const sexByte = sexNorm === 'male' ? 1 : 2;
+
+  const profileWeight = float2int(0.0, 2);
   const targetWeight = float2int(0.0, 2);
   let functionFlags = 0;
   functionFlags = setBit(functionFlags, 0); // enable BIA impedance measurement
@@ -663,10 +756,6 @@ export class Scale27Protocol {
 // Comprehensive BIA Body Composition & Health Analytics Engine
 // ---------------------------------------------------------------------------
 
-function isMaleSex(sex) {
-  return ['male', 'm', 'man', '男', '1'].includes(String(sex ?? '').trim().toLowerCase());
-}
-
 function firstValidResistance(impedances) {
   if (!Array.isArray(impedances)) return undefined;
   for (const val of impedances) {
@@ -739,9 +828,9 @@ function classifyBodyType(bmi, bodyFatPct, male) {
 
 export function computeFullHealthReport({
   weightKg,
-  heightCm = 172,
-  age = 28,
-  sex = 'male',
+  heightCm,
+  age,
+  sex,
   targetWeightKg = null,
   impedances = [],
   adcs = [],
@@ -749,11 +838,15 @@ export function computeFullHealthReport({
   heartRate = null,
 } = {}) {
   const weight = Number(weightKg);
-  const height = clamp(Number(heightCm || 172), 80, 230);
-  const ageInt = clamp(Math.round(Number(age || 28)), 5, 120);
-  const male = isMaleSex(sex);
-
-  if (!Number.isFinite(weight) || weight <= 0) return null;
+  const rawHeight = Number(heightCm);
+  const rawAge = Number(age);
+  const normSex = normalizeSexInput(sex);
+  if (!Number.isFinite(weight) || weight <= 0 || !Number.isFinite(rawHeight) || !Number.isFinite(rawAge) || !normSex) {
+    return null;
+  }
+  const height = clamp(rawHeight, 80, 230);
+  const ageInt = clamp(Math.round(rawAge), 5, 120);
+  const male = normSex === 'male';
 
   const heightM = height / 100.0;
   const bmi = roundTo(weight / (heightM * heightM), 1);
@@ -1189,17 +1282,19 @@ function mapMeasurementRow(row, profile) {
   const adcs = safeJsonParse(row.adcs_json, []);
   const impedances = safeJsonParse(row.impedances_json, []);
   const rawMeta = safeJsonParse(row.raw_meta_json, {});
-  const metrics = computeFullHealthReport({
-    weightKg: row.weight_kg,
-    heightCm: profile?.heightCm ?? 172,
-    age: profile?.age ?? 28,
-    sex: profile?.sex ?? 'male',
-    targetWeightKg: profile?.targetWeightKg ?? null,
-    impedances,
-    adcs,
-    algType: row.alg_type,
-    heartRate: row.heart_rate,
-  });
+  const metrics = profile
+    ? computeFullHealthReport({
+        weightKg: row.weight_kg,
+        heightCm: profile.heightCm,
+        age: profile.age,
+        sex: profile.sex,
+        targetWeightKg: profile.targetWeightKg ?? null,
+        impedances,
+        adcs,
+        algType: row.alg_type,
+        heartRate: row.heart_rate,
+      })
+    : null;
 
   return {
     id: row.id,
@@ -1233,7 +1328,7 @@ function mapMeasurementRow(row, profile) {
 }
 
 function upsertDevice(db, info, nowMs) {
-  const mac = normalizeMac(info.mac || info.address || DEFAULT_SCALE_MAC);
+  const mac = normalizeMac(info.mac || info.address || '');
   if (!mac) return null;
   const existing = db.prepare('SELECT * FROM devices WHERE mac = ?').get(mac);
   const address = normalizeMac(info.address || existing?.address || mac);
@@ -1372,8 +1467,31 @@ function computeDeltas(records, activeProfile, nowMs) {
   };
 }
 
-function buildDashboardData(db, dataDir, { profileId, limit = 120, nowMs }) {
+function buildDashboardData(db, dataDir, { profileId, limit = 120, nowMs, config = DEFAULT_CONFIG }) {
   const { profiles, activeProfile } = resolveProfilesAndActive(db, profileId);
+  const devRow = db.prepare('SELECT * FROM devices ORDER BY last_seen_at DESC LIMIT 1').get();
+  const device = mapDeviceRow(devRow);
+
+  if (!activeProfile) {
+    const liveSession = readLiveSessionSnapshot(dataDir, db, null, nowMs, false);
+    return {
+      profiles,
+      activeProfileId: null,
+      activeProfile: null,
+      needsProfile: true,
+      device,
+      liveSession,
+      latest: null,
+      deltas: null,
+      records: [],
+      config: {
+        targetMac: config.targetMac || '',
+        namePrefix: config.namePrefix || DEFAULT_NAME_PREFIX,
+        hasDefaultProfile: Boolean(config.defaultProfile),
+      },
+    };
+  }
+
   const safeLimit = clamp(asInt(limit) ?? 120, 1, 500);
   const rows = db.prepare(`
     SELECT * FROM measurements
@@ -1390,19 +1508,23 @@ function buildDashboardData(db, dataDir, { profileId, limit = 120, nowMs }) {
 
   const latest = records[0] || null;
   const deltas = computeDeltas(records, activeProfile, nowMs);
-  const devRow = db.prepare('SELECT * FROM devices ORDER BY last_seen_at DESC LIMIT 1').get();
-  const device = mapDeviceRow(devRow);
   const liveSession = readLiveSessionSnapshot(dataDir, db, activeProfile.id, nowMs, false);
 
   return {
     profiles,
     activeProfileId: activeProfile.id,
     activeProfile,
+    needsProfile: false,
     device,
     liveSession,
     latest,
     deltas,
     records,
+    config: {
+      targetMac: config.targetMac || '',
+      namePrefix: config.namePrefix || DEFAULT_NAME_PREFIX,
+      hasDefaultProfile: Boolean(config.defaultProfile),
+    },
   };
 }
 
@@ -1452,23 +1574,23 @@ function readLiveSessionSnapshot(dataDir, db, activeProfileId, nowMs, ingestComp
   let error = raw.error || null;
 
   const activePhases = new Set(['scanning', 'connecting', 'measuring']);
-  if (activePhases.has(phase) && raw.pid && !isPidAlive(Number(raw.pid))) {
+  if (activePhases.has(phase) && raw.pid && !isBleHelperPid(Number(raw.pid))) {
     // Process exited unexpectedly without writing terminal phase
     phase = 'error';
     error = error || '蓝牙采集进程已退出，请重新发起测量';
     message = error;
     try {
-      writeFileSync(path, JSON.stringify({ ...raw, phase, error, message, updatedAt: nowMs }), 'utf8');
+      writeJsonAtomic(path, { ...raw, phase, error, message, updatedAt: nowMs });
     } catch { /* ignore */ }
   }
 
   const decoded = decodeNotifications(raw.notifications || []);
   const parsedAdv = raw.device ? parseScaleAdvertisement(raw.device) : null;
   const devMac = normalizeMac(
-    raw.deviceInfo?.mac || parsedAdv?.mac || raw.device?.address || DEFAULT_SCALE_MAC,
+    raw.deviceInfo?.mac || parsedAdv?.mac || raw.device?.address || '',
   );
 
-  if (raw.device || Object.keys(raw.deviceInfo || {}).length > 0 || decoded.latestWeight) {
+  if (devMac && (raw.device || Object.keys(raw.deviceInfo || {}).length > 0 || decoded.latestWeight)) {
     upsertDevice(db, {
       mac: devMac,
       address: raw.device?.address || devMac,
@@ -1488,8 +1610,8 @@ function readLiveSessionSnapshot(dataDir, db, activeProfileId, nowMs, ingestComp
   }
 
   const ingestedIds = [];
-  if (ingestCompleted) {
-    const targetProfileId = raw.profileId || activeProfileId || 'owner';
+  const targetProfileId = raw.profileId || activeProfileId || null;
+  if (ingestCompleted && targetProfileId) {
     for (const h of decoded.historyEvents) {
       if (!h.weight || !(h.weight.weightKg > 0)) continue;
       const tsMs = h.time && h.time > 1_000_000_000 ? h.time * 1000 : nowMs;
@@ -1596,11 +1718,12 @@ function readLiveSessionSnapshot(dataDir, db, activeProfileId, nowMs, ingestComp
 // BLE Subprocess Runners (Injectable for tests)
 // ---------------------------------------------------------------------------
 
-async function defaultBleRunner(commandArgs, timeoutMs = 15_000) {
+async function defaultBleRunner(commandArgs, timeoutMs = 15_000, signal) {
   const { stdout } = await execFileAsync('python3', [HELPER_PATH, ...commandArgs], {
     cwd: PLUGIN_DIR,
     timeout: timeoutMs,
     maxBuffer: 2 * 1024 * 1024,
+    ...(signal ? { signal } : {}),
   });
   return JSON.parse(String(stdout || '{}').trim() || '{}');
 }
@@ -1621,12 +1744,13 @@ function defaultSpawnMeasure(commandArgs) {
 
 async function handleScan(ctx) {
   const timeoutSec = clamp(asFiniteNumber(ctx.args.timeoutSec ?? ctx.args.timeout) ?? 4, 1, 15);
-  const targetMac = normalizeMac(ctx.args.targetMac || DEFAULT_SCALE_MAC);
-  const namePrefix = String(ctx.args.namePrefix || DEFAULT_NAME_PREFIX).trim();
+  const targetMac = normalizeMac(ctx.args.targetMac ?? ctx.config.targetMac ?? DEFAULT_SCALE_MAC);
+  const namePrefix = String(ctx.args.namePrefix ?? ctx.config.namePrefix ?? DEFAULT_NAME_PREFIX).trim() || DEFAULT_NAME_PREFIX;
 
   const raw = await ctx.bleRunner(
     ['scan', '--timeout', String(timeoutSec), '--target-mac', targetMac, '--name-prefix', namePrefix],
     (timeoutSec + 6) * 1000,
+    ctx.signal,
   );
   if (!raw || raw.ok === false) {
     throw new Error(raw?.error || '蓝牙扫描失败');
@@ -1671,16 +1795,24 @@ async function handleScan(ctx) {
 
 async function handleMeasureStart(ctx) {
   const { activeProfile } = resolveProfilesAndActive(ctx.db, ctx.args.profileId);
+  if (!activeProfile) {
+    return {
+      ok: false,
+      notify: true,
+      title: '需要创建健康档案',
+      message: '尚未配置健康档案，请先调用 profile-save 创建成员档案（填写 name、sex、age、heightCm），或先在 config.json 中设置 defaultProfile。',
+      data: { needsProfile: true },
+    };
+  }
   const timeoutSec = clamp(asFiniteNumber(ctx.args.timeoutSec ?? ctx.args.timeout) ?? 45, 10, 120);
-  const targetMac = normalizeMac(ctx.args.targetMac || DEFAULT_SCALE_MAC);
-  const namePrefix = String(ctx.args.namePrefix || DEFAULT_NAME_PREFIX).trim();
+  const targetMac = normalizeMac(ctx.args.targetMac ?? ctx.config.targetMac ?? DEFAULT_SCALE_MAC);
+  const namePrefix = String(ctx.args.namePrefix ?? ctx.config.namePrefix ?? DEFAULT_NAME_PREFIX).trim() || DEFAULT_NAME_PREFIX;
   const sPath = sessionFilePath(ctx.dataDir);
 
   if (existsSync(sPath)) {
-    const existing = safeJsonParse(readFileSync(sPath, 'utf8'), null);
-    if (existing?.pid && isPidAlive(Number(existing.pid))) {
-      try { process.kill(Number(existing.pid), 'SIGTERM'); } catch { /* ignore */ }
-      await new Promise(r => setTimeout(r, 150));
+    const existing = readJsonSafe(sPath, null);
+    if (existing?.pid) {
+      await terminateBleHelperPid(Number(existing.pid));
     }
   }
 
@@ -1712,69 +1844,60 @@ async function handleMeasureStart(ctx) {
     notifications: [],
     error: null,
   };
-  writeFileSync(sPath, JSON.stringify(initialSession), 'utf8');
+  writeJsonAtomic(sPath, initialSession);
 
   const pid = ctx.spawnMeasure([
     'measure',
     '--state-file', sPath,
     '--session-id', sessionId,
+    '--profile-id', activeProfile.id,
     '--timeout', String(timeoutSec),
     '--target-mac', targetMac,
     '--name-prefix', namePrefix,
     '--tx-packet-hex', txPacket.toString('hex').toUpperCase(),
   ]);
 
-  // Wait briefly (up to 250ms) for Python helper to flush its PID/initial state
+  // Brief read-only wait (up to 250ms) for Python helper to flush initial state without overwriting sPath
   for (let i = 0; i < 5; i++) {
     await new Promise(r => setTimeout(r, 50));
-    const cur = safeJsonParse(readFileSync(sPath, 'utf8'), null);
+    const cur = readJsonSafe(sPath, null);
     if (cur && cur.sessionId === sessionId && cur.pid) {
-      if (!cur.profileId) {
-        writeFileSync(sPath, JSON.stringify({ ...cur, profileId: activeProfile.id }), 'utf8');
-      }
       break;
     }
   }
 
   const session = readLiveSessionSnapshot(ctx.dataDir, ctx.db, activeProfile.id, ctx.nowMs, false)
     || { ...initialSession, pid };
-  session.profileId = activeProfile.id;
+  session.profileId = session.profileId || activeProfile.id;
 
+  const targetDesc = targetMac ? `${namePrefix} (${targetMac})` : `${namePrefix} (自动扫描匹配)`;
   return {
     ok: true,
     notify: false,
     title: '已启动实时称重测量',
-    message: `已开始监听沃莱 A1 (${targetMac})，请赤脚站上体脂秤（限时 ${timeoutSec} 秒）。`,
+    message: `已开始监听沃莱 A1 ${targetDesc}，请赤脚站上体脂秤（限时 ${timeoutSec} 秒）。`,
     data: { session },
   };
 }
 
 async function handleMeasureStatus(ctx) {
   const { activeProfile } = resolveProfilesAndActive(ctx.db, ctx.args.profileId);
-  const sPath = sessionFilePath(ctx.dataDir);
-  if (existsSync(sPath)) {
-    const raw = safeJsonParse(readFileSync(sPath, 'utf8'), null);
-    if (raw && !raw.profileId) {
-      try {
-        writeFileSync(sPath, JSON.stringify({ ...raw, profileId: activeProfile.id }), 'utf8');
-      } catch { /* ignore */ }
-    }
-  }
-
-  const session = readLiveSessionSnapshot(ctx.dataDir, ctx.db, activeProfile.id, ctx.nowMs, true);
+  const activeId = activeProfile?.id ?? null;
+  const session = readLiveSessionSnapshot(ctx.dataDir, ctx.db, activeId, ctx.nowMs, true);
   if (!session) {
     return {
       ok: true,
       notify: false,
       title: '无进行中的测量',
       message: '当前没有正在运行的蓝牙测量会话。',
-      data: { session: null, dashboard: buildDashboardData(ctx.db, ctx.dataDir, { profileId: activeProfile.id, nowMs: ctx.nowMs }) },
+      data: { session: null, dashboard: buildDashboardData(ctx.db, ctx.dataDir, { profileId: activeId, nowMs: ctx.nowMs, config: ctx.config }) },
     };
   }
 
   const dashboard = buildDashboardData(ctx.db, ctx.dataDir, {
-    profileId: session.profileId || activeProfile.id,
+    profileId: session.profileId || activeId,
     nowMs: ctx.nowMs,
+    config: ctx.config,
   });
 
   return {
@@ -1792,10 +1915,10 @@ async function handleMeasureStatus(ctx) {
 async function handleMeasureStop(ctx) {
   const sPath = sessionFilePath(ctx.dataDir);
   if (existsSync(sPath)) {
-    const raw = safeJsonParse(readFileSync(sPath, 'utf8'), null);
+    const raw = readJsonSafe(sPath, null);
     if (raw) {
-      if (raw.pid && isPidAlive(Number(raw.pid))) {
-        try { process.kill(Number(raw.pid), 'SIGTERM'); } catch { /* ignore */ }
+      if (raw.pid) {
+        await terminateBleHelperPid(Number(raw.pid));
       }
       const next = {
         ...raw,
@@ -1803,11 +1926,11 @@ async function handleMeasureStop(ctx) {
         message: raw.phase === 'completed' ? raw.message : '已手动停止本次蓝牙测量',
         updatedAt: ctx.nowMs,
       };
-      writeFileSync(sPath, JSON.stringify(next), 'utf8');
+      writeJsonAtomic(sPath, next);
     }
   }
   const { activeProfile } = resolveProfilesAndActive(ctx.db, ctx.args.profileId);
-  const session = readLiveSessionSnapshot(ctx.dataDir, ctx.db, activeProfile.id, ctx.nowMs, false);
+  const session = readLiveSessionSnapshot(ctx.dataDir, ctx.db, activeProfile?.id ?? null, ctx.nowMs, false);
   return {
     ok: true,
     notify: false,
@@ -1821,10 +1944,11 @@ function handleProfileSave(ctx) {
   const args = ctx.args;
   const requestedId = args.id ? String(args.id).trim() : '';
   const name = String(args.name || '').trim();
-  const sexRaw = args.sex !== undefined ? String(args.sex).trim().toLowerCase() : undefined;
-  const sex = sexRaw ? (isMaleSex(sexRaw) ? 'male' : 'female') : undefined;
-  const age = args.age !== undefined ? asInt(args.age) : undefined;
-  const heightCm = args.heightCm !== undefined ? asFiniteNumber(args.heightCm) : (args.height !== undefined ? asFiniteNumber(args.height) : undefined);
+  const sexRaw = args.sex !== undefined ? String(args.sex).trim() : '';
+  const sex = sexRaw ? normalizeSexInput(sexRaw) : undefined;
+  const age = args.age !== undefined && args.age !== null && args.age !== '' ? asInt(args.age) : undefined;
+  const rawHeight = args.heightCm ?? args.height;
+  const heightCm = rawHeight !== undefined && rawHeight !== null && rawHeight !== '' ? asFiniteNumber(rawHeight) : undefined;
   const targetWeightKg = args.targetWeightKg !== undefined
     ? (args.targetWeightKg === null || args.targetWeightKg === '' ? null : asFiniteNumber(args.targetWeightKg))
     : undefined;
@@ -1832,6 +1956,7 @@ function handleProfileSave(ctx) {
   const unit = unitRaw ? (unitRaw === 'jin' || unitRaw === '斤' ? 'jin' : 'kg') : undefined;
   const setDefault = Boolean(args.setDefault);
 
+  if (sexRaw && !sex) throw new Error('性别需为 male/female（或 男/女）');
   if (age !== undefined && (age < 5 || age > 120)) throw new Error('年龄需在 5 ~ 120 岁之间');
   if (heightCm !== undefined && (heightCm < 80 || heightCm > 230)) throw new Error('身高需在 80 ~ 230 cm 之间');
   if (targetWeightKg !== undefined && targetWeightKg !== null && (targetWeightKg < 20 || targetWeightKg > 250)) {
@@ -1841,11 +1966,14 @@ function handleProfileSave(ctx) {
   let targetId = requestedId;
   const existing = targetId ? ctx.db.prepare('SELECT * FROM profiles WHERE id = ?').get(targetId) : null;
 
-  if (!existing && !name) {
-    throw new Error('新建成员档案必须填写名称 (name)');
+  if (!existing && (!name || !sex || age === undefined || heightCm === undefined)) {
+    throw new Error('新建成员档案必须填写名称 (name)、性别 (sex)、年龄 (age) 和身高 (heightCm)');
   }
 
-  if (setDefault) {
+  const totalProfiles = ctx.db.prepare('SELECT COUNT(*) AS cnt FROM profiles').get().cnt;
+  const makeDefault = setDefault || (!existing && totalProfiles === 0 && args.setDefault !== false);
+
+  if (makeDefault) {
     ctx.db.prepare('UPDATE profiles SET is_default = 0').run();
   }
 
@@ -1862,7 +1990,7 @@ function handleProfileSave(ctx) {
       heightCm ?? existing.height_cm,
       targetWeightKg !== undefined ? targetWeightKg : existing.target_weight_kg,
       unit || existing.unit,
-      setDefault ? 1 : existing.is_default,
+      makeDefault ? 1 : existing.is_default,
       ctx.nowMs,
       existing.id,
     );
@@ -1875,18 +2003,18 @@ function handleProfileSave(ctx) {
     `).run(
       targetId,
       name,
-      sex || 'male',
-      age ?? 28,
-      heightCm ?? 172,
+      sex,
+      age,
+      heightCm,
       targetWeightKg ?? null,
       unit || 'kg',
-      setDefault ? 1 : 0,
+      makeDefault ? 1 : 0,
       ctx.nowMs,
       ctx.nowMs,
     );
   }
 
-  const dashboard = buildDashboardData(ctx.db, ctx.dataDir, { profileId: targetId, nowMs: ctx.nowMs });
+  const dashboard = buildDashboardData(ctx.db, ctx.dataDir, { profileId: targetId, nowMs: ctx.nowMs, config: ctx.config });
   return {
     ok: true,
     notify: false,
@@ -1908,7 +2036,7 @@ function handleProfileDelete(ctx) {
   ctx.db.prepare('DELETE FROM measurements WHERE profile_id = ?').run(id);
   ctx.db.prepare('DELETE FROM profiles WHERE id = ?').run(id);
 
-  const dashboard = buildDashboardData(ctx.db, ctx.dataDir, { nowMs: ctx.nowMs });
+  const dashboard = buildDashboardData(ctx.db, ctx.dataDir, { nowMs: ctx.nowMs, config: ctx.config });
   return {
     ok: true,
     notify: false,
@@ -1920,6 +2048,9 @@ function handleProfileDelete(ctx) {
 
 function handleRecordAdd(ctx) {
   const { activeProfile } = resolveProfilesAndActive(ctx.db, ctx.args.profileId);
+  if (!activeProfile) {
+    throw new Error('尚未创建成员健康档案，请先调用 profile-save 创建档案后再补录体重。');
+  }
   const rawWeight = asFiniteNumber(ctx.args.weightKg ?? ctx.args.weight);
   const inputUnit = String(ctx.args.unit || 'kg').trim().toLowerCase();
   if (rawWeight === undefined || rawWeight <= 0) {
@@ -1948,7 +2079,7 @@ function handleRecordAdd(ctx) {
     note,
   }, ctx.nowMs);
 
-  const dashboard = buildDashboardData(ctx.db, ctx.dataDir, { profileId: activeProfile.id, nowMs: ctx.nowMs });
+  const dashboard = buildDashboardData(ctx.db, ctx.dataDir, { profileId: activeProfile.id, nowMs: ctx.nowMs, config: ctx.config });
   return {
     ok: true,
     notify: false,
@@ -1970,6 +2101,7 @@ function handleRecordDelete(ctx) {
   const dashboard = buildDashboardData(ctx.db, ctx.dataDir, {
     profileId: ctx.args.profileId || existing.profile_id,
     nowMs: ctx.nowMs,
+    config: ctx.config,
   });
   return {
     ok: true,
@@ -1985,7 +2117,17 @@ function handleDashboard(ctx) {
     profileId: ctx.args.profileId,
     limit: ctx.args.limit,
     nowMs: ctx.nowMs,
+    config: ctx.config,
   });
+  if (!dashboard.activeProfile) {
+    return {
+      ok: true,
+      notify: false,
+      title: '需要创建健康档案',
+      message: '尚未创建成员健康档案，请先调用 profile-save 创建档案（或配置 config.json.defaultProfile）。',
+      data: dashboard,
+    };
+  }
   return {
     ok: true,
     notify: false,
@@ -2002,8 +2144,18 @@ function handleStatus(ctx) {
     profileId: ctx.args.profileId,
     limit: 30,
     nowMs: ctx.nowMs,
+    config: ctx.config,
   });
   const { activeProfile, latest, deltas, device } = dashboard;
+  if (!activeProfile) {
+    return {
+      ok: true,
+      notify: Boolean(ctx.args.notify),
+      title: '沃莱 A1 健康状态（待建档）',
+      message: `尚未创建健康档案，请先调用 profile-save 创建成员档案（填写性别、年龄、身高），或在 config.json 中设置 defaultProfile。${device ? `\n设备：${device.name} (${device.mac})` : ''}`,
+      data: dashboard,
+    };
+  }
   const lines = [`【健康管理 · ${activeProfile.name}】`];
   if (latest && latest.metrics) {
     const m = latest.metrics;
@@ -2037,10 +2189,70 @@ function handleStatus(ctx) {
   };
 }
 
+function handleConfig(ctx) {
+  const { args, paths } = ctx;
+  const next = loadScaleConfig(paths.configPath);
+  let changed = false;
+
+  if (args.targetMac !== undefined) {
+    const mac = normalizeMac(args.targetMac);
+    if (mac && !/^([0-9A-F]{2}:){5}[0-9A-F]{2}$/.test(mac)) {
+      throw new Error(`targetMac "${args.targetMac}" 格式无效（示例 AA:BB:CC:DD:EE:FF 或空字符串）`);
+    }
+    next.targetMac = mac;
+    changed = true;
+  }
+  if (args.namePrefix !== undefined) {
+    const prefix = String(args.namePrefix ?? '').trim();
+    next.namePrefix = prefix || DEFAULT_NAME_PREFIX;
+    changed = true;
+  }
+  if (args.defaultProfile !== undefined) {
+    if (args.defaultProfile === null) {
+      next.defaultProfile = null;
+    } else {
+      const dp = normalizeDefaultProfile(args.defaultProfile);
+      if (!dp) {
+        throw new Error('defaultProfile 格式无效（需包含有效 name、sex、age[5-120]、heightCm[80-230]）');
+      }
+      next.defaultProfile = dp;
+      const cnt = ctx.db.prepare('SELECT COUNT(*) AS cnt FROM profiles').get().cnt;
+      if (cnt === 0) {
+        ctx.db.prepare(`
+          INSERT INTO profiles (id, name, sex, age, height_cm, target_weight_kg, unit, is_default, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+        `).run(dp.id, dp.name, dp.sex, dp.age, dp.heightCm, dp.targetWeightKg, dp.unit, ctx.nowMs, ctx.nowMs);
+      }
+    }
+    changed = true;
+  }
+
+  if (changed) {
+    writeConfig(paths.configPath, next);
+  }
+
+  return {
+    ok: true,
+    notify: false,
+    title: '健康秤配置',
+    message: `${changed ? '✅ 已保存配置' : '⚙️ 当前配置'}：targetMac=${next.targetMac || '(未绑定，按前缀扫描)'}, namePrefix=${next.namePrefix}, defaultProfile=${next.defaultProfile ? next.defaultProfile.name : '(未设置)'}`,
+    data: {
+      config: next,
+      configPath: paths.configPath,
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Plugin Entrypoint
 // ---------------------------------------------------------------------------
 
+/**
+ * Execute a health-scale plugin action.
+ * @param {string} [action]
+ * @param {Record<string, unknown>} [args]
+ * @param {import('../_shared/types.d.ts').PluginExecutionContext & { bleRunner?: Function; spawnMeasure?: Function }} [deps]
+ */
 export async function runAction(action = 'status', args = {}, deps = {}) {
   const name = String(action || 'status').trim().toLowerCase();
   const safeArgs = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
@@ -2054,14 +2266,18 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
   }
 
   const nowMs = typeof deps.nowFn === 'function' ? deps.nowFn() : Date.now();
-  const dataDir = resolveDataDir(safeArgs, deps);
-  const { db } = openDb(dataDir, nowMs);
+  const paths = resolveScalePaths(safeArgs, deps);
+  const config = loadScaleConfig(paths.configPath);
+  const { db } = openDb(paths, nowMs, config);
 
   const ctx = {
     args: safeArgs,
-    dataDir,
+    dataDir: paths.pluginDataDir,
+    paths,
+    config,
     db,
     nowMs,
+    signal: deps.signal,
     bleRunner: deps.bleRunner || defaultBleRunner,
     spawnMeasure: deps.spawnMeasure || defaultSpawnMeasure,
   };
@@ -2070,6 +2286,7 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
     switch (name) {
       case 'dashboard': return handleDashboard(ctx);
       case 'status': return handleStatus(ctx);
+      case 'config': return handleConfig(ctx);
       case 'scan': return await handleScan(ctx);
       case 'measure-start': return await handleMeasureStart(ctx);
       case 'measure-status': return await handleMeasureStatus(ctx);
@@ -2086,7 +2303,7 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
       ok: false,
       notify: true,
       title: '健康管理插件执行失败',
-      message: err instanceof Error ? err.message : String(err),
+      message: errMsg(err),
     };
   } finally {
     try { db.close(); } catch { /* ignore */ }

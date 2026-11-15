@@ -3,6 +3,9 @@
   "title": "红米/小米电视红外遥控 (LX06)",
   "description": "通过小爱音箱 Pro (LX06) 内置万能红外 (ubus ir_agent) 毫秒级操控红米/小米电视：支持上下左右、确认(点击)、返回、菜单、主页、音量加减、电源、组合按键序列与物理遥控红外自学习。",
   "entry": "index.mjs",
+  "runtime": "in-process",
+  "voiceFastpath": true,
+  "promptHint": "通过小爱音箱红外遥控电视按键（方向/确认/返回/主页/菜单/音量/电源/信号源/学习），支持直接语音指令和连续电视遥控模式；开关电视会优先调用 tv-agent 并以红外作兜底。",
   "actions": ["status", "keys", "press", "sequence", "learn", "config"],
   "actionSpecs": [
     {
