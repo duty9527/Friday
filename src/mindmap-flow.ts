@@ -3,297 +3,45 @@ import { join } from 'node:path';
 import type { Coordinator } from './coordinator.js';
 import { requestGeminiDecisions, type DecisionCredentials } from './decision.js';
 import type { Task } from './store.js';
-import type { ChatMessage, DecisionSource, MemoryCard, MessageOrigin, MissingAspect, ModelHubView, RouteAction, SessionLinkKind, SessionTurnLink, ThinkingLevel, TraceEvent, WorkerProfile } from './view.js';
+import type {
+  MindmapConsolidatedMemory,
+  MindmapDeliveryItem,
+  MindmapJevQualityGateItem,
+  MindmapJevRouteInfo,
+  MindmapRecalledItem,
+  MindmapRouterToolCall,
+  MindmapRouterTurn,
+  MindmapSession,
+  MindmapSessionLinkKind,
+  MindmapSessionTurnSummary,
+  MindmapSnapshot,
+  MindmapTaskDetail,
+  MindmapTaskFlow,
+  MindmapTurnLink,
+  MindmapWorkerPhase,
+  MindmapWorkerStep,
+} from './mindmap-types.js';
+import type { ChatMessage, DecisionSource, MemoryCard, MessageOrigin, MissingAspect, ModelHubView, ThinkingLevel, TraceEvent } from './view.js';
 
-export interface MindmapRecalledItem {
-  kind: 'memory' | 'work' | 'message';
-  id: string;
-  title: string;
-  score: number;
-  snippet: string;
-  tags?: string[];
-  cwd?: string;
-  activatedVia?: { memoryId: string; topic: string; weight: number; relation: string };
-}
-
-export interface MindmapRouterToolCall {
-  spanId: string;
-  toolName: string;
-  status: string;
-  at: number;
-  durationMs?: number;
-  inputPreview?: string;
-  outputPreview?: string;
-}
-
-export interface MindmapRouterTurn {
-  spanId: string;
-  triggerKind: string;
-  startedAt: number;
-  endedAt?: number;
-  durationMs?: number;
-  status: string;
-  llmTurns: number;
-  usage?: { input: number; output: number; cacheRead: number; reasoning: number; totalTokens: number };
-  outputPreview?: string;
-  tools: MindmapRouterToolCall[];
-}
-
-export interface MindmapJevRouteInfo {
-  called: boolean;
-  source: DecisionSource | 'tier-config';
-  status: 'completed' | 'fallback' | 'static';
-  at?: number;
-  request: {
-    endpoint: string;
-    decisionModel: string;
-    profile: string;
-    preferredTier?: string;
-    preferredLevel?: string;
-    fileCount: number;
-    hasImages: boolean;
-    isTimer: boolean;
-    candidateCount?: number;
-    excludedSpecs?: string[];
-    excludedProviders?: string[];
-    instructionPreview: string;
-  };
-  response: {
-    selectedModel?: string;
-    modelTier?: string;
-    thinkingLevel?: ThinkingLevel;
-    confidence?: number;
-    needsQualityGate?: boolean;
-    needsQualityGateProb?: number;
-    usage?: { inputTokens: number; totalTokens: number };
-    fallbackReason?: string;
-  };
-}
-
-export interface MindmapJevQualityGateItem {
-  index: number;
-  at: number;
-  source: DecisionSource;
-  status: 'completed' | 'fallback' | 'skipped';
-  request: {
-    endpoint: string;
-    decisionModel: string;
-    profile: string;
-    succeededOps: number;
-    failedOps: number;
-    followupCount: number;
-    reportLength: number;
-    skipRemote: boolean;
-  };
-  response: {
-    score: number;
-    maxScore: number;
-    confidence: number;
-    supplementProbability: number;
-    shouldSupplement: boolean;
-    missingAspect: MissingAspect;
-    skippedByRoute?: boolean;
-    usage?: { inputTokens: number; totalTokens: number };
-    fallbackReason?: string;
-  };
-}
-
-export interface MindmapWorkerStep {
-  id: string;
-  kind: 'llm_turn' | 'tool_call' | 'ask_boss' | 'followup';
-  at: number;
-  durationMs?: number;
-  status: string;
-  title: string;
-  phaseIndex?: number;
-  toolName?: string;
-  operationId?: string;
-  inputPreview?: string;
-  outputPreview?: string;
-  hasFullOperation?: boolean;
-  usage?: { input: number; output: number; cacheRead: number; reasoning: number; totalTokens: number };
-  stopReason?: string;
-}
-
-export interface MindmapWorkerPhase {
-  index: number;
-  spanId?: string;
-  isFollowup: boolean;
-  followupPrompt?: string;
-  startedAt: number;
-  endedAt?: number;
-  durationMs?: number;
-  status: string;
-  llmCount: number;
-  toolCount: number;
-  qualityGateIndex?: number;
-  routerReportSpanId?: string;
-}
-
-export interface MindmapTaskDetail {
-  id: string;
-  parentTaskId?: string;
-  prompt: string;
-  promptTruncated?: boolean;
-  status: string;
-  reason?: string;
-  profile?: WorkerProfile;
-  execution?: 'native' | 'snapshot';
-  cwd?: string;
-  createdAt: number;
-  activeMs: number;
-  limitMs: number;
-  contextBrief?: string;
-  compiledMemories: Array<{ id: string; topic: string; tags: string[]; preview: string }>;
-  jevRoute?: MindmapJevRouteInfo;
-  executionPhases: MindmapWorkerPhase[];
-  workerSteps: MindmapWorkerStep[];
-  totalSteps: number;
-  omittedSteps: number;
-  succeededOps: number;
-  failedOps: number;
-  jevQualityGates: MindmapJevQualityGateItem[];
-  reportPreview?: string;
-  reportTruncated?: boolean;
-}
-
-export interface MindmapConsolidatedMemory {
-  id: string;
-  topic: string;
-  tags: string[];
-  pinned: boolean;
-  autoConsolidated: boolean;
-  contentPreview: string;
-  synapseCount: number;
-  createdAt: number;
-}
-
-export interface MindmapDeliveryItem {
-  messageId: string;
-  seq: number;
-  at: number;
-  roleLabel: string;
-  status: string;
-  text: string;
-  textTruncated?: boolean;
-  reason?: string;
-  source?: string;
-}
-
-export type MindmapSessionLinkKind = SessionLinkKind;
-
-export type MindmapTurnLink = SessionTurnLink;
-
-export interface MindmapSessionTurnSummary {
-  flowId: string;
-  seq: number;
-  at: number;
-  sourceKind: MindmapTaskFlow['ingress']['sourceKind'];
-  channelLabel: string;
-  textPreview: string;
-  status: MindmapTaskFlow['status'];
-  taskIds: string[];
-  link?: MindmapTurnLink;
-}
-
-export interface MindmapSession {
-  id: string;
-  title: string;
-  kind: 'human' | 'timer' | 'standalone';
-  status: MindmapTaskFlow['status'];
-  startedAt: number;
-  updatedAt: number;
-  channels: Array<'wechat' | 'telegram' | 'dingtalk' | 'xiaoai' | 'local' | 'timer' | 'standalone'>;
-  primaryChannelLabel: string;
-  turnCount: number;
-  taskCount: number;
-  jevCallCount: number;
-  recalledMemoryCount: number;
-  consolidatedMemoryCount: number;
-  aiManagedContext: boolean;
-  turnFlowIds: string[];
-  turnSummaries: MindmapSessionTurnSummary[];
-}
-
-export interface MindmapTaskFlow {
-  id: string;
-  seq: number;
-  createdAt: number;
-  completedAt?: number;
-  status: 'queued' | 'processing' | 'streaming' | 'running' | 'completed' | 'failed' | 'paused' | 'interrupted';
-  sessionId?: string;
-  sessionPersisted?: boolean;
-  turnIndex?: number;
-  turnCount?: number;
-  sessionLink?: MindmapTurnLink;
-  ingress: {
-    sourceKind: 'wechat' | 'telegram' | 'dingtalk' | 'xiaoai' | 'local' | 'timer' | 'standalone';
-    channelLabel: string;
-    origin?: Omit<MessageOrigin, 'contextToken' | 'replyWebhook'>;
-    messageId?: string;
-    text: string;
-    textTruncated?: boolean;
-    attachments: Array<{ kind: string; name: string; status: string; path?: string; mimeType?: string; error?: string }>;
-    paths: string[];
-    timerInfo?: {
-      id: string;
-      name: string;
-      plugin?: string;
-      pluginAction?: string;
-      dailyAt?: string;
-      intervalMs: number;
-      once?: boolean;
-    };
-  };
-  memoryRecall: {
-    directoryTotal?: number;
-    visibleWorksCount?: number;
-    executionMode?: 'native' | 'snapshot';
-    cwd?: string;
-    recalledItems: MindmapRecalledItem[];
-  };
-  routerTurns: MindmapRouterTurn[];
-  routeActions: RouteAction[];
-  directPlugin?: { timerName: string; plugin: string; pluginAction: string };
-  tasks: MindmapTaskDetail[];
-  consolidatedMemories: MindmapConsolidatedMemory[];
-  deliveries: MindmapDeliveryItem[];
-  imPush: {
-    channel: 'wechat' | 'telegram' | 'dingtalk' | 'xiaoai' | 'local';
-    channelName: string;
-    target?: string;
-    delivered: boolean;
-    deliveryCount: number;
-    sentFiles: Array<{ name: string; target?: string; at: number }>;
-  };
-}
-
-export interface MindmapSnapshot {
-  generatedAt: number;
-  cursor: number;
-  mode: 'real' | 'offline';
-  hasMore: boolean;
-  beforeSeq?: number;
-  summary: {
-    totalFlows: number;
-    loadedFlows: number;
-    totalSessions: number;
-    multiTurnSessions: number;
-    wechatFlows: number;
-    localFlows: number;
-    timerFlows: number;
-    totalTasks: number;
-    jevCalls: number;
-    totalMemories: number;
-    routerProvider: string;
-    routerModel: string;
-    decisionModel: string;
-    decisionEnabled: boolean;
-    decisionConfigured: boolean;
-  };
-  sessions: MindmapSession[];
-  flows: MindmapTaskFlow[];
-}
+export type {
+  MindmapConsolidatedMemory,
+  MindmapDeliveryItem,
+  MindmapIngressOrigin,
+  MindmapJevQualityGateItem,
+  MindmapJevRouteInfo,
+  MindmapRecalledItem,
+  MindmapRouterToolCall,
+  MindmapRouterTurn,
+  MindmapSession,
+  MindmapSessionLinkKind,
+  MindmapSessionTurnSummary,
+  MindmapSnapshot,
+  MindmapTaskDetail,
+  MindmapTaskFlow,
+  MindmapTurnLink,
+  MindmapWorkerPhase,
+  MindmapWorkerStep,
+} from './mindmap-types.js';
 
 const IMAGE_FILE_RE = /\.(png|jpe?g|gif|webp|bmp|heic|heif)$/i;
 const SDK_META_SPANS = new Set(['Agent 请求', '模型推理调用', '上下文压缩（SDK）', '模型请求重试（SDK）']);

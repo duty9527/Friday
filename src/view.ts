@@ -1,5 +1,36 @@
 import type { DecisionSource, MissingAspect, QualityGateAssessment, ThinkingLevel } from './decision.js';
 export type { DecisionSource, MissingAspect, QualityGateAssessment, ThinkingLevel };
+export type {
+  FlowCategory,
+  FlowNodeKind,
+  FlowTreeNode,
+  FlowchartEdge,
+  FlowchartEdgeKind,
+  FlowchartEdgeTone,
+  FlowchartFrame,
+  FlowchartGraph,
+  FlowchartNode,
+  FlowchartShape,
+  InspectorPayload,
+  MindmapConsolidatedMemory,
+  MindmapDeliveryItem,
+  MindmapIngressOrigin,
+  MindmapJevQualityGateItem,
+  MindmapJevRouteInfo,
+  MindmapRecalledItem,
+  MindmapRouterToolCall,
+  MindmapRouterTurn,
+  MindmapSession,
+  MindmapSessionLinkKind,
+  MindmapSessionTurnSummary,
+  MindmapSnapshot,
+  MindmapTaskDetail,
+  MindmapTaskFlow,
+  MindmapTurnLink,
+  MindmapWorkerPhase,
+  MindmapWorkerStep,
+  RouteActionSummary,
+} from './mindmap-types.js';
 
 export type MessageState = 'queued' | 'processing' | 'streaming' | 'completed' | 'interrupted' | 'failed';
 export type RouteKind = 'new_work' | 'followup' | 'related_work' | 'inspect' | 'stop' | 'resume' | 'recall' | 'search_memory' | 'save_memory' | 'timer' | 'plugin' | 'send_file' | 'switch_channel' | 'reply';
@@ -183,8 +214,17 @@ export interface MessageOrigin {
   speakerId?: string; speakerName?: string;
   replyToMessageId?: string; replyWebhook?: string; contextToken?: string;
 }
+export interface AttachmentView {
+  kind: 'image' | 'file';
+  name: string;
+  status: 'ready' | 'failed';
+  path?: string;
+  mimeType?: string;
+  bytes?: number;
+  error?: string;
+}
 export interface ChatMessage {
-  attachments?: import('./wechat-inbound.js').ReceivedAttachment[];
+  attachments?: AttachmentView[];
   origin?: MessageOrigin;
   sessionId?: string;
   sessionLink?: SessionTurnLink;
@@ -257,6 +297,8 @@ export interface WechatQrLoginSession {
   error?: string;
   channel?: ImChannelView;
 }
+export type PluginRuntimeMode = 'subprocess' | 'in-process';
+
 export interface PluginActionSpec {
   name: string;
   label?: string;
@@ -268,12 +310,20 @@ export interface PluginView {
   title: string;
   description: string;
   entry: string;
-  entryPath: string;
-  dir: string;
-  dataDir: string;
+  enabled?: boolean;
+  runtime?: PluginRuntimeMode;
+  promptHint?: string;
+  voiceFastpath?: boolean;
   actions: string[];
   actionSpecs?: PluginActionSpec[];
   manifestJson?: string;
+  /** @deprecated Host paths and source code are omitted from /api/view; kept optional until UI migration. */
+  entryPath?: string;
+  /** @deprecated Host paths are omitted from /api/view. */
+  dir?: string;
+  /** @deprecated Host paths are omitted from /api/view. */
+  dataDir?: string;
+  /** @deprecated Raw plugin source is omitted from /api/view. */
   sourceCode?: string;
 }
 export interface VoiceprintProfileView {

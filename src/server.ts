@@ -5,7 +5,7 @@ import { privateHome } from './files.js';
 import { realFactory, offlineFactory } from './agent.js';
 import { Coordinator } from './coordinator.js';
 import { buildMindmapSnapshot } from './mindmap-flow.js';
-import { listPlugins, runPlugin } from './plugin.js';
+import { listPluginViews, runPlugin } from './plugin.js';
 import { integer, REQUEST_LIMIT, RESPONSE_LIMIT, socketPath, text, type Response } from './protocol.js';
 import type { ModelTier, ThinkingLevel } from './view.js';
 
@@ -158,7 +158,7 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
           );
           case 'timer-toggle': return coordinator.toggleTimer(text(command.id, 'id', 128), Boolean(command.enabled));
           case 'timer-remove': return { removed: coordinator.removeTimer(text(command.id, 'id', 128)) };
-          case 'plugin-list': return await listPlugins(home);
+          case 'plugin-list': return listPluginViews(home);
           case 'plugin-run': return await runPlugin(
             home,
             text(command.plugin, 'plugin', 64),

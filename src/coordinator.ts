@@ -12,7 +12,7 @@ import { publicData } from './conversation.js';
 import { Executor } from './executor.js';
 import { ImGateway } from './im.js';
 import { ModelHub, type ModelHubConfigureInput } from './model-hub.js';
-import { listPlugins, listPluginsSync, runPlugin } from './plugin.js';
+import { listPluginViews, runPlugin } from './plugin.js';
 import {
   assignInitialMessageSessionSync,
   backfillPersistedSessions,
@@ -665,7 +665,7 @@ export class Coordinator {
         const args = toolInput(input, ['action', 'plugin', 'pluginAction', 'args', 'summary']);
         const mode = args.action === undefined ? (args.plugin ? 'run' : 'list') : text(args.action, 'action', 32);
         if (mode === 'list') {
-          return JSON.stringify({ plugins: await listPlugins(this.home) });
+          return JSON.stringify({ plugins: listPluginViews(this.home) });
         }
         if (mode !== 'run') throw new Error(`Unknown run_plugin action: ${mode}`);
         const pluginName = text(args.plugin, 'plugin', 64);
@@ -936,7 +936,7 @@ export class Coordinator {
       memoryDirectory: this.store.memoryDirectory(24),
       ...(this.factory.modelTiers ? { modelTiers: this.factory.modelTiers } : {}),
       timers: this.store.listTimers(),
-      plugins: listPluginsSync(this.home),
+      plugins: listPluginViews(this.home),
       imChannels: this.store.listImChannelViews(),
       voiceprint: {
         enabled: vp.enabled,
