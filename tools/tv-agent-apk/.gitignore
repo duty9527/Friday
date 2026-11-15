@@ -1,0 +1,10 @@
+build/
+*.apk
+*.idsig
+*.keystore
+*.dex
+*.class
+*.jks
+local.properties
+.gradle/
+R.java
