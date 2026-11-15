@@ -1654,8 +1654,9 @@ test('XiaoAI continuous follow-up confirmation dialog and cross-endpoint switch_
       pushSamples(0.75, 16);
       pushSamples(0.15, 480);
       pushSamples(0, 800);
-      await until(() => wechatOutbound.length >= 1 && ttsTexts().some(c => c.includes('已发到微信')));
-      const wxMsg = JSON.stringify(wechatOutbound[0]!.body);
+      await until(() => wechatOutbound.some(r => r.url.startsWith('/ilink/bot/sendmessage')) && ttsTexts().some(c => c.includes('已发到微信')));
+      const wxSend = wechatOutbound.find(r => r.url.startsWith('/ilink/bot/sendmessage'))!;
+      const wxMsg = JSON.stringify(wxSend.body);
       assert.match(wxMsg, /完整长报告内容/);
       assert.equal(ttsTexts().some(c => c.includes('完整长报告内容')), false, 'Long WeChat report must not play on speaker');
 
