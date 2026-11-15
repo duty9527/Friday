@@ -1,28 +1,31 @@
 #!/usr/bin/env node
 // End-to-end check of the local Web conversation and trace in a real browser.
 //
-//   node scripts/browser-check.mjs <entry-url> [--sample /absolute/path.txt] [--out DIR]
+//   node scripts/browser-check.mjs <entry-url> [--cdp-lib PATH] [--sample /absolute/path.txt] [--out-dir DIR]
 //
 // <entry-url> is the URL printed by `node dist/cli.js web`. The daemon behind it must be running
 // (offline mode is fine). Requires Node 22+ and an installed Chrome/Edge/Chromium, plus the
-// tasteskill CDP helper: set CDP_HELPER to its lib/cdp.mjs, or keep the default path used here.
+// tasteskill CDP helper: pass --cdp-lib <path/to/lib/cdp.mjs> or set CDP_HELPER_PATH.
 // This script submits real messages to that daemon's transcript, so point it at a demo data directory.
 import assert from 'node:assert/strict';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
 
-const helperPath = process.env.CDP_HELPER ?? '/Users/duty/.agents/skills/design-taste-frontend/scripts/lib/cdp.mjs';
-let cdp;
-try { cdp = await import(pathToFileURL(helperPath).href); }
-catch { throw new Error(`CDP helper not found at ${helperPath}. Install the tasteskill CDP helper or set CDP_HELPER to its lib/cdp.mjs path.`); }
-const { Browser, sleep } = cdp;
-
 const args = process.argv.slice(2);
 const entryUrl = args.find(argument => /^https?:\/\//.test(argument));
 const option = (name) => { const index = args.indexOf(`--${name}`); return index === -1 ? undefined : args[index + 1]; };
-if (!entryUrl) throw new Error('usage: node scripts/browser-check.mjs <entry-url from `web`> [--sample /abs/file.txt] [--out DIR]');
-const outDir = resolve(option('out') ?? '.thinkrail/context/browser-smoke');
+const helperPath = option('cdp-lib') ?? process.env.CDP_HELPER_PATH ?? process.env.CDP_HELPER;
+if (!helperPath) {
+  throw new Error('CDP helper path is required. Pass --cdp-lib <path/to/lib/cdp.mjs> or set CDP_HELPER_PATH.');
+}
+let cdp;
+try { cdp = await import(pathToFileURL(resolve(helperPath)).href); }
+catch { throw new Error(`CDP helper not found at ${helperPath}. Install the tasteskill CDP helper and set CDP_HELPER_PATH or pass --cdp-lib.`); }
+const { Browser, sleep } = cdp;
+
+if (!entryUrl) throw new Error('usage: node scripts/browser-check.mjs <entry-url from `web`> [--cdp-lib PATH] [--sample /abs/file.txt] [--out-dir DIR]');
+const outDir = resolve(option('out-dir') ?? option('out') ?? 'tmp/browser-smoke');
 const samplePath = option('sample');
 const sample = samplePath ? resolve(samplePath) : undefined;
 if (sample) await writeFile(sample, 'Router maintains one continuous conversation.\nWorkers execute isolated read-only tasks.\n').catch(() => {});
@@ -53,7 +56,7 @@ const pressEnter = async () => {
   await page.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
 };
 const burst = (texts) => page.eval(async ({ texts }) => {
-  const token = sessionStorage.getItem('super-agent.local-access-token');
+  const token = sessionStorage.getItem('friday.local-access-token') ?? sessionStorage.getItem('super-agent.local-access-token');
   for (const text of texts) {
     await fetch('/api/chat', { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ requestId: crypto.randomUUID(), text, files: [] }) });

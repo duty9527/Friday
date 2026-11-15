@@ -3,22 +3,22 @@
 # 功能：
 # 1. 监听本机或远端小爱音箱的 /tmp/mico_aivs_lab/instruction.log 最终识别文本
 # 2. 命中触发词后立即通过 ubus 暂停小爱原生抢答
-# 3. 若配置 MAC_PING_HOST 且检测到 Mac 主机休眠，发送 WOL 魔术包唤醒并由音箱播报等待提示
+# 3. 若配置 MAC_PING_HOST 且检测到宿主机休眠，发送 WOL 魔术包唤醒并由音箱播报等待提示
 # 4. 将语音指令 POST 到 F.R.I.D.A.Y. Webhook（携带 x-xiaoai-secret 请求头）
 
 set -eu
 
 FRIDAY_WEBHOOK_URL="${FRIDAY_WEBHOOK_URL:-}"
 FRIDAY_SECRET="${FRIDAY_SECRET:-}"
-SPEAKER_HOST="${SPEAKER_HOST:-}"
-SPEAKER_PORT="${SPEAKER_PORT:-}"
-SPEAKER_ID="${SPEAKER_ID:-}"
-MAC_WOL_MAC="${MAC_WOL_MAC:-}"
-MAC_WOL_IFACE="${MAC_WOL_IFACE:-br-lan}"
-MAC_PING_HOST="${MAC_PING_HOST:-}"
-TRIGGER_PREFIX="${TRIGGER_PREFIX:-}"
-POLL_INTERVAL="${POLL_INTERVAL:-1}"
-LOG_FILE="${XIAOAI_LOG_FILE:-/tmp/mico_aivs_lab/instruction.log}"
+SPEAKER_HOST="${FRIDAY_SPEAKER_HOST:-${SPEAKER_HOST:-}}"
+SPEAKER_PORT="${FRIDAY_SPEAKER_PORT:-${SPEAKER_PORT:-}}"
+SPEAKER_ID="${FRIDAY_SPEAKER_ID:-${SPEAKER_ID:-}}"
+MAC_WOL_MAC="${FRIDAY_WOL_MAC:-${MAC_WOL_MAC:-}}"
+MAC_WOL_IFACE="${FRIDAY_WOL_IFACE:-${MAC_WOL_IFACE:-br-lan}}"
+MAC_PING_HOST="${FRIDAY_HOST_PING:-${MAC_PING_HOST:-}}"
+TRIGGER_PREFIX="${FRIDAY_TRIGGER_PREFIX:-${TRIGGER_PREFIX:-}}"
+POLL_INTERVAL="${FRIDAY_POLL_INTERVAL:-${POLL_INTERVAL:-1}}"
+LOG_FILE="${FRIDAY_XIAOAI_LOG_FILE:-${XIAOAI_LOG_FILE:-/tmp/mico_aivs_lab/instruction.log}}"
 
 usage() {
   cat <<'EOF'
@@ -27,30 +27,37 @@ usage() {
 环境变量或命令行参数:
   --webhook-url URL     F.R.I.D.A.Y. Webhook 回调地址 (FRIDAY_WEBHOOK_URL)
   --secret SECRET       Webhook 签名密钥 (FRIDAY_SECRET)
-  --speaker-host HOST   音箱 SSH 地址，如 root@192.168.31.101；留空表示在音箱本机运行 (SPEAKER_HOST)
-  --speaker-port PORT   音箱 SSH 端口（可选） (SPEAKER_PORT)
-  --speaker-id ID       上报给 Friday 的设备标识，默认取 SPEAKER_HOST 或 default (SPEAKER_ID)
-  --mac-wol MAC         Mac 网卡 MAC 地址，用于 Wake-on-LAN (MAC_WOL_MAC)
-  --wol-iface IFACE     ether-wake 使用的网口，默认 br-lan (MAC_WOL_IFACE)
-  --mac-ping HOST       Mac 主机局域网 IP，用于检测休眠并触发 WOL (MAC_PING_HOST)
-  --prefix PREFIX       逗号分隔的触发前缀，如 "星期五,Friday"；留空由服务端判定 (TRIGGER_PREFIX)
-  --interval SEC        轮询日志间隔秒数，默认 1 (POLL_INTERVAL)
+  --speaker-host HOST   音箱 SSH 地址，如 root@192.0.2.101；留空表示在音箱本机运行 (FRIDAY_SPEAKER_HOST / SPEAKER_HOST)
+  --speaker-port PORT   音箱 SSH 端口（可选） (FRIDAY_SPEAKER_PORT / SPEAKER_PORT)
+  --speaker-id ID       上报给 Friday 的设备标识，默认取 SPEAKER_HOST 或 default (FRIDAY_SPEAKER_ID / SPEAKER_ID)
+  --mac-wol MAC         宿主机网卡 MAC 地址，用于 Wake-on-LAN (FRIDAY_WOL_MAC / MAC_WOL_MAC)
+  --wol-iface IFACE     ether-wake 使用的网口，默认 br-lan (FRIDAY_WOL_IFACE / MAC_WOL_IFACE)
+  --mac-ping HOST       宿主机局域网 IP，用于检测休眠并触发 WOL (FRIDAY_HOST_PING / MAC_PING_HOST)
+  --prefix PREFIX       逗号分隔的触发前缀，如 "星期五,Friday"；留空由服务端判定 (FRIDAY_TRIGGER_PREFIX / TRIGGER_PREFIX)
+  --interval SEC        轮询日志间隔秒数，默认 1 (FRIDAY_POLL_INTERVAL / POLL_INTERVAL)
   -h, --help            显示此帮助
 EOF
 }
 
+require_value() {
+  if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+    echo "[xiaoai-bridge] 错误: 参数 $1 缺少值" >&2
+    exit 2
+  fi
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --webhook-url) FRIDAY_WEBHOOK_URL="$2"; shift 2 ;;
-    --secret) FRIDAY_SECRET="$2"; shift 2 ;;
-    --speaker-host) SPEAKER_HOST="$2"; shift 2 ;;
-    --speaker-port) SPEAKER_PORT="$2"; shift 2 ;;
-    --speaker-id) SPEAKER_ID="$2"; shift 2 ;;
-    --mac-wol) MAC_WOL_MAC="$2"; shift 2 ;;
-    --wol-iface) MAC_WOL_IFACE="$2"; shift 2 ;;
-    --mac-ping) MAC_PING_HOST="$2"; shift 2 ;;
-    --prefix) TRIGGER_PREFIX="$2"; shift 2 ;;
-    --interval) POLL_INTERVAL="$2"; shift 2 ;;
+    --webhook-url) require_value "$@"; FRIDAY_WEBHOOK_URL="$2"; shift 2 ;;
+    --secret) require_value "$@"; FRIDAY_SECRET="$2"; shift 2 ;;
+    --speaker-host) require_value "$@"; SPEAKER_HOST="$2"; shift 2 ;;
+    --speaker-port) require_value "$@"; SPEAKER_PORT="$2"; shift 2 ;;
+    --speaker-id) require_value "$@"; SPEAKER_ID="$2"; shift 2 ;;
+    --mac-wol) require_value "$@"; MAC_WOL_MAC="$2"; shift 2 ;;
+    --wol-iface) require_value "$@"; MAC_WOL_IFACE="$2"; shift 2 ;;
+    --mac-ping) require_value "$@"; MAC_PING_HOST="$2"; shift 2 ;;
+    --prefix) require_value "$@"; TRIGGER_PREFIX="$2"; shift 2 ;;
+    --interval) require_value "$@"; POLL_INTERVAL="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[xiaoai-bridge] 未知参数: $1" >&2; usage >&2; exit 2 ;;
   esac
