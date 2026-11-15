@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,7 +26,10 @@ const staticMimeTypes: Record<string, string> = {
   '.woff2': 'font/woff2',
   '.txt': 'text/plain; charset=utf-8',
 };
-const webRoot = resolve(fileURLToPath(new URL('./web/', import.meta.url)));
+const adjacentWebRoot = resolve(fileURLToPath(new URL('./web/', import.meta.url)));
+const webRoot = existsSync(resolve(adjacentWebRoot, 'client.js'))
+  ? adjacentWebRoot
+  : resolve(fileURLToPath(new URL('../dist/web/', import.meta.url)));
 const webRootPrefix = `${webRoot}${sep}`;
 
 function resolveStaticAsset(pathname: string): { filePath: string; mime: string } | undefined {

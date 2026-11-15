@@ -7,9 +7,9 @@ import { join, posix } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
-import { serve } from '../dist/server.js';
-import { startWeb } from '../dist/web-server.js';
-import { XiaoaiSpeakerManager } from '../dist/xiaoai-speaker.js';
+import { serve } from '../src/server.js';
+import { startWeb } from '../src/web-server.js';
+import { XiaoaiSpeakerManager } from '../src/xiaoai-speaker.js';
 import { request } from '../src/protocol.js';
 import type { MainView, TraceEvent } from '../src/view.js';
 
