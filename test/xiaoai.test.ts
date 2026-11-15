@@ -2598,6 +2598,7 @@ test('XiaoaiKwsMonitor adaptive endpointing tolerates 1050ms mid-sentence pause 
       chimeDiscardMs: 10,
       maxWaitSpeechMs: 2_000,
       speechRmsThreshold: 0.01,
+      sshRunner: async () => ({ stdout: '', stderr: '', code: 0 }),
       streamFactory: () => {
         audioStream = new PassThrough();
         return {
@@ -2734,6 +2735,7 @@ test('XiaoAI KWS ASR wake rescue catches missed bare "星期五" and one-breath 
       maxWaitSpeechMs: 1_500,
       endSilenceMs: 60,
       asrWakeRescue: true,
+      sshRunner: async () => ({ stdout: '', stderr: '', code: 0 }),
       streamFactory: () => {
         audioStream = new PassThrough();
         return { stdout: audioStream, sampleFormat: 's16le', kill: () => audioStream?.end(), onClose: () => {} };
