@@ -730,26 +730,6 @@ button:focus-visible,a:focus-visible,input:focus-visible {
 }
 
 /* SVG 节点与连线 */
-.mm-edge {
-  fill:none;
-  stroke:#b6c2c9;
-  stroke-width:1.7;
-  marker-end:url(#mm-arrow-main);
-}
-
-.mm-edge.edge-active {
-  stroke:var(--mm-accent);
-  stroke-width:2.3;
-}
-
-.mm-edge.edge-dim {
-  opacity:0.22;
-}
-
-.mm-marker-main {
-  fill:#94a3b8;
-}
-
 .mm-node-group {
   cursor:pointer;
 }
@@ -781,10 +761,6 @@ button:focus-visible,a:focus-visible,input:focus-visible {
 
 .mm-node-accent {
   fill:var(--c-ingress-bd);
-}
-
-.mm-node-badge-bg {
-  fill:var(--mm-raised);
 }
 
 .mm-node-badge-text {
@@ -867,17 +843,6 @@ button:focus-visible,a:focus-visible,input:focus-visible {
 
 .mm-toggle-btn {
   cursor:pointer;
-}
-
-.mm-toggle-circle {
-  fill:var(--mm-surface);
-  stroke:var(--mm-control);
-  stroke-width:1.4;
-}
-
-.mm-toggle-btn:hover .mm-toggle-circle {
-  fill:var(--mm-accent);
-  stroke:var(--mm-accent);
 }
 
 .mm-toggle-btn:hover .mm-toggle-text {

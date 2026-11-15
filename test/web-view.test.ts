@@ -2,6 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mergeMessages, orderConversation, routeLabel, routeState, spanDuration, spanNodes, spanTree, usageSummary } from '../src/web/model.js';
 import { layoutBrainGraph } from '../src/web/brain.js';
+import { buildOverviewFlowchart, buildSessionFlowchart, type MindmapSession, type MindmapTaskFlow } from '../src/web/mindmap-data.js';
+import { consumeSseStream, isValidAccessToken, LEGACY_TOKEN_STORAGE_KEY, resolveBootstrapToken, TOKEN_STORAGE_KEY } from '../src/web/shared/auth-http.js';
 import type { ChatMessage, TraceEvent } from '../src/view.js';
 
 const message = (id: string, seq: number, role: 'user' | 'assistant', replyTo?: string, version = seq): ChatMessage =>
@@ -123,4 +125,216 @@ test('golden brain 3D layout places pinned beliefs in the inner mantle and dedup
   assert.equal(graph.edges.length, 1, 'bidirectional synapse pairs collapse to a single filament');
   assert.equal(graph.edges[0]!.weight, 0.82, 'merged synapse retains the stronger weight');
   assert.deepEqual(layoutBrainGraph(cards).nodes.map(n => [n.x, n.y, n.z]), graph.nodes.map(n => [n.x, n.y, n.z]), 'coordinates stay deterministic across renders');
+});
+
+test('flowchart builders lay out session turns, tasks, search matches, and overview rows without v1 trees', () => {
+  const flow: MindmapTaskFlow = {
+    id: 'flow-1',
+    seq: 1,
+    createdAt: 1_000,
+    completedAt: 2_500,
+    status: 'completed',
+    sessionId: 'sess-1',
+    turnIndex: 1,
+    turnCount: 1,
+    ingress: {
+      sourceKind: 'local',
+      channelLabel: 'Web 控制台',
+      messageId: 'msg-1',
+      text: '检查构建流水线',
+      attachments: [],
+      paths: [],
+    },
+    memoryRecall: { recalledItems: [] },
+    routerTurns: [{
+      spanId: 'rt-1',
+      triggerKind: 'message',
+      startedAt: 1_050,
+      endedAt: 1_300,
+      durationMs: 250,
+      status: 'completed',
+      llmTurns: 1,
+      tools: [],
+    }],
+    routeActions: [{ id: 'ra-1', kind: 'new_work', status: 'accepted', at: 1_250, taskId: 'task-1' }],
+    tasks: [{
+      id: 'task-1',
+      prompt: '检查构建流水线并验证测试',
+      status: 'completed',
+      profile: 'coding',
+      createdAt: 1_300,
+      activeMs: 900,
+      limitMs: 60_000,
+      compiledMemories: [],
+      executionPhases: [{
+        index: 1,
+        isFollowup: false,
+        startedAt: 1_320,
+        endedAt: 2_200,
+        durationMs: 880,
+        status: 'completed',
+        llmCount: 1,
+        toolCount: 1,
+      }],
+      workerSteps: [{
+        id: 'ws-1',
+        kind: 'tool_call',
+        at: 1_500,
+        durationMs: 200,
+        status: 'completed',
+        title: 'run_tests',
+        phaseIndex: 1,
+      }],
+      totalSteps: 1,
+      omittedSteps: 0,
+      succeededOps: 1,
+      failedOps: 0,
+      jevQualityGates: [],
+      reportPreview: '构建与测试全部通过',
+    }],
+    consolidatedMemories: [],
+    deliveries: [{
+      messageId: 'msg-2',
+      seq: 2,
+      at: 2_500,
+      roleLabel: 'F.R.I.D.A.Y.',
+      status: 'completed',
+      text: '已确认构建与测试全部通过。',
+    }],
+    imPush: {
+      channel: 'local',
+      channelName: 'Web 控制台',
+      delivered: true,
+      deliveryCount: 1,
+      sentFiles: [],
+    },
+  };
+  const session: MindmapSession = {
+    id: 'sess-1',
+    title: '构建巡检',
+    kind: 'human',
+    status: 'completed',
+    startedAt: 1_000,
+    updatedAt: 2_500,
+    channels: ['local'],
+    primaryChannelLabel: 'Web 控制台',
+    turnCount: 1,
+    taskCount: 1,
+    jevCallCount: 0,
+    recalledMemoryCount: 0,
+    consolidatedMemoryCount: 0,
+    aiManagedContext: false,
+    turnFlowIds: ['flow-1'],
+    turnSummaries: [{
+      flowId: 'flow-1',
+      seq: 1,
+      at: 1_000,
+      sourceKind: 'local',
+      channelLabel: 'Web 控制台',
+      textPreview: '检查构建流水线',
+      status: 'completed',
+      taskIds: ['task-1'],
+    }],
+  };
+  const flowsById = new Map<string, MindmapTaskFlow>([['flow-1', flow]]);
+  const graph = buildSessionFlowchart(session, flowsById, null, new Map(), '流水线');
+  assert.equal(graph.mode, 'session');
+  assert.equal(graph.frames.length, 1);
+  assert.ok(graph.nodes.some(n => n.kind === 'ingress'));
+  assert.ok(graph.nodes.some(n => n.kind === 'worker_phase'));
+  assert.ok(graph.nodes.some(n => n.kind === 'worker_step'));
+  assert.ok(graph.nodes.some(n => n.kind === 'im_delivery'));
+  assert.ok(graph.nodes.some(n => n.match), 'search term marks matching flowchart nodes');
+  assert.ok(graph.edges.length >= 2);
+
+  const overview = buildOverviewFlowchart([session], flowsById, null, '');
+  assert.equal(overview.mode, 'overview');
+  assert.equal(overview.frames.length, 1);
+  assert.ok(overview.nodes.some(n => n.kind === 'session_summary'));
+  assert.ok(overview.nodes.some(n => n.kind === 'worker_exec'));
+});
+
+test('auth-http token validation, fragment stripping, legacy storage migration, and SSE parser', async () => {
+  const validToken = 'a'.repeat(64);
+  assert.equal(isValidAccessToken(validToken), true);
+  assert.equal(isValidAccessToken('short-token'), false);
+  assert.equal(isValidAccessToken('g'.repeat(64)), false);
+
+  const store = new Map<string, string>([[LEGACY_TOKEN_STORAGE_KEY, validToken]]);
+  const replaced: string[] = [];
+  const origLocation = Object.getOwnPropertyDescriptor(globalThis, 'location');
+  const origHistory = Object.getOwnPropertyDescriptor(globalThis, 'history');
+  const origStorage = Object.getOwnPropertyDescriptor(globalThis, 'sessionStorage');
+
+  const storageMock = {
+    getItem: (key: string) => store.get(key) ?? null,
+    setItem: (key: string, value: string) => { store.set(key, value); },
+    removeItem: (key: string) => { store.delete(key); },
+  };
+  try {
+    Object.defineProperty(globalThis, 'location', {
+      configurable: true,
+      value: { hash: '', pathname: '/mindmap', search: '?view=all' },
+    });
+    Object.defineProperty(globalThis, 'history', {
+      configurable: true,
+      value: { replaceState: (_state: unknown, _title: string, url: string) => replaced.push(url) },
+    });
+    Object.defineProperty(globalThis, 'sessionStorage', { configurable: true, value: storageMock });
+
+    const migrated = resolveBootstrapToken();
+    assert.equal(migrated.token, validToken);
+    assert.equal(migrated.storageUnavailable, false);
+    assert.equal(store.get(TOKEN_STORAGE_KEY), validToken);
+    assert.equal(store.has(LEGACY_TOKEN_STORAGE_KEY), false);
+
+    // Invalid fragment is stripped without overwriting storage with invalid data
+    Object.defineProperty(globalThis, 'location', {
+      configurable: true,
+      value: { hash: '#token=invalid!', pathname: '/', search: '' },
+    });
+    const rejected = resolveBootstrapToken();
+    assert.equal(rejected.token, '');
+    assert.deepEqual(replaced, ['/']);
+    assert.equal(store.has(TOKEN_STORAGE_KEY), false);
+  } finally {
+    const restore = (name: string, desc: PropertyDescriptor | undefined) => {
+      if (desc) Object.defineProperty(globalThis, name, desc);
+      else delete (globalThis as Record<string, unknown>)[name];
+    };
+    restore('location', origLocation);
+    restore('history', origHistory);
+    restore('sessionStorage', origStorage);
+  }
+
+  const ssePayload = ': heartbeat\n\nevent: updates\ndata: {"events":[],"cursor":3,"head":3}\n\n';
+  const sseResp = new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(ssePayload));
+      controller.close();
+    },
+  }));
+  const seen: Array<{ event: string; data: string }> = [];
+  await assert.rejects(
+    () => consumeSseStream(sseResp, {
+      shouldContinue: () => true,
+      onEvent: (event, data) => { seen.push({ event, data }); },
+    }),
+    /已断开/,
+  );
+  assert.deepEqual(seen, [{ event: 'updates', data: '{"events":[],"cursor":3,"head":3}' }]);
+
+  const probResp = new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('event: problem\ndata: {"error":"daemon down"}\n\n'));
+      controller.close();
+    },
+  }));
+  await assert.rejects(
+    () => consumeSseStream(probResp, {
+      shouldContinue: () => true,
+      onEvent: () => {},
+    }),
+    /daemon down/,
+  );
 });

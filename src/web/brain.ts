@@ -665,6 +665,12 @@ export class GoldenBrainStage {
     this.rafId = 0;
   }
 
+  dispose() {
+    this.stop();
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = undefined;
+  }
+
   private notifySelection() {
     const found = this.selectedId ? this.graph.nodes.find(n => n.id === this.selectedId)?.item : undefined;
     this.callbacks.onSelect(found);

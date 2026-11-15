@@ -1,31 +1,58 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { extname, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Socket } from 'node:net';
 import { integer, request, REQUEST_LIMIT } from './protocol.js';
 import type { TraceEvent } from './view.js';
 
 class HttpFailure extends Error { constructor(readonly status: number, message: string) { super(message); } }
-const assets: Record<string, { file: string; mime: string }> = {
-  '/': { file: 'index.html', mime: 'text/html; charset=utf-8' },
-  '/index.html': { file: 'index.html', mime: 'text/html; charset=utf-8' },
-  '/mindmap': { file: 'mindmap.html', mime: 'text/html; charset=utf-8' },
-  '/mindmap.html': { file: 'mindmap.html', mime: 'text/html; charset=utf-8' },
-  '/mindmap.css': { file: 'mindmap.css', mime: 'text/css; charset=utf-8' },
-  '/mindmap.js': { file: 'mindmap.js', mime: 'application/javascript; charset=utf-8' },
-  '/mindmap-data.js': { file: 'mindmap-data.js', mime: 'application/javascript; charset=utf-8' },
-  '/client.js': { file: 'client.js', mime: 'application/javascript; charset=utf-8' },
-  '/model.js': { file: 'model.js', mime: 'application/javascript; charset=utf-8' },
-  '/brain.js': { file: 'brain.js', mime: 'application/javascript; charset=utf-8' },
-  '/style.css': { file: 'style.css', mime: 'text/css; charset=utf-8' },
-  '/plex-sans.woff2': { file: 'plex-sans.woff2', mime: 'font/woff2' },
-  '/plex-mono.woff2': { file: 'plex-mono.woff2', mime: 'font/woff2' },
-  '/logo.png': { file: 'logo.png', mime: 'image/png' },
-  '/favicon.ico': { file: 'logo.png', mime: 'image/png' },
-  '/avatar.png': { file: 'avatar.png', mime: 'image/png' },
+const staticRoutes: Record<string, string> = {
+  '/': 'index.html',
+  '/index.html': 'index.html',
+  '/mindmap': 'mindmap.html',
+  '/mindmap.html': 'mindmap.html',
+  '/favicon.ico': 'logo.png',
 };
+const staticMimeTypes: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.woff2': 'font/woff2',
+  '.txt': 'text/plain; charset=utf-8',
+};
+const adjacentWebRoot = resolve(fileURLToPath(new URL('./web/', import.meta.url)));
+const webRoot = existsSync(resolve(adjacentWebRoot, 'client.js'))
+  ? adjacentWebRoot
+  : resolve(fileURLToPath(new URL('../dist/web/', import.meta.url)));
+const webRootPrefix = `${webRoot}${sep}`;
+
+function resolveStaticAsset(pathname: string): { filePath: string; mime: string } | undefined {
+  const mapped = Object.hasOwn(staticRoutes, pathname) ? staticRoutes[pathname] : undefined;
+  let relative: string;
+  if (mapped) {
+    relative = mapped;
+  } else {
+    let decoded: string;
+    try { decoded = decodeURIComponent(pathname); }
+    catch { return undefined; }
+    if (!decoded || decoded.includes('\0') || decoded.includes('\\')) return undefined;
+    const stripped = decoded.replace(/^\/+/, '');
+    const segments = stripped.split('/');
+    if (!stripped || segments.some(segment => !segment || segment === '.' || segment === '..')) return undefined;
+    relative = segments.join('/');
+  }
+  const filePath = resolve(webRoot, relative);
+  if (!filePath.startsWith(webRootPrefix)) return undefined;
+  const ext = extname(filePath).toLowerCase();
+  const mime = Object.hasOwn(staticMimeTypes, ext) ? staticMimeTypes[ext] : undefined;
+  return mime ? { filePath, mime } : undefined;
+}
 const policy = "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
 function send(response: ServerResponse, status: number, result: unknown) {
   if (response.destroyed) return;
@@ -65,30 +92,190 @@ async function bridge(home: string, command: unknown): Promise<unknown> {
     throw new HttpFailure(400, error instanceof Error ? error.message : 'Service request failed');
   }
 }
-async function stream(home: string, response: ServerResponse, after: number) {
-  const controller = new AbortController();
-  const close = () => controller.abort();
-  response.once('close', close);
-  response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'x-accel-buffering': 'no' });
-  response.flushHeaders();
-  let cursor = after; let heartbeat = 0;
-  try {
-    while (!controller.signal.aborted) {
-      const batch = await bridge(home, { command: 'updates', after: cursor }) as { events: TraceEvent[]; cursor: number; head: number };
-      if (controller.signal.aborted) break;
-      if (batch.events.length) {
-        const writable = response.write(`event: updates\ndata: ${JSON.stringify(batch)}\n\n`);
-        cursor = batch.cursor;
-        if (!writable) await new Promise<void>(resolve => {
-          const done = () => { response.off('drain', done); response.off('close', done); resolve(); };
-          response.once('drain', done); response.once('close', done);
-        });
-      } else if (Date.now() - heartbeat >= 5000) { response.write(': heartbeat\n\n'); heartbeat = Date.now(); }
-      if (cursor >= batch.head) await delay(300, undefined, { signal: controller.signal, ref: false });
+
+interface SseClient {
+  response: ServerResponse;
+  cursor: number;
+  heartbeat: number;
+  draining: boolean;
+  drainingSince: number;
+  cleanup: () => void;
+}
+
+function createSseBroadcaster(home: string) {
+  const clients = new Set<SseClient>();
+  let loopController: AbortController | undefined;
+  let sleepController: AbortController | undefined;
+  let running: Promise<void> | undefined;
+  let lastHead = 0;
+  let closed = false;
+
+  const wake = () => {
+    sleepController?.abort();
+  };
+
+  const removeClient = (client: SseClient) => {
+    if (!clients.delete(client)) return;
+    client.cleanup();
+    if (!client.response.destroyed && !client.response.writableEnded) {
+      client.response.end();
     }
-  } catch (error) {
-    if (!controller.signal.aborted && !response.destroyed) response.write(`event: problem\ndata: ${JSON.stringify({ error: error instanceof Error ? error.message : 'Event stream unavailable' })}\n\n`);
-  } finally { response.off('close', close); response.end(); }
+    if (clients.size === 0) {
+      loopController?.abort();
+      wake();
+    }
+  };
+
+  const writeClient = (client: SseClient, chunk: string): boolean => {
+    if (client.response.destroyed || client.response.writableEnded) {
+      removeClient(client);
+      return false;
+    }
+    if (client.draining) {
+      if (Date.now() - client.drainingSince > 15_000) removeClient(client);
+      return false;
+    }
+    const writable = client.response.write(chunk);
+    if (!writable) {
+      client.draining = true;
+      client.drainingSince = Date.now();
+    }
+    return true;
+  };
+
+  const startLoop = () => {
+    if (running || closed) return;
+    const controller = new AbortController();
+    loopController = controller;
+    let currentRun: Promise<void> | undefined;
+    currentRun = (async () => {
+      try {
+        while (!controller.signal.aborted && clients.size > 0 && !closed) {
+          let minCursor = Number.MAX_SAFE_INTEGER;
+          for (const client of clients) {
+            if (!client.draining && client.cursor < minCursor) minCursor = client.cursor;
+          }
+          if (minCursor === Number.MAX_SAFE_INTEGER) {
+            for (const client of clients) {
+              if (Date.now() - client.drainingSince > 15_000) removeClient(client);
+            }
+            if (clients.size === 0) break;
+            const sleep = new AbortController();
+            sleepController = sleep;
+            const onLoopAbort = () => sleep.abort();
+            controller.signal.addEventListener('abort', onLoopAbort, { once: true });
+            try { await delay(300, undefined, { signal: sleep.signal, ref: false }); }
+            catch { /* woken or aborted */ }
+            finally {
+              controller.signal.removeEventListener('abort', onLoopAbort);
+              if (sleepController === sleep) sleepController = undefined;
+            }
+            continue;
+          }
+
+          const batch = await bridge(home, { command: 'updates', after: minCursor }) as { events: TraceEvent[]; cursor: number; head: number };
+          if (controller.signal.aborted || clients.size === 0) break;
+          lastHead = Math.max(lastHead, batch.head);
+          const now = Date.now();
+
+          for (const client of [...clients]) {
+            if (client.draining) {
+              if (now - client.drainingSince > 15_000) removeClient(client);
+              continue;
+            }
+            const relevant = batch.events.length
+              ? batch.events.filter(event => event.seq > client.cursor)
+              : [];
+            if (relevant.length) {
+              const clientCursor = relevant.at(-1)?.seq ?? client.cursor;
+              const payload = relevant.length === batch.events.length
+                ? batch
+                : { events: relevant, cursor: clientCursor, head: batch.head };
+              if (writeClient(client, `event: updates\ndata: ${JSON.stringify(payload)}\n\n`)) {
+                client.cursor = clientCursor;
+                client.heartbeat = now;
+              }
+            } else {
+              if (batch.cursor > client.cursor && batch.events.length === 0) {
+                client.cursor = batch.cursor;
+              }
+              if (now - client.heartbeat >= 5000) {
+                if (writeClient(client, ': heartbeat\n\n')) client.heartbeat = now;
+              }
+            }
+          }
+
+          let nextMinCursor = Number.MAX_SAFE_INTEGER;
+          for (const client of clients) {
+            if (!client.draining && client.cursor < nextMinCursor) nextMinCursor = client.cursor;
+          }
+          if (nextMinCursor >= batch.head && clients.size > 0 && !controller.signal.aborted) {
+            const sleep = new AbortController();
+            sleepController = sleep;
+            const onLoopAbort = () => sleep.abort();
+            controller.signal.addEventListener('abort', onLoopAbort, { once: true });
+            try { await delay(300, undefined, { signal: sleep.signal, ref: false }); }
+            catch { /* woken or aborted */ }
+            finally {
+              controller.signal.removeEventListener('abort', onLoopAbort);
+              if (sleepController === sleep) sleepController = undefined;
+            }
+          }
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          const message = error instanceof Error ? error.message : 'Event stream unavailable';
+          for (const client of [...clients]) {
+            if (!client.response.destroyed && !client.response.writableEnded) {
+              client.response.write(`event: problem\ndata: ${JSON.stringify({ error: message })}\n\n`);
+            }
+            removeClient(client);
+          }
+        }
+      } finally {
+        if (loopController === controller) loopController = undefined;
+        if (currentRun && running === currentRun) running = undefined;
+        if (clients.size > 0 && !closed) startLoop();
+      }
+    })();
+    running = currentRun;
+  };
+
+  return {
+    get clientCount() { return clients.size; },
+    add(response: ServerResponse, after: number) {
+      if (closed) { response.end(); return; }
+      response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'x-accel-buffering': 'no' });
+      response.flushHeaders();
+      const onClose = () => removeClient(client);
+      const onDrain = () => {
+        client.draining = false;
+        if (client.cursor < lastHead) wake();
+      };
+      const client: SseClient = {
+        response,
+        cursor: after,
+        heartbeat: 0,
+        draining: false,
+        drainingSince: 0,
+        cleanup: () => {
+          response.off('close', onClose);
+          response.off('drain', onDrain);
+        },
+      };
+      response.once('close', onClose);
+      response.on('drain', onDrain);
+      clients.add(client);
+      if (!running) startLoop();
+      else if (after < lastHead) wake();
+    },
+    closeAll() {
+      closed = true;
+      loopController?.abort();
+      wake();
+      for (const client of [...clients]) removeClient(client);
+    },
+  };
 }
 
 export async function startWeb(options: { home: string; port?: number }): Promise<{ url: string; home: string; close(): Promise<void> }> {
@@ -96,12 +283,23 @@ export async function startWeb(options: { home: string; port?: number }): Promis
   const port = integer(options.port, 0, 0, 65535);
   await bridge(home, { command: 'health' });
   const assetCache = new Map<string, Buffer>();
-  const loadAsset = async (file: string) => {
-    let cached = assetCache.get(file);
-    if (!cached) { cached = await readFile(new URL(`./web/${file}`, import.meta.url)); assetCache.set(file, cached); }
+  const loadAsset = async (filePath: string) => {
+    let cached = assetCache.get(filePath);
+    if (!cached) {
+      try { cached = await readFile(filePath); }
+      catch (error) {
+        const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
+        if (code === 'ENOENT' || code === 'EISDIR' || code === 'ENOTDIR') throw new HttpFailure(404, 'Not found');
+        throw error;
+      }
+      assetCache.set(filePath, cached);
+    }
     return cached;
   };
-  await loadAsset('index.html');
+  const indexAsset = resolveStaticAsset('/');
+  if (!indexAsset) throw new Error('Missing web entrypoint');
+  await loadAsset(indexAsset.filePath);
+  const sseBroadcaster = createSseBroadcaster(home);
   const token = randomBytes(32).toString('hex');
   const credential = Buffer.from(`Bearer ${token}`);
   let host = '';
@@ -135,9 +333,12 @@ export async function startWeb(options: { home: string; port?: number }): Promis
         return;
       }
       if (!url.pathname.startsWith('/api/')) {
-        const asset = Object.hasOwn(assets, url.pathname) ? assets[url.pathname] : undefined;
-        if (!asset || !['GET', 'HEAD'].includes(incoming.method ?? '')) throw new HttpFailure(404, 'Not found');
-        const bytes = await loadAsset(asset.file);
+        if (!['GET', 'HEAD'].includes(incoming.method ?? '')) throw new HttpFailure(404, 'Not found');
+        const rawPath = (incoming.url ?? '/').split('?')[0] ?? '/';
+        if (rawPath.includes('..') || rawPath.toLowerCase().includes('%2e%2e')) throw new HttpFailure(404, 'Not found');
+        const asset = resolveStaticAsset(url.pathname);
+        if (!asset) throw new HttpFailure(404, 'Not found');
+        const bytes = await loadAsset(asset.filePath);
         response.writeHead(200, { 'content-type': asset.mime });
         response.end(incoming.method === 'HEAD' ? undefined : bytes);
         return;
@@ -158,7 +359,7 @@ export async function startWeb(options: { home: string; port?: number }): Promis
         return rest;
       };
       if (incoming.method === 'GET') {
-        if (url.pathname === '/api/stream') { await stream(home, response, numeric('after') ?? 0); return; }
+        if (url.pathname === '/api/stream') { sseBroadcaster.add(response, numeric('after') ?? 0); return; }
         if (url.pathname === '/api/voiceprints') {
           send(response, 200, sanitizeVoiceprint(await bridge(home, { command: 'voice-status' })));
           return;
@@ -222,6 +423,7 @@ export async function startWeb(options: { home: string; port?: number }): Promis
   host = `127.0.0.1:${address.port}`;
   let closing: Promise<void> | undefined;
   return { home, url: `http://${host}/#token=${token}`, close: () => closing ??= (async () => {
+    sseBroadcaster.closeAll();
     const closed = new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     for (const socket of connections) socket.destroy();
     await closed;
