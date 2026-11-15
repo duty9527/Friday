@@ -41,12 +41,46 @@ export class Conversation {
       .run(event.rootId, event.taskId ?? null, event.messageId ?? null, JSON.stringify(body));
     return { ...body, seq: Number(result.lastInsertRowid) };
   }
+  private decodeBatch(rows: Array<Record<string, unknown>>): ChatMessage[] {
+    if (!rows.length) return [];
+    const messages = rows.map(row => {
+      const message = JSON.parse(String(row.body)) as ChatMessage;
+      message.seq = Number(row.seq);
+      return message;
+    });
+    const versionMap = new Map<string, number>();
+    const taskIdsMap = new Map<string, string[]>();
+    const ids = messages.map(m => m.id);
+    for (let i = 0; i < ids.length; i += 200) {
+      const chunk = ids.slice(i, i + 200);
+      const placeholders = chunk.map(() => '?').join(',');
+      const vRows = this.db.prepare(
+        `SELECT message_id, coalesce(max(seq),0) AS seq FROM journal WHERE message_id IN (${placeholders}) GROUP BY message_id`,
+      ).all(...chunk);
+      for (const vr of vRows) {
+        versionMap.set(String(vr.message_id), Number(vr.seq));
+      }
+      const tRows = this.db.prepare(
+        `SELECT message_id, task_id FROM message_tasks WHERE message_id IN (${placeholders}) ORDER BY rowid`,
+      ).all(...chunk);
+      for (const tr of tRows) {
+        const mid = String(tr.message_id);
+        let list = taskIdsMap.get(mid);
+        if (!list) {
+          list = [];
+          taskIdsMap.set(mid, list);
+        }
+        list.push(String(tr.task_id));
+      }
+    }
+    for (const msg of messages) {
+      msg.version = versionMap.get(msg.id) ?? 0;
+      msg.taskIds = taskIdsMap.get(msg.id) ?? [];
+    }
+    return messages;
+  }
   private decode(row: Record<string, unknown>): ChatMessage {
-    const message = JSON.parse(String(row.body)) as ChatMessage;
-    message.seq = Number(row.seq);
-    message.version = Number(this.db.prepare('SELECT coalesce(max(seq),0) AS seq FROM journal WHERE message_id=?').get(message.id)!.seq);
-    message.taskIds = this.db.prepare('SELECT task_id FROM message_tasks WHERE message_id=? ORDER BY rowid').all(message.id).map(link => String(link.task_id));
-    return message;
+    return this.decodeBatch([row])[0]!;
   }
   get(id: string): ChatMessage {
     const row = this.db.prepare('SELECT seq,body FROM messages WHERE id=?').get(id);
@@ -113,26 +147,18 @@ export class Conversation {
     const rows = this.db.prepare(
       `SELECT seq,body FROM messages WHERE seq<? AND json_extract(body,'$.role')='user' AND coalesce(json_extract(body,'$.source'),'')!='system' ORDER BY seq DESC LIMIT ?`,
     ).all(beforeSeq, safeLimit);
-    return rows.map(row => this.decode(row)).reverse();
+    return this.decodeBatch(rows).reverse();
   }
   hasUnassignedUserMessages(): boolean {
     return Boolean(this.db.prepare(`SELECT 1 FROM messages WHERE json_extract(body,'$.role')='user' AND json_extract(body,'$.sessionId') IS NULL LIMIT 1`).get());
   }
   allUserMessagesChronological(): ChatMessage[] {
     const rows = this.db.prepare(`SELECT seq,body FROM messages WHERE json_extract(body,'$.role')='user' ORDER BY seq ASC`).all();
-    return rows.map(row => this.decode(row));
+    return this.decodeBatch(rows);
   }
+  /** @deprecated Use `assignSession(id, sessionId, sessionLink, false)` directly. Kept temporarily for cross-slice compatibility. */
   quietSetMessageSession(id: string, sessionId: string, sessionLink?: SessionTurnLink): void {
-    this.atomic(() => {
-      const message = { ...this.get(id), sessionId };
-      if (sessionLink) message.sessionLink = sessionLink;
-      else delete message.sessionLink;
-      this.db.prepare('UPDATE messages SET body=? WHERE id=?').run(JSON.stringify(message), id);
-      for (const replyId of this.replyIds(id)) {
-        const reply = { ...this.get(replyId), sessionId };
-        this.db.prepare('UPDATE messages SET body=? WHERE id=?').run(JSON.stringify(reply), replyId);
-      }
-    });
+    this.assignSession(id, sessionId, sessionLink, false);
   }
   delete(id: string) {
     this.atomic(() => {
@@ -183,7 +209,7 @@ export class Conversation {
     const rows = before === undefined
       ? this.db.prepare('SELECT seq,body FROM messages ORDER BY seq DESC LIMIT ?').all(limit + 1)
       : this.db.prepare('SELECT seq,body FROM messages WHERE seq<? ORDER BY seq DESC LIMIT ?').all(before, limit + 1);
-    const items = rows.slice(0, limit).map(row => this.decode(row)).reverse();
+    const items = this.decodeBatch(rows.slice(0, limit)).reverse();
     return { items, hasMore: rows.length > limit, before: items[0]?.seq };
   }
   recentContext(): unknown[] {
@@ -191,15 +217,47 @@ export class Conversation {
   }
   allMessages(limit = 500): ChatMessage[] {
     const rows = this.db.prepare('SELECT seq,body FROM messages ORDER BY seq DESC LIMIT ?').all(limit);
-    return rows.map(row => this.decode(row));
+    return this.decodeBatch(rows);
   }
   neighbors(seq: number, radius = 1): Array<{ id: string; seq: number; role: 'user' | 'assistant'; preview: string }> {
     const prev = this.db.prepare('SELECT seq,body FROM messages WHERE seq<? ORDER BY seq DESC LIMIT ?').all(seq, radius).reverse();
     const next = this.db.prepare('SELECT seq,body FROM messages WHERE seq>? ORDER BY seq ASC LIMIT ?').all(seq, radius);
     return [...prev, ...next].map(row => {
-      const msg = this.decode(row);
-      return { id: msg.id, seq: msg.seq, role: msg.role, preview: String(publicData(msg.text.slice(0, 240))) };
+      const msg = JSON.parse(String(row.body)) as ChatMessage;
+      return { id: msg.id, seq: Number(row.seq), role: msg.role, preview: String(publicData(msg.text.slice(0, 240))) };
     });
+  }
+  neighborsBatch(
+    seqs: number[],
+    radius = 1,
+  ): Map<number, Array<{ id: string; seq: number; role: 'user' | 'assistant'; preview: string }>> {
+    const out = new Map<number, Array<{ id: string; seq: number; role: 'user' | 'assistant'; preview: string }>>();
+    const uniqueSeqs = [...new Set(seqs)].filter(Number.isFinite).sort((a, b) => a - b);
+    if (!uniqueSeqs.length || radius <= 0) return out;
+    const minSeq = Math.max(0, uniqueSeqs[0]! - radius * 2 - 4);
+    const maxSeq = uniqueSeqs.at(-1)! + radius * 2 + 4;
+    // Narrow range query handles dense sequences in 1 SQL roundtrip; fall back per sparse seq if gaps exist.
+    const rangeRows = this.db.prepare('SELECT seq,body FROM messages WHERE seq>=? AND seq<=? ORDER BY seq ASC').all(minSeq, maxSeq);
+    if (rangeRows.length <= 1000) {
+      const parsed = rangeRows.map(row => {
+        const msg = JSON.parse(String(row.body)) as ChatMessage;
+        return { id: msg.id, seq: Number(row.seq), role: msg.role, preview: String(publicData(msg.text.slice(0, 240))) };
+      });
+      for (const targetSeq of uniqueSeqs) {
+        const before = parsed.filter(item => item.seq < targetSeq).slice(-radius);
+        const after = parsed.filter(item => item.seq > targetSeq).slice(0, radius);
+        if (before.length === radius && after.length === radius) {
+          out.set(targetSeq, [...before, ...after]);
+        } else {
+          out.set(targetSeq, this.neighbors(targetSeq, radius));
+        }
+      }
+      return out;
+    }
+    for (const seq of uniqueSeqs) {
+      out.set(seq, this.neighbors(seq, radius));
+    }
+    return out;
   }
   /**
    * `after` reads forward for live updates, `before` reads the window that precedes a known event,
@@ -248,7 +306,7 @@ export class Conversation {
     const rows = beforeSeq === undefined
       ? this.db.prepare("SELECT seq,body FROM messages WHERE json_extract(body,'$.role')='user' ORDER BY seq DESC LIMIT ?").all(safeLimit + 1)
       : this.db.prepare("SELECT seq,body FROM messages WHERE json_extract(body,'$.role')='user' AND seq<? ORDER BY seq DESC LIMIT ?").all(beforeSeq, safeLimit + 1);
-    const items = rows.slice(0, safeLimit).map(row => this.decode(row));
+    const items = this.decodeBatch(rows.slice(0, safeLimit));
     return { items, hasMore: rows.length > safeLimit, before: items.at(-1)?.seq, totalUsers };
   }
   repliesForMessages(messageIds: string[]): ChatMessage[] {
@@ -258,7 +316,7 @@ export class Conversation {
       const chunk = messageIds.slice(i, i + 200);
       const placeholders = chunk.map(() => '?').join(',');
       const rows = this.db.prepare(`SELECT seq,body FROM messages WHERE json_extract(body,'$.replyTo') IN (${placeholders}) ORDER BY seq ASC`).all(...chunk);
-      for (const row of rows) results.push(this.decode(row));
+      results.push(...this.decodeBatch(rows));
     }
     return results.sort((a, b) => a.seq - b.seq);
   }
@@ -299,7 +357,6 @@ export class Conversation {
           this.emit({ ...previous, status: 'interrupted', data: { reason: '服务重启，未确认完成，不自动重放。' } });
         }
       }
-      this.db.exec(`DELETE FROM metadata WHERE key='router_pending'`);
     });
   }
   span(context: TraceContext, actor: TraceEvent['actor'], label: string, status: string, data?: unknown) {

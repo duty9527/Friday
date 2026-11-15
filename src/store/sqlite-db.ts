@@ -1,0 +1,138 @@
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+
+/**
+ * Low-level SQLite database handle, schema bootstrap, safe forward migrations,
+ * and nested-savepoint transaction helper for Friday's state store.
+ */
+export class SqliteDb {
+  readonly db: DatabaseSync;
+  private depth = 0;
+
+  constructor(readonly home: string) {
+    this.db = new DatabaseSync(join(home, 'state.sqlite'));
+    this.db.exec(`
+      PRAGMA journal_mode=WAL;
+      PRAGMA busy_timeout=5000;
+      PRAGMA foreign_keys=ON;
+      CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, body TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), text TEXT NOT NULL, state TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS events_task ON events(task_id,state);
+      CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), body TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS operations_task ON operations(task_id);
+      CREATE TABLE IF NOT EXISTS timers(id TEXT PRIMARY KEY, body TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS memories(
+        id TEXT PRIMARY KEY,
+        topic TEXT NOT NULL,
+        cwd TEXT,
+        superseded_by TEXT,
+        updated_at INTEGER NOT NULL,
+        access_count INTEGER NOT NULL DEFAULT 0,
+        last_accessed_at INTEGER,
+        last_reinforced_at INTEGER,
+        importance INTEGER,
+        body TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS memories_active ON memories(superseded_by, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS memories_topic ON memories(topic, cwd);
+      CREATE TABLE IF NOT EXISTS memory_embeddings(
+        memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+        model_id TEXT NOT NULL,
+        dim INTEGER NOT NULL,
+        content_hash TEXT NOT NULL,
+        vector BLOB NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS im_channels(id TEXT PRIMARY KEY, platform TEXT NOT NULL, updated_at INTEGER NOT NULL, body TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS notices(seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL);
+    `);
+    this.migrateMemoriesColumns();
+    this.migrateMemoryEmbeddingsFk();
+  }
+
+  private migrateMemoriesColumns(): void {
+    const cols = new Set(
+      (this.db.prepare('PRAGMA table_info(memories)').all() as Array<Record<string, unknown>>)
+        .map(row => String(row.name ?? '')),
+    );
+    let addedColumn = false;
+    this.transaction(() => {
+      if (!cols.has('access_count')) {
+        this.db.exec('ALTER TABLE memories ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0;');
+        addedColumn = true;
+      }
+      if (!cols.has('last_accessed_at')) {
+        this.db.exec('ALTER TABLE memories ADD COLUMN last_accessed_at INTEGER;');
+        addedColumn = true;
+      }
+      if (!cols.has('last_reinforced_at')) {
+        this.db.exec('ALTER TABLE memories ADD COLUMN last_reinforced_at INTEGER;');
+        addedColumn = true;
+      }
+      if (!cols.has('importance')) {
+        this.db.exec('ALTER TABLE memories ADD COLUMN importance INTEGER;');
+        addedColumn = true;
+      }
+      if (addedColumn) {
+        this.db.exec(`
+          UPDATE memories
+          SET
+            access_count = coalesce(CAST(json_extract(body, '$.accessCount') AS INTEGER), access_count, 0),
+            last_accessed_at = coalesce(CAST(json_extract(body, '$.lastAccessedAt') AS INTEGER), last_accessed_at),
+            last_reinforced_at = coalesce(CAST(json_extract(body, '$.lastReinforcedAt') AS INTEGER), last_reinforced_at),
+            importance = coalesce(CAST(json_extract(body, '$.importance') AS INTEGER), importance)
+        `);
+      }
+    });
+  }
+
+  private migrateMemoryEmbeddingsFk(): void {
+    const fkRows = this.db.prepare('PRAGMA foreign_key_list(memory_embeddings)').all() as Array<Record<string, unknown>>;
+    const hasCascadeFk = fkRows.some(row =>
+      String(row.table ?? '') === 'memories'
+      && String(row.from ?? '') === 'memory_id'
+      && String(row.on_delete ?? '').toUpperCase() === 'CASCADE',
+    );
+    if (hasCascadeFk) return;
+
+    this.transaction(() => {
+      // Remove any orphaned embeddings first so FK creation succeeds on dirty pre-migration DBs.
+      this.db.exec(`
+        DELETE FROM memory_embeddings WHERE memory_id NOT IN (SELECT id FROM memories);
+        CREATE TABLE memory_embeddings_new(
+          memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+          model_id TEXT NOT NULL,
+          dim INTEGER NOT NULL,
+          content_hash TEXT NOT NULL,
+          vector BLOB NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+        INSERT INTO memory_embeddings_new(memory_id, model_id, dim, content_hash, vector, updated_at)
+        SELECT memory_id, model_id, dim, content_hash, vector, updated_at FROM memory_embeddings;
+        DROP TABLE memory_embeddings;
+        ALTER TABLE memory_embeddings_new RENAME TO memory_embeddings;
+      `);
+    });
+  }
+
+  transaction<T>(run: () => T): T {
+    const level = this.depth++;
+    const savepoint = `nested_${level}`;
+    this.db.exec(level === 0 ? 'BEGIN IMMEDIATE' : `SAVEPOINT ${savepoint}`);
+    try {
+      const result = run();
+      this.db.exec(level === 0 ? 'COMMIT' : `RELEASE SAVEPOINT ${savepoint}`);
+      return result;
+    } catch (error) {
+      this.db.exec(level === 0 ? 'ROLLBACK' : `ROLLBACK TO SAVEPOINT ${savepoint}`);
+      if (level !== 0) this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
+      throw error;
+    } finally {
+      this.depth--;
+    }
+  }
+
+  close(): void {
+    this.db.close();
+  }
+}

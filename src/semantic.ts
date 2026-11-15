@@ -78,7 +78,7 @@ type OrtModule = typeof import('onnxruntime-node');
 
 const inFlightFileDownloads = new Map<string, Promise<string>>();
 
-const EN_STOPWORDS = new Set([
+export const EN_STOPWORDS = new Set([
   'about', 'after', 'all', 'also', 'am', 'an', 'and', 'any', 'are', 'as', 'at',
   'be', 'because', 'been', 'before', 'being', 'between', 'both', 'but', 'by',
   'can', 'could', 'did', 'do', 'does', 'doing', 'done', 'down', 'during',
@@ -99,7 +99,7 @@ const EN_STOPWORDS = new Set([
   'you', 'your',
 ]);
 
-const ZH_STOPWORDS = new Set([
+export const ZH_STOPWORDS = new Set([
   '我们', '你们', '他们', '她们', '它们', '自己', '大家',
   '这个', '那个', '这些', '那些', '这里', '那里', '这样', '那样',
   '什么', '怎么', '怎样', '如何', '为何', '为什么', '哪里', '哪个', '哪些',
@@ -114,7 +114,7 @@ const ZH_STOPWORDS = new Set([
   '现在', '目前', '当前', '之前', '之后', '以上', '以下', '其中',
 ]);
 
-const ZH_PARTICLE_CHARS = new Set(['的', '了', '吗', '呢', '吧', '啊', '呀', '哇', '嘛', '哦']);
+export const ZH_PARTICLE_CHARS = new Set(['的', '了', '吗', '呢', '吧', '啊', '呀', '哇', '嘛', '哦']);
 
 function parseFalseLike(value: string | undefined): boolean {
   if (!value) return false;
@@ -552,9 +552,7 @@ class SemanticEngine implements SemanticEmbedder {
       const tokFactory = this.options.tokenizerFactory ?? defaultTokenizerFactory;
       const sessFactory = this.options.sessionFactory ?? defaultSessionFactory;
 
-      if (!this.ortMod && !this.options.sessionFactory) {
-        this.ortMod = await tryImportOrt();
-      } else if (!this.ortMod) {
+      if (!this.ortMod) {
         this.ortMod = await tryImportOrt();
       }
 
@@ -942,7 +940,49 @@ export function normalizeTopicForDedup(topic: string): string {
     .trim();
 }
 
-function extractConceptTerms(text: string): Set<string> {
+export function normalizeCwd(cwd?: string): string {
+  const trimmed = cwd?.trim();
+  if (!trimmed) return '';
+  const unified = trimmed.replace(/\\/g, '/').replace(/\/+/g, '/');
+  return unified.length > 1 ? unified.replace(/\/+$/, '') : unified;
+}
+
+export function extractCjkBigrams(
+  text: string,
+  options?: { filterParticles?: boolean; filterStopwords?: boolean },
+): Set<string> {
+  const bigrams = new Set<string>();
+  const cjkRuns = text.normalize('NFKC').toLowerCase().match(/[\u4e00-\u9fff\u3400-\u4dbf]{2,}/g) ?? [];
+  for (const run of cjkRuns) {
+    for (let i = 0; i < run.length - 1; i++) {
+      const a = run[i]!;
+      const b = run[i + 1]!;
+      const bigram = `${a}${b}`;
+      if (options?.filterParticles && (ZH_PARTICLE_CHARS.has(a) || ZH_PARTICLE_CHARS.has(b)) && bigram !== '目的' && bigram !== '了解') {
+        continue;
+      }
+      if (options?.filterStopwords && ZH_STOPWORDS.has(bigram)) continue;
+      bigrams.add(bigram);
+    }
+  }
+  return bigrams;
+}
+
+export function tokenizeSearchQuery(rawQuery: string): {
+  lowerQuery: string;
+  tokens: string[];
+  cjkBigrams: Set<string>;
+} {
+  const lowerQuery = rawQuery.trim().toLowerCase();
+  const tokens = [...new Set(lowerQuery.split(/[\s,，。；;、/|?:!！？"'“”‘’()（）[\]【】]+/).filter(Boolean))];
+  const cjkBigrams = new Set<string>();
+  for (const token of tokens) {
+    for (const bg of extractCjkBigrams(token)) cjkBigrams.add(bg);
+  }
+  return { lowerQuery, tokens, cjkBigrams };
+}
+
+export function extractConceptTerms(text: string): Set<string> {
   const terms = new Set<string>();
   const normalized = text.normalize('NFKC').toLowerCase();
 
@@ -953,17 +993,8 @@ function extractConceptTerms(text: string): Set<string> {
     }
   }
 
-  const cjkRuns = normalized.match(/[\u4e00-\u9fff\u3400-\u4dbf]{2,}/g) ?? [];
-  for (const run of cjkRuns) {
-    for (let i = 0; i < run.length - 1; i++) {
-      const a = run[i]!;
-      const b = run[i + 1]!;
-      const bigram = `${a}${b}`;
-      if ((ZH_PARTICLE_CHARS.has(a) || ZH_PARTICLE_CHARS.has(b)) && bigram !== '目的' && bigram !== '了解') continue;
-      if (!ZH_STOPWORDS.has(bigram)) {
-        terms.add(bigram);
-      }
-    }
+  for (const bigram of extractCjkBigrams(normalized, { filterParticles: true, filterStopwords: true })) {
+    terms.add(bigram);
   }
 
   return terms;

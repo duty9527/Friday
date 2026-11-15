@@ -4,8 +4,11 @@ import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Store } from '../src/store.js';
+import { buildMindmapSnapshot } from '../src/mindmap-flow.js';
 import { timelineSteps } from '../src/web/model.js';
 import type { TraceEvent } from '../src/view.js';
+import type { Coordinator } from '../src/coordinator.js';
+import { withTempHome } from './helpers/tmp-home.js';
 
 let seq = 0;
 const event = (overrides: Partial<TraceEvent>): TraceEvent => ({
@@ -159,4 +162,78 @@ test('trace reads the recent window, then earlier pages, without losing durable 
     assert.deepEqual(forward, [], 'reading forward from the head is empty rather than replaying history');
     store.close();
   } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test('buildMindmapSnapshot is strictly read-only with zero DB mutations or outbound network calls', async () => {
+  await withTempHome('sa-mindmap-ro-', async home => {
+    const store = new Store(home);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => {
+      throw new Error('buildMindmapSnapshot must never make outbound network calls');
+    };
+    try {
+      const chat = store.conversation;
+      const u1 = chat.create({
+        id: 'u-ro-1',
+        role: 'user',
+        text: 'Inspect project structure',
+        status: 'completed',
+        mode: 'offline',
+        paths: [],
+      });
+      chat.create({
+        id: 'a-ro-1',
+        replyTo: u1.id,
+        role: 'assistant',
+        text: 'Inspected.',
+        status: 'completed',
+        mode: 'offline',
+        paths: [],
+      });
+      store.create({
+        id: 'orphan-ro-1',
+        requestId: 'req-ro-1',
+        fingerprint: 'fp-ro-1',
+        prompt: 'Scheduled check',
+        status: 'completed',
+        revision: 0,
+        files: [],
+        mode: 'offline',
+        createdAt: Date.now(),
+        limitMs: 30_000,
+        activeMs: 50,
+      });
+
+      const storeDb = (store as unknown as { sqlite: { db: import('node:sqlite').DatabaseSync } }).sqlite.db;
+      const beforeMetaCount = Number((storeDb.prepare('SELECT count(*) AS cnt FROM metadata').get() as { cnt: number }).cnt);
+      const beforeDataVersion = Number((storeDb.prepare('PRAGMA data_version').get() as { data_version: number }).data_version);
+
+      const mockCoordinator = {
+        store,
+        modelHub: {
+          getView: async () => ({
+            mode: 'offline' as const,
+            configured: false,
+            providers: [],
+            pool: [],
+            roles: { router: { active: 'mock' }, worker: { active: 'mock' } },
+          }),
+        },
+      } as unknown as Coordinator;
+
+      const snap = await buildMindmapSnapshot(mockCoordinator, { home });
+      assert.equal(snap.flows.length, 2);
+      assert.equal(snap.summary.totalFlows, 2);
+      assert.equal(snap.summary.totalTasks, 1);
+      assert.equal(snap.sessions.length, 2);
+
+      const afterMetaCount = Number((storeDb.prepare('SELECT count(*) AS cnt FROM metadata').get() as { cnt: number }).cnt);
+      const afterDataVersion = Number((storeDb.prepare('PRAGMA data_version').get() as { data_version: number }).data_version);
+      assert.equal(afterMetaCount, beforeMetaCount, 'mindmap snapshot must not write metadata rows');
+      assert.equal(afterDataVersion, beforeDataVersion, 'mindmap snapshot must not mutate SQLite');
+    } finally {
+      globalThis.fetch = originalFetch;
+      store.close();
+    }
+  });
 });

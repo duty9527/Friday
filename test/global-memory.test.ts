@@ -9,10 +9,10 @@ import { Store } from '../src/store.js';
 import { resolveRuntimeMessageSession } from '../src/session.js';
 import { deserializeEmbedding, l2Normalize, type EmbeddingPurpose, type SemanticEmbedder } from '../src/semantic.js';
 import type { ModelHub } from '../src/model-hub.js';
-import { Coordinator } from '../dist/coordinator.js';
-import { serve } from '../dist/server.js';
-import { startWeb } from '../dist/web-server.js';
-import { request } from '../dist/protocol.js';
+import { Coordinator } from '../src/coordinator.js';
+import { serve } from '../src/server.js';
+import { startWeb } from '../src/web-server.js';
+import { request } from '../src/protocol.js';
 import { routeLabel, routeState, timelineSteps } from '../src/web/model.js';
 import type { AgentFactory } from '../src/agent.js';
 
@@ -418,7 +418,7 @@ test('Global Memory Step 4: daemon IPC commands, Web API /api/memories, and offl
     const timerAddRes = await fetch(`${parsedUrl.origin}/api/timer-add`, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ name: '每日代码巡检', intervalSeconds: 3600, instruction: '检查仓库构建状态' }),
+      body: JSON.stringify({ name: '每日代码巡检', intervalMs: 3_600_000, instruction: '检查仓库构建状态' }),
     });
     assert.equal(timerAddRes.status, 200);
     const createdTimer = await timerAddRes.json() as { id: string; enabled: boolean };
