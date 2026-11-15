@@ -195,3 +195,64 @@ test('WORKER_REPORT supports autonomous supplementary start_work, inspect_work, 
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test('switch_channel from xiaoai to wechat speaks Chinese TTS default notice', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'origin-switch-xiaoai-'));
+  const coordinator = new Coordinator(home, offlineFactory(10));
+  await coordinator.ready();
+  try {
+    const notices: Array<{ channelId: string; targetId: string; text: string }> = [];
+    coordinator.im.sendToChannel = async () => {};
+    coordinator.im.enqueueXiaoaiNotice = (channelId, targetId, noticeText) => {
+      notices.push({ channelId, targetId, text: noticeText });
+    };
+    const now = Date.now();
+    coordinator.store.saveImChannel({
+      id: 'xiaoai-living',
+      platform: 'xiaoai',
+      name: '客厅小爱',
+      accountId: 'xiaoai-1',
+      enabled: true,
+      notifyAll: false,
+      defaultTarget: 'speaker-1',
+      allowedSenders: ['speaker-1'],
+      inboundCount: 0,
+      outboundCount: 0,
+      createdAt: now,
+      updatedAt: now,
+    });
+    coordinator.store.saveImChannel({
+      id: 'wechat-clawbot',
+      platform: 'wechat',
+      name: '微信个人号',
+      accountId: 'bot@im.bot',
+      enabled: true,
+      notifyAll: true,
+      defaultTarget: 'boss@im.wechat',
+      allowedSenders: ['boss@im.wechat'],
+      inboundCount: 0,
+      outboundCount: 0,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const msg = coordinator.chat(
+      'req-switch-xiaoai-wx',
+      '接下来会在微信中，这条对话你在微信中回复',
+      [],
+      { channel: 'xiaoai', channelId: 'xiaoai-living', conversationId: 'speaker-1', senderId: 'speaker-1' },
+    );
+    for (let i = 0; i < 60; i++) {
+      if (coordinator.store.conversation.get(msg.id).status === 'completed') break;
+      await new Promise(r => setTimeout(r, 20));
+    }
+
+    assert.equal(notices.length, 1);
+    assert.equal(notices[0]!.channelId, 'xiaoai-living');
+    assert.equal(notices[0]!.targetId, 'speaker-1');
+    assert.equal(notices[0]!.text, '好的，详细内容已发到微信。');
+  } finally {
+    await coordinator.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});

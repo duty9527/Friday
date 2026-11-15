@@ -831,7 +831,9 @@ export function createRouterTools(host: RouterToolsHost, requestIdFn: (messageId
         const customNotice = args.voiceNotice === undefined ? '' : text(args.voiceNotice, 'voiceNotice', 200).trim();
         const defaultNotice = nextOrigin.channel === 'local'
           ? '好的，详细内容已转到网页端。'
-          : `好的，详细内容已转到 ${nextOrigin.channel}。`;
+          : nextOrigin.channel === 'wechat'
+            ? '好的，详细内容已发到微信。'
+            : '好的，详细内容已转到其他终端。';
         host.im.enqueueXiaoaiNotice?.(
           prevOrigin.channelId,
           prevOrigin.conversationId,
