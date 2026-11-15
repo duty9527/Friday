@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { cpus } from 'node:os';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
 import type { ImChannelConfig } from '../store.js';
@@ -156,7 +157,7 @@ export interface XiaoaiAsrRecognizer {
 
 export interface XiaoaiSpeechDetector {
   isSpeech: (samples: Float32Array, sampleRate: number) => boolean;
-  observeAmbient?: (samples: Float32Array) => void;
+  observeAmbient?: (samples: Float32Array, precomputedRms?: number) => void;
   markWake?: (wakeRms: number) => void;
   reset: () => void;
   free?: () => void;
@@ -232,6 +233,7 @@ export interface XiaoaiKwsMonitorOptions {
   maxUtteranceMs?: number;
   speechRmsThreshold?: number;
   asrWakeRescue?: boolean;
+  idleEnergyGate?: boolean;
   sshRunner?: XiaoaiSshRunner;
   speakerGate?: XiaoaiKwsSpeakerGate;
   onWake?: (event: XiaoaiKwsWakeEvent) => Promise<{ woken: boolean; suppressed: boolean }>;
@@ -355,6 +357,10 @@ interface ActiveWorker {
   kwsRingChunks: Float32Array[];
   kwsRingSamples: number;
   kwsPrevSample: number;
+  kwsGateActive: boolean;
+  kwsGateHoldSamples: number;
+  kwsIdlePreRoll: Float32Array[];
+  kwsIdlePreRollSamples: number;
   kwsBurstPreRoll: Float32Array[];
   kwsBurstPreRollSamples: number;
   kwsBurstChunks: Float32Array[];
@@ -519,6 +525,21 @@ export function normalizeUtteranceSamples(samples: Float32Array): Float32Array {
   return out;
 }
 
+function pushBoundedSamples(
+  chunks: Float32Array[],
+  currentSamples: number,
+  chunk: Float32Array,
+  limitSamples: number,
+): number {
+  chunks.push(chunk);
+  let total = currentSamples + chunk.length;
+  while (total > limitSamples && chunks.length > 1) {
+    const removed = chunks.shift();
+    if (removed) total -= removed.length;
+  }
+  return total;
+}
+
 function concatFloat32Arrays(chunks: Float32Array[]): Float32Array {
   let total = 0;
   for (const chunk of chunks) total += chunk.length;
@@ -671,11 +692,11 @@ function defaultSpotterFactory(config: { modelsDir: string; keywordsFile: string
         joiner: join(config.modelsDir, 'joiner.onnx'),
       },
       tokens: join(config.modelsDir, 'tokens.txt'),
-      numThreads: 2,
+      numThreads: 1,
       provider: 'cpu',
       debug: 0,
     },
-    maxActivePaths: 16,
+    maxActivePaths: 8,
     numTrailingBlanks: 0,
     keywordsScore: 1.35,
     keywordsThreshold: 0.19,
@@ -723,7 +744,7 @@ async function defaultRecognizerFactory(config: { asrModelsDir: string }): Promi
             },
           }),
       tokens: tokensPath,
-      numThreads: 4,
+      numThreads: Math.min(4, Math.max(1, Math.floor(cpus().length / 2))),
       provider: 'cpu',
       debug: 0,
     },
@@ -770,6 +791,22 @@ export function computeForegroundSpeechGate(noiseRms: number, wakeRefRms: number
   return Math.max(safeNoise * 1.65, wakeFloor);
 }
 
+export function computeKwsIdleGateRms(
+  ambientRms: number,
+  sampleFormat?: 's16le' | 's32le',
+  speechRmsThreshold = DEFAULT_SPEECH_RMS_THRESHOLD,
+): number {
+  if (sampleFormat === 's32le') {
+    const safeAmbient = Math.max(0.00025, ambientRms || 0.00035);
+    return Math.max(0.00075, Math.min(0.0020, safeAmbient * 1.45));
+  }
+  const safeAmbient = Math.max(0.0004, ambientRms || 0.0008);
+  return Math.max(
+    Math.min(speechRmsThreshold * 0.45, 0.004),
+    Math.min(speechRmsThreshold * 0.85, safeAmbient * 1.50),
+  );
+}
+
 function defaultVadFactory(config: { vadModelPath: string; speechRmsThreshold: number }): XiaoaiSpeechDetector {
   if (!existsSync(config.vadModelPath)) {
     return {
@@ -798,9 +835,11 @@ function defaultVadFactory(config: { vadModelPath: string; speechRmsThreshold: n
   );
   let noiseRms = 0;
   let wakeRefRms = 0;
+  const trailingSilenceFlushSamples = msToSamples(320);
+  let trailingZeroFlushedSamples = trailingSilenceFlushSamples;
   return {
-    observeAmbient: (samples) => {
-      noiseRms = updateAmbientNoiseRms(noiseRms, computeRms(samples));
+    observeAmbient: (samples, precomputedRms) => {
+      noiseRms = updateAmbientNoiseRms(noiseRms, precomputedRms ?? computeRms(samples));
     },
     markWake: (wakeRms) => {
       wakeRefRms = Math.max(0, wakeRms);
@@ -813,9 +852,15 @@ function defaultVadFactory(config: { vadModelPath: string; speechRmsThreshold: n
       const minSpeechRms = Math.max(0.0011, computeForegroundSpeechGate(noiseRms, wakeRefRms));
       const lowGateFactor = vadActive ? 0.52 : 0.75;
       if (rawRms < minSpeechRms * lowGateFactor) {
-        vad.acceptWaveform(new Float32Array(samples.length));
-        while (!vad.isEmpty()) {
-          vad.pop();
+        if (vadActive || trailingZeroFlushedSamples < trailingSilenceFlushSamples) {
+          vad.acceptWaveform(new Float32Array(samples.length));
+          while (!vad.isEmpty()) {
+            vad.pop();
+          }
+          trailingZeroFlushedSamples += samples.length;
+          if (!vad.isDetected() && trailingZeroFlushedSamples >= trailingSilenceFlushSamples) {
+            vad.reset();
+          }
         }
         if (rawRms > 0 && rawRms <= noiseRms * 2.0) {
           noiseRms = updateAmbientNoiseRms(noiseRms, rawRms);
@@ -823,6 +868,7 @@ function defaultVadFactory(config: { vadModelPath: string; speechRmsThreshold: n
         return false;
       }
 
+      trailingZeroFlushedSamples = 0;
       const gain = Math.min(28, Math.max(1, 0.012 / Math.max(noiseRms, 0.00030)));
       let vadInput = samples;
       if (gain > 1.05) {
@@ -845,6 +891,7 @@ function defaultVadFactory(config: { vadModelPath: string; speechRmsThreshold: n
     },
     reset: () => {
       vad.reset();
+      trailingZeroFlushedSamples = trailingSilenceFlushSamples;
     },
   };
 }
@@ -863,6 +910,7 @@ export class XiaoaiKwsMonitor {
   private readonly maxUtteranceMs: number;
   private readonly speechRmsThreshold: number;
   private readonly asrWakeRescue: boolean;
+  private readonly idleEnergyGate: boolean;
   private readonly options: XiaoaiKwsMonitorOptions;
   private readonly workers = new Map<string, ActiveWorker>();
   private spotter?: XiaoaiKwsSpotter;
@@ -888,6 +936,7 @@ export class XiaoaiKwsMonitor {
     this.maxUtteranceMs = options.maxUtteranceMs ?? DEFAULT_MAX_UTTERANCE_MS;
     this.speechRmsThreshold = options.speechRmsThreshold ?? DEFAULT_SPEECH_RMS_THRESHOLD;
     this.asrWakeRescue = options.asrWakeRescue ?? !options.spotterFactory;
+    this.idleEnergyGate = options.idleEnergyGate ?? !options.spotterFactory;
   }
 
   getStatus(channelId?: string, targetId?: string): {
@@ -1072,6 +1121,10 @@ export class XiaoaiKwsMonitor {
         kwsRingChunks: [],
         kwsRingSamples: 0,
         kwsPrevSample: 0,
+        kwsGateActive: false,
+        kwsGateHoldSamples: 0,
+        kwsIdlePreRoll: [],
+        kwsIdlePreRollSamples: 0,
         kwsBurstPreRoll: [],
         kwsBurstPreRollSamples: 0,
         kwsBurstChunks: [],
@@ -1143,6 +1196,7 @@ export class XiaoaiKwsMonitor {
 
     worker.captureEpoch++;
     this.resetKwsBurst(worker, true);
+    this.resetKwsIdleGate(worker);
     worker.mode = 'capturing';
     worker.activeKeyword = '连续对话';
     worker.isFollowUpCapture = true;
@@ -1188,6 +1242,7 @@ export class XiaoaiKwsMonitor {
     }
     worker.captureEpoch++;
     this.resetKwsBurst(worker, true);
+    this.resetKwsIdleGate(worker);
     worker.mode = 'capturing';
     worker.activeKeyword = '连续对话';
     worker.isFollowUpCapture = true;
@@ -1221,6 +1276,14 @@ export class XiaoaiKwsMonitor {
     return true;
   }
 
+  private resetKwsIdleGate(worker: ActiveWorker): void {
+    worker.kwsGateActive = false;
+    worker.kwsGateHoldSamples = 0;
+    worker.kwsIdlePreRoll = [];
+    worker.kwsIdlePreRollSamples = 0;
+    worker.kwsPrevSample = 0;
+  }
+
   private resetKwsBurst(worker: ActiveWorker, abortInFlight = false): void {
     worker.kwsBurstPreRoll = [];
     worker.kwsBurstPreRollSamples = 0;
@@ -1249,6 +1312,7 @@ export class XiaoaiKwsMonitor {
     worker.kwsRingChunks = [];
     worker.kwsRingSamples = 0;
     this.resetKwsBurst(worker, true);
+    this.resetKwsIdleGate(worker);
     worker.probeSamples = 0;
     worker.probeSkipSamplesRemaining = 0;
     worker.probeSawSpeech = false;
@@ -1391,51 +1455,68 @@ export class XiaoaiKwsMonitor {
 
     // 'kws' mode
     const chunkRms = computeRms(samples);
-    const isFgSpeech = this.asrWakeRescue
-      ? (worker.vad?.isSpeech(samples, SAMPLE_RATE) ?? (chunkRms >= this.speechRmsThreshold))
-      : false;
-    if (worker.ambientRms <= 0 || !isFgSpeech) {
-      worker.ambientRms = updateAmbientNoiseRms(worker.ambientRms, chunkRms);
-      worker.vad?.observeAmbient?.(samples);
-    }
     worker.recentKwsRms.push(chunkRms);
     if (worker.recentKwsRms.length > 16) {
       worker.recentKwsRms.shift();
     }
     this.pushKwsRingSamples(worker, samples);
 
-    spotter.acceptWaveform(worker.kwsStream, this.prepareKwsSamples(worker, samples), SAMPLE_RATE);
-    while (spotter.isReady(worker.kwsStream)) {
-      spotter.decode(worker.kwsStream);
-      const keyword = spotter.getResult(worker.kwsStream).trim();
-      if (keyword) {
-        const now = Date.now();
-        if (now - worker.lastWakeAt < this.cooldownMs) {
-          spotter.reset(worker.kwsStream);
-          this.resetKwsBurst(worker, true);
-          return;
+    if (this.idleEnergyGate && !worker.kwsRescueInFlight) {
+      const gateRms = computeKwsIdleGateRms(worker.ambientRms, worker.stream?.sampleFormat, this.speechRmsThreshold);
+      const aboveGate = chunkRms >= (worker.kwsGateActive ? gateRms * 0.85 : gateRms);
+      if (!worker.kwsGateActive && !aboveGate) {
+        worker.ambientRms = updateAmbientNoiseRms(worker.ambientRms, chunkRms);
+        worker.vad?.observeAmbient?.(samples, chunkRms);
+        worker.kwsIdlePreRollSamples = pushBoundedSamples(
+          worker.kwsIdlePreRoll,
+          worker.kwsIdlePreRollSamples,
+          samples,
+          msToSamples(400),
+        );
+        if (this.asrWakeRescue && worker.kwsBurstSpeechSamples === 0) {
+          worker.kwsBurstPreRollSamples = pushBoundedSamples(
+            worker.kwsBurstPreRoll,
+            worker.kwsBurstPreRollSamples,
+            samples,
+            msToSamples(200),
+          );
         }
-        if (isXiaoaiSpeakingSelfEcho(worker.channel.id, worker.target.id, keyword, now)) {
-          worker.lastWakeAt = Math.max(worker.lastWakeAt, now - Math.max(0, this.cooldownMs - 500));
-          spotter.reset(worker.kwsStream);
-          this.resetKwsBurst(worker, true);
-          return;
-        }
-        if (!this.passesWakeSpeakerGate(worker, keyword)) {
-          spotter.reset(worker.kwsStream);
-          worker.kwsRingChunks = [];
-          worker.kwsRingSamples = 0;
-          this.resetKwsBurst(worker, true);
-          return;
-        }
-        const wakeRms = Math.max(chunkRms, ...worker.recentKwsRms);
-        worker.lastSpeechRms = wakeRms;
-        worker.vad?.markWake?.(wakeRms);
-        spotter.reset(worker.kwsStream);
-        this.resetKwsBurst(worker, true);
-        this.beginWakeProbe(worker, spotter, keyword);
         return;
       }
+
+      if (!worker.kwsGateActive) {
+        worker.kwsGateActive = true;
+        worker.kwsGateHoldSamples = msToSamples(900);
+        worker.kwsPrevSample = 0;
+        spotter.reset(worker.kwsStream);
+        const preRoll = worker.kwsIdlePreRoll;
+        worker.kwsIdlePreRoll = [];
+        worker.kwsIdlePreRollSamples = 0;
+        for (const preChunk of preRoll) {
+          if (this.feedSpotterAndCheckWake(worker, spotter, this.prepareKwsSamples(worker, preChunk), computeRms(preChunk))) {
+            return;
+          }
+        }
+      } else if (aboveGate) {
+        worker.kwsGateHoldSamples = msToSamples(900);
+      } else {
+        worker.kwsGateHoldSamples -= samples.length;
+      }
+    }
+
+    const isFgSpeech = this.asrWakeRescue
+      ? (worker.vad?.isSpeech(samples, SAMPLE_RATE) ?? (chunkRms >= this.speechRmsThreshold))
+      : false;
+    if (isFgSpeech && worker.kwsGateActive) {
+      worker.kwsGateHoldSamples = msToSamples(900);
+    }
+    if (worker.ambientRms <= 0 || !isFgSpeech) {
+      worker.ambientRms = updateAmbientNoiseRms(worker.ambientRms, chunkRms);
+      worker.vad?.observeAmbient?.(samples, chunkRms);
+    }
+
+    if (this.feedSpotterAndCheckWake(worker, spotter, this.prepareKwsSamples(worker, samples), chunkRms)) {
+      return;
     }
 
     if (worker.kwsRescueInFlight) {
@@ -1450,19 +1531,74 @@ export class XiaoaiKwsMonitor {
       return;
     }
 
-    if (!this.asrWakeRescue) {
-      return;
+    if (this.asrWakeRescue) {
+      this.updateAsrWakeRescueBurst(worker, spotter, samples, chunkRms, isFgSpeech);
     }
 
+    this.maybeHibernateKwsAfterChunk(worker, spotter, chunkRms);
+  }
+
+  private feedSpotterAndCheckWake(
+    worker: ActiveWorker,
+    spotter: XiaoaiKwsSpotter,
+    preparedSamples: Float32Array,
+    chunkRms: number,
+  ): boolean {
+    spotter.acceptWaveform(worker.kwsStream, preparedSamples, SAMPLE_RATE);
+    while (spotter.isReady(worker.kwsStream)) {
+      spotter.decode(worker.kwsStream);
+      const keyword = spotter.getResult(worker.kwsStream).trim();
+      if (!keyword) continue;
+
+      const now = Date.now();
+      if (now - worker.lastWakeAt < this.cooldownMs) {
+        spotter.reset(worker.kwsStream);
+        this.resetKwsBurst(worker, true);
+        this.resetKwsIdleGate(worker);
+        return true;
+      }
+      if (isXiaoaiSpeakingSelfEcho(worker.channel.id, worker.target.id, keyword, now)) {
+        worker.lastWakeAt = Math.max(worker.lastWakeAt, now - Math.max(0, this.cooldownMs - 500));
+        spotter.reset(worker.kwsStream);
+        this.resetKwsBurst(worker, true);
+        this.resetKwsIdleGate(worker);
+        return true;
+      }
+      if (!this.passesWakeSpeakerGate(worker, keyword)) {
+        spotter.reset(worker.kwsStream);
+        worker.kwsRingChunks = [];
+        worker.kwsRingSamples = 0;
+        this.resetKwsBurst(worker, true);
+        this.resetKwsIdleGate(worker);
+        return true;
+      }
+      const wakeRms = Math.max(chunkRms, ...worker.recentKwsRms);
+      worker.lastSpeechRms = wakeRms;
+      worker.vad?.markWake?.(wakeRms);
+      spotter.reset(worker.kwsStream);
+      this.resetKwsBurst(worker, true);
+      this.resetKwsIdleGate(worker);
+      this.beginWakeProbe(worker, spotter, keyword);
+      return true;
+    }
+    return false;
+  }
+
+  private updateAsrWakeRescueBurst(
+    worker: ActiveWorker,
+    spotter: XiaoaiKwsSpotter,
+    samples: Float32Array,
+    chunkRms: number,
+    isFgSpeech: boolean,
+  ): void {
     if (worker.kwsBurstSpeechSamples === 0) {
       if (!isFgSpeech) {
-        const preLimit = msToSamples(200);
-        worker.kwsBurstPreRoll.push(samples);
-        worker.kwsBurstPreRollSamples += samples.length;
-        while (worker.kwsBurstPreRollSamples > preLimit && worker.kwsBurstPreRoll.length > 1) {
-          const removed = worker.kwsBurstPreRoll.shift();
-          if (removed) worker.kwsBurstPreRollSamples -= removed.length;
-        }
+        worker.kwsBurstPreRollSamples = pushBoundedSamples(
+          worker.kwsBurstPreRoll,
+          worker.kwsBurstPreRollSamples,
+          samples,
+          msToSamples(200),
+        );
         return;
       }
       worker.kwsBurstChunks = [...worker.kwsBurstPreRoll, samples];
@@ -1515,14 +1651,31 @@ export class XiaoaiKwsMonitor {
     }
   }
 
-  private pushKwsRingSamples(worker: ActiveWorker, samples: Float32Array): void {
-    const limit = msToSamples(1_800);
-    worker.kwsRingChunks.push(samples);
-    worker.kwsRingSamples += samples.length;
-    while (worker.kwsRingSamples > limit && worker.kwsRingChunks.length > 1) {
-      const removed = worker.kwsRingChunks.shift();
-      if (removed) worker.kwsRingSamples -= removed.length;
+  private maybeHibernateKwsAfterChunk(
+    worker: ActiveWorker,
+    spotter: XiaoaiKwsSpotter,
+    chunkRms: number,
+  ): void {
+    if (
+      !this.idleEnergyGate
+      || !worker.kwsGateActive
+      || worker.kwsGateHoldSamples > 0
+      || worker.kwsRescueInFlight
+      || worker.kwsBurstSpeechSamples > 0
+    ) {
+      return;
     }
+    // Flush Transducer right-context lookahead frames once before entering hibernation
+    if (this.feedSpotterAndCheckWake(worker, spotter, new Float32Array(msToSamples(160)), chunkRms)) {
+      return;
+    }
+    spotter.reset(worker.kwsStream);
+    worker.vad?.reset();
+    this.resetKwsIdleGate(worker);
+  }
+
+  private pushKwsRingSamples(worker: ActiveWorker, samples: Float32Array): void {
+    worker.kwsRingSamples = pushBoundedSamples(worker.kwsRingChunks, worker.kwsRingSamples, samples, msToSamples(1_800));
   }
 
   private passesWakeSpeakerGate(
@@ -1608,6 +1761,7 @@ export class XiaoaiKwsMonitor {
         worker.vad?.reset();
         worker.vad?.markWake?.(burstMaxRms);
         spotter.reset(worker.kwsStream);
+        this.resetKwsIdleGate(worker);
 
         if (postSawSpeech) {
           let postTotal = 0;
@@ -1724,6 +1878,7 @@ export class XiaoaiKwsMonitor {
       worker.lastWakeAt = Date.now();
       worker.lastSpeechRms = burstMaxRms;
       spotter.reset(worker.kwsStream);
+      this.resetKwsIdleGate(worker);
       await this.invokeWake(worker, match.keyword, false).catch((err) => {
         this.options.onError?.(worker.channel.id, err);
       });
@@ -1949,13 +2104,7 @@ export class XiaoaiKwsMonitor {
   }
 
   private pushPreRoll(worker: ActiveWorker, samples: Float32Array): void {
-    const limit = msToSamples(DEFAULT_PRE_ROLL_MS);
-    worker.preRollChunks.push(samples);
-    worker.preRollSamples += samples.length;
-    while (worker.preRollSamples > limit && worker.preRollChunks.length > 1) {
-      const removed = worker.preRollChunks.shift();
-      if (removed) worker.preRollSamples -= removed.length;
-    }
+    worker.preRollSamples = pushBoundedSamples(worker.preRollChunks, worker.preRollSamples, samples, msToSamples(DEFAULT_PRE_ROLL_MS));
   }
 
   private handleCaptureSamples(

@@ -9,6 +9,7 @@ export {
   computeRms,
   normalizeUtteranceSamples,
   computeKwsGain,
+  computeKwsIdleGateRms,
   updateAmbientNoiseRms,
   computeForegroundSpeechGate,
   XiaoaiKwsMonitor,

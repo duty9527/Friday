@@ -31,6 +31,7 @@ import {
   cleanXiaoaiAsrUtterance,
   computeForegroundSpeechGate,
   computeKwsGain,
+  computeKwsIdleGateRms,
   computeRms,
   DEFAULT_END_SILENCE_MS,
   DEFAULT_XIAOAI_KEYWORDS,
@@ -3099,6 +3100,154 @@ export async function handleVoiceFastpath(req) {
     }
   } finally {
     delete g[callsKey];
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('XiaoaiKwsMonitor idleEnergyGate skips ONNX inference on silence, replays 400ms pre-roll on onset, and hibernates with 160ms flush', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-idle-gate-'));
+  try {
+    let audioStream: PassThrough | undefined;
+    let vadCalls = 0;
+    let vadResets = 0;
+    let spotterResets = 0;
+    let allowWake = true;
+    let sawWake = false;
+    const spotterChunks: Array<{ len: number; peak: number; allZero: boolean }> = [];
+    const state = { sawQuietOnset: false, ready: false };
+
+    const monitor = new XiaoaiKwsMonitor({
+      homeDir: home,
+      cooldownMs: 20,
+      probeDurationMs: 25,
+      chimeDiscardMs: 10,
+      idleEnergyGate: true,
+      asrWakeRescue: true,
+      streamFactory: () => {
+        audioStream = new PassThrough();
+        return {
+          stdout: audioStream,
+          sampleFormat: 's32le',
+          kill: () => audioStream?.end(),
+          onClose: () => {},
+        };
+      },
+      spotterFactory: () => ({
+        createStream: () => state,
+        acceptWaveform: (_s, samples) => {
+          let peak = 0;
+          let allZero = samples.length > 0;
+          for (let i = 0; i < samples.length; i++) {
+            const abs = Math.abs(samples[i] ?? 0);
+            if (abs > peak) peak = abs;
+            if (abs !== 0) allZero = false;
+          }
+          spotterChunks.push({ len: samples.length, peak, allZero });
+          // Soft consonant onset precedes loud vowel wake phrase
+          if (peak >= 0.015 && peak < 0.12) {
+            state.sawQuietOnset = true;
+          }
+          if (allowWake && state.sawQuietOnset && peak >= 0.20) {
+            state.ready = true;
+          }
+        },
+        isReady: () => state.ready,
+        decode: () => {},
+        getResult: () => (state.ready ? '你好星期五' : ''),
+        reset: () => {
+          spotterResets++;
+          state.sawQuietOnset = false;
+          state.ready = false;
+        },
+      }),
+      vadFactory: () => ({
+        isSpeech: () => {
+          vadCalls++;
+          return false;
+        },
+        reset: () => {
+          vadResets++;
+        },
+      }),
+      recognizerFactory: () => ({ transcribe: async () => '' }),
+      onWake: async () => {
+        sawWake = true;
+        return { woken: false, suppressed: false };
+      },
+    });
+
+    monitor.sync([makeChannel({
+      id: 'xiaoai-idle-gate',
+      apiBase: 'ssh://lx06=root@192.0.2.104',
+    })]);
+    await until(() => Boolean(audioStream));
+
+    const pushS32Chunk = (amp: number, sampleCount: number, freq = 1000) => {
+      const buf = Buffer.alloc(sampleCount * 4);
+      for (let i = 0; i < sampleCount; i++) {
+        const val = amp === 0 ? 0 : amp * Math.sin((2 * Math.PI * freq * i) / 16000);
+        buf.writeInt32LE(Math.round(val * 2147483647), i * 4);
+      }
+      audioStream!.write(buf);
+    };
+
+    // 1. Continuous 3s thermal hiss (< 0.00075 gate RMS) => 0 spotter calls & 0 VAD calls
+    assert.ok(computeKwsIdleGateRms(0.00035, 's32le') >= 0.00075);
+    for (let i = 0; i < 30; i++) {
+      pushS32Chunk(0.00035, 1600);
+    }
+    await delay(30);
+    assert.equal(spotterChunks.length, 0, 'spotter must stay hibernated on quiet thermal hiss');
+    assert.equal(vadCalls, 0, 'VAD must stay skipped while KWS is hibernated');
+
+    // 2. Soft onset pre-roll (0.00045 sine, still below gate) followed by loud wake syllable (0.0045)
+    for (let i = 0; i < 3; i++) {
+      pushS32Chunk(0.00045, 1600);
+    }
+    await delay(10);
+    assert.equal(spotterChunks.length, 0, 'sub-gate onset stays buffered in pre-roll until speech crosses gate');
+
+    pushS32Chunk(0.0045, 1600);
+    pushS32Chunk(0.00035, 1600); // Finish probe window (probeDurationMs=25) -> onWake(woken=false) -> resets to kws
+    await until(() => sawWake && monitor.getStatus('xiaoai-idle-gate', 'lx06').workers[0]?.mode === 'kws');
+    assert.ok(
+      spotterChunks.some((c) => c.peak >= 0.015 && c.peak < 0.12),
+      '400ms pre-roll onset chunk must be replayed into spotter upon waking from hibernation',
+    );
+
+    // 3. After returning to kws mode, hiss again produces 0 calls
+    const countAfterWake = spotterChunks.length;
+    const vadAfterWake = vadCalls;
+    for (let i = 0; i < 6; i++) {
+      pushS32Chunk(0.00035, 1600);
+    }
+    await delay(25);
+    assert.equal(spotterChunks.length, countAfterWake);
+    assert.equal(vadCalls, vadAfterWake);
+
+    // 4. Brief non-wake blip wakes KWS, then >900ms hiss triggers 160ms zero flush and re-hibernates
+    allowWake = false;
+    const resetsBeforeBlip = spotterResets;
+    const vadResetsBeforeBlip = vadResets;
+    pushS32Chunk(0.0045, 1600); // 100ms blip opens 900ms hold window
+    for (let i = 0; i < 10; i++) {
+      pushS32Chunk(0.00035, 1600); // First 900ms decays hold window -> flushes 160ms zeros -> hibernates
+    }
+    await until(() => spotterChunks.some((c) => c.len === 2560 && c.allZero));
+    assert.ok(spotterResets > resetsBeforeBlip, 'spotter resets upon entering hibernation');
+    assert.ok(vadResets > vadResetsBeforeBlip, 'VAD resets upon entering hibernation');
+
+    const countAfterHibernate = spotterChunks.length;
+    const vadAfterHibernate = vadCalls;
+    for (let i = 0; i < 10; i++) {
+      pushS32Chunk(0.00035, 1600);
+    }
+    await delay(25);
+    assert.equal(spotterChunks.length, countAfterHibernate, 'spotter stays silent after hibernation');
+    assert.equal(vadCalls, vadAfterHibernate, 'VAD stays silent after hibernation');
+
+    monitor.close();
+  } finally {
     await rm(home, { recursive: true, force: true });
   }
 });

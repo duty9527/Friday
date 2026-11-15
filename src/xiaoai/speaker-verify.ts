@@ -231,7 +231,7 @@ function defaultSpeakerExtractorFactory(config: { modelPath: string }): XiaoaiSp
   };
   const extractor = new sherpa.SpeakerEmbeddingExtractor({
     model: config.modelPath,
-    numThreads: 2,
+    numThreads: 1,
     provider: 'cpu',
     debug: 0,
   });
