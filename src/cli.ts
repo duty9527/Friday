@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
+import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { request } from './protocol.js';
+import { request, socketPath } from './protocol.js';
 
 const help = `F.R.I.D.A.Y. (friday) — Local persistent personal AI assistant & tactical Router/Worker orchestrator (macOS/Linux)
 
@@ -20,7 +21,8 @@ const help = `F.R.I.D.A.Y. (friday) — Local persistent personal AI assistant &
   timer list | add [--name NAME] [--every-ms 60000] [--delay-ms MS] [--daily-at HH:MM] [--once] [--plugin NAME] [--action ACTION] [--channel ID] [--target TARGET] [--cwd DIR] ["instruction"] | toggle ID [--enabled] | remove ID
   plugin list | run NAME [ACTION] [--args JSON]
   memory list | search [--scope all|memories|works|messages] [--cwd DIR] "query" | save --topic TOPIC [--tag TAG ...] [--link ID ...] [--pinned] [--cwd DIR] "content" | link ID TARGET_ID | pin ID [--unpin] | remove ID
-  im list | login [CHANNEL_ID] [--name NAME] [--api-base URL] [--no-wait] | add --platform telegram|dingtalk|wechat|xiaoai --name NAME [--bot-token TOKEN] [--account-id ID] [--webhook-url URL] [--secret SECRET] [--target CHAT_ID] [--allow SENDER ...] [--api-base URL] [--every-ms MS] | toggle ID [--enabled] | test ID ["message"] | remove ID
+  im list | login [CHANNEL_ID] [--name NAME] [--api-base URL] [--no-wait] | add --platform telegram|dingtalk|wechat|xiaoai --name NAME [--bot-token TOKEN] [--account-id ID] [--webhook-url URL] [--secret SECRET] [--target CHAT_ID] [--allow SENDER ...] [--api-base URL] [--every-ms MS] | toggle ID [--enabled] | test ID ["message"] | remove ID | voice ...
+  voice status | list | model | enroll [NAME] [--role owner|member] [--append] [--channel ID] [--target ID] [--no-wait] | remove NAME_OR_ID | clear | enable | disable | config [--threshold N] [--wake-precheck|--no-wake-precheck] | rename TARGET NEW_NAME | role TARGET owner|member
   model list | probe [PROVIDER/]MODEL ["prompt"] | set [--router MODEL] [--provider PROVIDER] [--fast MODEL] [--balanced MODEL] [--strong MODEL] [--api-key KEY]
   brief            FRIDAY holographic situation report (health, active works, memory cortex, timers, IM channels)
   get TASK_ID
@@ -56,6 +58,8 @@ async function main() {
       platform: { type: 'string' }, 'bot-token': { type: 'string' }, 'account-id': { type: 'string' }, 'webhook-url': { type: 'string' },
       secret: { type: 'string' }, target: { type: 'string' }, allow: { type: 'string', multiple: true }, 'api-base': { type: 'string' },
       router: { type: 'string' }, provider: { type: 'string' }, fast: { type: 'string' }, balanced: { type: 'string' }, strong: { type: 'string' }, 'api-key': { type: 'string' },
+      threshold: { type: 'string' }, role: { type: 'string' }, append: { type: 'boolean' },
+      'wake-precheck': { type: 'boolean' }, 'no-wake-precheck': { type: 'boolean' },
       enabled: { type: 'boolean' }, 'no-wait': { type: 'boolean' }, 'interval-ms': { type: 'string' }, 'max-retries': { type: 'string' },
       help: { type: 'boolean', short: 'h' },
     },
@@ -277,8 +281,16 @@ async function main() {
       else if (sub === 'toggle') message = { command: 'im-toggle', id: args[1], enabled: values.enabled ?? true };
       else if (sub === 'test') message = { command: 'im-test', id: args[1], text: args.slice(2).join(' ') || undefined };
       else if (sub === 'remove') message = { command: 'im-remove', id: args[1] };
+      else if (sub === 'voice') {
+        await runVoiceCli(home, args.slice(1), values);
+        return;
+      }
       else throw new Error(`Unknown im subcommand: ${sub}`);
       break;
+    }
+    case 'voice': {
+      await runVoiceCli(home, args, values);
+      return;
     }
     case 'model': {
       const sub = args[0] ?? 'list';
@@ -322,6 +334,219 @@ async function main() {
   }
   const result = await request(home, message);
   process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+}
+
+async function requestVoiceOrLocal(
+  home: string,
+  payload: Record<string, unknown>,
+  localFallback: (manager: InstanceType<typeof import('./xiaoai-speaker.js').XiaoaiSpeakerManager>) => unknown,
+): Promise<unknown> {
+  if (existsSync(socketPath(home))) {
+    try {
+      return await request(home, payload);
+    } catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
+      if (code !== 'ENOENT' && code !== 'ECONNREFUSED') {
+        throw error;
+      }
+    }
+  }
+  const { XiaoaiSpeakerManager } = await import('./xiaoai-speaker.js');
+  const manager = new XiaoaiSpeakerManager({ homeDir: home });
+  try {
+    return localFallback(manager);
+  } finally {
+    manager.close();
+  }
+}
+
+async function runVoiceCli(
+  home: string,
+  args: string[],
+  values: {
+    name?: string;
+    role?: string;
+    append?: boolean;
+    channel?: string;
+    target?: string;
+    threshold?: string;
+    'wake-precheck'?: boolean;
+    'no-wake-precheck'?: boolean;
+    'no-wait'?: boolean;
+  },
+): Promise<void> {
+  const sub = args[0] ?? 'status';
+
+  if (sub === 'status' || sub === 'list') {
+    const res = await requestVoiceOrLocal(home, { command: 'voice-status' }, m => m.getStatus());
+    process.stdout.write(JSON.stringify(res, null, 2) + '\n');
+    return;
+  }
+
+  if (sub === 'model') {
+    const { ensureXiaoaiSpeakerModel } = await import('./xiaoai-speaker.js');
+    process.stderr.write('⏳ 检查/下载本地声纹模型 (CAM++ zh-cn 16k)...\n');
+    const modelPath = await ensureXiaoaiSpeakerModel({ homeDir: home });
+    process.stdout.write(JSON.stringify({ status: 'ready', modelPath }, null, 2) + '\n');
+    return;
+  }
+
+  if (sub === 'remove' || sub === 'rm' || sub === 'delete') {
+    const target = args[1] ?? values.target ?? values.name;
+    if (!target) throw new Error('Target speaker name or id is required: friday voice remove NAME_OR_ID');
+    const res = await requestVoiceOrLocal(
+      home,
+      { command: 'voice-remove', target },
+      (m) => {
+        const out = m.removeSpeaker(target);
+        return {
+          removed: out.removed,
+          ...(out.profile ? { name: out.profile.name, id: out.profile.id } : {}),
+          remaining: out.remaining,
+        };
+      },
+    );
+    process.stdout.write(JSON.stringify(res, null, 2) + '\n');
+    return;
+  }
+
+  if (sub === 'clear') {
+    const res = await requestVoiceOrLocal(home, { command: 'voice-clear' }, m => m.clearSpeakers());
+    process.stdout.write(JSON.stringify(res, null, 2) + '\n');
+    return;
+  }
+
+  if (sub === 'enable' || sub === 'disable') {
+    const enabled = sub === 'enable';
+    const res = await requestVoiceOrLocal(
+      home,
+      { command: 'voice-config', enabled },
+      m => m.configure({ enabled }),
+    );
+    process.stdout.write(JSON.stringify(res, null, 2) + '\n');
+    return;
+  }
+
+  if (sub === 'rename') {
+    const renameTarget = args[1];
+    const renameName = args[2];
+    if (!renameTarget || !renameName) {
+      throw new Error('Usage: friday voice rename TARGET NEW_NAME');
+    }
+    const res = await requestVoiceOrLocal(
+      home,
+      { command: 'voice-config', renameTarget, renameName },
+      m => m.configure({ rename: { target: renameTarget, name: renameName } }),
+    );
+    process.stdout.write(JSON.stringify(res, null, 2) + '\n');
+    return;
+  }
+
+  if (sub === 'role') {
+    const roleTarget = args[1];
+    const role = args[2];
+    if (!roleTarget || (role !== 'owner' && role !== 'member')) {
+      throw new Error('Usage: friday voice role TARGET owner|member');
+    }
+    const res = await requestVoiceOrLocal(
+      home,
+      { command: 'voice-config', roleTarget, role },
+      m => m.configure({ role: { target: roleTarget, role } }),
+    );
+    process.stdout.write(JSON.stringify(res, null, 2) + '\n');
+    return;
+  }
+
+  if (sub === 'config') {
+    const threshold = values.threshold === undefined ? undefined : Number(values.threshold);
+    if (threshold !== undefined && (!Number.isFinite(threshold) || threshold < 0.1 || threshold > 0.95)) {
+      throw new Error('threshold must be between 0.1 and 0.95');
+    }
+    const wakePrecheck = values['no-wake-precheck']
+      ? false
+      : (values['wake-precheck'] ? true : undefined);
+    if (threshold === undefined && wakePrecheck === undefined) {
+      throw new Error('Specify --threshold N and/or --wake-precheck|--no-wake-precheck');
+    }
+    const res = await requestVoiceOrLocal(
+      home,
+      { command: 'voice-config', threshold, wakePrecheck },
+      m => m.configure({ threshold, wakePrecheck }),
+    );
+    process.stdout.write(JSON.stringify(res, null, 2) + '\n');
+    return;
+  }
+
+  if (sub === 'enroll') {
+    if (values.role !== undefined && values.role !== 'owner' && values.role !== 'member') {
+      throw new Error('role must be owner or member');
+    }
+    const { ensureXiaoaiSpeakerModel } = await import('./xiaoai-speaker.js');
+    process.stderr.write('⏳ 检查本地声纹模型...\n');
+    await ensureXiaoaiSpeakerModel({ homeDir: home });
+    const started = await request(home, {
+      command: 'voice-enroll-start',
+      name: args[1] ?? values.name,
+      role: values.role,
+      mode: values.append ? 'append' : 'replace',
+      channelId: values.channel,
+      targetId: values.target,
+    }) as { session: Record<string, unknown>; channelId: string; targetId: string };
+    if (values['no-wait']) {
+      process.stdout.write(JSON.stringify(started, null, 2) + '\n');
+      return;
+    }
+
+    const sessionId = String(started.session.sessionId ?? '');
+    let lastShown = '';
+    const printPrompt = (snap: Record<string, unknown>) => {
+      const tag = `${String(snap.status ?? '')}:${String(snap.step ?? '')}:${String(snap.message ?? '')}`;
+      if (tag !== lastShown) {
+        lastShown = tag;
+        process.stderr.write(`🎤 ${String(snap.message ?? '')}\n`);
+      }
+    };
+    printPrompt(started.session);
+
+    let aborted = false;
+    const onSignal = () => {
+      aborted = true;
+      void request(home, { command: 'voice-enroll-cancel', sessionId }).catch(() => {});
+    };
+    process.once('SIGINT', onSignal);
+    process.once('SIGTERM', onSignal);
+
+    try {
+      const deadline = Date.now() + 150_000;
+      while (!aborted && Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 700));
+        if (aborted) break;
+        const current = await request(home, {
+          command: 'voice-enroll-status',
+          sessionId,
+        }) as Record<string, unknown>;
+        printPrompt(current);
+        const status = String(current.status ?? '');
+        if (status === 'completed') {
+          process.stdout.write(JSON.stringify(current, null, 2) + '\n');
+          return;
+        }
+        if (status === 'failed' || status === 'cancelled') {
+          throw new Error(String(current.error ?? current.message ?? '声纹录入已结束'));
+        }
+      }
+      if (aborted) {
+        throw new Error('声纹录入已取消');
+      }
+      await request(home, { command: 'voice-enroll-cancel', sessionId }).catch(() => {});
+      throw new Error('等待声纹录入超时');
+    } finally {
+      process.removeListener('SIGINT', onSignal);
+      process.removeListener('SIGTERM', onSignal);
+    }
+  }
+
+  throw new Error(`Unknown voice subcommand: ${sub}`);
 }
 main().catch(error => {
   process.stderr.write(`friday: ${error instanceof Error ? error.message : 'Command failed'}\n`);

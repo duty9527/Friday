@@ -247,6 +247,20 @@ test('OpenClaw-style Multi-Channel IM Gateway: DingTalk, WeChat, and Telegram sh
     assert.match(allWechatTexts, /coding/, 'WeChat received Router dispatch confirmation with coding specialist profile');
     assert.match(allWechatTexts, /已完成|汇总/, 'WeChat proactively received background Worker completion report');
 
+    // Completed task no longer pollutes long-term memory automatically; save an explicit 任务经验 card to verify /memories formatting
+    const autoTaskMemories = await request(home, { command: 'memory-list' }) as Array<{ topic: string; tags?: string[] }>;
+    assert.equal(
+      autoTaskMemories.some(m => m.tags?.includes('auto-consolidated')),
+      false,
+      'Completed Worker task should not unconditionally pollute long-term memory with auto-consolidated task logs',
+    );
+    await request(home, {
+      command: 'memory-save',
+      topic: '任务经验 · 战甲重构',
+      content: '重构战甲纳米流体钛合金控制模块已完成模块化拆分。',
+      tags: ['coding', 'armor'],
+    });
+
     // =========================================================================
     // 3. Telegram Channel: Long-polling getUpdates, cross-IM memory recall & reply_to_message_id
     // =========================================================================
@@ -287,7 +301,7 @@ test('OpenClaw-style Multi-Channel IM Gateway: DingTalk, WeChat, and Telegram sh
     assert.ok(tgMemoriesReply, 'Telegram replied directly to message_id 88 (/memories)');
     assert.equal(tgMemoriesReply.chat_id, '9001');
     assert.match(String(tgMemoriesReply.text), /战甲协议/, 'Telegram /memories shows memory saved earlier from DingTalk');
-    assert.match(String(tgMemoriesReply.text), /任务经验/, 'Telegram /memories shows auto-consolidated memory from WeChat Worker task');
+    assert.match(String(tgMemoriesReply.text), /任务经验/, 'Telegram /memories shows explicitly saved 任务经验 memory card');
 
     const tgChatReply = telegramSent.find(m => m.reply_to_message_id === 89);
     assert.ok(tgChatReply, 'Telegram replied directly to message_id 89 (chat question)');

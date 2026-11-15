@@ -1,26 +1,59 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdtemp, realpath, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { PassThrough } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   sanitizeForSpeech,
   splitSpeechSegments,
   shouldInterceptXiaoaiQuery,
+  shouldContinueXiaoaiDialog,
+  stripXiaoaiDialogDirective,
   parseXiaoaiSshTargets,
   isXiaoaiPollable,
+  isXiaoaiSpeakingSelfEcho,
+  markXiaoaiSpeakingGuard,
+  resetXiaoaiRuntimeState,
   parseXiaoaiWebhookPayload,
   pollXiaoaiChannel,
   sendXiaoaiSpeech,
   type XiaoaiSshRunner,
 } from '../src/xiaoai.js';
+import {
+  cleanXiaoaiAsrUtterance,
+  computeForegroundSpeechGate,
+  computeKwsGain,
+  computeRms,
+  DEFAULT_END_SILENCE_MS,
+  DEFAULT_XIAOAI_KEYWORDS,
+  decodePcm16leToFloat32,
+  decodePcm32leToFloat32,
+  extractLeadingXiaoaiWakeKeyword,
+  hasLeadingXiaoaiWakeWord,
+  isXiaoaiFollowUpCancel,
+  normalizeUtteranceSamples,
+  updateAmbientNoiseRms,
+  XIAOAI_KEYWORDS_VERSION,
+  XiaoaiKwsMonitor,
+} from '../src/xiaoai-kws.js';
+import {
+  SPEAKER_SAMPLE_RATE,
+  trimWakeSpeechWindow,
+  XiaoaiSpeakerEnrollController,
+  XiaoaiSpeakerManager,
+  isEnrollCancelPhrase,
+  parseSpeakerVoiceCommand,
+  type XiaoaiSpeakerExtractor,
+} from '../src/xiaoai-speaker.js';
+import { encodeXiaomiTvIrFrame } from '../src/xiaoai-tv-remote.js';
 import { serve } from '../dist/server.js';
 import { startWeb } from '../dist/web-server.js';
 import { request } from '../dist/protocol.js';
 import { Coordinator } from '../dist/coordinator.js';
-import { offlineFactory } from '../src/agent.js';
+import { compactHostEventText, offlineFactory, prepareRouterSessionModel, type AgentFactory } from '../src/agent.js';
 import { Store, type ImChannelConfig } from '../src/store.js';
 import { ImGateway } from '../src/im.js';
 
@@ -104,8 +137,8 @@ test('XiaoAI speech sanitization and segmentation', () => {
 });
 
 test('XiaoAI query interception, SSH multi-speaker target parsing, pollability, and webhook parsing', () => {
-  // Without prefix: native speaker commands pass through; natural language is intercepted
-  for (const nativeCmd of ['音量大一点', '暂停', '定个7点闹钟', '闭嘴', '下一首']) {
+  // Without prefix: native speaker commands & smart-home IoT pass through; natural language is intercepted
+  for (const nativeCmd of ['音量大一点', '暂停', '定个7点闹钟', '闭嘴', '下一首', '打开鱼缸灯', '关闭客厅空调']) {
     assert.deepEqual(shouldInterceptXiaoaiQuery(nativeCmd), { intercept: false, query: '' }, `Should pass through: ${nativeCmd}`);
   }
   assert.deepEqual(shouldInterceptXiaoaiQuery('小爱同学，今天深圳天气如何'), {
@@ -113,18 +146,35 @@ test('XiaoAI query interception, SSH multi-speaker target parsing, pollability, 
     query: '今天深圳天气如何',
   });
 
-  // With prefix: only matching prefixes are intercepted and stripped (case-insensitive)
+  // With prefix: only matching prefixes with non-empty command are intercepted and stripped (case-insensitive)
   assert.deepEqual(
     shouldInterceptXiaoaiQuery('今天天气怎么样', { prefix: '星期五,Friday' }),
+    { intercept: false, query: '' },
+  );
+  assert.deepEqual(
+    shouldInterceptXiaoaiQuery('小爱同学，星期五', { prefix: '星期五,Friday' }),
     { intercept: false, query: '' },
   );
   assert.deepEqual(
     shouldInterceptXiaoaiQuery('小爱同学，星期五，帮我检查一下项目状态', { prefix: '星期五,Friday' }),
     { intercept: true, query: '帮我检查一下项目状态' },
   );
+
+  // Local ASR utterance cleanup & anti-crosstalk filters
+  assert.equal(cleanXiaoaiAsrUtterance('<|zh|><|NEUTRAL|>帮我打印一张纸。'), '帮我打印一张纸。');
+  assert.equal(cleanXiaoaiAsrUtterance('你好星期五，现在几点了'), '现在几点了');
+  assert.equal(cleanXiaoaiAsrUtterance('你好星期五。'), '');
+  assert.equal(cleanXiaoaiAsrUtterance('在。'), '');
+  assert.equal(cleanXiaoaiAsrUtterance('在，查一下明天天气'), '查一下明天天气');
+  assert.equal(cleanXiaoaiAsrUtterance('在哪里买咖啡'), '在哪里买咖啡');
+  assert.equal(cleanXiaoaiAsrUtterance('小爱同学，打开鱼缸灯'), '');
   assert.deepEqual(
     shouldInterceptXiaoaiQuery('friday: summarize today tasks', { prefix: '星期五,Friday' }),
     { intercept: true, query: 'summarize today tasks' },
+  );
+  assert.deepEqual(
+    shouldInterceptXiaoaiQuery('小爱，星期五？现在几点', { prefix: '星期五,Friday' }),
+    { intercept: true, query: '现在几点' },
   );
 
   // Multi-speaker SSH URI parsing
@@ -561,6 +611,2064 @@ test('XiaoAI Webhook Bridge secret auth and switch_channel cross-device routing'
     await web.close();
     await daemon.close();
     await new Promise<void>(resolve => mockWebhookServer.close(() => resolve()));
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('XiaoAI SSH multi-segment TTS marks friday_speaking and waits for mediaplayer playback completion', async () => {
+  const events: Array<{ type: 'tts' | 'status'; detail: string }> = [];
+  let statusPollCount = 0;
+
+  const sshRunner: XiaoaiSshRunner = async (_target, remoteCommand) => {
+    if (remoteCommand.includes('player_get_play_status')) {
+      statusPollCount++;
+      const status = statusPollCount <= 2 ? 1 : 0;
+      events.push({ type: 'status', detail: `status=${status}` });
+      return {
+        stdout: JSON.stringify({
+          code: 0,
+          info: `{ "status": ${status}, "volume": 42, "loop_type": 1 }`,
+        }),
+        stderr: '',
+        code: 0,
+      };
+    }
+    events.push({ type: 'tts', detail: remoteCommand });
+    return { stdout: '', stderr: '', code: 0 };
+  };
+
+  const ch = makeChannel({
+    id: 'xiaoai-lx06-sync',
+    apiBase: 'ssh://lx06=root@192.168.31.104?prefix=星期五,Friday',
+  });
+  const longSpeech = `${'第一段内容，'.repeat(30)}。${'第二段内容，'.repeat(10)}。`;
+  const res = await sendXiaoaiSpeech(ch, longSpeech, { target: 'lx06', sshRunner });
+
+  assert.equal(res.mode, 'ssh');
+  assert.ok(res.segments.length >= 2, `Expected >= 2 segments, got ${res.segments.length}`);
+  assert.equal(events[0]?.type, 'tts');
+  assert.match(events[0]?.detail ?? '', /touch \/tmp\/friday_speaking;/);
+  assert.equal(events[1]?.type, 'status');
+  assert.equal(events[1]?.detail, 'status=1');
+  assert.equal(events[2]?.type, 'status');
+  assert.equal(events[2]?.detail, 'status=1');
+  assert.equal(events[3]?.type, 'status');
+  assert.equal(events[3]?.detail, 'status=0');
+  assert.equal(events[4]?.type, 'tts');
+});
+
+test('XiaoAI Scheme A KWS direct wake: local VAD + ASR eliminates pnshelper/XiaoAI cross-talk', async () => {
+  // 1. Odd-byte PCM carry-over decoding check
+  const pcmBuf = Buffer.alloc(4);
+  pcmBuf.writeInt16LE(-16384, 0); // -0.5
+  pcmBuf.writeInt16LE(8192, 2);   // 0.25
+  const part1 = decodePcm16leToFloat32(pcmBuf.subarray(0, 3), null);
+  assert.equal(part1.samples.length, 1);
+  assert.ok(Math.abs(part1.samples[0]! - (-0.5)) < 1e-6);
+  assert.notEqual(part1.leftoverByte, null);
+  const part2 = decodePcm16leToFloat32(pcmBuf.subarray(3), part1.leftoverByte);
+  assert.equal(part2.samples.length, 1);
+  assert.ok(Math.abs(part2.samples[0]! - 0.25) < 1e-6);
+  assert.equal(part2.leftoverByte, null);
+
+  // 1b. Software AGC normalizes ultra-quiet noop captures without clipping loud captures
+  const quiet = new Float32Array([0, 0.003, -0.0015]);
+  const boosted = normalizeUtteranceSamples(quiet);
+  assert.ok(boosted[1]! >= 0.15 && boosted[1]! <= 0.5, `expected quiet peak boosted, got ${boosted[1]}`);
+  const normal = new Float32Array([0, 0.5, -0.25]);
+  assert.equal(normalizeUtteranceSamples(normal), normal);
+
+  // 2. End-to-end Coordinator + KWS local VAD/ASR monitor flow
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-kws-'));
+  const sshCalls: Array<{ targetId: string; command: string }> = [];
+  const instructionLines: string[] = [
+    JSON.stringify({
+      header: { id: 'kws-baseline-1', namespace: 'SpeechRecognizer', name: 'RecognizeResult' },
+      payload: { is_final: true, results: [{ text: '历史记录不要重放' }] },
+    }),
+  ];
+
+  const sshRunner: XiaoaiSshRunner = async (target, remoteCommand) => {
+    sshCalls.push({ targetId: target.id, command: remoteCommand });
+    if (remoteCommand.includes('instruction.log')) {
+      return { stdout: instructionLines.join('\n') + '\n', stderr: '', code: 0 };
+    }
+    if (remoteCommand.includes('player_get_play_status')) {
+      return { stdout: '{"code":0,"info":"{ \\"status\\": 0 }"}', stderr: '', code: 0 };
+    }
+    return { stdout: '{"code":0}', stderr: '', code: 0 };
+  };
+
+  let spawnedDevice = '';
+  let streamKills = 0;
+  let audioStream: PassThrough | undefined;
+  const closeListeners: Array<(code: number | null) => void> = [];
+  const asrQueue: string[] = [
+    '记住：本地直连识别=零串音',
+    '记住：一口气连说=不播报提示音',
+    '小爱同学，把音量调到50',
+  ];
+
+  const coordinator = new Coordinator(home, offlineFactory(10));
+  await coordinator.ready();
+
+  try {
+    coordinator.im.xiaoaiDeps = {
+      sshRunner,
+      kwsCooldownMs: 20,
+      kwsProbeDurationMs: 25,
+      kwsChimeDiscardMs: 20,
+      kwsEndSilenceMs: 40,
+      kwsMaxWaitSpeechMs: 120,
+      kwsStreamFactory: (_target, device) => {
+        spawnedDevice = device;
+        audioStream = new PassThrough();
+        return {
+          stdout: audioStream,
+          kill: () => {
+            streamKills++;
+            audioStream?.end();
+            for (const cb of closeListeners) cb(0);
+          },
+          onClose: (cb) => {
+            closeListeners.push(cb);
+          },
+        };
+      },
+      kwsSpotterFactory: () => {
+        const state = { peak: 0 };
+        return {
+          createStream: () => ({ state }),
+          acceptWaveform: (_s, samples) => {
+            for (const v of samples) {
+              const abs = Math.abs(v);
+              if (abs > state.peak) state.peak = abs;
+            }
+          },
+          isReady: () => state.peak >= 0.3,
+          decode: () => {},
+          getResult: () => {
+            if (state.peak >= 0.65) return '你好星期五';
+            if (state.peak >= 0.3) return '星期五';
+            return '';
+          },
+          reset: () => {
+            state.peak = 0;
+          },
+        };
+      },
+      kwsRecognizerFactory: () => ({
+        transcribe: async () => asrQueue.shift() ?? '',
+      }),
+    };
+
+    coordinator.im.saveChannel({
+      id: 'xiaoai-kws-lx06',
+      platform: 'xiaoai',
+      name: '小爱直接唤醒测试',
+      apiBase: 'ssh://lx06=root@192.168.31.104?prefix=星期五,Friday',
+      pollIntervalMs: 50,
+      notifyAll: false,
+    });
+
+    await until(() => Boolean(audioStream) && sshCalls.some(c => c.command.includes('instruction.log')));
+    assert.equal(spawnedDevice, 'noop');
+    await delay(80);
+    assert.equal(
+      coordinator.store.conversation.history(undefined, 20).items.length,
+      0,
+      'Baseline poll does not replay old entries',
+    );
+
+    const pushPcmSamples = (amplitude: number, sampleCount: number, splitOdd = false) => {
+      const b = Buffer.alloc(sampleCount * 2);
+      const val = Math.round(amplitude * 32767);
+      for (let i = 0; i < sampleCount; i++) b.writeInt16LE(val, i * 2);
+      if (splitOdd && b.length > 5) {
+        audioStream!.write(b.subarray(0, 5));
+        audioStream!.write(b.subarray(5));
+      } else {
+        audioStream!.write(b);
+      }
+    };
+
+    const chimeCallCount = () => sshCalls.filter(c => c.command.includes('wakeup_zai_01.wav')).length;
+    const led1Count = () => sshCalls.filter(c => c.command.includes('/bin/show_led 1')).length;
+    const led2Count = () => sshCalls.filter(c => c.command.includes('/bin/show_led 2')).length;
+    const ledOffCount = () => sshCalls.filter(c => c.command.includes('/bin/shut_led 1') && !c.command.includes('/bin/show_led')).length;
+    const ttsCallCount = () => sshCalls.filter(c => c.command.includes('text_to_speech')).length;
+
+    // 3. Two-step wake: "你好星期五" -> silent probe -> plays chime + show_led 1 (NO pnshelper!)
+    pushPcmSamples(0.75, 16, true);
+    pushPcmSamples(0, 480); // 30ms silence (> 25ms probe)
+    await until(() => chimeCallCount() === 1);
+    const wakeCmd = sshCalls.find(c => c.command.includes('wakeup_zai_01.wav'))!.command;
+    assert.match(wakeCmd, /qplayer|miplayer -f/);
+    assert.doesNotMatch(wakeCmd, /miplayer '\/usr/);
+    assert.equal(
+      sshCalls.some(c => c.command.includes('pnshelper') || c.command.includes('event_notify')),
+      false,
+      'Must never call pnshelper event_notify',
+    );
+
+    // 4. Native XiaoAI instruction.log entries without Friday prefix are NEVER hijacked
+    instructionLines.push(JSON.stringify({
+      header: { id: 'native-xiaoai-1', namespace: 'SpeechRecognizer', name: 'RecognizeResult' },
+      payload: { is_final: true, results: [{ text: '打开鱼缸灯' }] },
+    }));
+    await delay(120);
+    assert.equal(ttsCallCount(), 0, 'Unprefixed native XiaoAI command in instruction.log is never hijacked');
+
+    // 5. Feed chime tail (20ms = 320 samples) + user speech (30ms = 480 samples) + trailing silence (50ms = 800 samples)
+    pushPcmSamples(0, 320);
+    pushPcmSamples(0.15, 480);
+    pushPcmSamples(0, 800);
+    await until(() => ttsCallCount() === 1);
+    assert.ok(led2Count() >= 1, 'show_led 2 lights during ASR thinking');
+    assert.match(
+      sshCalls.filter(c => c.command.includes('text_to_speech')).map(c => c.command).join('\n'),
+      /已存入全局记忆/,
+    );
+
+    // 6. Speaking guard: bare "星期五" is suppressed, while explicit "你好星期五" barges in (one-breath skips chime)
+    const led1BeforeEcho = led1Count();
+    pushPcmSamples(0.4, 16); // bare "星期五"
+    await delay(60);
+    assert.equal(led1Count(), led1BeforeEcho, 'Bare "星期五" self-echo is suppressed during speaking guard');
+
+    // Explicit "你好星期五" immediately followed by speech (one-breath) -> show_led 1 without chime!
+    pushPcmSamples(0.75, 16);
+    pushPcmSamples(0.15, 480); // speech during 25ms probe -> one-breath
+    await until(() => led1Count() === led1BeforeEcho + 1);
+    assert.equal(chimeCallCount(), 1, 'One-breath speech skips audible chime');
+    pushPcmSamples(0, 800); // end utterance
+    await until(() => ttsCallCount() === 2);
+
+    // 7. Wake followed by long silence cancels cleanly (shut_led, no LLM turn)
+    await delay(30);
+    pushPcmSamples(0.75, 16);
+    pushPcmSamples(0, 480); // silent probe -> chime #2
+    await until(() => chimeCallCount() === 2);
+    await delay(15); // let invokeWake microtasks enter 'capturing'
+    const shutBeforeTimeout = ledOffCount();
+    pushPcmSamples(0, 400); // 25ms discard
+    pushPcmSamples(0, 2200); // > 120ms maxWaitSpeech
+    await until(() => ledOffCount() > shutBeforeTimeout);
+    await delay(60);
+    assert.equal(ttsCallCount(), 2, 'Silence timeout does not send anything to Coordinator');
+
+    // 8. If local ASR transcribes "小爱同学...", it is ignored and LED shuts off
+    await delay(30);
+    pushPcmSamples(0.75, 16);
+    pushPcmSamples(0, 480); // silent probe -> chime #3
+    await until(() => chimeCallCount() === 3);
+    await delay(15); // let invokeWake microtasks enter 'capturing'
+    const shutBeforeXiaoaiAsr = ledOffCount();
+    pushPcmSamples(0, 400);
+    pushPcmSamples(0.15, 480);
+    pushPcmSamples(0, 800);
+    await until(() => ledOffCount() > shutBeforeXiaoaiAsr);
+    await delay(60);
+    assert.equal(ttsCallCount(), 2, '"小爱同学..." transcribed by local ASR is ignored');
+    assert.equal(
+      sshCalls.some(c => c.command.includes('pnshelper') || c.command.includes('event_notify')),
+      false,
+    );
+
+    await coordinator.close();
+    assert.ok(streamKills >= 1, 'KWS audio stream is terminated on close()');
+  } finally {
+    await coordinator.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('XiaoAI KWS supports re-wake during capture silent wait and preserves background tasks across concurrent requests', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-conc-'));
+  try {
+    // Part A: Re-wake during silent wait inside capturing mode
+    let audioStreamA: PassThrough | undefined;
+    let wakeCalls = 0;
+    const monitor = new XiaoaiKwsMonitor({
+      homeDir: home,
+      cooldownMs: 20,
+      probeDurationMs: 25,
+      chimeDiscardMs: 20,
+      maxWaitSpeechMs: 1_500,
+      endSilenceMs: 40,
+      streamFactory: () => {
+        audioStreamA = new PassThrough();
+        return { stdout: audioStreamA, kill: () => audioStreamA?.end(), onClose: () => {} };
+      },
+      spotterFactory: () => {
+        const state = { peak: 0 };
+        return {
+          createStream: () => ({ state }),
+          acceptWaveform: (_s, samples) => {
+            for (const v of samples) {
+              const abs = Math.abs(v);
+              if (abs > state.peak) state.peak = abs;
+            }
+          },
+          isReady: () => state.peak >= 0.65,
+          decode: () => {},
+          getResult: () => (state.peak >= 0.65 ? '你好星期五' : ''),
+          reset: () => { state.peak = 0; },
+        };
+      },
+      recognizerFactory: () => ({ transcribe: async () => '' }),
+      vadFactory: () => ({
+        isSpeech: (samples) => samples.some(s => Math.abs(s) >= 0.05 && Math.abs(s) < 0.5),
+        reset: () => {},
+      }),
+      onWake: async () => {
+        wakeCalls++;
+        return { woken: true, suppressed: false };
+      },
+    });
+    monitor.sync([{
+      id: 'xiaoai-rewake',
+      platform: 'xiaoai',
+      name: '小爱测试',
+      enabled: true,
+      notifyAll: false,
+      allowedSenders: [],
+      apiBase: 'ssh://lx06=root@192.168.31.104',
+      inboundCount: 0,
+      outboundCount: 0,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }]);
+    await until(() => Boolean(audioStreamA));
+    const pushSamples = (stream: PassThrough, amp: number, count: number) => {
+      const buf = Buffer.alloc(count * 2);
+      const val = Math.round(amp * 32767);
+      for (let i = 0; i < count; i++) buf.writeInt16LE(val, i * 2);
+      stream.write(buf);
+    };
+    pushSamples(audioStreamA!, 0.75, 16);
+    pushSamples(audioStreamA!, 0, 480);
+    await until(() => wakeCalls === 1);
+    await delay(15);
+    assert.equal(monitor.isCapturing('xiaoai-rewake', 'lx06'), true);
+    // 20ms chime discard + 550ms silence (< 1500ms timeout, > 500ms re-wake guard)
+    pushSamples(audioStreamA!, 0, 320 + 8_800);
+    pushSamples(audioStreamA!, 0.75, 16);
+    pushSamples(audioStreamA!, 0, 480);
+    await until(() => wakeCalls === 2);
+    monitor.close();
+
+    // Part B: Concurrent voice request does NOT abort Request 1 background task dispatch
+    // and holds/skips stale outbound TTS while speaker is actively capturing Request 2
+    const sshCalls: Array<{ targetId: string; command: string }> = [];
+    const sshRunner: XiaoaiSshRunner = async (target, remoteCommand) => {
+      sshCalls.push({ targetId: target.id, command: remoteCommand });
+      if (remoteCommand.includes('instruction.log')) return { stdout: '', stderr: '', code: 0 };
+      if (remoteCommand.includes('player_get_play_status')) {
+        return { stdout: '{"code":0,"info":"{ \\"status\\": 0 }"}', stderr: '', code: 0 };
+      }
+      return { stdout: '{"code":0}', stderr: '', code: 0 };
+    };
+    let audioStreamB: PassThrough | undefined;
+    const asrQueue = ['派发：后台整理今日日志', '第二条消息'];
+    const coordinator = new Coordinator(home, offlineFactory(80));
+    await coordinator.ready();
+    try {
+      coordinator.im.xiaoaiDeps = {
+        sshRunner,
+        kwsCooldownMs: 20,
+        kwsProbeDurationMs: 25,
+        kwsChimeDiscardMs: 20,
+        kwsEndSilenceMs: 40,
+        kwsMaxWaitSpeechMs: 600,
+        kwsStreamFactory: () => {
+          audioStreamB = new PassThrough();
+          return { stdout: audioStreamB, kill: () => audioStreamB?.end(), onClose: () => {} };
+        },
+        kwsSpotterFactory: () => {
+          const state = { peak: 0 };
+          return {
+            createStream: () => ({ state }),
+            acceptWaveform: (_s, samples) => {
+              for (const v of samples) {
+                const abs = Math.abs(v);
+                if (abs > state.peak) state.peak = abs;
+              }
+            },
+            isReady: () => state.peak >= 0.65,
+            decode: () => {},
+            getResult: () => (state.peak >= 0.65 ? '你好星期五' : ''),
+            reset: () => { state.peak = 0; },
+          };
+        },
+        kwsRecognizerFactory: () => ({ transcribe: async () => asrQueue.shift() ?? '' }),
+      };
+      coordinator.im.saveChannel({
+        id: 'xiaoai-bg-lx06',
+        platform: 'xiaoai',
+        name: '小爱并发后台测试',
+        apiBase: 'ssh://lx06=root@192.168.31.104',
+        pollIntervalMs: 50,
+        notifyAll: false,
+      });
+      await until(() => Boolean(audioStreamB));
+
+      // Utterance 1 triggers background task (one-breath skips chime)
+      pushSamples(audioStreamB!, 0.75, 16);
+      pushSamples(audioStreamB!, 0.15, 480);
+      pushSamples(audioStreamB!, 0, 800);
+      await until(() => coordinator.store.conversation.history(undefined, 10).items.some(m => m.role === 'user'));
+
+      // Wait past kwsCooldownMs (20ms) while Request 1's Router turn (80ms) is still in-flight
+      await delay(30);
+      pushSamples(audioStreamB!, 0.75, 16);
+      await delay(10); // capture active before Utterance 2 finishes
+      const ttsDuringCapture = sshCalls.filter(c => c.command.includes('text_to_speech')).length;
+      pushSamples(audioStreamB!, 0.15, 480);
+      pushSamples(audioStreamB!, 0, 800);
+
+      // Background task from Utterance 1 MUST NOT be aborted, and completes + delivers WORKER_REPORT
+      await until(() => {
+        const works = coordinator.store.list();
+        return works.length === 1 && works[0]!.status === 'completed';
+      });
+      await until(() => {
+        const ttsCmds = sshCalls.filter(c => c.command.includes('text_to_speech')).map(c => c.command);
+        return ttsCmds.some(c => c.includes('第二条消息')) && ttsCmds.some(c => c.includes('后台工作已交由'));
+      });
+      // Request 1's superseded intermediate handoff ack may be skipped when Request 2 already superseded it
+      assert.equal(ttsDuringCapture, 0, 'Must not fire TTS mid-capture of Request 2');
+    } finally {
+      await coordinator.close();
+    }
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('Router HOST_EVENT snapshot compaction and S32LE single-mic ambient/AGC helpers', () => {
+  // 1. compactHostEventText strips bulky per-turn Router world snapshots on historical turns only
+  const chatPayload = {
+    kind: 'CHAT',
+    message: {
+      id: 'm1',
+      role: 'user',
+      text: '今天几点开饭',
+      origin: { channel: 'xiaoai', senderId: 'lx06' },
+      routing: { status: 'processing', actions: [{ id: 'a1' }] },
+      attachments: [{ id: 'att1', name: 'img.png', mime: 'image/png', path: '/tmp/secret.png' }],
+      paths: ['/tmp/secret.png', '/tmp/keep.txt'],
+    },
+    works: [{ id: 'w1', reportPreview: 'x'.repeat(500) }],
+    memoryDirectory: [{ id: 'mem1', content: 'y'.repeat(500) }],
+    autoRecalled: [{ kind: 'memory', text: 'z'.repeat(200) }],
+    context: { summary: 'recent' },
+    imChannels: [{ id: 'xiaoai' }],
+    subconscious: { pendingInsight: { id: 's1' } },
+    execution: 'native',
+    cwd: '/home/duty/Friday',
+  };
+  const chatRaw = `HOST_EVENT\n${JSON.stringify(chatPayload)}`;
+
+  const currentCompacted = JSON.parse(compactHostEventText(chatRaw, false).slice('HOST_EVENT\n'.length));
+  assert.equal(currentCompacted.message.routing, undefined);
+  assert.equal(currentCompacted.works.length, 1);
+  assert.equal(currentCompacted.memoryDirectory.length, 1);
+  assert.equal(currentCompacted.message.attachments[0].path, '/tmp/secret.png');
+
+  const histCompacted = JSON.parse(compactHostEventText(chatRaw, true).slice('HOST_EVENT\n'.length));
+  assert.equal(histCompacted.works, undefined);
+  assert.equal(histCompacted.memoryDirectory, undefined);
+  assert.equal(histCompacted.autoRecalled, undefined);
+  assert.equal(histCompacted.context, undefined);
+  assert.equal(histCompacted.imChannels, undefined);
+  assert.equal(histCompacted.subconscious, undefined);
+  assert.equal(histCompacted.execution, undefined);
+  assert.equal(histCompacted.cwd, undefined);
+  assert.equal(histCompacted.message.text, '今天几点开饭');
+  assert.equal(histCompacted.message.attachments[0].path, undefined);
+  assert.deepEqual(histCompacted.message.paths, ['/tmp/keep.txt']);
+
+  const reportRaw = `HOST_EVENT\n${JSON.stringify({
+    kind: 'WORKER_REPORT',
+    taskId: 't1',
+    report: 'R'.repeat(2000),
+    qualityGate: { ok: true },
+    autoDispatchesRemaining: 2,
+    memoryDirectory: [{ id: 'm' }],
+    cwd: '/tmp',
+  })}`;
+  const histReport = JSON.parse(compactHostEventText(reportRaw, true).slice('HOST_EVENT\n'.length));
+  assert.equal(histReport.qualityGate, undefined);
+  assert.equal(histReport.autoDispatchesRemaining, undefined);
+  assert.equal(histReport.memoryDirectory, undefined);
+  assert.equal(histReport.cwd, undefined);
+  assert.ok(histReport.report.length <= 1601 && histReport.report.endsWith('…'));
+
+  const workerTaskRaw = `HOST_EVENT\n${JSON.stringify({
+    kind: 'TASK',
+    taskId: 't1',
+    execution: 'native',
+    cwd: '/home/duty/Friday',
+    compiledContext: { profile: 'coding' },
+  })}`;
+  assert.equal(compactHostEventText(workerTaskRaw, true), workerTaskRaw);
+
+  // 2. decodePcm32leToFloat32 partial frame carry-over & DC-blocker removes DC bias while keeping AC
+  const s32Frames = 1200;
+  const s32Buf = Buffer.alloc(s32Frames * 4);
+  const dcBias = 0.05;
+  for (let i = 0; i < s32Frames; i++) {
+    const val = dcBias + 0.01 * Math.sin((2 * Math.PI * 500 * i) / 16000);
+    s32Buf.writeInt32LE(Math.round(val * 2147483647), i * 4);
+  }
+  const dcState = { prevX: 0, prevY: 0 };
+  const s1 = decodePcm32leToFloat32(s32Buf.subarray(0, 5), Buffer.alloc(0), dcState);
+  assert.equal(s1.samples.length, 1);
+  assert.equal(s1.leftover.length, 1);
+  const s2 = decodePcm32leToFloat32(s32Buf.subarray(5, 11), s1.leftover, dcState);
+  assert.equal(s2.samples.length, 1);
+  assert.equal(s2.leftover.length, 3);
+  const s3 = decodePcm32leToFloat32(s32Buf.subarray(11), s2.leftover, dcState);
+  assert.equal(s3.samples.length, s32Frames - 2);
+  assert.equal(s3.leftover.length, 0);
+  const tailSlice = s3.samples.subarray(-400);
+  const tailMean = tailSlice.reduce((sum, v) => sum + v, 0) / tailSlice.length;
+  assert.ok(Math.abs(tailMean) < 0.005, `DC bias should settle near zero, got ${tailMean}`);
+  const tailPeak = tailSlice.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+  assert.ok(tailPeak >= 0.008 && tailPeak <= 0.014, `AC wave should be preserved, got peak=${tailPeak}`);
+
+  // 3. normalizeUtteranceSamples ignores isolated single-sample click spike >= 0.25 and boosts quiet speech
+  const spiky = new Float32Array(2048);
+  spiky.fill(0.003);
+  for (let i = 0; i < spiky.length; i += 2) spiky[i] = -0.003;
+  spiky[100] = 0.40;
+  const spikyBoosted = normalizeUtteranceSamples(spiky);
+  assert.ok(Math.abs(spikyBoosted[200]!) > 0.25, `expected quiet body boosted despite click, got ${spikyBoosted[200]}`);
+
+  // 4. Un-freezable ambient noise adaptation & foreground gate vs background TV
+  let ambient = 0.0002;
+  for (let i = 0; i < 400; i++) {
+    ambient = updateAmbientNoiseRms(ambient, 0.0006);
+  }
+  assert.ok(ambient > 0.0005, `ambient must adapt upward when background rises, got ${ambient}`);
+
+  const gate = computeForegroundSpeechGate(0.0006, 0.015);
+  assert.ok(gate >= 0.0029 && gate <= 0.0031, `expected wake-referenced gate ~0.003, got ${gate}`);
+  assert.equal(0.0012 >= gate, false, 'soft background room audio below wakeRef*0.20 must be gated out');
+  const cappedGate = computeForegroundSpeechGate(0.0002, 0.05);
+  assert.ok(cappedGate <= 0.0002 * 6 + 1e-9, `loud wake shout must not push gate above 6x noise floor, got ${cappedGate}`);
+});
+
+test('XiaoAI KWS keywords auto-sync, follow-up cancel parsing, and Router non-thinking model setup', async () => {
+  // 1. DEFAULT_XIAOAI_KEYWORDS covers all wake variants & zero-initial sandhi without comment lines
+  assert.equal(XIAOAI_KEYWORDS_VERSION, 'v4');
+  const joined = DEFAULT_XIAOAI_KEYWORDS.join('\n');
+  for (const tag of ['@星期五', '@你好星期五', '@嘿星期五', '@嗨星期五', '@喂星期五', '@呼叫星期五']) {
+    assert.ok(joined.includes(tag), `Missing wake keyword ${tag}`);
+  }
+  assert.ok(joined.includes('x īng q ī w ǔ'), 'Missing bare 星期五 variant');
+  assert.ok(joined.includes('x īn q ī w ǔ'), 'Missing front-nasal 星期五 variant');
+  assert.ok(joined.includes('x īn q í w ǔ'), 'Missing colloquial front-nasal rising-tone 星期五 variant');
+  assert.ok(joined.includes('h ēi x ìn q ī w ǔ'), 'Missing h ēi x ìn q ī w ǔ variant');
+  assert.ok(joined.includes('ēi x īng q ī w ǔ'), 'Missing zero-initial 嘿/诶 variant');
+  assert.ok(joined.includes('h ái x īng q ī w ǔ'), 'Missing tone-sandhi 嗨 variant');
+  assert.ok(DEFAULT_XIAOAI_KEYWORDS.every(line => !line.startsWith('#')), 'No # comment lines inside keywords.txt');
+
+  // Peak-safe KWS gain avoids loud-shout tanh clipping while boosting quiet speech
+  const quietChunk = new Float32Array([0.002, -0.001, 0.0015]);
+  const loudChunk = new Float32Array([0.25, -0.2, 0.18]);
+  const quietGain = computeKwsGain(quietChunk, 0.00035);
+  const loudGain = computeKwsGain(loudChunk, 0.00035);
+  assert.equal(quietGain, 80);
+  assert.ok(loudGain <= 2.25, `Expected loud shout gain <= 2.25, got ${loudGain}`);
+  assert.ok(0.25 * loudGain <= 0.56, `Expected peak * gain <= 0.56, got ${0.25 * loudGain}`);
+
+  assert.equal(hasLeadingXiaoaiWakeWord('你好星期五，今天天气怎么样'), true);
+  assert.equal(hasLeadingXiaoaiWakeWord('<|zh|>星期五。'), true);
+  assert.equal(hasLeadingXiaoaiWakeWord('往右往上'), false);
+  assert.equal(cleanXiaoaiAsrUtterance('诶星期五，今天天气怎么样'), '今天天气怎么样');
+  assert.equal(cleanXiaoaiAsrUtterance('喂星期五帮我查一下'), '帮我查一下');
+  assert.equal(cleanXiaoaiAsrUtterance('你好新期五，打开灯'), '打开灯');
+  assert.equal(isXiaoaiFollowUpCancel('不用了。'), true);
+  assert.equal(isXiaoaiFollowUpCancel('算了吧'), true);
+  assert.equal(isXiaoaiFollowUpCancel('退下呗。'), true);
+  assert.equal(isXiaoaiFollowUpCancel('发微信'), false);
+  assert.equal(isXiaoaiFollowUpCancel('明天上午九点'), false);
+  assert.deepEqual(extractLeadingXiaoaiWakeKeyword('<|zh|>星期五。'), { keyword: '星期五', remainder: '' });
+  assert.deepEqual(extractLeadingXiaoaiWakeKeyword('新期五。'), { keyword: '星期五', remainder: '' });
+  assert.equal(extractLeadingXiaoaiWakeKeyword('新期五个人去吃饭'), undefined);
+  assert.deepEqual(extractLeadingXiaoaiWakeKeyword('星期五，打开客厅灯'), { keyword: '星期五', remainder: '打开客厅灯' });
+
+  // 2. Managed keywords.txt auto-upgrades when version file is missing/outdated; custom file untouched
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-kw-'));
+  try {
+    const kwsDir = join(home, 'xiaoai-kws');
+    await mkdir(join(kwsDir, 'models'), { recursive: true });
+    for (const file of ['encoder.onnx', 'decoder.onnx', 'joiner.onnx', 'tokens.txt']) {
+      await writeFile(join(kwsDir, 'models', file), 'dummy');
+    }
+    await writeFile(join(kwsDir, 'keywords.txt'), 'old-line @你好星期五\n');
+
+    const streamA = new PassThrough();
+    const monitorA = new XiaoaiKwsMonitor({
+      homeDir: home,
+      streamFactory: () => ({ stdout: streamA, kill: () => streamA.end(), onClose: () => {} }),
+      spotterFactory: () => ({
+        createStream: () => ({}),
+        acceptWaveform: () => {},
+        isReady: () => false,
+        decode: () => {},
+        getResult: () => '',
+        reset: () => {},
+      }),
+    });
+    monitorA.sync([{
+      id: 'xiaoai-sync',
+      platform: 'xiaoai',
+      name: '小爱同步',
+      enabled: true,
+      notifyAll: false,
+      allowedSenders: [],
+      apiBase: 'ssh://lx06=root@192.168.31.104',
+      inboundCount: 0,
+      outboundCount: 0,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }]);
+    const syncedKw = await readFile(join(kwsDir, 'keywords.txt'), 'utf8');
+    const syncedVer = (await readFile(join(kwsDir, 'keywords.version'), 'utf8')).trim();
+    assert.ok(syncedKw.includes('@嘿星期五'));
+    assert.equal(syncedVer, XIAOAI_KEYWORDS_VERSION);
+    monitorA.close();
+
+    const customKwPath = join(home, 'custom-kw.txt');
+    await writeFile(customKwPath, 'custom-only @你好星期五\n');
+    const streamB = new PassThrough();
+    const monitorB = new XiaoaiKwsMonitor({
+      homeDir: home,
+      keywordsFile: customKwPath,
+      streamFactory: () => ({ stdout: streamB, kill: () => streamB.end(), onClose: () => {} }),
+      spotterFactory: () => ({
+        createStream: () => ({}),
+        acceptWaveform: () => {},
+        isReady: () => false,
+        decode: () => {},
+        getResult: () => '',
+        reset: () => {},
+      }),
+    });
+    monitorB.sync([{
+      id: 'xiaoai-custom',
+      platform: 'xiaoai',
+      name: '小爱自定义',
+      enabled: true,
+      notifyAll: false,
+      allowedSenders: [],
+      apiBase: 'ssh://lx06=root@192.168.31.104',
+      inboundCount: 0,
+      outboundCount: 0,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }]);
+    assert.equal(await readFile(customKwPath, 'utf8'), 'custom-only @你好星期五\n');
+    monitorB.close();
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+
+  // 3. prepareRouterSessionModel disables CoT thinking for DeepSeek/GLM/MiMo reasoning models on Router
+  const ds = prepareRouterSessionModel({
+    id: 'deepseek-v4.1-flash',
+    api: 'openai-completions',
+    reasoning: true,
+    compat: { thinkingFormat: 'deepseek' },
+    thinkingLevelMap: { off: null, low: 'low' },
+  });
+  assert.equal(ds.compat?.thinkingFormat, 'deepseek');
+  assert.equal(ds.thinkingLevelMap?.off, 'off');
+
+  const glm = prepareRouterSessionModel({
+    id: 'glm-5.3-flash',
+    api: 'openai-completions',
+    reasoning: true,
+    thinkingLevelMap: { off: null, high: 'high' },
+  });
+  assert.equal(glm.compat?.thinkingFormat, 'deepseek');
+  assert.equal(glm.thinkingLevelMap?.off, 'off');
+
+  const plain = prepareRouterSessionModel({
+    id: 'gpt-4o-mini',
+    api: 'openai-completions',
+    reasoning: false,
+  });
+  assert.equal(plain.reasoning, false);
+
+  // 4. markXiaoaiSpeakingGuard overwrite shrinks guard immediately when playback ends early
+  resetXiaoaiRuntimeState();
+  try {
+    markXiaoaiSpeakingGuard('ch-guard', 'lx06', 18_000);
+    assert.equal(isXiaoaiSpeakingSelfEcho('ch-guard', 'lx06', '星期五'), true);
+    markXiaoaiSpeakingGuard('ch-guard', 'lx06', 40, true);
+    assert.equal(isXiaoaiSpeakingSelfEcho('ch-guard', 'lx06', '星期五'), true);
+    await delay(65);
+    assert.equal(isXiaoaiSpeakingSelfEcho('ch-guard', 'lx06', '星期五'), false);
+  } finally {
+    resetXiaoaiRuntimeState();
+  }
+
+  // 5. compactHostEventText keeps active voiceModeConstraint and strips it on historical turns
+  const activePayload = `HOST_EVENT\n${JSON.stringify({
+    kind: 'CHAT',
+    deliveryChannel: 'xiaoai',
+    voiceModeConstraint: 'short spoken constraint',
+    message: { text: '你好' },
+  })}`;
+  assert.ok(compactHostEventText(activePayload, false).includes('voiceModeConstraint'));
+  assert.equal(compactHostEventText(activePayload, true).includes('voiceModeConstraint'), false);
+});
+
+test('XiaoAI continuous follow-up confirmation dialog and cross-endpoint switch_channel handoff', async () => {
+  // Unit assertions for shouldContinueXiaoaiDialog & directive stripping
+  assert.equal(shouldContinueXiaoaiDialog('请问需要定几点？'), true);
+  assert.equal(
+    shouldContinueXiaoaiDialog('查了一圈，没查到能对上的《醉梦》。帮我确认一下是哪个：你是在哪个平台看到的，或者记得主演、大概剧情？也有可能名字记岔了一点。给个线索我再查一遍。'),
+    true,
+  );
+  assert.equal(shouldContinueXiaoaiDialog('发你微信还是放网页端'), true);
+  assert.equal(shouldContinueXiaoaiDialog('好的，后台去办了。'), false);
+  assert.equal(shouldContinueXiaoaiDialog('现在凌晨两点整。[[LISTEN]]'), true);
+  assert.equal(shouldContinueXiaoaiDialog('需要确认吗？[[END]]'), false);
+  assert.equal(
+    shouldContinueXiaoaiDialog('好，电视已经能直接控制，刚才往下按了一个，红外码发送成功。要试别的键就说。[[END]]'),
+    true,
+  );
+  assert.equal(shouldContinueXiaoaiDialog('好，刚才往下按了一个。要试别的键就说。'), true);
+  assert.equal(shouldContinueXiaoaiDialog('告诉我音箱能不能用蓝牙连手机就行。'), true);
+  assert.equal(shouldContinueXiaoaiDialog('有需要随时跟我说。[[END]]'), false);
+  assert.deepEqual(stripXiaoaiDialogDirective('确定要删除吗？ [[LISTEN]]'), { text: '确定要删除吗？', directive: 'listen' });
+  assert.equal(sanitizeForSpeech('请问定几点？[[LISTEN]]'), '请问定几点？');
+  assert.equal(sanitizeForSpeech('要我现在去查这台音箱支不支持蓝牙输入？</br>'), '要我现在去查这台音箱支不支持蓝牙输入？');
+
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-dialog-'));
+  try {
+    const sshCalls: Array<{ targetId: string; command: string }> = [];
+    const sshRunner: XiaoaiSshRunner = async (target, remoteCommand) => {
+      sshCalls.push({ targetId: target.id, command: remoteCommand });
+      if (remoteCommand.includes('instruction.log')) return { stdout: '', stderr: '', code: 0 };
+      if (remoteCommand.includes('player_get_play_status')) {
+        return { stdout: '{"code":0,"info":"{ \\"status\\": 0 }"}', stderr: '', code: 0 };
+      }
+      return { stdout: '{"code":0}', stderr: '', code: 0 };
+    };
+
+    const wechatOutbound: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const wechatServer = createServer(async (req, res) => {
+      if (req.url === '/ilink/bot/getupdates') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ret: 0, get_updates_buf: 'buf-1', msgs: [] }));
+        return;
+      }
+      const raw = await readReqBody(req);
+      wechatOutbound.push({ url: req.url ?? '', body: JSON.parse(raw || '{}') as Record<string, unknown> });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ret: 0 }));
+    });
+    await new Promise<void>((resolve) => wechatServer.listen(0, '127.0.0.1', () => resolve()));
+    const wechatPort = (wechatServer.address() as { port: number }).port;
+
+    let audioStream: PassThrough | undefined;
+    const asrQueue = ['帮我设个提醒', '明天早上九点', '不用了', '切到微信', '切到网页端'];
+    const customFactory: AgentFactory = {
+      mode: 'offline',
+      nativeTools: false,
+      async create(role, _id, tools) {
+        if (role === 'router') {
+          return {
+            async prompt(rawPrompt) {
+              const event = JSON.parse(rawPrompt) as { kind?: string; message?: { text?: string } };
+              if (event.kind !== 'CHAT') return '完成。';
+              const text = event.message?.text ?? '';
+              const switchTool = tools.find(t => t.name === 'switch_channel');
+              if (text === '帮我设个提醒') {
+                return '好的，请问要设在几点？';
+              }
+              if (text === '明天早上九点') {
+                return '好的，已记下明天九点提醒。';
+              }
+              if (text === '切到微信' && switchTool) {
+                await switchTool.execute(JSON.stringify({ channel: 'wechat' }));
+                return '这是微信端收到的完整长报告内容：一、状态正常；二、磁盘充足。';
+              }
+              if (text === '切到网页端' && switchTool) {
+                await switchTool.execute(JSON.stringify({ channel: 'web' }));
+                return '这是网页端控制台收到的详细技术报告，不会在小爱音箱念出。';
+              }
+              return '收到。';
+            },
+            close() {},
+          };
+        }
+        return offlineFactory().create(role, _id, tools);
+      },
+    };
+
+    const coordinator = new Coordinator(home, customFactory);
+    await coordinator.ready();
+    try {
+      coordinator.im.xiaoaiDeps = {
+        sshRunner,
+        kwsCooldownMs: 20,
+        kwsProbeDurationMs: 25,
+        kwsChimeDiscardMs: 20,
+        kwsEndSilenceMs: 40,
+        kwsMaxWaitSpeechMs: 600,
+        kwsStreamFactory: () => {
+          audioStream = new PassThrough();
+          return { stdout: audioStream, kill: () => audioStream?.end(), onClose: () => {} };
+        },
+        kwsSpotterFactory: () => {
+          const state = { peak: 0 };
+          return {
+            createStream: () => ({ state }),
+            acceptWaveform: (_s, samples) => {
+              for (const v of samples) {
+                const abs = Math.abs(v);
+                if (abs > state.peak) state.peak = abs;
+              }
+            },
+            isReady: () => state.peak >= 0.65,
+            decode: () => {},
+            getResult: () => (state.peak >= 0.65 ? '嘿星期五' : ''),
+            reset: () => { state.peak = 0; },
+          };
+        },
+        kwsRecognizerFactory: () => ({ transcribe: async () => asrQueue.shift() ?? '' }),
+      };
+      coordinator.im.saveChannel({
+        id: 'wechat-test',
+        platform: 'wechat',
+        name: '测试微信',
+        apiBase: `http://127.0.0.1:${wechatPort}`,
+        botToken: 'bot-tok-test',
+        accountId: 'acc-1',
+        defaultTarget: 'wx-boss-1',
+        pollIntervalMs: 5000,
+        notifyAll: false,
+      });
+      coordinator.im.saveChannel({
+        id: 'xiaoai-dialog',
+        platform: 'xiaoai',
+        name: '小爱连续对话',
+        apiBase: 'ssh://lx06=root@192.168.31.104',
+        pollIntervalMs: 50,
+        notifyAll: false,
+      });
+      await until(() => Boolean(audioStream));
+
+      const pushSamples = (amp: number, count: number) => {
+        const buf = Buffer.alloc(count * 2);
+        const val = Math.round(amp * 32767);
+        for (let i = 0; i < count; i++) buf.writeInt16LE(val, i * 2);
+        audioStream!.write(buf);
+      };
+      const wakeCount = () => sshCalls.filter(c => c.command.includes('wakeup_zai_01.wav')).length;
+      const ttsTexts = () => sshCalls.filter(c => c.command.includes('text_to_speech')).map(c => c.command);
+
+      // Turn 1 (with wake): asks "请问要设在几点？" -> waits for completion -> lights listen LED without chime
+      pushSamples(0.75, 16);
+      pushSamples(0.15, 480);
+      pushSamples(0, 800);
+      await until(() => ttsTexts().some(c => c.includes('请问要设在几点')));
+      await until(() => sshCalls.filter(c => c.command.includes('/bin/show_led 1')).length >= 2);
+      const chimesAfterQ1 = wakeCount();
+
+      // Turn 2 (NO wake word! Follow-up mode captures directly): "明天早上九点" -> final statement ends dialog
+      await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-dialog', 'lx06') === true);
+      pushSamples(0, 3200); // > 180ms follow-up discard
+      pushSamples(0.15, 480);
+      pushSamples(0, 800);
+      await until(() => ttsTexts().some(c => c.includes('已记下明天九点提醒')));
+      assert.equal(wakeCount(), chimesAfterQ1, 'Follow-up turn must not require re-wake or chime');
+      await delay(50);
+      assert.equal(
+        coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-dialog', 'lx06'),
+        false,
+        'Speaker must return to standby after final statement',
+      );
+
+      // Verify cancel phrase ("不用了") during follow-up capture does not send to Coordinator
+      const msgsBeforeCancel = coordinator.store.conversation.history(undefined, 20).items.length;
+      assert.equal(coordinator.im.xiaoaiKwsMonitor?.enterFollowUpCapture('xiaoai-dialog', 'lx06', { waitMs: 1200, discardMs: 0 }), true);
+      pushSamples(0.15, 480);
+      pushSamples(0, 800);
+      await until(() => !coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-dialog', 'lx06'));
+      await delay(60);
+      assert.equal(coordinator.store.conversation.history(undefined, 20).items.length, msgsBeforeCancel);
+
+      // Turn 3: xiaoai -> wechat handoff: speaker hears brief voice notice, WeChat gets full report
+      pushSamples(0.75, 16);
+      pushSamples(0.15, 480);
+      pushSamples(0, 800);
+      await until(() => wechatOutbound.length >= 1 && ttsTexts().some(c => c.includes('已发到微信')));
+      const wxMsg = JSON.stringify(wechatOutbound[0]!.body);
+      assert.match(wxMsg, /完整长报告内容/);
+      assert.equal(ttsTexts().some(c => c.includes('完整长报告内容')), false, 'Long WeChat report must not play on speaker');
+
+      // Turn 4: xiaoai -> web handoff: speaker hears brief web notice, full reply saved locally only
+      await delay(40);
+      const ttsBeforeWeb = ttsTexts().length;
+      pushSamples(0.75, 16);
+      pushSamples(0.15, 480);
+      pushSamples(0, 800);
+      await until(() => ttsTexts().slice(ttsBeforeWeb).some(c => c.includes('已转到网页端')));
+      await delay(60);
+      assert.equal(ttsTexts().some(c => c.includes('详细技术报告')), false, 'Long Web reply must not play on speaker');
+      const webMsgs = coordinator.store.conversation.history(undefined, 30).items;
+      assert.ok(webMsgs.some(m => m.text.includes('详细技术报告') && m.origin?.channel === 'local'));
+    } finally {
+      await coordinator.close();
+      await new Promise<void>(resolve => wechatServer.close(() => resolve()));
+    }
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('XiaoAI TV Remote Mode: zero-LLM deterministic keys, empty/timeout/noise capture persistence, and clean exit / idle TTL expiry', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-tvremote-'));
+  try {
+    const sshCalls: Array<{ targetId: string; command: string }> = [];
+    const sshRunner: XiaoaiSshRunner = async (target, remoteCommand) => {
+      sshCalls.push({ targetId: target.id, command: remoteCommand });
+      if (remoteCommand.includes('instruction.log')) return { stdout: '', stderr: '', code: 0 };
+      if (remoteCommand.includes('player_get_play_status')) {
+        return { stdout: '{"code":0,"info":"{ \\"status\\": 0 }"}', stderr: '', code: 0 };
+      }
+      return { stdout: '{"code":0}', stderr: '', code: 0 };
+    };
+
+    let audioStream: PassThrough | undefined;
+    const asrQueue = [
+      '遥控电视模式。',
+      '往下。',
+      '。',
+      '这不是我写的字。',
+      '往下两下再确认',
+      '呃，往右往上。',
+      '网友。',
+      '退出遥控',
+      '遥控电视模式',
+      '遥控电视模式',
+      '你好星期五，今天天气怎么样',
+      '测试电视能力',
+      '马上。',
+      '哪下啊。',
+      '退出遥控',
+    ];
+    let routerChatCalls = 0;
+    const routerTexts: string[] = [];
+
+    const customFactory: AgentFactory = {
+      mode: 'offline',
+      nativeTools: false,
+      async create(role, id, tools) {
+        if (role === 'router') {
+          return {
+            async prompt(rawPrompt) {
+              const event = JSON.parse(rawPrompt) as { kind?: string; message?: { text?: string } };
+              if (event.kind === 'CHAT') {
+                routerChatCalls++;
+                const text = event.message?.text ?? '';
+                routerTexts.push(text);
+                if (text === '测试电视能力') {
+                  return '好，刚才往下按了一个，红外码发送成功。要试别的键就说。[[END]]';
+                }
+              }
+              return '不该走到路由。';
+            },
+            close() {},
+          };
+        }
+        return offlineFactory().create(role, id, tools);
+      },
+    };
+
+    const coordinator = new Coordinator(home, customFactory);
+    await coordinator.ready();
+    try {
+      coordinator.im.xiaoaiDeps = {
+        sshRunner,
+        kwsCooldownMs: 20,
+        kwsProbeDurationMs: 25,
+        kwsChimeDiscardMs: 20,
+        kwsEndSilenceMs: 40,
+        kwsMaxWaitSpeechMs: 600,
+        tvRemoteIdleTtlMs: 3_000,
+        tvRemoteCaptureWaitMs: 220,
+        tvRemoteStepIntervalMs: 10,
+        kwsStreamFactory: () => {
+          audioStream = new PassThrough();
+          return { stdout: audioStream, kill: () => audioStream?.end(), onClose: () => {} };
+        },
+        kwsSpotterFactory: () => {
+          const state = { peak: 0 };
+          return {
+            createStream: () => ({ state }),
+            acceptWaveform: (_s, samples) => {
+              for (const v of samples) {
+                const abs = Math.abs(v);
+                if (abs > state.peak) state.peak = abs;
+              }
+            },
+            isReady: () => state.peak >= 0.65,
+            decode: () => {},
+            getResult: () => (state.peak >= 0.65 ? '嘿星期五' : ''),
+            reset: () => { state.peak = 0; },
+          };
+        },
+        kwsRecognizerFactory: () => ({ transcribe: async () => asrQueue.shift() ?? '' }),
+      };
+
+      coordinator.im.saveChannel({
+        id: 'xiaoai-tv',
+        platform: 'xiaoai',
+        name: '小爱电视遥控',
+        apiBase: 'ssh://lx06=root@192.168.31.104',
+        pollIntervalMs: 50,
+        notifyAll: false,
+      });
+      await until(() => Boolean(audioStream));
+
+      const pushSamples = (amp: number, count: number) => {
+        const buf = Buffer.alloc(count * 2);
+        const val = Math.round(amp * 32767);
+        for (let i = 0; i < count; i++) buf.writeInt16LE(val, i * 2);
+        audioStream!.write(buf);
+      };
+      const irPlayCommands = () => sshCalls.filter(c => c.command.includes('call ir_agent play')).map(c => c.command);
+      const ttsCommands = () => sshCalls.filter(c => c.command.includes('text_to_speech')).map(c => c.command);
+      const listenLedCount = () => sshCalls.filter(c => c.command.includes('/bin/show_led 1')).length;
+
+      const downCode = encodeXiaomiTvIrFrame(0x86, 0x06, 2).code;
+      const upCode = encodeXiaomiTvIrFrame(0x86, 0x05, 2).code;
+      const rightCode = encodeXiaomiTvIrFrame(0x86, 0x0c, 2).code;
+      const okCode = encodeXiaomiTvIrFrame(0x86, 0x0d, 2).code;
+
+      // 1. Enter remote mode via KWS ("遥控电视模式。") -> zero Router LLM calls, announces entry, arms follow-up capture
+      pushSamples(0.75, 16);
+      pushSamples(0.15, 480);
+      pushSamples(0, 800);
+      await until(() => ttsCommands().some(c => c.includes('已进入遥控模式')));
+      await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06') === true);
+      assert.equal(routerChatCalls, 0, 'Entering TV remote mode must not invoke Router LLM');
+
+      // 2. Direct key without wake word ("往下。") -> instant IR play, zero TTS, zero Router LLM
+      const ttsBeforePress = ttsCommands().length;
+      pushSamples(0, 2200); // > 120ms entry discard
+      pushSamples(0.15, 480);
+      pushSamples(0, 800);
+      await until(() => irPlayCommands().length === 1);
+      assert.ok(irPlayCommands()[0]!.includes(downCode), 'Should emit Redmi TV down IR code');
+      assert.ok(irPlayCommands()[0]!.includes('/bin/show_led 1'), 'Should refresh listen LED in same SSH call');
+      assert.equal(ttsCommands().length, ttsBeforePress, 'In-mode button press must not block on TTS');
+      assert.equal(routerChatCalls, 0, 'In-mode press must not invoke Router LLM');
+      assert.equal(coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06'), true);
+
+      // 3. Reproduce 12:46:39 empty ASR bug ("。") -> must NOT exit capture or turn off LED
+      const ledsBeforeNoise = listenLedCount();
+      pushSamples(0.15, 480);
+      pushSamples(0, 800);
+      await until(() => listenLedCount() > ledsBeforeNoise);
+      await delay(30);
+      assert.equal(
+        coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06'),
+        true,
+        'Empty ASR punctuation during TV remote mode must stay capturing',
+      );
+      assert.equal(routerChatCalls, 0);
+
+      // 4. Silence wait timeout (< 3000ms idle TTL) -> must automatically re-arm capture instead of dropping out
+      const ledsBeforeTimeout = listenLedCount();
+      pushSamples(0, 4000); // 250ms > 220ms tvRemoteCaptureWaitMs
+      await until(() => listenLedCount() > ledsBeforeTimeout);
+      await delay(30);
+      assert.equal(
+        coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06'),
+        true,
+        'Wait timeout before idle TTL must automatically re-arm capture',
+      );
+
+      // 5. Unrecognized background speech ("这不是我写的字。") -> ignored cleanly, capture remains active
+      const ledsBeforeIgnored = listenLedCount();
+      pushSamples(0.15, 480);
+      pushSamples(0, 800);
+      await until(() => listenLedCount() > ledsBeforeIgnored);
+      assert.equal(irPlayCommands().length, 1, 'Unrecognized speech must not emit IR');
+      assert.equal(routerChatCalls, 0, 'Unrecognized speech in remote mode must not invoke Router LLM');
+      assert.equal(coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06'), true);
+
+      // 6. Combo phrase after noise/timeout recovery ("往下两下再确认") -> down, down, ok
+      pushSamples(0.15, 480);
+      pushSamples(0, 800);
+      await until(() => irPlayCommands().length === 4);
+      const addedIr = irPlayCommands().slice(1);
+      assert.ok(addedIr[0]!.includes(downCode));
+      assert.ok(addedIr[1]!.includes(downCode));
+      assert.ok(addedIr[2]!.includes(okCode));
+      assert.equal(routerChatCalls, 0);
+      assert.equal(coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06'), true);
+
+      // 6b. Concatenated & homophone commands ("呃，往右往上。" + "网友。") -> right, up, right
+      pushSamples(0.15, 480);
+      pushSamples(0, 800);
+      await until(() => irPlayCommands().length === 6);
+      assert.ok(irPlayCommands()[4]!.includes(rightCode));
+      assert.ok(irPlayCommands()[5]!.includes(upCode));
+
+      pushSamples(0.15, 480);
+      pushSamples(0, 800);
+      await until(() => irPlayCommands().length === 7);
+      assert.ok(irPlayCommands()[6]!.includes(rightCode));
+      assert.equal(routerChatCalls, 0);
+      assert.equal(coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06'), true);
+
+      // 7. Explicit exit ("退出遥控") -> announces exit and returns speaker to standby
+      pushSamples(0.15, 480);
+      pushSamples(0, 800);
+      await until(() => ttsCommands().some(c => c.includes('已退出遥控')));
+      await delay(40);
+      assert.equal(coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06'), false);
+      assert.equal(routerChatCalls, 0);
+
+      // 8. Re-enter with short idle TTL and confirm natural idle expiry shuts down LED & returns to standby
+      coordinator.im.xiaoaiDeps.tvRemoteIdleTtlMs = 260;
+      coordinator.im.xiaoaiDeps.tvRemoteCaptureWaitMs = 200;
+      const entryTtsBefore = ttsCommands().length;
+      pushSamples(0.75, 16);
+      pushSamples(0.15, 480);
+      pushSamples(0, 800);
+      await until(() => ttsCommands().length > entryTtsBefore);
+      await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06') === true);
+      const offLedCount = () => sshCalls.filter(c => c.command.includes('/bin/shut_led 1') && !c.command.includes('/bin/show_led')).length;
+      const shutLedsBeforeExpiry = offLedCount();
+      await delay(290);
+      pushSamples(0, 6400); // > 120ms entry discard + 200ms capture wait
+      await until(() => !coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06'));
+      await until(() => offLedCount() > shutLedsBeforeExpiry);
+      assert.equal(routerChatCalls, 0);
+
+      // 9. Explicit wake word + non-TV query ("你好星期五，今天天气怎么样") exits TV remote mode & routes to Router
+      coordinator.im.xiaoaiDeps.tvRemoteIdleTtlMs = 3_000;
+      coordinator.im.xiaoaiDeps.tvRemoteCaptureWaitMs = 220;
+      const ttsBeforeReenter = ttsCommands().length;
+      pushSamples(0.75, 16);
+      pushSamples(0.15, 480);
+      pushSamples(0, 800);
+      await until(() => ttsCommands().length > ttsBeforeReenter);
+      await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06') === true);
+      pushSamples(0, 2200);
+      pushSamples(0.15, 480);
+      pushSamples(0, 800);
+      await until(() => routerChatCalls === 1 && ttsCommands().some(c => c.includes('不该走到路由')));
+      assert.deepEqual(routerTexts, ['今天天气怎么样']);
+      await delay(40);
+      assert.equal(coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06'), false);
+
+      // 10. Router replying "……要试别的键就说。[[END]]" after testing TV activates continuous local TV remote mode
+      const irBeforeInvite = irPlayCommands().length;
+      pushSamples(0.75, 16);
+      pushSamples(0.15, 480);
+      pushSamples(0, 800);
+      await until(() => routerChatCalls === 2 && ttsCommands().some(c => c.includes('要试别的键就说')));
+      await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06') === true);
+      pushSamples(0, 2200); // > 120ms discard
+      pushSamples(0.15, 480); // "马上。" -> up
+      pushSamples(0, 800);
+      await until(() => irPlayCommands().length === irBeforeInvite + 1);
+      assert.ok(irPlayCommands()[irBeforeInvite]!.includes(upCode));
+
+      pushSamples(0.15, 480); // "哪下啊。" -> down
+      pushSamples(0, 800);
+      await until(() => irPlayCommands().length === irBeforeInvite + 2);
+      assert.ok(irPlayCommands()[irBeforeInvite + 1]!.includes(downCode));
+      assert.equal(routerChatCalls, 2, 'Subsequent button presses must stay zero-LLM local');
+
+      pushSamples(0.15, 480); // "退出遥控"
+      pushSamples(0, 800);
+      await until(() => !coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06'));
+    } finally {
+      await coordinator.close();
+    }
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('XiaoAI KWS s32le sub-threshold hiss skips ASR and cancels capture cleanly', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-hiss-'));
+  try {
+    let audioStream: PassThrough | undefined;
+    let transcribeCalls = 0;
+    const cancels: Array<{ reason: string; keyword: string }> = [];
+    const monitor = new XiaoaiKwsMonitor({
+      homeDir: home,
+      cooldownMs: 20,
+      probeDurationMs: 25,
+      chimeDiscardMs: 10,
+      maxWaitSpeechMs: 500,
+      endSilenceMs: 40,
+      speechRmsThreshold: 0.0001,
+      streamFactory: () => {
+        audioStream = new PassThrough();
+        return {
+          stdout: audioStream,
+          sampleFormat: 's32le',
+          kill: () => audioStream?.end(),
+          onClose: () => {},
+        };
+      },
+      spotterFactory: () => {
+        const state = { peak: 0 };
+        return {
+          createStream: () => ({ state }),
+          acceptWaveform: (_s, samples) => {
+            for (const v of samples) {
+              const abs = Math.abs(v);
+              if (abs > state.peak) state.peak = abs;
+            }
+          },
+          isReady: () => state.peak >= 0.4,
+          decode: () => {},
+          getResult: () => (state.peak >= 0.4 ? '你好星期五' : ''),
+          reset: () => { state.peak = 0; },
+        };
+      },
+      recognizerFactory: () => ({
+        transcribe: async () => {
+          transcribeCalls++;
+          return '我。';
+        },
+      }),
+      onWake: async () => ({ woken: true, suppressed: false }),
+      onCaptureCancel: (ev) => {
+        cancels.push({ reason: ev.reason, keyword: ev.keyword });
+      },
+    });
+    monitor.sync([{
+      id: 'xiaoai-hiss',
+      platform: 'xiaoai',
+      name: '底噪过滤测试',
+      enabled: true,
+      notifyAll: false,
+      allowedSenders: [],
+      apiBase: 'ssh://lx06=root@192.168.31.104',
+      inboundCount: 0,
+      outboundCount: 0,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }]);
+    await until(() => Boolean(audioStream));
+
+    const pushS32Sine = (amp: number, count: number) => {
+      const buf = Buffer.alloc(count * 4);
+      for (let i = 0; i < count; i++) {
+        const val = amp === 0 ? 0 : amp * Math.sin((2 * Math.PI * 1000 * i) / 16000);
+        buf.writeInt32LE(Math.round(val * 2147483647), i * 4);
+      }
+      audioStream!.write(buf);
+    };
+
+    // Wake into two-step capture, discard 10ms chime tail, then emit ultra-quiet thermal hiss (~0.00035 RMS < 0.0010)
+    pushS32Sine(0.5, 400);
+    pushS32Sine(0, 480);
+    await until(() => monitor.isCapturing('xiaoai-hiss', 'lx06'));
+    pushS32Sine(0, 200);
+    pushS32Sine(0.0005, 640);
+    pushS32Sine(0, 800);
+    await until(() => cancels.length === 1);
+    assert.equal(cancels[0]!.reason, 'empty');
+    assert.equal(transcribeCalls, 0, 'Sub-0.0010 RMS S32_LE hiss must skip ASR completely');
+    monitor.close();
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+function synthToneSamples(freqHz: number, durationMs: number, amplitude = 0.2, sampleRate = SPEAKER_SAMPLE_RATE): Float32Array {
+  const total = Math.round((sampleRate * durationMs) / 1000);
+  const out = new Float32Array(total);
+  for (let i = 0; i < total; i++) {
+    out[i] = amplitude * Math.sin((2 * Math.PI * freqHz * i) / sampleRate);
+  }
+  return out;
+}
+
+function encodeFloat32ToS16Le(samples: Float32Array): Buffer {
+  const buf = Buffer.allocUnsafe(samples.length * 2);
+  for (let i = 0; i < samples.length; i++) {
+    const clamped = Math.max(-1, Math.min(1, samples[i]!));
+    buf.writeInt16LE(Math.round(clamped * 32767), i * 2);
+  }
+  return buf;
+}
+
+function concatAudio(...parts: Float32Array[]): Float32Array {
+  const total = parts.reduce((sum, p) => sum + p.length, 0);
+  const out = new Float32Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+function createBandSpeakerExtractorFactory(): () => XiaoaiSpeakerExtractor {
+  const computeVector = (samples: Float32Array, sampleRate: number): Float32Array => {
+    const weights = new Float32Array(4); // [200Hz owner, 800Hz wife, 3200Hz tv, fallback]
+    const win = Math.max(160, Math.round(sampleRate * 0.04));
+    for (let start = 0; start + 32 <= samples.length; start += win) {
+      const end = Math.min(samples.length, start + win);
+      let energy = 0;
+      let crossings = 0;
+      let prev = samples[start]!;
+      for (let i = start; i < end; i++) {
+        const cur = samples[i]!;
+        energy += cur * cur;
+        if ((prev < 0 && cur >= 0) || (prev > 0 && cur <= 0)) {
+          crossings++;
+        }
+        prev = cur;
+      }
+      const rms = Math.sqrt(energy / (end - start));
+      if (rms < 0.008) continue;
+      const zcr = crossings / (end - start);
+      if (zcr < 0.06) {
+        weights[0]! += rms;
+      } else if (zcr < 0.22) {
+        weights[1]! += rms;
+      } else {
+        weights[2]! += rms;
+      }
+    }
+    let norm = 0;
+    for (let i = 0; i < weights.length; i++) norm += weights[i]! * weights[i]!;
+    if (norm === 0) weights[3] = 1;
+    else {
+      const inv = 1 / Math.sqrt(norm);
+      for (let i = 0; i < weights.length; i++) weights[i] = weights[i]! * inv;
+    }
+    return weights;
+  };
+
+  return () => ({
+    dim: 4,
+    extract(samples: Float32Array, sampleRate: number): Float32Array | undefined {
+      return computeVector(samples, sampleRate);
+    },
+    free() {},
+  });
+}
+
+test('XiaoaiSpeakerManager multi-speaker profiles, TV-tail trimming, and command parsing', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-spk-unit-'));
+  try {
+    assert.deepEqual(parseSpeakerVoiceCommand('你好星期五，录入我的声纹'), { kind: 'enroll', mode: 'replace' });
+    assert.deepEqual(parseSpeakerVoiceCommand('帮老婆录入声纹'), { kind: 'enroll', targetName: '老婆', mode: 'replace' });
+    assert.deepEqual(parseSpeakerVoiceCommand('给爸爸补充声纹'), { kind: 'enroll', targetName: '爸爸', mode: 'append' });
+    assert.deepEqual(parseSpeakerVoiceCommand('我是谁'), { kind: 'whoami' });
+    assert.deepEqual(parseSpeakerVoiceCommand('查看声纹列表'), { kind: 'list' });
+    assert.deepEqual(parseSpeakerVoiceCommand('删除小明的声纹'), { kind: 'remove', targetName: '小明' });
+    assert.deepEqual(parseSpeakerVoiceCommand('清空所有声纹'), { kind: 'clear' });
+    assert.deepEqual(parseSpeakerVoiceCommand('暂停声纹识别'), { kind: 'toggle', enabled: false });
+    assert.deepEqual(parseSpeakerVoiceCommand('开启声纹识别'), { kind: 'toggle', enabled: true });
+    assert.equal(parseSpeakerVoiceCommand('今天天气怎么样'), undefined);
+    assert.equal(isEnrollCancelPhrase('不用了取消吧'), true);
+
+    const extractorFactory = createBandSpeakerExtractorFactory();
+    const manager = new XiaoaiSpeakerManager({ homeDir: home, extractorFactory });
+
+    // Inactive while empty -> passes everything through
+    assert.equal(manager.isVerificationActive(), false);
+    assert.equal(manager.verifyWakeSlice(synthToneSamples(3200, 600), SPEAKER_SAMPLE_RATE, '星期五').matched, true);
+
+    // Enroll owner (200Hz) and member (800Hz)
+    const ownerEmb = manager.extractEmbedding(synthToneSamples(200, 1200))!;
+    const wifeEmb = manager.extractEmbedding(synthToneSamples(800, 1200))!;
+    const tvSamples = synthToneSamples(3200, 3000);
+
+    const owner = manager.enrollEmbeddings({ name: '主人', role: 'owner', embeddings: [ownerEmb] });
+    assert.equal(owner.role, 'owner');
+    assert.equal(manager.isVerificationActive(), true);
+    assert.equal(manager.isVerificationActive({ speakerVerify: false }), false);
+
+    const wife = manager.enrollEmbeddings({ name: '老婆', embeddings: [wifeEmb] });
+    assert.equal(wife.role, 'member');
+    const wifeAppended = manager.enrollEmbeddings({ name: '老婆', mode: 'append', embeddings: [wifeEmb] });
+    assert.equal(wifeAppended.sampleCount, 2);
+
+    // Stage 1 wake precheck (including 1.80s ring buffer with long leading room noise + short "星期五")
+    assert.equal(manager.verifyWakeSlice(synthToneSamples(200, 700), SPEAKER_SAMPLE_RATE, '星期五').matched, true);
+    assert.equal(manager.verifyWakeSlice(synthToneSamples(3200, 700), SPEAKER_SAMPLE_RATE, '星期五').matched, false);
+    const ringWithLeadingNoise = concatAudio(
+      synthToneSamples(3200, 1150, 0.02),
+      synthToneSamples(200, 650, 0.12),
+    );
+    const trimmedWake = trimWakeSpeechWindow(ringWithLeadingNoise, SPEAKER_SAMPLE_RATE);
+    assert.ok(
+      trimmedWake.length >= Math.round(SPEAKER_SAMPLE_RATE * 0.65)
+        && trimmedWake.length <= Math.round(SPEAKER_SAMPLE_RATE * 0.90),
+      `Expected leading noise trimmed to [0.65s, 0.90s], got ${(trimmedWake.length / SPEAKER_SAMPLE_RATE).toFixed(2)}s`,
+    );
+    assert.equal(manager.verifyWakeSlice(ringWithLeadingNoise, SPEAKER_SAMPLE_RATE, '星期五').matched, true);
+    const ringWithTvSpeech = concatAudio(
+      synthToneSamples(3200, 1150, 0.02),
+      synthToneSamples(3200, 650, 0.12),
+    );
+    assert.equal(manager.verifyWakeSlice(ringWithTvSpeech, SPEAKER_SAMPLE_RATE, '星期五').matched, false);
+
+    // Stage 2 pure TV rejection
+    const tvCheck = manager.verifyAndTrimUtterance(tvSamples, SPEAKER_SAMPLE_RATE);
+    assert.equal(tvCheck.matched, false);
+
+    // Stage 2 tail trimming: 2.0s owner + 3.5s TV
+    const ownerThenTv = concatAudio(synthToneSamples(200, 2000), synthToneSamples(3200, 3500));
+    const trimmedRes = manager.verifyAndTrimUtterance(ownerThenTv, SPEAKER_SAMPLE_RATE);
+    assert.equal(trimmedRes.matched, true);
+    assert.equal(trimmedRes.speaker?.name, '主人');
+    assert.equal(trimmedRes.trimmed, true);
+    assert.ok(trimmedRes.samples.length <= Math.round(SPEAKER_SAMPLE_RATE * 2.9), `Expected TV tail trimmed (got ${trimmedRes.samples.length} samples)`);
+
+    // Stage 2 short prefix + long TV tail (1.0s owner + 4.0s TV) rescued by sliding window
+    const shortOwnerLongTv = concatAudio(synthToneSamples(200, 1000), synthToneSamples(3200, 4000));
+    const rescuedRes = manager.verifyAndTrimUtterance(shortOwnerLongTv, SPEAKER_SAMPLE_RATE);
+    assert.equal(rescuedRes.matched, true);
+    assert.equal(rescuedRes.speaker?.name, '主人');
+    assert.equal(rescuedRes.trimmed, true);
+    assert.ok(rescuedRes.samples.length <= Math.round(SPEAKER_SAMPLE_RATE * 1.9));
+
+    // Configure rename/role & removing owner promotes remaining member to owner
+    manager.configure({ threshold: 0.48, rename: { target: '老婆', name: '太太' } });
+    assert.equal(manager.findProfile('太太')?.name, '太太');
+    const removedOwner = manager.removeSpeaker('主人');
+    assert.equal(removedOwner.removed, true);
+    assert.equal(removedOwner.remaining, 1);
+    assert.equal(manager.findProfile('太太')?.role, 'owner');
+
+    // Interactive enrollment controller retries + cancel + completion
+    const ctrl = new XiaoaiSpeakerEnrollController({ stepTtlMs: 30_000 });
+    const prep = ctrl.createPreparingSession({ channelId: 'c1', targetId: 't1', speakerName: '小明', role: 'member', mode: 'replace' });
+    ctrl.activateSession(prep.sessionId);
+    const shortRes = ctrl.processSample({
+      channelId: 'c1',
+      targetId: 't1',
+      samples: synthToneSamples(200, 300),
+      transcript: '你好',
+      extractor: (s, sr) => manager.extractEmbedding(s, sr),
+    });
+    assert.equal(shortRes.outcome, 'retry');
+    const step1 = ctrl.processSample({
+      channelId: 'c1',
+      targetId: 't1',
+      samples: synthToneSamples(200, 1000),
+      transcript: '第一句声纹样本',
+      extractor: (s, sr) => manager.extractEmbedding(s, sr),
+    });
+    assert.equal(step1.outcome, 'next_step');
+    const mismatchTv = ctrl.processSample({
+      channelId: 'c1',
+      targetId: 't1',
+      samples: synthToneSamples(3200, 1000),
+      transcript: '电视插话',
+      extractor: (s, sr) => manager.extractEmbedding(s, sr),
+    });
+    assert.equal(mismatchTv.outcome, 'retry');
+    assert.equal(ctrl.isActive('c1', 't1'), true);
+    assert.equal(ctrl.processSample({
+      channelId: 'c1',
+      targetId: 't1',
+      transcript: '取消录入',
+      extractor: (s, sr) => manager.extractEmbedding(s, sr),
+    }).outcome, 'cancelled');
+
+    const cleared = manager.clearSpeakers();
+    assert.equal(cleared.cleared, 1);
+    manager.close();
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('XiaoAI E2E voiceprint enrollment, multi-speaker recognition, TV rejection, and poll bypass blocking', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-spk-e2e-'));
+  try {
+    const sshCalls: Array<{ targetId: string; command: string }> = [];
+    let simulateUnverifiedLogLine = false;
+    const sshRunner: XiaoaiSshRunner = async (target, remoteCommand) => {
+      sshCalls.push({ targetId: target.id, command: remoteCommand });
+      if (remoteCommand.includes('instruction.log')) {
+        return {
+          stdout: simulateUnverifiedLogLine ? '__LINE__:999:{"dialog_id":"log-tv","text":"星期五打开电视"}\n' : '',
+          stderr: '',
+          code: 0,
+        };
+      }
+      if (remoteCommand.includes('player_get_play_status')) {
+        return { stdout: '{"code":0,"info":"{ \\"status\\": 0 }"}', stderr: '', code: 0 };
+      }
+      return { stdout: '{"code":0}', stderr: '', code: 0 };
+    };
+
+    let audioStream: PassThrough | undefined;
+    const asrQueue = [
+      // 1. Pre-enrollment backward compatibility
+      '你好星期五，现在几点了',
+      // 2. Owner voice enrollment ("录入我的声纹" + 3 owner utterances)
+      '你好星期五，录入我的声纹',
+      '今天天气真不错，适合出门散步',
+      '明天早上记得提醒我喝水',
+      '帮我把客厅灯光调亮一点',
+      // 3. Wife voice enrollment triggered by owner ("帮老婆录入声纹" + 3 wife utterances)
+      '你好星期五，帮老婆录入声纹',
+      '我想周末去看电影',
+      '顺便帮我查一下明天下雨吗',
+      '晚饭记得多放点青菜',
+      // 4. Follow-up dialog initiated by owner ("今天安排提醒") -> TV speaks (rejected before ASR) -> wife replies
+      '你好星期五，今天安排提醒',
+      '买瓶牛奶',
+      // 5. Voice management: whoami (wife), list (owner), member clear denied (wife)
+      '你好星期五，我是谁',
+      '你好星期五，查看声纹列表',
+      '你好星期五，清空所有声纹',
+      // 6. TV remote mode: owner enters, TV noise rejected, owner presses down -> IR emitted
+      '你好星期五，遥控电视模式',
+      '往下',
+      '退出遥控',
+    ];
+    let asrCalls = 0;
+    const routerEvents: Array<{ text: string; speakerName?: string }> = [];
+
+    const customFactory: AgentFactory = {
+      mode: 'offline',
+      nativeTools: false,
+      async create(role, id, tools) {
+        if (role === 'router') {
+          return {
+            async prompt(rawPrompt) {
+              const event = JSON.parse(rawPrompt) as {
+                kind?: string;
+                message?: { text?: string; origin?: { speakerName?: string } };
+              };
+              if (event.kind === 'CHAT') {
+                const text = event.message?.text ?? '';
+                routerEvents.push({ text, speakerName: event.message?.origin?.speakerName });
+                if (text === '今天安排提醒') {
+                  return '好的，还有其他需要一起提醒的吗？[[ASK]]';
+                }
+                return `收到：${text}。`;
+              }
+              return '已处理。';
+            },
+            close() {},
+          };
+        }
+        return offlineFactory().create(role, id, tools);
+      },
+    };
+
+    const coordinator = new Coordinator(home, customFactory);
+    await coordinator.ready();
+    try {
+      const downCode = encodeXiaomiTvIrFrame(0x86, 0x06, 2).code;
+
+      coordinator.im.xiaoaiDeps = {
+        sshRunner,
+        kwsCooldownMs: 20,
+        kwsProbeDurationMs: 25,
+        kwsChimeDiscardMs: 20,
+        kwsEndSilenceMs: 40,
+        kwsMaxWaitSpeechMs: 1_200,
+        tvRemoteIdleTtlMs: 3_000,
+        tvRemoteCaptureWaitMs: 600,
+        tvRemoteStepIntervalMs: 10,
+        speakerEnrollWaitMs: 3_000,
+        speakerExtractorFactory: createBandSpeakerExtractorFactory(),
+        kwsStreamFactory: () => {
+          audioStream = new PassThrough();
+          return { stdout: audioStream, sampleFormat: 's16le', kill: () => audioStream?.end(), onClose: () => {} };
+        },
+        kwsSpotterFactory: () => {
+          const state = { wakeSamples: 0 };
+          const minWakeSamples = Math.round(SPEAKER_SAMPLE_RATE * 0.5);
+          return {
+            createStream: () => ({ state }),
+            acceptWaveform: (_s, samples) => {
+              let peak = 0;
+              for (const v of samples) {
+                const abs = Math.abs(v);
+                if (abs > peak) peak = abs;
+              }
+              if (peak >= 0.65) {
+                state.wakeSamples += samples.length;
+              } else if (state.wakeSamples < minWakeSamples) {
+                state.wakeSamples = 0;
+              }
+            },
+            isReady: () => state.wakeSamples >= minWakeSamples,
+            decode: () => {},
+            getResult: () => (state.wakeSamples >= minWakeSamples ? '你好星期五' : ''),
+            reset: () => { state.wakeSamples = 0; },
+          };
+        },
+        kwsRecognizerFactory: () => ({
+          transcribe: async () => {
+            asrCalls++;
+            return asrQueue.shift() ?? '';
+          },
+        }),
+      };
+
+      coordinator.im.saveChannel({
+        id: 'xiaoai-spk',
+        platform: 'xiaoai',
+        name: '客厅声纹小爱',
+        enabled: true,
+        notifyAll: false,
+        allowedSenders: ['lx06'],
+        apiBase: 'ssh://lx06=root@192.168.1.99?kws=1&chime=0',
+        defaultTarget: 'lx06',
+        pollIntervalMs: 50,
+      });
+      await until(() => Boolean(audioStream));
+
+      const ttsCommands = () => sshCalls
+        .filter(c => c.command.includes('text_to_speech'))
+        .map(c => c.command);
+      const irPlayCommands = () => sshCalls
+        .filter(c => c.command.includes('call ir_agent play'))
+        .map(c => c.command);
+
+      const pushChunked = async (samples: Float32Array, stepMs = 40) => {
+        const chunkLen = Math.round((SPEAKER_SAMPLE_RATE * stepMs) / 1000);
+        for (let off = 0; off < samples.length; off += chunkLen) {
+          audioStream!.write(encodeFloat32ToS16Le(samples.subarray(off, off + chunkLen)));
+        }
+      };
+      const sendSpokenTurn = async (freqHz: number, bodyMs = 1000, wake = true) => {
+        const parts: Float32Array[] = [];
+        if (wake) {
+          parts.push(synthToneSamples(freqHz, 600, 0.72));
+        }
+        parts.push(synthToneSamples(freqHz, bodyMs, 0.2));
+        parts.push(synthToneSamples(0, 160, 0));
+        await pushChunked(concatAudio(...parts));
+      };
+
+      // 1. Pre-enrollment wake + query passes unobstructed
+      await sendSpokenTurn(200, 600, true);
+      await until(() => routerEvents.length === 1 && ttsCommands().some(c => c.includes('收到：现在几点了')));
+      assert.equal(routerEvents[0]!.text, '现在几点了');
+      await delay(35);
+
+      // 2. Owner voice-triggered enrollment (no model needed because custom extractor factory is provided)
+      await sendSpokenTurn(200, 700, true);
+      await until(() => ttsCommands().some(c => c.includes('开始为主人录入声纹')));
+      await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-spk', 'lx06') === true);
+      for (const expectedPrompt of ['请说第 2 句', '请说第 3 句', '已保存主人的声纹']) {
+        await pushChunked(synthToneSamples(0, 200, 0)); // clear discard window
+        await sendSpokenTurn(200, 1000, false);
+        await until(() => ttsCommands().some(c => c.includes(expectedPrompt)));
+        if (expectedPrompt !== '已保存主人的声纹') {
+          await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-spk', 'lx06') === true);
+        }
+      }
+      await delay(35);
+
+      // 3. Stage 1 wake precheck rejects TV (3200Hz) completely -> zero ASR calls
+      const asrBeforeTvWake = asrCalls;
+      const tvWakeWait = ttsCommands().length;
+      await sendSpokenTurn(3200, 800, true);
+      await delay(80);
+      assert.equal(asrCalls, asrBeforeTvWake, 'TV wake phrase must be dropped at Stage 1 without waking ASR');
+      assert.equal(ttsCommands().length, tvWakeWait);
+
+      // 4. Owner enrolls family member '老婆' (800Hz) via voice
+      const ttsBeforeWife = ttsCommands().length;
+      await sendSpokenTurn(200, 700, true);
+      await until(() => ttsCommands().slice(ttsBeforeWife).some(c => c.includes('开始为老婆录入声纹')));
+      await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-spk', 'lx06') === true);
+      for (const expectedTts of ['第 1 句已收到', '第 2 句已收到', '已保存老婆的声纹']) {
+        await pushChunked(synthToneSamples(0, 200, 0));
+        await sendSpokenTurn(800, 1000, false);
+        await until(() => ttsCommands().slice(ttsBeforeWife).some(c => c.includes(expectedTts)));
+        if (expectedTts !== '已保存老婆的声纹') {
+          await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-spk', 'lx06') === true);
+        }
+      }
+      await delay(35);
+
+      const status = coordinator.im.getVoiceprintStatus();
+      assert.equal(status.active, true);
+      assert.deepEqual(
+        status.profiles.map(p => ({ name: p.name, role: p.role })),
+        [{ name: '主人', role: 'owner' }, { name: '老婆', role: 'member' }],
+      );
+
+      // 5. Owner opens follow-up window -> TV speaks 1.8s (rejected silently, window stays alive) -> Wife replies
+      await sendSpokenTurn(200, 700, true);
+      await until(() => routerEvents.length === 2 && ttsCommands().some(c => c.includes('还有其他需要一起提醒的吗')));
+      await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-spk', 'lx06') === true);
+      const asrBeforeFollowUpTv = asrCalls;
+      await pushChunked(synthToneSamples(0, 240, 0)); // clear discardMs (150ms)
+      await pushChunked(concatAudio(synthToneSamples(3200, 1650, 0.2), synthToneSamples(0, 120, 0))); // continuous TV dialogue rejected live without breaking follow-up
+      await delay(60);
+      assert.equal(asrCalls, asrBeforeFollowUpTv, 'TV crosstalk during follow-up must not call ASR');
+      assert.equal(coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-spk', 'lx06'), true, 'Follow-up window must stay open for real user');
+
+      await sendSpokenTurn(800, 700, false); // Wife answers inside re-armed follow-up window
+      await until(() => routerEvents.length === 3 && ttsCommands().some(c => c.includes('收到：买瓶牛奶')));
+      assert.deepEqual(routerEvents[2], { text: '买瓶牛奶', speakerName: '老婆' });
+      await delay(35);
+
+      // 6. Voice commands: whoami (wife), list (owner), member denied clear (wife)
+      const ttsBeforeWhoami = ttsCommands().length;
+      await sendSpokenTurn(800, 700, true);
+      await until(() => ttsCommands().slice(ttsBeforeWhoami).some(c => c.includes('你是老婆')));
+      await delay(35);
+
+      const ttsBeforeList = ttsCommands().length;
+      await sendSpokenTurn(200, 700, true);
+      await until(() => ttsCommands().slice(ttsBeforeList).some(c => c.includes('主人（主人）') && c.includes('老婆')));
+      await delay(35);
+
+      const ttsBeforeDenied = ttsCommands().length;
+      await sendSpokenTurn(800, 700, true);
+      await until(() => ttsCommands().slice(ttsBeforeDenied).some(c => c.includes('只有主人或命令行可以清空全部声纹')));
+      assert.equal(coordinator.im.getVoiceprintStatus().profiles.length, 2);
+      await delay(35);
+
+      // 7. TV remote mode ignores TV dialogue and still accepts owner's key press
+      await sendSpokenTurn(200, 700, true);
+      await until(() => ttsCommands().some(c => c.includes('已进入遥控模式')));
+      await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-spk', 'lx06') === true);
+      await pushChunked(synthToneSamples(0, 200, 0));
+      await pushChunked(concatAudio(synthToneSamples(3200, 1650, 0.2), synthToneSamples(0, 120, 0))); // TV rejected in remote mode
+      await delay(60);
+      assert.equal(irPlayCommands().length, 0);
+      assert.equal(coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-spk', 'lx06'), true);
+
+      await sendSpokenTurn(200, 500, false); // Owner says "往下"
+      await until(() => irPlayCommands().length === 1);
+      assert.ok(irPlayCommands()[0]!.includes(downCode));
+      await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-spk', 'lx06') === true);
+      await sendSpokenTurn(200, 500, false); // "退出遥控"
+      await until(() => ttsCommands().some(c => c.includes('已退出遥控')));
+
+      // 8. Unverified instruction.log polling is suppressed while speaker gate is active on KWS SSH channel
+      const routerCountBeforeLog = routerEvents.length;
+      simulateUnverifiedLogLine = true;
+      await delay(180);
+      assert.equal(routerEvents.length, routerCountBeforeLog, 'instruction.log polling must be suppressed when speaker verification is active');
+    } finally {
+      await coordinator.close();
+    }
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('Daemon IPC voice-status, voice-config, voice-remove, and voice-clear commands work end-to-end', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-spk-ipc-'));
+  try {
+    const seededManager = new XiaoaiSpeakerManager({ homeDir: home });
+    seededManager.enrollEmbeddings({ name: '主人', role: 'owner', embeddings: [new Float32Array([1, 0, 0, 0])] });
+    seededManager.enrollEmbeddings({ name: '爸爸', role: 'member', embeddings: [new Float32Array([0, 1, 0, 0])] });
+    seededManager.close();
+
+    const daemon = await serve({ home, mode: 'offline' });
+    try {
+      const initial = await request(home, { command: 'voice-status' }) as {
+        enabled: boolean;
+        threshold: number;
+        profiles: Array<{ name: string; role: string }>;
+      };
+      assert.equal(initial.enabled, true);
+      assert.equal(initial.profiles.length, 2);
+
+      const configured = await request(home, {
+        command: 'voice-config',
+        threshold: 0.52,
+        wakePrecheck: false,
+        renameTarget: '爸爸',
+        renameName: '爷爷',
+      }) as {
+        threshold: number;
+        wakePrecheck: boolean;
+        profiles: Array<{ name: string; role: string }>;
+      };
+      assert.equal(configured.threshold, 0.52);
+      assert.equal(configured.wakePrecheck, false);
+      assert.ok(configured.profiles.some(p => p.name === '爷爷'));
+
+      const removed = await request(home, { command: 'voice-remove', target: '爷爷' }) as {
+        removed: boolean;
+        id?: string;
+        name?: string;
+        remaining: number;
+      };
+      assert.equal(removed.removed, true);
+      assert.equal(removed.name, '爷爷');
+      assert.equal(removed.remaining, 1);
+      assert.ok(typeof removed.id === 'string' && removed.id.startsWith('spk-'));
+
+      const cleared = await request(home, { command: 'voice-clear' }) as { cleared: number };
+      assert.equal(cleared.cleared, 1);
+    } finally {
+      await daemon.close();
+    }
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('XiaoaiKwsMonitor adaptive endpointing tolerates 1050ms mid-sentence pause in slow speech before closing cleanly', async () => {
+  assert.equal(DEFAULT_END_SILENCE_MS, 900);
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-slow-vad-'));
+  try {
+    let audioStream: PassThrough | undefined;
+    let wakeCount = 0;
+    const utterances: Array<{ text: string; durSec: number }> = [];
+    const monitor = new XiaoaiKwsMonitor({
+      homeDir: home,
+      cooldownMs: 20,
+      probeDurationMs: 25,
+      chimeDiscardMs: 10,
+      maxWaitSpeechMs: 2_000,
+      speechRmsThreshold: 0.01,
+      streamFactory: () => {
+        audioStream = new PassThrough();
+        return {
+          stdout: audioStream,
+          sampleFormat: 's16le',
+          kill: () => audioStream?.end(),
+          onClose: () => {},
+        };
+      },
+      spotterFactory: () => {
+        const state = { peak: 0 };
+        return {
+          createStream: () => ({ state }),
+          acceptWaveform: (_s, samples) => {
+            for (const v of samples) {
+              const abs = Math.abs(v);
+              if (abs > state.peak) state.peak = abs;
+            }
+          },
+          isReady: () => state.peak >= 0.4,
+          decode: () => {},
+          getResult: () => (state.peak >= 0.4 ? '星期五' : ''),
+          reset: () => { state.peak = 0; },
+        };
+      },
+      vadFactory: ({ speechRmsThreshold }) => ({
+        isSpeech: (samples) => computeRms(samples) >= speechRmsThreshold,
+        reset: () => {},
+      }),
+      recognizerFactory: () => ({
+        transcribe: async (samples, sampleRate) => {
+          const durSec = samples.length / sampleRate;
+          const text = durSec >= 1.8 ? '空气炸锅200度5分钟。' : '空气炸锅。';
+          utterances.push({ text, durSec });
+          return text;
+        },
+      }),
+      onWake: async () => {
+        wakeCount++;
+        return { woken: true, suppressed: false };
+      },
+    });
+    monitor.sync([{
+      id: 'xiaoai-slow',
+      platform: 'xiaoai',
+      name: '慢语速断句测试',
+      enabled: true,
+      notifyAll: false,
+      allowedSenders: [],
+      apiBase: 'ssh://lx06=root@192.168.31.104',
+      inboundCount: 0,
+      outboundCount: 0,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }]);
+    await until(() => Boolean(audioStream));
+
+    const writeS16 = (amp: number, samplesCount: number) => {
+      const buf = Buffer.alloc(samplesCount * 2);
+      for (let i = 0; i < samplesCount; i++) {
+        const val = amp === 0 ? 0 : amp * Math.sin((2 * Math.PI * 500 * i) / 16000);
+        buf.writeInt16LE(Math.round(val * 32767), i * 2);
+      }
+      audioStream!.write(buf);
+    };
+    const writeChunks = (amp: number, count: number, chunkSamples = 1600) => {
+      for (let i = 0; i < count; i++) writeS16(amp, chunkSamples);
+    };
+
+    // Trigger wake -> probe silence -> transition to capturing -> discard 10ms chime
+    writeS16(0.5, 400);
+    writeS16(0, 480);
+    await until(() => wakeCount === 1);
+    await delay(20);
+    writeS16(0, 160);
+
+    // Part 1: 600ms speech ("空气炸锅") followed by 1050ms mid-sentence pause while thinking of parameters
+    writeChunks(0.3, 6, 1600);
+    writeChunks(0, 10, 1600);
+    writeS16(0, 800);
+    await delay(30);
+    assert.equal(utterances.length, 0, 'short utterance (<1.8s) must NOT cut off during 1050ms mid-sentence pause');
+    assert.equal(monitor.isCapturing('xiaoai-slow', 'lx06'), true);
+
+    // Part 2: 700ms continuation ("200度5分钟"), then 950ms trailing silence closes the full utterance once
+    writeChunks(0.3, 7, 1600);
+    writeChunks(0, 9, 1600);
+    writeS16(0, 800);
+    await until(() => utterances.length === 1);
+    await delay(30);
+    assert.equal(utterances.length, 1);
+    assert.equal(utterances[0]!.text, '空气炸锅200度5分钟。');
+    assert.ok(utterances[0]!.durSec >= 2.0, `expected combined slow utterance >= 2.0s, got ${utterances[0]!.durSec.toFixed(2)}s`);
+    monitor.close();
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('XiaoAI KWS ASR wake rescue catches missed bare "星期五" and one-breath commands while blocking TV via speaker gate', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-rescue-'));
+  try {
+    const extractorFactory = createBandSpeakerExtractorFactory();
+    const manager = new XiaoaiSpeakerManager({ homeDir: home, extractorFactory });
+    const ownerEmb = manager.extractEmbedding(synthToneSamples(200, 1200))!;
+    manager.enrollEmbeddings({ name: '主人', role: 'owner', embeddings: [ownerEmb] });
+
+    let audioStream: PassThrough | undefined;
+    let asrCalls = 0;
+    const asrQueue = ['星期五。', '退下呗。', '星期五，打开客厅灯'];
+    const wakeEvents: Array<{ keyword: string; chime?: boolean }> = [];
+    const cancelEvents: Array<{ keyword: string; reason: string; text?: string }> = [];
+    const utteranceEvents: Array<{ keyword: string; text: string; explicitWake?: boolean }> = [];
+
+    const channel: ImChannelConfig = {
+      id: 'xiaoai-rescue',
+      platform: 'xiaoai',
+      name: '小爱唤醒兜底测试',
+      enabled: true,
+      notifyAll: false,
+      allowedSenders: [],
+      apiBase: 'ssh://lx06=root@192.168.31.104',
+      inboundCount: 0,
+      outboundCount: 0,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+
+    const monitor = new XiaoaiKwsMonitor({
+      homeDir: home,
+      cooldownMs: 40,
+      probeDurationMs: 25,
+      chimeDiscardMs: 20,
+      maxWaitSpeechMs: 1_500,
+      endSilenceMs: 60,
+      asrWakeRescue: true,
+      streamFactory: () => {
+        audioStream = new PassThrough();
+        return { stdout: audioStream, sampleFormat: 's16le', kill: () => audioStream?.end(), onClose: () => {} };
+      },
+      spotterFactory: () => ({
+        createStream: () => ({}),
+        acceptWaveform: () => {},
+        isReady: () => false,
+        decode: () => {},
+        getResult: () => '',
+        reset: () => {},
+      }),
+      recognizerFactory: () => ({
+        transcribe: async () => {
+          asrCalls++;
+          return asrQueue.shift() ?? '';
+        },
+      }),
+      vadFactory: () => ({
+        isSpeech: (samples) => computeRms(samples) >= 0.02,
+        reset: () => {},
+      }),
+      speakerGate: {
+        isActive: () => manager.isVerificationActive(),
+        verifyWake: ({ keyword, samples, sampleRate }) => manager.verifyWakeSlice(samples, sampleRate, keyword),
+        verifyUtterance: ({ samples, sampleRate }) => manager.verifyAndTrimUtterance(samples, sampleRate),
+      },
+      onWake: async (ev) => {
+        wakeEvents.push({ keyword: ev.keyword, chime: ev.chime });
+        return { woken: true, suppressed: false };
+      },
+      onCaptureCancel: (ev) => {
+        cancelEvents.push({ keyword: ev.keyword, reason: ev.reason, ...(ev.text ? { text: ev.text } : {}) });
+      },
+      onUtterance: (ev) => {
+        utteranceEvents.push({ keyword: ev.keyword, text: ev.text, explicitWake: ev.explicitWake });
+      },
+    });
+
+    monitor.sync([channel]);
+    await until(() => Boolean(audioStream));
+
+    const writeChunkedTone = (freqHz: number, totalMs: number, amp: number, chunkMs = 50) => {
+      for (let off = 0; off < totalMs; off += chunkMs) {
+        const dur = Math.min(chunkMs, totalMs - off);
+        audioStream!.write(encodeFloat32ToS16Le(synthToneSamples(freqHz, dur, amp)));
+      }
+    };
+
+    // 1. 700ms TV dialogue (3200Hz) + 350ms silence -> blocked at speaker gate BEFORE ASR (asrCalls stays 0)
+    writeChunkedTone(3200, 700, 0.2);
+    writeChunkedTone(0, 350, 0);
+    await delay(40);
+    assert.equal(asrCalls, 0, 'TV audio must be rejected by speaker gate before invoking ASR wake rescue');
+    assert.equal(wakeEvents.length, 0);
+
+    // 2. 650ms owner bare "星期五" + 350ms silence (Zipformer missed) -> SenseVoice rescues bare wake
+    writeChunkedTone(200, 650, 0.2);
+    writeChunkedTone(0, 350, 0);
+    await until(() => wakeEvents.length === 1 && monitor.isCapturing('xiaoai-rescue', 'lx06'));
+    assert.equal(asrCalls, 1);
+    assert.deepEqual(wakeEvents[0], { keyword: '星期五', chime: true });
+
+    // 3. Flush chime discard then say "退下呗。" -> dismisses cleanly without invoking Router
+    await delay(25);
+    writeChunkedTone(0, 40, 0);
+    writeChunkedTone(200, 500, 0.2);
+    writeChunkedTone(0, 200, 0);
+    await until(() => cancelEvents.length === 1);
+    assert.equal(cancelEvents[0]!.reason, 'cancel');
+    assert.equal(cancelEvents[0]!.text, '退下呗。');
+    assert.equal(utteranceEvents.length, 0);
+
+    // 4. Past cooldown: 1200ms owner one-breath "星期五，打开客厅灯" -> direct command emission
+    await delay(60);
+    writeChunkedTone(200, 1200, 0.2);
+    writeChunkedTone(0, 350, 0);
+    await until(() => utteranceEvents.length === 1);
+    assert.equal(wakeEvents.length, 2);
+    assert.deepEqual(wakeEvents[1], { keyword: '星期五', chime: false });
+    assert.deepEqual(utteranceEvents[0], {
+      keyword: '星期五',
+      text: '打开客厅灯',
+      explicitWake: true,
+    });
+    monitor.close();
+  } finally {
     await rm(home, { recursive: true, force: true });
   }
 });

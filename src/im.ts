@@ -6,14 +6,49 @@ import { deliverWechatFile } from './wechat-file.js';
 import type { Coordinator } from './coordinator.js';
 import { renderQrSvgDataUrl, renderQrTerminal } from './qrcode.js';
 import type { ImChannelConfig } from './store.js';
-import type { ChatMessage, ImChannelView, ImPlatform, WechatQrLoginSession } from './view.js';
+import type { ChatMessage, ImChannelView, ImPlatform, MessageOrigin, WechatQrLoginSession } from './view.js';
 import {
+  bumpXiaoaiSpeechEpoch,
+  handleXiaoaiKeywordWake,
   isXiaoaiPollable,
+  parseXiaoaiApiOptions,
+  parseXiaoaiSshTargets,
   parseXiaoaiWebhookPayload,
   pollXiaoaiChannel,
   sendXiaoaiSpeech,
+  setXiaoaiSpeakerLed,
+  shouldContinueXiaoaiDialog,
+  stripXiaoaiDialogDirective,
   type XiaoaiSshRunner,
 } from './xiaoai.js';
+import {
+  XiaoaiKwsMonitor,
+  type XiaoaiKwsMonitorOptions,
+  type XiaoaiMatchedSpeaker,
+} from './xiaoai-kws.js';
+import {
+  parseSpeakerVoiceCommand,
+  XiaoaiSpeakerEnrollController,
+  XiaoaiSpeakerManager,
+  type XiaoaiEnrollSessionSnapshot,
+  type XiaoaiSpeakerExtractor,
+  type XiaoaiSpeakerStatus,
+} from './xiaoai-speaker.js';
+import {
+  DEFAULT_TV_REMOTE_IDLE_TTL_MS,
+  isAssistantTvRemoteActivation,
+  loadTvIrRuntimeSettings,
+  parseTvRemoteEntryUtterance,
+  parseTvRemoteInModeUtterance,
+  XiaoaiTvRemoteController,
+} from './xiaoai-tv-remote.js';
+import {
+  createDefaultMiotRunner,
+  executeXiaoaiMiotFastpath,
+  parseXiaoaiMiotUtterance,
+  type XiaoaiMiotRunner,
+} from './xiaoai-miot-fastpath.js';
+import { assignInitialMessageSessionSync } from './session.js';
 
 export const DEFAULT_WECHAT_ILINK_BASE = 'https://ilinkai.weixin.qq.com';
 const WECHAT_TYPING_KEEPALIVE_MS = 5_000;
@@ -27,6 +62,10 @@ export interface ImInboundMessage {
   senderUsername?: string;
   target?: string;
   text: string;
+  explicitWake?: boolean;
+  speaker?: XiaoaiMatchedSpeaker;
+  samples?: Float32Array;
+  sampleRate?: number;
   replyWebhook?: string;
   contextToken?: string;
   mediaItems?: Record<string, unknown>[];
@@ -85,18 +124,54 @@ function buildWechatIlinkHeaders(botToken: string): Record<string, string> {
 }
 
 export class ImGateway {
-  xiaoaiDeps?: { sshRunner?: XiaoaiSshRunner; fetchImpl?: typeof fetch };
+  xiaoaiDeps?: {
+    sshRunner?: XiaoaiSshRunner;
+    fetchImpl?: typeof fetch;
+    kwsStreamFactory?: XiaoaiKwsMonitorOptions['streamFactory'];
+    kwsSpotterFactory?: XiaoaiKwsMonitorOptions['spotterFactory'];
+    kwsRecognizerFactory?: XiaoaiKwsMonitorOptions['recognizerFactory'];
+    kwsVadFactory?: XiaoaiKwsMonitorOptions['vadFactory'];
+    kwsModelsDir?: string;
+    kwsKeywordsFile?: string;
+    kwsAsrModelsDir?: string;
+    kwsVadModelPath?: string;
+    kwsCooldownMs?: number;
+    kwsProbeDurationMs?: number;
+    kwsChimeDiscardMs?: number;
+    kwsMaxWaitSpeechMs?: number;
+    kwsEndSilenceMs?: number;
+    tvRemoteIdleTtlMs?: number;
+    tvRemoteCaptureWaitMs?: number;
+    tvRemoteStepIntervalMs?: number;
+    speakerModelsDir?: string;
+    speakerRegistryPath?: string;
+    speakerExtractorFactory?: (config: { modelPath: string }) => XiaoaiSpeakerExtractor;
+    speakerMinEnrollMs?: number;
+    speakerEnrollWaitMs?: number;
+    /** Test hook: replaces the lazily-loaded `plugins/miot` runner used by the zero-LLM fast path. */
+    miotRunner?: XiaoaiMiotRunner;
+  };
   private trustedFileRequests = new WeakSet<ImInboundMessage>();
   private trustedMediaRequests = new WeakSet<ImInboundMessage>();
   private cursor = 0;
   private watchTimer?: ReturnType<typeof setInterval>;
   private pollTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private pollingActive = new Set<string>();
+  private xiaoaiKwsMonitor?: XiaoaiKwsMonitor;
+  private xiaoaiKwsDepsRef?: ImGateway['xiaoaiDeps'];
+  private xiaoaiSpeakerManager?: XiaoaiSpeakerManager;
+  private xiaoaiSpeakerDepsRef?: ImGateway['xiaoaiDeps'];
+  private readonly xiaoaiSpeakerEnroll = new XiaoaiSpeakerEnrollController();
+  private readonly xiaoaiTvRemote = new XiaoaiTvRemoteController();
+  private readonly xiaoaiPendingFryer = new Map<string, { tempC?: number; minutes?: number; expiresAt: number }>();
   private seenMessageVersions = new Map<string, number>();
   private wechatQrSessions = new Map<string, InternalWechatQrSession>();
   private wechatTypingTickets = new Map<string, WechatTypingTicketEntry>();
   private wechatTypingSessions = new Map<string, WechatTypingSession>();
   private typingKeepaliveMs = WECHAT_TYPING_KEEPALIVE_MS;
+  private flushingOutbound = false;
+  private pendingOutboundFlush = false;
+  private readonly xiaoaiOutboundChains = new Map<string, Promise<void>>();
   private closing = false;
 
   constructor(private readonly coordinator: Coordinator) {}
@@ -115,6 +190,14 @@ export class ImGateway {
 
   async close() {
     this.closing = true;
+    this.xiaoaiKwsMonitor?.close();
+    this.xiaoaiKwsMonitor = undefined;
+    this.xiaoaiKwsDepsRef = undefined;
+    this.xiaoaiSpeakerManager?.close();
+    this.xiaoaiSpeakerManager = undefined;
+    this.xiaoaiSpeakerDepsRef = undefined;
+    this.xiaoaiSpeakerEnroll.clear();
+    this.xiaoaiPendingFryer.clear();
     if (this.watchTimer) clearInterval(this.watchTimer);
     for (const timer of this.pollTimers.values()) clearTimeout(timer);
     this.pollTimers.clear();
@@ -126,6 +209,8 @@ export class ImGateway {
     }
     this.wechatTypingSessions.clear();
     this.wechatTypingTickets.clear();
+    this.xiaoaiOutboundChains.clear();
+    this.xiaoaiTvRemote.clear();
   }
 
   listChannels(): ImChannelView[] {
@@ -418,7 +503,7 @@ export class ImGateway {
   async sendToChannel(
     channelId: string,
     text: string,
-    options?: { target?: string; replyToMessageId?: string; replyWebhook?: string; contextToken?: string },
+    options?: { target?: string; replyToMessageId?: string; replyWebhook?: string; contextToken?: string; waitForCompletion?: boolean },
   ): Promise<void> {
     const channel = this.coordinator.store.getImChannel(channelId);
     const explicitTarget = options?.target && options.target !== 'default' ? options.target : undefined;
@@ -529,6 +614,7 @@ export class ImGateway {
           target,
           replyToMessageId: options?.replyToMessageId,
           replyWebhook: options?.replyWebhook,
+          waitForCompletion: options?.waitForCompletion,
           ...this.xiaoaiDeps,
         });
       }
@@ -849,6 +935,15 @@ export class ImGateway {
       contextToken: inbound.contextToken,
     };
 
+    if (channel.platform === 'xiaoai' && !inbound.mediaItems?.length) {
+      const speakerVoiceResult = await this.tryHandleXiaoaiSpeakerVoice(channel, inbound);
+      if (speakerVoiceResult) return speakerVoiceResult;
+      const tvRemoteResult = await this.tryHandleXiaoaiTvRemote(channel, inbound);
+      if (tvRemoteResult) return tvRemoteResult;
+      const miotFastResult = await this.tryHandleXiaoaiMiotFastpath(channel, inbound, requestId);
+      if (miotFastResult) return miotFastResult;
+    }
+
     // Only explicit local staging + exact sender authorization can release a file.
     if (rawText.startsWith('/file ')) {
       const root = this.wechatAttachmentDir();
@@ -901,6 +996,7 @@ export class ImGateway {
       accountId: channel.accountId,
       conversationId: inbound.target ?? inbound.senderId,
       senderId: inbound.senderId,
+      ...(inbound.speaker ? { speakerId: inbound.speaker.id, speakerName: inbound.speaker.name } : {}),
       replyToMessageId: inbound.externalId,
       replyWebhook: inbound.replyWebhook,
       contextToken: inbound.contextToken,
@@ -1014,75 +1110,1023 @@ export class ImGateway {
     }
   }
 
-  private async flushOutboundUpdates() {
-    if (this.closing) return;
-    const events = this.coordinator.store.conversation.trace({}, this.cursor);
-    if (!events.length) return;
-    this.cursor = events.at(-1)?.seq ?? this.cursor;
+  private async waitForXiaoaiCaptureIdle(channelId: string, targetId: string, maxWaitMs = 10_000): Promise<void> {
+    const deadline = Date.now() + maxWaitMs;
+    while (!this.closing && this.xiaoaiKwsMonitor?.isCapturing(channelId, targetId) && Date.now() < deadline) {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 60);
+        timer.unref();
+      });
+    }
+  }
 
-    const messageIds = [...new Set(
-      events
-        .filter(e => e.type === 'message')
-        .map(e => e.messageId)
-        .filter((id): id is string => Boolean(id)),
-    )];
-
-    const settledTypingReleases: Array<{ channelId: string; target: string; ref: string }> = [];
-
-    for (const id of messageIds) {
-      let msg: ChatMessage;
+  private hasNewerSpeakerUserMessage(msg: ChatMessage): boolean {
+    const route = msg.origin;
+    if (!route?.channelId || !route.conversationId) return false;
+    let replyToSeq = msg.seq;
+    if (msg.replyTo) {
       try {
-        msg = this.coordinator.store.conversation.get(id);
+        replyToSeq = this.coordinator.store.conversation.get(msg.replyTo).seq;
       } catch {
-        for (const [key, session] of this.wechatTypingSessions.entries()) {
-          if (session.activeRefs.has(`msg:${id}`)) {
-            const [chId, target] = key.split('\0');
-            if (chId && target) settledTypingReleases.push({ channelId: chId, target, ref: `msg:${id}` });
+        replyToSeq = msg.seq;
+      }
+    }
+    const items = this.coordinator.store.conversation.history(undefined, 16).items;
+    return items.some((item) =>
+      item.role === 'user'
+      && item.seq > replyToSeq
+      && item.origin?.channel === 'xiaoai'
+      && item.origin.channelId === route.channelId
+      && item.origin.conversationId === route.conversationId);
+  }
+
+  private isBackgroundTaskDeliveryMessage(msg: ChatMessage): boolean {
+    if (!msg.taskIds?.length) return false;
+    return msg.taskIds.some((taskId) => {
+      try {
+        const task = this.coordinator.store.get(taskId);
+        return ['completed', 'failed', 'paused', 'cancelled'].includes(task.status) || Boolean(task.pendingQuestion);
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  private hasPendingWorkerQuestion(msg: ChatMessage): boolean {
+    if (!msg.taskIds?.length) return false;
+    return msg.taskIds.some((taskId) => {
+      try {
+        return Boolean(this.coordinator.store.get(taskId).pendingQuestion);
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  private armXiaoaiTvRemoteCapture(
+    channelId: string,
+    target: { id: string; userHost: string; port?: number },
+    options?: { discardMs?: number; refreshLed?: boolean; allowDuringTranscribe?: boolean },
+  ): Promise<void> | undefined {
+    const remaining = this.xiaoaiTvRemote.remainingMs(channelId, target.id);
+    if (remaining <= 0 || this.closing || !this.xiaoaiKwsMonitor) {
+      return undefined;
+    }
+    const configuredWaitMs = this.xiaoaiDeps?.tvRemoteCaptureWaitMs ?? 10_000;
+    const waitMs = Math.max(200, Math.min(configuredWaitMs, remaining));
+    const endSilenceMs = Math.min(this.xiaoaiDeps?.kwsEndSilenceMs ?? 280, 280);
+    const entered = this.xiaoaiKwsMonitor.enterFollowUpCapture(channelId, target.id, {
+      waitMs,
+      discardMs: options?.discardMs ?? 0,
+      endSilenceMs,
+      maxUtteranceMs: 2_800,
+      allowDuringTranscribe: options?.allowDuringTranscribe ?? true,
+    });
+    if (!entered) return undefined;
+    if (options?.refreshLed) {
+      return setXiaoaiSpeakerLed(target, 'listen', this.xiaoaiDeps?.sshRunner);
+    }
+    return Promise.resolve();
+  }
+
+  private xiaoaiMiotMode?: 'real' | 'offline';
+
+  private getXiaoaiMiotRunner(): XiaoaiMiotRunner {
+    return this.xiaoaiDeps?.miotRunner
+      ?? createDefaultMiotRunner({ homeDir: this.coordinator.store.home });
+  }
+
+  /**
+   * Zero-LLM smart-home fast path: deterministic MiOT utterances (air fryer / AC / lights / outlets)
+   * run straight through `plugins/miot` and are spoken back without waking the Router.
+   * Returns `undefined` to fall through to the Router for anything it does not own.
+   */
+  private async tryHandleXiaoaiMiotFastpath(
+    channel: ImChannelConfig,
+    inbound: ImInboundMessage,
+    requestId: string,
+  ): Promise<{ ok: boolean; action: string; messageId?: string } | undefined> {
+    const targetId = inbound.target ?? inbound.senderId;
+    if (this.xiaoaiTvRemote.isActive(channel.id, targetId) || this.xiaoaiSpeakerEnroll.isActive(channel.id, targetId)) {
+      return undefined;
+    }
+    const slotKey = `${channel.id}:${targetId}`;
+    const rawSlot = this.xiaoaiPendingFryer.get(slotKey);
+    const activeSlot = rawSlot && rawSlot.expiresAt > Date.now()
+      ? { tempC: rawSlot.tempC, minutes: rawSlot.minutes }
+      : undefined;
+    if (rawSlot && !activeSlot) {
+      this.xiaoaiPendingFryer.delete(slotKey);
+    }
+    const intent = parseXiaoaiMiotUtterance(inbound.text, activeSlot);
+    if (!intent) {
+      this.xiaoaiPendingFryer.delete(slotKey);
+      return undefined;
+    }
+
+    let outcome;
+    try {
+      outcome = await executeXiaoaiMiotFastpath(intent, { runMiot: this.getXiaoaiMiotRunner() });
+    } catch {
+      return undefined;
+    }
+    if (this.closing || !outcome.handled || !outcome.speech) return undefined;
+    const { speech, followUp = false, actionName, pendingFryer } = outcome;
+    if (actionName === 'cook_clarify' && pendingFryer) {
+      this.xiaoaiPendingFryer.set(slotKey, { ...pendingFryer, expiresAt: Date.now() + 45_000 });
+    } else {
+      this.xiaoaiPendingFryer.delete(slotKey);
+    }
+
+    const store = this.coordinator.store;
+    const chat = store.conversation;
+    if (!this.xiaoaiMiotMode) {
+      try { this.xiaoaiMiotMode = this.coordinator.view().mode; } catch { this.xiaoaiMiotMode = 'real'; }
+    }
+    const mode = this.xiaoaiMiotMode ?? 'real';
+    const inboundOrigin: MessageOrigin = {
+      channel: channel.platform,
+      channelId: channel.id,
+      accountId: channel.accountId,
+      conversationId: inbound.target ?? inbound.senderId,
+      senderId: inbound.senderId,
+      ...(inbound.speaker ? { speakerId: inbound.speaker.id, speakerName: inbound.speaker.name } : {}),
+      replyToMessageId: inbound.externalId,
+      replyWebhook: inbound.replyWebhook,
+      contextToken: inbound.contextToken,
+    };
+    const userId = randomUUID();
+    const replyId = randomUUID();
+    const at = Date.now();
+    // The reply is spoken directly below; mark it as already delivered so flushOutboundUpdates() never replays it.
+    this.seenMessageVersions.set(replyId, Number.MAX_SAFE_INTEGER);
+    let userMsg: ChatMessage;
+    try {
+      userMsg = store.transaction(() => {
+        const session = assignInitialMessageSessionSync(
+          store,
+          { id: userId, text: inbound.text, origin: inboundOrigin, source: 'router', at },
+          store.list(),
+        );
+        const created = chat.create({
+          id: userId,
+          requestId,
+          role: 'user',
+          origin: inboundOrigin,
+          sessionId: session.sessionId,
+          ...(session.sessionLink ? { sessionLink: session.sessionLink } : {}),
+          text: inbound.text,
+          status: 'completed',
+          paths: [],
+          mode,
+          at,
+          routing: {
+            at,
+            status: 'completed',
+            actions: [],
+            context: { execution: 'native', cwd: process.cwd(), totalWorks: 0, truncated: false, works: [], messages: [] },
+          },
+        });
+        chat.create({
+          id: replyId,
+          role: 'assistant',
+          replyTo: userId,
+          text: `${speech} ${followUp ? '[[LISTEN]]' : '[[END]]'}`,
+          status: 'completed',
+          origin: inboundOrigin,
+          sessionId: session.sessionId,
+          paths: [],
+          mode,
+          at: at + 1,
+        });
+        chat.routeAction(userId, {
+          id: randomUUID(),
+          kind: 'plugin',
+          status: 'accepted',
+          at,
+          summary: `miot.${actionName ?? intent.kind} (xiaoai fast path)`,
+        });
+        return created;
+      });
+    } catch {
+      this.seenMessageVersions.delete(replyId);
+      return undefined;
+    }
+
+    this.enqueueXiaoaiDirectSpeech(
+      channel.id,
+      targetId,
+      speech,
+      followUp ? { followUpWaitMs: 10_000, discardMs: 150 } : undefined,
+    );
+    return { ok: true, action: 'xiaoai_miot_fastpath', messageId: userMsg.id };
+  }
+
+  private async tryHandleXiaoaiTvRemote(
+    channel: ImChannelConfig,
+    inbound: ImInboundMessage,
+  ): Promise<{ ok: boolean; action: string } | undefined> {
+    const targetId = inbound.target ?? inbound.senderId;
+    const targets = parseXiaoaiSshTargets(channel.apiBase);
+    const speakerTarget = targets.find(t => t.id === targetId || t.userHost === targetId) ?? targets[0];
+    const idleTtlMs = this.xiaoaiDeps?.tvRemoteIdleTtlMs ?? DEFAULT_TV_REMOTE_IDLE_TTL_MS;
+    const settings = loadTvIrRuntimeSettings(this.coordinator.store.home);
+    const keyOpts = { defaultFrames: settings.config.defaultFrames };
+
+    if (this.xiaoaiTvRemote.isActive(channel.id, targetId)) {
+      const parsed = parseTvRemoteInModeUtterance(inbound.text, settings.learnedKeys, keyOpts);
+
+      if (parsed.kind === 'exit') {
+        this.xiaoaiTvRemote.deactivate(channel.id, targetId);
+        const key = `${channel.id}:${targetId}`;
+        const prev = this.xiaoaiOutboundChains.get(key) ?? Promise.resolve();
+        const next = prev.catch(() => {}).then(async () => {
+          if (this.closing) return;
+          await this.waitForXiaoaiCaptureIdle(channel.id, targetId);
+          if (this.closing) return;
+          try {
+            const ch = this.coordinator.store.getImChannel(channel.id);
+            if (ch.enabled && ch.platform === 'xiaoai') {
+              await this.sendToChannel(ch.id, '已退出遥控。', {
+                target: targetId,
+                replyToMessageId: inbound.externalId,
+                replyWebhook: inbound.replyWebhook,
+                contextToken: inbound.contextToken,
+                waitForCompletion: false,
+              });
+            }
+          } catch {
+            if (speakerTarget) {
+              await setXiaoaiSpeakerLed(speakerTarget, 'off', this.xiaoaiDeps?.sshRunner);
+            }
           }
-        }
-        continue;
+        }).finally(() => {
+          if (this.xiaoaiOutboundChains.get(key) === next) {
+            this.xiaoaiOutboundChains.delete(key);
+          }
+        });
+        this.xiaoaiOutboundChains.set(key, next);
+        return { ok: true, action: 'tv_remote_exited' };
       }
-      if (msg.origin?.channel === 'wechat' && msg.origin.channelId && msg.origin.conversationId && !msg.origin.replyWebhook) {
-        const active = (msg.role === 'user' && ['queued', 'processing'].includes(msg.status))
-          || (msg.role === 'assistant' && msg.status === 'streaming');
-        if (active) {
-          this.retainWechatTyping(msg.origin.channelId, msg.origin.conversationId, `msg:${msg.id}`, msg.origin.contextToken);
-        } else if (['completed', 'failed', 'interrupted'].includes(msg.status)) {
-          settledTypingReleases.push({
-            channelId: msg.origin.channelId,
-            target: msg.origin.conversationId,
-            ref: `msg:${msg.id}`,
-          });
-        }
-      }
-      const prevVersion = this.seenMessageVersions.get(msg.id) ?? -1;
-      if (msg.version <= prevVersion) continue;
-      if (msg.role !== 'assistant' || !['completed', 'failed', 'interrupted'].includes(msg.status)) continue;
-      this.seenMessageVersions.set(msg.id, msg.version);
 
-      const bodyText = (msg.text || msg.reason || (msg.status === 'completed' ? '' : `(${msg.status})`)).trim();
-      if (!bodyText) continue;
-
-      const route = msg.origin;
-      if (!route?.channelId || !route.conversationId || !route.senderId || route.channel === 'local') continue;
-      if (route.channel === 'dingtalk' && !route.replyWebhook) continue;
-      if (route) {
-        try {
-          const ch = this.coordinator.store.getImChannel(route.channelId);
-          if (ch.enabled && ch.platform === route.channel && ch.accountId === route.accountId) {
-            await this.sendToChannel(ch.id, bodyText, {
-              target: route.conversationId,
-              replyToMessageId: route.replyToMessageId,
-              replyWebhook: route.replyWebhook,
-              contextToken: route.contextToken,
+      if (parsed.kind === 'reenter' || parsed.kind === 'press') {
+        const session = this.xiaoaiTvRemote.touch(channel.id, targetId, idleTtlMs);
+        const armPromise = speakerTarget
+          ? this.armXiaoaiTvRemoteCapture(channel.id, speakerTarget, {
+              discardMs: 0,
+              refreshLed: parsed.steps.length === 0,
+              allowDuringTranscribe: true,
+            })
+          : undefined;
+        if (session && parsed.steps.length > 0) {
+          try {
+            await this.xiaoaiTvRemote.emitSteps({
+              session,
+              steps: parsed.steps,
+              settings,
+              sshRunner: this.xiaoaiDeps?.sshRunner,
+              stepIntervalMs: this.xiaoaiDeps?.tvRemoteStepIntervalMs,
+              refreshListenLed: true,
             });
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            console.warn(`[xiaoai-tv-remote] emit failed (${channel.id}/${targetId}): ${msg}`);
+            if (speakerTarget) {
+              await setXiaoaiSpeakerLed(speakerTarget, 'listen', this.xiaoaiDeps?.sshRunner);
+            }
           }
-        } catch { /* recorded in channel.lastError */ }
+        }
+        if (armPromise) await armPromise;
+        return {
+          ok: true,
+          action: parsed.kind === 'reenter' ? 'tv_remote_reentered' : 'tv_remote_press',
+        };
+      }
+
+      if (inbound.explicitWake) {
+        this.xiaoaiTvRemote.deactivate(channel.id, targetId);
+        console.log(
+          `[xiaoai-tv-remote] explicit wake with non-TV utterance; exiting remote mode (${channel.id}/${targetId}): ${JSON.stringify(inbound.text)}`,
+        );
+        if (speakerTarget) {
+          await setXiaoaiSpeakerLed(speakerTarget, 'think', this.xiaoaiDeps?.sshRunner);
+        }
+        return undefined;
+      }
+
+      // Unrecognized background speech or noise in remote mode: ignore without extending idle TTL
+      console.log(
+        `[xiaoai-tv-remote] ignored unrecognized phrase in remote mode (${channel.id}/${targetId}): ${JSON.stringify(inbound.text)}`,
+      );
+      if (speakerTarget) {
+        await this.armXiaoaiTvRemoteCapture(channel.id, speakerTarget, {
+          discardMs: 0,
+          refreshLed: true,
+          allowDuringTranscribe: true,
+        });
+      }
+      return { ok: true, action: 'tv_remote_ignored' };
+    }
+
+    const entry = parseTvRemoteEntryUtterance(inbound.text, settings.learnedKeys, keyOpts);
+    if (!entry.matched) {
+      return undefined;
+    }
+
+    const allChannels = this.coordinator.store.listImChannels();
+    const irTarget = this.xiaoaiTvRemote.resolveIrTarget(channel, speakerTarget, allChannels, settings.config);
+    if (!irTarget) {
+      return undefined;
+    }
+
+    const session = this.xiaoaiTvRemote.activate({
+      channelId: channel.id,
+      targetId,
+      speakerTarget: speakerTarget ?? irTarget,
+      irTarget,
+      // Give greeting TTS playback time before starting the exact idle countdown
+      idleTtlMs: Math.max(idleTtlMs, 10_000),
+    });
+
+    if (entry.initialSteps.length > 0) {
+      try {
+        await this.xiaoaiTvRemote.emitSteps({
+          session,
+          steps: entry.initialSteps,
+          settings,
+          sshRunner: this.xiaoaiDeps?.sshRunner,
+          stepIntervalMs: this.xiaoaiDeps?.tvRemoteStepIntervalMs,
+          refreshListenLed: false,
+        });
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        console.warn(`[xiaoai-tv-remote] initial emit failed (${channel.id}/${targetId}): ${msg}`);
       }
     }
 
-    for (const item of settledTypingReleases) {
-      this.releaseWechatTyping(item.channelId, item.target, item.ref);
+    const key = `${channel.id}:${targetId}`;
+    const prev = this.xiaoaiOutboundChains.get(key) ?? Promise.resolve();
+    const next = prev.catch(() => {}).then(async () => {
+      if (this.closing || !this.xiaoaiTvRemote.isActive(channel.id, targetId)) return;
+      await this.waitForXiaoaiCaptureIdle(channel.id, targetId);
+      if (this.closing || !this.xiaoaiTvRemote.isActive(channel.id, targetId)) return;
+      try {
+        const ch = this.coordinator.store.getImChannel(channel.id);
+        if (ch.enabled && ch.platform === 'xiaoai') {
+          await this.sendToChannel(ch.id, '已进入遥控模式。', {
+            target: targetId,
+            replyToMessageId: inbound.externalId,
+            replyWebhook: inbound.replyWebhook,
+            contextToken: inbound.contextToken,
+            waitForCompletion: true,
+          });
+          if (!this.closing && this.xiaoaiTvRemote.isActive(channel.id, targetId) && speakerTarget) {
+            this.xiaoaiTvRemote.touch(channel.id, targetId, idleTtlMs);
+            await this.armXiaoaiTvRemoteCapture(ch.id, speakerTarget, {
+              discardMs: 120,
+              refreshLed: true,
+              allowDuringTranscribe: true,
+            });
+          }
+        }
+      } catch { /* recorded in channel.lastError */ }
+    }).finally(() => {
+      if (this.xiaoaiOutboundChains.get(key) === next) {
+        this.xiaoaiOutboundChains.delete(key);
+      }
+    });
+    this.xiaoaiOutboundChains.set(key, next);
+    return { ok: true, action: 'tv_remote_entered' };
+  }
+
+  enqueueXiaoaiNotice(
+    channelId: string,
+    targetId: string,
+    noticeText: string,
+    route?: MessageOrigin,
+  ): void {
+    const text = stripXiaoaiDialogDirective(noticeText).text;
+    if (!text) return;
+    const key = `${channelId}:${targetId}`;
+    const prev = this.xiaoaiOutboundChains.get(key) ?? Promise.resolve();
+    const next = prev.catch(() => {}).then(async () => {
+      if (this.closing) return;
+      await this.waitForXiaoaiCaptureIdle(channelId, targetId);
+      if (this.closing) return;
+      try {
+        const ch = this.coordinator.store.getImChannel(channelId);
+        if (ch.enabled && ch.platform === 'xiaoai') {
+          await this.sendToChannel(ch.id, text, {
+            target: targetId,
+            replyWebhook: route?.replyWebhook,
+            waitForCompletion: this.xiaoaiTvRemote.isActive(channelId, targetId),
+          });
+          if (!this.closing && this.xiaoaiTvRemote.isActive(channelId, targetId)) {
+            const targets = parseXiaoaiSshTargets(ch.apiBase);
+            const sshTarget = targets.find(t => t.id === targetId || t.userHost === targetId) ?? targets[0];
+            if (sshTarget) {
+              await this.armXiaoaiTvRemoteCapture(ch.id, sshTarget, {
+                discardMs: 120,
+                refreshLed: true,
+                allowDuringTranscribe: true,
+              });
+            }
+          }
+        }
+      } catch { /* recorded in channel.lastError */ }
+    }).finally(() => {
+      if (this.xiaoaiOutboundChains.get(key) === next) {
+        this.xiaoaiOutboundChains.delete(key);
+      }
+    });
+    this.xiaoaiOutboundChains.set(key, next);
+  }
+
+  private getXiaoaiSpeakerManager(): XiaoaiSpeakerManager {
+    if (this.xiaoaiSpeakerManager && this.xiaoaiSpeakerDepsRef !== this.xiaoaiDeps) {
+      this.xiaoaiSpeakerManager.close();
+      this.xiaoaiSpeakerManager = undefined;
+    }
+    if (!this.xiaoaiSpeakerManager) {
+      this.xiaoaiSpeakerDepsRef = this.xiaoaiDeps;
+      this.xiaoaiSpeakerManager = new XiaoaiSpeakerManager({
+        homeDir: this.coordinator.store.home,
+        speakerModelsDir: this.xiaoaiDeps?.speakerModelsDir,
+        registryPath: this.xiaoaiDeps?.speakerRegistryPath,
+        extractorFactory: this.xiaoaiDeps?.speakerExtractorFactory,
+        fetchImpl: this.xiaoaiDeps?.fetchImpl,
+      });
+    }
+    return this.xiaoaiSpeakerManager;
+  }
+
+  private isXiaoaiSpeakerGateEnforced(channel: ImChannelConfig): boolean {
+    const opts = parseXiaoaiApiOptions(channel.apiBase);
+    return this.getXiaoaiSpeakerManager().isVerificationActive({ speakerVerify: opts.speakerVerify });
+  }
+
+  private enqueueXiaoaiDirectSpeech(
+    channelId: string,
+    targetId: string,
+    speechText: string,
+    options?: { followUpWaitMs?: number; discardMs?: number },
+  ): void {
+    const cleanText = stripXiaoaiDialogDirective(speechText).text;
+    if (!cleanText) return;
+    const key = `${channelId}:${targetId}`;
+    const prev = this.xiaoaiOutboundChains.get(key) ?? Promise.resolve();
+    const next = prev.catch(() => {}).then(async () => {
+      if (this.closing) return;
+      await this.waitForXiaoaiCaptureIdle(channelId, targetId);
+      if (this.closing) return;
+      let sshTarget: { id: string; userHost: string; port?: number } | undefined;
+      try {
+        const ch = this.coordinator.store.getImChannel(channelId);
+        if (!ch.enabled || ch.platform !== 'xiaoai') return;
+        const targets = parseXiaoaiSshTargets(ch.apiBase);
+        sshTarget = targets.find(t => t.id === targetId || t.userHost === targetId) ?? targets[0];
+        await this.sendToChannel(ch.id, cleanText, {
+          target: targetId,
+          waitForCompletion: Boolean(options?.followUpWaitMs),
+        });
+        if (!this.closing && sshTarget) {
+          if (options?.followUpWaitMs && this.xiaoaiKwsMonitor) {
+            const entered = this.xiaoaiKwsMonitor.enterFollowUpCapture(ch.id, sshTarget.id, {
+              waitMs: options.followUpWaitMs,
+              discardMs: options.discardMs ?? 120,
+              allowDuringTranscribe: true,
+            });
+            if (entered) {
+              await setXiaoaiSpeakerLed(sshTarget, 'listen', this.xiaoaiDeps?.sshRunner);
+            }
+          } else if (!this.xiaoaiTvRemote.isActive(ch.id, sshTarget.id)) {
+            await setXiaoaiSpeakerLed(sshTarget, 'off', this.xiaoaiDeps?.sshRunner);
+          }
+        }
+      } catch {
+        if (!this.closing && sshTarget && !options?.followUpWaitMs && !this.xiaoaiTvRemote.isActive(channelId, sshTarget.id)) {
+          await setXiaoaiSpeakerLed(sshTarget, 'off', this.xiaoaiDeps?.sshRunner).catch(() => {});
+        }
+      }
+    }).finally(() => {
+      if (this.xiaoaiOutboundChains.get(key) === next) {
+        this.xiaoaiOutboundChains.delete(key);
+      }
+    });
+    this.xiaoaiOutboundChains.set(key, next);
+  }
+
+  private launchXiaoaiEnrollmentSession(
+    channel: ImChannelConfig,
+    targetId: string,
+    sessionId: string,
+    needsDownload: boolean,
+  ): XiaoaiEnrollSessionSnapshot {
+    const enrollWaitMs = this.xiaoaiDeps?.speakerEnrollWaitMs ?? 15_000;
+    const manager = this.getXiaoaiSpeakerManager();
+    if (!needsDownload) {
+      const activated = this.xiaoaiSpeakerEnroll.activateSession(sessionId);
+      if (activated) {
+        this.enqueueXiaoaiDirectSpeech(channel.id, targetId, activated.prompt, {
+          followUpWaitMs: enrollWaitMs,
+          discardMs: 120,
+        });
+        return activated.snapshot;
+      }
+    }
+
+    const snapshot = this.xiaoaiSpeakerEnroll.getStatus(sessionId)!;
+    this.enqueueXiaoaiDirectSpeech(channel.id, targetId, snapshot.message);
+    void (async () => {
+      try {
+        await manager.ensureModelReady();
+        if (this.closing) return;
+        const current = this.xiaoaiSpeakerEnroll.getStatus(sessionId);
+        if (!current || current.status !== 'preparing_model') return;
+        const activated = this.xiaoaiSpeakerEnroll.activateSession(sessionId);
+        if (activated) {
+          this.enqueueXiaoaiDirectSpeech(channel.id, targetId, activated.prompt, {
+            followUpWaitMs: enrollWaitMs,
+            discardMs: 120,
+          });
+        }
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : '声纹模型下载失败';
+        const failed = this.xiaoaiSpeakerEnroll.failSession(sessionId, msg);
+        if (!this.closing && failed) {
+          this.enqueueXiaoaiDirectSpeech(
+            channel.id,
+            targetId,
+            '声纹模型下载失败，请检查网络或用命令行下载后再试。',
+          );
+        }
+      }
+    })();
+    return snapshot;
+  }
+
+  private async tryHandleXiaoaiSpeakerVoice(
+    channel: ImChannelConfig,
+    inbound: ImInboundMessage,
+  ): Promise<{ ok: boolean; action: string } | undefined> {
+    const targetId = inbound.target ?? inbound.senderId;
+    const manager = this.getXiaoaiSpeakerManager();
+
+    if (this.xiaoaiSpeakerEnroll.isActive(channel.id, targetId)) {
+      const enrollWaitMs = this.xiaoaiDeps?.speakerEnrollWaitMs ?? 15_000;
+      const activeSnap = this.xiaoaiSpeakerEnroll.getActive(channel.id, targetId);
+      const existingProfile = activeSnap ? manager.findProfile(activeSnap.speakerName) : undefined;
+      const stepRes = this.xiaoaiSpeakerEnroll.processSample({
+        channelId: channel.id,
+        targetId,
+        samples: inbound.samples,
+        sampleRate: inbound.sampleRate,
+        transcript: inbound.text,
+        extractor: (s, sr) => manager.extractEmbedding(s, sr),
+        existingProfile,
+        minEnrollDurationMs: this.xiaoaiDeps?.speakerMinEnrollMs,
+      });
+
+      if (stepRes.outcome === 'cancelled' || stepRes.outcome === 'failed') {
+        this.enqueueXiaoaiDirectSpeech(channel.id, targetId, stepRes.prompt);
+        return {
+          ok: true,
+          action: stepRes.outcome === 'cancelled' ? 'voice_enroll_cancelled' : 'voice_enroll_failed',
+        };
+      }
+      if (stepRes.outcome === 'retry' || stepRes.outcome === 'next_step') {
+        this.enqueueXiaoaiDirectSpeech(channel.id, targetId, stepRes.prompt, {
+          followUpWaitMs: enrollWaitMs,
+          discardMs: 120,
+        });
+        return {
+          ok: true,
+          action: stepRes.outcome === 'retry' ? 'voice_enroll_retry' : 'voice_enroll_next_step',
+        };
+      }
+      if (stepRes.outcome === 'ready_to_save') {
+        const saved = manager.enrollEmbeddings({
+          name: stepRes.session.speakerName,
+          role: stepRes.session.role,
+          mode: stepRes.session.mode,
+          embeddings: stepRes.embeddings,
+        });
+        const status = manager.getStatus();
+        const doneMsg = `已保存${saved.name}的声纹，当前共有${status.profiles.length}个已录入声纹。`;
+        this.xiaoaiSpeakerEnroll.completeSession(stepRes.session.sessionId, saved.id, doneMsg);
+        this.enqueueXiaoaiDirectSpeech(channel.id, targetId, doneMsg);
+        return { ok: true, action: 'voice_enroll_completed' };
+      }
+    }
+
+    const cmd = parseSpeakerVoiceCommand(inbound.text);
+    if (!cmd) return undefined;
+
+    if (cmd.kind === 'enroll') {
+      const targets = parseXiaoaiSshTargets(channel.apiBase);
+      const apiOpts = parseXiaoaiApiOptions(channel.apiBase);
+      if (targets.length === 0 || !apiOpts.kws) {
+        this.enqueueXiaoaiDirectSpeech(
+          channel.id,
+          targetId,
+          '当前小爱频道还没有开启本地语音识别（kws=1），暂时不能直接通过语音录入声纹。',
+        );
+        return { ok: true, action: 'voice_enroll_unsupported' };
+      }
+      if (this.xiaoaiTvRemote.isActive(channel.id, targetId)) {
+        this.xiaoaiTvRemote.deactivate(channel.id, targetId);
+      }
+
+      const profiles = manager.listProfiles();
+      const speakerName = (
+        cmd.targetName?.trim()
+        || inbound.speaker?.name
+        || (profiles.length === 0 ? '主人' : `成员${profiles.length + 1}`)
+      ).slice(0, 40);
+      const existing = manager.findProfile(speakerName);
+      if (existing?.role === 'owner' && inbound.speaker && inbound.speaker.role !== 'owner') {
+        this.enqueueXiaoaiDirectSpeech(channel.id, targetId, '只有主人本人或命令行可以重新录入主人声纹。');
+        return { ok: true, action: 'voice_enroll_denied' };
+      }
+      const role: 'owner' | 'member' = existing?.role
+        ?? (profiles.length === 0 || speakerName === '主人' ? 'owner' : 'member');
+      const effectiveMode: 'replace' | 'append' = cmd.mode === 'append' && existing ? 'append' : 'replace';
+
+      const preparing = this.xiaoaiSpeakerEnroll.createPreparingSession({
+        channelId: channel.id,
+        targetId,
+        speakerName,
+        role,
+        mode: effectiveMode,
+      });
+      this.launchXiaoaiEnrollmentSession(channel, targetId, preparing.sessionId, !manager.isModelReady());
+      return { ok: true, action: 'voice_enroll_started' };
+    }
+
+    if (cmd.kind === 'whoami') {
+      const status = manager.getStatus();
+      let reply: string;
+      if (inbound.speaker) {
+        reply = `你是${inbound.speaker.name}。`;
+      } else if (status.profiles.length === 0) {
+        reply = '目前还没有录入任何声纹，你可以说录入我的声纹。';
+      } else if (!status.enabled) {
+        reply = '声纹识别当前已暂停，你可以说开启声纹识别。';
+      } else {
+        reply = '当前暂未匹配到你的声纹，你可以说录入声纹。';
+      }
+      this.enqueueXiaoaiDirectSpeech(channel.id, targetId, reply);
+      return { ok: true, action: 'voice_whoami' };
+    }
+
+    if (cmd.kind === 'list') {
+      const status = manager.getStatus();
+      const reply = status.profiles.length === 0
+        ? '当前还没有录入任何声纹。'
+        : `已录入${status.profiles.length}个声纹：${status.profiles.map(p => (p.role === 'owner' ? `${p.name}（主人）` : p.name)).join('、')}。声纹识别当前已${status.active ? '开启' : '暂停'}。`;
+      this.enqueueXiaoaiDirectSpeech(channel.id, targetId, reply);
+      return { ok: true, action: 'voice_list' };
+    }
+
+    if (cmd.kind === 'remove') {
+      const targetName = cmd.targetName?.trim() || inbound.speaker?.name;
+      if (!targetName) {
+        this.enqueueXiaoaiDirectSpeech(channel.id, targetId, '请说出要删除谁的声纹，比如删除小明的声纹。');
+        return { ok: true, action: 'voice_remove_missing_target' };
+      }
+      const found = manager.findProfile(targetName);
+      if (!found) {
+        this.enqueueXiaoaiDirectSpeech(channel.id, targetId, `没有找到名为${targetName}的声纹。`);
+        return { ok: true, action: 'voice_remove_not_found' };
+      }
+      if (found.role === 'owner' && inbound.speaker && inbound.speaker.role !== 'owner') {
+        this.enqueueXiaoaiDirectSpeech(channel.id, targetId, '只有主人本人或命令行可以删除主人声纹。');
+        return { ok: true, action: 'voice_remove_denied' };
+      }
+      const res = manager.removeSpeaker(found.id);
+      const reply = res.remaining === 0
+        ? `已删除${found.name}的声纹，当前已没有已录入声纹。`
+        : `已删除${found.name}的声纹，还剩${res.remaining}个声纹。`;
+      this.enqueueXiaoaiDirectSpeech(channel.id, targetId, reply);
+      return { ok: true, action: 'voice_removed' };
+    }
+
+    if (cmd.kind === 'clear') {
+      if (inbound.speaker && inbound.speaker.role !== 'owner') {
+        this.enqueueXiaoaiDirectSpeech(channel.id, targetId, '只有主人或命令行可以清空全部声纹。');
+        return { ok: true, action: 'voice_clear_denied' };
+      }
+      const res = manager.clearSpeakers();
+      const reply = res.cleared === 0
+        ? '当前本来就没有录入声纹。'
+        : `已清空全部${res.cleared}个声纹。`;
+      this.enqueueXiaoaiDirectSpeech(channel.id, targetId, reply);
+      return { ok: true, action: 'voice_cleared' };
+    }
+
+    if (cmd.kind === 'toggle') {
+      if (!cmd.enabled && inbound.speaker && inbound.speaker.role !== 'owner') {
+        this.enqueueXiaoaiDirectSpeech(channel.id, targetId, '只有主人或命令行可以暂停声纹识别。');
+        return { ok: true, action: 'voice_toggle_denied' };
+      }
+      const status = manager.configure({ enabled: cmd.enabled });
+      let reply: string;
+      if (!cmd.enabled) {
+        reply = '已暂停声纹识别。';
+      } else if (status.profiles.length === 0) {
+        reply = '声纹开关已打开，但还没有录入声纹，你可以说录入我的声纹。';
+      } else if (!status.modelReady) {
+        reply = '声纹开关已打开，首次录入时会自动下载声纹模型。';
+      } else {
+        reply = '已开启声纹识别。';
+      }
+      this.enqueueXiaoaiDirectSpeech(channel.id, targetId, reply);
+      return { ok: true, action: 'voice_toggled' };
+    }
+
+    return undefined;
+  }
+
+  getVoiceprintStatus(): XiaoaiSpeakerStatus {
+    return this.getXiaoaiSpeakerManager().getStatus();
+  }
+
+  configureVoiceprint(patch: {
+    enabled?: boolean;
+    threshold?: number;
+    wakePrecheck?: boolean;
+    rename?: { target: string; name: string };
+    role?: { target: string; role: 'owner' | 'member' };
+  }): XiaoaiSpeakerStatus {
+    return this.getXiaoaiSpeakerManager().configure(patch);
+  }
+
+  removeVoiceprint(target: string): { removed: boolean; name?: string; id?: string; remaining: number } {
+    const res = this.getXiaoaiSpeakerManager().removeSpeaker(target);
+    return {
+      removed: res.removed,
+      ...(res.profile ? { name: res.profile.name, id: res.profile.id } : {}),
+      remaining: res.remaining,
+    };
+  }
+
+  clearVoiceprints(): { cleared: number } {
+    return this.getXiaoaiSpeakerManager().clearSpeakers();
+  }
+
+  async startVoiceprintEnrollment(input: {
+    name?: string;
+    role?: 'owner' | 'member';
+    mode?: 'replace' | 'append';
+    channelId?: string;
+    targetId?: string;
+  }): Promise<{
+    session: XiaoaiEnrollSessionSnapshot;
+    channelId: string;
+    targetId: string;
+  }> {
+    const channels = this.coordinator.store.listImChannels().filter(ch => ch.enabled && ch.platform === 'xiaoai');
+    const channel = input.channelId
+      ? channels.find(ch => ch.id === input.channelId)
+      : channels.find(ch => parseXiaoaiSshTargets(ch.apiBase).length > 0 && parseXiaoaiApiOptions(ch.apiBase).kws)
+        ?? channels.find(ch => parseXiaoaiSshTargets(ch.apiBase).length > 0)
+        ?? channels[0];
+    if (!channel) {
+      throw new Error(input.channelId ? `未找到已启用的小爱频道 ${input.channelId}` : '当前没有已启用的小爱音箱频道');
+    }
+    const targets = parseXiaoaiSshTargets(channel.apiBase);
+    if (targets.length === 0 || !parseXiaoaiApiOptions(channel.apiBase).kws) {
+      throw new Error(`小爱频道 ${channel.id} 未启用本地语音流（需要配置 SSH 且 ?kws=1）`);
+    }
+    const target = input.targetId
+      ? targets.find(t => t.id === input.targetId || t.userHost === input.targetId)
+      : targets[0];
+    if (!target) {
+      throw new Error(`未找到音箱目标 ${input.targetId}`);
+    }
+
+    if (this.xiaoaiTvRemote.isActive(channel.id, target.id)) {
+      this.xiaoaiTvRemote.deactivate(channel.id, target.id);
+    }
+
+    const manager = this.getXiaoaiSpeakerManager();
+    const status = manager.getStatus();
+    const speakerName = (
+      input.name?.trim()
+      || (status.profiles.length === 0 ? '主人' : `成员${status.profiles.length + 1}`)
+    ).slice(0, 40);
+    const existing = manager.findProfile(speakerName);
+    const role: 'owner' | 'member' = input.role
+      ?? existing?.role
+      ?? (status.profiles.length === 0 || speakerName === '主人' ? 'owner' : 'member');
+    const mode: 'replace' | 'append' = input.mode === 'append' && existing ? 'append' : 'replace';
+
+    const preparing = this.xiaoaiSpeakerEnroll.createPreparingSession({
+      channelId: channel.id,
+      targetId: target.id,
+      speakerName,
+      role,
+      mode,
+    });
+    const session = this.launchXiaoaiEnrollmentSession(channel, target.id, preparing.sessionId, !manager.isModelReady());
+    return {
+      session,
+      channelId: channel.id,
+      targetId: target.id,
+    };
+  }
+
+  getVoiceprintEnrollmentStatus(sessionId: string): XiaoaiEnrollSessionSnapshot {
+    const snap = this.xiaoaiSpeakerEnroll.getStatus(sessionId);
+    if (!snap) {
+      throw new Error(`未找到声纹录入会话 ${sessionId}`);
+    }
+    return snap;
+  }
+
+  cancelVoiceprintEnrollment(sessionId?: string): XiaoaiEnrollSessionSnapshot | { cancelled: false } {
+    const cancelled = this.xiaoaiSpeakerEnroll.cancelByIdOrTarget(
+      sessionId ? { sessionId } : undefined,
+    );
+    if (!cancelled) {
+      return { cancelled: false };
+    }
+    this.enqueueXiaoaiDirectSpeech(cancelled.channelId, cancelled.targetId, '已取消声纹录入。');
+    return cancelled;
+  }
+
+  private enqueueXiaoaiOutbound(
+    channelId: string,
+    msg: ChatMessage,
+    bodyText: string,
+    route: MessageOrigin,
+  ): void {
+    const targetId = route.conversationId!;
+    const key = `${channelId}:${targetId}`;
+    const prev = this.xiaoaiOutboundChains.get(key) ?? Promise.resolve();
+    const next = prev.catch(() => {}).then(async () => {
+      if (this.closing) return;
+      await this.waitForXiaoaiCaptureIdle(channelId, targetId);
+      if (this.closing) return;
+      if (this.hasNewerSpeakerUserMessage(msg) && !this.isBackgroundTaskDeliveryMessage(msg)) {
+        return;
+      }
+      try {
+        const ch = this.coordinator.store.getImChannel(channelId);
+        if (ch.enabled && ch.platform === route.channel && ch.accountId === route.accountId) {
+          const hasPendingWorkerQuestion = this.hasPendingWorkerQuestion(msg);
+          const tvActivatedByRouter = msg.status === 'completed' && isAssistantTvRemoteActivation(bodyText);
+          const expectFollowUp = msg.status === 'completed'
+            && (shouldContinueXiaoaiDialog(bodyText, { hasPendingWorkerQuestion }) || tvActivatedByRouter);
+          const cleanBody = stripXiaoaiDialogDirective(bodyText).text;
+          if (!cleanBody) return;
+          await this.sendToChannel(ch.id, cleanBody, {
+            target: targetId,
+            replyToMessageId: route.replyToMessageId,
+            replyWebhook: route.replyWebhook,
+            contextToken: route.contextToken,
+            waitForCompletion: expectFollowUp || this.xiaoaiTvRemote.isActive(ch.id, targetId),
+          });
+          if (!this.closing && !this.hasNewerSpeakerUserMessage(msg)) {
+            const targets = parseXiaoaiSshTargets(ch.apiBase);
+            const sshTarget = targets.find(t => t.id === targetId || t.userHost === targetId) ?? targets[0];
+            if (tvActivatedByRouter && sshTarget) {
+              const settings = loadTvIrRuntimeSettings(this.coordinator.store.home);
+              const irTarget = this.xiaoaiTvRemote.resolveIrTarget(
+                ch,
+                sshTarget,
+                this.coordinator.store.listImChannels(),
+                settings.config,
+              );
+              if (irTarget) {
+                this.xiaoaiTvRemote.activate({
+                  channelId: ch.id,
+                  targetId: sshTarget.id,
+                  speakerTarget: sshTarget,
+                  irTarget,
+                  idleTtlMs: this.xiaoaiDeps?.tvRemoteIdleTtlMs,
+                });
+              }
+            }
+            if (sshTarget && this.xiaoaiKwsMonitor) {
+              if (this.xiaoaiTvRemote.isActive(ch.id, sshTarget.id)) {
+                await this.armXiaoaiTvRemoteCapture(ch.id, sshTarget, {
+                  discardMs: 120,
+                  refreshLed: true,
+                  allowDuringTranscribe: true,
+                });
+              } else if (expectFollowUp) {
+                const entered = this.xiaoaiKwsMonitor.enterFollowUpCapture(ch.id, sshTarget.id, {
+                  waitMs: 8_000,
+                  discardMs: 150,
+                  allowDuringTranscribe: true,
+                });
+                if (entered) {
+                  await setXiaoaiSpeakerLed(sshTarget, 'listen', this.xiaoaiDeps?.sshRunner);
+                }
+              }
+            }
+          }
+        }
+      } catch { /* recorded in channel.lastError */ }
+    }).finally(() => {
+      if (this.xiaoaiOutboundChains.get(key) === next) {
+        this.xiaoaiOutboundChains.delete(key);
+      }
+    });
+    this.xiaoaiOutboundChains.set(key, next);
+  }
+
+  private async flushOutboundUpdates() {
+    if (this.closing) return;
+    if (this.flushingOutbound) {
+      this.pendingOutboundFlush = true;
+      return;
+    }
+    this.flushingOutbound = true;
+    try {
+      const events = this.coordinator.store.conversation.trace({}, this.cursor);
+      if (!events.length) return;
+      this.cursor = events.at(-1)?.seq ?? this.cursor;
+
+      const messageIds = [...new Set(
+        events
+          .filter(e => e.type === 'message')
+          .map(e => e.messageId)
+          .filter((id): id is string => Boolean(id)),
+      )];
+
+      const settledTypingReleases: Array<{ channelId: string; target: string; ref: string }> = [];
+
+      for (const id of messageIds) {
+        let msg: ChatMessage;
+        try {
+          msg = this.coordinator.store.conversation.get(id);
+        } catch {
+          for (const [key, session] of this.wechatTypingSessions.entries()) {
+            if (session.activeRefs.has(`msg:${id}`)) {
+              const [chId, target] = key.split('\0');
+              if (chId && target) settledTypingReleases.push({ channelId: chId, target, ref: `msg:${id}` });
+            }
+          }
+          continue;
+        }
+        if (msg.origin?.channel === 'wechat' && msg.origin.channelId && msg.origin.conversationId && !msg.origin.replyWebhook) {
+          const active = (msg.role === 'user' && ['queued', 'processing'].includes(msg.status))
+            || (msg.role === 'assistant' && msg.status === 'streaming');
+          if (active) {
+            this.retainWechatTyping(msg.origin.channelId, msg.origin.conversationId, `msg:${msg.id}`, msg.origin.contextToken);
+          } else if (['completed', 'failed', 'interrupted'].includes(msg.status)) {
+            settledTypingReleases.push({
+              channelId: msg.origin.channelId,
+              target: msg.origin.conversationId,
+              ref: `msg:${msg.id}`,
+            });
+          }
+        }
+        const prevVersion = this.seenMessageVersions.get(msg.id) ?? -1;
+        if (msg.version <= prevVersion) continue;
+        if (msg.role !== 'assistant' || !['completed', 'failed', 'interrupted'].includes(msg.status)) continue;
+        this.seenMessageVersions.set(msg.id, msg.version);
+
+        if (msg.origin?.channel === 'xiaoai' && msg.status === 'interrupted') continue;
+
+        const bodyText = (msg.text || msg.reason || (msg.status === 'completed' ? '' : `(${msg.status})`)).trim();
+        if (!bodyText) continue;
+
+        const route = msg.origin;
+        if (!route?.channelId || !route.conversationId || !route.senderId || route.channel === 'local') continue;
+        if (route.channel === 'dingtalk' && !route.replyWebhook) continue;
+        if (route) {
+          try {
+            const ch = this.coordinator.store.getImChannel(route.channelId);
+            if (ch.enabled && ch.platform === route.channel && ch.accountId === route.accountId) {
+              if (route.channel === 'xiaoai') {
+                this.enqueueXiaoaiOutbound(ch.id, msg, bodyText, route);
+              } else {
+                const cleanText = stripXiaoaiDialogDirective(bodyText).text;
+                if (!cleanText) continue;
+                await this.sendToChannel(ch.id, cleanText, {
+                  target: route.conversationId,
+                  replyToMessageId: route.replyToMessageId,
+                  replyWebhook: route.replyWebhook,
+                  contextToken: route.contextToken,
+                });
+              }
+            }
+          } catch { /* recorded in channel.lastError */ }
+        }
+      }
+
+      for (const item of settledTypingReleases) {
+        this.releaseWechatTyping(item.channelId, item.target, item.ref);
+      }
+    } finally {
+      this.flushingOutbound = false;
+      if (this.pendingOutboundFlush && !this.closing) {
+        this.pendingOutboundFlush = false;
+        void this.flushOutboundUpdates();
+      }
     }
   }
 
@@ -1373,6 +2417,177 @@ export class ImGateway {
         this.scheduleChannelPoll(id, 50);
       }
     }
+
+    const skipRealKwsForMockSsh = Boolean(this.xiaoaiDeps?.sshRunner && !this.xiaoaiDeps?.kwsStreamFactory);
+    const hasActiveKwsTarget = channels.some(ch =>
+      ch.enabled
+      && ch.platform === 'xiaoai'
+      && parseXiaoaiSshTargets(ch.apiBase).length > 0
+      && parseXiaoaiApiOptions(ch.apiBase).kws,
+    );
+    if (skipRealKwsForMockSsh || !hasActiveKwsTarget) {
+      this.xiaoaiKwsMonitor?.close();
+      this.xiaoaiKwsMonitor = undefined;
+      this.xiaoaiKwsDepsRef = undefined;
+      return;
+    }
+
+    if (this.xiaoaiKwsMonitor && this.xiaoaiKwsDepsRef !== this.xiaoaiDeps) {
+      this.xiaoaiKwsMonitor.close();
+      this.xiaoaiKwsMonitor = undefined;
+    }
+
+    if (!this.xiaoaiKwsMonitor) {
+      this.xiaoaiKwsDepsRef = this.xiaoaiDeps;
+      this.xiaoaiKwsMonitor = new XiaoaiKwsMonitor({
+        homeDir: this.coordinator.store.home,
+        modelsDir: this.xiaoaiDeps?.kwsModelsDir,
+        keywordsFile: this.xiaoaiDeps?.kwsKeywordsFile,
+        asrModelsDir: this.xiaoaiDeps?.kwsAsrModelsDir,
+        vadModelPath: this.xiaoaiDeps?.kwsVadModelPath,
+        cooldownMs: this.xiaoaiDeps?.kwsCooldownMs,
+        probeDurationMs: this.xiaoaiDeps?.kwsProbeDurationMs,
+        chimeDiscardMs: this.xiaoaiDeps?.kwsChimeDiscardMs,
+        maxWaitSpeechMs: this.xiaoaiDeps?.kwsMaxWaitSpeechMs,
+        endSilenceMs: this.xiaoaiDeps?.kwsEndSilenceMs,
+        sshRunner: this.xiaoaiDeps?.sshRunner,
+        streamFactory: this.xiaoaiDeps?.kwsStreamFactory,
+        spotterFactory: this.xiaoaiDeps?.kwsSpotterFactory,
+        recognizerFactory: this.xiaoaiDeps?.kwsRecognizerFactory,
+        vadFactory: this.xiaoaiDeps?.kwsVadFactory,
+        speakerGate: {
+          isActive: (channel) => this.isXiaoaiSpeakerGateEnforced(channel),
+          isBypassed: (channelId, targetId) => this.xiaoaiSpeakerEnroll.isActive(channelId, targetId),
+          verifyWake: ({ channel, keyword, samples, sampleRate }) => {
+            const opts = parseXiaoaiApiOptions(channel.apiBase);
+            return this.getXiaoaiSpeakerManager().verifyWakeSlice(samples, sampleRate, keyword, {
+              speakerVerify: opts.speakerVerify,
+              thresholdOverride: opts.speakerThreshold,
+            });
+          },
+          verifyUtterance: ({ channel, samples, sampleRate }) => {
+            const opts = parseXiaoaiApiOptions(channel.apiBase);
+            return this.getXiaoaiSpeakerManager().verifyAndTrimUtterance(samples, sampleRate, {
+              speakerVerify: opts.speakerVerify,
+              thresholdOverride: opts.speakerThreshold,
+            });
+          },
+        },
+        onWake: async (event) => {
+          return handleXiaoaiKeywordWake({
+            channel: event.channel,
+            target: event.target,
+            keyword: event.keyword,
+            chime: event.chime,
+            sshRunner: this.xiaoaiDeps?.sshRunner,
+          });
+        },
+        onTranscribing: async (event) => {
+          if (this.xiaoaiTvRemote.isActive(event.channel.id, event.target.id)) {
+            return;
+          }
+          await setXiaoaiSpeakerLed(event.target, 'think', this.xiaoaiDeps?.sshRunner);
+        },
+        shouldBypassFollowUpCancel: (channelId, targetId) => {
+          return this.xiaoaiTvRemote.isActive(channelId, targetId)
+            || this.xiaoaiSpeakerEnroll.isActive(channelId, targetId);
+        },
+        onCaptureCancel: async (event) => {
+          if (event.reason === 'cancel' || event.reason === 'timeout') {
+            this.xiaoaiPendingFryer.delete(`${event.channel.id}:${event.target.id}`);
+          }
+          if (!this.closing && this.xiaoaiSpeakerEnroll.isActive(event.channel.id, event.target.id)) {
+            const enrollAction = this.xiaoaiSpeakerEnroll.handleCaptureTimeoutOrEmpty(
+              event.channel.id,
+              event.target.id,
+              event.reason === 'empty' ? 'empty' : 'timeout',
+            );
+            if (enrollAction.action === 'rearm') {
+              const enrollWaitMs = this.xiaoaiDeps?.speakerEnrollWaitMs ?? 15_000;
+              if (enrollAction.speakHint) {
+                this.enqueueXiaoaiDirectSpeech(event.channel.id, event.target.id, enrollAction.speakHint, {
+                  followUpWaitMs: enrollWaitMs,
+                  discardMs: 120,
+                });
+                return;
+              }
+              const entered = this.xiaoaiKwsMonitor?.enterFollowUpCapture(event.channel.id, event.target.id, {
+                waitMs: enrollWaitMs,
+                discardMs: 0,
+                allowDuringTranscribe: true,
+              });
+              if (entered) {
+                await setXiaoaiSpeakerLed(event.target, 'listen', this.xiaoaiDeps?.sshRunner);
+                return;
+              }
+            } else if (enrollAction.action === 'cancelled') {
+              this.enqueueXiaoaiDirectSpeech(event.channel.id, event.target.id, enrollAction.prompt);
+              return;
+            }
+          }
+          if (!this.closing && this.xiaoaiTvRemote.isActive(event.channel.id, event.target.id)) {
+            if (event.explicitWake && event.reason !== 'speaker_rejected') {
+              this.xiaoaiTvRemote.deactivate(event.channel.id, event.target.id);
+              await handleXiaoaiKeywordWake({
+                channel: event.channel,
+                target: event.target,
+                keyword: '你好星期五',
+                chime: true,
+                sshRunner: this.xiaoaiDeps?.sshRunner,
+              });
+              this.xiaoaiKwsMonitor?.enterFollowUpCapture(event.channel.id, event.target.id, {
+                waitMs: this.xiaoaiDeps?.kwsMaxWaitSpeechMs ?? 4_500,
+                discardMs: this.xiaoaiDeps?.kwsChimeDiscardMs ?? 320,
+              });
+              return;
+            }
+            const armed = this.armXiaoaiTvRemoteCapture(event.channel.id, event.target, {
+              discardMs: 0,
+              refreshLed: event.reason !== 'speaker_rejected',
+              allowDuringTranscribe: true,
+            });
+            if (armed) {
+              await armed;
+              return;
+            }
+          }
+          await setXiaoaiSpeakerLed(event.target, 'off', this.xiaoaiDeps?.sshRunner);
+        },
+        onUtterance: async (event) => {
+          if (this.closing) return;
+          try {
+            const latest = this.coordinator.store.getImChannel(event.channel.id);
+            if (latest.lastError !== undefined) {
+              latest.lastError = undefined;
+              latest.updatedAt = Date.now();
+              this.coordinator.store.saveImChannel(latest);
+            }
+          } catch {
+            // Channel may have been deleted
+          }
+          bumpXiaoaiSpeechEpoch(event.channel.id, event.target.id);
+          const res = await this.ingestMessage({
+            channelId: event.channel.id,
+            externalId: `${event.target.id}:kws-${randomUUID()}`,
+            senderId: event.target.id,
+            senderName: event.target.id,
+            target: event.target.id,
+            text: event.text,
+            explicitWake: event.explicitWake,
+            ...(event.speaker ? { speaker: event.speaker } : {}),
+            ...(event.samples ? { samples: event.samples, sampleRate: event.sampleRate } : {}),
+          });
+          if (!res.ok) {
+            await setXiaoaiSpeakerLed(event.target, 'off', this.xiaoaiDeps?.sshRunner);
+          }
+        },
+        onError: (channelId, error) => {
+          const msg = error instanceof Error ? error.message : String(error);
+          console.warn(`[xiaoai-kws] ${channelId}: ${msg}`);
+        },
+      });
+    }
+    this.xiaoaiKwsMonitor.sync(channels);
   }
 
   private scheduleChannelPoll(channelId: string, delayMs: number) {
@@ -1511,15 +2726,24 @@ export class ImGateway {
     this.pollingActive.add(channelId);
     let receivedAny = false;
     try {
+      const suppressUnverifiedPoll = parseXiaoaiSshTargets(channel.apiBase).length > 0
+        && parseXiaoaiApiOptions(channel.apiBase).kws
+        && Boolean(this.xiaoaiKwsMonitor?.hasActiveWorker(channelId))
+        && this.isXiaoaiSpeakerGateEnforced(channel);
+      if (suppressUnverifiedPoll) {
+        return;
+      }
       const result = await pollXiaoaiChannel(channel, this.xiaoaiDeps);
       receivedAny = result.messages.length > 0;
       if (
         (result.nextPollOffset !== undefined && result.nextPollOffset !== channel.pollOffset)
         || (result.nextSyncBuf !== undefined && result.nextSyncBuf !== channel.syncBuf)
+        || channel.lastError !== undefined
       ) {
         const current = this.coordinator.store.getImChannel(channelId);
         if (result.nextPollOffset !== undefined) current.pollOffset = result.nextPollOffset;
         if (result.nextSyncBuf !== undefined) current.syncBuf = result.nextSyncBuf;
+        current.lastError = undefined;
         this.coordinator.store.saveImChannel(current);
       }
       for (const inbound of result.messages) {

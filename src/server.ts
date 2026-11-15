@@ -174,7 +174,7 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
           case 'memory-search': {
             const scope = command.scope === undefined ? 'all' : text(command.scope, 'scope', 32);
             if (!['all', 'memories', 'works', 'messages'].includes(scope)) throw new Error('Invalid search scope');
-            return store.searchContext({
+            return await store.searchContextAsync({
               query: text(command.query, 'query', 512),
               scope: scope as 'all' | 'memories' | 'works' | 'messages',
               cwd: command.cwd === undefined ? undefined : text(command.cwd, 'cwd', 4096),
@@ -182,7 +182,7 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
               includeSuperseded: Boolean(command.includeSuperseded),
             });
           }
-          case 'memory-save': return store.saveMemory({
+          case 'memory-save': return await store.saveMemoryAsync({
             id: command.id === undefined ? undefined : text(command.id, 'id', 128),
             topic: text(command.topic, 'topic', 160),
             content: text(command.content, 'content', 8192),
@@ -239,6 +239,47 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
             new URLSearchParams(typeof command.query === 'string' ? command.query : ''),
             (command.headers && typeof command.headers === 'object' && !Array.isArray(command.headers) ? command.headers : {}) as Record<string, string | string[] | undefined>,
             typeof command.rawBody === 'string' ? command.rawBody : '',
+          );
+          case 'voice-status': return coordinator.im.getVoiceprintStatus();
+          case 'voice-config': {
+            const patch: Parameters<typeof coordinator.im.configureVoiceprint>[0] = {};
+            if (command.enabled !== undefined) patch.enabled = Boolean(command.enabled);
+            if (command.threshold !== undefined) {
+              const num = Number(command.threshold);
+              if (!Number.isFinite(num) || num < 0.1 || num > 0.95) {
+                throw new Error('threshold must be between 0.1 and 0.95');
+              }
+              patch.threshold = num;
+            }
+            if (command.wakePrecheck !== undefined) patch.wakePrecheck = Boolean(command.wakePrecheck);
+            if (command.renameTarget !== undefined && command.renameName !== undefined) {
+              patch.rename = {
+                target: text(command.renameTarget, 'renameTarget', 120),
+                name: text(command.renameName, 'renameName', 40),
+              };
+            }
+            if (command.roleTarget !== undefined && (command.role === 'owner' || command.role === 'member')) {
+              patch.role = {
+                target: text(command.roleTarget, 'roleTarget', 120),
+                role: command.role,
+              };
+            }
+            return coordinator.im.configureVoiceprint(patch);
+          }
+          case 'voice-remove': return coordinator.im.removeVoiceprint(text(command.target, 'target', 120));
+          case 'voice-clear': return coordinator.im.clearVoiceprints();
+          case 'voice-enroll-start': return await coordinator.im.startVoiceprintEnrollment({
+            name: command.name === undefined ? undefined : text(command.name, 'name', 40),
+            role: command.role === 'owner' || command.role === 'member' ? command.role : undefined,
+            mode: command.mode === 'append' ? 'append' : 'replace',
+            channelId: command.channelId === undefined ? undefined : text(command.channelId, 'channelId', 128),
+            targetId: command.targetId === undefined ? undefined : text(command.targetId, 'targetId', 128),
+          });
+          case 'voice-enroll-status': return coordinator.im.getVoiceprintEnrollmentStatus(
+            text(command.sessionId ?? command.id, 'sessionId', 128),
+          );
+          case 'voice-enroll-cancel': return coordinator.im.cancelVoiceprintEnrollment(
+            command.sessionId === undefined ? undefined : text(command.sessionId, 'sessionId', 128),
           );
           case 'get': {
             const task = store.get(text(command.taskId, 'taskId', 128));
