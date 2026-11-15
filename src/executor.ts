@@ -1,7 +1,33 @@
 import { fork, type ChildProcess } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { InputFile } from './files.js';
 import type { Operation } from './store.js';
+
+function resolveExecutorChildLaunch(): { entry: string; execArgv: string[] } {
+  const sameDirJs = fileURLToPath(new URL('./executor-child.js', import.meta.url));
+  if (existsSync(sameDirJs)) {
+    return { entry: sameDirJs, execArgv: [] };
+  }
+  const sameDirTs = fileURLToPath(new URL('./executor-child.ts', import.meta.url));
+  if (existsSync(sameDirTs)) {
+    try {
+      const require = createRequire(import.meta.url);
+      const tsxLoader = require.resolve('tsx');
+      return { entry: sameDirTs, execArgv: ['--import', tsxLoader] };
+    } catch {
+      // Fall through to compiled dist fallback when tsx is unavailable
+    }
+  }
+  const distJs = resolve(dirname(sameDirJs), '..', 'dist', 'executor-child.js');
+  return { entry: distJs, execArgv: [] };
+}
+
+function operationFingerprint(op: Operation, file: InputFile): string {
+  return JSON.stringify({ op: { ...op, status: undefined, result: undefined, error: undefined }, file });
+}
 
 export class Executor {
   private readonly child: ChildProcess;
@@ -10,8 +36,9 @@ export class Executor {
   readonly ready: Promise<void>;
   private dead = false;
   constructor(home: string, private readonly update: (op: Operation) => void) {
-    this.child = fork(fileURLToPath(new URL('./executor-child.js', import.meta.url)), [home], {
-      env: {}, execArgv: [], stdio: ['ignore', 'ignore', 'inherit', 'ipc'],
+    const launch = resolveExecutorChildLaunch();
+    this.child = fork(launch.entry, [home], {
+      env: {}, execArgv: launch.execArgv, stdio: ['ignore', 'ignore', 'inherit', 'ipc'],
     });
     this.ready = new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('Executor startup timed out')), 10_000);
@@ -41,7 +68,7 @@ export class Executor {
   get pid() { return this.child.pid; }
   get available() { return !this.dead && this.child.connected; }
   start(op: Operation, file: InputFile): Promise<Operation> {
-    const fingerprint = JSON.stringify({ op, file });
+    const fingerprint = operationFingerprint(op, file);
     const prior = this.pending.get(op.id) ?? this.finished.get(op.id);
     if (prior && prior.fingerprint !== fingerprint) return Promise.reject(new Error('Operation ID parameter mismatch'));
     if (this.pending.has(op.id)) return this.pending.get(op.id)!.promise;

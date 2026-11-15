@@ -1,13 +1,18 @@
 import { constants } from 'node:fs';
 import { open } from 'node:fs/promises';
-import { imageMime, MEDIA_LIMIT, type ReceivedAttachment } from './wechat-inbound.js';
+import type { AttachmentView } from './view.js';
+import { imageMime, MEDIA_LIMIT } from './wechat-inbound.js';
 
-/** Only current-message attachments enter model content; history remains metadata-only. */
+/** Only current-message or task attachments enter model content; history remains metadata-only. */
 export async function messageImages(text: string, supportsImages: boolean) {
-  let event: { kind?: string; message?: { attachments?: ReceivedAttachment[] } };
+  let event: { kind?: string; attachments?: AttachmentView[]; message?: { attachments?: AttachmentView[] } };
   try { event = JSON.parse(text); } catch { return { text, images: [] }; }
-  if (event.kind !== 'CHAT') return { text, images: [] };
-  const attachments = event.message?.attachments ?? [];
+  if (event.kind !== 'CHAT' && event.kind !== 'TASK' && event.kind !== 'FOLLOWUP' && event.kind !== 'BOSS_DECISION') {
+    return { text, images: [] };
+  }
+  const attachments = event.kind === 'CHAT'
+    ? (event.message?.attachments ?? [])
+    : (event.attachments ?? event.message?.attachments ?? []);
   const images: { type: 'image'; data: string; mimeType: string }[] = [];
   const notes: string[] = [];
   for (const attachment of attachments.slice(0, 4)) {
@@ -17,10 +22,12 @@ export async function messageImages(text: string, supportsImages: boolean) {
       const file = await open(attachment.path, constants.O_RDONLY | constants.O_NOFOLLOW);
       try {
         const stat = await file.stat();
-        if (!stat.isFile() || stat.size > MEDIA_LIMIT || stat.size !== attachment.bytes) throw new Error('Invalid image');
+        if (!stat.isFile() || stat.size > MEDIA_LIMIT || (attachment.bytes !== undefined && stat.size !== attachment.bytes)) {
+          throw new Error('Invalid image');
+        }
         const bytes = await file.readFile();
         const mimeType = imageMime(bytes);
-        if (!mimeType || mimeType !== attachment.mimeType) throw new Error('Invalid image');
+        if (!mimeType || (attachment.mimeType && mimeType !== attachment.mimeType)) throw new Error('Invalid image');
         images.push({ type: 'image', data: bytes.toString('base64'), mimeType });
       } finally { await file.close(); }
     } catch { notes.push('图片读取失败；不可声称已看到图片。'); }

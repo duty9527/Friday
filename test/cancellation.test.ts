@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { Coordinator } from '../dist/coordinator.js';
+import { Coordinator } from '../src/coordinator.js';
 import { privateHome } from '../src/files.js';
 import { abortableDelay, type AgentFactory } from '../src/agent.js';
 

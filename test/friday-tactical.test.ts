@@ -5,10 +5,10 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { Coordinator } from '../dist/coordinator.js';
-import { offlineFactory, type AgentFactory } from '../dist/agent.js';
-import { listPlugins, runPlugin } from '../dist/plugin.js';
-import { Store } from '../dist/store.js';
+import { Coordinator } from '../src/coordinator.js';
+import { offlineFactory, type AgentFactory } from '../src/agent.js';
+import { listPlugins, runPlugin } from '../src/plugin.js';
+import { Store } from '../src/store.js';
 
 async function until(predicate: () => boolean, attempts = 300, stepMs = 15) {
   for (let i = 0; i < attempts; i++) {

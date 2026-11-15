@@ -13,7 +13,7 @@ const STOP_EN = new Set([
   'can', 'could', 'will', 'would', 'should', 'what', 'when', 'where', 'which', 'who', 'how', 'why',
   'not', 'but', 'all', 'any', 'use', 'using', 'into', 'out', 'about', 'just', 'like', 'some', 'more',
   'your', 'you', 'our', 'their', 'http', 'https', 'com', 'org', 'net', 'www', 'true', 'false', 'null',
-  'undefined', 'file', 'files', 'code', 'test', 'json', 'markdown', 'users', 'duty', 'friday',
+  'undefined', 'file', 'files', 'code', 'test', 'json', 'markdown', 'users', 'friday',
 ]);
 
 const STOP_CJK = new Set([
@@ -417,6 +417,7 @@ export async function resolveRuntimeMessageSession(
   currentMessage: ChatMessage,
   knownWorks: Task[],
   semantic?: SemanticEmbedder,
+  options?: { skipAiContinuity?: boolean },
 ): Promise<{ sessionId: string; sessionLink?: SessionTurnLink }> {
   if (isTimerOrSystemMessage(currentMessage)) {
     return { sessionId: formatFlowSessionId(currentMessage.id) };
@@ -493,7 +494,7 @@ export async function resolveRuntimeMessageSession(
       } catch { /* graceful fallback to lexical heuristic */ }
     }
 
-    if (modelHub.hasDecisionEngine() && currentMessage.origin?.channel !== 'xiaoai') {
+    if (modelHub.hasDecisionEngine() && !options?.skipAiContinuity) {
       const heuristicRel = heuristic?.kind === 'answer_clarification'
         || heuristic?.kind === 'post_task_discussion'
         || heuristic?.kind === 'topic_continuity'
@@ -887,7 +888,7 @@ export function backfillPersistedSessions(store: Store): number {
   let updatedCount = 0;
   store.transaction(() => {
     for (const u of updates) {
-      store.conversation.quietSetMessageSession(u.msg.id, u.sessionId, u.link);
+      store.conversation.assignSession(u.msg.id, u.sessionId, u.link, false);
       updatedCount += 1;
     }
     for (const task of tasks) {

@@ -361,6 +361,87 @@ function formatOptionCriterion(candidate: DecisionRouteCandidate, level: Thinkin
   return `${candidate.providerName} ${candidate.modelName} | ${LEVEL_HINTS[level]} | ${caps.join(', ')}${stats}`;
 }
 
+export const COMPLEX_TASK_PATTERN = /重构|架构|根因|并发|竞态|死锁|安全|漏洞|审计|迁移|多文件|深入|全面|复杂|端到端|性能瓶颈|全量|refactor|architecture|root\s*cause|security|vulnerability|audit|concurrency|race\s*condition|deadlock|complex|migration|redesign|deep\s*dive/i;
+export const SIMPLE_TASK_PATTERN = /^(?:查看|列出|检查|状态|概括|总结|读取|格式|重命名|巡检|health|status|list|check|summary|summarize|read|format|rename)\b|查看状态|列出文件|检查构建|健康检查|日常巡检|概括这|简单总结|快速检查|统计行数/i;
+
+export type ComplexityTier = 'fast' | 'balanced' | 'strong';
+const COMPLEXITY_TIERS = new Set<ComplexityTier>(['fast', 'balanced', 'strong']);
+
+/** Infers task complexity tier from prompt, profile, and scope hints. */
+export function inferTaskComplexityTier(input: {
+  instruction?: string;
+  profile?: string;
+  model?: string;
+  tier?: string;
+  fileCount?: number;
+  isTimer?: boolean;
+}): ComplexityTier {
+  if (input.tier && COMPLEXITY_TIERS.has(input.tier as ComplexityTier)) {
+    return input.tier as ComplexityTier;
+  }
+  if (input.model && COMPLEXITY_TIERS.has(input.model as ComplexityTier)) {
+    return input.model as ComplexityTier;
+  }
+  const text = (input.instruction ?? '').trim();
+  if (input.profile === 'review' || COMPLEX_TASK_PATTERN.test(text) || text.length >= 240 || (input.fileCount ?? 0) >= 4) {
+    return 'strong';
+  }
+  if ((input.isTimer || (text.length > 0 && text.length <= 90 && SIMPLE_TASK_PATTERN.test(text))) && input.profile !== 'coding') {
+    return 'fast';
+  }
+  return 'balanced';
+}
+
+/** Classifies a model's execution depth tier and routing specialty tags. */
+export function classifyModelSpecialties(
+  providerId: string,
+  modelId: string,
+  caps?: {
+    reasoning?: boolean;
+    supportsImages?: boolean;
+    contextWindow?: number;
+    sampleTiers?: { fast?: string; balanced?: string; strong?: string };
+  },
+): { tier: ComplexityTier; specialties: string[] } {
+  const id = modelId.toLowerCase();
+  const sampleTiers = caps?.sampleTiers;
+  let tier: ComplexityTier = 'balanced';
+  if (sampleTiers?.strong === modelId && sampleTiers?.strong !== sampleTiers?.fast) {
+    tier = 'strong';
+  } else if (sampleTiers?.fast === modelId && sampleTiers?.fast !== sampleTiers?.balanced) {
+    tier = 'fast';
+  } else if (/(?:opus|o1|o3|o4|reasoner|deepseek-r1|grok-4|qwen-max|glm-4\.5|pro)/i.test(id)) {
+    tier = 'strong';
+  } else if (/(?:flash|mini|haiku|turbo|nano|lite)/i.test(id)) {
+    tier = 'fast';
+  }
+
+  const specialties: string[] = [];
+  if (
+    /(?:claude|codex|gemini|gpt-5|gpt-4\.1|gpt-4o|o3|o4|coder|deepseek|glm-4\.5|kimi-k2)/i.test(id)
+    || providerId === 'anthropic'
+    || providerId === 'openai-codex'
+  ) {
+    specialties.push('代码工程');
+  }
+  if (caps?.reasoning || /(?:opus|o1|o3|o4|reasoner|r1|thinking|grok-4|qwen-max)/i.test(id)) {
+    specialties.push('深度推理');
+  }
+  if ((caps?.contextWindow ?? 0) >= 256_000) {
+    specialties.push('超长上下文');
+  }
+  if (caps?.supportsImages) {
+    specialties.push('多模态看图');
+  }
+  if (tier === 'fast') {
+    specialties.push('极速响应');
+  }
+  if (!specialties.length) {
+    specialties.push('通用执行');
+  }
+  return { tier, specialties };
+}
+
 export function selectHeuristicRoute(
   candidates: readonly DecisionRouteCandidate[],
   task: DecisionRouteTaskInput,
@@ -375,10 +456,14 @@ export function selectHeuristicRoute(
 
   const needsVision = Boolean(task.hasImages)
     || /图片|截图|看图|视觉|二维码|照片|设计稿|OCR|image|screenshot|vision|photo|diagram/i.test(text);
-  const complexPattern = /重构|架构|根因|并发|竞态|死锁|安全|漏洞|审计|迁移|多文件|深入|全面|复杂|端到端|性能瓶颈|全量|refactor|architecture|root\s*cause|security|vulnerability|audit|concurrency|race\s*condition|deadlock|complex|migration|redesign|deep\s*dive/i;
-  const simplePattern = /^(?:查看|列出|检查|状态|概括|总结|读取|格式|重命名|巡检|health|status|list|check|summary|summarize|read|format|rename)\b|查看状态|列出文件|检查构建|健康检查|日常巡检|概括这|简单总结|快速检查|统计行数/i;
-  const isComplex = task.profile === 'review' || complexPattern.test(text) || text.length >= 240 || (task.fileCount ?? 0) >= 4;
-  const isSimple = !isComplex && (Boolean(task.isTimer) || (text.length > 0 && text.length <= 90 && simplePattern.test(text))) && task.profile !== 'coding';
+  const inferredTier = inferTaskComplexityTier({
+    instruction: text,
+    profile: task.profile,
+    fileCount: task.fileCount,
+    isTimer: task.isTimer,
+  });
+  const isComplex = inferredTier === 'strong';
+  const isSimple = inferredTier === 'fast';
   const needsCoding = task.profile === 'coding'
     || /代码|实现|修改|组件|接口|函数|测试|构建|修复|报错|脚本|编译|类型|bug|fix|implement|code|typescript|javascript|python|rust|go|css|html/i.test(text);
   const needsLongContext = task.profile === 'research'
@@ -404,16 +489,16 @@ export function selectHeuristicRoute(
       } else if (isComplex) {
         score += depth >= 4 ? 42 + (depth - 4) * 6 : depth * 6;
         if (entry.reasoning) score += 32;
-        if (entry.specialties.includes('深度推理') || /(?:opus|sol|argon|o3|reasoner|deepseek-r1|grok-4|pro)/i.test(entry.modelId)) {
+        if (entry.specialties.includes('深度推理') || /(?:opus|o1|o3|o4|reasoner|deepseek-r1|grok-4|pro)/i.test(entry.modelId)) {
           score += 24;
         }
       } else if (isSimple) {
         score += depth <= 2 ? 42 - depth * 4 : Math.max(-15, 16 - depth * 6);
-        if (/(?:flash|mini|luna|haiku|turbo|nano|lite)/i.test(entry.modelId)) score += 28;
-        if (/(?:opus|sol|argon|o3|pro)/i.test(entry.modelId)) score -= 12;
+        if (/(?:flash|mini|haiku|turbo|nano|lite)/i.test(entry.modelId)) score += 28;
+        if (/(?:opus|o1|o3|o4|reasoner|pro)/i.test(entry.modelId) || entry.reasoning) score -= 12;
       } else {
         score += 36 - Math.abs(depth - 3) * 10;
-        if (/(?:terra|sonnet|flash|gpt-4\.1|gpt-6\.1-terra|gemini-3\.8-flash)/i.test(entry.modelId)) score += 18;
+        if (/(?:sonnet|flash|gpt-4\.1|gpt-4o|deepseek-chat|gemini-2\.5)/i.test(entry.modelId)) score += 18;
       }
 
       if (needsVision) {
@@ -421,7 +506,7 @@ export function selectHeuristicRoute(
       }
       if (needsCoding) {
         if (entry.specialties.includes('代码工程')) score += 26;
-        if (/(?:claude-sonnet|claude-opus|gemini|gpt-6|gpt-5|gpt-4\.1|codex|deepseek|qwen.*coder)/i.test(entry.modelId)) score += 18;
+        if (/(?:claude-sonnet|claude-opus|gemini|gpt-5|gpt-4\.1|gpt-4o|codex|deepseek|qwen.*coder)/i.test(entry.modelId)) score += 18;
       }
       if (needsLongContext) {
         if (entry.contextWindow >= 500_000) score += 32;

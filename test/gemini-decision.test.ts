@@ -5,8 +5,8 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { Coordinator } from '../dist/coordinator.js';
-import { Store } from '../dist/store.js';
+import { Coordinator } from '../src/coordinator.js';
+import { Store } from '../src/store.js';
 import type { AgentFactory } from '../src/agent.js';
 import type { QualityGateAssessment, ThinkingLevel } from '../src/view.js';
 
@@ -157,7 +157,7 @@ test('Gemini Decision 1: cross-provider model@thinkingLevel routing, quality gat
     await coordinator.configureModels({
       providerId: 'deepseek',
       apiKey: 'sk-ds-test',
-      selectedModels: ['deepseek-flash'],
+      selectedModels: ['deepseek-reasoner'],
       decisionApiKey: 'jev-test-key',
       decisionBaseUrl: mock.baseUrl,
     });
@@ -180,8 +180,8 @@ test('Gemini Decision 1: cross-provider model@thinkingLevel routing, quality gat
     assert.equal(routeReqs[0]!.model, 'gemini-decision-1');
     const criteria = routeReqs[0]!.questions.route!.criteria as Record<string, string>;
     const optionKeys = Object.keys(criteria);
-    assert.ok(optionKeys.some(k => k.startsWith('deepseek/deepseek-flash@off')));
-    assert.ok(optionKeys.some(k => k.startsWith('deepseek/deepseek-flash@max')));
+    assert.ok(optionKeys.some(k => k.startsWith('deepseek/deepseek-reasoner@off')));
+    assert.ok(optionKeys.some(k => k.startsWith('deepseek/deepseek-reasoner@max')));
     assert.ok(optionKeys.some(k => k.startsWith('google/')));
 
     // 3. Worker received the exact model and native thinkingLevel chosen by Jev
@@ -280,9 +280,9 @@ test('Gemini Decision 1: single-model multiple native thinkingLevels selection',
       providerId: 'deepseek',
       apiKey: 'sk-ds-single',
       workerProvider: 'deepseek',
-      fastModel: 'deepseek-flash',
-      balancedModel: 'deepseek-flash',
-      strongModel: 'deepseek-flash',
+      fastModel: 'deepseek-reasoner',
+      balancedModel: 'deepseek-reasoner',
+      strongModel: 'deepseek-reasoner',
       decisionApiKey: 'jev-single-key',
       decisionBaseUrl: mock.baseUrl,
     });
@@ -296,12 +296,12 @@ test('Gemini Decision 1: single-model multiple native thinkingLevels selection',
     const routeReq = mock.requests.find(r => Boolean(r.questions.route))!;
     const keys = Object.keys((routeReq.questions.route!.criteria as Record<string, string>) ?? {});
     assert.deepEqual(keys, [
-      'deepseek/deepseek-flash@off',
-      'deepseek/deepseek-flash@low',
-      'deepseek/deepseek-flash@high',
-      'deepseek/deepseek-flash@max',
+      'deepseek/deepseek-reasoner@off',
+      'deepseek/deepseek-reasoner@low',
+      'deepseek/deepseek-reasoner@high',
+      'deepseek/deepseek-reasoner@max',
     ]);
-    assert.equal(seenModel, 'deepseek-flash');
+    assert.equal(seenModel, 'deepseek-reasoner');
     assert.equal(seenLevel, 'max');
   } finally {
     await coordinator.close();
@@ -384,7 +384,7 @@ test('Gemini Decision 1: excludes failed model on WORKER_FAILED retry & falls ba
     await coordinator.configureModels({
       providerId: 'deepseek',
       apiKey: 'sk-ds-fb',
-      selectedModels: ['deepseek-flash'],
+      selectedModels: ['deepseek-reasoner'],
       decisionApiKey: 'jev-fb-key',
       decisionBaseUrl: mock.baseUrl,
     });
@@ -401,7 +401,7 @@ test('Gemini Decision 1: excludes failed model on WORKER_FAILED retry & falls ba
     const failedSpec = coordinator.store.list()[0]!.workerModel!;
     const retryKeys = Object.keys((routeReqs[1]!.questions.route!.criteria as Record<string, string>) ?? {});
     assert.equal(retryKeys.some(k => k.startsWith(`${failedSpec}@`)), false, 'failed model spec is excluded from retry candidates');
-    assert.ok(retryKeys.some(k => k.startsWith('deepseek/deepseek-flash@')));
+    assert.ok(retryKeys.some(k => k.startsWith('deepseek/deepseek-reasoner@')));
 
     // Scenario B: HTTP 500 from decision endpoint falls back seamlessly to heuristic
     failDecisions = true;
@@ -424,7 +424,7 @@ test('Gemini Decision 1: piggybacks needs_quality_gate on route request to skip 
   const mock = await withMockDecisionServer(req => {
     if (req.questions.route) {
       const keys = Object.keys((req.questions.route.criteria as Record<string, string>) ?? {});
-      const deepseekLow = keys.find(k => k === 'deepseek/deepseek-flash@low') ?? keys[0]!;
+      const deepseekLow = keys.find(k => k === 'deepseek/deepseek-reasoner@low') ?? keys[0]!;
       return {
         body: {
           answers: {
@@ -492,7 +492,7 @@ test('Gemini Decision 1: piggybacks needs_quality_gate on route request to skip 
     await coordinator.configureModels({
       providerId: 'deepseek',
       apiKey: 'sk-ds-skip',
-      selectedModels: ['deepseek-flash'],
+      selectedModels: ['deepseek-reasoner'],
       decisionApiKey: 'jev-skip-key',
       decisionBaseUrl: mock.baseUrl,
     });
@@ -512,7 +512,7 @@ test('Gemini Decision 1: piggybacks needs_quality_gate on route request to skip 
     assert.equal(trace1.some(e => e.label === 'Gemini Decision 1 完成度评估'), false);
 
     const hubAfterSkip = await coordinator.modelHub.getView();
-    const dsEntryAfterSkip = hubAfterSkip.modelPool?.find(m => m.spec === 'deepseek/deepseek-flash');
+    const dsEntryAfterSkip = hubAfterSkip.modelPool?.find(m => m.spec === 'deepseek/deepseek-reasoner');
     assert.equal(dsEntryAfterSkip?.successCount, 1);
     assert.equal(dsEntryAfterSkip?.avgQualityScore, undefined, 'skipped trivial task does not inflate avgQualityScore');
 
@@ -542,8 +542,8 @@ test('Gemini Decision 1: isolates pre-Jev history via epoch migration, tags gemi
   const mock = await withMockDecisionServer(req => {
     if (req.questions.route) {
       const keys = Object.keys((req.questions.route.criteria as Record<string, string>) ?? {});
-      const geminiHigh = keys.find(k => k.startsWith('google/gemini-4-argon@high'))
-        ?? keys.find(k => k.startsWith('google/gemini-4-argon@'))
+      const geminiHigh = keys.find(k => k.startsWith('google/gemini-2.5-pro@high'))
+        ?? keys.find(k => k.startsWith('google/gemini-2.5-pro@'))
         ?? keys[0]!;
       return {
         body: {
@@ -582,7 +582,7 @@ test('Gemini Decision 1: isolates pre-Jev history via epoch migration, tags gemi
       revision: 1,
       mode: 'offline',
       createdAt: now - 100_000,
-      workerModel: 'openai/gpt-6.1-sol',
+      workerModel: 'openai/gpt-4.1',
     });
     seedStore.create({
       id: 'legacy-argon-fail-1',
@@ -596,7 +596,7 @@ test('Gemini Decision 1: isolates pre-Jev history via epoch migration, tags gemi
       revision: 1,
       mode: 'offline',
       createdAt: now - 90_000,
-      workerModel: 'google/gemini-4-argon',
+      workerModel: 'google/gemini-2.5-pro',
       reason: '模型或执行器请求失败：Cannot find module old-path',
     });
     seedStore.create({
@@ -611,7 +611,7 @@ test('Gemini Decision 1: isolates pre-Jev history via epoch migration, tags gemi
       revision: 1,
       mode: 'offline',
       createdAt: now - 80_000,
-      workerModel: 'google/gemini-4-argon',
+      workerModel: 'google/gemini-2.5-pro',
       reason: '模型或执行器请求失败：Cannot find module old-path',
     });
     seedStore.create({
@@ -626,7 +626,7 @@ test('Gemini Decision 1: isolates pre-Jev history via epoch migration, tags gemi
       revision: 1,
       mode: 'offline',
       createdAt: now - 10_000,
-      workerModel: 'google/gemini-4-argon',
+      workerModel: 'google/gemini-2.5-pro',
       thinkingLevel: 'high',
       decisionSource: 'gemini-decision-1',
       qualityGate: {
@@ -634,6 +634,8 @@ test('Gemini Decision 1: isolates pre-Jev history via epoch migration, tags gemi
         maxScore: 3,
         confidence: 0.9,
         shouldSupplement: false,
+        supplementProbability: 0.05,
+        missingAspect: 'none',
         source: 'gemini-decision-1',
         evaluatedAt: now - 9_000,
       },
@@ -647,16 +649,16 @@ test('Gemini Decision 1: isolates pre-Jev history via epoch migration, tags gemi
       providers: {
         openai: {
           apiKey: 'sk-openai-era',
-          selectedModels: ['gpt-6.1-sol'],
+          selectedModels: ['gpt-4.1'],
         },
         google: {
           apiKey: 'sk-google-era',
-          selectedModels: ['gemini-4-argon', 'gemini-3.8-flash'],
+          selectedModels: ['gemini-2.5-pro', 'gemini-2.5-flash'],
         },
       },
       modelStats: {
-        'openai/gpt-6.1-sol': { successCount: 12, failCount: 0, lastLatencyMs: 20000, updatedAt: now - 100_000 },
-        'google/gemini-4-argon': { successCount: 0, failCount: 2, lastLatencyMs: 4, updatedAt: now - 80_000 },
+        'openai/gpt-4.1': { successCount: 12, failCount: 0, lastLatencyMs: 20000, updatedAt: now - 100_000 },
+        'google/gemini-2.5-pro': { successCount: 0, failCount: 2, lastLatencyMs: 4, updatedAt: now - 80_000 },
       },
       decision: {
         enabled: true,
@@ -693,19 +695,19 @@ test('Gemini Decision 1: isolates pre-Jev history via epoch migration, tags gemi
       await coordinator.ready();
 
       const hubAfterInit = await coordinator.modelHub.getView();
-      const solEntry = hubAfterInit.modelPool?.find(m => m.spec === 'openai/gpt-6.1-sol');
-      const argonEntry = hubAfterInit.modelPool?.find(m => m.spec === 'google/gemini-4-argon');
-      const flashEntry = hubAfterInit.modelPool?.find(m => m.spec === 'google/gemini-3.8-flash');
+      const solEntry = hubAfterInit.modelPool?.find(m => m.spec === 'openai/gpt-4.1');
+      const argonEntry = hubAfterInit.modelPool?.find(m => m.spec === 'google/gemini-2.5-pro');
+      const flashEntry = hubAfterInit.modelPool?.find(m => m.spec === 'google/gemini-2.5-flash');
 
-      // Legacy 12 successes on gpt-6.1-sol and 2 legacy failures on gemini-4-argon are purged;
-      // only the 1 Jev-era success on gemini-4-argon remains.
+      // Legacy 12 successes on gpt-4.1 and 2 legacy failures on gemini-2.5-pro are purged;
+      // only the 1 Jev-era success on gemini-2.5-pro remains.
       assert.equal(solEntry?.successCount, undefined);
       assert.equal(solEntry?.failCount, undefined);
       assert.equal(argonEntry?.successCount, 1);
       assert.equal(argonEntry?.failCount, 0);
       assert.equal(argonEntry?.avgQualityScore, 2.85);
-      assert.ok(argonEntry?.specialties.includes('代码工程'), 'gemini-4-argon receives 代码工程 specialty');
-      assert.ok(flashEntry?.specialties.includes('代码工程'), 'gemini-3.8-flash receives 代码工程 specialty');
+      assert.ok(argonEntry?.specialties.includes('代码工程'), 'gemini-2.5-pro receives 代码工程 specialty');
+      assert.ok(flashEntry?.specialties.includes('代码工程'), 'gemini-2.5-flash receives 代码工程 specialty');
 
       // Dispatch 1 (argon total Jev samples = 1 -> 2): < 3 samples, no `; stats:` shown; legacy google failures do NOT trip circuit breaker
       coordinator.chat('req-era-1', '重构第一批模块');
@@ -723,12 +725,12 @@ test('Gemini Decision 1: isolates pre-Jev history via epoch migration, tags gemi
       assert.equal(routeReqs.length, 3);
 
       const criteria1 = routeReqs[0]!.questions.route!.criteria as Record<string, string>;
-      const argonDesc1 = criteria1['google/gemini-4-argon@high']!;
+      const argonDesc1 = criteria1['google/gemini-2.5-pro@high']!;
       assert.ok(argonDesc1.includes('代码工程'));
       assert.equal(argonDesc1.includes('stats:'), false, 'samples < 3 must not expose stats to Jev');
 
       const criteria3 = routeReqs[2]!.questions.route!.criteria as Record<string, string>;
-      const argonDesc3 = criteria3['google/gemini-4-argon@high']!;
+      const argonDesc3 = criteria3['google/gemini-2.5-pro@high']!;
       assert.ok(argonDesc3.includes('stats: avgQuality=2.85/3, ok=3/fail=0'), 'samples >= 3 exposes reliable stats without activeMs latency noise');
       assert.equal(argonDesc3.includes('latency='), false);
     } finally {

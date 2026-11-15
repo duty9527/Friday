@@ -4,7 +4,7 @@ import { mkdtemp, realpath, mkdir, writeFile, readdir, rm, access } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { Coordinator } from '../dist/coordinator.js';
+import { Coordinator } from '../src/coordinator.js';
 import type { AgentFactory } from '../src/agent.js';
 import type { Task } from '../src/store.js';
 

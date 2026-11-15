@@ -5,7 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { serve } from '../dist/server.js';
+import { Coordinator } from '../src/coordinator.js';
+import { offlineFactory } from '../src/agent.js';
+import { serve } from '../src/server.js';
 import { request } from '../src/protocol.js';
 import type { ChatMessage, MainView, TraceEvent } from '../src/view.js';
 import type { Task } from '../src/store.js';
@@ -34,10 +36,11 @@ async function fixture(delayMs = 20) {
 test('single persistent main chat accepts ordinary conversation without files and idempotent message retries', async () => {
   const f = await fixture();
   try {
-    const message = await send(f.home, '你好，我们始终在这里对话', [], 'stable-message');
-    const same = await send(f.home, message.text, [], 'stable-message');
+    const stableId = randomUUID();
+    const message = await send(f.home, '你好，我们始终在这里对话', [], stableId);
+    const same = await send(f.home, message.text, [], stableId);
     assert.equal(same.id, message.id);
-    await assert.rejects(send(f.home, 'changed', [], 'stable-message'), /already used/);
+    await assert.rejects(send(f.home, 'changed', [], stableId), /already used/);
     const result = await wait(() => view(f.home), state => state.messages.items.some(item => item.replyTo === message.id && item.status === 'completed'));
     assert.equal(result.works.length, 0);
     assert.ok(result.messages.items.some(item => item.role === 'assistant' && item.text.includes('[OFFLINE SIMULATION]')));
@@ -108,4 +111,57 @@ test('stopping a Router reply is independent from daemon lifetime and queued rep
     const after = await wait(() => view(home), state => state.messages.items.some(item => item.replyTo === next.id && item.status === 'completed'));
     assert.equal(after.messages.items.filter(item => item.role === 'user').length, 3);
   } finally { await service.close(); await rm(home, { recursive: true, force: true }); }
+});
+
+test('Coordinator.subscribeOutbound fires event-driven updates and recordFastpathTurn persists session, messages, and plugin action', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-fastpath-'));
+  const coordinator = new Coordinator(home, offlineFactory(10));
+  try {
+    await coordinator.ready();
+    coordinator.im.saveChannel({
+      id: 'xiaoai-room',
+      platform: 'xiaoai',
+      name: '客厅小爱',
+      enabled: true,
+    });
+    let outboundCalls = 0;
+    const unsubscribe = coordinator.subscribeOutbound(() => {
+      outboundCalls += 1;
+    });
+
+    const recorded = coordinator.recordFastpathTurn({
+      channelId: 'xiaoai-room',
+      senderId: 'speaker-1',
+      senderName: 'Owner',
+      userText: '打开客厅灯',
+      replyText: '客厅灯已打开',
+      pluginName: 'miot',
+      action: 'toggle',
+      latencyMs: 12,
+    });
+    assert.ok(outboundCalls >= 1, 'subscribeOutbound listener notified on fastpath turn');
+    assert.ok(recorded.userMessage.sessionId);
+    assert.equal(recorded.userMessage.sessionId, recorded.replyMessage.sessionId);
+    assert.equal(recorded.replyMessage.replyTo, recorded.userMessage.id);
+
+    const storedUser = coordinator.store.conversation.get(recorded.userMessage.id);
+    assert.equal(storedUser.routing?.actions[0]?.kind, 'plugin');
+    assert.equal(storedUser.routing?.actions[0]?.status, 'accepted');
+    assert.equal(storedUser.routing?.actions[0]?.summary, 'miot.toggle (12ms fast path)');
+
+    const countBeforeUnsub = outboundCalls;
+    unsubscribe();
+    coordinator.recordFastpathTurn({
+      channelId: 'xiaoai-room',
+      senderId: 'speaker-1',
+      userText: '关闭客厅灯',
+      replyText: '客厅灯已关闭',
+      pluginName: 'miot',
+      action: 'toggle',
+    });
+    assert.equal(outboundCalls, countBeforeUnsub, 'unsubscribed listener is not notified again');
+  } finally {
+    await coordinator.close();
+    await rm(home, { recursive: true, force: true });
+  }
 });
