@@ -6,9 +6,9 @@ import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { serve } from '../dist/server.js';
-import { startWeb } from '../dist/web-server.js';
-import { request } from '../dist/protocol.js';
+import { serve } from '../src/server.js';
+import { startWeb } from '../src/web-server.js';
+import { request } from '../src/protocol.js';
 import { Store } from '../src/store.js';
 import { ImGateway } from '../src/im.js';
 
@@ -30,7 +30,7 @@ function readReqBody(req: IncomingMessage): Promise<string> {
 }
 
 test('OpenClaw-style Multi-Channel IM Gateway: DingTalk, WeChat, and Telegram share unified conversation, global memory, and proactive Worker push', async () => {
-  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-im-gateway-'));
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-im-gateway-'));
 
   // Mock external IM servers (DingTalk, WeChat, Telegram Bot API)
   const dingtalkReceived: Array<{ url: string; body: Record<string, unknown> }> = [];
@@ -367,7 +367,7 @@ test('OpenClaw-style Multi-Channel IM Gateway: DingTalk, WeChat, and Telegram sh
 
     // Wait for iLink getupdates poller to ingest the message and reply via /ilink/bot/sendmessage
     await until(() => wechatIlinkSent.length >= 1);
-    const ilinkReply = wechatIlinkSent[0];
+    const ilinkReply = wechatIlinkSent[0]!;
     assert.equal(ilinkReply.headers['authorizationtype'], 'ilink_bot_token');
     assert.equal(ilinkReply.headers['authorization'], 'Bearer ilink-bot-token-xyz');
     assert.ok(ilinkReply.headers['x-wechat-uin'], 'X-WECHAT-UIN header is present');
@@ -380,7 +380,7 @@ test('OpenClaw-style Multi-Channel IM Gateway: DingTalk, WeChat, and Telegram sh
     assert.equal(ilinkMsg.to_user_id, 'wx_user_tony@im.wechat');
     assert.equal(ilinkMsg.context_token, 'ctx-token-tony-session-999', 'Replies echo back the exact iLink context_token');
     assert.equal(ilinkMsg.message_type, 2);
-    assert.match(ilinkMsg.item_list[0].text_item.text, /FRIDAY 全息态势简报/);
+    assert.match(ilinkMsg.item_list[0]?.text_item.text ?? '', /FRIDAY 全息态势简报/);
   } finally {
     await web.close();
     await daemon.close();
@@ -390,7 +390,7 @@ test('OpenClaw-style Multi-Channel IM Gateway: DingTalk, WeChat, and Telegram sh
 });
 
 test('WeChat iLink typing indicator: getconfig ticket cache, strict start/message/stop ordering, and stale ticket refresh', async () => {
-  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-im-wx-typing-'));
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-im-wx-typing-'));
   const updatesQueue: Array<Record<string, unknown>> = [];
   const timeline: string[] = [];
   const getconfigCalls: Array<Record<string, unknown>> = [];
@@ -479,11 +479,11 @@ test('WeChat iLink typing indicator: getconfig ticket cache, strict start/messag
       'typing:2:typing-ticket-1',
     ]);
     assert.equal(getconfigCalls.length, 1);
-    assert.equal(getconfigCalls[0].ilink_user_id, 'wx_user_pepper@im.wechat');
-    assert.equal(getconfigCalls[0].context_token, 'ctx-typing-1');
-    assert.equal(typingCalls[0].headers['authorizationtype'], 'ilink_bot_token');
-    assert.equal(typingCalls[0].headers['authorization'], 'Bearer ilink-typing-bot-token');
-    assert.equal(typingCalls[0].body.ilink_user_id, 'wx_user_pepper@im.wechat');
+    assert.equal(getconfigCalls[0]!.ilink_user_id, 'wx_user_pepper@im.wechat');
+    assert.equal(getconfigCalls[0]!.context_token, 'ctx-typing-1');
+    assert.equal(typingCalls[0]!.headers['authorizationtype'], 'ilink_bot_token');
+    assert.equal(typingCalls[0]!.headers['authorization'], 'Bearer ilink-typing-bot-token');
+    assert.equal(typingCalls[0]!.body.ilink_user_id, 'wx_user_pepper@im.wechat');
 
     // Turn 2: reuses cached typing_ticket without calling getconfig again
     timeline.length = 0;
@@ -530,7 +530,7 @@ test('WeChat iLink typing indicator: getconfig ticket cache, strict start/messag
 });
 
 test('WeChat iLink typing keepalive pulses during long streaming and clears cleanly on interruption', async () => {
-  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-im-wx-keepalive-'));
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-im-wx-keepalive-'));
   const store = new Store(home);
   const statuses: number[] = [];
   const oldFetch = globalThis.fetch;

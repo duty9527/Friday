@@ -22,8 +22,16 @@ test('replaces internal staging paths but keeps ordinary user paths', () => {
     sanitizePublicReply('文档落到 `~/.super-agent/wechat-files/brief.md`，原件在 `~/Documents/ljzp_final.xlsx`。'),
     '文档落到 本地，原件在 `~/Documents/ljzp_final.xlsx`。',
   );
-  assert.equal(sanitizePublicReply('图在 /Users/duty/.super-agent/inbound-media/a.jpg 里'), '图在 本地 里');
+  assert.equal(sanitizePublicReply('图在 /Users/alice/.super-agent/inbound-media/a.jpg 里'), '图在 本地 里');
+  assert.equal(sanitizePublicReply('图在 /home/alice/.friday/inbound-media/a.jpg 里'), '图在 本地 里');
+  assert.equal(sanitizePublicReply('文件在 `/home/bob/.super-agent/tasks/t1/out.txt`'), '文件在 本地');
+  assert.equal(sanitizePublicReply('凭证在 ~/.friday/run/ssh-ctl-123'), '凭证在 本地');
   assert.equal(sanitizePublicReply('报告在 ~/.super-agent/reports/x.md'), '报告在 ~/.super-agent/reports/x.md');
+  assert.equal(sanitizePublicReply('报告在 /home/alice/.friday/reports/x.md'), '报告在 /home/alice/.friday/reports/x.md');
+  assert.equal(
+    sanitizePublicReply('目录在 /srv/custom-friday/wechat-files/doc.pdf，报告在 /srv/custom-friday/reports/r.md', [], '/srv/custom-friday'),
+    '目录在 本地，报告在 /srv/custom-friday/reports/r.md',
+  );
 });
 
 test('leaves the dispatch acknowledgment and WeChat native expressions untouched', () => {

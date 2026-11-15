@@ -22,7 +22,7 @@ test('spoofed exact authorized sender via direct/webhook ingest cannot download 
     const message = store.conversation.get(result.messageId!);
     assert.match(message.text, /保留正文/);
     assert.match(message.text, /来源未经 iLink 轮询认证/);
-    assert.equal(message.attachments?.[0].status, 'failed');
+    assert.equal(message.attachments?.[0]?.status, 'failed');
     assert.equal(JSON.stringify(message).includes('secret'), false);
   } finally { globalThis.fetch = original; store.close(); await rm(home, { recursive: true, force: true }); }
 });
@@ -56,16 +56,16 @@ test('production getupdates entry preserves provenance; empty allowlist independ
     // Invoke the production channel dispatcher, not the parser or internal trust sets.
     await (gateway as any).pollChannel('wx');
     assert.equal(downloads, 0);
-    assert.equal(store.conversation.history(undefined, 10).items[0].attachments?.[0].status, 'failed');
+    assert.equal(store.conversation.history(undefined, 10).items[0]?.attachments?.[0]?.status, 'failed');
     const channel = store.getImChannel('wx');
     channel.allowedSenders = ['A'];
     store.saveImChannel(channel);
     await (gateway as any).pollChannel('wx');
     assert.equal(polls, 2);
     assert.equal(downloads, 1);
-    const ready = store.conversation.history(undefined, 10).items.find(m => m.attachments?.[0].status === 'ready');
+    const ready = store.conversation.history(undefined, 10).items.find(m => m.attachments?.[0]?.status === 'ready');
     assert.ok(ready);
-    assert.deepEqual(await readFile(ready.attachments![0].path!), png);
+    assert.deepEqual(await readFile(ready.attachments![0]!.path!), png);
     assert.equal(ready.origin?.senderId, 'A');
     assert.equal(ready.origin?.conversationId, 'A');
   } finally {

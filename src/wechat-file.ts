@@ -3,9 +3,9 @@ import { open, realpath } from 'node:fs/promises';
 import { join, basename } from 'node:path';
 import { createCipheriv, createHash, randomBytes, randomUUID } from 'node:crypto';
 
-// Local memory policy, not an upstream file-size limit. Transfers serialize through a queue.
+// Local memory policy, not an upstream file-size limit. Transfers serialize per channel.
 export const MAX_ATTACHMENT_BYTES = 16 * 1024 * 1024;
-let deliveryQueue: Promise<void> = Promise.resolve();
+const channelDeliveryQueues = new Map<string, Promise<void>>();
 export async function readStagedAttachment(root: string, name: string): Promise<Buffer> {
   if (!name || name === '.' || name === '..' || basename(name) !== name || /[\\/\x00-\x1f]/.test(name)) throw new Error('Invalid attachment name');
   const dir = await realpath(root);
@@ -25,11 +25,18 @@ export async function readStagedAttachment(root: string, name: string): Promise<
   } finally { await handle.close(); }
 }
 
+function withTimeout(ms: number, parentSignal?: AbortSignal): AbortSignal {
+  const timeoutSignal = AbortSignal.timeout(ms);
+  return parentSignal ? AbortSignal.any([timeoutSignal, parentSignal]) : timeoutSignal;
+}
+
 export async function deliverWechatFile(input: {
   root: string; name: string; target: string; contextToken: string; accountId?: string;
-  base: string; headers: Record<string, string>;
+  base: string; headers: Record<string, string>; channelId?: string; signal?: AbortSignal;
 }, transport: typeof fetch = fetch): Promise<void> {
-  const run = deliveryQueue.then(async () => {
+  const queueKey = input.channelId?.trim() || `${input.base}:${input.accountId ?? ''}:${input.target}`;
+  const prev = channelDeliveryQueues.get(queueKey) ?? Promise.resolve();
+  const run = prev.catch(() => {}).then(async () => {
     try {
       const plain = await readStagedAttachment(input.root, input.name);
       const key = randomBytes(16);
@@ -38,7 +45,7 @@ export async function deliverWechatFile(input: {
       const filekey = randomBytes(16).toString('hex');
       const post = async (endpoint: string, body: unknown) => {
         const res = await transport(`${input.base}/ilink/bot/${endpoint}`, {
-          method: 'POST', headers: input.headers, redirect: 'error', signal: AbortSignal.timeout(30_000),
+          method: 'POST', headers: input.headers, redirect: 'error', signal: withTimeout(30_000, input.signal),
           body: JSON.stringify({ base_info: { channel_version: '1.0.2' }, ...body as object }),
         });
         if (!res.ok) throw new Error(`iLink ${endpoint} HTTP ${res.status}`);
@@ -56,7 +63,7 @@ export async function deliverWechatFile(input: {
         ? new URL(upload.upload_full_url.trim())
         : new URL(`${cdn}/c2c/upload?encrypted_query_param=${encodeURIComponent(String(upload.upload_param ?? ''))}&filekey=${filekey}`);
       if ((!upload.upload_full_url && !upload.upload_param) || url.origin !== cdn || url.username || url.password) throw new Error('Invalid CDN destination');
-      const res = await transport(url, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(60_000), headers: { 'Content-Type': 'application/octet-stream' }, body: new Uint8Array(encrypted) });
+      const res = await transport(url, { method: 'POST', redirect: 'error', signal: withTimeout(60_000, input.signal), headers: { 'Content-Type': 'application/octet-stream' }, body: new Uint8Array(encrypted) });
       const param = res.headers.get('x-encrypted-param');
       if (res.status !== 200) throw new Error(`CDN upload HTTP ${res.status}`);
       if (!param) throw new Error('CDN upload missing x-encrypted-param');
@@ -76,6 +83,11 @@ export async function deliverWechatFile(input: {
       throw new Error(`Attachment delivery failed (${detail}); no automatic retry`);
     }
   });
-  deliveryQueue = run.then(() => {}, () => {});
+  const settled = run.then(() => {}, () => {}).finally(() => {
+    if (channelDeliveryQueues.get(queueKey) === settled) {
+      channelDeliveryQueues.delete(queueKey);
+    }
+  });
+  channelDeliveryQueues.set(queueKey, settled);
   return run;
 }

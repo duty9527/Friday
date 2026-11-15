@@ -48,11 +48,10 @@ import {
   parseSpeakerVoiceCommand,
   type XiaoaiSpeakerExtractor,
 } from '../src/xiaoai-speaker.js';
-import { encodeXiaomiTvIrFrame } from '../src/xiaoai-tv-remote.js';
-import { serve } from '../dist/server.js';
-import { startWeb } from '../dist/web-server.js';
-import { request } from '../dist/protocol.js';
-import { Coordinator } from '../dist/coordinator.js';
+import { serve } from '../src/server.js';
+import { startWeb } from '../src/web-server.js';
+import { request } from '../src/protocol.js';
+import { Coordinator } from '../src/coordinator.js';
 import { compactHostEventText, offlineFactory, prepareRouterSessionModel, type AgentFactory } from '../src/agent.js';
 import { Store, type ImChannelConfig } from '../src/store.js';
 import { ImGateway } from '../src/im.js';
@@ -63,6 +62,151 @@ async function until(predicate: () => boolean | Promise<boolean>, attempts = 300
     await delay(15);
   }
   throw new Error('Timed out waiting for XiaoAI condition');
+}
+
+type TestTvPluginConfig = {
+  idleTtlMs: number;
+  captureWaitMs: number;
+  stepIntervalMs: number;
+};
+
+type TestTvFastpathHandler = (request: {
+  text: string;
+  explicitWake?: boolean;
+  sessionState?: Record<string, unknown>;
+}) => Promise<Record<string, unknown>>;
+
+const TEST_TV_FASTPATH_KEY = '__fridayTestTvFastpath';
+const TEST_TV_IR_CODES = {
+  down: 'TEST_TV_IR_DOWN',
+  up: 'TEST_TV_IR_UP',
+  right: 'TEST_TV_IR_RIGHT',
+  ok: 'TEST_TV_IR_OK',
+} as const;
+
+function parseTestTvPressSequence(text: string): string[] | undefined {
+  const normalized = text.trim();
+  if (normalized.includes('往下两下再确认')) {
+    return [TEST_TV_IR_CODES.down, TEST_TV_IR_CODES.down, TEST_TV_IR_CODES.ok];
+  }
+  if (normalized.includes('往右往上')) {
+    return [TEST_TV_IR_CODES.right, TEST_TV_IR_CODES.up];
+  }
+  if (normalized.includes('往下') || normalized.includes('哪下')) {
+    return [TEST_TV_IR_CODES.down];
+  }
+  if (normalized.includes('往上') || normalized.includes('马上')) {
+    return [TEST_TV_IR_CODES.up];
+  }
+  if (normalized.includes('往右') || normalized.includes('网友')) {
+    return [TEST_TV_IR_CODES.right];
+  }
+  if (normalized.includes('确认')) {
+    return [TEST_TV_IR_CODES.ok];
+  }
+  return undefined;
+}
+
+async function installTestTvFastpathPlugin(
+  home: string,
+  targetUserHost: string,
+  sshRunner: XiaoaiSshRunner,
+  cfg: TestTvPluginConfig,
+): Promise<() => void> {
+  const realHome = await realpath(home);
+  const pluginDir = join(realHome, 'plugins', 'test-tv-ir');
+  await mkdir(pluginDir, { recursive: true });
+  await writeFile(join(pluginDir, 'plugin.json'), JSON.stringify({
+    name: 'test-tv-ir',
+    version: '1.0.0',
+    description: 'Test TV remote fastpath plugin',
+    enabled: true,
+    runtime: 'in-process',
+    voiceFastpath: true,
+    entry: 'index.mjs',
+    actions: [],
+  }));
+  const g = globalThis as Record<string, unknown>;
+  let reg = g[TEST_TV_FASTPATH_KEY] as Map<string, TestTvFastpathHandler> | undefined;
+  if (!reg) {
+    reg = new Map();
+    g[TEST_TV_FASTPATH_KEY] = reg;
+  }
+  const key = realHome;
+  reg.set(key, async (req) => {
+    const activeState = () => ({
+      continuous: true,
+      tvRemoteActive: true,
+      idleTtlMs: cfg.idleTtlMs,
+      captureWaitMs: cfg.captureWaitMs,
+    });
+    if (req.sessionState?.event === 'assistant_reply') {
+      const reply = String(req.sessionState.assistantReply ?? '');
+      if (reply.includes('要试别的键就说')) {
+        return {
+          handled: true,
+          followUp: true,
+          followUpWaitMs: cfg.captureWaitMs,
+          sessionState: activeState(),
+        };
+      }
+      return { handled: false };
+    }
+    const clean = req.text.replace(/[。！？，、\s]+/g, '');
+    if (clean === '遥控电视模式') {
+      return {
+        handled: true,
+        ok: true,
+        speech: '已进入遥控模式。',
+        followUp: true,
+        followUpWaitMs: cfg.captureWaitMs,
+        sessionState: activeState(),
+        action: 'tv_enter',
+      };
+    }
+    if (!req.sessionState?.tvRemoteActive) {
+      return { handled: false };
+    }
+    if (clean === '退出遥控') {
+      return {
+        handled: true,
+        ok: true,
+        speech: '已退出遥控。',
+        clearSessionState: true,
+        action: 'tv_exit',
+      };
+    }
+    const codes = parseTestTvPressSequence(req.text);
+    if (!codes?.length) {
+      return { handled: false };
+    }
+    for (let i = 0; i < codes.length; i++) {
+      if (i > 0) await delay(cfg.stepIntervalMs);
+      await sshRunner(
+        { id: 'lx06', userHost: targetUserHost },
+        `/bin/show_led 1 >/dev/null 2>&1; ubus call ir_agent play '${JSON.stringify({ protocol: 0, code: codes[i] })}'`,
+      );
+    }
+    return {
+      handled: true,
+      ok: true,
+      followUp: true,
+      followUpWaitMs: cfg.captureWaitMs,
+      sessionState: activeState(),
+      data: { ledRefreshed: true, recordTurn: false },
+      action: 'tv_press',
+    };
+  });
+  await writeFile(join(pluginDir, 'index.mjs'), `
+export async function handleVoiceFastpath(request, context) {
+  const reg = globalThis[${JSON.stringify(TEST_TV_FASTPATH_KEY)}];
+  const fn = reg?.get(${JSON.stringify(key)});
+  return fn ? fn(request, context) : { handled: false };
+}
+`);
+  return () => {
+    reg?.delete(key);
+  };
 }
 
 function readReqBody(req: IncomingMessage): Promise<string> {
@@ -138,7 +282,7 @@ test('XiaoAI speech sanitization and segmentation', () => {
 
 test('XiaoAI query interception, SSH multi-speaker target parsing, pollability, and webhook parsing', () => {
   // Without prefix: native speaker commands & smart-home IoT pass through; natural language is intercepted
-  for (const nativeCmd of ['音量大一点', '暂停', '定个7点闹钟', '闭嘴', '下一首', '打开鱼缸灯', '关闭客厅空调']) {
+  for (const nativeCmd of ['音量大一点', '暂停', '定个7点闹钟', '闭嘴', '下一首', '打开客厅灯', '关闭客厅空调']) {
     assert.deepEqual(shouldInterceptXiaoaiQuery(nativeCmd), { intercept: false, query: '' }, `Should pass through: ${nativeCmd}`);
   }
   assert.deepEqual(shouldInterceptXiaoaiQuery('小爱同学，今天深圳天气如何'), {
@@ -167,7 +311,7 @@ test('XiaoAI query interception, SSH multi-speaker target parsing, pollability, 
   assert.equal(cleanXiaoaiAsrUtterance('在。'), '');
   assert.equal(cleanXiaoaiAsrUtterance('在，查一下明天天气'), '查一下明天天气');
   assert.equal(cleanXiaoaiAsrUtterance('在哪里买咖啡'), '在哪里买咖啡');
-  assert.equal(cleanXiaoaiAsrUtterance('小爱同学，打开鱼缸灯'), '');
+  assert.equal(cleanXiaoaiAsrUtterance('小爱同学，打开客厅灯'), '');
   assert.deepEqual(
     shouldInterceptXiaoaiQuery('friday: summarize today tasks', { prefix: '星期五,Friday' }),
     { intercept: true, query: 'summarize today tasks' },
@@ -178,24 +322,24 @@ test('XiaoAI query interception, SSH multi-speaker target parsing, pollability, 
   );
 
   // Multi-speaker SSH URI parsing
-  const targets = parseXiaoaiSshTargets('ssh://oh2p=root@192.168.31.101,lx06=root@192.168.31.102:2222?prefix=星期五');
+  const targets = parseXiaoaiSshTargets('ssh://oh2p=root@192.0.2.101,lx06=root@192.0.2.102:2222?prefix=星期五');
   assert.equal(targets.length, 2);
   assert.equal(targets[0]?.id, 'oh2p');
-  assert.equal(targets[0]?.userHost, 'root@192.168.31.101');
+  assert.equal(targets[0]?.userHost, 'root@192.0.2.101');
   assert.equal(targets[0]?.port, undefined);
   assert.equal(targets[1]?.id, 'lx06');
-  assert.equal(targets[1]?.userHost, 'root@192.168.31.102');
+  assert.equal(targets[1]?.userHost, 'root@192.0.2.102');
   assert.equal(targets[1]?.port, 2222);
 
-  const singleTarget = parseXiaoaiSshTargets('ssh://root@192.168.31.101');
+  const singleTarget = parseXiaoaiSshTargets('ssh://root@192.0.2.101');
   assert.equal(singleTarget.length, 1);
   assert.equal(singleTarget[0]?.id, 'default');
-  assert.equal(singleTarget[0]?.userHost, 'root@192.168.31.101');
+  assert.equal(singleTarget[0]?.userHost, 'root@192.0.2.101');
 
   assert.deepEqual(parseXiaoaiSshTargets('https://api2.mina.mi.com'), []);
 
   // Pollability checks
-  assert.equal(isXiaoaiPollable(makeChannel({ apiBase: 'ssh://oh2p=root@192.168.31.101' })), true);
+  assert.equal(isXiaoaiPollable(makeChannel({ apiBase: 'ssh://oh2p=root@192.0.2.101' })), true);
   assert.equal(isXiaoaiPollable(makeChannel({ accountId: '10086', botToken: 'secret' })), true);
   assert.equal(isXiaoaiPollable(makeChannel({ webhookUrl: 'http://127.0.0.1:9999/tts' })), false);
 
@@ -218,7 +362,7 @@ test('XiaoAI query interception, SSH multi-speaker target parsing, pollability, 
 });
 
 test('XiaoAI SSH dual-speaker end-to-end: baseline anti-replay, pause interrupt, task dispatch, and exact-speaker sanitized TTS', async () => {
-  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-ssh-'));
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-ssh-'));
   const coordinator = new Coordinator(home, offlineFactory(10));
   await coordinator.ready();
 
@@ -244,7 +388,7 @@ test('XiaoAI SSH dual-speaker end-to-end: baseline anti-replay, pause interrupt,
     // 1. Verify pollXiaoaiChannel directly establishes baseline without emitting inbound messages
     const standaloneChannel = makeChannel({
       id: 'xiaoai-direct',
-      apiBase: 'ssh://oh2p=root@192.168.31.101,lx06=root@192.168.31.102?prefix=星期五',
+      apiBase: 'ssh://oh2p=root@192.0.2.101,lx06=root@192.0.2.102?prefix=星期五',
     });
     const baseline = await pollXiaoaiChannel(standaloneChannel, { sshRunner });
     assert.equal(baseline.messages.length, 0, 'Initial SSH poll with historical logs produces no inbound messages');
@@ -258,7 +402,7 @@ test('XiaoAI SSH dual-speaker end-to-end: baseline anti-replay, pause interrupt,
       id: 'xiaoai-ssh-home',
       platform: 'xiaoai',
       name: '客厅书房双音箱',
-      apiBase: 'ssh://oh2p=root@192.168.31.101,lx06=root@192.168.31.102?prefix=星期五',
+      apiBase: 'ssh://oh2p=root@192.0.2.101,lx06=root@192.0.2.102?prefix=星期五',
       pollIntervalMs: 60,
       notifyAll: true,
     });
@@ -322,7 +466,7 @@ test('XiaoAI SSH dual-speaker end-to-end: baseline anti-replay, pause interrupt,
 });
 
 test('XiaoAI cloud MiNA mode end-to-end: login session cached in syncBuf, pollOffset anti-replay, pause, and exact device TTS', async () => {
-  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-cloud-'));
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-cloud-'));
 
   let loginAuthCount = 0;
   let stsCount = 0;
@@ -502,7 +646,7 @@ test('XiaoAI cloud MiNA mode end-to-end: login session cached in syncBuf, pollOf
 });
 
 test('XiaoAI Webhook Bridge secret auth and switch_channel cross-device routing', async () => {
-  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-webhook-'));
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-webhook-'));
   const webhookReceived: Array<{ headers: IncomingMessage['headers']; body: Record<string, unknown> }> = [];
 
   const mockWebhookServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -639,7 +783,7 @@ test('XiaoAI SSH multi-segment TTS marks friday_speaking and waits for mediaplay
 
   const ch = makeChannel({
     id: 'xiaoai-lx06-sync',
-    apiBase: 'ssh://lx06=root@192.168.31.104?prefix=星期五,Friday',
+    apiBase: 'ssh://lx06=root@192.0.2.104?prefix=星期五,Friday',
   });
   const longSpeech = `${'第一段内容，'.repeat(30)}。${'第二段内容，'.repeat(10)}。`;
   const res = await sendXiaoaiSpeech(ch, longSpeech, { target: 'lx06', sshRunner });
@@ -679,7 +823,7 @@ test('XiaoAI Scheme A KWS direct wake: local VAD + ASR eliminates pnshelper/Xiao
   assert.equal(normalizeUtteranceSamples(normal), normal);
 
   // 2. End-to-end Coordinator + KWS local VAD/ASR monitor flow
-  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-kws-'));
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-kws-'));
   const sshCalls: Array<{ targetId: string; command: string }> = [];
   const instructionLines: string[] = [
     JSON.stringify({
@@ -766,7 +910,7 @@ test('XiaoAI Scheme A KWS direct wake: local VAD + ASR eliminates pnshelper/Xiao
       id: 'xiaoai-kws-lx06',
       platform: 'xiaoai',
       name: '小爱直接唤醒测试',
-      apiBase: 'ssh://lx06=root@192.168.31.104?prefix=星期五,Friday',
+      apiBase: 'ssh://lx06=root@192.0.2.104?prefix=星期五,Friday',
       pollIntervalMs: 50,
       notifyAll: false,
     });
@@ -814,7 +958,7 @@ test('XiaoAI Scheme A KWS direct wake: local VAD + ASR eliminates pnshelper/Xiao
     // 4. Native XiaoAI instruction.log entries without Friday prefix are NEVER hijacked
     instructionLines.push(JSON.stringify({
       header: { id: 'native-xiaoai-1', namespace: 'SpeechRecognizer', name: 'RecognizeResult' },
-      payload: { is_final: true, results: [{ text: '打开鱼缸灯' }] },
+      payload: { is_final: true, results: [{ text: '打开客厅灯' }] },
     }));
     await delay(120);
     assert.equal(ttsCallCount(), 0, 'Unprefixed native XiaoAI command in instruction.log is never hijacked');
@@ -884,7 +1028,7 @@ test('XiaoAI Scheme A KWS direct wake: local VAD + ASR eliminates pnshelper/Xiao
 });
 
 test('XiaoAI KWS supports re-wake during capture silent wait and preserves background tasks across concurrent requests', async () => {
-  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-conc-'));
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-conc-'));
   try {
     // Part A: Re-wake during silent wait inside capturing mode
     let audioStreamA: PassThrough | undefined;
@@ -933,7 +1077,7 @@ test('XiaoAI KWS supports re-wake during capture silent wait and preserves backg
       enabled: true,
       notifyAll: false,
       allowedSenders: [],
-      apiBase: 'ssh://lx06=root@192.168.31.104',
+      apiBase: 'ssh://lx06=root@192.0.2.104',
       inboundCount: 0,
       outboundCount: 0,
       createdAt: Date.now(),
@@ -1007,7 +1151,7 @@ test('XiaoAI KWS supports re-wake during capture silent wait and preserves backg
         id: 'xiaoai-bg-lx06',
         platform: 'xiaoai',
         name: '小爱并发后台测试',
-        apiBase: 'ssh://lx06=root@192.168.31.104',
+        apiBase: 'ssh://lx06=root@192.0.2.104',
         pollIntervalMs: 50,
         notifyAll: false,
       });
@@ -1066,7 +1210,7 @@ test('Router HOST_EVENT snapshot compaction and S32LE single-mic ambient/AGC hel
     imChannels: [{ id: 'xiaoai' }],
     subconscious: { pendingInsight: { id: 's1' } },
     execution: 'native',
-    cwd: '/home/duty/Friday',
+    cwd: '/tmp/friday-test',
   };
   const chatRaw = `HOST_EVENT\n${JSON.stringify(chatPayload)}`;
 
@@ -1109,7 +1253,7 @@ test('Router HOST_EVENT snapshot compaction and S32LE single-mic ambient/AGC hel
     kind: 'TASK',
     taskId: 't1',
     execution: 'native',
-    cwd: '/home/duty/Friday',
+    cwd: '/tmp/friday-test',
     compiledContext: { profile: 'coding' },
   })}`;
   assert.equal(compactHostEventText(workerTaskRaw, true), workerTaskRaw);
@@ -1201,7 +1345,7 @@ test('XiaoAI KWS keywords auto-sync, follow-up cancel parsing, and Router non-th
   assert.deepEqual(extractLeadingXiaoaiWakeKeyword('星期五，打开客厅灯'), { keyword: '星期五', remainder: '打开客厅灯' });
 
   // 2. Managed keywords.txt auto-upgrades when version file is missing/outdated; custom file untouched
-  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-kw-'));
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-kw-'));
   try {
     const kwsDir = join(home, 'xiaoai-kws');
     await mkdir(join(kwsDir, 'models'), { recursive: true });
@@ -1230,7 +1374,7 @@ test('XiaoAI KWS keywords auto-sync, follow-up cancel parsing, and Router non-th
       enabled: true,
       notifyAll: false,
       allowedSenders: [],
-      apiBase: 'ssh://lx06=root@192.168.31.104',
+      apiBase: 'ssh://lx06=root@192.0.2.104',
       inboundCount: 0,
       outboundCount: 0,
       createdAt: Date.now(),
@@ -1265,7 +1409,7 @@ test('XiaoAI KWS keywords auto-sync, follow-up cancel parsing, and Router non-th
       enabled: true,
       notifyAll: false,
       allowedSenders: [],
-      apiBase: 'ssh://lx06=root@192.168.31.104',
+      apiBase: 'ssh://lx06=root@192.0.2.104',
       inboundCount: 0,
       outboundCount: 0,
       createdAt: Date.now(),
@@ -1294,7 +1438,7 @@ test('XiaoAI KWS keywords auto-sync, follow-up cancel parsing, and Router non-th
     reasoning: true,
     thinkingLevelMap: { off: null, high: 'high' },
   });
-  assert.equal(glm.compat?.thinkingFormat, 'deepseek');
+  assert.equal((glm as { compat?: { thinkingFormat?: string } }).compat?.thinkingFormat, 'deepseek');
   assert.equal(glm.thinkingLevelMap?.off, 'off');
 
   const plain = prepareRouterSessionModel({
@@ -1350,7 +1494,7 @@ test('XiaoAI continuous follow-up confirmation dialog and cross-endpoint switch_
   assert.equal(sanitizeForSpeech('请问定几点？[[LISTEN]]'), '请问定几点？');
   assert.equal(sanitizeForSpeech('要我现在去查这台音箱支不支持蓝牙输入？</br>'), '要我现在去查这台音箱支不支持蓝牙输入？');
 
-  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-dialog-'));
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-dialog-'));
   try {
     const sshCalls: Array<{ targetId: string; command: string }> = [];
     const sshRunner: XiaoaiSshRunner = async (target, remoteCommand) => {
@@ -1460,7 +1604,7 @@ test('XiaoAI continuous follow-up confirmation dialog and cross-endpoint switch_
         id: 'xiaoai-dialog',
         platform: 'xiaoai',
         name: '小爱连续对话',
-        apiBase: 'ssh://lx06=root@192.168.31.104',
+        apiBase: 'ssh://lx06=root@192.0.2.104',
         pollIntervalMs: 50,
         notifyAll: false,
       });
@@ -1484,7 +1628,7 @@ test('XiaoAI continuous follow-up confirmation dialog and cross-endpoint switch_
       const chimesAfterQ1 = wakeCount();
 
       // Turn 2 (NO wake word! Follow-up mode captures directly): "明天早上九点" -> final statement ends dialog
-      await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-dialog', 'lx06') === true);
+      await until(() => coordinator.im.getXiaoaiKwsStatus('xiaoai-dialog', 'lx06')?.capturing === true);
       pushSamples(0, 3200); // > 180ms follow-up discard
       pushSamples(0.15, 480);
       pushSamples(0, 800);
@@ -1492,17 +1636,17 @@ test('XiaoAI continuous follow-up confirmation dialog and cross-endpoint switch_
       assert.equal(wakeCount(), chimesAfterQ1, 'Follow-up turn must not require re-wake or chime');
       await delay(50);
       assert.equal(
-        coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-dialog', 'lx06'),
+        Boolean(coordinator.im.getXiaoaiKwsStatus('xiaoai-dialog', 'lx06')?.capturing),
         false,
         'Speaker must return to standby after final statement',
       );
 
       // Verify cancel phrase ("不用了") during follow-up capture does not send to Coordinator
       const msgsBeforeCancel = coordinator.store.conversation.history(undefined, 20).items.length;
-      assert.equal(coordinator.im.xiaoaiKwsMonitor?.enterFollowUpCapture('xiaoai-dialog', 'lx06', { waitMs: 1200, discardMs: 0 }), true);
+      assert.equal(coordinator.im.enterXiaoaiFollowUpCapture('xiaoai-dialog', 'lx06', { waitMs: 1200, discardMs: 0 }), true);
       pushSamples(0.15, 480);
       pushSamples(0, 800);
-      await until(() => !coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-dialog', 'lx06'));
+      await until(() => !coordinator.im.getXiaoaiKwsStatus('xiaoai-dialog', 'lx06')?.capturing);
       await delay(60);
       assert.equal(coordinator.store.conversation.history(undefined, 20).items.length, msgsBeforeCancel);
 
@@ -1536,7 +1680,7 @@ test('XiaoAI continuous follow-up confirmation dialog and cross-endpoint switch_
 });
 
 test('XiaoAI TV Remote Mode: zero-LLM deterministic keys, empty/timeout/noise capture persistence, and clean exit / idle TTL expiry', async () => {
-  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-tvremote-'));
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-tvremote-'));
   try {
     const sshCalls: Array<{ targetId: string; command: string }> = [];
     const sshRunner: XiaoaiSshRunner = async (target, remoteCommand) => {
@@ -1596,6 +1740,12 @@ test('XiaoAI TV Remote Mode: zero-LLM deterministic keys, empty/timeout/noise ca
 
     const coordinator = new Coordinator(home, customFactory);
     await coordinator.ready();
+    const tvCfg: TestTvPluginConfig = {
+      idleTtlMs: 3_000,
+      captureWaitMs: 220,
+      stepIntervalMs: 10,
+    };
+    const uninstallTvPlugin = await installTestTvFastpathPlugin(home, 'root@192.0.2.104', sshRunner, tvCfg);
     try {
       coordinator.im.xiaoaiDeps = {
         sshRunner,
@@ -1604,9 +1754,6 @@ test('XiaoAI TV Remote Mode: zero-LLM deterministic keys, empty/timeout/noise ca
         kwsChimeDiscardMs: 20,
         kwsEndSilenceMs: 40,
         kwsMaxWaitSpeechMs: 600,
-        tvRemoteIdleTtlMs: 3_000,
-        tvRemoteCaptureWaitMs: 220,
-        tvRemoteStepIntervalMs: 10,
         kwsStreamFactory: () => {
           audioStream = new PassThrough();
           return { stdout: audioStream, kill: () => audioStream?.end(), onClose: () => {} };
@@ -1634,7 +1781,7 @@ test('XiaoAI TV Remote Mode: zero-LLM deterministic keys, empty/timeout/noise ca
         id: 'xiaoai-tv',
         platform: 'xiaoai',
         name: '小爱电视遥控',
-        apiBase: 'ssh://lx06=root@192.168.31.104',
+        apiBase: 'ssh://lx06=root@192.0.2.104',
         pollIntervalMs: 50,
         notifyAll: false,
       });
@@ -1650,17 +1797,17 @@ test('XiaoAI TV Remote Mode: zero-LLM deterministic keys, empty/timeout/noise ca
       const ttsCommands = () => sshCalls.filter(c => c.command.includes('text_to_speech')).map(c => c.command);
       const listenLedCount = () => sshCalls.filter(c => c.command.includes('/bin/show_led 1')).length;
 
-      const downCode = encodeXiaomiTvIrFrame(0x86, 0x06, 2).code;
-      const upCode = encodeXiaomiTvIrFrame(0x86, 0x05, 2).code;
-      const rightCode = encodeXiaomiTvIrFrame(0x86, 0x0c, 2).code;
-      const okCode = encodeXiaomiTvIrFrame(0x86, 0x0d, 2).code;
+      const downCode = TEST_TV_IR_CODES.down;
+      const upCode = TEST_TV_IR_CODES.up;
+      const rightCode = TEST_TV_IR_CODES.right;
+      const okCode = TEST_TV_IR_CODES.ok;
 
       // 1. Enter remote mode via KWS ("遥控电视模式。") -> zero Router LLM calls, announces entry, arms follow-up capture
       pushSamples(0.75, 16);
       pushSamples(0.15, 480);
       pushSamples(0, 800);
       await until(() => ttsCommands().some(c => c.includes('已进入遥控模式')));
-      await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06') === true);
+      await until(() => coordinator.im.getXiaoaiKwsStatus('xiaoai-tv', 'lx06')?.capturing === true);
       assert.equal(routerChatCalls, 0, 'Entering TV remote mode must not invoke Router LLM');
 
       // 2. Direct key without wake word ("往下。") -> instant IR play, zero TTS, zero Router LLM
@@ -1669,11 +1816,11 @@ test('XiaoAI TV Remote Mode: zero-LLM deterministic keys, empty/timeout/noise ca
       pushSamples(0.15, 480);
       pushSamples(0, 800);
       await until(() => irPlayCommands().length === 1);
-      assert.ok(irPlayCommands()[0]!.includes(downCode), 'Should emit Redmi TV down IR code');
+      assert.ok(irPlayCommands()[0]!.includes(downCode), 'Should emit TV down IR code');
       assert.ok(irPlayCommands()[0]!.includes('/bin/show_led 1'), 'Should refresh listen LED in same SSH call');
       assert.equal(ttsCommands().length, ttsBeforePress, 'In-mode button press must not block on TTS');
       assert.equal(routerChatCalls, 0, 'In-mode press must not invoke Router LLM');
-      assert.equal(coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06'), true);
+      assert.equal(Boolean(coordinator.im.getXiaoaiKwsStatus('xiaoai-tv', 'lx06')?.capturing), true);
 
       // 3. Reproduce 12:46:39 empty ASR bug ("。") -> must NOT exit capture or turn off LED
       const ledsBeforeNoise = listenLedCount();
@@ -1682,7 +1829,7 @@ test('XiaoAI TV Remote Mode: zero-LLM deterministic keys, empty/timeout/noise ca
       await until(() => listenLedCount() > ledsBeforeNoise);
       await delay(30);
       assert.equal(
-        coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06'),
+        Boolean(coordinator.im.getXiaoaiKwsStatus('xiaoai-tv', 'lx06')?.capturing),
         true,
         'Empty ASR punctuation during TV remote mode must stay capturing',
       );
@@ -1690,11 +1837,11 @@ test('XiaoAI TV Remote Mode: zero-LLM deterministic keys, empty/timeout/noise ca
 
       // 4. Silence wait timeout (< 3000ms idle TTL) -> must automatically re-arm capture instead of dropping out
       const ledsBeforeTimeout = listenLedCount();
-      pushSamples(0, 4000); // 250ms > 220ms tvRemoteCaptureWaitMs
+      pushSamples(0, 4000); // 250ms > 220ms captureWaitMs
       await until(() => listenLedCount() > ledsBeforeTimeout);
       await delay(30);
       assert.equal(
-        coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06'),
+        Boolean(coordinator.im.getXiaoaiKwsStatus('xiaoai-tv', 'lx06')?.capturing),
         true,
         'Wait timeout before idle TTL must automatically re-arm capture',
       );
@@ -1706,7 +1853,7 @@ test('XiaoAI TV Remote Mode: zero-LLM deterministic keys, empty/timeout/noise ca
       await until(() => listenLedCount() > ledsBeforeIgnored);
       assert.equal(irPlayCommands().length, 1, 'Unrecognized speech must not emit IR');
       assert.equal(routerChatCalls, 0, 'Unrecognized speech in remote mode must not invoke Router LLM');
-      assert.equal(coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06'), true);
+      assert.equal(Boolean(coordinator.im.getXiaoaiKwsStatus('xiaoai-tv', 'lx06')?.capturing), true);
 
       // 6. Combo phrase after noise/timeout recovery ("往下两下再确认") -> down, down, ok
       pushSamples(0.15, 480);
@@ -1717,7 +1864,7 @@ test('XiaoAI TV Remote Mode: zero-LLM deterministic keys, empty/timeout/noise ca
       assert.ok(addedIr[1]!.includes(downCode));
       assert.ok(addedIr[2]!.includes(okCode));
       assert.equal(routerChatCalls, 0);
-      assert.equal(coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06'), true);
+      assert.equal(Boolean(coordinator.im.getXiaoaiKwsStatus('xiaoai-tv', 'lx06')?.capturing), true);
 
       // 6b. Concatenated & homophone commands ("呃，往右往上。" + "网友。") -> right, up, right
       pushSamples(0.15, 480);
@@ -1731,49 +1878,49 @@ test('XiaoAI TV Remote Mode: zero-LLM deterministic keys, empty/timeout/noise ca
       await until(() => irPlayCommands().length === 7);
       assert.ok(irPlayCommands()[6]!.includes(rightCode));
       assert.equal(routerChatCalls, 0);
-      assert.equal(coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06'), true);
+      assert.equal(Boolean(coordinator.im.getXiaoaiKwsStatus('xiaoai-tv', 'lx06')?.capturing), true);
 
       // 7. Explicit exit ("退出遥控") -> announces exit and returns speaker to standby
       pushSamples(0.15, 480);
       pushSamples(0, 800);
       await until(() => ttsCommands().some(c => c.includes('已退出遥控')));
       await delay(40);
-      assert.equal(coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06'), false);
+      assert.equal(Boolean(coordinator.im.getXiaoaiKwsStatus('xiaoai-tv', 'lx06')?.capturing), false);
       assert.equal(routerChatCalls, 0);
 
       // 8. Re-enter with short idle TTL and confirm natural idle expiry shuts down LED & returns to standby
-      coordinator.im.xiaoaiDeps.tvRemoteIdleTtlMs = 260;
-      coordinator.im.xiaoaiDeps.tvRemoteCaptureWaitMs = 200;
+      tvCfg.idleTtlMs = 260;
+      tvCfg.captureWaitMs = 200;
       const entryTtsBefore = ttsCommands().length;
       pushSamples(0.75, 16);
       pushSamples(0.15, 480);
       pushSamples(0, 800);
       await until(() => ttsCommands().length > entryTtsBefore);
-      await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06') === true);
+      await until(() => coordinator.im.getXiaoaiKwsStatus('xiaoai-tv', 'lx06')?.capturing === true);
       const offLedCount = () => sshCalls.filter(c => c.command.includes('/bin/shut_led 1') && !c.command.includes('/bin/show_led')).length;
       const shutLedsBeforeExpiry = offLedCount();
       await delay(290);
       pushSamples(0, 6400); // > 120ms entry discard + 200ms capture wait
-      await until(() => !coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06'));
+      await until(() => !coordinator.im.getXiaoaiKwsStatus('xiaoai-tv', 'lx06')?.capturing);
       await until(() => offLedCount() > shutLedsBeforeExpiry);
       assert.equal(routerChatCalls, 0);
 
       // 9. Explicit wake word + non-TV query ("你好星期五，今天天气怎么样") exits TV remote mode & routes to Router
-      coordinator.im.xiaoaiDeps.tvRemoteIdleTtlMs = 3_000;
-      coordinator.im.xiaoaiDeps.tvRemoteCaptureWaitMs = 220;
+      tvCfg.idleTtlMs = 3_000;
+      tvCfg.captureWaitMs = 220;
       const ttsBeforeReenter = ttsCommands().length;
       pushSamples(0.75, 16);
       pushSamples(0.15, 480);
       pushSamples(0, 800);
       await until(() => ttsCommands().length > ttsBeforeReenter);
-      await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06') === true);
+      await until(() => coordinator.im.getXiaoaiKwsStatus('xiaoai-tv', 'lx06')?.capturing === true);
       pushSamples(0, 2200);
       pushSamples(0.15, 480);
       pushSamples(0, 800);
       await until(() => routerChatCalls === 1 && ttsCommands().some(c => c.includes('不该走到路由')));
       assert.deepEqual(routerTexts, ['今天天气怎么样']);
       await delay(40);
-      assert.equal(coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06'), false);
+      assert.equal(Boolean(coordinator.im.getXiaoaiKwsStatus('xiaoai-tv', 'lx06')?.capturing), false);
 
       // 10. Router replying "……要试别的键就说。[[END]]" after testing TV activates continuous local TV remote mode
       const irBeforeInvite = irPlayCommands().length;
@@ -1781,7 +1928,7 @@ test('XiaoAI TV Remote Mode: zero-LLM deterministic keys, empty/timeout/noise ca
       pushSamples(0.15, 480);
       pushSamples(0, 800);
       await until(() => routerChatCalls === 2 && ttsCommands().some(c => c.includes('要试别的键就说')));
-      await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06') === true);
+      await until(() => coordinator.im.getXiaoaiKwsStatus('xiaoai-tv', 'lx06')?.capturing === true);
       pushSamples(0, 2200); // > 120ms discard
       pushSamples(0.15, 480); // "马上。" -> up
       pushSamples(0, 800);
@@ -1796,8 +1943,9 @@ test('XiaoAI TV Remote Mode: zero-LLM deterministic keys, empty/timeout/noise ca
 
       pushSamples(0.15, 480); // "退出遥控"
       pushSamples(0, 800);
-      await until(() => !coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-tv', 'lx06'));
+      await until(() => !coordinator.im.getXiaoaiKwsStatus('xiaoai-tv', 'lx06')?.capturing);
     } finally {
+      uninstallTvPlugin();
       await coordinator.close();
     }
   } finally {
@@ -1806,7 +1954,7 @@ test('XiaoAI TV Remote Mode: zero-LLM deterministic keys, empty/timeout/noise ca
 });
 
 test('XiaoAI KWS s32le sub-threshold hiss skips ASR and cancels capture cleanly', async () => {
-  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-hiss-'));
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-hiss-'));
   try {
     let audioStream: PassThrough | undefined;
     let transcribeCalls = 0;
@@ -1862,7 +2010,7 @@ test('XiaoAI KWS s32le sub-threshold hiss skips ASR and cancels capture cleanly'
       enabled: true,
       notifyAll: false,
       allowedSenders: [],
-      apiBase: 'ssh://lx06=root@192.168.31.104',
+      apiBase: 'ssh://lx06=root@192.0.2.104',
       inboundCount: 0,
       outboundCount: 0,
       createdAt: Date.now(),
@@ -1972,7 +2120,7 @@ function createBandSpeakerExtractorFactory(): () => XiaoaiSpeakerExtractor {
 }
 
 test('XiaoaiSpeakerManager multi-speaker profiles, TV-tail trimming, and command parsing', async () => {
-  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-spk-unit-'));
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-spk-unit-'));
   try {
     assert.deepEqual(parseSpeakerVoiceCommand('你好星期五，录入我的声纹'), { kind: 'enroll', mode: 'replace' });
     assert.deepEqual(parseSpeakerVoiceCommand('帮老婆录入声纹'), { kind: 'enroll', targetName: '老婆', mode: 'replace' });
@@ -2101,7 +2249,7 @@ test('XiaoaiSpeakerManager multi-speaker profiles, TV-tail trimming, and command
 });
 
 test('XiaoAI E2E voiceprint enrollment, multi-speaker recognition, TV rejection, and poll bypass blocking', async () => {
-  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-spk-e2e-'));
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-spk-e2e-'));
   try {
     const sshCalls: Array<{ targetId: string; command: string }> = [];
     let simulateUnverifiedLogLine = false;
@@ -2179,8 +2327,14 @@ test('XiaoAI E2E voiceprint enrollment, multi-speaker recognition, TV rejection,
 
     const coordinator = new Coordinator(home, customFactory);
     await coordinator.ready();
+    const uninstallTvPlugin = await installTestTvFastpathPlugin(
+      home,
+      'root@192.0.2.99',
+      sshRunner,
+      { idleTtlMs: 3_000, captureWaitMs: 600, stepIntervalMs: 10 },
+    );
     try {
-      const downCode = encodeXiaomiTvIrFrame(0x86, 0x06, 2).code;
+      const downCode = TEST_TV_IR_CODES.down;
 
       coordinator.im.xiaoaiDeps = {
         sshRunner,
@@ -2189,9 +2343,6 @@ test('XiaoAI E2E voiceprint enrollment, multi-speaker recognition, TV rejection,
         kwsChimeDiscardMs: 20,
         kwsEndSilenceMs: 40,
         kwsMaxWaitSpeechMs: 1_200,
-        tvRemoteIdleTtlMs: 3_000,
-        tvRemoteCaptureWaitMs: 600,
-        tvRemoteStepIntervalMs: 10,
         speakerEnrollWaitMs: 3_000,
         speakerExtractorFactory: createBandSpeakerExtractorFactory(),
         kwsStreamFactory: () => {
@@ -2236,7 +2387,7 @@ test('XiaoAI E2E voiceprint enrollment, multi-speaker recognition, TV rejection,
         enabled: true,
         notifyAll: false,
         allowedSenders: ['lx06'],
-        apiBase: 'ssh://lx06=root@192.168.1.99?kws=1&chime=0',
+        apiBase: 'ssh://lx06=root@192.0.2.99?kws=1&chime=0',
         defaultTarget: 'lx06',
         pollIntervalMs: 50,
       });
@@ -2274,13 +2425,13 @@ test('XiaoAI E2E voiceprint enrollment, multi-speaker recognition, TV rejection,
       // 2. Owner voice-triggered enrollment (no model needed because custom extractor factory is provided)
       await sendSpokenTurn(200, 700, true);
       await until(() => ttsCommands().some(c => c.includes('开始为主人录入声纹')));
-      await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-spk', 'lx06') === true);
+      await until(() => coordinator.im.getXiaoaiKwsStatus('xiaoai-spk', 'lx06')?.capturing === true);
       for (const expectedPrompt of ['请说第 2 句', '请说第 3 句', '已保存主人的声纹']) {
         await pushChunked(synthToneSamples(0, 200, 0)); // clear discard window
         await sendSpokenTurn(200, 1000, false);
         await until(() => ttsCommands().some(c => c.includes(expectedPrompt)));
         if (expectedPrompt !== '已保存主人的声纹') {
-          await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-spk', 'lx06') === true);
+          await until(() => coordinator.im.getXiaoaiKwsStatus('xiaoai-spk', 'lx06')?.capturing === true);
         }
       }
       await delay(35);
@@ -2297,13 +2448,13 @@ test('XiaoAI E2E voiceprint enrollment, multi-speaker recognition, TV rejection,
       const ttsBeforeWife = ttsCommands().length;
       await sendSpokenTurn(200, 700, true);
       await until(() => ttsCommands().slice(ttsBeforeWife).some(c => c.includes('开始为老婆录入声纹')));
-      await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-spk', 'lx06') === true);
+      await until(() => coordinator.im.getXiaoaiKwsStatus('xiaoai-spk', 'lx06')?.capturing === true);
       for (const expectedTts of ['第 1 句已收到', '第 2 句已收到', '已保存老婆的声纹']) {
         await pushChunked(synthToneSamples(0, 200, 0));
         await sendSpokenTurn(800, 1000, false);
         await until(() => ttsCommands().slice(ttsBeforeWife).some(c => c.includes(expectedTts)));
         if (expectedTts !== '已保存老婆的声纹') {
-          await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-spk', 'lx06') === true);
+          await until(() => coordinator.im.getXiaoaiKwsStatus('xiaoai-spk', 'lx06')?.capturing === true);
         }
       }
       await delay(35);
@@ -2318,13 +2469,13 @@ test('XiaoAI E2E voiceprint enrollment, multi-speaker recognition, TV rejection,
       // 5. Owner opens follow-up window -> TV speaks 1.8s (rejected silently, window stays alive) -> Wife replies
       await sendSpokenTurn(200, 700, true);
       await until(() => routerEvents.length === 2 && ttsCommands().some(c => c.includes('还有其他需要一起提醒的吗')));
-      await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-spk', 'lx06') === true);
+      await until(() => coordinator.im.getXiaoaiKwsStatus('xiaoai-spk', 'lx06')?.capturing === true);
       const asrBeforeFollowUpTv = asrCalls;
       await pushChunked(synthToneSamples(0, 240, 0)); // clear discardMs (150ms)
       await pushChunked(concatAudio(synthToneSamples(3200, 1650, 0.2), synthToneSamples(0, 120, 0))); // continuous TV dialogue rejected live without breaking follow-up
       await delay(60);
       assert.equal(asrCalls, asrBeforeFollowUpTv, 'TV crosstalk during follow-up must not call ASR');
-      assert.equal(coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-spk', 'lx06'), true, 'Follow-up window must stay open for real user');
+      assert.equal(Boolean(coordinator.im.getXiaoaiKwsStatus('xiaoai-spk', 'lx06')?.capturing), true, 'Follow-up window must stay open for real user');
 
       await sendSpokenTurn(800, 700, false); // Wife answers inside re-armed follow-up window
       await until(() => routerEvents.length === 3 && ttsCommands().some(c => c.includes('收到：买瓶牛奶')));
@@ -2351,17 +2502,17 @@ test('XiaoAI E2E voiceprint enrollment, multi-speaker recognition, TV rejection,
       // 7. TV remote mode ignores TV dialogue and still accepts owner's key press
       await sendSpokenTurn(200, 700, true);
       await until(() => ttsCommands().some(c => c.includes('已进入遥控模式')));
-      await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-spk', 'lx06') === true);
+      await until(() => coordinator.im.getXiaoaiKwsStatus('xiaoai-spk', 'lx06')?.capturing === true);
       await pushChunked(synthToneSamples(0, 200, 0));
       await pushChunked(concatAudio(synthToneSamples(3200, 1650, 0.2), synthToneSamples(0, 120, 0))); // TV rejected in remote mode
       await delay(60);
       assert.equal(irPlayCommands().length, 0);
-      assert.equal(coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-spk', 'lx06'), true);
+      assert.equal(Boolean(coordinator.im.getXiaoaiKwsStatus('xiaoai-spk', 'lx06')?.capturing), true);
 
       await sendSpokenTurn(200, 500, false); // Owner says "往下"
       await until(() => irPlayCommands().length === 1);
       assert.ok(irPlayCommands()[0]!.includes(downCode));
-      await until(() => coordinator.im.xiaoaiKwsMonitor?.isCapturing('xiaoai-spk', 'lx06') === true);
+      await until(() => coordinator.im.getXiaoaiKwsStatus('xiaoai-spk', 'lx06')?.capturing === true);
       await sendSpokenTurn(200, 500, false); // "退出遥控"
       await until(() => ttsCommands().some(c => c.includes('已退出遥控')));
 
@@ -2371,6 +2522,7 @@ test('XiaoAI E2E voiceprint enrollment, multi-speaker recognition, TV rejection,
       await delay(180);
       assert.equal(routerEvents.length, routerCountBeforeLog, 'instruction.log polling must be suppressed when speaker verification is active');
     } finally {
+      uninstallTvPlugin();
       await coordinator.close();
     }
   } finally {
@@ -2379,7 +2531,7 @@ test('XiaoAI E2E voiceprint enrollment, multi-speaker recognition, TV rejection,
 });
 
 test('Daemon IPC voice-status, voice-config, voice-remove, and voice-clear commands work end-to-end', async () => {
-  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-spk-ipc-'));
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-spk-ipc-'));
   try {
     const seededManager = new XiaoaiSpeakerManager({ homeDir: home });
     seededManager.enrollEmbeddings({ name: '主人', role: 'owner', embeddings: [new Float32Array([1, 0, 0, 0])] });
@@ -2434,7 +2586,7 @@ test('Daemon IPC voice-status, voice-config, voice-remove, and voice-clear comma
 
 test('XiaoaiKwsMonitor adaptive endpointing tolerates 1050ms mid-sentence pause in slow speech before closing cleanly', async () => {
   assert.equal(DEFAULT_END_SILENCE_MS, 900);
-  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-slow-vad-'));
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-slow-vad-'));
   try {
     let audioStream: PassThrough | undefined;
     let wakeCount = 0;
@@ -2495,7 +2647,7 @@ test('XiaoaiKwsMonitor adaptive endpointing tolerates 1050ms mid-sentence pause 
       enabled: true,
       notifyAll: false,
       allowedSenders: [],
-      apiBase: 'ssh://lx06=root@192.168.31.104',
+      apiBase: 'ssh://lx06=root@192.0.2.104',
       inboundCount: 0,
       outboundCount: 0,
       createdAt: Date.now(),
@@ -2546,7 +2698,7 @@ test('XiaoaiKwsMonitor adaptive endpointing tolerates 1050ms mid-sentence pause 
 });
 
 test('XiaoAI KWS ASR wake rescue catches missed bare "星期五" and one-breath commands while blocking TV via speaker gate', async () => {
-  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-xiaoai-rescue-'));
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-rescue-'));
   try {
     const extractorFactory = createBandSpeakerExtractorFactory();
     const manager = new XiaoaiSpeakerManager({ homeDir: home, extractorFactory });
@@ -2567,7 +2719,7 @@ test('XiaoAI KWS ASR wake rescue catches missed bare "星期五" and one-breath 
       enabled: true,
       notifyAll: false,
       allowedSenders: [],
-      apiBase: 'ssh://lx06=root@192.168.31.104',
+      apiBase: 'ssh://lx06=root@192.0.2.104',
       inboundCount: 0,
       outboundCount: 0,
       createdAt: Date.now(),

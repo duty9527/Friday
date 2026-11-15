@@ -8,6 +8,7 @@ import { decryptMedia, receiveMedia, mediaUrl, MEDIA_LIMIT } from '../src/wechat
 import { messageImages } from '../src/message-images.js';
 import { Store } from '../src/store.js';
 import { ImGateway } from '../src/im.js';
+import { parseWechatIlinkMessage } from '../src/im/channels/wechat-ilink.js';
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEUlEQVR4nGP4z8DA8B+MgBgAHfAD/dPQfSYAAAAASUVORK5CYII=', 'base64');
 const key = Buffer.alloc(16, 7);
 function encrypt(bytes: Buffer) { const c = createCipheriv('aes-128-ecb', key, null); return Buffer.concat([c.update(bytes), c.final()]); }
@@ -34,7 +35,7 @@ test('AES formats, safe CDN, real image blocks, random filenames and durable mes
     store.close(); store = new Store(home);
     const message = store.conversation.get('image-message'); assert.deepEqual(message.origin, origin);
     const event = JSON.stringify({ kind: 'CHAT', message });
-    const vision = await messageImages(event, true); assert.equal(vision.images.length, 1); assert.equal(vision.images[0].data, png.toString('base64'));
+    const vision = await messageImages(event, true); assert.equal(vision.images.length, 1); assert.equal(vision.images[0]?.data, png.toString('base64'));
     const textOnly = await messageImages(event, false); assert.equal(textOnly.images.length, 0); assert.match(textOnly.text, /不支持图像输入/);
     assert.equal((await messageImages(JSON.stringify({ kind: 'WORKER_REPORT', message }), true)).images.length, 0);
   } finally { store.close(); await rm(home, { recursive: true, force: true }); }
@@ -58,8 +59,8 @@ test('pure and mixed image parsing; unauthorized sender never downloads or loses
     store.saveImChannel({ id: 'wx', platform: 'wechat', name: 'wx', enabled: true, notifyAll: false, allowedSenders: ['A'], inboundCount: 0, outboundCount: 0, createdAt: 0, updatedAt: 0 });
     const gateway = new ImGateway({ store } as any);
     for (const caption of ['', '这是参考形象']) {
-      const inbound = (gateway as any).parseWechatIlinkMessage('wx', { from_user_id: 'B', msg_id: caption || 'pure', item_list: [item(), { type: 1, text_item: { text: caption } }] });
-      assert.equal(inbound.mediaItems.length, 1); assert.ok(inbound.text); if (caption) assert.equal(inbound.text, caption);
+      const inbound = parseWechatIlinkMessage('wx', { from_user_id: 'B', msg_id: caption || 'pure', item_list: [item(), { type: 1, text_item: { text: caption } }] })!;
+      assert.equal(inbound.mediaItems?.length, 1); assert.ok(inbound.text); if (caption) assert.equal(inbound.text, caption);
       assert.equal((await gateway.ingestMessage(inbound)).reason, 'sender_not_allowed');
     }
     assert.equal(fetched, 0);

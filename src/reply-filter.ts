@@ -2,16 +2,24 @@
  * Host-layer hygiene for text the Router speaks to the Boss. The prompt already forbids these, but the
  * Router model does not always comply, so the host strips them deterministically before delivery:
  * - task / record IDs (full UUIDs anywhere, and short prefixes of known task IDs);
- * - internal staging paths under the service home (wechat-files, inbound-media, tasks, sdk).
+ * - internal staging paths under the service home (wechat-files, inbound-media, tasks, sdk, run).
  */
 const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
-const STAGING_PATH = /`?(?:~|\/Users\/[^/\s`]+)\/\.super-agent\/(?:wechat-files|inbound-media|tasks|sdk)\b[^\s`，。；、,;)）]*`?/g;
+const INTERNAL_SUBDIRS = '(?:wechat-files|inbound-media|tasks|sdk|run)';
+const STAGING_PATH = new RegExp(
+  `\`?(?:~|\\/(?:home|Users)\\/[^/\\s\`]+)\\/(?:\\.friday|\\.super-agent)\\/${INTERNAL_SUBDIRS}\\b[^\\s\`，。；、,;)）]*\`?`,
+  'g',
+);
 
 function escape(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-export function sanitizePublicReply(text: string, knownTaskIds: string[] = []): string {
+export function sanitizePublicReply(
+  text: string,
+  knownTaskIds: string[] = [],
+  homeDir?: string,
+): string {
   if (!text) return text;
   const shortIds = [...new Set(knownTaskIds.map(id => id.slice(0, 8).toLowerCase()))].filter(id => /^[0-9a-f]{8}$/.test(id));
   const idAlternatives = [UUID, ...shortIds.map(escape)].join('|');
@@ -25,6 +33,14 @@ export function sanitizePublicReply(text: string, knownTaskIds: string[] = []): 
     // any remaining full UUID
     .replace(new RegExp(`\`?${UUID}\`?`, 'gi'), '')
     .replace(STAGING_PATH, '本地');
+  const trimmedHome = homeDir?.trim().replace(/[\\/]+$/, '');
+  if (trimmedHome) {
+    const runtimeHomePattern = new RegExp(
+      `\`?${escape(trimmedHome)}\\/${INTERNAL_SUBDIRS}\\b[^\\s\`，。；、,;)）]*\`?`,
+      'g',
+    );
+    out = out.replace(runtimeHomePattern, '本地');
+  }
   out = out
     .replace(/[（(]\s*[）)]/g, '')
     .replace(/[ \t]{2,}/g, ' ')
