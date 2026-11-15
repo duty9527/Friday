@@ -2,15 +2,14 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, statfsSync } from 'node:fs';
 import { cpus, freemem, hostname, loadavg, platform, release, totalmem, uptime } from 'node:os';
 import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { resolveHomeDir } from '../_shared/config-store.mjs';
 
-const action = process.argv[2] || 'status';
-let args = {};
-try {
-  args = process.argv[3] ? JSON.parse(process.argv[3]) : {};
-} catch {
-  args = {};
-}
+const ACTIONS = ['status', 'patrol', 'remind'];
 
+/**
+ * @param {string} targetPath
+ */
 function collectDisk(targetPath) {
   try {
     const st = statfsSync(targetPath);
@@ -26,6 +25,9 @@ function collectDisk(targetPath) {
   }
 }
 
+/**
+ * @param {string} cwd
+ */
 function collectGit(cwd) {
   if (!cwd || !existsSync(cwd)) return null;
   try {
@@ -66,9 +68,13 @@ function collectGit(cwd) {
   }
 }
 
-function collectSnapshot() {
+/**
+ * @param {Record<string, unknown>} args
+ * @param {import('../_shared/types.d.ts').PluginExecutionContext} context
+ */
+function collectSnapshot(args, context) {
   const coreCount = Math.max(1, cpus().length);
-  const [load1, load5, load15] = loadavg().map(v => Number(v.toFixed(2)));
+  const [load1 = 0, load5 = 0, load15 = 0] = loadavg().map(v => Number(v.toFixed(2)));
   const loadPerCore = Number((load1 / coreCount).toFixed(2));
   const memTotalBytes = totalmem();
   const memFreeBytes = freemem();
@@ -76,11 +82,10 @@ function collectSnapshot() {
   const memUsedPct = memTotalBytes > 0 ? Number(((memUsedBytes / memTotalBytes) * 100).toFixed(1)) : 0;
   const memTotalGb = Number((memTotalBytes / (1024 ** 3)).toFixed(1));
   const memUsedGb = Number((memUsedBytes / (1024 ** 3)).toFixed(1));
-  const targetDir = typeof args.cwd === 'string' && args.cwd.trim()
-    ? resolve(args.cwd.trim())
-    : process.env.SUPER_AGENT_HOME || process.cwd();
-  const disk = collectDisk(existsSync(targetDir) ? targetDir : process.cwd());
-  const git = collectGit(typeof args.cwd === 'string' && args.cwd.trim() ? resolve(args.cwd.trim()) : process.cwd());
+  const explicitCwd = typeof args.cwd === 'string' && args.cwd.trim() ? resolve(args.cwd.trim()) : '';
+  const targetDir = explicitCwd || resolveHomeDir(context);
+  const disk = collectDisk(existsSync(targetDir) ? targetDir : resolveHomeDir(context));
+  const git = collectGit(explicitCwd || process.cwd());
   const uptimeHours = Number((uptime() / 3600).toFixed(1));
   return {
     host: hostname(),
@@ -94,56 +99,79 @@ function collectSnapshot() {
   };
 }
 
-if (action === 'remind') {
-  const content = String(args.text ?? args.instruction ?? args.timerName ?? '定时提醒时间已到').trim();
-  const clean = content.replace(/^(?:提醒我?|定时提醒)[:：\s]*/i, '').trim() || content;
-  process.stdout.write(JSON.stringify({
-    ok: true,
-    notify: true,
-    title: 'F.R.I.D.A.Y. 准点提醒',
-    message: `⏰ 老板，提醒时间到了：${clean}`,
-    data: { reminder: clean, triggeredAt: Date.now() },
-  }) + '\n');
-} else if (action === 'patrol') {
-  const snap = collectSnapshot();
-  const maxLoadPerCore = typeof args.maxLoadPerCore === 'number' ? args.maxLoadPerCore : 2.5;
-  const maxMemUsedPct = typeof args.maxMemUsedPct === 'number' ? args.maxMemUsedPct : 94;
-  const minDiskFreeGb = typeof args.minDiskFreeGb === 'number' ? args.minDiskFreeGb : 2;
-  const alerts = [];
-  if (snap.cpu.loadPerCore > maxLoadPerCore) {
-    alerts.push(`CPU 单核负载偏高 (${snap.cpu.loadPerCore} > ${maxLoadPerCore}，1m 负载 ${snap.cpu.load1}/${snap.cpu.cores} 核)`);
+/**
+ * Execute a system-pulse plugin action.
+ * @param {string} [action]
+ * @param {Record<string, unknown>} [args]
+ * @param {import('../_shared/types.d.ts').PluginExecutionContext} [context]
+ * @returns {Promise<import('../_shared/types.d.ts').PluginRunResult>}
+ */
+export async function runAction(action = 'status', args = {}, context = {}) {
+  const safeArgs = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
+  const name = String(action || 'status').trim().toLowerCase();
+  if (!ACTIONS.includes(name)) {
+    return {
+      ok: false,
+      notify: true,
+      title: '系统巡检失败',
+      message: `不支持的 system-pulse 动作 "${action}"，可用动作：${ACTIONS.join('、')}。`,
+    };
   }
-  if (snap.memory.usedPct > maxMemUsedPct) {
-    alerts.push(`系统内存占用偏高 (${snap.memory.usedPct}% > ${maxMemUsedPct}%，已用 ${snap.memory.usedGb}/${snap.memory.totalGb} GiB)`);
-  }
-  if (snap.disk && snap.disk.freeGb < minDiskFreeGb) {
-    alerts.push(`磁盘剩余空间不足 (${snap.disk.freeGb} GiB < ${minDiskFreeGb} GiB)`);
-  }
-  if (args.warnDirtyGit === true && snap.git && snap.git.dirtyCount > 0) {
-    alerts.push(`工作区 ${snap.git.branch} 存在 ${snap.git.dirtyCount} 处未提交变更`);
-  }
-  if (alerts.length === 0 && args.force !== true) {
-    process.stdout.write(JSON.stringify({
+
+  const nowFn = typeof context.nowFn === 'function' ? context.nowFn : Date.now;
+
+  if (name === 'remind') {
+    const content = String(safeArgs.text ?? safeArgs.instruction ?? safeArgs.timerName ?? '定时提醒时间已到').trim();
+    const clean = content.replace(/^(?:提醒我?|定时提醒)[:：\s]*/i, '').trim() || content;
+    return {
       ok: true,
-      notify: false,
-      title: '系统巡航正常',
-      message: '',
-      data: { healthy: true, snapshot: snap },
-    }) + '\n');
-  } else {
+      notify: true,
+      title: 'F.R.I.D.A.Y. 准点提醒',
+      message: `⏰ 老板，提醒时间到了：${clean}`,
+      data: { reminder: clean, triggeredAt: nowFn() },
+    };
+  }
+
+  const snap = collectSnapshot(safeArgs, context);
+
+  if (name === 'patrol') {
+    const maxLoadPerCore = typeof safeArgs.maxLoadPerCore === 'number' ? safeArgs.maxLoadPerCore : 2.5;
+    const maxMemUsedPct = typeof safeArgs.maxMemUsedPct === 'number' ? safeArgs.maxMemUsedPct : 94;
+    const minDiskFreeGb = typeof safeArgs.minDiskFreeGb === 'number' ? safeArgs.minDiskFreeGb : 2;
+    const alerts = [];
+    if (snap.cpu.loadPerCore > maxLoadPerCore) {
+      alerts.push(`CPU 单核负载偏高 (${snap.cpu.loadPerCore} > ${maxLoadPerCore}，1m 负载 ${snap.cpu.load1}/${snap.cpu.cores} 核)`);
+    }
+    if (snap.memory.usedPct > maxMemUsedPct) {
+      alerts.push(`系统内存占用偏高 (${snap.memory.usedPct}% > ${maxMemUsedPct}%，已用 ${snap.memory.usedGb}/${snap.memory.totalGb} GiB)`);
+    }
+    if (snap.disk && snap.disk.freeGb < minDiskFreeGb) {
+      alerts.push(`磁盘剩余空间不足 (${snap.disk.freeGb} GiB < ${minDiskFreeGb} GiB)`);
+    }
+    if (safeArgs.warnDirtyGit === true && snap.git && snap.git.dirtyCount > 0) {
+      alerts.push(`工作区 ${snap.git.branch} 存在 ${snap.git.dirtyCount} 处未提交变更`);
+    }
+    if (alerts.length === 0 && safeArgs.force !== true) {
+      return {
+        ok: true,
+        notify: false,
+        title: '系统巡航正常',
+        message: '',
+        data: { healthy: true, snapshot: snap },
+      };
+    }
     const lines = alerts.length
       ? [`⚠️ 老板，巡航检测到 ${alerts.length} 项主机/工作区指标越界：`, ...alerts.map(a => `- ${a}`)]
       : [`✅ 老板，主机各项生命体征平稳（CPU 负载 ${snap.cpu.load1}/${snap.cpu.cores} 核 · 内存 ${snap.memory.usedPct}% · 磁盘余量 ${snap.disk?.freeGb ?? '—'} GiB）。`];
-    process.stdout.write(JSON.stringify({
+    return {
       ok: true,
       notify: true,
       title: alerts.length ? 'F.R.I.D.A.Y. 系统巡航告警' : 'F.R.I.D.A.Y. 巡航简报',
       message: lines.join('\n'),
       data: { healthy: alerts.length === 0, alerts, snapshot: snap },
-    }) + '\n');
+    };
   }
-} else {
-  const snap = collectSnapshot();
+
   const lines = [
     `🖥️ 主机 ${snap.host} (${snap.os} · Node ${snap.node} · 已运行 ${snap.uptimeHours}h)`,
     `⚡ CPU：${snap.cpu.cores} 核 · 负载 ${snap.cpu.load1} / ${snap.cpu.load5} / ${snap.cpu.load15}（单核比 ${snap.cpu.loadPerCore}）`,
@@ -155,11 +183,28 @@ if (action === 'remind') {
   if (snap.git) {
     lines.push(`🌿 Git (${snap.git.branch})：${snap.git.dirtyCount === 0 ? '工作区干净' : `${snap.git.dirtyCount} 处未提交变更`}${snap.git.lastCommit ? ` · 最近提交 ${snap.git.lastCommit}` : ''}`);
   }
-  process.stdout.write(JSON.stringify({
+  return {
     ok: true,
     notify: true,
     title: '主机与工作区状态快照',
     message: lines.join('\n'),
     data: snap,
-  }) + '\n');
+  };
+}
+
+async function main() {
+  const action = process.argv[2] || 'status';
+  let args = {};
+  try {
+    args = process.argv[3] ? JSON.parse(process.argv[3]) : {};
+  } catch {
+    args = {};
+  }
+  const result = await runAction(action, args);
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+}
+
+const isEntrypoint = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isEntrypoint) {
+  await main();
 }

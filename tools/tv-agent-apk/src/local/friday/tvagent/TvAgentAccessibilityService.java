@@ -34,7 +34,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
 public final class TvAgentAccessibilityService extends AccessibilityService {
     private static volatile TvAgentAccessibilityService instance;
@@ -559,7 +558,6 @@ public final class TvAgentAccessibilityService extends AccessibilityService {
     private JSONObject captureOnce(final int targetMaxWidth, final int jpegQuality) throws Exception {
         final CountDownLatch latch = new CountDownLatch(1);
         final JSONObject out = new JSONObject();
-        final AtomicInteger errCode = new AtomicInteger(0);
 
         takeScreenshot(Display.DEFAULT_DISPLAY, screenshotExecutor, new TakeScreenshotCallback() {
             @Override
@@ -636,7 +634,6 @@ public final class TvAgentAccessibilityService extends AccessibilityService {
 
             @Override
             public void onFailure(int errorCode) {
-                errCode.set(errorCode);
                 try {
                     out.put("ok", false);
                     out.put("errorCode", errorCode);

@@ -1,18 +1,21 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  DEFAULT_CONFIG,
   buildDidlLite,
   isOpenOnlyGoal,
   executeTvAgentAction,
   formatRelTime,
   resolveDecisionEndpoint,
+  runAction,
   stateFingerprint,
 } from '../plugins/tv-agent/index.mjs';
 
-const HOST = '192.168.31.182';
+const HOST = '192.0.2.182';
 const AGENT = `http://${HOST}:8989`;
 const DLNA = `http://${HOST}:49152`;
 
@@ -62,7 +65,7 @@ function createMockTv(opts: Partial<{
     awake: opts.awake ?? true,
     volume: opts.volume ?? 20,
     muted: opts.muted ?? false,
-    pkg: opts.pkg ?? 'com.spocky.projengmenu',
+    pkg: opts.pkg ?? 'com.example.launcher',
     apps: opts.apps ?? [
       { package: 'com.bili.tv.bili_tv_app', label: '哔哩哔哩' },
       { package: 'org.smarttube.stable', label: 'SmartTube' },
@@ -96,7 +99,7 @@ function createMockTv(opts: Partial<{
       const path = url.slice(AGENT.length);
       if (path === '/status') {
         return json({
-          ok: true, version: '1.0.0', awake: tv.awake, a11yBound: true, projectivyEnabled: true,
+          ok: true, version: '1.0.0', awake: tv.awake, a11yBound: true, guardedLauncherEnabled: true,
           packageName: tv.pkg, className: 'Main', volume: 7, maxVolume: 15, apps: tv.apps,
         });
       }
@@ -156,7 +159,15 @@ function createMockTv(opts: Partial<{
     return { ok: true, message: 'sent' };
   };
   const sleep = async () => {};
-  const deps = { fetch, irRunner, sleep, pollMs: 100 } as any;
+  const mockDataDir = mkdtempSync(join(tmpdir(), 'tv-agent-mock-'));
+  writeFileSync(join(mockDataDir, 'config.json'), JSON.stringify({ tvHost: HOST }) + '\n', { mode: 0o600 });
+  const deps = {
+    fetch,
+    irRunner,
+    sleep,
+    pollMs: 100,
+    env: { PLUGIN_DATA_DIR: mockDataDir, FRIDAY_HOME: mockDataDir },
+  } as any;
   const actBodies = () => tv.calls.filter(c => c.url === `${AGENT}/act` && c.method === 'POST').map(c => c.body);
   const decisionCalls = () => tv.calls.filter(c => c.url.includes('/decisions'));
   const soapActions = () => tv.calls.filter(c => c.soap).map(c => /#(\w+)"?$/.exec(c.headers?.SOAPACTION ?? '')?.[1]);
@@ -450,16 +461,6 @@ test('tv-agent open_app resolves built-in aliases (Chinese + English) to package
     ['油管', 'org.smarttube.stable'],
     ['SmartTube', 'org.smarttube.stable'],
     ['yt', 'org.smarttube.stable'],
-    ['直播', 'com.github.mytv.dv'],
-    ['我的电视', 'com.github.mytv.dv'],
-    ['mytv', 'com.github.mytv.dv'],
-    ['tvbox', 'com.huawei.himovceie'],
-    ['影视仓', 'com.huawei.himovceie'],
-    ['久久影视', 'com.hdbox.hdhd.tv'],
-    ['hdbox', 'com.hdbox.hdhd.tv'],
-    ['桌面', 'com.spocky.projengmenu'],
-    ['home', 'com.spocky.projengmenu'],
-    ['Projectivy', 'com.spocky.projengmenu'],
   ];
   for (const [alias, pkg] of cases) {
     const m = createMockTv();
@@ -467,6 +468,26 @@ test('tv-agent open_app resolves built-in aliases (Chinese + English) to package
     assert.equal(r.ok, true, alias);
     assert.deepEqual(m.actBodies(), [{ action: 'launch_app', package: pkg }], alias);
     // aliases never need the app list
+    assert.equal(m.tv.calls.some(c => c.url.endsWith('/status')), false, alias);
+  }
+
+  for (const [alias, pkg] of [
+    ['直播', 'com.example.livetv'],
+    ['mediabox', 'com.example.mediabox'],
+    ['桌面', 'com.example.launcher'],
+    ['home', 'com.example.launcher'],
+  ]) {
+    const m = createMockTv();
+    const r = await executeTvAgentAction('open_app', {
+      app: alias,
+      appAliases: {
+        'com.example.livetv': ['直播', 'livetv'],
+        'com.example.mediabox': ['mediabox', '媒体箱'],
+        'com.example.launcher': ['桌面', 'home'],
+      },
+    }, m.deps);
+    assert.equal(r.ok, true, alias);
+    assert.deepEqual(m.actBodies(), [{ action: 'launch_app', package: pkg }], alias);
     assert.equal(m.tv.calls.some(c => c.url.endsWith('/status')), false, alias);
   }
 });
@@ -506,12 +527,22 @@ test('tv-agent tree, screenshot and act are structured wrappers over :8989', asy
   assert.ok(m.tv.calls.some(c => c.url === `${AGENT}/tree?maxNodes=25`));
 
   await withTmp(async dir => {
-    const out = join(dir, 'shot.jpg');
-    const shot = await executeTvAgentAction('screenshot', { savePath: out }, m.deps);
+    const scDeps = { ...m.deps, env: { PLUGIN_DATA_DIR: dir, FRIDAY_HOME: dir } };
+    await writeFile(join(dir, 'config.json'), JSON.stringify({ tvHost: HOST }) + '\n');
+    const shot = await executeTvAgentAction('screenshot', { savePath: 'shot.jpg' }, scDeps);
     assert.equal(shot.ok, true);
     assert.equal(shot.data.base64, undefined);
-    assert.equal((await readFile(out)).toString(), 'JPEGDATA');
+    const savedOut = join(dir, 'screenshots', 'shot.jpg');
+    assert.equal(shot.data.savedTo, savedOut);
+    assert.equal((await readFile(savedOut)).toString(), 'JPEGDATA');
     assert.ok(m.tv.calls.some(c => c.url === `${AGENT}/screenshot?maxWidth=960&quality=70`));
+
+    // Reject path traversal or outside-sandbox paths
+    const badRel = await executeTvAgentAction('screenshot', { savePath: '../outside.jpg' }, scDeps);
+    assert.equal(badRel.ok, false);
+    const badAbs = await executeTvAgentAction('screenshot', { savePath: '/tmp/outside-shot.jpg' }, scDeps);
+    assert.equal(badAbs.ok, false);
+
     const withData = await executeTvAgentAction('screenshot', { includeBase64: true }, m.deps);
     assert.equal(Buffer.from(withData.data.base64, 'base64').toString(), 'JPEGDATA');
   });
@@ -531,14 +562,14 @@ test('tv-agent config persists tvHost/ports/sshTarget in PLUGIN_DATA_DIR and app
     const m = createMockTv();
     const deps = { ...m.deps, env: { PLUGIN_DATA_DIR: dir, SUPER_AGENT_HOME: dir } };
     const initial = await executeTvAgentAction('config', {}, deps);
-    assert.equal(initial.data.tvHost, '192.168.31.182');
+    assert.equal(initial.data.tvHost, '');
     assert.equal(initial.data.agentPort, 8989);
     assert.equal(initial.data.dlnaPort, 49152);
 
     const set = await executeTvAgentAction('config', { tvHost: '10.1.2.3', agentPort: 9000, dlnaPort: 50000, sshTarget: 'root@lx06' }, deps);
     assert.equal(set.ok, true);
     const saved = JSON.parse(await readFile(join(dir, 'config.json'), 'utf8'));
-    assert.deepEqual(saved, { tvHost: '10.1.2.3', agentPort: 9000, dlnaPort: 50000, sshTarget: 'root@lx06' });
+    assert.deepEqual(saved, { tvHost: '10.1.2.3', tvToken: '', agentPort: 9000, dlnaPort: 50000, sshTarget: 'root@lx06', appAliases: {} });
 
     const seen: string[] = [];
     deps.fetch = async (url: string) => { seen.push(String(url)); throw new Error('down'); };
@@ -605,9 +636,9 @@ test('tv-agent navigate multi-step: click → set_text search injection → goal
   assert.equal(m.tv.calls.some(c => c.url.includes('/screenshot')), false);
   const decisions = m.decisionCalls();
   assert.equal(decisions.length, 3);
-  assert.equal(decisions[0].url, 'https://decision.test/v1beta/decisions');
-  assert.equal(decisions[0].headers?.['x-goog-api-key'], 'test-key');
-  const first = decisions[0].body;
+  assert.equal(decisions[0]!.url, 'https://decision.test/v1beta/decisions');
+  assert.equal(decisions[0]!.headers?.['x-goog-api-key'], 'test-key');
+  const first = decisions[0]!.body;
   assert.equal(first.model, 'gemini-decision-1');
   assert.equal(typeof first.input, 'string');
   assert.match(first.input, /搜索 "周杰伦" 并播放/);
@@ -620,9 +651,9 @@ test('tv-agent navigate multi-step: click → set_text search injection → goal
   }
   assert.ok(keys.length <= 255);
   // searchText derived from the quoted keyword => type option on editable node in step 2
-  assert.ok(Object.keys(decisions[1].body.questions.next_action.criteria).includes('type_n1'));
+  assert.ok(Object.keys(decisions[1]!.body.questions.next_action.criteria).includes('type_n1'));
   // history is fed back to the model
-  assert.match(decisions[1].body.input, /click_n1/);
+  assert.match(decisions[1]!.body.input, /click_n1/);
 });
 
 test('tv-agent navigate attaches /screenshot as multimodal inline_data when tree is empty or sparse', async () => {
@@ -637,7 +668,7 @@ test('tv-agent navigate attaches /screenshot as multimodal inline_data when tree
   assert.equal(r.ok, true, r.message);
 
   const decisions = m.decisionCalls();
-  const first = decisions[0].body;
+  const first = decisions[0]!.body;
   assert.ok(Array.isArray(first.input));
   assert.equal(first.input[0].type, 'image');
   assert.equal(first.input[0].mime_type, 'image/jpeg');
@@ -650,7 +681,7 @@ test('tv-agent navigate attaches /screenshot as multimodal inline_data when tree
   assert.equal(Object.keys(first.questions.next_action.criteria).includes('request_screenshot'), false);
   assert.deepEqual(m.actBodies().slice(1), [{ action: 'global', name: 'home' }]);
   // second tree has 2 labelled nodes => text-only again
-  assert.equal(typeof decisions[1].body.input, 'string');
+  assert.equal(typeof decisions[1]!.body.input, 'string');
 });
 
 test('tv-agent navigate: choosing request_screenshot re-evaluates the same step with the screenshot attached (no step wasted)', async () => {
@@ -666,8 +697,8 @@ test('tv-agent navigate: choosing request_screenshot re-evaluates the same step 
   assert.equal(r.data.steps, 1);
   const decisions = m.decisionCalls();
   assert.equal(decisions.length, 2);
-  assert.equal(typeof decisions[0].body.input, 'string');
-  assert.ok(Array.isArray(decisions[1].body.input));
+  assert.equal(typeof decisions[0]!.body.input, 'string');
+  assert.ok(Array.isArray(decisions[1]!.body.input));
   assert.equal(r.data.trace[0].requestedScreenshot, true);
   assert.equal(r.data.trace[0].screenshot, true);
 });
@@ -675,7 +706,7 @@ test('tv-agent navigate: choosing request_screenshot re-evaluates the same step 
 test('tv-agent navigate launches app first (args.app or goal alias) and waits for launch settle', async () => {
   const sleeps: number[] = [];
   const m = createMockTv({
-    pkg: 'com.spocky.projengmenu',
+    pkg: 'com.example.launcher',
     trees: [resultTree],
     decisions: [{ goal: 0.95, choice: 'done_now' }],
   });
@@ -693,9 +724,15 @@ test('tv-agent navigate launches app first (args.app or goal alias) and waits fo
   // explicit args.app always launches, configurable settle
   const ex = createMockTv({ trees: [resultTree], decisions: [{ goal: 0.95 }] });
   ex.deps.sleep = async () => {};
-  const rr = await executeTvAgentAction('navigate', { ...NAV_ARGS, goal: '随便看看', app: 'tvbox', launchSettleMs: 5 }, ex.deps);
+  const rr = await executeTvAgentAction('navigate', {
+    ...NAV_ARGS,
+    goal: '随便看看',
+    app: 'mediabox',
+    appAliases: { 'com.example.mediabox': ['mediabox'] },
+    launchSettleMs: 5,
+  }, ex.deps);
   assert.equal(rr.ok, true);
-  assert.deepEqual(ex.actBodies()[1], { action: 'launch_app', package: 'com.huawei.himovceie' });
+  assert.deepEqual(ex.actBodies()[1], { action: 'launch_app', package: 'com.example.mediabox' });
 
   // goals that mention the desktop/launcher must be navigated by the model, not short-circuited
   const desk = createMockTv({ trees: [homeTree], decisions: [{ goal: 0.1, choice: 'click_n2' }, { goal: 0.9 }] });
@@ -727,12 +764,12 @@ test('tv-agent navigate stops when the same action repeats on an unchanged scree
   assert.equal(m.actBodies().filter(b => b.action === 'click').length, 1);
   // unchanged state after an action forces the screenshot fallback on the next evaluation
   const decisions = m.decisionCalls();
-  assert.ok(Array.isArray(decisions[1].body.input));
+  assert.ok(Array.isArray(decisions[1]!.body.input));
   // already-tried actions on the same screen state are no longer offered
-  assert.ok('click_n2' in decisions[0].body.questions.next_action.criteria);
-  assert.equal('click_n2' in decisions[1].body.questions.next_action.criteria, false);
-  assert.ok('dpad_left' in decisions[1].body.questions.next_action.criteria);
-  assert.match(decisions[1].body.input[1].text, /dpad_left/);
+  assert.ok('click_n2' in decisions[0]!.body.questions.next_action.criteria);
+  assert.equal('click_n2' in decisions[1]!.body.questions.next_action.criteria, false);
+  assert.ok('dpad_left' in decisions[1]!.body.questions.next_action.criteria);
+  assert.match(decisions[1]!.body.input[1].text, /dpad_left/);
 });
 
 test('tv-agent navigate exhausts maxSteps (clamped 1..12) and reports unfinished', async () => {
@@ -766,8 +803,8 @@ test('tv-agent navigate low confidence forces screenshot on the next step', asyn
   const r = await executeTvAgentAction('navigate', { ...NAV_ARGS, goal: '进入推荐' }, m.deps);
   assert.equal(r.ok, true);
   const decisions = m.decisionCalls();
-  assert.equal(typeof decisions[0].body.input, 'string');
-  assert.ok(Array.isArray(decisions[1].body.input));
+  assert.equal(typeof decisions[0]!.body.input, 'string');
+  assert.ok(Array.isArray(decisions[1]!.body.input));
 });
 
 test('tv-agent navigate uses explicit searchText for set_text on a search box without quotes in goal', async () => {
@@ -783,6 +820,8 @@ test('tv-agent navigate uses explicit searchText for set_text on a search box wi
 test('tv-agent navigate credentials: reads model-hub.json (decision then google provider) and fails clearly without a key', async () => {
   await withTmp(async dir => {
     await mkdir(join(dir, 'sdk'), { recursive: true });
+    await mkdir(join(dir, 'data'), { recursive: true });
+    await writeFile(join(dir, 'data', 'config.json'), JSON.stringify({ tvHost: HOST }));
     await writeFile(join(dir, 'sdk', 'model-hub.json'), JSON.stringify({
       providers: { google: { apiKey: 'google-key' } },
     }));
@@ -790,7 +829,7 @@ test('tv-agent navigate credentials: reads model-hub.json (decision then google 
     const deps = { ...m.deps, env: { SUPER_AGENT_HOME: dir, PLUGIN_DATA_DIR: join(dir, 'data') } };
     const r = await executeTvAgentAction('navigate', { goal: 'g', settleMs: 0 }, deps);
     assert.equal(r.ok, true, r.message);
-    const call = m.decisionCalls()[0];
+    const call = m.decisionCalls()[0]!;
     assert.equal(call.headers?.['x-goog-api-key'], 'google-key');
     assert.equal(call.url, 'https://generativelanguage.googleapis.com/v1beta/decisions');
 
@@ -801,13 +840,13 @@ test('tv-agent navigate credentials: reads model-hub.json (decision then google 
     const m2 = createMockTv({ trees: [resultTree], decisions: [{ goal: 0.95 }] });
     const r2 = await executeTvAgentAction('navigate', { goal: 'g' }, { ...m2.deps, env: deps.env });
     assert.equal(r2.ok, true);
-    assert.equal(m2.decisionCalls()[0].headers?.['x-goog-api-key'], 'decision-key');
-    assert.equal(m2.decisionCalls()[0].url, 'https://proxy.example.com/v1beta/decisions');
+    assert.equal(m2.decisionCalls()[0]!.headers?.['x-goog-api-key'], 'decision-key');
+    assert.equal(m2.decisionCalls()[0]!.url, 'https://proxy.example.com/v1beta/decisions');
 
     // explicit args.apiKey wins over the hub
     const m3 = createMockTv({ trees: [resultTree], decisions: [{ goal: 0.95 }] });
     await executeTvAgentAction('navigate', { goal: 'g', apiKey: 'explicit' }, { ...m3.deps, env: deps.env });
-    assert.equal(m3.decisionCalls()[0].headers?.['x-goog-api-key'], 'explicit');
+    assert.equal(m3.decisionCalls()[0]!.headers?.['x-goog-api-key'], 'explicit');
 
     // no key anywhere
     await rm(join(dir, 'sdk', 'model-hub.json'));
@@ -870,9 +909,9 @@ test('tv-agent navigate keeps exploring untried actions on an unchanged screen (
     { action: 'global', name: 'dpad_left' },
   ]);
   const crit = m.decisionCalls().map(c => Object.keys(c.body.questions.next_action.criteria));
-  assert.ok(crit[0].includes('scroll_right') && crit[0].includes('scroll_left'));
-  assert.equal(crit[1].includes('scroll_right'), false);
-  assert.equal(crit[2].includes('scroll_right') || crit[2].includes('dpad_left'), false);
+  assert.ok(crit[0]!.includes('scroll_right') && crit[0]!.includes('scroll_left'));
+  assert.equal(crit[1]!.includes('scroll_right'), false);
+  assert.equal(crit[2]!.includes('scroll_right') || crit[2]!.includes('dpad_left'), false);
 });
 
 test('tv-agent navigate open-only goal finishes deterministically once the target app is foreground (no overshoot)', async () => {
@@ -904,4 +943,77 @@ test('tv-agent navigate does not short-circuit goals with follow-up tasks; isOpe
   assert.equal(r.ok, true);
   assert.equal(r.data.deterministic, undefined);
   assert.equal(m.decisionCalls().length, 1);
+});
+
+test('tv-agent DEFAULT_CONFIG is empty/neutral and non-config actions reject before tvHost is configured', async () => {
+  assert.equal(DEFAULT_CONFIG.tvHost, '');
+  assert.equal(DEFAULT_CONFIG.tvToken, '');
+  assert.equal(DEFAULT_CONFIG.sshTarget, '');
+  assert.deepEqual(DEFAULT_CONFIG.appAliases, {});
+
+  const dataDir = await mkdtemp(join(tmpdir(), 'tv-agent-empty-'));
+  try {
+    const unconf = await runAction('status', {}, { pluginDataDir: dataDir });
+    assert.equal(unconf.ok, false);
+    assert.equal(unconf.title, '电视 Agent 未配置');
+
+    const cfgRes = await runAction('config', {
+      tvHost: '192.0.2.182',
+      tvToken: 'tok-xyz',
+      sshTarget: 'speaker=root@192.0.2.104',
+      appAliases: { 'com.example.video': ['示例视频'] },
+    }, { pluginDataDir: dataDir });
+    assert.equal(cfgRes.ok, true);
+    const st = await stat(join(dataDir, 'config.json'));
+    assert.equal(st.mode & 0o777, 0o600);
+    const saved = JSON.parse(await readFile(join(dataDir, 'config.json'), 'utf8')) as Record<string, unknown>;
+    assert.equal(saved.tvHost, '192.0.2.182');
+    assert.equal(saved.tvToken, 'tok-xyz');
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('tv-agent sends X-TV-Token header when configured and forwards sshTarget to callPlugin("tv-ir", ...)', async () => {
+  const seenHeaders: Array<Record<string, string>> = [];
+  const irPluginCalls: Array<{ plugin: string; action: string; args: Record<string, unknown> }> = [];
+  const dataDir = await mkdtemp(join(tmpdir(), 'tv-agent-token-'));
+  try {
+    await runAction('config', {
+      tvHost: '192.0.2.182',
+      tvToken: 'secret-tv-token',
+      sshTarget: 'speaker=root@192.0.2.104',
+    }, { pluginDataDir: dataDir });
+
+    const offlineFetch = async (_url: string, init: { headers?: Record<string, string> } = {}) => {
+      seenHeaders.push(init.headers ?? {});
+      throw new Error('EHOSTUNREACH');
+    };
+
+    const stRes = await runAction('status', {}, {
+      pluginDataDir: dataDir,
+      fetch: offlineFetch,
+    });
+    assert.equal(stRes.ok, true);
+    assert.ok(seenHeaders.some(h => h['X-TV-Token'] === 'secret-tv-token'));
+
+    const pwrRes = await runAction('power', { state: 'on', waitMs: 5, pollMs: 1 }, {
+      pluginDataDir: dataDir,
+      fetch: offlineFetch,
+      sleep: async () => {},
+      callPlugin: async (plugin: string, action: string, args: Record<string, unknown>) => {
+        irPluginCalls.push({ plugin, action, args });
+        return { ok: true, message: 'sent' };
+      },
+    });
+    assert.equal(pwrRes.ok, false);
+    assert.equal(irPluginCalls.length, 1);
+    assert.deepEqual(irPluginCalls[0], {
+      plugin: 'tv-ir',
+      action: 'press',
+      args: { key: 'power', sshTarget: 'speaker=root@192.0.2.104' },
+    });
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
 });

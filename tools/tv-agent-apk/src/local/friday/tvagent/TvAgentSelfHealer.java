@@ -7,6 +7,7 @@ import android.content.ComponentName;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
@@ -25,6 +26,7 @@ import org.json.JSONObject;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -40,12 +42,13 @@ public final class TvAgentSelfHealer {
             "local.friday.tvagent/local.friday.tvagent.TvAgentAccessibilityService";
     public static final ComponentName SELF_A11Y_COMPONENT = new ComponentName(
             PACKAGE_NAME, "local.friday.tvagent.TvAgentAccessibilityService");
-    public static final ComponentName PROJECTIVY_A11Y_COMPONENT = new ComponentName(
-            "com.spocky.projengmenu",
-            "com.spocky.projengmenu.services.ProjectivyAccessibilityService");
-    public static final ComponentName PROJECTIVY_HOME_COMPONENT = new ComponentName(
-            "com.spocky.projengmenu",
-            "com.spocky.projengmenu.ui.home.MainActivity");
+
+    private static final String PREFS_NAME = "tv_agent_prefs";
+    private static final String PREF_LAUNCHER_PACKAGE = "launcher_package";
+    private static final String PREF_LAUNCHER_ACTIVITY = "launcher_activity";
+    private static final String PREF_LAUNCHER_A11Y_COMPONENT = "launcher_a11y_component";
+    private static final String PREF_EXTRA_PACKAGES = "extra_packages";
+    private static final String PREF_EXCLUDED_PACKAGES = "excluded_packages";
 
     private static volatile long lastAppsCacheTimeMs = 0L;
     private static volatile JSONArray cachedAppsArray = null;
@@ -53,11 +56,59 @@ public final class TvAgentSelfHealer {
     private TvAgentSelfHealer() {
     }
 
+    private static SharedPreferences getPrefs(Context context) {
+        if (context == null) return null;
+        Context storage = context;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            try {
+                Context dp = context.createDeviceProtectedStorageContext();
+                if (dp != null) storage = dp;
+            } catch (Throwable ignored) {
+            }
+        }
+        return storage.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+    }
+
+    private static String getPrefString(Context context, String key) {
+        SharedPreferences prefs = getPrefs(context);
+        if (prefs == null) return "";
+        String val = prefs.getString(key, "");
+        return val != null ? val.trim() : "";
+    }
+
+    private static Set<String> getPrefPackageSet(Context context, String key) {
+        Set<String> set = new HashSet<>();
+        String raw = getPrefString(context, key);
+        if (raw.isEmpty()) return set;
+        for (String token : raw.split("[,;\\s]+")) {
+            String trimmed = token.trim();
+            if (!trimmed.isEmpty()) set.add(trimmed);
+        }
+        return set;
+    }
+
+    private static String getGuardedLauncherPackage(Context context) {
+        return getPrefString(context, PREF_LAUNCHER_PACKAGE);
+    }
+
+    private static ComponentName getGuardedLauncherHomeComponent(Context context) {
+        String pkg = getPrefString(context, PREF_LAUNCHER_PACKAGE);
+        String activity = getPrefString(context, PREF_LAUNCHER_ACTIVITY);
+        if (pkg.isEmpty() || activity.isEmpty()) return null;
+        return new ComponentName(pkg, activity);
+    }
+
+    private static ComponentName getGuardedLauncherA11yComponent(Context context) {
+        String raw = getPrefString(context, PREF_LAUNCHER_A11Y_COMPONENT);
+        if (raw.isEmpty()) return null;
+        return ComponentName.unflattenFromString(raw);
+    }
+
     /**
      * Cooperative accessibility self-healer:
      * Reads enabled_accessibility_services and splits by ':'.
      * ONLY writes Settings.Secure if local.friday.tvagent/.TvAgentAccessibilityService
-     * is missing OR accessibility_enabled != 1. Preserves all existing entries (such as Projectivy).
+     * is missing OR accessibility_enabled != 1. Preserves all existing entries.
      */
     public static synchronized boolean ensureAccessibilityEnabled(Context context) {
         if (context == null) return false;
@@ -126,8 +177,10 @@ public final class TvAgentSelfHealer {
         return false;
     }
 
-    public static boolean isProjectivyEnabled(Context context) {
+    public static boolean isGuardedLauncherEnabled(Context context) {
         if (context == null) return false;
+        ComponentName guardedComp = getGuardedLauncherA11yComponent(context);
+        if (guardedComp == null) return false;
         try {
             ContentResolver cr = context.getContentResolver();
             if (Settings.Secure.getInt(cr, Settings.Secure.ACCESSIBILITY_ENABLED, 0) != 1) {
@@ -137,7 +190,7 @@ public final class TvAgentSelfHealer {
                     cr, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
             if (current == null) return false;
             for (String part : current.split(":")) {
-                if (isSameComponent(part.trim(), PROJECTIVY_A11Y_COMPONENT)) {
+                if (isSameComponent(part.trim(), guardedComp)) {
                     return true;
                 }
             }
@@ -216,11 +269,14 @@ public final class TvAgentSelfHealer {
         wakeScreen(context);
         try {
             PackageManager pm = context.getPackageManager();
+            String guardedPkg = getGuardedLauncherPackage(context);
+            ComponentName guardedHome = getGuardedLauncherHomeComponent(context);
+            boolean isGuardedHome = !guardedPkg.isEmpty() && guardedPkg.equals(pkg);
             Intent intent = null;
-            if ("com.spocky.projengmenu".equals(pkg)) {
+            if (isGuardedHome && guardedHome != null) {
                 intent = new Intent(Intent.ACTION_MAIN)
                         .addCategory(Intent.CATEGORY_HOME)
-                        .setComponent(PROJECTIVY_HOME_COMPONENT);
+                        .setComponent(guardedHome);
             }
             if (intent == null) {
                 intent = pm.getLeanbackLaunchIntentForPackage(pkg);
@@ -244,7 +300,7 @@ public final class TvAgentSelfHealer {
             }
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
                     | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
-            if ("com.spocky.projengmenu".equals(pkg)) {
+            if (isGuardedHome) {
                 intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP);
             }
             return startActivityReliably(context, intent);
@@ -255,7 +311,8 @@ public final class TvAgentSelfHealer {
     }
 
     public static boolean launchHomeFallback(Context context) {
-        if (launchApp(context, "com.spocky.projengmenu")) {
+        String guardedPkg = getGuardedLauncherPackage(context);
+        if (!guardedPkg.isEmpty() && launchApp(context, guardedPkg)) {
             return true;
         }
         try {
@@ -358,6 +415,13 @@ public final class TvAgentSelfHealer {
                 }
             }
 
+            Set<String> extraPackages = getPrefPackageSet(context, PREF_EXTRA_PACKAGES);
+            Set<String> excludedPackages = getPrefPackageSet(context, PREF_EXCLUDED_PACKAGES);
+            String guardedPkg = getGuardedLauncherPackage(context);
+            if (!guardedPkg.isEmpty()) {
+                extraPackages.add(guardedPkg);
+            }
+
             List<ApplicationInfo> installed = pm.getInstalledApplications(0);
             if (installed != null) {
                 for (ApplicationInfo ai : installed) {
@@ -365,8 +429,8 @@ public final class TvAgentSelfHealer {
                     String pkg = ai.packageName;
                     if (appMap.containsKey(pkg)) continue;
                     boolean isUserApp = (ai.flags & ApplicationInfo.FLAG_SYSTEM) == 0;
-                    if (!isUserApp && !"com.spocky.projengmenu".equals(pkg)) continue;
-                    if (!shouldIncludePackage(pm, pkg)) continue;
+                    if (!isUserApp && !extraPackages.contains(pkg)) continue;
+                    if (!shouldIncludePackage(pm, pkg, extraPackages, excludedPackages)) continue;
                     if (pm.getLeanbackLaunchIntentForPackage(pkg) != null
                             || pm.getLaunchIntentForPackage(pkg) != null) {
                         CharSequence labelCs = pm.getApplicationLabel(ai);
@@ -397,12 +461,16 @@ public final class TvAgentSelfHealer {
         return result;
     }
 
-    private static boolean shouldIncludePackage(PackageManager pm, String pkg) {
+    private static boolean shouldIncludePackage(
+            PackageManager pm,
+            String pkg,
+            Set<String> extraPackages,
+            Set<String> excludedPackages) {
         if (pkg == null || pkg.isEmpty()) return false;
-        if (PACKAGE_NAME.equals(pkg) || "local.projectivy.guard".equals(pkg)) {
+        if (PACKAGE_NAME.equals(pkg) || excludedPackages.contains(pkg)) {
             return false;
         }
-        if ("com.spocky.projengmenu".equals(pkg)) return true;
+        if (extraPackages.contains(pkg)) return true;
         try {
             ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
             if ((ai.flags & ApplicationInfo.FLAG_SYSTEM) == 0) {

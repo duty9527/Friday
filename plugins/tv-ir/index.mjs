@@ -1,9 +1,21 @@
-import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import {
+  clampInt as sharedClampInt,
+  errMsg,
+  readConfig,
+  readJsonSafe,
+  resolvePluginPaths,
+  writeJsonAtomic,
+} from '../_shared/config-store.mjs';
+import {
+  discoverOptionalXiaoaiSshFromSqlite,
+  execSshText,
+  parseSshTargets,
+  shellQuote,
+} from '../_shared/ssh.mjs';
+import { handleTvIrVoiceFastpath } from './voice-fastpath.mjs';
 
 const DEFAULT_FREQ_HZ = 38_000;
 const DEFAULT_INTERVAL_MS = 240;
@@ -145,53 +157,31 @@ export function encodeXiaomiIrFrame(deviceByte, funcByte, frames = 2) {
 }
 
 function escapeShellSingleQuote(value) {
-  return String(value).replace(/'/g, "'\\''");
+  return shellQuote(value).slice(1, -1);
 }
 
 function clampInt(value, fallback, min, max) {
-  if (value === undefined || value === null || value === '') return fallback;
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return fallback;
-  return Math.max(min, Math.min(max, Math.round(parsed)));
-}
-
-function readJsonSafe(filePath, fallback) {
-  if (!filePath || !existsSync(filePath)) return fallback;
-  try {
-    const parsed = JSON.parse(readFileSync(filePath, 'utf8'));
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      return parsed;
-    }
-  } catch {
-    // Ignore malformed local state files and use fallback
-  }
-  return fallback;
+  return sharedClampInt(value, min, max) ?? fallback;
 }
 
 function writeJsonPrivate(filePath, payload) {
-  mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 });
-  writeFileSync(filePath, JSON.stringify(payload, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
+  writeJsonAtomic(filePath, payload, { mode: 0o600 });
 }
 
 function getRuntimePaths(deps = {}) {
-  const homeDir = resolve(deps.homeDir || process.env.SUPER_AGENT_HOME || join(homedir(), '.super-agent'));
-  const dataDir = resolve(deps.dataDir || process.env.PLUGIN_DATA_DIR || join(homeDir, 'plugins', 'tv-ir'));
-  return {
-    homeDir,
-    dataDir,
-    configPath: join(dataDir, 'config.json'),
-    learnedPath: join(dataDir, 'learned-keys.json'),
-  };
+  return resolvePluginPaths('tv-ir', deps, {
+    learnedPath: 'learned-keys.json',
+  });
 }
 
 function loadConfig(configPath) {
-  return readJsonSafe(configPath, {});
+  return readConfig(configPath, {});
 }
 
 function loadLearnedKeys(learnedPath) {
   const raw = readJsonSafe(learnedPath, {});
   const out = {};
-  for (const [k, v] of Object.entries(raw)) {
+  for (const [k, v] of Object.entries(raw || {})) {
     if (v && typeof v === 'object' && typeof v.code === 'string' && v.code.trim()) {
       out[k] = v;
     }
@@ -342,44 +332,14 @@ export function parseSequenceSteps(rawKeys) {
  * Parse `ssh://id=user@host:port,...?query` entries compatible with src/xiaoai.ts.
  */
 export function parseXiaoaiSshTargets(apiBase) {
-  const trimmed = typeof apiBase === 'string' ? apiBase.trim() : '';
-  if (!trimmed) return [];
-  const withoutScheme = trimmed.startsWith('ssh://') ? trimmed.slice('ssh://'.length) : trimmed;
-  if (!withoutScheme.includes('@')) return [];
-  const qIdx = withoutScheme.indexOf('?');
-  const hostsPart = qIdx >= 0 ? withoutScheme.slice(0, qIdx) : withoutScheme;
-  const entries = hostsPart.split(',').map(item => item.trim()).filter(Boolean);
-  const targets = [];
-
-  for (const entry of entries) {
-    const eqIdx = entry.indexOf('=');
-    const hasExplicitId = eqIdx > 0;
-    const explicitId = hasExplicitId ? entry.slice(0, eqIdx).trim() : '';
-    const addr = hasExplicitId ? entry.slice(eqIdx + 1).trim() : entry;
-    if (!addr || !addr.includes('@')) continue;
-
-    let userHost = addr;
-    let port;
-    const portMatch = /^(.+):(\d+)$/.exec(addr);
-    if (portMatch?.[1] && portMatch?.[2]) {
-      const parsedPort = Number(portMatch[2]);
-      if (Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535) {
-        userHost = portMatch[1].trim();
-        port = parsedPort;
-      }
-    }
-    const id = hasExplicitId ? explicitId : (entries.length === 1 ? 'default' : userHost);
-    if (!id || !userHost) continue;
-    targets.push({ id, userHost, ...(port !== undefined ? { port } : {}) });
-  }
-  return targets;
+  return parseSshTargets(apiBase, 'default');
 }
 
 /**
- * Discover the target speaker SSH connection from explicit override, config.json, or state.sqlite.
+ * Discover the target speaker SSH connection from explicit override, config.json, or optional state.sqlite.
  */
-export async function discoverSpeakerSsh({ sshTarget, dataDir, homeDir } = {}) {
-  const paths = getRuntimePaths({ dataDir, homeDir });
+export async function discoverSpeakerSsh({ sshTarget, pluginDataDir, dataDir, homeDir } = {}) {
+  const paths = getRuntimePaths({ pluginDataDir, dataDir, homeDir });
   const config = loadConfig(paths.configPath);
   const candidateSpec = typeof sshTarget === 'string' && sshTarget.trim()
     ? sshTarget.trim()
@@ -397,133 +357,30 @@ export async function discoverSpeakerSsh({ sshTarget, dataDir, homeDir } = {}) {
     }
   }
 
-  const preferredId = candidateSpec || undefined;
-  const dbPath = join(paths.homeDir, 'state.sqlite');
-  if (existsSync(dbPath)) {
-    const { DatabaseSync } = await import('node:sqlite');
-    const db = new DatabaseSync(dbPath, { readOnly: true });
-    try {
-      const rows = db
-        .prepare("SELECT id, body FROM im_channels WHERE platform = 'xiaoai' ORDER BY updated_at DESC")
-        .all();
-      const channels = [];
-      for (const row of rows) {
-        try {
-          const ch = JSON.parse(String(row.body));
-          if (ch && typeof ch === 'object') {
-            channels.push({ channelId: String(row.id), channel: ch });
-          }
-        } catch {
-          // Ignore malformed channel JSON
-        }
-      }
-      // Prefer enabled channels first, then disabled fallback
-      channels.sort((a, b) => Number(b.channel.enabled !== false) - Number(a.channel.enabled !== false));
-
-      const allTargets = [];
-      for (const item of channels) {
-        const targets = parseXiaoaiSshTargets(item.channel.apiBase);
-        for (const t of targets) {
-          allTargets.push({
-            target: t,
-            channelId: item.channelId,
-            defaultTarget: item.channel.defaultTarget,
-            enabled: item.channel.enabled !== false,
-          });
-        }
-      }
-
-      if (allTargets.length > 0) {
-        let picked;
-        if (preferredId) {
-          picked = allTargets.find(
-            x => x.target.id === preferredId || x.target.userHost === preferredId,
-          );
-        }
-        if (!picked) {
-          picked = allTargets.find(x => /lx06/i.test(x.target.id));
-        }
-        if (!picked) {
-          picked = allTargets.find(x => /lx06/i.test(x.channelId));
-        }
-        if (!picked) {
-          picked = allTargets.find(x => x.defaultTarget && x.target.id === x.defaultTarget);
-        }
-        if (!picked) {
-          picked = allTargets[0];
-        }
-        if (picked) {
-          return {
-            target: picked.target,
-            source: 'sqlite',
-            channelId: picked.channelId,
-          };
-        }
-      }
-    } finally {
-      db.close();
-    }
+  const preferredId = candidateSpec || 'lx06';
+  const discovered = discoverOptionalXiaoaiSshFromSqlite({ homeDir: paths.homeDir }, preferredId);
+  if (discovered) {
+    return {
+      target: discovered.target,
+      source: 'sqlite',
+      channelId: discovered.channelId,
+    };
   }
 
   throw new Error(
-    `未找到小爱音箱 SSH 目标（home=${paths.homeDir}）。请先绑定 xiaoai SSH 通道，或调用 config 动作设置 sshTarget（如 "lx06=root@192.168.31.104"）。`,
+    `未找到小爱音箱 SSH 目标（home=${paths.homeDir}）。请先绑定 xiaoai SSH 通道，或调用 config 动作设置 sshTarget（如 "speaker=root@192.0.2.10"）。`,
   );
 }
 
-function runSshOnce(target, remoteCommand, timeoutMs, useControlMaster) {
-  return new Promise((resolvePromise, rejectPromise) => {
-    const controlArgs = useControlMaster
-      ? [
-          '-o', 'ControlMaster=auto',
-          '-o', 'ControlPath=/tmp/friday-xiaoai-%C',
-          '-o', 'ControlPersist=600',
-        ]
-      : [
-          '-o', 'ControlMaster=no',
-          '-o', 'ControlPath=none',
-        ];
-    const args = [
-      '-o', 'BatchMode=yes',
-      '-o', 'StrictHostKeyChecking=accept-new',
-      '-o', 'ConnectTimeout=5',
-      '-o', 'HostKeyAlgorithms=+ssh-rsa',
-      '-o', 'PubkeyAcceptedKeyTypes=+ssh-rsa',
-      ...controlArgs,
-      '-o', 'ServerAliveInterval=15',
-      '-o', 'ServerAliveCountMax=2',
-      ...(target.port ? ['-p', String(target.port)] : []),
-      target.userHost,
-      remoteCommand,
-    ];
-    execFile('ssh', args, { timeout: timeoutMs }, (error, stdout, stderr) => {
-      if (error) {
-        if (typeof error.code === 'number') {
-          resolvePromise({
-            stdout: String(stdout ?? ''),
-            stderr: String(stderr ?? ''),
-            code: error.code,
-          });
-          return;
-        }
-        rejectPromise(error);
-        return;
-      }
-      resolvePromise({
-        stdout: String(stdout ?? ''),
-        stderr: String(stderr ?? ''),
-        code: 0,
-      });
-    });
+export async function defaultSshRunner(target, remoteCommand, timeoutMs = 8_000, options = {}) {
+  return execSshText(target, remoteCommand, {
+    timeoutMs,
+    homeDir: options.homeDir,
+    signal: options.signal,
+    controlPersistSec: 60,
+    allowLegacyRsa: true,
+    useControlMaster: options.useControlMaster ?? Boolean(options.homeDir),
   });
-}
-
-export async function defaultSshRunner(target, remoteCommand, timeoutMs = 8_000) {
-  const startedAt = Date.now();
-  const first = await runSshOnce(target, remoteCommand, timeoutMs, true);
-  if (first.code === 255 && Date.now() - startedAt < 2_000) {
-    return runSshOnce(target, remoteCommand, timeoutMs, false);
-  }
-  return first;
 }
 
 function parseUbusJson(stdout) {
@@ -980,9 +837,19 @@ async function handleLearn(args, deps, paths, sshRunner, sleepFn) {
 /**
  * Execute a tv-ir plugin action with optional injected dependencies for unit tests.
  */
+/**
+ * Execute a tv-ir plugin action.
+ * @param {string} [action]
+ * @param {Record<string, any>} [args]
+ * @param {Record<string, any>} [deps]
+ * @returns {Promise<import('../_shared/types.d.ts').PluginActionResult>}
+ */
 export async function executeTvIrAction(action = 'status', args = {}, deps = {}) {
   const paths = getRuntimePaths(deps);
-  const sshRunner = deps.sshRunner ?? defaultSshRunner;
+  const sshRunner = deps.sshRunner ?? ((target, cmd, timeoutMs) => defaultSshRunner(target, cmd, timeoutMs, {
+    homeDir: paths.homeDir,
+    signal: deps.signal,
+  }));
   const sleepFn = deps.sleep ?? delay;
   const normalizedAction = String(action || 'status').trim();
 
@@ -1029,6 +896,14 @@ export async function executeTvIrAction(action = 'status', args = {}, deps = {})
   };
 }
 
+export async function runAction(action = 'status', args = {}, context = {}) {
+  return executeTvIrAction(action, args, context);
+}
+
+export async function handleVoiceFastpath(request, context = {}) {
+  return handleTvIrVoiceFastpath(request, context, (action, args, ctx) => executeTvIrAction(action, args, ctx ?? context));
+}
+
 async function main() {
   const action = process.argv[2] || 'status';
   let args = {};
@@ -1041,12 +916,11 @@ async function main() {
     const result = await executeTvIrAction(action, args);
     process.stdout.write(JSON.stringify(result) + '\n');
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
     process.stdout.write(JSON.stringify({
       ok: false,
       notify: true,
       title: '电视红外遥控失败',
-      message: msg,
+      message: errMsg(err),
     }) + '\n');
   }
 }

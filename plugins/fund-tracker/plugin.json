@@ -1,9 +1,11 @@
 {
   "name": "fund-tracker",
   "title": "基金持仓与收益监控",
-  "description": "独立基金持仓管理、盘中多源实时估值（12:00）与晚间正式净值结算（21:30）插件。使用 Node 22 内置 node:sqlite 与 fetch，零外部依赖。",
+  "runtime": "in-process",
+  "promptHint": "管理基金持仓（add-holding/remove-holding/set-holding/config）与查询盘中估值/晚间正式净值结算（status/noon/settle）。",
+  "description": "独立基金持仓管理、盘中多源实时估值（12:00）与晚间正式净值结算（21:30）插件。使用 Node 22 内置 node:sqlite 与 fetch，个人持仓从 <pluginDataDir>/config.json 加载。",
   "entry": "index.mjs",
-  "actions": ["status", "noon", "settle", "init", "set-holding"],
+  "actions": ["status", "noon", "settle", "init", "config", "add-holding", "remove-holding", "set-holding"],
   "actionSpecs": [
     {
       "name": "status",
@@ -14,26 +16,44 @@
     {
       "name": "noon",
       "label": "12:00 午间盘中估值",
-      "description": "交易日 12:00 触发：基于上一交易日正式净值 + 腾讯实时行情（恒生科技/卫星ETF/标普500/黄金ETF/有色ETF/纳指100 × 0.95 仓位系数）计算盘中估值；周末默认静默跳过，传 force:true 可强制输出。",
-      "defaultArgs": { "force": true }
+      "description": "交易日 12:00 触发：基于上一交易日正式净值 + 跟踪指数实时涨跌幅与仓位系数计算盘中估值；周末默认静默跳过，传 force:true 可强制输出。",
+      "defaultArgs": {}
     },
     {
       "name": "settle",
       "label": "21:30 晚间正式结算",
       "description": "交易日 21:30 触发：从东方财富拉取当日最新正式单位净值入库结算，区分已出当日净值基金与 QDII 待更新基金；周末默认静默跳过，传 force:true 可强制输出。",
-      "defaultArgs": { "force": true }
+      "defaultArgs": {}
     },
     {
       "name": "init",
-      "label": "初始化/同步净值库",
-      "description": "初始化 7 只基金默认持仓（总成本 29,020 元，其中 018168 成本 720 元）并同步东方财富近期历史净值。",
+      "label": "同步历史净值库",
+      "description": "同步当前已配置持仓基金的东方财富近期历史净值（若数据库为空，将从 config.json.holdings 自动导入）。",
       "defaultArgs": {}
+    },
+    {
+      "name": "config",
+      "label": "查看或导入持仓配置",
+      "description": "读取或写入 config.json 中的 holdings 列表（传 holdings 数组并可选 syncDb:true/replace:true 同步到 SQLite）。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "add-holding",
+      "label": "新增或覆盖单只基金持仓",
+      "description": "新增一只基金持仓（code, name, cost, shares/initAmount, initNav, proxySymbol, proxyName）并同步保存至 config.json。",
+      "defaultArgs": { "code": "000001", "name": "示例基金", "cost": 1000, "shares": 1000, "initNav": 1.0 }
+    },
+    {
+      "name": "remove-holding",
+      "label": "移除单只基金持仓",
+      "description": "按基金代码从持仓与 config.json 中移除指定基金。",
+      "defaultArgs": { "code": "000001" }
     },
     {
       "name": "set-holding",
       "label": "修改单只基金份额/成本",
       "description": "按基金代码更新持仓成本 (cost)、持有份额 (shares) 或基准净值日期 (navDate，传入后自动反推份额)。",
-      "defaultArgs": { "code": "018168", "cost": 720, "shares": 322.779, "navDate": "2026-11-09" }
+      "defaultArgs": { "code": "000001", "cost": 1000, "shares": 1000, "navDate": "2026-01-05" }
     }
   ]
 }

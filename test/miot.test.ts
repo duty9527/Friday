@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import dgram from 'node:dgram';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,7 +12,6 @@ import {
   DEFAULT_CONFIG,
   FRYER_STATUS_MAP,
   PRESET_RECIPES,
-  SSH_BASE_OPTIONS,
   buildAcInstructions,
   buildFryerGetParams,
   buildFryerStartInputs,
@@ -23,7 +23,7 @@ import {
   defaultFetchHubRawRows,
   discoverSpeakerSsh,
   encryptMiioPacket,
-  executeMiotAction,
+  handleVoiceFastpath,
   packMipsFrame,
   parseHubSnapshot,
   parseSshSpec,
@@ -80,7 +80,7 @@ function createHubFixtureRows() {
       model: q('xiaomi.router.rd08'),
       model_name: q('Xiaomi路由器BE6500 Pro'),
       urn: q('urn:miot-spec-v2:device:router:0000A036:xiaomi-rd08:1'),
-      ip: q('192.168.31.1'),
+      ip: q('192.0.2.1'),
       connect_type: q(0),
       online: q(true),
       homeid,
@@ -91,14 +91,14 @@ function createHubFixtureRows() {
     },
     // 2. Wi-Fi Air Fryer (connect_type = 8)
     {
-      did: q('443905315'),
+      did: q('881122334'),
       uid: q('100001'),
       token: q(TOKENS.fryer),
       dev_name: q('米家智能空气炸锅3.5L'),
       model: q('careli.fryer.maf01'),
       model_name: q('米家智能空气炸锅3.5L'),
       urn: q('urn:miot-spec-v2:device:air-fryer:0000A0A4:careli-maf01:1'),
-      ip: q('192.168.31.216'),
+      ip: q('192.0.2.216'),
       connect_type: q(8),
       online: q(true),
       homeid,
@@ -116,7 +116,7 @@ function createHubFixtureRows() {
       model: q('xiaomi.wifispeaker.lx06'),
       model_name: q('小米AI音箱第二代'),
       urn: q('urn:miot-spec-v2:device:speaker:0000A015:xiaomi-lx06:1'),
-      ip: q('192.168.31.104'),
+      ip: q('192.0.2.104'),
       connect_type: q(8),
       online: q(true),
       homeid,
@@ -134,7 +134,7 @@ function createHubFixtureRows() {
       model: q('xiaomi.wifispeaker.oh2p'),
       model_name: q('Xiaomi Sound'),
       urn: q('urn:miot-spec-v2:device:speaker:0000A015:xiaomi-oh2p:1'),
-      ip: q('192.168.31.155'),
+      ip: q('192.0.2.155'),
       connect_type: q(8),
       online: q(true),
       homeid,
@@ -143,12 +143,12 @@ function createHubFixtureRows() {
       parent: null,
       fw_ver: q('1.72.4'),
     },
-    // 5. BT Mesh Outlet 鱼缸灯 (connect_type = 16)
+    // 5. BT Mesh Outlet 水草补光灯 (connect_type = 16)
     {
       did: q('110022001'),
       uid: q('100001'),
       token: q(TOKENS.fish),
-      dev_name: q('鱼缸灯'),
+      dev_name: q('水草补光灯'),
       model: q('cuco.plug.v3'),
       model_name: q('米家智能插座蓝牙网关版'),
       urn: q('urn:miot-spec-v2:device:outlet:0000A002:cuco-v3:1'),
@@ -161,12 +161,12 @@ function createHubFixtureRows() {
       parent: q('miwifi.be6500pro'),
       fw_ver: q('1.3.0'),
     },
-    // 6. BT Mesh Outlet 乌龟灯 (connect_type = 16)
+    // 6. BT Mesh Outlet 阳台夜灯 (connect_type = 16)
     {
       did: q('110022002'),
       uid: q('100001'),
       token: q(TOKENS.turtle),
-      dev_name: q('乌龟灯'),
+      dev_name: q('阳台夜灯'),
       model: q('cuco.plug.v2'),
       model_name: q('米家智能插座3'),
       urn: q('urn:miot-spec-v2:device:outlet:0000A002:cuco-v2:1'),
@@ -260,7 +260,7 @@ function createHubFixtureRows() {
     { key: '110022003😂online', value: JSON.stringify({ value: 1, ts: 1700000305 }) },
     // Secret-like hot keys must never leak into cachedState.rawKeys
     { key: '110022003😂bind_key', value: JSON.stringify(TOKENS.bedroomLight) },
-    { key: '443905315😂token', value: JSON.stringify(TOKENS.fryer) },
+    { key: '881122334😂token', value: JSON.stringify(TOKENS.fryer) },
   ];
 
   return { devInfoRows, hotDataRows };
@@ -282,7 +282,7 @@ function makeFryerPropsResult(overrides: Record<string, unknown> = {}) {
     '3.10': 1, // turnPot
     ...overrides,
   };
-  return buildFryerGetParams('443905315').map(({ did, siid, piid }) => ({
+  return buildFryerGetParams('881122334').map(({ did, siid, piid }) => ({
     did,
     siid,
     piid,
@@ -329,10 +329,27 @@ function createMockHarness(opts: MockHarnessOptions) {
   const tvCalls: Array<{ action: string; args: any }> = [];
   const sleeps: number[] = [];
 
+  const dataDir = join(opts.dir, 'plugins', 'miot');
+  if ((opts as { seedConfig?: boolean }).seedConfig !== false) {
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    writeFileSync(
+      join(dataDir, 'config.json'),
+      JSON.stringify({
+        routerSsh: 'root@192.0.2.1',
+        speakerSsh: 'lx06=root@192.0.2.104',
+        protectedDevices: ['水草补光灯'],
+        customAliases: {
+          水草补光灯: ['水草灯'],
+          阳台夜灯: ['夜灯'],
+        },
+      }) + '\n',
+      { mode: 0o600 },
+    );
+  }
   const deps = {
     homeDir: opts.dir,
-    dataDir: join(opts.dir, 'plugins', 'miot'),
-    env: { SUPER_AGENT_HOME: opts.dir, PLUGIN_DATA_DIR: join(opts.dir, 'plugins', 'miot') },
+    dataDir,
+    env: { SUPER_AGENT_HOME: opts.dir, PLUGIN_DATA_DIR: dataDir },
     nowFn: () => currentNow,
     sleepFn: async (ms: number) => {
       sleeps.push(ms);
@@ -346,7 +363,7 @@ function createMockHarness(opts: MockHarnessOptions) {
       sshBinCalls.push({ target, cmd, input: callOpts.input, decoded });
       const reqId = decoded?.reqId ?? 1;
       const returnTopic = decoded?.returnTopic ?? 'local/friday/rpcReply_test';
-      const payload = decoded?.payload ?? {};
+      const payload: any = decoded?.payload ?? {};
       if (payload.method === 'get_properties') {
         const result = (payload.params ?? []).map((p: any) => {
           const val = bleState[String(p.did)];
@@ -559,10 +576,10 @@ test('4. buildMipsRemoteScript generates chroot mosquitto script for hex nonces 
 // ---------------------------------------------------------------------------
 
 test('5. encryptMiioPacket & decryptMiioPacket round-trip AES-128-CBC + MD5 0x2131 header and preserve stamp', () => {
-  const devId = 443905315;
+  const devId = 881122334;
   const stamp = 0x00abcdef;
   const tokenHex = TOKENS.fryer;
-  const payloadObj = { id: 77, method: 'get_properties', params: [{ did: '443905315', siid: 2, piid: 1 }] };
+  const payloadObj = { id: 77, method: 'get_properties', params: [{ did: '881122334', siid: 2, piid: 1 }] };
 
   const packet = encryptMiioPacket({ devId, stamp, tokenHex, payloadObj });
   assert.ok(packet.length > 32);
@@ -594,7 +611,7 @@ test('5. encryptMiioPacket & decryptMiioPacket round-trip AES-128-CBC + MD5 0x21
 
 test('6. encryptMiioPacket & decryptMiioPacket reject invalid tokens, wrong-token MD5 checksums, and bad headers', () => {
   const packet = encryptMiioPacket({
-    devId: 443905315,
+    devId: 881122334,
     stamp: 1234,
     tokenHex: TOKENS.fryer,
     payloadObj: { id: 1, method: 'get_properties', params: [] },
@@ -605,7 +622,8 @@ test('6. encryptMiioPacket & decryptMiioPacket reject invalid tokens, wrong-toke
 
   // Tampered ciphertext fails MD5 checksum
   const tampered = Buffer.from(packet);
-  tampered[tampered.length - 1] ^= 0xff;
+  const lastIdx = tampered.length - 1;
+  tampered[lastIdx] = (tampered[lastIdx] ?? 0) ^ 0xff;
   assert.throws(() => decryptMiioPacket({ packet: tampered, tokenHex: TOKENS.fryer }), /校验和不匹配/);
 
   // Invalid token format rejected
@@ -620,7 +638,7 @@ test('6. encryptMiioPacket & decryptMiioPacket reject invalid tokens, wrong-toke
 
 test('7. udpCall performs MiIO hello handshake + encrypted request/response against local UDP socket', async () => {
   const server = dgram.createSocket('udp4');
-  const devId = 443905315;
+  const devId = 881122334;
   const serverStamp = 500;
   const tokenHex = TOKENS.fryer;
   let receivedPayload: any;
@@ -643,7 +661,7 @@ test('7. udpCall performs MiIO hello handshake + encrypted request/response agai
       devId,
       stamp: serverStamp + 2,
       tokenHex,
-      payloadObj: { id: dec.payload.id, result: [{ did: '443905315', siid: 2, piid: 1, code: 0, value: 4 }] },
+      payloadObj: { id: dec.payload?.id, result: [{ did: '881122334', siid: 2, piid: 1, code: 0, value: 4 }] },
     });
     server.send(reply, rinfo.port, rinfo.address);
   });
@@ -658,11 +676,11 @@ test('7. udpCall performs MiIO hello handshake + encrypted request/response agai
       port,
       tokenHex,
       method: 'get_properties',
-      params: [{ did: '443905315', siid: 2, piid: 1 }],
+      params: [{ did: '881122334', siid: 2, piid: 1 }],
       timeoutMs: 1500,
     });
     assert.equal(receivedPayload.method, 'get_properties');
-    assert.deepEqual(res.result, [{ did: '443905315', siid: 2, piid: 1, code: 0, value: 4 }]);
+    assert.deepEqual(res.result, [{ did: '881122334', siid: 2, piid: 1, code: 0, value: 4 }]);
   } finally {
     server.close();
   }
@@ -685,11 +703,11 @@ test('8. parseHubSnapshot classifies all 10 realistic devices (category, categor
   assert.equal(router.controlChannel, 'router');
   assert.equal(router.controllable, false);
 
-  const fryer = byDid.get('443905315');
+  const fryer = byDid.get('881122334');
   assert.equal(fryer.category, 'air_fryer');
   assert.equal(fryer.controlChannel, 'miio_udp');
   assert.equal(fryer.controllable, true);
-  assert.equal(fryer.ip, '192.168.31.216');
+  assert.equal(fryer.ip, '192.0.2.216');
 
   const lx06 = byDid.get('60000104');
   const oh2p = byDid.get('60000208');
@@ -738,42 +756,43 @@ test('9. parseHubSnapshot merges appMsg cached state and enforces strict token r
   assertNoTokenLeak(snap.devices, 'snap.devices');
 
   // tokenByDid retains valid 32-hex tokens internally
-  assert.equal(snap.tokenByDid['443905315'], TOKENS.fryer);
+  assert.equal(snap.tokenByDid['881122334'], TOKENS.fryer);
   assert.equal(snap.tokenByDid['60000104'], TOKENS.lx06);
   assert.equal(snap.tokenByDid['60000208'], TOKENS.oh2p);
   assert.equal(snap.tokenByDid['110022001'], TOKENS.fish);
   assert.equal(snap.tokenByDid['ir.190000001'], undefined);
 
   const byDid = new Map(snap.devices.map((d: any) => [d.did, d]));
-  assert.equal(byDid.get('443905315').hasToken, true);
+  assert.equal(byDid.get('881122334').hasToken, true);
   assert.equal(byDid.get('ir.190000001').hasToken, false);
   assert.deepEqual(byDid.get('110022001').cachedState.properties['2.1'], { value: true, ts: 1700000100 });
   assert.deepEqual(byDid.get('110022002').cachedState.properties['2.1'], { value: false, ts: 1700000200 });
   assert.deepEqual(byDid.get('110022003').cachedState.properties['2.1'], { value: true, ts: 1700000300 });
   assert.deepEqual(byDid.get('110022003').cachedState.rawKeys, { online: { value: 1, ts: 1700000305 } });
   assert.equal('bind_key' in (byDid.get('110022003').cachedState.rawKeys ?? {}), false);
-  assert.equal(byDid.get('443905315').cachedState.rawKeys, undefined);
+  assert.equal(byDid.get('881122334').cachedState.rawKeys, undefined);
 });
 
 // ---------------------------------------------------------------------------
 // 5. resolveDevice
 // ---------------------------------------------------------------------------
 
-test('10. resolveDevice matches exact did, exact dev_name, room+dev_name, and built-in aliases', () => {
+test('10. resolveDevice matches exact did, exact dev_name, room+dev_name, customAliases, and built-in aliases', () => {
   const { devices } = parseHubSnapshot(createHubFixtureRows());
+  const customAliases = { 水草补光灯: ['水草灯'], 阳台夜灯: ['夜灯'] };
 
-  assert.equal(resolveDevice(devices, { did: '443905315' }).dev_name, '米家智能空气炸锅3.5L');
+  assert.equal(resolveDevice(devices, { did: '881122334' }).dev_name, '米家智能空气炸锅3.5L');
   assert.equal(resolveDevice(devices, { device: '卧室灯' }).did, '110022003');
-  assert.equal(resolveDevice(devices, { device: '鱼缸灯' }).did, '110022001');
-  assert.equal(resolveDevice(devices, { device: '乌龟灯' }).did, '110022002');
+  assert.equal(resolveDevice(devices, { device: '水草补光灯' }).did, '110022001');
+  assert.equal(resolveDevice(devices, { device: '阳台夜灯' }).did, '110022002');
   assert.equal(resolveDevice(devices, { device: '客厅空调' }).did, 'ir.190000002');
   assert.equal(resolveDevice(devices, { device: '卧室空调' }).did, 'ir.190000003');
   assert.equal(resolveDevice(devices, { device: '卧室的空调' }).did, 'ir.190000003');
   assert.equal(resolveDevice(devices, { device: '卧室的灯' }).did, '110022003');
-  assert.equal(resolveDevice(devices, { device: '炸锅' }).did, '443905315');
-  assert.equal(resolveDevice(devices, { device: '空气炸锅' }).did, '443905315');
-  assert.equal(resolveDevice(devices, { device: '鱼缸' }).did, '110022001');
-  assert.equal(resolveDevice(devices, { device: '乌龟' }).did, '110022002');
+  assert.equal(resolveDevice(devices, { device: '炸锅' }).did, '881122334');
+  assert.equal(resolveDevice(devices, { device: '空气炸锅' }).did, '881122334');
+  assert.equal(resolveDevice(devices, { device: '水草灯', customAliases }).did, '110022001');
+  assert.equal(resolveDevice(devices, { device: '夜灯', customAliases }).did, '110022002');
   assert.equal(resolveDevice(devices, { device: '电视' }).did, 'ir.190000001');
 });
 
@@ -803,7 +822,7 @@ test('11. resolveDevice disambiguates by room filter and throws AMBIGUOUS_DEVICE
 // 6. devices, status, config + cache TTL + 0600 permissions + zero token leak
 // ---------------------------------------------------------------------------
 
-test('12. devices action filters by room, category (灯 includes 鱼缸灯/乌龟灯/卧室灯), and controllableOnly', async () => {
+test('12. devices action filters by room, category (灯 includes 水草补光灯/阳台夜灯/卧室灯), and controllableOnly', async () => {
   await withTmp(async dir => {
     const h = createMockHarness({ dir });
 
@@ -816,10 +835,10 @@ test('12. devices action filters by room, category (灯 includes 鱼缸灯/乌�
     assert.deepEqual(bedroom.data.devices.map((d: any) => d.fullName).sort(), ['卧室Xiaomi Sound', '卧室灯', '卧室空调'].sort());
 
     const lights = await runAction('devices', { category: '灯', live: false }, h.deps);
-    assert.deepEqual(lights.data.devices.map((d: any) => d.name).sort(), ['乌龟灯', '卧室灯', '鱼缸灯']);
+    assert.deepEqual(lights.data.devices.map((d: any) => d.name).sort(), ['卧室灯', '水草补光灯', '阳台夜灯']);
 
     const outlets = await runAction('devices', { category: '插座', live: false }, h.deps);
-    assert.deepEqual(outlets.data.devices.map((d: any) => d.name).sort(), ['乌龟灯', '鱼缸灯']);
+    assert.deepEqual(outlets.data.devices.map((d: any) => d.name).sort(), ['水草补光灯', '阳台夜灯']);
 
     const controllable = await runAction('devices', { controllableOnly: true, live: false }, h.deps);
     assert.equal(controllable.data.count, 9);
@@ -876,15 +895,15 @@ test('14. devices with live:true performs batch BLE Mesh get_properties RPC and 
     assert.equal(res.ok, true);
     assert.equal(res.data.live, true);
     assert.equal(h.sshBinCalls.length, 1);
-    assert.equal(h.sshBinCalls[0].decoded.payload.method, 'get_properties');
-    assert.equal(h.sshBinCalls[0].decoded.payload.params.length, 3);
+    assert.equal(h.sshBinCalls[0]!.decoded.payload.method, 'get_properties');
+    assert.equal(h.sshBinCalls[0]!.decoded.payload.params.length, 3);
     assert.equal(h.udpCalls.length, 1);
-    assert.equal(h.udpCalls[0].method, 'get_properties');
-    assert.equal(h.udpCalls[0].params.length, 12);
+    assert.equal(h.udpCalls[0]!.method, 'get_properties');
+    assert.equal(h.udpCalls[0]!.params.length, 12);
 
     const bedLight = res.data.devices.find((d: any) => d.did === '110022003');
     assert.deepEqual(bedLight.state, { on: true, source: 'live' });
-    const fryer = res.data.devices.find((d: any) => d.did === '443905315');
+    const fryer = res.data.devices.find((d: any) => d.did === '881122334');
     assert.equal(fryer.fryer.statusText, '烹饪中');
     assert.equal(fryer.fryer.targetTempC, 200);
     assertNoTokenLeak(res, 'devices (live)');
@@ -919,7 +938,7 @@ test('16. config action persists 0600 config.json in PLUGIN_DATA_DIR and validat
 
     const cfgRes = await runAction(
       'config',
-      { routerSsh: 'hub=root@192.168.31.1:22', speakerSsh: 'lx06=root@192.168.31.104', cacheTtlMs: 20_000, udpTimeoutMs: 4_000 },
+      { routerSsh: 'hub=root@192.0.2.1:22', speakerSsh: 'lx06=root@192.0.2.104', cacheTtlMs: 20_000, udpTimeoutMs: 4_000 },
       h.deps,
     );
     assert.equal(cfgRes.ok, true);
@@ -959,7 +978,7 @@ test('17. sanitizeOutput strips secret keys and masks any 32-hex string anywhere
 // 7. BLE Mesh get, set (on: true/false), toggle: true, dryRun: true
 // ---------------------------------------------------------------------------
 
-test('18. BLE Mesh get and set (on: true/false and generic siid/piid/value) on 卧室灯 & 鱼缸灯, including offline fallback', async () => {
+test('18. BLE Mesh get and set (on: true/false and generic siid/piid/value) on 卧室灯 & 水草补光灯, including offline fallback', async () => {
   await withTmp(async dir => {
     const h = createMockHarness({ dir, bleProps: { '110022003': false, '110022001': true } });
 
@@ -978,13 +997,13 @@ test('18. BLE Mesh get and set (on: true/false and generic siid/piid/value) on �
     assertNoTokenLeak(s1, 'ble set on');
 
     // Generic siid/piid/value write on BLE Mesh
-    const sGen = await runAction('set', { device: '鱼缸灯', siid: 2, piid: 2, value: 1 }, h.deps);
+    const sGen = await runAction('set', { device: '水草补光灯', siid: 2, piid: 2, value: 1 }, h.deps);
     assert.equal(sGen.ok, true);
     assert.deepEqual(h.sshBinCalls.at(-1)!.decoded.payload.params, [{ did: '110022001', siid: 2, piid: 2, value: 1 }]);
 
     // Offline BLE device returns code=-4004 and surfaces cached state in message
     h.bleState['110022001'] = undefined;
-    const gOffline = await runAction('get', { device: '鱼缸灯' }, h.deps);
+    const gOffline = await runAction('get', { device: '水草补光灯' }, h.deps);
     assert.equal(gOffline.ok, false);
     assert.match(gOffline.message, /中枢缓存显示开/);
   });
@@ -995,15 +1014,15 @@ test('19. BLE Mesh toggle:true reads live 2.1 first then writes !current, and dr
     const h = createMockHarness({ dir, bleProps: { '110022001': true, '110022003': false } });
 
     const callsBeforeToggle = h.sshBinCalls.length;
-    const tog = await runAction('set', { device: '鱼缸灯', toggle: true }, h.deps);
+    const tog = await runAction('set', { device: '水草补光灯', toggle: true }, h.deps);
     assert.equal(tog.ok, true);
     assert.equal(tog.data.previous, true);
     assert.equal(tog.data.on, false);
     assert.equal(h.bleState['110022001'], false);
     assert.equal(h.sshBinCalls.length - callsBeforeToggle, 2);
-    assert.equal(h.sshBinCalls[callsBeforeToggle].decoded.payload.method, 'get_properties');
-    assert.equal(h.sshBinCalls[callsBeforeToggle + 1].decoded.payload.method, 'set_properties');
-    assert.deepEqual(h.sshBinCalls[callsBeforeToggle + 1].decoded.payload.params, [
+    assert.equal(h.sshBinCalls[callsBeforeToggle]!.decoded.payload.method, 'get_properties');
+    assert.equal(h.sshBinCalls[callsBeforeToggle + 1]!.decoded.payload.method, 'set_properties');
+    assert.deepEqual(h.sshBinCalls[callsBeforeToggle + 1]!.decoded.payload.params, [
       { did: '110022001', siid: 2, piid: 1, value: false },
     ]);
 
@@ -1022,7 +1041,7 @@ test('19. BLE Mesh toggle:true reads live 2.1 first then writes !current, and dr
 // ---------------------------------------------------------------------------
 
 test('20. Air Fryer buildFryerGetParams has 12 properties without siid:1, and get decodes FRYER_STATUS_MAP & turnPot', async () => {
-  const params = buildFryerGetParams('443905315');
+  const params = buildFryerGetParams('881122334');
   assert.equal(params.length, 12);
   assert.equal(params.some((p: any) => p.siid === 1), false, 'MUST NOT contain siid: 1');
 
@@ -1095,7 +1114,7 @@ test('21. Air Fryer cook start ignites via action(3,1) start-custom-cook with 7 
     assert.deepEqual(h.sleeps, [220]);
 
     assert.equal(h.udpCalls.length, 3);
-    const actionCall = h.udpCalls[1];
+    const actionCall = h.udpCalls[1]!;
     assert.equal(actionCall.method, 'action');
     assert.equal(actionCall.params.siid, 3);
     assert.equal(actionCall.params.aiid, 1);
@@ -1150,16 +1169,16 @@ test('23. Air Fryer cook pause/resume/stop/cancel map to action(2,3), action(3,2
 
     const pause = await runAction('cook', { op: 'pause' }, h.deps);
     assert.equal(pause.ok, true);
-    assert.deepEqual(h.udpCalls[0].params, { did: '443905315', siid: 2, aiid: 3, in: [] });
+    assert.deepEqual(h.udpCalls[0]!.params, { did: '881122334', siid: 2, aiid: 3, in: [] });
 
     const resume = await runAction('cook', { op: 'resume' }, h.deps);
     assert.equal(resume.ok, true);
-    assert.deepEqual(h.udpCalls[2].params, { did: '443905315', siid: 3, aiid: 2, in: [] });
+    assert.deepEqual(h.udpCalls[2]!.params, { did: '881122334', siid: 3, aiid: 2, in: [] });
 
     const cancel = await runAction('cook', { op: 'cancel' }, h.deps);
     assert.equal(cancel.ok, true);
     assert.equal(cancel.data.op, 'stop');
-    assert.deepEqual(h.udpCalls[4].params, { did: '443905315', siid: 2, aiid: 2, in: [] });
+    assert.deepEqual(h.udpCalls[4]!.params, { did: '881122334', siid: 2, aiid: 2, in: [] });
 
     // set on:false on air fryer delegates to cook stop
     const setOff = await runAction('set', { device: '空气炸锅', on: false }, h.deps);
@@ -1189,7 +1208,7 @@ test('24. IR AC set builds room-prefixed Chinese instructions and invokes silent
       ['打开卧室空调', '把卧室空调调到26度', '卧室空调设为制冷模式', '把卧室空调风速调到低档'],
     );
     assert.equal(h.sshTextCalls.length, 4);
-    assert.match(h.sshTextCalls[0].cmd, /"nlp_text":"打开卧室空调","tts":0,"tts_play":0/);
+    assert.match(h.sshTextCalls[0]!.cmd, /"nlp_text":"打开卧室空调","tts":0,"tts_play":0/);
 
     const spoken = await runAction('set', { device: '客厅空调', on: false, speakReply: true }, h.deps);
     assert.equal(spoken.ok, true);
@@ -1267,7 +1286,7 @@ test('27. command & low-level action route to LX06 ai_service, BLE Mesh, and MiI
     const cmdLive = await runAction('command', { text: '打开客厅空调', speakReply: false }, h.deps);
     assert.equal(cmdLive.ok, true);
     assert.equal(h.sshTextCalls.length, 1);
-    assert.match(h.sshTextCalls[0].cmd, /打开客厅空调/);
+    assert.match(h.sshTextCalls[0]!.cmd, /打开客厅空调/);
 
     const cmdEmpty = await runAction('command', { text: '   ' }, h.deps);
     assert.equal(cmdEmpty.ok, false);
@@ -1286,12 +1305,11 @@ test('27. command & low-level action route to LX06 ai_service, BLE Mesh, and MiI
   });
 });
 
-test('28. discoverSpeakerSsh follows priority: args -> config.json -> state.sqlite (preferring enabled lx06) -> default', async () => {
+test('28. discoverSpeakerSsh follows priority: args -> config.json -> state.sqlite (preferring enabled lx06) -> rejects unconfigured', async () => {
   await withTmp(async dir => {
     const dataDir = join(dir, 'plugins', 'miot');
 
-    const def = await discoverSpeakerSsh({ homeDir: dir, dataDir });
-    assert.deepEqual(def, { id: 'lx06', userHost: 'root@192.168.31.104', source: 'default' });
+    await assert.rejects(() => discoverSpeakerSsh({ homeDir: dir, dataDir }), /未找到小爱音箱/);
 
     const dbPath = join(dir, 'state.sqlite');
     const db = new DatabaseSync(dbPath);
@@ -1307,7 +1325,7 @@ test('28. discoverSpeakerSsh follows priority: args -> config.json -> state.sqli
     ins.run(
       'xiaoai-bedroom',
       'xiaoai',
-      JSON.stringify({ enabled: true, apiBase: 'oh2p=root@192.168.31.155,lx06=root@192.168.31.199:2222' }),
+      JSON.stringify({ enabled: true, apiBase: 'oh2p=root@192.0.2.155,lx06=root@192.0.2.199:2222' }),
       100,
     );
     db.close();
@@ -1315,15 +1333,15 @@ test('28. discoverSpeakerSsh follows priority: args -> config.json -> state.sqli
     const fromSqlite = await discoverSpeakerSsh({ homeDir: dir, dataDir });
     assert.equal(fromSqlite.source, 'sqlite');
     assert.equal(fromSqlite.id, 'lx06');
-    assert.equal(fromSqlite.userHost, 'root@192.168.31.199');
+    assert.equal(fromSqlite.userHost, 'root@192.0.2.199');
     assert.equal(fromSqlite.port, 2222);
 
-    await runAction('config', { speakerSsh: 'cfgspk=root@192.168.31.188:2022' }, { homeDir: dir, dataDir });
+    await runAction('config', { speakerSsh: 'cfgspk=root@192.0.2.188:2022' }, { homeDir: dir, dataDir });
     const fromCfg = await discoverSpeakerSsh({ homeDir: dir, dataDir });
-    assert.deepEqual(fromCfg, { id: 'cfgspk', userHost: 'root@192.168.31.188', port: 2022, source: 'config' });
+    assert.deepEqual(fromCfg, { id: 'cfgspk', userHost: 'root@192.0.2.188', port: 2022, source: 'config' });
 
-    const fromArg = await discoverSpeakerSsh({ speakerSsh: 'argspk=root@192.168.31.177', homeDir: dir, dataDir });
-    assert.deepEqual(fromArg, { id: 'argspk', userHost: 'root@192.168.31.177', source: 'args' });
+    const fromArg = await discoverSpeakerSsh({ speakerSsh: 'argspk=root@192.0.2.177', homeDir: dir, dataDir });
+    assert.deepEqual(fromArg, { id: 'argspk', userHost: 'root@192.0.2.177', source: 'args' });
   });
 });
 
@@ -1355,13 +1373,13 @@ test('29. defaultFetchHubRawRows unpacks streamed tar of devInfo.db + hot_data_v
 
     const tarBuf = execFileSync('tar', ['-C', dir, '-cf', '-', 'share/custom/devInfo', 'local/hotdatasync']);
     const rows = await defaultFetchHubRawRows({
-      target: { id: 'router', userHost: 'root@192.168.31.1' },
+      target: { id: 'router', userHost: 'root@192.0.2.1' },
       sshBinaryExec: async () => ({ stdout: tarBuf, stderr: '', code: 0 }),
     });
     assert.equal(rows.devInfoRows.length, 1);
     assert.equal(rows.hotDataRows.length, 1);
     const snap = parseHubSnapshot(rows);
-    assert.equal(snap.devices[0].did, '110022003');
+    assert.equal(snap.devices[0]!.did, '110022003');
     assert.equal(snap.tokenByDid['110022003'], TOKENS.bedroomLight);
     assertNoTokenLeak(snap.devices, 'defaultFetchHubRawRows devices');
   });
@@ -1377,7 +1395,7 @@ test('30. Host listPlugins & runPlugin discover miot, work with env stripping, a
     const miot = plugins.find(p => p.name === 'miot');
     assert.ok(miot, 'miot plugin must be discovered by listPlugins');
     assert.deepEqual(miot.actions, ACTIONS);
-    assert.equal(miot.actionSpecs.length, ACTIONS.length);
+    assert.equal(miot.actionSpecs!.length, ACTIONS.length);
 
     const snap = parseHubSnapshot({ ...createHubFixtureRows(), nowMs: Date.now() });
     const dataDir = join(home, 'plugins', 'miot');
@@ -1438,7 +1456,7 @@ test('31. topologyTtlMs (600_000ms) skips SSH on repeated set/cook >15s apart wh
     const dev1 = await runAction('devices', { live: false }, h.deps);
     assert.equal(dev1.ok, true);
     assert.equal(fetchCalls.length, 1);
-    assert.equal(fetchCalls[0].includeHotData, true);
+    assert.equal(fetchCalls[0]!.includeHotData, true);
 
     // 2. Advance 30s (> 15s cacheTtlMs, < 600s topologyTtlMs): set and cook skip SSH completely!
     h.advanceTime(30_000);
@@ -1457,7 +1475,7 @@ test('31. topologyTtlMs (600_000ms) skips SSH on repeated set/cook >15s apart wh
     const set2 = await runAction('set', { device: '卧室灯', on: false }, h.deps);
     assert.equal(set2.ok, true);
     assert.equal(fetchCalls.length, 2);
-    assert.equal(fetchCalls[1].includeHotData, false);
+    assert.equal(fetchCalls[1]!.includeHotData, false);
 
     const cacheAfterTopoOnly = JSON.parse(await readFile(join(dir, 'plugins', 'miot', 'hub-cache.json'), 'utf8'));
     assert.equal(cacheAfterTopoOnly.fetchedAt, 1_700_000_610_000);
@@ -1470,7 +1488,7 @@ test('31. topologyTtlMs (600_000ms) skips SSH on repeated set/cook >15s apart wh
     const dev2 = await runAction('devices', { live: false }, h.deps);
     assert.equal(dev2.ok, true);
     assert.equal(fetchCalls.length, 3);
-    assert.equal(fetchCalls[2].includeHotData, true);
+    assert.equal(fetchCalls[2]!.includeHotData, true);
   });
 });
 
@@ -1478,10 +1496,10 @@ test('32. Auto-refresh on DEVICE_NOT_FOUND and miioCall UDP failure when snapsho
   await withTmp(async dir => {
     const h = createMockHarness({ dir });
     let includeNewDevice = false;
-    let fryerIp = '192.168.31.216';
+    let fryerIp = '192.0.2.216';
     h.deps.fetchHubRawRows = async () => {
       const rows = createHubFixtureRows();
-      const fryerRow = rows.devInfoRows.find(r => r.did === q('443905315'));
+      const fryerRow = rows.devInfoRows.find(r => r.did === q('881122334'));
       if (fryerRow) fryerRow.ip = q(fryerIp);
       if (includeNewDevice) {
         rows.devInfoRows.push({
@@ -1515,19 +1533,19 @@ test('32. Auto-refresh on DEVICE_NOT_FOUND and miioCall UDP failure when snapsho
     assert.equal(resNew.ok, true);
     assert.equal(resNew.data.device.did, '110022999');
 
-    // Advance another 10s, simulate fryer DHCP IP change (old cached IP 192.168.31.216 times out, new IP 192.168.31.219 works)
+    // Advance another 10s, simulate fryer DHCP IP change (old cached IP 192.0.2.216 times out, new IP 192.0.2.219 works)
     h.advanceTime(10_000);
-    fryerIp = '192.168.31.219';
+    fryerIp = '192.0.2.219';
     const origUdp = h.deps.udpCall;
     h.deps.udpCall = async (call: any) => {
-      if (call.ip === '192.168.31.216') {
+      if (call.ip === '192.0.2.216') {
         throw new Error('UDP timeout on old IP');
       }
       return origUdp(call);
     };
     const cookStatus = await runAction('cook', { op: 'status' }, h.deps);
     assert.equal(cookStatus.ok, true);
-    assert.equal(h.udpCalls.at(-1)!.ip, '192.168.31.219');
+    assert.equal(h.udpCalls.at(-1)!.ip, '192.0.2.219');
   });
 });
 
@@ -1535,7 +1553,7 @@ test('33. ASR homophone aliases ("空气炸播", "空气炸国", "空炸", "炸�
   const { devices } = parseHubSnapshot(createHubFixtureRows());
   for (const alias of ['空气炸播', '空气炸国', '空炸', '炸播', '空气炸锅机', '厨房空气炸播']) {
     const resolved = resolveDevice(devices, { device: alias });
-    assert.equal(resolved.did, '443905315', `alias "${alias}" must resolve to air_fryer`);
+    assert.equal(resolved.did, '881122334', `alias "${alias}" must resolve to air_fryer`);
     assert.equal(resolved.category, 'air_fryer');
   }
 });
@@ -1602,9 +1620,91 @@ test('35. runPluginInProcess & runPlugin execute miot in-process without child_p
     assert.ok(elapsedMs < 100, `in-process execution should be fast (<100ms), got ${elapsedMs}ms`);
     assertNoTokenLeak(inProc, 'runPluginInProcess');
 
-    const viaRunPlugin = await runPlugin(home, 'miot', 'set', { device: '鱼缸灯', on: true, dryRun: true });
+    const viaRunPlugin = await runPlugin(home, 'miot', 'set', { device: '水草补光灯', on: true, dryRun: true });
     assert.equal(viaRunPlugin.ok, true);
     assert.equal((viaRunPlugin.data as any).device.did, '110022001');
     assertNoTokenLeak(viaRunPlugin, 'runPlugin in-process');
+  });
+});
+
+test('36. DEFAULT_CONFIG is neutral/empty, buildAcInstructions supports 16..31°C consistently, and TV delegates via callPlugin("tv-agent")', async () => {
+  assert.equal(DEFAULT_CONFIG.routerSsh, '');
+  assert.equal(DEFAULT_CONFIG.speakerSsh, '');
+  assert.deepEqual(DEFAULT_CONFIG.protectedDevices, []);
+  assert.deepEqual(DEFAULT_CONFIG.customAliases, {});
+
+  assert.deepEqual(
+    buildAcInstructions({ name: '空调', room_name: '卧室' }, { temperature: 31 }),
+    ['把卧室空调调到31度'],
+  );
+  assert.deepEqual(
+    buildAcInstructions({ name: '空调', room_name: '卧室' }, { temperature: 32 }),
+    ['把卧室空调调到31度'],
+  );
+  assert.throws(
+    () => buildAcInstructions({ name: '空调', room_name: '卧室' }, { temperature: 'abc' }),
+    /16-31/,
+  );
+
+  await withTmp(async dir => {
+    const h = createMockHarness({ dir });
+    const tvCalls: Array<{ plugin: string; action: string; args: Record<string, unknown> }> = [];
+    const depsWithCallPlugin = {
+      ...h.deps,
+      tvAgentRunner: undefined,
+      callPlugin: async (plugin: string, action: string, args: Record<string, unknown>) => {
+        tvCalls.push({ plugin, action, args });
+        return { ok: true, message: '电视在线', data: { online: true } };
+      },
+    };
+    const tvGet = await runAction('get', { device: '客厅电视' }, depsWithCallPlugin);
+    assert.equal(tvGet.ok, true);
+    assert.deepEqual(tvCalls[0], { plugin: 'tv-agent', action: 'status', args: {} });
+  });
+});
+
+test('37. handleVoiceFastpath executes AC (16..31°C), fryer, switches, enforces protectedDevices, and yields for TV commands', async () => {
+  await withTmp(async dir => {
+    const h = createMockHarness({ dir, bleProps: { '110022003': false } });
+    const ctx = {
+      pluginDataDir: join(dir, 'plugins', 'miot'),
+      ...h.deps,
+    };
+
+    const ac31 = await handleVoiceFastpath({ text: '把卧室空调调到31度' }, ctx);
+    assert.equal(ac31.handled, true);
+    assert.equal((ac31.data as any)?.ok, true);
+
+    const ac32 = await handleVoiceFastpath({ text: '把卧室空调调到32度' }, ctx);
+    assert.equal(ac32.handled, true);
+    assert.equal((ac32.data as any)?.ok, false);
+    assert.match(ac32.speech || '', /16 到 31 度/);
+
+    const fryerStatus = await handleVoiceFastpath({ text: '空气炸锅状态怎么样' }, ctx);
+    assert.equal(fryerStatus.handled, true);
+    assert.match(fryerStatus.speech || '', /空气炸锅：待机/);
+
+    const lightOn = await handleVoiceFastpath({ text: '打开卧室灯' }, ctx);
+    assert.equal(lightOn.handled, true);
+    assert.equal(h.bleState['110022003'], true);
+
+    // Configure protectedDevices -> blocks voice power off
+    await runAction('config', { protectedDevices: ['水草补光灯'] }, h.deps);
+    const sshCountBefore = h.sshBinCalls.length;
+    const blocked = await handleVoiceFastpath({ text: '关掉水草补光灯' }, ctx);
+    assert.equal(blocked.handled, true);
+    assert.equal((blocked.data as any)?.blocked, true);
+    assert.equal((blocked.data as any)?.reason, 'protected_device');
+    assert.equal(h.sshBinCalls.length, sshCountBefore);
+
+    // Yields on TV commands or while TV remote continuous mode is active
+    const yieldTv = await handleVoiceFastpath({ text: '打开电视' }, ctx);
+    assert.equal(yieldTv.handled, false);
+
+    const yieldRemote = await handleVoiceFastpath({
+      text: '打开卧室灯',
+      sessionState: { tvRemoteActive: true },
+    }, ctx);
+    assert.equal(yieldRemote.handled, false);
   });
 });

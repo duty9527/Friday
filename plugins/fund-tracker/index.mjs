@@ -1,110 +1,106 @@
 #!/usr/bin/env node
-import { mkdirSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { fileURLToPath } from 'node:url';
+import { join, resolve } from 'node:path';
+import {
+  ensurePrivateDir,
+  errMsg,
+  readConfig,
+  resolvePluginPaths,
+  writeConfig,
+} from '../_shared/config-store.mjs';
 
-const DEFAULT_HOLDINGS = [
-  {
-    code: '020989',
-    name: '南方恒生科技ETF发起联接(QDII)C',
-    fundType: 'hk_etf_feeder',
-    proxySymbol: 'hkHSTECH',
-    proxyName: '恒生科技指数',
-    positionRatio: 0.95,
-    initAmount: 6840.20,
-    cost: 10000.00,
-    initNav: 0.9520,
-    initNavDate: '2026-11-09',
-  },
-  {
-    code: '024749',
-    name: '博时中证卫星产业指数C',
-    fundType: 'a_index',
-    proxySymbol: 'sz159206',
-    proxyName: '卫星ETF',
-    positionRatio: 0.95,
-    initAmount: 5602.24,
-    cost: 10000.00,
-    initNav: 0.8479,
-    initNavDate: '2026-11-09',
-  },
-  {
-    code: '019305',
-    name: '摩根标普500指数(QDII)人民币C',
-    fundType: 'us_qdii',
-    proxySymbol: 'usINX',
-    proxyName: '标普500指数',
-    positionRatio: 0.95,
-    initAmount: 5124.80,
-    cost: 5000.00,
-    initNav: 1.6138,
-    initNavDate: '2026-11-06',
-  },
-  {
-    code: '000217',
-    name: '华安黄金ETF联接C',
-    fundType: 'gold_feeder',
-    proxySymbol: 'sh518880',
-    proxyName: '黄金ETF华安',
-    positionRatio: 0.95,
-    initAmount: 1504.42,
-    cost: 2000.00,
-    initNav: 2.9575,
-    initNavDate: '2026-11-09',
-  },
-  {
-    code: '012349',
-    name: '天弘恒生科技ETF联接C',
-    fundType: 'hk_etf_feeder',
-    proxySymbol: 'hkHSTECH',
-    proxyName: '恒生科技指数',
-    positionRatio: 0.95,
-    initAmount: 825.13,
-    cost: 1000.00,
-    initNav: 0.5426,
-    initNavDate: '2026-11-09',
-  },
-  {
-    code: '018168',
-    name: '国泰有色矿业ETF联接C',
-    fundType: 'a_etf_feeder',
-    proxySymbol: 'sh561330',
-    proxyName: '有色矿业ETF',
-    positionRatio: 0.95,
-    initAmount: 468.32,
-    cost: 720.00,
-    initNav: 1.4509,
-    initNavDate: '2026-11-09',
-  },
-  {
-    code: '016055',
-    name: '博时纳斯达克100ETF发起式联接(QDII)A',
-    fundType: 'us_qdii',
-    proxySymbol: 'usNDX',
-    proxyName: '纳斯达克100',
-    positionRatio: 0.95,
-    initAmount: 318.66,
-    cost: 300.00,
-    initNav: 1.9969,
-    initNavDate: '2026-11-09',
-  },
-];
+/** @type {Array<Record<string, unknown>>} */
+export const DEFAULT_HOLDINGS = [];
 
-function getDataDir() {
-  if (process.env.PLUGIN_DATA_DIR) return resolve(process.env.PLUGIN_DATA_DIR);
-  const home = process.env.SUPER_AGENT_HOME
-    ? resolve(process.env.SUPER_AGENT_HOME)
-    : resolve(homedir(), '.super-agent');
-  return join(home, 'plugins', 'fund-tracker');
+const DEFAULT_CONFIG = {
+  holdings: /** @type {Array<Record<string, unknown>>} */ ([]),
+};
+
+const ACTIONS = ['status', 'noon', 'settle', 'init', 'config', 'add-holding', 'remove-holding', 'set-holding'];
+
+/**
+ * @param {Record<string, unknown>} raw
+ */
+function normalizeHoldingInput(raw) {
+  const code = String(raw?.code ?? '').trim();
+  const name = String(raw?.name ?? '').trim();
+  if (!code || !name) {
+    throw new Error('基金持仓必须包含 code 与 name');
+  }
+  const fundType = String(raw?.fundType ?? 'other').trim() || 'other';
+  const proxySymbol = String(raw?.proxySymbol ?? '').trim();
+  const proxyName = String(raw?.proxyName ?? proxySymbol).trim();
+  const rawRatio = Number(raw?.positionRatio ?? 0.95);
+  const positionRatio = Number.isFinite(rawRatio) && rawRatio > 0 && rawRatio <= 1 ? rawRatio : 0.95;
+  const cost = Number(raw?.cost ?? raw?.initAmount ?? 0);
+  if (!Number.isFinite(cost) || cost < 0) {
+    throw new Error(`基金 ${code} 的 cost 必须为非负数字`);
+  }
+  const initAmountRaw = Number(raw?.initAmount ?? cost);
+  const initAmount = Number.isFinite(initAmountRaw) && initAmountRaw >= 0 ? initAmountRaw : cost;
+  const initNavRaw = Number(raw?.initNav ?? 1);
+  const initNav = Number.isFinite(initNavRaw) && initNavRaw > 0 ? initNavRaw : 1;
+  const initNavDate = String(raw?.initNavDate ?? formatLocalDate()).trim() || formatLocalDate();
+  const rawShares = raw?.shares !== undefined ? Number(raw.shares) : initAmount / initNav;
+  const shares = Number.isFinite(rawShares) && rawShares >= 0 ? Number(rawShares.toFixed(4)) : 0;
+
+  return {
+    code,
+    name,
+    fundType,
+    proxySymbol,
+    proxyName,
+    positionRatio,
+    initAmount,
+    cost,
+    initNav,
+    initNavDate,
+    shares,
+  };
 }
 
-function openDb() {
-  const dir = getDataDir();
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const db = new DatabaseSync(join(dir, 'funds.sqlite'));
+/**
+ * @param {import('node:sqlite').DatabaseSync} db
+ */
+function listHoldingsFromDb(db) {
+  return /** @type {Array<Record<string, unknown>>} */ (
+    db.prepare('SELECT * FROM holdings ORDER BY cost DESC, code ASC').all()
+  );
+}
+
+/**
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {import('../_shared/types.d.ts').PluginPaths} paths
+ */
+function syncConfigHoldingsFromDb(db, paths) {
+  const rows = listHoldingsFromDb(db).map(row => ({
+    code: String(row.code),
+    name: String(row.name),
+    fundType: String(row.fund_type),
+    proxySymbol: String(row.proxy_symbol),
+    proxyName: String(row.proxy_name),
+    positionRatio: Number(row.position_ratio),
+    initAmount: Number(row.init_amount),
+    cost: Number(row.cost),
+    initNav: Number(row.init_nav),
+    initNavDate: String(row.init_nav_date),
+    shares: Number(row.shares),
+  }));
+  const cfg = readConfig(paths.configPath, DEFAULT_CONFIG);
+  writeConfig(paths.configPath, { ...cfg, holdings: rows });
+}
+
+/**
+ * @param {import('../_shared/types.d.ts').PluginPaths} paths
+ * @param {() => number} nowFn
+ */
+function openDb(paths, nowFn = Date.now) {
+  ensurePrivateDir(paths.pluginDataDir);
+  const db = new DatabaseSync(join(paths.pluginDataDir, 'funds.sqlite'));
   db.exec(`
     PRAGMA journal_mode=WAL;
+    PRAGMA busy_timeout=5000;
     CREATE TABLE IF NOT EXISTS holdings (
       code TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -143,22 +139,34 @@ function openDb() {
     );
   `);
 
-  const countRow = db.prepare('SELECT COUNT(*) AS cnt FROM holdings').get();
+  const countRow = /** @type {{ cnt?: number } | undefined} */ (
+    db.prepare('SELECT COUNT(*) AS cnt FROM holdings').get()
+  );
   if (Number(countRow?.cnt ?? 0) === 0) {
-    const now = Date.now();
-    const insert = db.prepare(`
-      INSERT INTO holdings (
-        code, name, fund_type, proxy_symbol, proxy_name, position_ratio,
-        init_amount, cost, init_nav, init_nav_date, shares, last_nav, last_nav_date, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    for (const item of DEFAULT_HOLDINGS) {
-      const shares = Number((item.initAmount / item.initNav).toFixed(4));
-      insert.run(
-        item.code, item.name, item.fundType, item.proxySymbol, item.proxyName, item.positionRatio,
-        item.initAmount, item.cost, item.initNav, item.initNavDate, shares,
-        item.initNav, item.initNavDate, now,
-      );
+    const cfg = readConfig(paths.configPath, DEFAULT_CONFIG);
+    const seedItems = Array.isArray(cfg.holdings) && cfg.holdings.length > 0
+      ? cfg.holdings
+      : DEFAULT_HOLDINGS;
+    if (seedItems.length > 0) {
+      const now = nowFn();
+      const insert = db.prepare(`
+        INSERT INTO holdings (
+          code, name, fund_type, proxy_symbol, proxy_name, position_ratio,
+          init_amount, cost, init_nav, init_nav_date, shares, last_nav, last_nav_date, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const rawItem of seedItems) {
+        try {
+          const item = normalizeHoldingInput(/** @type {Record<string, unknown>} */ (rawItem));
+          insert.run(
+            item.code, item.name, item.fundType, item.proxySymbol, item.proxyName, item.positionRatio,
+            item.initAmount, item.cost, item.initNav, item.initNavDate, item.shares,
+            item.initNav, item.initNavDate, now,
+          );
+        } catch {
+          // Skip malformed entries in external seed config rather than crashing openDb
+        }
+      }
     }
   }
   return db;
@@ -177,22 +185,41 @@ function isWeekend(ts = Date.now()) {
   return day === 0 || day === 6;
 }
 
+/**
+ * @param {number} n
+ * @param {number} [digits]
+ */
 function signNum(n, digits = 2) {
   const fixed = Math.abs(n).toFixed(digits);
   return n > 0 ? `+${fixed}` : n < 0 ? `-${fixed}` : fixed;
 }
 
-async function fetchFundNavHistory(code, pageSize = 10) {
+/**
+ * @param {number} timeoutMs
+ * @param {AbortSignal} [signal]
+ */
+function buildRequestSignal(timeoutMs, signal) {
+  const timer = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([timer, signal]) : timer;
+}
+
+/**
+ * @param {string} code
+ * @param {number} [pageSize]
+ * @param {typeof fetch} [fetchFn]
+ * @param {AbortSignal} [signal]
+ */
+async function fetchFundNavHistory(code, pageSize = 10, fetchFn = fetch, signal) {
   const url = `https://api.fund.eastmoney.com/f10/lsjz?fundCode=${encodeURIComponent(code)}&pageIndex=1&pageSize=${pageSize}`;
-  const res = await fetch(url, {
+  const res = await fetchFn(url, {
     headers: {
       Referer: 'https://fundf10.eastmoney.com/',
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)',
+      'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64)',
     },
-    signal: AbortSignal.timeout(10_000),
+    signal: buildRequestSignal(10_000, signal),
   });
   if (!res.ok) throw new Error(`Eastmoney NAV HTTP ${res.status} for ${code}`);
-  const json = await res.json();
+  const json = /** @type {{ Data?: { LSJZList?: Array<Record<string, unknown>> } }} */ (await res.json());
   const list = Array.isArray(json?.Data?.LSJZList) ? json.Data.LSJZList : [];
   return list
     .filter(row => row?.FSRQ && row?.DWJZ && !Number.isNaN(Number(row.DWJZ)))
@@ -204,11 +231,16 @@ async function fetchFundNavHistory(code, pageSize = 10) {
     }));
 }
 
-async function fetchMarketQuotes(symbols) {
+/**
+ * @param {string[]} symbols
+ * @param {typeof fetch} [fetchFn]
+ * @param {AbortSignal} [signal]
+ */
+async function fetchMarketQuotes(symbols, fetchFn = fetch, signal) {
   const unique = [...new Set(symbols.filter(Boolean))];
   if (!unique.length) return new Map();
   const url = `https://qt.gtimg.cn/q=${unique.join(',')}`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+  const res = await fetchFn(url, { signal: buildRequestSignal(10_000, signal) });
   if (!res.ok) throw new Error(`Tencent quote HTTP ${res.status}`);
   const text = new TextDecoder('gbk').decode(await res.arrayBuffer());
   const map = new Map();
@@ -231,8 +263,13 @@ async function fetchMarketQuotes(symbols) {
   return map;
 }
 
-async function syncAllNavs(db, holdings) {
-  const now = Date.now();
+/**
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {Array<Record<string, unknown>>} holdings
+ * @param {{ nowFn?: () => number; fetchFn?: typeof fetch; signal?: AbortSignal }} [opts]
+ */
+async function syncAllNavs(db, holdings, opts = {}) {
+  const now = (opts.nowFn ?? Date.now)();
   const upsertNav = db.prepare(`
     INSERT INTO nav_history (code, nav_date, nav, acc_nav, daily_return, fetched_at)
     VALUES (?, ?, ?, ?, ?, ?)
@@ -244,14 +281,17 @@ async function syncAllNavs(db, holdings) {
   `);
 
   for (const h of holdings) {
+    const code = String(h.code);
     try {
-      const history = await fetchFundNavHistory(h.code, 10);
+      const history = await fetchFundNavHistory(code, 10, opts.fetchFn ?? fetch, opts.signal);
       if (history.length > 0) {
         for (const item of history) {
-          upsertNav.run(h.code, item.navDate, item.nav, item.accNav, item.dailyReturn, now);
+          upsertNav.run(code, item.navDate, item.nav, item.accNav, item.dailyReturn, now);
         }
         const latest = history[0];
-        updateHoldingLatest.run(latest.nav, latest.navDate, now, h.code);
+        if (latest) {
+          updateHoldingLatest.run(latest.nav, latest.navDate, now, code);
+        }
       }
     } catch {
       // Keep cached SQLite NAV if upstream is temporarily unreachable
@@ -259,23 +299,54 @@ async function syncAllNavs(db, holdings) {
   }
 }
 
-async function computeValuation(db, mode = 'noon', offline = false) {
-  const holdings = db.prepare('SELECT * FROM holdings ORDER BY cost DESC, code ASC').all();
-  if (!offline) {
-    await syncAllNavs(db, holdings);
+/**
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {'status' | 'noon' | 'settle'} mode
+ * @param {boolean} offline
+ * @param {{ nowFn?: () => number; fetchFn?: typeof fetch; signal?: AbortSignal }} [opts]
+ */
+async function computeValuation(db, mode = 'noon', offline = false, opts = {}) {
+  const nowFn = opts.nowFn ?? Date.now;
+  const holdings = listHoldingsFromDb(db);
+  const today = formatLocalDate(nowFn());
+
+  if (holdings.length === 0) {
+    const title = mode === 'settle'
+      ? `# 🌙 基金晚间正式结算 · ${today}`
+      : mode === 'noon'
+        ? `# ☀️ 基金午间持仓估值 · ${today}`
+        : `# 📊 基金实时持仓状态 · ${today}`;
+    return {
+      today,
+      title,
+      empty: true,
+      message: `${title}\n\n当前尚未配置任何基金持仓。请使用 \`add-holding\` 添加基金，或在 \`config.json\` 的 \`holdings\` 中导入持仓列表。`,
+      summary: {
+        totalCost: 0,
+        totalAsset: 0,
+        totalDailyPnl: 0,
+        dailyPnlPct: 0,
+        totalPnl: 0,
+        totalPnlPct: 0,
+        holdings: [],
+      },
+    };
   }
-  const refreshedHoldings = db.prepare('SELECT * FROM holdings ORDER BY cost DESC, code ASC').all();
-  const symbols = refreshedHoldings.map(h => String(h.proxy_symbol));
-  let quotes = new Map();
+
   if (!offline) {
+    await syncAllNavs(db, holdings, opts);
+  }
+  const refreshedHoldings = listHoldingsFromDb(db);
+  const symbols = refreshedHoldings.map(h => String(h.proxy_symbol || '')).filter(Boolean);
+  let quotes = new Map();
+  if (!offline && symbols.length > 0) {
     try {
-      quotes = await fetchMarketQuotes(symbols);
+      quotes = await fetchMarketQuotes(symbols, opts.fetchFn ?? fetch, opts.signal);
     } catch {
       // Fallback to 0% intraday change if quote API fails
     }
   }
 
-  const today = formatLocalDate();
   const rows = [];
   let totalCost = 0;
   let totalAsset = 0;
@@ -288,20 +359,23 @@ async function computeValuation(db, mode = 'noon', offline = false) {
     const cost = Number(h.cost);
     const positionRatio = Number(h.position_ratio);
     const proxySymbol = String(h.proxy_symbol);
-    const proxyName = String(h.proxy_name);
+    const proxyName = String(h.proxy_name || proxySymbol || '跟踪标的');
 
-    const navRows = db.prepare('SELECT * FROM nav_history WHERE code=? ORDER BY nav_date DESC LIMIT 3').all(code);
-    const latestNavObj = navRows[0]
-      ? { nav: Number(navRows[0].nav), navDate: String(navRows[0].nav_date), dailyReturn: Number(navRows[0].daily_return ?? 0) }
+    const navRows = /** @type {Array<Record<string, unknown>>} */ (
+      db.prepare('SELECT * FROM nav_history WHERE code=? ORDER BY nav_date DESC LIMIT 3').all(code)
+    );
+    const firstNav = navRows[0];
+    const secondNav = navRows[1];
+    const latestNavObj = firstNav
+      ? { nav: Number(firstNav.nav), navDate: String(firstNav.nav_date), dailyReturn: Number(firstNav.daily_return ?? 0) }
       : { nav: Number(h.last_nav), navDate: String(h.last_nav_date), dailyReturn: 0 };
-    const prevNavObj = navRows[1]
-      ? { nav: Number(navRows[1].nav), navDate: String(navRows[1].nav_date) }
+    const prevNavObj = secondNav
+      ? { nav: Number(secondNav.nav), navDate: String(secondNav.nav_date) }
       : undefined;
 
-    const quote = quotes.get(proxySymbol);
+    const quote = proxySymbol ? quotes.get(proxySymbol) : undefined;
     const proxyChangePct = quote ? Number(quote.changePct) : 0;
 
-    // 区分 12:00 盘中实时估值 与 21:30 晚间正式结算
     const hasTodayOfficialNav = latestNavObj.navDate === today;
     let baseNav = latestNavObj.nav;
     let currentNav = latestNavObj.nav;
@@ -309,33 +383,29 @@ async function computeValuation(db, mode = 'noon', offline = false) {
     let navSource = '';
 
     if (hasTodayOfficialNav) {
-      // 当日正式净值已公布：直接采用官方正式净值与日涨跌幅结算
       currentNav = latestNavObj.nav;
       changePct = latestNavObj.dailyReturn;
       baseNav = prevNavObj ? prevNavObj.nav : Number((currentNav / (1 + changePct / 100)).toFixed(4));
       navSource = `✅ 正式净值(${latestNavObj.navDate})`;
+    } else if (!proxySymbol) {
+      baseNav = latestNavObj.nav;
+      currentNav = latestNavObj.nav;
+      changePct = 0;
+      navSource = `ℹ️ 最近净值(${latestNavObj.navDate})`;
     } else if (mode === 'settle') {
-      // 晚间 21:30 结算时该基金尚未公布今日正式净值（如美股 QDII T+1 结算或晚间延迟更新）：
-      // 采用收盘跟踪标的涨跌幅计算预估结算值，并同时展示已确认的最新正式净值
       baseNav = latestNavObj.nav;
       changePct = Number((proxyChangePct * positionRatio).toFixed(2));
       currentNav = Number((baseNav * (1 + changePct / 100)).toFixed(4));
       navSource = `⏳ 净值待更新(前值${latestNavObj.navDate}:${latestNavObj.nav.toFixed(4)}, 按${proxyName} ${signNum(proxyChangePct)}%预估)`;
     } else {
-      // 盘中估值公式：
-      // 估算净值 = 上一交易日净值 × (1 + 估算涨跌幅)
-      // 估算涨跌幅 = 跟踪指数/ETF涨跌幅 × 仓位系数
       baseNav = latestNavObj.nav;
       changePct = Number((proxyChangePct * positionRatio).toFixed(2));
       currentNav = Number((baseNav * (1 + changePct / 100)).toFixed(4));
       navSource = `盘中估值(锚定${proxyName} ${signNum(proxyChangePct)}%)`;
     }
 
-    // 当前估算资产 = 持仓份额 × 估算净值
     const currentAsset = Number((shares * currentNav).toFixed(2));
-    // 当日估算收益 = 持仓份额 × (估算净值 - 上一交易日净值)
     const dailyPnl = Number((shares * (currentNav - baseNav)).toFixed(2));
-    // 累计收益 = 当前估算资产 - 持仓成本
     const totalPnl = Number((currentAsset - cost).toFixed(2));
     const totalPnlPct = cost > 0 ? Number(((totalPnl / cost) * 100).toFixed(2)) : 0;
 
@@ -372,9 +442,8 @@ async function computeValuation(db, mode = 'noon', offline = false) {
   db.prepare(`
     INSERT INTO snapshots (kind, date, total_cost, total_asset, daily_pnl, total_pnl, detail_json, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(mode, today, totalCost, totalAsset, totalDailyPnl, totalPnl, JSON.stringify(rows), Date.now());
+  `).run(mode, today, totalCost, totalAsset, totalDailyPnl, totalPnl, JSON.stringify(rows), nowFn());
 
-  // 文案面向微信个人号渲染：标题、粗体、无序列表、引用、行内代码均已验证可用。
   const title = mode === 'settle'
     ? `# 🌙 基金晚间正式结算 · ${today} 21:30`
     : mode === 'noon'
@@ -410,6 +479,7 @@ async function computeValuation(db, mode = 'noon', offline = false) {
   return {
     today,
     title,
+    empty: false,
     message: lines.join('\n'),
     summary: {
       totalCost,
@@ -423,86 +493,280 @@ async function computeValuation(db, mode = 'noon', offline = false) {
   };
 }
 
+/**
+ * Execute a fund-tracker plugin action.
+ * @param {string} [action]
+ * @param {Record<string, unknown>} [args]
+ * @param {import('../_shared/types.d.ts').PluginExecutionContext & { fetchFn?: typeof fetch }} [depsOrCtx]
+ * @returns {Promise<import('../_shared/types.d.ts').PluginRunResult>}
+ */
+export async function runAction(action = 'status', args = {}, depsOrCtx = {}) {
+  const safeArgs = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
+  const name = String(action || 'status').trim().toLowerCase();
+  if (!ACTIONS.includes(name)) {
+    return {
+      ok: false,
+      notify: true,
+      title: '基金操作失败',
+      message: `不支持的 fund-tracker 动作 "${action}"，可用动作：${ACTIONS.join('、')}。`,
+    };
+  }
+
+  const paths = resolvePluginPaths('fund-tracker', depsOrCtx);
+  const nowFn = typeof depsOrCtx.nowFn === 'function' ? depsOrCtx.nowFn : Date.now;
+  const fetchFn = typeof depsOrCtx.fetchFn === 'function' ? depsOrCtx.fetchFn : fetch;
+  const signal = depsOrCtx.signal;
+  const db = openDb(paths, nowFn);
+
+  try {
+    if (name === 'config') {
+      const current = readConfig(paths.configPath, DEFAULT_CONFIG);
+      const next = { ...current };
+      let changed = false;
+
+      if (safeArgs.holdings !== undefined) {
+        if (!Array.isArray(safeArgs.holdings)) {
+          return {
+            ok: false,
+            notify: false,
+            title: '基金配置无效',
+            message: 'holdings 必须是基金持仓数组。',
+          };
+        }
+        const normalized = safeArgs.holdings.map(item =>
+          normalizeHoldingInput(/** @type {Record<string, unknown>} */ (item)),
+        );
+        next.holdings = normalized;
+        writeConfig(paths.configPath, next);
+        changed = true;
+
+        const existingCount = listHoldingsFromDb(db).length;
+        if (existingCount === 0 || safeArgs.replace === true || safeArgs.syncDb === true) {
+          db.exec('BEGIN');
+          try {
+            if (safeArgs.replace === true) {
+              db.prepare('DELETE FROM holdings').run();
+            }
+            const upsert = db.prepare(`
+              INSERT INTO holdings (
+                code, name, fund_type, proxy_symbol, proxy_name, position_ratio,
+                init_amount, cost, init_nav, init_nav_date, shares, last_nav, last_nav_date, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(code) DO UPDATE SET
+                name=excluded.name,
+                fund_type=excluded.fund_type,
+                proxy_symbol=excluded.proxy_symbol,
+                proxy_name=excluded.proxy_name,
+                position_ratio=excluded.position_ratio,
+                init_amount=excluded.init_amount,
+                cost=excluded.cost,
+                init_nav=excluded.init_nav,
+                init_nav_date=excluded.init_nav_date,
+                shares=excluded.shares,
+                updated_at=excluded.updated_at
+            `);
+            const now = nowFn();
+            for (const item of normalized) {
+              upsert.run(
+                item.code, item.name, item.fundType, item.proxySymbol, item.proxyName, item.positionRatio,
+                item.initAmount, item.cost, item.initNav, item.initNavDate, item.shares,
+                item.initNav, item.initNavDate, now,
+              );
+            }
+            db.exec('COMMIT');
+          } catch (err) {
+            try { db.exec('ROLLBACK'); } catch { /* ignore */ }
+            throw err;
+          }
+        }
+      }
+
+      const dbHoldings = listHoldingsFromDb(db);
+      return {
+        ok: true,
+        notify: false,
+        title: '基金插件配置',
+        message: `${changed ? '✅ 已保存基金配置' : '⚙️ 当前基金配置'}：共 ${dbHoldings.length} 只持仓（config=${paths.configPath}）。`,
+        data: {
+          config: next,
+          configPath: paths.configPath,
+          dbHoldingCount: dbHoldings.length,
+        },
+      };
+    }
+
+    if (name === 'init') {
+      const holdings = listHoldingsFromDb(db);
+      if (holdings.length === 0) {
+        return {
+          ok: true,
+          notify: true,
+          title: '基金持仓为空',
+          message: '当前没有任何基金持仓可初始化。请先通过 `add-holding` 或 `config.json` 添加持仓后再执行初始化同步。',
+          data: { holdings: [], totalCost: 0 },
+        };
+      }
+      const offline = Boolean(safeArgs.offline || process.env.FUND_TRACKER_OFFLINE === '1');
+      if (!offline) {
+        await syncAllNavs(db, holdings, { nowFn, fetchFn, signal });
+      }
+      const updated = listHoldingsFromDb(db);
+      const totalCost = updated.reduce((sum, h) => sum + Number(h.cost ?? 0), 0);
+      return {
+        ok: true,
+        notify: true,
+        title: '基金持仓初始化完成',
+        message: `✅ 已同步 ${updated.length} 只基金持仓（合计成本 ${totalCost.toFixed(2)} 元）。`,
+        data: { holdings: updated, totalCost: Number(totalCost.toFixed(2)) },
+      };
+    }
+
+    if (name === 'add-holding') {
+      const normalized = normalizeHoldingInput(safeArgs);
+      const now = nowFn();
+      db.prepare(`
+        INSERT INTO holdings (
+          code, name, fund_type, proxy_symbol, proxy_name, position_ratio,
+          init_amount, cost, init_nav, init_nav_date, shares, last_nav, last_nav_date, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(code) DO UPDATE SET
+          name=excluded.name,
+          fund_type=excluded.fund_type,
+          proxy_symbol=excluded.proxy_symbol,
+          proxy_name=excluded.proxy_name,
+          position_ratio=excluded.position_ratio,
+          init_amount=excluded.init_amount,
+          cost=excluded.cost,
+          init_nav=excluded.init_nav,
+          init_nav_date=excluded.init_nav_date,
+          shares=excluded.shares,
+          updated_at=excluded.updated_at
+      `).run(
+        normalized.code, normalized.name, normalized.fundType, normalized.proxySymbol, normalized.proxyName,
+        normalized.positionRatio, normalized.initAmount, normalized.cost, normalized.initNav,
+        normalized.initNavDate, normalized.shares, normalized.initNav, normalized.initNavDate, now,
+      );
+      syncConfigHoldingsFromDb(db, paths);
+      const saved = db.prepare('SELECT * FROM holdings WHERE code=?').get(normalized.code);
+      return {
+        ok: true,
+        notify: true,
+        title: `已保存基金 ${normalized.code}`,
+        message: `✅ 已添加/更新 ${normalized.name} (${normalized.code})：成本 ${normalized.cost.toFixed(2)} 元，份额 ${normalized.shares.toFixed(4)}。`,
+        data: saved,
+      };
+    }
+
+    if (name === 'remove-holding') {
+      const code = String(safeArgs.code ?? '').trim();
+      if (!code) {
+        return { ok: false, notify: false, title: '删除基金失败', message: 'remove-holding 需要提供 code。' };
+      }
+      const existing = db.prepare('SELECT * FROM holdings WHERE code=?').get(code);
+      if (!existing) {
+        return { ok: false, notify: false, title: '删除基金失败', message: `未找到基金持仓 ${code}。` };
+      }
+      db.prepare('DELETE FROM holdings WHERE code=?').run(code);
+      syncConfigHoldingsFromDb(db, paths);
+      return {
+        ok: true,
+        notify: true,
+        title: `已移除基金 ${code}`,
+        message: `🗑️ 已从持仓移除 ${String(existing.name)} (${code})。`,
+        data: { code, remainingCount: listHoldingsFromDb(db).length },
+      };
+    }
+
+    if (name === 'set-holding') {
+      const code = String(safeArgs.code ?? '').trim();
+      if (!code) {
+        return { ok: false, notify: false, title: '更新基金失败', message: 'set-holding 需要提供 args.code。' };
+      }
+      const existing = /** @type {Record<string, unknown> | undefined} */ (
+        db.prepare('SELECT * FROM holdings WHERE code=?').get(code)
+      );
+      if (!existing) {
+        return { ok: false, notify: false, title: '更新基金失败', message: `未找到基金持仓 ${code}。` };
+      }
+      let shares = safeArgs.shares !== undefined ? Number(safeArgs.shares) : Number(existing.shares);
+      const cost = safeArgs.cost !== undefined ? Number(safeArgs.cost) : Number(existing.cost);
+      let initNav = Number(existing.init_nav);
+      let initNavDate = String(existing.init_nav_date);
+      if (typeof safeArgs.navDate === 'string' && safeArgs.navDate.trim()) {
+        initNavDate = safeArgs.navDate.trim();
+        const history = await fetchFundNavHistory(code, 20, fetchFn, signal);
+        const matched = history.find(item => item.navDate === initNavDate);
+        if (!matched) {
+          throw new Error(`未找到 ${code} 在 ${initNavDate} 的正式净值`);
+        }
+        initNav = matched.nav;
+        if (safeArgs.shares === undefined) {
+          shares = Number((Number(existing.init_amount) / initNav).toFixed(4));
+        }
+      }
+      db.prepare('UPDATE holdings SET shares=?, cost=?, init_nav=?, init_nav_date=?, updated_at=? WHERE code=?')
+        .run(shares, cost, initNav, initNavDate, nowFn(), code);
+      syncConfigHoldingsFromDb(db, paths);
+      const after = /** @type {Record<string, unknown>} */ (
+        db.prepare('SELECT * FROM holdings WHERE code=?').get(code)
+      );
+      return {
+        ok: true,
+        notify: true,
+        title: `已更新基金 ${code} 持仓配置`,
+        message: `✅ 已更新 ${String(after.name)} (${code})：成本 ${Number(after.cost).toFixed(2)} 元，份额 ${Number(after.shares).toFixed(2)}（基准净值日 ${String(after.init_nav_date)}: ${Number(after.init_nav)}）`,
+        data: after,
+      };
+    }
+
+    if ((name === 'noon' || name === 'settle') && isWeekend(nowFn()) && !safeArgs.force) {
+      return {
+        ok: true,
+        notify: false,
+        title: '非交易日静默跳过',
+        message: '今日为周末休市日，跳过定时持仓推送。',
+      };
+    }
+
+    const mode = name === 'settle' ? 'settle' : name === 'noon' ? 'noon' : 'status';
+    const offline = Boolean(safeArgs.offline || process.env.FUND_TRACKER_OFFLINE === '1');
+    const result = await computeValuation(db, mode, offline, { nowFn, fetchFn, signal });
+    return {
+      ok: true,
+      notify: result.empty ? (name === 'status') : true,
+      title: result.title,
+      message: result.message,
+      data: result.summary,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      notify: true,
+      title: '基金持仓操作失败',
+      message: errMsg(err),
+    };
+  } finally {
+    db.close();
+  }
+}
+
 async function main() {
   const action = process.argv[2] || 'status';
   let args = {};
   if (process.argv[3]) {
     try { args = JSON.parse(process.argv[3]); } catch { args = {}; }
   }
-  const db = openDb();
-  try {
-    if (action === 'init') {
-      const holdings = db.prepare('SELECT * FROM holdings ORDER BY cost DESC').all();
-      await syncAllNavs(db, holdings);
-      const updated = db.prepare('SELECT * FROM holdings ORDER BY cost DESC').all();
-      process.stdout.write(JSON.stringify({
-        ok: true,
-        notify: true,
-        title: '基金持仓初始化完成',
-        message: `✅ 已初始化 ${updated.length} 只基金持仓并同步最新东方财富正式净值（合计成本 29,020.00 元）。`,
-        data: { holdings: updated },
-      }) + '\n');
-      return;
-    }
-
-    if (action === 'set-holding') {
-      const code = String(args.code ?? '').trim();
-      if (!code) throw new Error('set-holding requires args.code');
-      const existing = db.prepare('SELECT * FROM holdings WHERE code=?').get(code);
-      if (!existing) throw new Error(`Holding ${code} not found`);
-      let shares = args.shares !== undefined ? Number(args.shares) : Number(existing.shares);
-      const cost = args.cost !== undefined ? Number(args.cost) : Number(existing.cost);
-      let initNav = Number(existing.init_nav);
-      let initNavDate = String(existing.init_nav_date);
-      if (typeof args.navDate === 'string' && args.navDate.trim()) {
-        initNavDate = args.navDate.trim();
-        const history = await fetchFundNavHistory(code, 20);
-        const matched = history.find(item => item.navDate === initNavDate);
-        if (!matched) throw new Error(`未找到 ${code} 在 ${initNavDate} 的正式净值`);
-        initNav = matched.nav;
-        if (args.shares === undefined) {
-          shares = Number((Number(existing.init_amount) / initNav).toFixed(4));
-        }
-      }
-      db.prepare('UPDATE holdings SET shares=?, cost=?, init_nav=?, init_nav_date=?, updated_at=? WHERE code=?')
-        .run(shares, cost, initNav, initNavDate, Date.now(), code);
-      const after = db.prepare('SELECT * FROM holdings WHERE code=?').get(code);
-      process.stdout.write(JSON.stringify({
-        ok: true,
-        notify: true,
-        title: `已更新基金 ${code} 持仓配置`,
-        message: `✅ 已更新 ${after.name} (${code})：成本 ${Number(after.cost).toFixed(2)} 元，份额 ${Number(after.shares).toFixed(2)}（基准净值日 ${after.init_nav_date}: ${after.init_nav}）`,
-        data: after,
-      }) + '\n');
-      return;
-    }
-
-    if ((action === 'noon' || action === 'settle') && isWeekend() && !args.force) {
-      process.stdout.write(JSON.stringify({
-        ok: true,
-        notify: false,
-        title: '非交易日静默跳过',
-        message: '今日为周末休市日，跳过定时持仓推送。',
-      }) + '\n');
-      return;
-    }
-
-    const mode = action === 'settle' ? 'settle' : action === 'noon' ? 'noon' : 'status';
-    const offline = Boolean(args.offline || process.env.FUND_TRACKER_OFFLINE === '1');
-    const result = await computeValuation(db, mode, offline);
-    process.stdout.write(JSON.stringify({
-      ok: true,
-      notify: true,
-      title: result.title,
-      message: result.message,
-      data: result.summary,
-    }) + '\n');
-  } finally {
-    db.close();
+  const result = await runAction(action, args);
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+  if (!result.ok) {
+    process.exitCode = 1;
   }
 }
 
-main().catch(err => {
-  process.stderr.write(`fund-tracker error: ${err instanceof Error ? err.message : String(err)}\n`);
-  process.exitCode = 1;
-});
+const isEntrypoint = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isEntrypoint) {
+  main().catch(err => {
+    process.stderr.write(`fund-tracker error: ${errMsg(err)}\n`);
+    process.exitCode = 1;
+  });
+}

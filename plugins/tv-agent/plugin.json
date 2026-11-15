@@ -3,6 +3,8 @@
   "title": "红米/小米电视智能 Agent (无障碍 + DLNA + Gemini 决策)",
   "description": "通过电视端 local.friday.tvagent (:8989) 无障碍 HTTP Agent 与 DLNA (:49152) 精确控制红米/小米电视：幂等开关机（仅必要时才发红外电源键）、精确音量/静音、DLNA 投屏、应用别名启动、界面树/截图读取，以及基于 gemini-decision-1 的多步（文本树 + 截图多模态回退）自主界面导航。",
   "entry": "index.mjs",
+  "runtime": "in-process",
+  "promptHint": "通过局域网 HTTP 辅助 Agent 与 DLNA 控制智能电视：支持状态检测、幂等开关机（优先唤醒/探测再兜底红外）、音量调节、投屏、打开应用、无障碍界面树、截图与多步 AI 导航；需在本地 config.json 或通过 config 配置 tvHost 与可选 tvToken/appAliases。",
   "actions": ["status", "power", "volume", "cast", "open_app", "tree", "screenshot", "act", "navigate", "config"],
   "actionSpecs": [
     {
@@ -32,7 +34,7 @@
     {
       "name": "open_app",
       "label": "打开应用",
-      "description": "按别名/包名/已安装应用名模糊匹配启动：bili(B站)、youtube/smarttube(油管)、live(直播/我的电视)、tvbox(影视仓)、hdbox(久久影视)、home(桌面/Projectivy)。传 uri 时通过 open_uri 打开链接。",
+      "description": "按别名/包名/已安装应用名模糊匹配启动：bili(B站)、youtube/smarttube(油管) 及 config.appAliases 中的自定义包名映射。传 uri 时通过 open_uri 打开链接。",
       "defaultArgs": { "app": "home" }
     },
     {
@@ -62,7 +64,7 @@
     {
       "name": "config",
       "label": "读取或设置电视配置",
-      "description": "查看或更新 tvHost（默认 192.168.31.182）、agentPort（8989）、dlnaPort（49152）、sshTarget（可选），持久化到插件数据目录 config.json。",
+      "description": "查看或更新 tvHost（如 \"192.0.2.50\"，默认空）、tvToken（可选 X-TV-Token 鉴权密钥）、agentPort（8989）、dlnaPort（49152）、sshTarget（可选红外转发目标）及 appAliases（自定义应用包名别名映射），持久化到插件数据目录 config.json。",
       "defaultArgs": {}
     }
   ]
