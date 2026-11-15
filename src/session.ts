@@ -1,5 +1,6 @@
 import type { SessionContinuityTurnSummary } from './decision.js';
 import type { ModelHub } from './model-hub.js';
+import { cosineSimilarity, type SemanticEmbedder } from './semantic.js';
 import type { Store, Task } from './store.js';
 import type { ChatMessage, RouteAction, SessionLinkKind, SessionTurnLink } from './view.js';
 
@@ -87,6 +88,7 @@ export interface HeuristicSessionMatch {
   kind: SessionLinkKind;
   label: string;
   detail?: string;
+  confidence?: number;
 }
 
 export function evaluateHeuristicSessionMatch(input: {
@@ -414,6 +416,7 @@ export async function resolveRuntimeMessageSession(
   modelHub: ModelHub,
   currentMessage: ChatMessage,
   knownWorks: Task[],
+  semantic?: SemanticEmbedder,
 ): Promise<{ sessionId: string; sessionLink?: SessionTurnLink }> {
   if (isTimerOrSystemMessage(currentMessage)) {
     return { sessionId: formatFlowSessionId(currentMessage.id) };
@@ -432,7 +435,7 @@ export async function resolveRuntimeMessageSession(
   }
 
   if (ctx.gapSec <= 2700) {
-    const heuristic = evaluateHeuristicSessionMatch({
+    let heuristic = evaluateHeuristicSessionMatch({
       prevTurnCount: ctx.sessionUsers.length,
       prevChannel: ctx.prevChannel,
       curChannel: ctx.curChannel,
@@ -443,7 +446,54 @@ export async function resolveRuntimeMessageSession(
       curText: currentMessage.text,
     });
 
-    if (modelHub.hasDecisionEngine()) {
+    const cleanCurText = currentMessage.text.replace(/\s+/g, ' ').trim();
+    if (semantic?.isReady() && cleanCurText && !STANDALONE_OPENER_RE.test(cleanCurText)) {
+      try {
+        const latestSnippet = [ctx.prevUser.text.trim(), ctx.lastAssistantText.trim().slice(0, 240)]
+          .filter(Boolean)
+          .join('\n');
+        const sessionSummary = ctx.recentTurnsForAi
+          .slice(-3)
+          .map(t => [t.userText.trim(), t.assistantReply?.trim().slice(0, 180), t.taskPrompts?.join(' ')].filter(Boolean).join(' '))
+          .filter(Boolean)
+          .join('\n')
+          .slice(0, 800);
+        const candidates = [latestSnippet, ...(sessionSummary && sessionSummary !== latestSnippet ? [sessionSummary] : [])]
+          .filter(Boolean);
+        if (candidates.length > 0) {
+          const queryVec = await semantic.embed(cleanCurText, 'query');
+          if (queryVec) {
+            const docVecs = semantic.embedBatch
+              ? await semantic.embedBatch(candidates, 'document')
+              : await Promise.all(candidates.map(c => semantic.embed(c, 'document')));
+            let bestSim = 0;
+            for (const dv of docVecs) {
+              if (!dv) continue;
+              const sim = cosineSimilarity(queryVec, dv);
+              if (sim > bestSim) bestSim = sim;
+            }
+            const sameChannel = ctx.prevChannel === ctx.curChannel;
+            const threshold = sameChannel ? (ctx.gapSec <= 600 ? 0.58 : 0.64) : 0.68;
+            if (!heuristic?.same && bestSim >= threshold) {
+              heuristic = {
+                same: true,
+                kind: 'topic_continuity',
+                label: `🧠 ${formatGapCompact(ctx.gapSec)} · 语义主题延续`,
+                detail: `semantic_sim=${bestSim.toFixed(2)}`,
+                confidence: Number(bestSim.toFixed(2)),
+              };
+            } else if (heuristic?.same && bestSim > 0) {
+              heuristic = {
+                ...heuristic,
+                confidence: Number(bestSim.toFixed(2)),
+              };
+            }
+          }
+        }
+      } catch { /* graceful fallback to lexical heuristic */ }
+    }
+
+    if (modelHub.hasDecisionEngine() && currentMessage.origin?.channel !== 'xiaoai') {
       const heuristicRel = heuristic?.kind === 'answer_clarification'
         || heuristic?.kind === 'post_task_discussion'
         || heuristic?.kind === 'topic_continuity'
@@ -492,6 +542,7 @@ export async function resolveRuntimeMessageSession(
             kind: heuristic.kind,
             source: 'heuristic',
             gapSec: ctx.gapSec,
+            ...(heuristic.confidence !== undefined ? { confidence: heuristic.confidence } : {}),
             label: heuristic.label,
             ...(heuristic.detail ? { detail: heuristic.detail } : {}),
             evaluatedAt: Date.now(),
@@ -509,6 +560,7 @@ export async function resolveRuntimeMessageSession(
           kind: heuristic.kind,
           source: 'heuristic',
           gapSec: ctx.gapSec,
+          ...(heuristic.confidence !== undefined ? { confidence: heuristic.confidence } : {}),
           label: heuristic.label,
           ...(heuristic.detail ? { detail: heuristic.detail } : {}),
           evaluatedAt: nowAt,

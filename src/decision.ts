@@ -190,6 +190,9 @@ interface DecisionApiResponse {
   error?: { message?: string };
 }
 
+export type DecisionContentBlock = { type: 'text'; text: string } | { type: 'image'; data: string; mime_type: string };
+export type DecisionInput = string | DecisionContentBlock[];
+
 export function resolveDecisionEndpoint(baseUrl?: string): string {
   const clean = (baseUrl?.trim() || DEFAULT_GEMINI_DECISION_BASE_URL).replace(/\/+$/, '');
   if (clean.endsWith('/decisions')) return clean;
@@ -199,7 +202,7 @@ export function resolveDecisionEndpoint(baseUrl?: string): string {
 
 export async function requestGeminiDecisions(
   credentials: DecisionCredentials,
-  input: string,
+  input: DecisionInput,
   questions: Record<string, DecisionQuestion>,
 ): Promise<{
   answers: Record<string, DecisionResponseAnswer>;

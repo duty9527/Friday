@@ -7,7 +7,7 @@ import { readSnapshot, snapshot, type InputFile } from './files.js';
 import { PromptTrace } from './trace.js';
 import { sanitizePublicReply } from './reply-filter.js';
 import { integer, text } from './protocol.js';
-import type { ChatMessage, DecisionSource, MainView, ModelTier, ModelTierConfig, QualityGateAssessment, RouteAction, RouteKind, ThinkingLevel, WorkerProfile } from './view.js';
+import type { ChatMessage, DecisionSource, MainView, MemoryDirectory, ModelTier, ModelTierConfig, QualityGateAssessment, RouteAction, RouteKind, ThinkingLevel, WorkerProfile } from './view.js';
 import { publicData } from './conversation.js';
 import { Executor } from './executor.js';
 import { ImGateway } from './im.js';
@@ -21,7 +21,96 @@ import {
   reconcileRuntimeSessionAfterTool,
   resolveRuntimeMessageSession,
 } from './session.js';
+import { createSemanticEngine, type SemanticEmbedder } from './semantic.js';
+import { distillCompletedTask, distillIdleConversation, resolveDistillIdleMs } from './distiller.js';
 import { Store, type Operation, type Task, type TaskStatus, type Timer } from './store.js';
+
+export function compactRouterChatWorks(knownWorks: Task[], maxSettledLimit = 3) {
+  const isActive = (task: Task) =>
+    task.status === 'queued'
+    || task.status === 'running'
+    || task.status === 'paused'
+    || Boolean(task.pendingQuestion);
+  const activeWorks = knownWorks.filter(isActive);
+  const settledWorks = knownWorks.filter(task => !isActive(task));
+  const maxSettled = Math.max(0, Math.min(maxSettledLimit, 12 - activeWorks.length));
+  const selectedIds = new Set<string>([
+    ...activeWorks.map(task => task.id),
+    ...settledWorks.slice(-maxSettled).map(task => task.id),
+  ]);
+  return knownWorks
+    .filter(task => selectedIds.has(task.id))
+    .map(task => {
+      const active = isActive(task);
+      const {
+        id, prompt, status, revision, mode, reason, report, files,
+        originMessageId, execution, cwd, profile, workerModel, modelTier, thinkingLevel, pendingQuestion,
+      } = task;
+      return {
+        execution: execution ?? 'snapshot',
+        cwd,
+        id,
+        prompt: prompt.slice(0, active ? 360 : 160),
+        status,
+        revision,
+        mode,
+        reason,
+        ...(active && report ? { reportPreview: report.slice(0, 300) } : {}),
+        fileCount: files.length,
+        originMessageId,
+        ...(profile ? { profile } : {}),
+        ...(modelTier ? { modelTier } : {}),
+        ...(thinkingLevel ? { thinkingLevel } : {}),
+        ...(workerModel ? { workerModel } : {}),
+        ...(pendingQuestion ? { pendingQuestion } : {}),
+      };
+    });
+}
+
+export function compactRouterChatMemoryDirectory(dir: MemoryDirectory): MemoryDirectory {
+  return {
+    totalActive: dir.totalActive,
+    truncated: dir.truncated,
+    items: dir.items.map(item => {
+      const {
+        synapses: _synapses,
+        preview: _preview,
+        summary: _summary,
+        content: _content,
+        ...rest
+      } = item as MemoryDirectory['items'][number] & { preview?: unknown; summary?: unknown; content?: unknown };
+      return rest as unknown as MemoryDirectory['items'][number];
+    }),
+  };
+}
+
+export function compactRouterChatRecentContext(recentContext: unknown): unknown {
+  const compactItem = (entry: unknown): unknown => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return entry;
+    const rec = entry as Record<string, unknown>;
+    if (typeof rec.text === 'string' && rec.text.length > 280) {
+      return {
+        ...rec,
+        text: rec.text.slice(-280),
+        truncated: true,
+      };
+    }
+    return entry;
+  };
+  if (Array.isArray(recentContext)) {
+    return recentContext.slice(-4).map(compactItem);
+  }
+  if (recentContext && typeof recentContext === 'object') {
+    const obj = recentContext as Record<string, unknown>;
+    if (Array.isArray(obj.items)) {
+      return { ...obj, items: obj.items.slice(-4).map(compactItem) };
+    }
+    if (Array.isArray(obj.recentMessages)) {
+      return { ...obj, recentMessages: obj.recentMessages.slice(-4).map(compactItem) };
+    }
+  }
+  return recentContext;
+}
 
 export function nextDailyRunAt(dailyAt: string, now = Date.now()): number {
   const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(dailyAt.trim());
@@ -78,7 +167,17 @@ export interface SubconsciousRuntime {
   now?: () => number;
   random?: () => number;
   checkIntervalMs?: number;
+  skipExecutor?: boolean;
+  semantic?: SemanticEmbedder;
+  semanticAutoDownload?: boolean;
+  distillerEnabled?: boolean;
+  distillIdleMs?: number;
+  distillCheckIntervalMs?: number;
 }
+
+const isRunningUnderNodeTest = () =>
+  Boolean(process.env.NODE_TEST_CONTEXT)
+  || process.execArgv.some(arg => arg === '--test' || arg.startsWith('--test-'));
 
 const unsettled = (op: Operation) => ['requested', 'started', 'cancel_requested', 'unknown'].includes(op.status);
 const taskStatusNeedsNotice = (status: TaskStatus) => ['paused', 'cancelled', 'failed'].includes(status);
@@ -182,12 +281,15 @@ function parseStringArray(value: unknown, label: string, maxItems = 16, maxLen =
 }
 export class Coordinator {
   readonly store: Store;
+  readonly semantic: SemanticEmbedder;
   readonly im: ImGateway;
   readonly modelHub: ModelHub;
   private readonly executor: Executor;
   private readonly runs = new Map<string, Run>();
   private readonly jobs = new Set<Promise<void>>();
   private readonly submissions = new Set<Promise<Task>>();
+  private readonly semanticAbort = new AbortController();
+  private semanticWarmup?: Promise<void>;
   private router?: AgentPort;
   private routerQueue: Promise<void> = Promise.resolve();
   private dispatch?: () => Promise<string>;
@@ -198,6 +300,7 @@ export class Coordinator {
   private activeFailureTask?: { id: string; reason: string; workerModel?: string; originMessageId?: string };
   private reportTurnDispatched = false;
   private reportTurnSentFile = false;
+  private reportTurnSavedMemory = false;
   private readonly reportAutoDispatches = new Map<string, number>();
   private readonly chatRuns = new Map<string, ChatRun>();
   private readonly chatJobs = new Set<Promise<void>>();
@@ -205,9 +308,14 @@ export class Coordinator {
   private readonly requestFingerprints = new Map<string, { messageId: string; text: string; pathsJson: string }>();
   private readonly timer: NodeJS.Timeout;
   private lastActivityAt: number;
+  private lastChatActivityAt: number;
   private lastSubconsciousCheckAt = 0;
+  private lastDistillCheckAt = 0;
   private nextLatencyMs?: number;
   private dreamRun?: { controller: AbortController; promise: Promise<void>; startedAt: number };
+  private readonly pendingDistillTaskIds: string[] = [];
+  private readonly queuedDistillTaskSet = new Set<string>();
+  private distillRun?: { kind: 'task' | 'chat'; controller: AbortController; promise: Promise<void> };
   private closing = false;
   constructor(
     private readonly home: string,
@@ -216,8 +324,35 @@ export class Coordinator {
   ) {
     this.store = new Store(home);
     this.store.recover();
-    this.lastActivityAt = this.now();
-    this.executor = new Executor(home, op => this.store.operation(op));
+    const explicitAutoDownload = this.subconsciousRuntime?.semanticAutoDownload
+      ?? (process.env.FRIDAY_SEMANTIC_AUTO_DOWNLOAD === '1'
+        ? true
+        : process.env.FRIDAY_SEMANTIC_AUTO_DOWNLOAD === '0'
+          ? false
+          : undefined);
+    const autoDownload = explicitAutoDownload ?? (
+      this.factory.mode === 'real'
+      && !this.subconsciousRuntime?.skipExecutor
+      && !isRunningUnderNodeTest()
+    );
+    this.semantic = this.subconsciousRuntime?.semantic ?? createSemanticEngine({
+      homeDir: home,
+      autoDownload,
+    });
+    this.store.attachSemanticEngine(this.semantic);
+    const initialNow = this.now();
+    this.lastActivityAt = initialNow;
+    this.lastChatActivityAt = initialNow;
+    this.executor = this.subconsciousRuntime?.skipExecutor
+      ? ({
+          ready: Promise.resolve(),
+          pid: process.pid,
+          available: true,
+          start: () => Promise.reject(new Error('Executor is disabled in test mode')),
+          stop: () => {},
+          close: async () => {},
+        } as unknown as Executor)
+      : new Executor(home, op => this.store.operation(op));
     this.im = new ImGateway(this);
     const defaultTiers: ModelTierConfig = this.factory.modelTiers ?? {
       provider: 'offline', router: 'deepseek-flash', fast: 'gpt-6-luna', balanced: 'gpt-6.1-terra', strong: 'gpt-6.1-sol', available: [],
@@ -244,8 +379,26 @@ export class Coordinator {
     );
     await this.modelHub.syncDecisionEraStats(this.store.list());
     backfillPersistedSessions(this.store);
+    this.store.initDistillerStateIfMissing();
     this.router = await this.createRouter(true);
     this.im.start();
+    this.startSemanticWarmup();
+  }
+  private startSemanticWarmup() {
+    if (this.closing || this.semanticWarmup) return;
+    if (this.factory.mode !== 'real' && !this.subconsciousRuntime?.semantic) return;
+    const signal = this.semanticAbort.signal;
+    this.semanticWarmup = (async () => {
+      try {
+        const ready = this.semantic.ensureReady
+          ? await this.semantic.ensureReady(signal)
+          : this.semantic.isReady();
+        if (!ready || signal.aborted || this.closing) return;
+        await this.store.backfillEmbeddings(32, signal);
+      } catch {
+        // Semantic engine degrades cleanly to lexical/BM25 retrieval.
+      }
+    })();
   }
   private createRouter(restoreCheckpoint = false): Promise<AgentPort> {
     return this.factory.create('router', 'router', ([{
@@ -255,7 +408,7 @@ export class Coordinator {
         return this.dispatch();
       },
     }, {
-      name: 'start_work', description: 'Start an isolated background task; returns immediately. Input JSON: {instruction, cwd?, sourceMessageId?, sourceTaskId?, contextBrief?, memoryIds?, profile?: "general"|"coding"|"research"|"review"}. For native work cwd is an optional absolute existing working directory; paths named in conversation are enough, attachments are NOT required. Omit cwd to reuse the source work directory, first hint path directory, or service cwd. Use contextBrief and memoryIds to compile recalled global memories for the Worker AI and profile to select a specialist Worker AI; the host Gemini Decision 1 engine automatically selects the optimal model and native thinkingLevel. Native Workers have full local tools, not a sandbox. Snapshot/offline work still uses explicitly supplied source files. Do not use both sources.',
+      name: 'start_work', description: 'Start an isolated background task; returns immediately. Input JSON: {instruction, cwd?, sourceMessageId?, sourceTaskId?, contextBrief?, memoryIds?, profile?: "general"|"coding"|"research"|"review"}. Omit cwd to reuse source/hint/service cwd; named host paths are enough without attachments. Pass contextBrief/memoryIds to supply recalled memories and profile for specialist Workers; Gemini Decision selects model/thinkingLevel. Native Workers have full local tools; snapshot/offline uses source files.',
       execute: async (input, callId) => {
         const context = this.requireChat();
         const inReportTurn = !this.chatContext && Boolean(this.activeReportTask);
@@ -307,7 +460,7 @@ export class Coordinator {
           note: 'Background work accepted, not completed' });
       },
     }, {
-      name: 'continue_work', description: 'Input JSON {taskId, instruction, cwd?, contextBrief?, memoryIds?, profile?: "general"|"coding"|"research"|"review"}. Append a follow-up to queued/running work; completed/failed/cancelled work starts a related isolated execution using the CURRENT service execution capabilities and prior report, with model and native thinkingLevel chosen dynamically by Gemini Decision 1. In native mode, even a legacy snapshot source creates a full-tool Worker in the current working directory, never another snapshot-only Worker. Optional cwd selects an absolute working directory; optional contextBrief/memoryIds compile global memory into the Worker context. Paused or unknown work cannot be resumed automatically.',
+      name: 'continue_work', description: 'Append a follow-up to queued/running work, or start a related isolated execution from completed/failed/cancelled work (using current capabilities and prior report; Gemini Decision chooses model/thinkingLevel). Input JSON {taskId, instruction, cwd?, contextBrief?, memoryIds?, profile?: "general"|"coding"|"research"|"review"}. Paused/unknown work cannot be resumed automatically.',
       execute: async (input, callId) => {
         const context = this.requireChat();
         const inReportTurn = !this.chatContext && Boolean(this.activeReportTask);
@@ -382,7 +535,7 @@ export class Coordinator {
           files: task.files, followups: this.store.events(task.id).map(({ id, text, state }) => ({ id, text, state })) });
       },
     }, {
-      name: 'recall_messages', description: 'Read older pages of the SAME continuous transcript, without a new session. Input JSON {beforeSeq?} for a bounded page, or {messageId} for one full message. Page previews are truncated explicitly; use the returned message ID for full text. Source messages remain the only file authorization.',
+      name: 'recall_messages', description: 'Read older pages of the current transcript without starting a new session. Input JSON {beforeSeq?} for a truncated page, or {messageId} for full text.',
       execute: async input => {
         this.requireChat();
         const args = toolInput(input, ['beforeSeq', 'messageId', 'summary']);
@@ -393,7 +546,7 @@ export class Coordinator {
         return JSON.stringify({ ...page, items: page.items.map(message => compact(message, false)) });
       },
     }, {
-      name: 'search_memory', description: 'Search global context like a human brain recalling memories across semantic memory cards, historical work reports, and conversation history. Input JSON {query, scope?: "all"|"memories"|"works"|"messages", cwd?, limit?, includeSuperseded?}. Returns ranked hits with snippets, neighbor messages (for locality), and IDs (memoryId, taskId, messageId) for Chain of Recall via inspect_work or recall_messages.',
+      name: 'search_memory', description: 'Search global context across semantic memories, work reports, and conversation history. Input JSON {query, scope?: "all"|"memories"|"works"|"messages", cwd?, limit?, includeSuperseded?}. Returns ranked hits with IDs for inspect_work/recall_messages.',
       execute: async input => {
         if (this.closing) throw new Error('Service is shutting down');
         const args = toolInput(input, ['query', 'scope', 'cwd', 'limit', 'includeSuperseded', 'summary']);
@@ -402,7 +555,7 @@ export class Coordinator {
         if (!['all', 'memories', 'works', 'messages'].includes(scopeRaw)) {
           throw new Error('Invalid search_memory scope: use "all", "memories", "works" or "messages"');
         }
-        const result = this.store.searchContext({
+        const result = await this.store.searchContextAsync({
           query,
           scope: scopeRaw as 'all' | 'memories' | 'works' | 'messages',
           cwd: args.cwd === undefined ? undefined : text(args.cwd, 'cwd', 4096),
@@ -413,7 +566,7 @@ export class Coordinator {
         return JSON.stringify(result);
       },
     }, {
-      name: 'save_memory', description: 'Consolidate durable knowledge, user preferences, architectural decisions, or key findings into global semantic memory (automatically superseding outdated cards on the same topic+cwd and wiring neural synapses), link two memory neurons, pin/unpin a core memory, or forget an outdated memory. Input JSON {action?: "save"|"link"|"forget"|"pin"|"unpin", id?, targetId?, linkedMemoryIds?, topic?, content?, tags?, cwd?, sourceTaskId?, supersedeId?, pinned?}.',
+      name: 'save_memory', description: 'Save durable knowledge/preferences/decisions to global memory (superseding matching outdated cards and linking synapses), or link/forget/pin cards. Input JSON {action?: "save"|"link"|"forget"|"pin"|"unpin", id?, targetId?, linkedMemoryIds?, topic?, content?, tags?, cwd?, sourceTaskId?, supersedeId?, pinned?}.',
       execute: async input => {
         if (this.closing) throw new Error('Service is shutting down');
         const args = toolInput(input, ['action', 'id', 'targetId', 'linkedMemoryIds', 'topic', 'content', 'tags', 'cwd', 'sourceTaskId', 'supersedeId', 'pinned', 'summary']);
@@ -435,7 +588,7 @@ export class Coordinator {
           return JSON.stringify({ action: 'link', memory: linked.source, target: linked.target, memoryIds: [linked.source.id, linked.target.id] });
         }
         if (action !== 'save') throw new Error(`Unknown save_memory action: ${action}`);
-        const card = this.store.saveMemory({
+        const card = await this.store.saveMemoryAsync({
           id: args.id === undefined ? undefined : text(args.id, 'id', 128),
           topic: text(args.topic, 'topic', 160),
           content: text(args.content, 'content', 8192),
@@ -475,7 +628,7 @@ export class Coordinator {
         return JSON.stringify({ taskId: task.id, state: task.status, limitMs: task.limitMs, reason: task.reason });
       },
     }, {
-      name: 'manage_timer', description: 'Manage persistent scheduled tasks and one-shot countdown/reminders. Input JSON {action: "add"|"list"|"toggle"|"remove", id?, name?, instruction?, intervalMs?, delayMs?, dailyAt?, once?, plugin?, pluginAction?, deliverChannelId?, deliverTarget?, cwd?, enabled?}. Use delayMs (e.g. 1800000 for 30m later; defaults once=true) or dailyAt ("HH:mm") + once:true for one-shot reminders/tasks, dailyAt ("HH:mm") for daily schedules, plugin/pluginAction (e.g. "system-pulse"/"remind" or "system-pulse"/"patrol" or "fund-tracker") for 0-token direct script execution, and deliverChannelId ("auto" or channel ID)/deliverTarget for IM delivery.',
+      name: 'manage_timer', description: 'Manage persistent schedules and one-shot reminders. Input JSON {action: "add"|"list"|"toggle"|"remove", id?, name?, instruction?, intervalMs?, delayMs?, dailyAt?, once?, plugin?, pluginAction?, deliverChannelId?, deliverTarget?, cwd?, enabled?}. Use delayMs or dailyAt ("HH:mm", +once:true) for timers, plugin/pluginAction (e.g. "system-pulse"/"remind") for 0-token runs, and deliverChannelId/deliverTarget for IM.',
       execute: async input => {
         const context = this.requireChat();
         const args = toolInput(input, ['action', 'id', 'name', 'instruction', 'intervalMs', 'delayMs', 'dailyAt', 'once', 'plugin', 'pluginAction', 'deliverChannelId', 'deliverTarget', 'cwd', 'enabled', 'summary']);
@@ -506,7 +659,7 @@ export class Coordinator {
         throw new Error(`Unknown timer action: ${action}`);
       },
     }, {
-      name: 'run_plugin', description: 'List or execute lightweight local Node script plugins (such as "system-pulse" for host CPU/memory/disk/Git telemetry, silent health patrol, and 0-token reminders, "fund-tracker" for fund portfolio valuation/settlement, or custom plugins forged under <home>/plugins/). Input JSON {action?: "list"|"run", plugin?, pluginAction?, args?}.',
+      name: 'run_plugin', description: 'List or run local Node script plugins. Input JSON {action?: "list"|"run", plugin?, pluginAction?, args?}. Built-ins: "tv-agent" (status, power {state}, volume {level?,delta?,mute?}, cast {op,url?,position?}, open_app {app:"bili"|"smarttube"|"live"|"tvbox"|"hdbox"|"home"|pkg,uri?}, tree, act, navigate {goal,app?,searchText?}); "tv-ir" (press {key,count?}, sequence {keys}, status, keys); "miot" (status, devices {room?,category?,controllableOnly?,live?,refresh?}, get {device?,did?,room?,refresh?}, set {device?,did?,room?,on?,toggle?,temperature?,mode?,fanSpeed?,siid?,piid?,value?,dryRun?}, cook {device?,op,tempC?,minutes?,recipe?,preheat?,dryRun?}, action {device?,did?,siid,aiid,in?}, command {text,speakReply?,dryRun?}); "health-scale" (status, dashboard, scan, measure-start, measure-status, measure-stop, profile-save, record-add); "system-pulse"; "fund-tracker"; or custom <home>/plugins/.',
       execute: async input => {
         if (this.closing) throw new Error('Service is shutting down');
         const args = toolInput(input, ['action', 'plugin', 'pluginAction', 'args', 'summary']);
@@ -524,7 +677,7 @@ export class Coordinator {
         return JSON.stringify(result);
       },
     }, {
-      name: 'send_file', description: 'Send a file attachment to the authenticated WeChat user. Input JSON {name, content?}. If `content` (UTF-8 text/Markdown) is supplied, the host stages it directly as `name` and delivers the attachment in this same turn (do NOT spawn a Worker just to write a text/Markdown file). If `content` is omitted, `name` must be an existing regular file (1B..16MiB) in FRIDAY_WECHAT_ATTACHMENT_DIR (or <home>/wechat-files). Works both in WeChat sessions and when requested from local Web/TUI if a WeChat channel is bound.',
+      name: 'send_file', description: 'Send a WeChat file attachment to the authenticated user (works from WeChat, or Web/TUI if WeChat is bound). Input JSON {name, content?}. Pass UTF-8 text/Markdown in content to stage and send directly without a Worker; omit content to send an existing file (1B..16MiB) from FRIDAY_WECHAT_ATTACHMENT_DIR or <home>/wechat-files.',
       execute: async input => {
         if (this.closing) throw new Error('Service is shutting down');
         const args = toolInput(input, ['name', 'content', 'summary']);
@@ -535,7 +688,7 @@ export class Coordinator {
         const currentOrigin = this.chatContext?.message.origin ?? this.activeReportTask?.origin;
         const origin = currentOrigin?.channel === 'wechat'
           ? currentOrigin
-          : (!currentOrigin?.channel || currentOrigin.channel === 'local')
+          : (!currentOrigin?.channel || currentOrigin.channel === 'local' || currentOrigin.channel === 'xiaoai')
             ? this.resolveChannelOrigin('wechat')
             : undefined;
         if (!origin || origin.channel !== 'wechat' || !origin.channelId || !origin.senderId) {
@@ -555,23 +708,31 @@ export class Coordinator {
         return JSON.stringify({ sent: true, name: fileName, target: origin.senderId });
       },
     }, {
-      name: 'switch_channel', description: 'Route the current turn reply (and any tasks started in this turn) to a target channel when the Boss asks to reply on WeChat/Telegram/DingTalk/XiaoAI or move the conversation across devices. Input JSON {channel: "wechat"|"telegram"|"dingtalk"|"xiaoai"|"local"|"auto"|string, target?}.',
+      name: 'switch_channel', description: 'Route the current turn reply and new tasks to another endpoint. Input JSON {channel: "wechat"|"web"|"local"|"telegram"|"dingtalk"|"xiaoai"|"auto"|string, target?, voiceNotice?}.',
       execute: async input => {
         if (this.closing) throw new Error('Service is shutting down');
-        const args = toolInput(input, ['channel', 'target', 'summary']);
+        const args = toolInput(input, ['channel', 'target', 'voiceNotice', 'summary']);
         const channelSpec = text(args.channel, 'channel', 128).trim();
         const targetSpec = args.target === undefined ? undefined : text(args.target, 'target', 128).trim();
-        const nextOrigin: import('./view.js').MessageOrigin | undefined = channelSpec === 'local'
-          ? { channel: 'local' }
-          : this.resolveChannelOrigin(channelSpec, targetSpec);
+        const prevOrigin = this.chatContext?.message.origin
+          ?? this.activeReportTask?.origin
+          ?? this.reportChatContext?.message.origin;
+        const nextOrigin: import('./view.js').MessageOrigin | undefined = this.resolveChannelOrigin(channelSpec, targetSpec);
         if (!nextOrigin) {
           throw new Error(`未找到已启用且匹配的 IM 通道: ${channelSpec}`);
         }
         if (this.chatContext) {
+          this.chatContext.hasSideEffectTool = true;
           this.chatContext.message.origin = nextOrigin;
           this.store.conversation.update(this.chatContext.message.id, { origin: nextOrigin });
           if (this.chatContext.replyId) {
             this.store.conversation.update(this.chatContext.replyId, { origin: nextOrigin });
+          }
+        }
+        if (this.reportChatContext) {
+          this.reportChatContext.message.origin = nextOrigin;
+          if (this.reportChatContext.replyId) {
+            this.store.conversation.update(this.reportChatContext.replyId, { origin: nextOrigin });
           }
         }
         if (this.activeReportTask) {
@@ -581,6 +742,25 @@ export class Coordinator {
           if (activeRun?.replyId) {
             this.store.conversation.update(activeRun.replyId, { origin: nextOrigin });
           }
+        }
+        if (
+          prevOrigin?.channel === 'xiaoai'
+          && prevOrigin.channelId
+          && prevOrigin.conversationId
+          && (nextOrigin.channel !== 'xiaoai' || nextOrigin.channelId !== prevOrigin.channelId || nextOrigin.conversationId !== prevOrigin.conversationId)
+        ) {
+          const customNotice = args.voiceNotice === undefined ? '' : text(args.voiceNotice, 'voiceNotice', 200).trim();
+          const defaultNotice = nextOrigin.channel === 'local'
+            ? '好的，详细内容已转到网页端。'
+            : nextOrigin.channel === 'wechat'
+              ? '好的，详细内容已发到微信。'
+              : '好的，详细内容已转到其他终端。';
+          this.im.enqueueXiaoaiNotice(
+            prevOrigin.channelId,
+            prevOrigin.conversationId,
+            customNotice || defaultNotice,
+            prevOrigin,
+          );
         }
         return JSON.stringify({
           switched: true,
@@ -618,7 +798,18 @@ export class Coordinator {
       resume_work: 'resume', recall_messages: 'recall', search_memory: 'search_memory', save_memory: 'save_memory', manage_timer: 'timer', run_plugin: 'plugin', send_file: 'send_file', switch_channel: 'switch_channel',
     };
     const context = this.chatContext ?? (this.reportChatContext && this.activeReportTask?.originMessageId && name !== 'save_memory' ? this.reportChatContext : undefined);
-    if (!context || !kinds[name]) return execute();
+    if (!context || !kinds[name]) {
+      const res = await execute();
+      if (name === 'save_memory' && this.activeReportTask) {
+        try {
+          const parsed = JSON.parse(res) as { action?: string };
+          if (!parsed.action || parsed.action === 'save') this.reportTurnSavedMemory = true;
+        } catch {
+          this.reportTurnSavedMemory = true;
+        }
+      }
+      return res;
+    }
     if (this.chatContext && !READONLY_ROUTER_TOOLS.has(name)) {
       if (this.chatContext.activeAttemptVersion !== undefined && (this.chatContext.mergeVersion !== this.chatContext.activeAttemptVersion || this.hasInboundHold(this.chatContext.message.origin))) {
         throw new Error('Superseded by incoming message in same IM session');
@@ -739,6 +930,7 @@ export class Coordinator {
   }
   view(): MainView {
     const recent = this.store.list(80);
+    const vp = this.im.getVoiceprintStatus();
     return { mode: this.factory.mode, health: { status: this.executor.available ? 'ready' : 'degraded', executorAvailable: this.executor.available },
       messages: this.store.conversation.history(), cursor: this.store.conversation.latestSeq(),
       memoryDirectory: this.store.memoryDirectory(24),
@@ -746,6 +938,14 @@ export class Coordinator {
       timers: this.store.listTimers(),
       plugins: listPluginsSync(this.home),
       imChannels: this.store.listImChannelViews(),
+      voiceprint: {
+        enabled: vp.enabled,
+        threshold: vp.threshold,
+        wakePrecheck: vp.wakePrecheck,
+        active: vp.active,
+        modelReady: vp.modelReady,
+        profiles: vp.profiles,
+      },
       works: recent.map(({ id, prompt, status, mode, createdAt, activeMs, limitMs, reason, sessionId, originMessageId, parentTaskId, cwd, execution, profile, workerModel, modelTier, thinkingLevel, decisionSource, skipQualityGate, qualityGate, pendingQuestion }) => {
         const concurrentTaskIds = execution === 'native' && ['queued', 'running'].includes(status) ? this.concurrentTasksInCwd(cwd, id) : undefined;
         return { id, prompt: prompt.slice(0, 240), status, mode, createdAt, activeMs, limitMs, reason, ...(sessionId ? { sessionId } : {}), originMessageId, parentTaskId, cwd,
@@ -775,14 +975,14 @@ export class Coordinator {
     return this.factory.mode === 'real' ? 9000 : 1200;
   }
   private computeCoalesceWindowMs(msg: ChatMessage): number {
-    if (!msg.origin?.channel || msg.origin.channel === 'local') return 0;
+    if (!msg.origin?.channel || msg.origin.channel === 'local' || msg.origin.channel === 'xiaoai') return 0;
     if (msg.attachments?.length && isCaptionlessAttachmentText(msg.text)) {
       return this.attachmentCoalesceMs();
     }
     return this.textCoalesceMs();
   }
   private findMergeableChatRun(origin?: import('./view.js').MessageOrigin): ChatRun | undefined {
-    if (!origin?.channel || origin.channel === 'local') return undefined;
+    if (!origin?.channel || origin.channel === 'local' || origin.channel === 'xiaoai') return undefined;
     for (const run of this.chatRuns.values()) {
       if (
         sameImSession(run.message.origin, origin)
@@ -953,7 +1153,7 @@ export class Coordinator {
         context.activeAttemptVersion = attemptVersion;
         let currentMessage = chat.get(message.id);
         const knownWorks = this.store.list();
-        const resolvedSession = await resolveRuntimeMessageSession(this.store, this.modelHub, currentMessage, knownWorks);
+        const resolvedSession = await resolveRuntimeMessageSession(this.store, this.modelHub, currentMessage, knownWorks, this.semantic);
         if (attemptVersion === 0
           || currentMessage.sessionId !== resolvedSession.sessionId
           || JSON.stringify(currentMessage.sessionLink ?? null) !== JSON.stringify(resolvedSession.sessionLink ?? null)) {
@@ -962,7 +1162,9 @@ export class Coordinator {
         context.message = currentMessage;
         const memoryDirectory = this.store.memoryDirectory(24);
         const autoRecalled = currentMessage.text.trim()
-          ? this.store.searchContext({ query: currentMessage.text, limit: 5, touch: true }).hits.filter(hit => !(hit.kind === 'message' && hit.messageId === message.id))
+          ? (await this.store.searchContextAsync({ query: currentMessage.text, limit: 3, touch: false }))
+              .hits
+              .filter(hit => hit.score >= 46 && !(hit.kind === 'message' && hit.messageId === message.id))
           : [];
         const subconscious = this.store.peekSubconsciousForChat(this.now());
         context.revisions = new Map(knownWorks.map(task => [task.id, task.revision]));
@@ -992,16 +1194,40 @@ export class Coordinator {
             .filter(c => c.enabled)
             .map(({ id, platform, name, loginStatus, defaultTarget }) => ({ id, platform, name, loginStatus, defaultTarget }));
           const carriedImages = this.resolveRecentSessionImages(currentMessage);
+          const { routing: _omittedRouting, ...cleanCurrentMessage } = currentMessage;
           const promptMessage = carriedImages.length
-            ? { ...currentMessage, attachments: [...(currentMessage.attachments ?? []), ...carriedImages] }
-            : currentMessage;
-          const result = await trace.run(this.router!, JSON.stringify({ kind: 'CHAT', message: promptMessage, deliveryChannel, context: recentContext,
+            ? { ...cleanCurrentMessage, attachments: [...(cleanCurrentMessage.attachments ?? []), ...carriedImages] }
+            : cleanCurrentMessage;
+          const promptMemoryDirectory = compactRouterChatMemoryDirectory(
+            this.store.memoryDirectory(deliveryChannel === 'xiaoai' ? 10 : 12),
+          );
+          const promptAutoRecalled = autoRecalled.map(({ synapses: _synapses, neighbors, ...hit }) => ({
+            ...hit,
+            snippet: hit.snippet.length > 200 ? `${hit.snippet.slice(0, 200)}…` : hit.snippet,
+            ...(neighbors?.length
+              ? {
+                  neighbors: neighbors.slice(0, 2).map(n => ({
+                    ...n,
+                    preview: n.preview.length > 100 ? `${n.preview.slice(0, 100)}…` : n.preview,
+                  })),
+                }
+              : {}),
+          }));
+          const includeRecentContext = !this.router?.leafId;
+          const promptContext = includeRecentContext
+            ? (this.factory.mode === 'real'
+              ? compactRouterChatRecentContext(recentContext)
+              : recentContext)
+            : undefined;
+          const promptWorks = compactRouterChatWorks(knownWorks, deliveryChannel === 'xiaoai' ? 2 : 3);
+          const result = await trace.run(this.router!, JSON.stringify({ kind: 'CHAT', message: promptMessage, deliveryChannel, ...this.xiaoaiVoiceTurnHint(deliveryChannel),
+            ...(promptContext !== undefined ? { context: promptContext } : {}),
             execution: this.factory.nativeTools ? 'native' : 'snapshot', cwd: process.cwd(),
-            memoryDirectory,
+            memoryDirectory: promptMemoryDirectory,
             ...(imChannels.length ? { imChannels } : {}),
-            ...(autoRecalled.length ? { autoRecalled } : {}),
+            ...(promptAutoRecalled.length ? { autoRecalled: promptAutoRecalled } : {}),
             ...(subconscious ? { subconscious } : {}),
-            works: knownWorks.slice(-40).map(({ id, prompt, status, revision, mode, reason, report, files, originMessageId, execution, cwd, profile, workerModel, modelTier, thinkingLevel, pendingQuestion }) => ({ execution: execution ?? 'snapshot', cwd, id, prompt: prompt.slice(0, 512), status, revision, mode, reason, reportPreview: report?.slice(0, 1024), fileCount: files.length, originMessageId, ...(profile ? { profile } : {}), ...(modelTier ? { modelTier } : {}), ...(thinkingLevel ? { thinkingLevel } : {}), ...(workerModel ? { workerModel } : {}), ...(pendingQuestion ? { pendingQuestion } : {}) })) }), attemptController.signal);
+            works: promptWorks }), attemptController.signal);
           this.accrueChat(context);
           if (context.controller.signal.aborted) throw context.controller.signal.reason;
           if ((context.mergeVersion !== attemptVersion || this.hasInboundHold(currentMessage.origin)) && !context.hasSideEffectTool && !this.closing) {
@@ -1036,14 +1262,18 @@ export class Coordinator {
           chat.routeState(message.id, status);
           chat.update(message.id, { status, reason: error instanceof Error ? '处理未完成，可查看执行轨迹。' : '处理失败。' });
           break;
-        } finally {
+      } finally {
           context.controller.signal.removeEventListener('abort', onUserAbort);
           context.attemptController = undefined;
           this.routerTrace = undefined;
           this.chatContext = undefined;
         }
       }
-    }).finally(() => { this.chatRuns.delete(message.id); this.chatJobs.delete(pending); });
+    }).finally(() => {
+      this.lastChatActivityAt = this.now();
+      this.chatRuns.delete(message.id);
+      this.chatJobs.delete(pending);
+    });
     this.chatJobs.add(pending);
     this.routerQueue = pending.then(() => {}, () => {});
     return message;
@@ -1055,6 +1285,21 @@ export class Coordinator {
     run?.wakeCoalesce?.();
     if (run && !run.replyId) this.store.conversation.update(run.message.id, { status: 'interrupted', reason: '已停止排队中的回复；后台工作不受影响。' });
     return { messageId: id, state: run ? 'stop_requested' : message.status };
+  }
+  stopImSessionReplies(origin?: import('./view.js').MessageOrigin): number {
+    if (!origin?.channel || origin.channel === 'local') return 0;
+    let count = 0;
+    for (const run of this.chatRuns.values()) {
+      if (sameImSession(run.message.origin, origin) && !run.controller.signal.aborted && !run.settled && !run.hasSideEffectTool) {
+        run.controller.abort(new Error('Superseded by newer voice utterance on same speaker'));
+        run.wakeCoalesce?.();
+        if (!run.replyId) {
+          this.store.conversation.update(run.message.id, { status: 'interrupted', reason: '已被新的语音指令打断；后台工作不受影响。' });
+        }
+        count++;
+      }
+    }
+    return count;
   }
   private checkpoint() {
     if (this.router?.checkpoint) this.store.conversation.setMeta('router_checkpoint', this.router.checkpoint);
@@ -1106,6 +1351,13 @@ export class Coordinator {
   private publicText(text: string): string {
     return sanitizePublicReply(text, this.store.list().map(task => task.id));
   }
+  private xiaoaiVoiceTurnHint(deliveryChannel: string): { voiceModeConstraint?: string } {
+    if (deliveryChannel !== 'xiaoai') return {};
+    return {
+      voiceModeConstraint:
+        '当前直连小爱音箱TTS外放：(1) 普通回复与任务派发确认必须极致简短口语（<=25字，如“好的，马上去查。”）；(2) 若需老板确认、追问或邀请老板接着说话（如“要试什么键直接说”/“告诉我…”），必须加 [[LISTEN]]（音箱自动免唤醒继续监听），严禁在邀请老板说话的句子后加 [[END]]；仅当本轮彻底结束、不期待老板立刻回应时才以“。”结尾并加 [[END]]；(3) 长篇内容或复杂报告严禁在音箱朗读，1句话报核心结论并询问“详细内容发你微信还是放网页端？ [[LISTEN]]”，或按老板要求调用 switch_channel；(4) 老板明确点名按单个电视按键（如“电视往下按一下”）时，直接调用 run_plugin（plugin:"tv-ir", pluginAction:"press"或"sequence"）发红外码并简短闭合确认加 [[END]]（勿附加“要试别的键就说”之类的追问）；若是开放性测试或连续遥控请求（如“测试一下电视操作能力”/“遥控电视”），执行首步后直接回复“已进入遥控模式，要试什么键直接说。 [[LISTEN]]”移交本地零延迟连续遥控；若是打开电视应用、设置精确音量、投屏或目标导向电视操作（如“打开电视B站搜周杰伦”/“把电视音量调到15”），直接调用 run_plugin（plugin:"tv-agent"，如 open_app / volume / cast / power / navigate）并简短口语确认加 [[END]]（若多步 navigate 耗时较长，用 start_work 派发并简短口语确认）；(5) 老板询问家里设备/灯光状态、空气炸锅剩余时间，或要求控制灯具/开关/插座/空气炸锅/空调（如“家里哪些灯开着”、“打开卧室灯”、“关掉鱼缸灯”、“空气炸锅180度10分钟”、“空气炸锅还剩几分钟”、“把卧室空调调到26度”）时，直接调用 run_plugin（plugin:"miot"，按需使用 devices / get / set / cook / command）直连执行，严禁派发缓慢的 start_work Worker，并给出简短口语闭合确认加 [[END]]（仅当需消歧如未指明房间时才问一句并加 [[LISTEN]]，例如“要开客厅空调还是卧室空调？ [[LISTEN]]”）。',
+    };
+  }
   private valid(run: Run): boolean {
     const task = this.store.get(run.id);
     return !run.controller.signal.aborted && task.revision === run.revision && ['queued', 'running'].includes(task.status);
@@ -1137,6 +1389,7 @@ export class Coordinator {
             ...(task.workerModel ? { workerModel: task.workerModel } : {}),
             error: detail,
             deliveryChannel: task.origin?.channel ?? 'local',
+            ...this.xiaoaiVoiceTurnHint(task.origin?.channel ?? 'local'),
             autoDispatchesRemaining: Math.max(0, 2 - (this.reportAutoDispatches.get(chainKey) ?? 0)),
           }));
           if (!this.valid(run)) return false;
@@ -1475,7 +1728,12 @@ export class Coordinator {
     if (!this.valid(run)) { worker.close(); return; }
     const current = this.store.get(task.id); current.sessionFile = worker.sessionFile; this.store.save(current);
     const prior = task.parentTaskId ? this.store.get(task.parentTaskId) : undefined;
-    const recalledMemories = this.store.memoriesForContext({ memoryIds: task.memoryIds, cwd: task.cwd, limit: 8 });
+    const recalledMemories = await this.store.memoriesForContextAsync({
+      memoryIds: task.memoryIds,
+      cwd: task.cwd,
+      queryText: task.prompt,
+      limit: 8,
+    });
     const initialPeers = task.execution === 'native' ? this.activePeersInCwd(task.cwd, task.id) : [];
     const compiledContext = (task.contextBrief || recalledMemories.length || initialPeers.length || task.profile || task.workerModel || task.modelTier || task.thinkingLevel) ? {
       profile: task.profile ?? 'general',
@@ -1565,6 +1823,7 @@ export class Coordinator {
               question: asked.question,
               ...(asked.options?.length ? { options: asked.options } : {}),
               deliveryChannel: task.origin?.channel ?? 'local',
+              ...this.xiaoaiVoiceTurnHint(task.origin?.channel ?? 'local'),
             }));
             if (run.replyId) {
               this.store.conversation.update(run.replyId, {
@@ -1634,24 +1893,36 @@ export class Coordinator {
         }
         let silentHandoff = false;
         let acceptedByRouter = false;
+        let savedMemoryInReportTurn = false;
         const delivered = await this.serialRouter(run, async () => {
+          this.reportTurnSavedMemory = false;
           const preReport = this.store.get(task.id);
           preReport.report = report;
           preReport.qualityGate = qualityEval.assessment;
           this.store.save(preReport);
           const chainKey = task.originMessageId ?? task.id;
           const autoDispatchesRemaining = Math.max(0, 2 - (this.reportAutoDispatches.get(chainKey) ?? 0));
+          const imChannels = this.store.listImChannelViews()
+            .filter(c => c.enabled)
+            .map(({ id, platform, name, loginStatus, defaultTarget }) => ({ id, platform, name, loginStatus, defaultTarget }));
+          const reportTruncSuffix = `\n…[已截断，完整共${report.length}字，详情调 inspect_work]`;
+          const reportForRouter = report.length > 800
+            ? `${report.slice(0, Math.max(0, 800 - reportTruncSuffix.length))}${reportTruncSuffix}`
+            : report;
           const text = await this.prompt(run, this.router!, JSON.stringify({
             kind: 'WORKER_REPORT',
             taskId: task.id,
             prompt: task.prompt,
             cwd: task.cwd,
-            report,
+            report: reportForRouter,
             qualityGate: qualityEval.assessment,
             deliveryChannel: task.origin?.channel ?? 'local',
+            ...this.xiaoaiVoiceTurnHint(task.origin?.channel ?? 'local'),
+            ...(imChannels.length ? { imChannels } : {}),
             autoDispatchesRemaining,
-            memoryDirectory: this.store.memoryDirectory(16),
+            memoryDirectory: compactRouterChatMemoryDirectory(this.store.memoryDirectory(10)),
           }));
+          savedMemoryInReportTurn = this.reportTurnSavedMemory;
           const isHandoffText = /^(?:\[OFFLINE SIMULATION\]\s*)?(?:好的老板[，,、\s]*)?任务已下发[。！!.\s]*$/i.test(text.trim());
           if (this.store.hasPending(task.id)) {
             if (run.replyId) {
@@ -1680,7 +1951,10 @@ export class Coordinator {
         if (!this.valid(run)) return;
         if (delivered === undefined) { input = { kind: 'FOLLOWUP' }; continue; }
         this.finish(run, 'completed', undefined, silentHandoff ? report : delivered);
-        if (task.originMessageId && acceptedByRouter) this.store.consolidateTaskMemory(this.store.get(task.id));
+        const settledTask = this.store.get(task.id);
+        if (this.isDistillerEnabled() && acceptedByRouter && task.originMessageId && !savedMemoryInReportTurn && settledTask.status === 'completed') {
+          this.enqueueTaskDistillation(settledTask.id);
+        }
         return;
       }
     } finally { worker.close(); }
@@ -1847,11 +2121,23 @@ export class Coordinator {
       '钉钉': 'dingtalk',
       'dingtalk': 'dingtalk',
       'telegram': 'telegram',
+      'local': 'local',
+      'web': 'local',
+      'webui': 'local',
+      'console': 'local',
+      '网页': 'local',
+      '网页端': 'local',
+      '控制台': 'local',
+      '电脑': 'local',
+      '桌面': 'local',
       'auto': 'auto',
     } as Record<string, string>)[trimmed.toLowerCase()] ?? trimmed;
+    if (normalizedSpec === 'local') {
+      return { channel: 'local' };
+    }
     const channels = this.store.listImChannels();
     const ch = normalizedSpec === 'auto'
-      ? (channels.find(c => c.enabled) ?? channels[0])
+      ? (channels.find(c => c.enabled && c.platform !== 'xiaoai') ?? channels.find(c => c.enabled) ?? channels[0])
       : (channels.find(c => c.enabled && (c.id === normalizedSpec || c.platform === normalizedSpec))
         ?? channels.find(c => c.id === normalizedSpec || c.platform === normalizedSpec));
     if (ch && ch.enabled) {
@@ -2030,6 +2316,7 @@ export class Coordinator {
       if (routerTaskReply) {
         this.reportTurnDispatched = false;
         this.reportTurnSentFile = false;
+        this.reportTurnSavedMemory = false;
         this.activeReportTask = typeof event.report === 'string' ? { ...task, report: event.report } : task;
         const originMessage = task.originMessageId
           ? (() => { try { return this.store.conversation.get(task.originMessageId); } catch { return undefined; } })()
@@ -2110,11 +2397,183 @@ export class Coordinator {
     return Math.round((4 + this.rand() * 5) * 3600_000);
   }
   private arouse(reason: string) {
-    this.lastActivityAt = this.now();
+    const now = this.now();
+    this.lastActivityAt = now;
+    this.lastChatActivityAt = now;
     this.nextLatencyMs = this.sampleLatencyMs();
     if (this.dreamRun) {
       this.dreamRun.controller.abort(new Error(reason));
     }
+    if (this.distillRun?.kind === 'chat') {
+      this.distillRun.controller.abort(new Error(reason));
+    }
+  }
+  private isDistillerEnabled(): boolean {
+    if (this.subconsciousRuntime?.distillerEnabled !== undefined) {
+      return this.subconsciousRuntime.distillerEnabled;
+    }
+    const envVal = process.env.FRIDAY_DISTILLER?.trim().toLowerCase();
+    if (envVal && ['0', 'false', 'off', 'no'].includes(envVal)) return false;
+    return this.factory.mode === 'real'
+      && !this.subconsciousRuntime?.skipExecutor
+      && !isRunningUnderNodeTest();
+  }
+  private distillIdleMs(): number {
+    return resolveDistillIdleMs(this.subconsciousRuntime?.distillIdleMs);
+  }
+  private enqueueTaskDistillation(taskId: string) {
+    if (!this.isDistillerEnabled() || this.closing || !taskId) return;
+    if (this.queuedDistillTaskSet.has(taskId)) return;
+    if (this.store.distillerState().distilledTaskIds.includes(taskId)) return;
+    this.queuedDistillTaskSet.add(taskId);
+    this.pendingDistillTaskIds.push(taskId);
+    this.pumpDistiller();
+  }
+  private pumpDistiller() {
+    if (!this.isDistillerEnabled() || this.closing || this.distillRun) return;
+    const taskId = this.pendingDistillTaskIds.shift();
+    if (!taskId) return;
+    this.queuedDistillTaskSet.delete(taskId);
+
+    let task: Task;
+    try {
+      task = this.store.get(taskId);
+    } catch {
+      this.pumpDistiller();
+      return;
+    }
+    if (task.status !== 'completed') {
+      this.pumpDistiller();
+      return;
+    }
+
+    let originUserText: string | undefined;
+    if (task.originMessageId) {
+      try { originUserText = this.store.conversation.get(task.originMessageId).text; } catch { /* ignore */ }
+    }
+    const followups = this.store.events(task.id).map(ev => ev.text);
+    const controller = new AbortController();
+    const spanCtx = {
+      rootId: task.originMessageId ?? task.id,
+      ...(task.originMessageId ? { messageId: task.originMessageId } : {}),
+      taskId: task.id,
+      spanId: `${task.id}:distill`,
+      parentSpanId: task.id,
+    };
+
+    const promise = (async () => {
+      try {
+        const res = await distillCompletedTask({
+          store: this.store,
+          factory: this.factory,
+          modelHub: this.modelHub,
+          task,
+          originUserText,
+          followups,
+          signal: controller.signal,
+        });
+        this.store.conversation.span(
+          spanCtx,
+          'system',
+          '记忆提炼 · 任务沉淀',
+          res.saved.length ? 'completed' : 'skipped',
+          {
+            taskId: task.id,
+            savedCount: res.saved.length,
+            topics: res.saved.map(m => m.topic),
+          },
+        );
+      } catch (err) {
+        if (!controller.signal.aborted && !this.closing) {
+          this.store.conversation.span(
+            spanCtx,
+            'system',
+            '记忆提炼 · 任务沉淀',
+            'failed',
+            { taskId: task.id, error: err instanceof Error ? err.message : String(err) },
+          );
+        }
+      } finally {
+        if (this.distillRun?.controller === controller) this.distillRun = undefined;
+        if (!this.closing && this.pendingDistillTaskIds.length > 0) {
+          this.pumpDistiller();
+        }
+      }
+    })();
+    this.distillRun = { kind: 'task', controller, promise };
+  }
+  private startIdleChatDistillRun(messages: ChatMessage[]) {
+    if (!this.isDistillerEnabled() || this.closing || this.distillRun || !messages.length) return;
+    const latestMsg = messages.at(-1)!;
+    const controller = new AbortController();
+    const spanCtx = {
+      rootId: latestMsg.id,
+      messageId: latestMsg.id,
+      spanId: `distill-chat:${latestMsg.seq}`,
+    };
+    const promise = (async () => {
+      try {
+        const res = await distillIdleConversation({
+          store: this.store,
+          factory: this.factory,
+          modelHub: this.modelHub,
+          messages,
+          signal: controller.signal,
+        });
+        this.store.conversation.span(
+          spanCtx,
+          'system',
+          '记忆提炼 · 对话沉淀',
+          res.saved.length ? 'completed' : 'skipped',
+          {
+            messageCount: messages.length,
+            latestSeq: latestMsg.seq,
+            savedCount: res.saved.length,
+            topics: res.saved.map(m => m.topic),
+          },
+        );
+      } catch (err) {
+        if (!controller.signal.aborted && !this.closing) {
+          this.store.conversation.span(
+            spanCtx,
+            'system',
+            '记忆提炼 · 对话沉淀',
+            'failed',
+            { latestSeq: latestMsg.seq, error: err instanceof Error ? err.message : String(err) },
+          );
+        }
+      } finally {
+        if (this.distillRun?.controller === controller) this.distillRun = undefined;
+        if (!this.closing && this.pendingDistillTaskIds.length > 0) {
+          this.pumpDistiller();
+        }
+      }
+    })();
+    this.distillRun = { kind: 'chat', controller, promise };
+  }
+  private tickDistiller() {
+    if (!this.isDistillerEnabled() || this.closing || !this.router || this.distillRun) return;
+    if (this.pendingDistillTaskIds.length > 0) {
+      this.pumpDistiller();
+      return;
+    }
+    const now = this.now();
+    const checkIntervalMs = this.subconsciousRuntime?.distillCheckIntervalMs ?? 5_000;
+    if (now - this.lastDistillCheckAt < checkIntervalMs) return;
+    this.lastDistillCheckAt = now;
+
+    if (this.chatRuns.size > 0 || this.runs.size > 0 || this.submissions.size > 0) {
+      this.lastChatActivityAt = now;
+      return;
+    }
+    if (now - this.lastChatActivityAt < this.distillIdleMs()) return;
+
+    const state = this.store.distillerState();
+    const pendingMsgs = this.store.conversation.allMessages(60)
+      .filter(m => m.seq > state.lastMessageSeq && m.status === 'completed' && m.source !== 'system' && m.text.trim().length > 0)
+      .sort((a, b) => a.seq - b.seq);
+    if (!pendingMsgs.length) return;
+    this.startIdleChatDistillRun(pendingMsgs);
   }
   private parseDreamResidue(raw: string): { impression: string; insight?: string; salience: 'faint' | 'vivid' } | undefined {
     const trimmed = raw.trim();
@@ -2227,7 +2686,7 @@ export class Coordinator {
         execute: async input => {
           controller.signal.throwIfAborted();
           const args = toolInput(input, ['topic', 'content', 'tags', 'cwd', 'supersedeIds', 'linkedMemoryIds']);
-          const card = this.store.saveMemory({
+          const card = await this.store.saveMemoryAsync({
             topic: text(args.topic, 'topic', 160).replace(/^(?:梦境|做梦|Dream)\s*[·:：-]\s*/i, ''),
             content: text(args.content, 'content', 8192),
             tags: sanitizeTags(parseStringArray(args.tags, 'tags', 16, 64)),
@@ -2239,13 +2698,34 @@ export class Coordinator {
         },
       }, {
         name: 'connect_synapse',
-        description: 'Wire or strengthen an associative neural synapse between two memory cards that resonated together. Input JSON: {id, targetId, relation?: "co_activated"|"explicit"}.',
+        description: 'Wire or gently reinforce a weak associative synapse between two memory cards that genuinely resonated together (max weight 0.40; "explicit" is forbidden). Input JSON: {id, targetId, relation?: "co_activated"|"semantic"}.',
         execute: async input => {
           controller.signal.throwIfAborted();
           const args = toolInput(input, ['id', 'targetId', 'relation']);
-          const rel = args.relation === 'explicit' ? 'explicit' : 'co_activated';
-          const linked = this.store.linkMemories(text(args.id, 'id', 128), text(args.targetId, 'targetId', 128), rel);
-          return JSON.stringify({ sourceId: linked.source.id, targetId: linked.target.id });
+          const relRaw = args.relation === undefined ? 'co_activated' : text(args.relation, 'relation', 32);
+          if (relRaw === 'explicit') {
+            throw new Error('Dreamer cannot create "explicit" synapses; only "co_activated" or "semantic" associations (weight <= 0.40) are allowed');
+          }
+          if (relRaw !== 'co_activated' && relRaw !== 'semantic') {
+            throw new Error('Invalid Dreamer synapse relation: use "co_activated" or "semantic"');
+          }
+          const id = text(args.id, 'id', 128);
+          const targetId = text(args.targetId, 'targetId', 128);
+          const sourceCard = this.store.getMemory(id);
+          const targetCard = this.store.getMemory(targetId);
+          const existingA = sourceCard.synapses?.find(s => s.targetId === targetId)?.weight;
+          const existingB = targetCard.synapses?.find(s => s.targetId === id)?.weight;
+          const existingMax = Math.max(existingA ?? 0, existingB ?? 0);
+          if (existingA !== undefined || existingB !== undefined) {
+            if (existingMax >= 0.40) {
+              return JSON.stringify({ sourceId: sourceCard.id, targetId: targetCard.id, relation: relRaw, capped: true, weight: existingMax });
+            }
+            const delta = Number(Math.max(0.01, Math.min(0.15, 0.40 - existingMax)).toFixed(2));
+            const linked = this.store.linkMemories(id, targetId, relRaw, delta);
+            return JSON.stringify({ sourceId: linked.source.id, targetId: linked.target.id, relation: relRaw });
+          }
+          const linked = this.store.linkMemories(id, targetId, relRaw, 0.35);
+          return JSON.stringify({ sourceId: linked.source.id, targetId: linked.target.id, relation: relRaw });
         },
       }, {
         name: 'forget_noise',
@@ -2332,21 +2812,27 @@ export class Coordinator {
       }
     }
     this.tickTimers();
+    this.tickDistiller();
     this.tickSubconscious();
   }
   async close() {
     if (this.closing) return;
     this.closing = true; clearInterval(this.timer);
+    this.semanticAbort.abort(new Error('Service shutdown'));
     this.dreamRun?.controller.abort(new Error('Service shutdown'));
+    this.distillRun?.controller.abort(new Error('Service shutdown'));
     await this.im.close();
     for (const context of this.chatRuns.values()) context.controller.abort(new Error('Service shutdown; reply interrupted without replay'));
     for (const run of this.runs.values()) this.stop(run.id, '服务关闭；工作暂停，不会自动重放', 'paused');
     await Promise.allSettled([...this.submissions]);
     await this.dreamRun?.promise.catch(() => {});
+    await this.distillRun?.promise.catch(() => {});
     await this.executor.close();
     await Promise.all([...this.jobs]);
     await Promise.allSettled([...this.chatJobs]);
+    await this.semanticWarmup?.catch(() => {});
     this.router?.close();
     this.store.close();
+    await Promise.resolve(this.semantic.close?.()).catch(() => {});
   }
 }

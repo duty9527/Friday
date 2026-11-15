@@ -84,20 +84,60 @@ test('Synaptic homeostasis & dream amnesia: cold weak synapses prune, explicit s
       content: '交付摘要：无异常',
       tags: ['auto-consolidated', 'general'],
     });
+    const reinforcedStub = store.saveMemory({
+      topic: '任务经验 · 反复被用到的线上排障经验',
+      content: '交付摘要：核心连接池告警处理手册',
+      tags: ['auto-consolidated', 'general'],
+    });
+    const coldLowCard = store.saveMemory({
+      topic: '临时实验参数备注',
+      content: '压测临时调优参数',
+      tags: ['benchmark'],
+      importance: 45,
+    });
+    const coldHighCard = store.saveMemory({
+      topic: '核心容灾架构原则',
+      content: '双活跨区容灾不能降级',
+      tags: ['architecture'],
+      importance: 80,
+    });
 
-    // Wire one weak co_activated synapse and one explicit synapse, then age them by 3 days
-    store.linkMemories(cardA.id, cardB.id, 'co_activated', 0.19);
+    // Passive search touch (accessCount === 1 < 3) must NOT grant permanent immortality to staleStub
+    store.searchContext({ query: '一次很久以前的临时检查', scope: 'memories', touch: true });
+    // Explicitly reinforce reinforcedStub 3 times
+    store.touchMemory(reinforcedStub.id);
+    store.touchMemory(reinforcedStub.id);
+    store.touchMemory(reinforcedStub.id);
+
+    // Wire weak (0.34 -> 0.28 < 0.30 pruned), medium (0.50 -> 0.41 >= 0.30 survives 1 pass), and explicit synapses
+    store.linkMemories(cardA.id, cardB.id, 'co_activated', 0.34);
     store.linkMemories(cardA.id, cardC.id, 'explicit', 0.85);
-    const future = baseNow + 15 * 24 * 3600_000;
+    store.linkMemories(cardB.id, cardC.id, 'co_activated', 0.50);
+    const future8d = baseNow + 8 * 24 * 3600_000;
 
-    const pass = store.homeostaticSleepPass(future);
-    assert.equal(pass.forgottenStubs, 1, '15-day-old zero-access auto-consolidated stub is naturally forgotten');
+    const pass = store.homeostaticSleepPass(future8d);
+    assert.equal(pass.forgottenStubs, 1, '8-day-old passively touched (accessCount < 3) auto-consolidated stub is pruned');
     assert.throws(() => store.getMemory(staleStub.id), /Memory not found/);
-    assert.ok(pass.prunedSynapses >= 2, 'weak unreinforced co_activated synapse decays below 0.18 and is pruned on both ends');
+    assert.ok(store.getMemory(reinforcedStub.id), 'stub with accessCount >= 3 survives 7d cleanup');
+    assert.ok(pass.prunedSynapses >= 2, 'weak co_activated synapse decays by 0.82 below 0.30 and is pruned on both ends');
+    assert.ok(pass.scaledSynapses >= 2, '0.50 synapse decays by 0.82 to 0.41 and survives one pass');
+    assert.equal(store.getMemory(cardB.id).synapses?.find(s => s.targetId === cardC.id)?.weight, 0.41);
 
     const refreshedA = store.getMemory(cardA.id);
     assert.equal(refreshedA.synapses?.some(s => s.targetId === cardB.id), false);
     assert.equal(refreshedA.synapses?.some(s => s.targetId === cardC.id && s.relation === 'explicit'), true, 'explicit synapse is protected');
+
+    // Cold-memory natural decay (>= 45 days unaccessed, importance < 55 decays down and prunes <= 20; >= 75 & pinned protected)
+    const future46d = baseNow + 46 * 24 * 3600_000;
+    const coldPass1 = store.homeostaticSleepPass(future46d);
+    assert.ok(coldPass1.decayedCards >= 1, '46-day-old unaccessed card with importance < 55 decays');
+    assert.ok((store.getMemory(coldLowCard.id).importance ?? 100) < 45);
+    const future90d = baseNow + 90 * 24 * 3600_000;
+    const coldPass2 = store.homeostaticSleepPass(future90d);
+    assert.ok(coldPass2.prunedColdCards >= 1, 'cold card falling <= 20 importance is pruned');
+    assert.throws(() => store.getMemory(coldLowCard.id), /Memory not found/);
+    assert.ok(store.getMemory(coldHighCard.id), 'high-importance (>= 75) card is never pruned');
+    assert.ok(store.getMemory(cardC.id), 'pinned card is never pruned');
 
     // Verify Dream Amnesia curve (clear -> hazy -> forgotten) and one-time insight consumption
     store.recordDreamOutcome({

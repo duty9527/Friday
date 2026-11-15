@@ -157,7 +157,7 @@ test('Router chat failure tells the Boss the reason in plain words instead of a 
   }
 });
 
-test('Reports the Router rejected with a supplementary dispatch are not consolidated into task-experience memory', async () => {
+test('Rejected and accepted supplementary Worker reports complete cleanly without auto-polluting long-term memory', async () => {
   const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-fail-consolidate-'));
   let reports = 0;
   const factory = makeFactory(async (event, call) => {
@@ -178,14 +178,36 @@ test('Reports the Router rejected with a supplementary dispatch are not consolid
   const coordinator = new Coordinator(home, factory);
   try {
     await coordinator.ready();
-    coordinator.chat('req-consolidate', '看看这张图');
+    const msg = coordinator.chat('req-consolidate', '看看这张图');
     await until(() => coordinator.store.list().length === 2 && coordinator.store.list().every(t => t.status === 'completed'));
-    await until(() => coordinator.store.listMemories().length === 1);
+    await until(() =>
+      coordinator.store.conversation.allMessages().some(
+        m => m.replyTo === msg.id && m.status === 'completed' && m.text.includes('红色斗鱼'),
+      ),
+    );
     await delay(50);
-    const memories = coordinator.store.listMemories();
-    assert.equal(memories.length, 1, 'only the accepted report becomes task experience');
-    assert.match(memories[0]!.content, /红色斗鱼/);
-    assert.doesNotMatch(memories[0]!.content, /图太大/);
+    assert.equal(reports, 2, 'Router handled both the rejected initial report and supplementary accepted report');
+    const replies = coordinator.store.conversation.allMessages().filter(m => m.replyTo === msg.id);
+    assert.equal(
+      replies.some(m => m.status === 'completed' && m.text.includes('红色斗鱼')),
+      true,
+      'Router delivered the accepted supplementary report to the Boss',
+    );
+    assert.equal(
+      replies.filter(m => /任务已下发/.test(m.text)).length,
+      1,
+      'rejected report handoff stays silent with only the original CHAT acknowledgment visible',
+    );
+    assert.equal(
+      replies.some(m => m.text.includes('图太大')),
+      false,
+      'Router did not surface the rejected initial report to the Boss',
+    );
+    assert.equal(
+      coordinator.store.listMemories().length,
+      0,
+      'neither rejected nor normal accepted task reports auto-pollute long-term memory',
+    );
   } finally {
     await coordinator.close();
     await rm(home, { recursive: true, force: true });

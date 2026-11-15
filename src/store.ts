@@ -3,6 +3,16 @@ import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
 import type { InputFile } from './files.js';
 import { Conversation, publicData } from './conversation.js';
+import {
+  computeLexicalConceptOverlap,
+  computeSemanticContentHash,
+  cosineSimilarity,
+  deserializeEmbedding,
+  l2Normalize,
+  normalizeTopicForDedup,
+  serializeEmbedding,
+  type SemanticEmbedder,
+} from './semantic.js';
 import type { ContextSearchHit, ImChannelView, ImPlatform, MemoryCard, MemoryDirectory, MemorySynapse, SynapseRelation, WorkerProfile } from './view.js';
 
 export type TaskStatus = 'queued' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';
@@ -95,11 +105,66 @@ export interface ChatSubconscious {
   pendingInsight?: { id: string; insight: string };
   impressions: Array<{ vividness: 'clear' | 'hazy'; text: string; interrupted?: boolean; hoursAgo: number }>;
 }
+export interface DistillerState {
+  lastMessageSeq: number;
+  distilledTaskIds: string[];
+  lastRunAt: number;
+}
+
+interface CachedMemoryEmbedding {
+  memoryId: string;
+  modelId: string;
+  dim: number;
+  contentHash: string;
+  vector: Float32Array;
+  updatedAt: number;
+}
+
+const AUTO_SYNAPSE_STOP_TAGS = new Set([
+  'auto-consolidated', 'auto-summary', 'general', 'coding', 'research', 'review',
+  'router', 'task', 'memory', 'config', 'fix', 'bug', 'test', 'dev', 'ts', 'js',
+]);
+const MAX_AUTO_SYNAPSES_PER_CARD = 8;
+const MAX_AUTO_PEERS_PER_SAVE = 4;
+
+function normalizeCwd(cwd?: string): string {
+  const trimmed = cwd?.trim();
+  if (!trimmed) return '';
+  const unified = trimmed.replace(/\\/g, '/').replace(/\/+/g, '/');
+  return unified.length > 1 ? unified.replace(/\/+$/, '') : unified;
+}
+
+function hasCwdConflict(cwdA?: string, cwdB?: string): boolean {
+  const a = normalizeCwd(cwdA);
+  const b = normalizeCwd(cwdB);
+  if (!a || !b) return false;
+  return a !== b && !a.startsWith(`${b}/`) && !b.startsWith(`${a}/`);
+}
+
+function isAutoStubCard(card: Pick<MemoryCard, 'topic' | 'tags'>): boolean {
+  const lowerTags = card.tags.map(t => t.trim().toLowerCase());
+  return lowerTags.includes('auto-consolidated')
+    || lowerTags.includes('auto-summary')
+    || /^auto[-_ ]?summary\b/i.test(card.topic.trim());
+}
+
+function defaultImportanceFor(card: { pinned?: boolean; topic: string; tags: string[] }): number {
+  if (card.pinned) return 90;
+  if (isAutoStubCard(card)) return 30;
+  return 50;
+}
+
+export function memoryDocumentText(input: { topic: string; content: string; tags?: string[] }): string {
+  const tagText = (input.tags ?? []).map(t => t.trim()).filter(Boolean).join(' ');
+  return [input.topic.trim(), tagText, input.content.trim()].filter(Boolean).join('\n');
+}
 
 export class Store {
   private readonly db: DatabaseSync;
   private depth = 0;
   private hasResiduesCache = false;
+  private semantic?: SemanticEmbedder;
+  private readonly embeddingCache = new Map<string, CachedMemoryEmbedding>();
   readonly conversation: Conversation;
   constructor(readonly home: string) {
     this.db = new DatabaseSync(join(home, 'state.sqlite'));
@@ -113,10 +178,67 @@ export class Store {
       CREATE TABLE IF NOT EXISTS memories(id TEXT PRIMARY KEY, topic TEXT NOT NULL, cwd TEXT, superseded_by TEXT, updated_at INTEGER NOT NULL, body TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS memories_active ON memories(superseded_by, updated_at DESC);
       CREATE INDEX IF NOT EXISTS memories_topic ON memories(topic, cwd);
+      CREATE TABLE IF NOT EXISTS memory_embeddings(memory_id TEXT PRIMARY KEY, model_id TEXT NOT NULL, dim INTEGER NOT NULL, content_hash TEXT NOT NULL, vector BLOB NOT NULL, updated_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS im_channels(id TEXT PRIMARY KEY, platform TEXT NOT NULL, updated_at INTEGER NOT NULL, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS notices(seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL);`);
     this.conversation = new Conversation(this.db, run => this.transaction(run));
     this.hasResiduesCache = (this.conversation.meta<SubconsciousState>('subconscious_state')?.residues?.length ?? 0) > 0;
+    this.hydrateEmbeddingCache();
+  }
+  attachSemanticEngine(engine?: SemanticEmbedder): void {
+    this.semantic = engine;
+  }
+  getSemanticEngine(): SemanticEmbedder | undefined {
+    return this.semantic;
+  }
+  private hydrateEmbeddingCache(): void {
+    this.embeddingCache.clear();
+    const rows = this.db.prepare(
+      `SELECT e.memory_id, e.model_id, e.dim, e.content_hash, e.vector, e.updated_at
+       FROM memory_embeddings e
+       JOIN memories m ON m.id = e.memory_id
+       WHERE m.superseded_by IS NULL`,
+    ).all();
+    for (const row of rows) {
+      if (!(row.vector instanceof Uint8Array)) continue;
+      const vec = deserializeEmbedding(row.vector, Number(row.dim));
+      if (!vec) continue;
+      this.embeddingCache.set(String(row.memory_id), {
+        memoryId: String(row.memory_id),
+        modelId: String(row.model_id),
+        dim: vec.length,
+        contentHash: String(row.content_hash),
+        vector: vec,
+        updatedAt: Number(row.updated_at),
+      });
+    }
+  }
+  private upsertEmbeddingRecord(memoryId: string, modelId: string, contentHash: string, vec: Float32Array, updatedAt: number): void {
+    const normalized = l2Normalize(vec);
+    if (!normalized) return;
+    const blob = serializeEmbedding(normalized);
+    this.db.prepare(
+      `INSERT INTO memory_embeddings(memory_id,model_id,dim,content_hash,vector,updated_at)
+       VALUES(?,?,?,?,?,?)
+       ON CONFLICT(memory_id) DO UPDATE SET
+         model_id=excluded.model_id,
+         dim=excluded.dim,
+         content_hash=excluded.content_hash,
+         vector=excluded.vector,
+         updated_at=excluded.updated_at`,
+    ).run(memoryId, modelId, normalized.length, contentHash, blob, updatedAt);
+    this.embeddingCache.set(memoryId, {
+      memoryId,
+      modelId,
+      dim: normalized.length,
+      contentHash,
+      vector: normalized,
+      updatedAt,
+    });
+  }
+  private deleteEmbeddingRecord(memoryId: string): void {
+    this.db.prepare('DELETE FROM memory_embeddings WHERE memory_id=?').run(memoryId);
+    this.embeddingCache.delete(memoryId);
   }
   transaction<T>(run: () => T): T {
     const level = this.depth++;
@@ -329,18 +451,41 @@ export class Store {
   deleteImChannel(id: string): boolean {
     return this.db.prepare('DELETE FROM im_channels WHERE id=?').run(id).changes > 0;
   }
+  private trimSynapses(list: MemorySynapse[]): MemorySynapse[] {
+    const byTarget = new Map<string, MemorySynapse>();
+    for (const syn of list) {
+      if (!syn.targetId) continue;
+      const prev = byTarget.get(syn.targetId);
+      if (!prev || syn.weight > prev.weight || (syn.weight === prev.weight && syn.updatedAt > prev.updatedAt)) {
+        byTarget.set(syn.targetId, syn);
+      }
+    }
+    const deduped = [...byTarget.values()];
+    const explicit = deduped.filter(s => s.relation === 'explicit');
+    const auto = deduped
+      .filter(s => s.relation !== 'explicit')
+      .sort((a, b) => b.weight - a.weight || b.updatedAt - a.updatedAt)
+      .slice(0, MAX_AUTO_SYNAPSES_PER_CARD);
+    return [...explicit, ...auto].sort((a, b) => b.weight - a.weight || b.updatedAt - a.updatedAt);
+  }
   private upsertSynapseOnCard(
     card: MemoryCard, targetId: string, targetTopic: string | undefined,
     relation: SynapseRelation, deltaOrInit?: number, now = Date.now(),
+    mode: 'reinforce' | 'at_least' = 'reinforce',
   ): boolean {
     if (!targetId || targetId === card.id) return false;
-    const rank: Record<SynapseRelation, number> = { explicit: 4, task_chain: 3, co_activated: 2, shared_tag: 1 };
-    const defaultInit: Record<SynapseRelation, number> = { explicit: 0.85, task_chain: 0.7, co_activated: 0.5, shared_tag: 0.4 };
+    const rank: Record<SynapseRelation, number> = { explicit: 5, task_chain: 4, semantic: 3, co_activated: 2, shared_tag: 1 };
+    const defaultInit: Record<SynapseRelation, number> = { explicit: 0.85, task_chain: 0.7, semantic: 0.7, co_activated: 0.5, shared_tag: 0.45 };
     const list = [...(card.synapses ?? [])];
     const existing = list.find(s => s.targetId === targetId);
     if (existing) {
-      const inc = deltaOrInit ?? 0.15;
-      existing.weight = Math.min(1, Number((existing.weight + inc).toFixed(2)));
+      if (mode === 'at_least') {
+        const floorW = deltaOrInit ?? defaultInit[relation];
+        existing.weight = Math.min(1, Math.max(existing.weight, Number(floorW.toFixed(2))));
+      } else {
+        const inc = deltaOrInit ?? 0.15;
+        existing.weight = Math.min(1, Number((existing.weight + inc).toFixed(2)));
+      }
       if (rank[relation] > rank[existing.relation]) existing.relation = relation;
       if (targetTopic) existing.targetTopic = targetTopic;
       existing.updatedAt = now;
@@ -354,9 +499,9 @@ export class Store {
         updatedAt: now,
       });
     }
-    list.sort((a, b) => b.weight - a.weight || b.updatedAt - a.updatedAt);
-    card.synapses = list.slice(0, 12);
-    return true;
+    const trimmed = this.trimSynapses(list);
+    card.synapses = trimmed.length ? trimmed : undefined;
+    return Boolean(card.synapses?.some(s => s.targetId === targetId));
   }
   linkMemories(idA: string, idB: string, relation: SynapseRelation = 'explicit', weightDelta?: number): { source: MemoryCard; target: MemoryCard } {
     if (idA === idB) throw new Error('Cannot link a memory neuron to itself');
@@ -378,6 +523,11 @@ export class Store {
       for (let i = 0; i < unique.length; i++) {
         for (let j = i + 1; j < unique.length; j++) {
           try {
+            if (relation !== 'explicit') {
+              const cardA = this.getMemory(unique[i]!);
+              const cardB = this.getMemory(unique[j]!);
+              if (normalizeCwd(cardA.cwd) !== normalizeCwd(cardB.cwd)) continue;
+            }
             this.linkMemories(unique[i]!, unique[j]!, relation, delta);
           } catch { /* ignore missing or superseded edge errors */ }
         }
@@ -388,28 +538,52 @@ export class Store {
     id?: string; topic: string; content: string; tags?: string[];
     cwd?: string; sourceMessageId?: string; sourceTaskId?: string;
     supersedeId?: string; supersedeIds?: string[]; pinned?: boolean;
-    linkedMemoryIds?: string[];
+    linkedMemoryIds?: string[]; importance?: number;
+    embedding?: Float32Array; embeddingModelId?: string;
   }): MemoryCard {
     const topic = String(publicData(input.topic.trim())).slice(0, 160);
     const content = String(publicData(input.content.trim())).slice(0, 8192);
     if (!topic || !content) throw new Error('Memory topic and content must be non-empty');
     const tags = [...new Set((input.tags ?? []).map(tag => String(publicData(tag.trim())).slice(0, 64)).filter(Boolean))].slice(0, 16);
     const cwd = input.cwd?.trim() || undefined;
+    const normCwd = normalizeCwd(cwd);
     const now = Date.now();
+    const normalizedInputVec = input.embedding ? l2Normalize(input.embedding) : undefined;
+    const docText = memoryDocumentText({ topic, content, tags });
+    const docHash = computeSemanticContentHash(docText);
+    const modelId = input.embeddingModelId ?? this.semantic?.modelId ?? 'custom';
+    const clampImp = (v: number) => Math.max(0, Math.min(100, Math.round(v)));
+
     return this.transaction(() => {
       let card: MemoryCard;
       if (input.id) {
         const existingRow = this.db.prepare('SELECT body FROM memories WHERE id=?').get(input.id);
         if (existingRow) {
           const prev = JSON.parse(String(existingRow.body)) as MemoryCard;
+          const nextTags = tags.length ? tags : prev.tags;
+          const nextPinned = input.pinned ?? prev.pinned;
+          const nextImportance = input.importance !== undefined
+            ? clampImp(input.importance)
+            : (input.pinned === true && !prev.pinned)
+              ? Math.max(90, prev.importance ?? 90)
+              : (prev.importance ?? defaultImportanceFor({ pinned: nextPinned, topic, tags: nextTags }));
           card = {
-            ...prev, topic, content, tags: tags.length ? tags : prev.tags,
+            ...prev, topic, content, tags: nextTags,
             cwd: cwd ?? prev.cwd, sourceMessageId: input.sourceMessageId ?? prev.sourceMessageId,
             sourceTaskId: input.sourceTaskId ?? prev.sourceTaskId,
-            pinned: input.pinned ?? prev.pinned, updatedAt: now,
+            pinned: nextPinned || undefined,
+            importance: nextImportance,
+            updatedAt: now,
           };
           this.db.prepare('UPDATE memories SET topic=?,cwd=?,superseded_by=?,updated_at=?,body=? WHERE id=?')
             .run(card.topic, card.cwd ?? null, card.supersededBy ?? null, card.updatedAt, JSON.stringify(card), card.id);
+          const updatedHash = computeSemanticContentHash(memoryDocumentText(card));
+          if (normalizedInputVec) {
+            this.upsertEmbeddingRecord(card.id, modelId, updatedHash, normalizedInputVec, now);
+          } else {
+            const cached = this.embeddingCache.get(card.id);
+            if (cached && cached.contentHash !== updatedHash) this.deleteEmbeddingRecord(card.id);
+          }
         } else {
           card = undefined!;
         }
@@ -422,26 +596,57 @@ export class Store {
           ...(input.supersedeId ? [input.supersedeId] : []),
           ...(input.supersedeIds ?? []),
         ].map(s => s.trim()).filter(Boolean))];
-        const priorRows = explicitSupersedeIds.length
-          ? this.db.prepare(`SELECT body FROM memories WHERE id IN (${explicitSupersedeIds.map(() => '?').join(',')}) AND superseded_by IS NULL`).all(...explicitSupersedeIds)
-          : this.db.prepare('SELECT body FROM memories WHERE topic=? AND coalesce(cwd,\'\')=? AND superseded_by IS NULL').all(topic, cwd ?? '');
-        const priors = priorRows.map(row => JSON.parse(String(row.body)) as MemoryCard).filter(prior => prior.id !== id);
+        let priors: MemoryCard[];
+        if (explicitSupersedeIds.length) {
+          const priorRows = this.db.prepare(`SELECT body FROM memories WHERE id IN (${explicitSupersedeIds.map(() => '?').join(',')}) AND superseded_by IS NULL`).all(...explicitSupersedeIds);
+          priors = priorRows.map(row => JSON.parse(String(row.body)) as MemoryCard).filter(prior => prior.id !== id);
+        } else {
+          const canonicalTopicKey = (value: string): string =>
+            normalizeTopicForDedup(value).replace(/(?<=[\u4e00-\u9fff\u3400-\u4dbf])\s+|\s+(?=[\u4e00-\u9fff\u3400-\u4dbf])/g, '');
+          const normDedupTopic = canonicalTopicKey(topic);
+          const isNewStub = isAutoStubCard({ topic, tags });
+          const sameCwdActive = this.listMemories({ includeSuperseded: false, limit: 500 })
+            .filter(prior => prior.id !== id && normalizeCwd(prior.cwd) === normCwd);
+          priors = sameCwdActive.filter(prior => {
+            if (prior.topic === topic) return true;
+            if (normDedupTopic.length > 0 && canonicalTopicKey(prior.topic) === normDedupTopic) return true;
+            if (prior.pinned) return false;
+            const priorCached = this.embeddingCache.get(prior.id);
+            const canUseEmbeddings = Boolean(
+              normalizedInputVec
+              && priorCached
+              && priorCached.vector.length === normalizedInputVec.length
+              && (!input.embeddingModelId || priorCached.modelId === modelId),
+            );
+            if (canUseEmbeddings) {
+              return cosineSimilarity(normalizedInputVec, priorCached!.vector) >= 0.86;
+            }
+            if (isAutoStubCard(prior) !== isNewStub) return false;
+            const overlap = computeLexicalConceptOverlap(docText, memoryDocumentText(prior));
+            return overlap.jaccard >= 0.68 && overlap.sharedTerms >= 4;
+          });
+        }
         const inheritedPin = input.pinned ?? priors.some(p => p.pinned);
+        const baseImp = defaultImportanceFor({ pinned: Boolean(inheritedPin), topic, tags });
+        const inheritedImp = input.importance !== undefined
+          ? clampImp(input.importance)
+          : Math.max(baseImp, ...priors.map(p => p.importance ?? baseImp));
         card = {
           id, topic, content, tags, cwd,
           sourceMessageId: input.sourceMessageId, sourceTaskId: input.sourceTaskId,
           supersedes: priors[0]?.id, pinned: inheritedPin || undefined,
+          importance: inheritedImp,
           accessCount: 0, createdAt: now, updatedAt: now,
         };
         // Inherit synapses from superseded prior neurons and redirect neighbor pointers
         for (const prior of priors) {
           for (const syn of prior.synapses ?? []) {
             if (syn.targetId !== card.id) {
-              this.upsertSynapseOnCard(card, syn.targetId, syn.targetTopic, syn.relation, syn.weight, now);
+              this.upsertSynapseOnCard(card, syn.targetId, syn.targetTopic, syn.relation, syn.weight, now, 'at_least');
               try {
                 const neighbor = this.getMemory(syn.targetId);
                 neighbor.synapses = (neighbor.synapses ?? []).filter(s => s.targetId !== prior.id);
-                this.upsertSynapseOnCard(neighbor, card.id, card.topic, syn.relation, syn.weight, now);
+                this.upsertSynapseOnCard(neighbor, card.id, card.topic, syn.relation, syn.weight, now, 'at_least');
                 this.db.prepare('UPDATE memories SET body=? WHERE id=?').run(JSON.stringify(neighbor), neighbor.id);
               } catch { /* ignore missing neighbor */ }
             }
@@ -449,54 +654,138 @@ export class Store {
         }
         this.db.prepare('INSERT INTO memories(id,topic,cwd,superseded_by,updated_at,body) VALUES(?,?,?,?,?,?)')
           .run(card.id, card.topic, card.cwd ?? null, null, card.updatedAt, JSON.stringify(card));
+        if (normalizedInputVec) {
+          this.upsertEmbeddingRecord(card.id, modelId, docHash, normalizedInputVec, now);
+        }
         for (const prior of priors) {
           prior.supersededBy = card.id;
           prior.updatedAt = now;
           this.db.prepare('UPDATE memories SET superseded_by=?,updated_at=?,body=? WHERE id=?')
             .run(card.id, now, JSON.stringify(prior), prior.id);
+          this.deleteEmbeddingRecord(prior.id);
         }
       }
       // Wire explicit synapses
+      const explicitLinked = new Set<string>();
       for (const linkedId of input.linkedMemoryIds ?? []) {
         if (linkedId && linkedId !== card.id) {
-          try { this.linkMemories(card.id, linkedId, 'explicit'); } catch { /* ignore unknown ID */ }
+          try {
+            this.linkMemories(card.id, linkedId, 'explicit');
+            explicitLinked.add(linkedId);
+          } catch { /* ignore unknown ID */ }
         }
       }
-      // Auto-wire synapses by shared specific tags or shared sourceTaskId
-      const genericTags = new Set(['auto-consolidated', 'general', 'coding', 'research', 'review']);
-      const specificTags = new Set(card.tags.filter(t => !genericTags.has(t.toLowerCase())));
-      if (specificTags.size > 0 || card.sourceTaskId) {
-        const activePeers = this.listMemories({ includeSuperseded: false, limit: 150 }).filter(p => p.id !== card.id);
+      // Domain-gated, high-threshold auto-wiring across active compatible peers
+      const cardNormCwd = normalizeCwd(card.cwd);
+      const cardVec = normalizedInputVec ?? this.embeddingCache.get(card.id)?.vector;
+      const cardModelId = normalizedInputVec ? modelId : this.embeddingCache.get(card.id)?.modelId;
+      const specificTags = new Set(
+        card.tags.map(t => t.trim().toLowerCase()).filter(t => t && !AUTO_SYNAPSE_STOP_TAGS.has(t)),
+      );
+      if (specificTags.size >= 2 || card.sourceTaskId || cardVec) {
+        const activePeers = this.listMemories({ includeSuperseded: false, limit: 200 })
+          .filter(p => p.id !== card.id && !explicitLinked.has(p.id) && normalizeCwd(p.cwd) === cardNormCwd);
+        const candidates: Array<{ peer: MemoryCard; relation: SynapseRelation; weight: number }> = [];
         for (const peer of activePeers) {
+          if (peer.synapses?.some(s => s.targetId === card.id && s.relation === 'explicit')) continue;
+          let best: { relation: SynapseRelation; weight: number } | undefined;
+          const consider = (relation: SynapseRelation, weight: number) => {
+            if (!best || weight > best.weight) best = { relation, weight };
+          };
           if (card.sourceTaskId && peer.sourceTaskId === card.sourceTaskId) {
-            try { this.linkMemories(card.id, peer.id, 'task_chain'); } catch { /* ignore */ }
-            continue;
+            consider('task_chain', 0.7);
           }
-          const sharedCount = peer.tags.filter(t => specificTags.has(t)).length;
-          if (sharedCount > 0) {
-            const initW = Math.min(0.75, 0.35 + (sharedCount - 1) * 0.15);
-            try { this.linkMemories(card.id, peer.id, 'shared_tag', initW); } catch { /* ignore */ }
+          if (cardVec) {
+            const peerCached = this.embeddingCache.get(peer.id);
+            if (peerCached && peerCached.vector.length === cardVec.length && (!cardModelId || peerCached.modelId === cardModelId)) {
+              const sim = cosineSimilarity(cardVec, peerCached.vector);
+              if (sim >= 0.68) {
+                consider('semantic', Number(Math.min(0.85, sim).toFixed(2)));
+              }
+            }
           }
+          if (specificTags.size >= 2) {
+            const peerTags = new Set(peer.tags.map(t => t.trim().toLowerCase()).filter(Boolean));
+            let sharedCount = 0;
+            for (const tag of specificTags) {
+              if (peerTags.has(tag)) sharedCount++;
+            }
+            if (sharedCount >= 2) {
+              const initW = Number(Math.min(0.75, 0.48 + (sharedCount - 2) * 0.12).toFixed(2));
+              consider('shared_tag', initW);
+            }
+          }
+          if (best) candidates.push({ peer, ...best });
+        }
+        candidates.sort((a, b) => b.weight - a.weight || b.peer.updatedAt - a.peer.updatedAt);
+        let wiredCount = 0;
+        let freshCard = this.getMemory(card.id);
+        for (const cand of candidates) {
+          if (wiredCount >= MAX_AUTO_PEERS_PER_SAVE) break;
+          const peerCopy: MemoryCard = { ...cand.peer, synapses: cand.peer.synapses ? cand.peer.synapses.map(s => ({ ...s })) : undefined };
+          const cardCopy: MemoryCard = { ...freshCard, synapses: freshCard.synapses ? freshCard.synapses.map(s => ({ ...s })) : undefined };
+          const keptOnPeer = this.upsertSynapseOnCard(peerCopy, cardCopy.id, cardCopy.topic, cand.relation, cand.weight, now, 'at_least');
+          const keptOnCard = this.upsertSynapseOnCard(cardCopy, peerCopy.id, peerCopy.topic, cand.relation, cand.weight, now, 'at_least');
+          if (!keptOnPeer || !keptOnCard) continue;
+          this.db.prepare('UPDATE memories SET body=? WHERE id=?').run(JSON.stringify(peerCopy), peerCopy.id);
+          this.db.prepare('UPDATE memories SET body=? WHERE id=?').run(JSON.stringify(cardCopy), cardCopy.id);
+          freshCard = cardCopy;
+          wiredCount++;
         }
       }
       return this.getMemory(card.id);
     });
   }
+  async saveMemoryAsync(input: Parameters<Store['saveMemory']>[0]): Promise<MemoryCard> {
+    const rawTopic = input.topic.trim();
+    const rawContent = input.content.trim();
+    if (!rawTopic || !rawContent) return this.saveMemory(input);
+    let embedding = input.embedding;
+    let embeddingModelId = input.embeddingModelId;
+    if (!embedding && this.semantic?.isReady()) {
+      const topic = String(publicData(rawTopic)).slice(0, 160);
+      const content = String(publicData(rawContent)).slice(0, 8192);
+      const tags = [...new Set((input.tags ?? []).map(tag => String(publicData(tag.trim())).slice(0, 64)).filter(Boolean))].slice(0, 16);
+      const docText = memoryDocumentText({ topic, content, tags });
+      const docHash = computeSemanticContentHash(docText);
+      const existing = input.id ? this.embeddingCache.get(input.id) : undefined;
+      if (existing && existing.modelId === this.semantic.modelId && existing.contentHash === docHash) {
+        embedding = existing.vector;
+        embeddingModelId = existing.modelId;
+      } else {
+        try {
+          const vec = await this.semantic.embed(docText, 'document');
+          if (vec) {
+            embedding = vec;
+            embeddingModelId = this.semantic.modelId;
+          }
+        } catch { /* graceful degradation */ }
+      }
+    }
+    return this.saveMemory({ ...input, embedding, embeddingModelId });
+  }
   pinMemory(id: string, pinned = true): MemoryCard {
     return this.transaction(() => {
       const card = this.getMemory(id);
       card.pinned = pinned || undefined;
+      card.importance = pinned ? Math.max(90, card.importance ?? 90) : (card.importance ?? 50);
       card.updatedAt = Date.now();
       this.db.prepare('UPDATE memories SET updated_at=?,body=? WHERE id=?').run(card.updatedAt, JSON.stringify(card), card.id);
       return card;
     });
   }
-  touchMemory(id: string): MemoryCard | undefined {
+  touchMemory(id: string, options?: { active?: boolean }): MemoryCard | undefined {
     const row = this.db.prepare('SELECT body FROM memories WHERE id=?').get(id);
     if (!row) return undefined;
+    const now = Date.now();
     const card = JSON.parse(String(row.body)) as MemoryCard;
     card.accessCount = (card.accessCount ?? 0) + 1;
-    card.lastAccessedAt = Date.now();
+    card.lastAccessedAt = now;
+    if (options?.active) {
+      card.lastReinforcedAt = now;
+      const curImp = card.importance ?? defaultImportanceFor(card);
+      card.importance = Math.min(75, Math.max(curImp, 25) + 5);
+    }
     this.db.prepare('UPDATE memories SET body=? WHERE id=?').run(JSON.stringify(card), card.id);
     return card;
   }
@@ -523,6 +812,7 @@ export class Store {
       let existing: MemoryCard | undefined;
       try { existing = this.getMemory(id); } catch { /* ignore */ }
       const deleted = this.db.prepare('DELETE FROM memories WHERE id=?').run(id).changes > 0;
+      this.deleteEmbeddingRecord(id);
       if (deleted && existing?.synapses?.length) {
         for (const syn of existing.synapses) {
           try {
@@ -548,44 +838,119 @@ export class Store {
     }));
     return { totalActive, truncated: totalActive > items.length, items };
   }
-  memoriesForContext(options: { memoryIds?: string[]; cwd?: string; limit?: number }): MemoryCard[] {
+  memoriesForContext(options: {
+    memoryIds?: string[];
+    cwd?: string;
+    queryText?: string;
+    queryEmbedding?: Float32Array;
+    limit?: number;
+  }): MemoryCard[] {
     const selected = new Map<string, MemoryCard>();
-    const limit = options.limit ?? 8;
+    const limit = Math.max(1, options.limit ?? 8);
+    const reqCwd = normalizeCwd(options.cwd);
     const explicitCards: MemoryCard[] = [];
     for (const id of options.memoryIds ?? []) {
       try {
-        const card = this.touchMemory(id) ?? this.getMemory(id);
+        const card = this.touchMemory(id, { active: true }) ?? this.getMemory(id);
         selected.set(card.id, card);
         explicitCards.push(card);
       } catch { /* ignore unknown memory IDs */ }
     }
     if (explicitCards.length >= 2) {
       this.reinforceCoActivated(explicitCards.map(c => c.id), 'co_activated', 0.15);
-    }
-    // 1-hop synaptic spreading for explicitly requested memories
-    for (const seed of explicitCards) {
-      if (selected.size >= limit) break;
-      for (const syn of seed.synapses ?? []) {
-        if (selected.size >= limit) break;
-        if (syn.weight < 0.45 || selected.has(syn.targetId)) continue;
+      for (let i = 0; i < explicitCards.length; i++) {
         try {
-          const neighbor = this.getMemory(syn.targetId);
-          if (!neighbor.supersededBy) selected.set(neighbor.id, neighbor);
+          const refreshed = this.getMemory(explicitCards[i]!.id);
+          explicitCards[i] = refreshed;
+          selected.set(refreshed.id, refreshed);
         } catch { /* ignore */ }
       }
     }
-    const active = this.listMemories({ includeSuperseded: false, cwd: options.cwd, limit: Math.max(limit * 2, 16) });
-    for (const card of active.filter(c => c.pinned)) {
-      if (selected.size >= limit) break;
-      selected.set(card.id, card);
+    // (a) Up to 2 tightly gated 1-hop synaptic neighbors (weight >= 0.60 in compatible cwd)
+    const neighborCandidates: Array<{ card: MemoryCard; weight: number }> = [];
+    const seenNeighborIds = new Set<string>();
+    for (const seed of explicitCards) {
+      const expectedScope = reqCwd || normalizeCwd(seed.cwd);
+      for (const syn of seed.synapses ?? []) {
+        if (syn.weight < 0.60 || selected.has(syn.targetId) || seenNeighborIds.has(syn.targetId)) continue;
+        try {
+          const neighbor = this.getMemory(syn.targetId);
+          if (neighbor.supersededBy) continue;
+          if (normalizeCwd(neighbor.cwd) !== expectedScope) continue;
+          seenNeighborIds.add(neighbor.id);
+          neighborCandidates.push({ card: neighbor, weight: syn.weight });
+        } catch { /* ignore */ }
+      }
     }
-    if (selected.size < limit) {
-      for (const card of active) {
+    neighborCandidates.sort((a, b) => b.weight - a.weight || b.card.updatedAt - a.card.updatedAt);
+    let addedNeighbors = 0;
+    for (const { card: neighbor } of neighborCandidates) {
+      if (selected.size >= limit || addedNeighbors >= 2) break;
+      selected.set(neighbor.id, neighbor);
+      addedNeighbors++;
+    }
+
+    const activePool = selected.size < limit ? this.listMemories({ includeSuperseded: false, limit: 300 }) : [];
+
+    // (c) Semantic (cosine >= 0.48) or strong lexical match against queryText/queryEmbedding
+    const qText = options.queryText?.trim() ?? '';
+    const qVec = options.queryEmbedding ? l2Normalize(options.queryEmbedding) : undefined;
+    if (selected.size < limit && (qText || qVec)) {
+      const lowerQ = qText.toLowerCase();
+      const matched: Array<{ card: MemoryCard; score: number }> = [];
+      for (const card of activePool) {
+        if (selected.has(card.id)) continue;
+        if (hasCwdConflict(options.cwd, card.cwd)) continue;
+        const cached = this.embeddingCache.get(card.id);
+        const canCompare = Boolean(
+          qVec
+          && cached
+          && cached.vector.length === qVec.length
+          && (!this.semantic || cached.modelId === this.semantic.modelId),
+        );
+        const semSim = canCompare ? cosineSimilarity(qVec, cached!.vector) : 0;
+        let strongLex = false;
+        let lexBonus = 0;
+        if (qText) {
+          const doc = memoryDocumentText(card);
+          const overlap = computeLexicalConceptOverlap(qText, doc);
+          const exactSub = lowerQ.length >= 3 && doc.toLowerCase().includes(lowerQ);
+          strongLex = exactSub || overlap.sharedTerms >= 2 || (overlap.jaccard >= 0.35 && overlap.sharedTerms >= 1);
+          lexBonus = (exactSub ? 40 : 0) + overlap.sharedTerms * 12 + overlap.jaccard * 30;
+        }
+        if (semSim < 0.48 && !strongLex) continue;
+        const sameCwdBoost = reqCwd && normalizeCwd(card.cwd) === reqCwd ? 15 : 0;
+        const total = (semSim >= 0.48 ? semSim * 100 : 0) + lexBonus + sameCwdBoost + (card.pinned ? 10 : 0);
+        matched.push({ card, score: total });
+      }
+      matched.sort((a, b) => b.score - a.score || b.card.updatedAt - a.card.updatedAt);
+      for (const item of matched) {
         if (selected.size >= limit) break;
-        selected.set(card.id, card);
+        selected.set(item.card.id, item.card);
+      }
+    }
+
+    // (b) Same normalized cwd active cards ONLY when non-empty cwd is provided; zero unrelated padding
+    if (selected.size < limit && reqCwd) {
+      for (const card of activePool) {
+        if (selected.size >= limit) break;
+        if (selected.has(card.id)) continue;
+        if (normalizeCwd(card.cwd) === reqCwd) {
+          selected.set(card.id, card);
+        }
       }
     }
     return [...selected.values()];
+  }
+  async memoriesForContextAsync(options: { memoryIds?: string[]; cwd?: string; queryText?: string; limit?: number }): Promise<MemoryCard[]> {
+    let queryEmbedding: Float32Array | undefined;
+    const qText = options.queryText?.trim();
+    if (qText && this.semantic?.isReady()) {
+      try {
+        queryEmbedding = await this.semantic.embed(qText, 'query');
+      } catch { /* graceful degradation */ }
+    }
+    return this.memoriesForContext({ ...options, queryEmbedding });
   }
   searchContext(options: {
     query: string;
@@ -594,11 +959,13 @@ export class Store {
     limit?: number;
     includeSuperseded?: boolean;
     touch?: boolean;
+    queryEmbedding?: Float32Array;
   }): { query: string; scope: string; totalHits: number; hits: ContextSearchHit[]; memoryDirectory: MemoryDirectory } {
     const rawQuery = options.query.trim();
     if (!rawQuery) throw new Error('Search query must not be empty');
     const scope = options.scope ?? 'all';
     const limit = Math.max(1, Math.min(options.limit ?? 12, 50));
+    const reqCwd = normalizeCwd(options.cwd);
     const lowerQuery = rawQuery.toLowerCase();
     const tokens = [...new Set(lowerQuery.split(/[\s,，。；;、/|?:!！？"'“”‘’()（）[\]【】]+/).filter(Boolean))];
     const cjkBigrams = new Set<string>();
@@ -611,10 +978,11 @@ export class Store {
     const now = Date.now();
     const recencyBonus = (at: number) => Math.max(0, 8 - Math.max(0, now - at) / (24 * 3600_000));
     const cwdBonus = (itemCwd?: string) => {
-      if (!options.cwd || !itemCwd) return 0;
-      if (itemCwd === options.cwd) return 25;
-      if (itemCwd.startsWith(options.cwd + '/') || options.cwd.startsWith(itemCwd + '/')) return 15;
-      return 0;
+      const normItem = normalizeCwd(itemCwd);
+      if (!reqCwd || !normItem) return 0;
+      if (normItem === reqCwd) return 25;
+      if (normItem.startsWith(`${reqCwd}/`) || reqCwd.startsWith(`${normItem}/`)) return 15;
+      return -25;
     };
     const scoreText = (header: string, bodyText: string) => {
       const h = header.toLowerCase();
@@ -662,6 +1030,7 @@ export class Store {
       const end = Math.min(clean.length, start + maxLen);
       return `${start > 0 ? '…' : ''}${clean.slice(start, end)}${end < clean.length ? '…' : ''}`;
     };
+    const queryVec = options.queryEmbedding ? l2Normalize(options.queryEmbedding) : undefined;
     const hits: ContextSearchHit[] = [];
     const directMemoryHits = new Map<string, { card: MemoryCard; hit: ContextSearchHit }>();
     if (scope === 'all' || scope === 'memories') {
@@ -669,12 +1038,22 @@ export class Store {
       const cardById = new Map(cards.map(c => [c.id, c]));
       for (const card of cards) {
         const header = `${card.topic} ${card.tags.join(' ')} ${card.cwd ?? ''}`;
-        const { score, firstAnchor } = scoreText(header, card.content);
-        if (score <= 0) continue;
+        const { score: lexScore, firstAnchor } = scoreText(header, card.content);
+        const cached = !card.supersededBy ? this.embeddingCache.get(card.id) : undefined;
+        const canCompareVec = Boolean(
+          queryVec
+          && cached
+          && cached.vector.length === queryVec.length
+          && (!this.semantic || cached.modelId === this.semantic.modelId),
+        );
+        const semSim = canCompareVec ? cosineSimilarity(queryVec, cached!.vector) : 0;
+        if (lexScore <= 0 && semSim < 0.42) continue;
         const base = card.supersededBy ? 5 : 30;
         const pinBonus = card.pinned ? 15 : 0;
         const ebbinghausBonus = Math.min(12, (card.accessCount ?? 0) * 2);
-        const finalScore = Number((base + pinBonus + ebbinghausBonus + score + cwdBonus(card.cwd) + recencyBonus(card.updatedAt)).toFixed(2));
+        const semScore = semSim >= 0.42 ? Math.max(0, (semSim - 0.30) * 90) : 0;
+        const finalScore = Number((base + pinBonus + ebbinghausBonus + lexScore + semScore + cwdBonus(card.cwd) + recencyBonus(card.updatedAt)).toFixed(2));
+        if (finalScore <= 0) continue;
         const hit: ContextSearchHit = {
           kind: 'memory', id: card.id, memoryId: card.id, score: finalScore, at: card.updatedAt,
           title: `记忆卡片${card.pinned ? ' [核心]' : ''} · ${card.topic}${card.supersededBy ? '（已被新记忆替代）' : ''}`,
@@ -686,21 +1065,22 @@ export class Store {
         hits.push(hit);
         directMemoryHits.set(card.id, { card, hit });
       }
-      // 1-hop Synaptic Spreading Activation across connected memory neurons
+      // 1-hop Synaptic Spreading Activation across connected memory neurons (weight >= 0.60, spreadScore >= 32, domain-gated)
       const topSeeds = [...directMemoryHits.values()].sort((a, b) => b.hit.score - a.hit.score).slice(0, 5);
       const spreadCandidates = new Map<string, ContextSearchHit>();
       for (const { card: seedCard, hit: seedHit } of topSeeds) {
         for (const syn of seedCard.synapses ?? []) {
+          if (syn.weight < 0.60) continue;
           const targetCard = cardById.get(syn.targetId);
           if (!targetCard) continue;
+          if (hasCwdConflict(seedCard.cwd, targetCard.cwd) || hasCwdConflict(options.cwd, targetCard.cwd)) continue;
           const directTarget = directMemoryHits.get(targetCard.id);
           if (directTarget) {
-            // Synaptic resonance bonus when both connected neurons are directly activated
             directTarget.hit.score = Number((directTarget.hit.score + syn.weight * 8).toFixed(2));
             continue;
           }
           const spreadScore = Number((seedHit.score * syn.weight * 0.45 + (targetCard.pinned ? 6 : 0)).toFixed(2));
-          if (spreadScore < 12) continue;
+          if (spreadScore < 32) continue;
           const prevSpread = spreadCandidates.get(targetCard.id);
           if (!prevSpread || spreadScore > prevSpread.score) {
             spreadCandidates.set(targetCard.id, {
@@ -725,6 +1105,7 @@ export class Store {
         if (score <= 0) continue;
         const base = task.status === 'completed' ? 18 : 12;
         const finalScore = Number((base + score + cwdBonus(task.cwd) + recencyBonus(task.createdAt)).toFixed(2));
+        if (finalScore <= 0) continue;
         hits.push({
           kind: 'work', id: task.id, taskId: task.id, score: finalScore, at: task.createdAt,
           title: `后台工作 (${task.status}) · ${String(publicData(task.prompt.slice(0, 100)))}`,
@@ -752,15 +1133,10 @@ export class Store {
     hits.sort((a, b) => b.score - a.score || b.at - a.at);
     const topHits = hits.slice(0, limit);
     if (options.touch) {
-      const touchedDirectIds: string[] = [];
       for (const hit of topHits) {
         if (hit.kind === 'memory' && hit.memoryId) {
           this.touchMemory(hit.memoryId);
-          if (!hit.activatedVia) touchedDirectIds.push(hit.memoryId);
         }
-      }
-      if (touchedDirectIds.length >= 2) {
-        this.reinforceCoActivated(touchedDirectIds.slice(0, 4), 'co_activated', 0.1);
       }
     }
     return {
@@ -768,6 +1144,78 @@ export class Store {
       hits: topHits,
       memoryDirectory: this.memoryDirectory(16),
     };
+  }
+  async searchContextAsync(options: Parameters<Store['searchContext']>[0]): Promise<ReturnType<Store['searchContext']>> {
+    const rawQuery = options.query.trim();
+    if (!rawQuery) throw new Error('Search query must not be empty');
+    let queryEmbedding = options.queryEmbedding;
+    const needsMemorySearch = options.scope === undefined || options.scope === 'all' || options.scope === 'memories';
+    if (!queryEmbedding && needsMemorySearch && this.semantic?.isReady()) {
+      try {
+        queryEmbedding = await this.semantic.embed(rawQuery, 'query');
+      } catch { /* graceful degradation */ }
+    }
+    return this.searchContext({ ...options, queryEmbedding });
+  }
+  async backfillEmbeddings(limit = 64, signal?: AbortSignal): Promise<number> {
+    const engine = this.semantic;
+    if (!engine || signal?.aborted) return 0;
+    if (!engine.isReady()) {
+      if (!engine.ensureReady) return 0;
+      try {
+        const ok = await engine.ensureReady(signal);
+        if (!ok || signal?.aborted) return 0;
+      } catch {
+        return 0;
+      }
+    }
+    const maxCount = Math.max(1, Math.min(limit, 500));
+    const active = this.listMemories({ includeSuperseded: false, limit: 500 });
+    const pending: Array<{ card: MemoryCard; docText: string; docHash: string }> = [];
+    for (const card of active) {
+      if (pending.length >= maxCount) break;
+      const docText = memoryDocumentText(card);
+      const docHash = computeSemanticContentHash(docText);
+      const cached = this.embeddingCache.get(card.id);
+      if (cached && cached.modelId === engine.modelId && cached.contentHash === docHash) continue;
+      pending.push({ card, docText, docHash });
+    }
+    if (!pending.length) return 0;
+
+    let updated = 0;
+    const batchSize = 16;
+    for (let offset = 0; offset < pending.length; offset += batchSize) {
+      if (signal?.aborted) break;
+      const chunk = pending.slice(offset, offset + batchSize);
+      let vectors: Array<Float32Array | undefined>;
+      try {
+        if (engine.embedBatch) {
+          vectors = await engine.embedBatch(chunk.map(item => item.docText), 'document');
+        } else {
+          vectors = [];
+          for (const item of chunk) {
+            if (signal?.aborted) break;
+            vectors.push(await engine.embed(item.docText, 'document'));
+          }
+        }
+      } catch {
+        continue;
+      }
+      if (signal?.aborted) break;
+      this.transaction(() => {
+        const now = Date.now();
+        for (let i = 0; i < Math.min(chunk.length, vectors.length); i++) {
+          const item = chunk[i]!;
+          const vec = vectors[i];
+          if (!vec) continue;
+          const row = this.db.prepare('SELECT superseded_by FROM memories WHERE id=?').get(item.card.id);
+          if (!row || row.superseded_by !== null) continue;
+          this.upsertEmbeddingRecord(item.card.id, engine.modelId, item.docHash, vec, now);
+          updated++;
+        }
+      });
+    }
+    return updated;
   }
   consolidateTaskMemory(task: Task): MemoryCard | undefined {
     if (task.status !== 'completed' || !task.report) return undefined;
@@ -786,6 +1234,69 @@ export class Store {
       sourceTaskId: task.id,
       sourceMessageId: task.originMessageId,
       linkedMemoryIds: task.memoryIds,
+    });
+  }
+  distillerState(): DistillerState {
+    const saved = this.conversation.meta<DistillerState>('memory_distiller_state');
+    if (saved && typeof saved === 'object') {
+      return {
+        lastMessageSeq: Number(saved.lastMessageSeq ?? 0),
+        distilledTaskIds: Array.isArray(saved.distilledTaskIds) ? saved.distilledTaskIds.slice(-200) : [],
+        lastRunAt: Number(saved.lastRunAt ?? 0),
+      };
+    }
+    return { lastMessageSeq: 0, distilledTaskIds: [], lastRunAt: 0 };
+  }
+  saveDistillerState(state: DistillerState): void {
+    this.conversation.setMeta('memory_distiller_state', {
+      lastMessageSeq: Math.max(0, Number(state.lastMessageSeq ?? 0)),
+      distilledTaskIds: [...new Set((state.distilledTaskIds ?? []).filter(Boolean))].slice(-200),
+      lastRunAt: Math.max(0, Number(state.lastRunAt ?? 0)),
+    });
+  }
+  initDistillerStateIfMissing(): DistillerState {
+    const saved = this.conversation.meta<DistillerState>('memory_distiller_state');
+    if (saved && typeof saved === 'object') return this.distillerState();
+    const latestSeq = this.conversation.allMessages(1)[0]?.seq ?? 0;
+    const existingCompletedIds = this.list(120)
+      .filter(task => task.status === 'completed')
+      .map(task => task.id)
+      .slice(-200);
+    const initial: DistillerState = {
+      lastMessageSeq: latestSeq,
+      distilledTaskIds: existingCompletedIds,
+      lastRunAt: 0,
+    };
+    this.saveDistillerState(initial);
+    return initial;
+  }
+  markDistilled(update: { latestMessageSeq?: number; taskIds?: string[]; now?: number }): void {
+    this.transaction(() => {
+      const prev = this.distillerState();
+      const nextSeq = update.latestMessageSeq !== undefined
+        ? Math.max(prev.lastMessageSeq, update.latestMessageSeq)
+        : prev.lastMessageSeq;
+      const nextTaskIds = update.taskIds?.length
+        ? [...new Set([...prev.distilledTaskIds, ...update.taskIds.filter(Boolean)])].slice(-200)
+        : prev.distilledTaskIds;
+      this.saveDistillerState({
+        lastMessageSeq: nextSeq,
+        distilledTaskIds: nextTaskIds,
+        lastRunAt: update.now ?? Date.now(),
+      });
+
+      const sub = this.subconsciousState();
+      const nextSubSeq = update.latestMessageSeq !== undefined
+        ? Math.max(sub.lastMessageSeq, update.latestMessageSeq)
+        : sub.lastMessageSeq;
+      const nextSubTasks = update.taskIds?.length
+        ? [...new Set([...sub.digestedTaskIds, ...update.taskIds.filter(Boolean)])].slice(-120)
+        : sub.digestedTaskIds;
+      this.saveSubconsciousState({
+        ...sub,
+        lastMessageSeq: nextSubSeq,
+        digestedTaskIds: nextSubTasks,
+      });
     });
   }
   subconsciousState(): SubconsciousState {
@@ -813,54 +1324,93 @@ export class Store {
   }
   homeostaticSleepPass(
     now = Date.now(),
-    options?: { decayAfterMs?: number; decayFactor?: number; minWeight?: number; stubMaxAgeMs?: number },
-  ): { scaledSynapses: number; prunedSynapses: number; forgottenStubs: number } {
+    options?: {
+      decayAfterMs?: number;
+      decayFactor?: number;
+      minWeight?: number;
+      stubMaxAgeMs?: number;
+      coldMaxAgeMs?: number;
+      coldImportanceThreshold?: number;
+      coldDecayStep?: number;
+      coldPruneThreshold?: number;
+    },
+  ): { scaledSynapses: number; prunedSynapses: number; forgottenStubs: number; decayedCards: number; prunedColdCards: number } {
     const decayAfterMs = options?.decayAfterMs ?? 24 * 3600_000;
-    const decayFactor = options?.decayFactor ?? 0.88;
-    const minWeight = options?.minWeight ?? 0.18;
-    const stubMaxAgeMs = options?.stubMaxAgeMs ?? 14 * 24 * 3600_000;
+    const decayFactor = options?.decayFactor ?? 0.82;
+    const minWeight = options?.minWeight ?? 0.30;
+    const stubMaxAgeMs = options?.stubMaxAgeMs ?? 7 * 24 * 3600_000;
+    const coldMaxAgeMs = options?.coldMaxAgeMs ?? 45 * 24 * 3600_000;
+    const coldImportanceThreshold = options?.coldImportanceThreshold ?? 55;
+    const coldPruneThreshold = options?.coldPruneThreshold ?? 20;
     let scaledSynapses = 0;
     let prunedSynapses = 0;
     let forgottenStubs = 0;
+    let decayedCards = 0;
+    let prunedColdCards = 0;
     return this.transaction(() => {
       const active = this.listMemories({ includeSuperseded: false, limit: 500 });
       for (const card of active) {
+        const imp = card.importance ?? defaultImportanceFor(card);
+        const recentlyReinforced = Boolean(card.lastReinforcedAt && now - card.lastReinforcedAt < stubMaxAgeMs);
         if (
-          !card.pinned
-          && (card.accessCount ?? 0) === 0
-          && card.tags.includes('auto-consolidated')
+          isAutoStubCard(card)
+          && !card.pinned
+          && imp < 85
+          && (card.accessCount ?? 0) < 3
+          && !recentlyReinforced
           && now - card.updatedAt >= stubMaxAgeMs
         ) {
           if (this.deleteMemory(card.id)) forgottenStubs++;
           continue;
         }
-        if (!card.synapses?.length) continue;
-        let mutated = false;
-        const nextSynapses: MemorySynapse[] = [];
-        for (const syn of card.synapses) {
-          if (syn.relation === 'explicit' || now - syn.updatedAt < decayAfterMs) {
-            nextSynapses.push(syn);
+        let cardMutated = false;
+        const lastActiveAt = Math.max(card.lastAccessedAt ?? 0, card.lastReinforcedAt ?? 0, card.updatedAt);
+        const coldAgeMs = now - lastActiveAt;
+        if (!card.pinned && imp < 75 && imp < coldImportanceThreshold && coldAgeMs >= coldMaxAgeMs) {
+          const overdueBuckets = Math.floor((coldAgeMs - coldMaxAgeMs) / (15 * 24 * 3600_000));
+          const decayStep = options?.coldDecayStep ?? Math.min(35, 15 + overdueBuckets * 10);
+          const nextImp = Math.max(0, imp - decayStep);
+          if (nextImp <= coldPruneThreshold) {
+            if (this.deleteMemory(card.id)) prunedColdCards++;
             continue;
           }
-          const decayed = Number((syn.weight * decayFactor).toFixed(2));
-          if (decayed < minWeight) {
-            prunedSynapses++;
-            mutated = true;
-          } else {
-            if (decayed !== syn.weight) {
-              scaledSynapses++;
-              mutated = true;
-            }
-            nextSynapses.push({ ...syn, weight: decayed });
+          if (nextImp !== imp) {
+            card.importance = nextImp;
+            decayedCards++;
+            cardMutated = true;
           }
         }
-        if (mutated) {
-          nextSynapses.sort((a, b) => b.weight - a.weight || b.updatedAt - a.updatedAt);
-          card.synapses = nextSynapses.length ? nextSynapses : undefined;
+        if (card.synapses?.length) {
+          let synMutated = false;
+          const nextSynapses: MemorySynapse[] = [];
+          for (const syn of card.synapses) {
+            if (syn.relation === 'explicit' || now - syn.updatedAt < decayAfterMs) {
+              nextSynapses.push(syn);
+              continue;
+            }
+            const decayed = Number((syn.weight * decayFactor).toFixed(2));
+            if (decayed < minWeight) {
+              prunedSynapses++;
+              synMutated = true;
+            } else {
+              if (decayed !== syn.weight) {
+                scaledSynapses++;
+                synMutated = true;
+              }
+              nextSynapses.push({ ...syn, weight: decayed });
+            }
+          }
+          if (synMutated) {
+            const trimmed = this.trimSynapses(nextSynapses);
+            card.synapses = trimmed.length ? trimmed : undefined;
+            cardMutated = true;
+          }
+        }
+        if (cardMutated) {
           this.db.prepare('UPDATE memories SET body=? WHERE id=?').run(JSON.stringify(card), card.id);
         }
       }
-      return { scaledSynapses, prunedSynapses, forgottenStubs };
+      return { scaledSynapses, prunedSynapses, forgottenStubs, decayedCards, prunedColdCards };
     });
   }
   sampleDreamMaterial(random: () => number = Math.random): DreamMaterial {
