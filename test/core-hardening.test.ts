@@ -644,3 +644,36 @@ test('5. Fastpath hot session bridge injects unseen fastpath turns once and stop
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('6. Pre-try chat() failure (e.g. searchContextAsync throw) settles cleanly without unhandledRejection', { timeout: 10_000 }, async () => {
+  const root = await mkdtemp(join(await realpath(tmpdir()), 'sa-chat-catch-'));
+  const home = await privateHome(join(root, 'h'));
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => {
+    unhandled.push(reason);
+  };
+  process.on('unhandledRejection', onUnhandled);
+
+  const factory: AgentFactory = {
+    mode: 'offline',
+    async create() {
+      return { close() {}, async prompt() { return 'ok'; } };
+    },
+  };
+  const coordinator = new Coordinator(home, factory);
+  try {
+    await coordinator.ready();
+    coordinator.store.searchContextAsync = async () => {
+      throw new Error('simulated searchContextAsync failure');
+    };
+    const msg = coordinator.chat(randomUUID(), '触发 pre-try 异常');
+    await until(() => coordinator.store.conversation.get(msg.id).status === 'failed');
+    await delay(50);
+    assert.equal(unhandled.length, 0, `Expected 0 unhandled rejections, got ${unhandled.length}`);
+    assert.match(coordinator.store.conversation.get(msg.id).reason ?? '', /simulated searchContextAsync failure/);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+    await coordinator.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});

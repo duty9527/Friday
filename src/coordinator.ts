@@ -968,6 +968,9 @@ export class Coordinator {
           try {
             memberRouter?.close();
             memberRouter = undefined;
+            if (isMemberSpeaker) {
+              await rm(join(this.home, 'sdk', `member-${message.id}`), { recursive: true, force: true }).catch(() => {});
+            }
           } finally {
             context.controller.signal.removeEventListener('abort', onUserAbort);
             context.attemptController = undefined;
@@ -978,25 +981,35 @@ export class Coordinator {
     }).catch((error: unknown) => {
       if (!context.settled) {
         context.settled = true;
-        const msgRecord = chat.get(message.id);
-        if (msgRecord.status === 'queued' || msgRecord.status === 'processing') {
-          chat.update(message.id, {
-            status: 'interrupted',
-            reason: 'F.R.I.D.A.Y. 处理前已停止；不会自动重发。',
-          });
-        }
-        if (context.replyId) {
-          const replyRecord = chat.get(context.replyId);
-          if (replyRecord.status === 'streaming') {
-            chat.update(context.replyId, {
-              status: 'interrupted',
-              reason: 'F.R.I.D.A.Y. 回复未完成；已保留公开输出和真实错误轨迹，不自动重放。',
+        try {
+          const isAbortOrShutdown = this.closing || context.controller.signal.aborted;
+          const status = isAbortOrShutdown ? 'interrupted' : 'failed';
+          const detail = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').trim();
+          const msgRecord = chat.get(message.id);
+          if (msgRecord.status === 'queued' || msgRecord.status === 'processing') {
+            chat.update(message.id, {
+              status,
+              reason: isAbortOrShutdown
+                ? 'F.R.I.D.A.Y. 处理前已停止；不会自动重发。'
+                : `处理失败：${detail.slice(0, 200) || '未知错误'}`,
             });
           }
+          if (context.replyId) {
+            const replyRecord = chat.get(context.replyId);
+            if (replyRecord.status === 'streaming') {
+              chat.update(context.replyId, {
+                status,
+                reason: isAbortOrShutdown
+                  ? 'F.R.I.D.A.Y. 回复未完成；已保留公开输出和真实错误轨迹，不自动重放。'
+                  : `这条我没答上：${detail.slice(0, 200) || '未知错误'}`,
+              });
+            }
+          }
+          this.notifyOutbound();
+        } catch {
+          // Ignore store errors if shutdown already closed the DB.
         }
-        this.notifyOutbound();
       }
-      if (!this.closing) throw error;
     }).finally(() => {
       this.subconscious.touchChatActivity();
       this.chatRuns.delete(message.id);
