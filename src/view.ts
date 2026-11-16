@@ -211,7 +211,7 @@ export interface RoutingRecord {
 export interface MessageOrigin {
   channel: 'local' | 'telegram' | 'wechat' | 'dingtalk' | 'xiaoai';
   channelId?: string; accountId?: string; conversationId?: string; senderId?: string;
-  speakerId?: string; speakerName?: string;
+  speakerId?: string; speakerName?: string; speakerRole?: 'owner' | 'member';
   replyToMessageId?: string; replyWebhook?: string; contextToken?: string;
 }
 export interface AttachmentView {

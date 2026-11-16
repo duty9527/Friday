@@ -25,6 +25,7 @@ import {
   type ChatRun,
 } from './orchestrator/chat-coalescer.js';
 import {
+  MEMBER_ALLOWED_PLUGINS,
   buildToolRequestId,
   buildVoiceTurnHint,
   compactRouterChatMemoryDirectory,
@@ -32,6 +33,7 @@ import {
   compactRouterChatWorks,
   createRouterTools,
   createRouterTurnScope,
+  type RouterToolsHost,
   type RouterTurnScope,
 } from './orchestrator/router-tools.js';
 import {
@@ -138,7 +140,10 @@ export class Coordinator {
   private semanticWarmup?: Promise<void>;
   private router?: AgentPort;
   private activeRouterSpec?: string;
-  private routerQueue: Promise<void> = Promise.resolve();
+  private readonly interactiveRouterQueue: Array<{ run: () => void; reject: (reason?: unknown) => void }> = [];
+  private readonly backgroundRouterQueue: Array<{ run: () => void; reject: (reason?: unknown) => void }> = [];
+  private routerActive = false;
+  private lastRouterChatSeq = 0;
   private currentTurn?: RouterTurnScope;
   private readonly reportAutoDispatches = new BoundedCounterMap(500, 3_600_000);
   private readonly chatRuns = new Map<string, ChatRun>();
@@ -381,8 +386,8 @@ export class Coordinator {
     })();
   }
 
-  private createRouter(restoreCheckpoint = false): Promise<AgentPort> {
-    const tools = createRouterTools({
+  private createRouterToolHost(): RouterToolsHost {
+    return {
       home: this.home,
       store: this.store,
       im: this.im,
@@ -403,18 +408,83 @@ export class Coordinator {
       removeTimer: id => this.removeTimer(id),
       resolveChannelOrigin: (channelSpec, deliverTarget) =>
         resolveStoreChannelOrigin(this.store, channelSpec, deliverTarget),
-    }, (messageId, callId, kind) => buildToolRequestId(this.currentTurn, messageId, callId, kind));
+    };
+  }
 
-    return this.factory.create('router', 'router', tools, {
-      restore: restoreCheckpoint ? this.store.conversation.meta('router_checkpoint') : undefined,
+  private async createRouter(restoreCheckpoint = false): Promise<AgentPort> {
+    const tools = createRouterTools(
+      this.createRouterToolHost(),
+      (messageId, callId, kind) => buildToolRequestId(this.currentTurn, messageId, callId, kind),
+    );
+    const checkpoint = restoreCheckpoint
+      ? this.store.conversation.meta<{ sessionFile: string; leafId: string }>('router_checkpoint')
+      : undefined;
+    const router = await this.factory.create('router', 'router', tools, {
+      restore: checkpoint,
       onEvent: event => this.currentTurn?.routerTrace?.observe(event),
     });
+    this.lastRouterChatSeq = checkpoint ? (this.store.conversation.allMessages(1)[0]?.seq ?? 0) : 0;
+    return router;
+  }
+
+  private enqueueRouter<T>(priority: 'interactive' | 'background', task: () => Promise<T>): Promise<T> {
+    if (this.closing) {
+      return Promise.reject(new Error('Service is shutting down'));
+    }
+    return new Promise<T>((resolve, reject) => {
+      const entry = {
+        reject,
+        run: () => {
+          Promise.resolve()
+            .then(task)
+            .then(resolve, reject)
+            .finally(() => {
+              this.routerActive = false;
+              this.pumpRouterQueue();
+            });
+        },
+      };
+      const queue = priority === 'interactive'
+        ? this.interactiveRouterQueue
+        : this.backgroundRouterQueue;
+      queue.push(entry);
+      if (!this.routerActive) {
+        this.pumpRouterQueue();
+      }
+    });
+  }
+
+  private pumpRouterQueue(): void {
+    if (this.routerActive) return;
+    if (this.closing) {
+      this.drainRouterQueues(new Error('Service is shutting down'));
+      return;
+    }
+    const next = this.interactiveRouterQueue.shift() ?? this.backgroundRouterQueue.shift();
+    if (!next) return;
+    this.routerActive = true;
+    next.run();
+  }
+
+  private drainRouterQueues(reason: Error): void {
+    while (this.interactiveRouterQueue.length) {
+      this.interactiveRouterQueue.shift()!.reject(reason);
+    }
+    while (this.backgroundRouterQueue.length) {
+      this.backgroundRouterQueue.shift()!.reject(reason);
+    }
+  }
+
+  resolveOriginSpeakerRole(origin?: MessageOrigin): 'owner' | 'member' | undefined {
+    if (origin?.speakerRole) return origin.speakerRole;
+    if (!origin?.speakerId) return undefined;
+    return this.im.getVoiceprintStatus().profiles.find(p => p.id === origin.speakerId)?.role;
   }
 
   async configureModels(input: ModelHubConfigureInput) {
     const view = await this.modelHub.configure(input);
     const targetSpec = `${view.routerProvider}/${view.routerModel}`;
-    const swap = this.routerQueue.then(async () => {
+    const swap = this.enqueueRouter('background', async () => {
       if (this.closing || !this.router) return;
       const latestSpec = `${this.factory.routerProvider ?? ''}/${this.factory.modelTiers?.router ?? ''}`;
       if (latestSpec === this.activeRouterSpec && targetSpec === this.activeRouterSpec) return;
@@ -425,7 +495,6 @@ export class Coordinator {
         this.activeRouterSpec = latestSpec;
       }
     });
-    this.routerQueue = swap.then(() => {}, () => {});
     await swap;
     return view;
   }
@@ -663,7 +732,7 @@ export class Coordinator {
     };
     this.chatRuns.set(message.id, context);
 
-    const pending = this.routerQueue.then(async () => {
+    const pending = this.enqueueRouter('interactive', async () => {
       for (;;) {
         await waitForChatCoalesceLoop(context, o => this.hasInboundHold(o), () => this.closing);
         if (context.controller.signal.aborted || this.closing) {
@@ -677,8 +746,9 @@ export class Coordinator {
         const attemptVersion = context.mergeVersion;
         context.activeAttemptVersion = attemptVersion;
         let currentMessage = chat.get(message.id);
-        const knownWorks = this.store.list();
-        const skipAiContinuity = currentMessage.origin?.channel === 'xiaoai';
+        const isMemberSpeaker = this.resolveOriginSpeakerRole(currentMessage.origin) === 'member';
+        const knownWorks = isMemberSpeaker ? [] : this.store.list();
+        const skipAiContinuity = isMemberSpeaker || currentMessage.origin?.channel === 'xiaoai';
         const resolvedSession = await resolveRuntimeMessageSession(
           this.store,
           this.modelHub,
@@ -693,18 +763,20 @@ export class Coordinator {
           currentMessage = chat.assignSession(message.id, resolvedSession.sessionId, resolvedSession.sessionLink, attemptVersion === 0);
         }
         context.message = currentMessage;
-        const memoryDirectory = this.store.memoryDirectory(24);
-        const autoRecalled = currentMessage.text.trim()
+        const memoryDirectory = isMemberSpeaker
+          ? { totalActive: 0, truncated: false, items: [] }
+          : this.store.memoryDirectory(24);
+        const autoRecalled = !isMemberSpeaker && currentMessage.text.trim()
           ? (await this.store.searchContextAsync({ query: currentMessage.text, limit: 3, touch: false }))
               .hits
               .filter(hit => hit.score >= 46 && !(hit.kind === 'message' && hit.messageId === message.id))
           : [];
-        const subconscious = this.store.peekSubconsciousForChat(this.subconscious.now());
+        const subconscious = isMemberSpeaker ? undefined : this.store.peekSubconsciousForChat(this.subconscious.now());
         context.revisions = new Map(knownWorks.map(task => [task.id, task.revision]));
 
         // Always reset heartbeat clock right before attaching active turn state after async coalesce/lookup work.
         resetChatContextClock(context);
-        const recentContext = chat.recentContext();
+        const recentContext = isMemberSpeaker ? undefined : chat.recentContext();
         chat.update(message.id, {
           status: 'processing',
           routing: {
@@ -722,11 +794,13 @@ export class Coordinator {
                 status,
                 revision,
               })),
-              messages: chat.history(undefined, 12).items.map(item => ({
-                id: item.id,
-                role: item.role,
-                preview: String(publicData(item.text.slice(-160))),
-              })),
+              messages: isMemberSpeaker
+                ? []
+                : chat.history(undefined, 12).items.map(item => ({
+                    id: item.id,
+                    role: item.role,
+                    preview: String(publicData(item.text.slice(-160))),
+                  })),
               memoryDirectory,
               ...(autoRecalled.length ? { autoRecalled } : {}),
             },
@@ -754,60 +828,84 @@ export class Coordinator {
         context.attemptController = attemptController;
         const onUserAbort = () => attemptController.abort(context.controller.signal.reason);
         context.controller.signal.addEventListener('abort', onUserAbort, { once: true });
-        const preTurnLeafId = this.router?.leafId;
+        const preTurnLeafId = isMemberSpeaker ? undefined : this.router?.leafId;
+        let memberRouter: AgentPort | undefined;
 
         try {
           const deliveryChannel = currentMessage.origin?.channel ?? 'local';
-          const imChannels = this.store.listImChannelViews()
-            .filter(c => c.enabled)
-            .map(({ id, platform, name, loginStatus, defaultTarget }) => ({ id, platform, name, loginStatus, defaultTarget }));
           const carriedImages = resolveRecentSessionImages(this.store, currentMessage);
           const { routing: _omittedRouting, ...cleanCurrentMessage } = currentMessage;
           const promptMessage = carriedImages.length
             ? { ...cleanCurrentMessage, attachments: [...(cleanCurrentMessage.attachments ?? []), ...carriedImages] }
             : cleanCurrentMessage;
-          const promptMemoryDirectory = compactRouterChatMemoryDirectory(
-            this.store.memoryDirectory(deliveryChannel === 'xiaoai' ? 10 : 12),
-          );
-          const promptAutoRecalled = autoRecalled.map(({ synapses: _synapses, neighbors, ...hit }) => ({
-            ...hit,
-            snippet: hit.snippet.length > 200 ? `${hit.snippet.slice(0, 200)}…` : hit.snippet,
-            ...(neighbors?.length
-              ? {
-                  neighbors: neighbors.slice(0, 2).map(n => ({
-                    ...n,
-                    preview: n.preview.length > 100 ? `${n.preview.slice(0, 100)}…` : n.preview,
-                  })),
-                }
-              : {}),
-          }));
-          const includeRecentContext = !this.router?.leafId;
-          let promptContext = includeRecentContext
-            ? (this.factory.mode === 'real' ? compactRouterChatRecentContext(recentContext) : recentContext)
-            : undefined;
-          if (!includeRecentContext) {
-            // Fastpath turns (e.g. MiOT/TV-IR) are recorded in SQLite without entering Router's SDK session;
-            // bridge recent turns whenever any of the last 8 prior messages came from a fastpath turn.
-            const priorItems = chat.history(currentMessage.seq, 8).items;
-            if (priorItems.some(isFastpathMessage)) {
-              const formattedPrior = priorItems.map(({ id, role, text, mode, status, taskIds, paths }) => ({
-                id,
-                role,
-                mode,
-                text: text.slice(-4096),
-                truncated: text.length > 4096,
-                status,
-                taskIds,
-                fileCount: paths.length,
-              }));
-              promptContext = compactRouterChatRecentContext(formattedPrior, 6);
+
+          let activeRouter: AgentPort;
+          let payload: string;
+          if (isMemberSpeaker) {
+            const memberTools = createRouterTools(
+              this.createRouterToolHost(),
+              (messageId, callId, kind) => buildToolRequestId(this.currentTurn, messageId, callId, kind),
+              { allowedPlugins: MEMBER_ALLOWED_PLUGINS, toolNames: new Set(['run_plugin']) },
+            );
+            memberRouter = await this.factory.create('router', `member-${message.id}`, memberTools, {
+              onEvent: event => this.currentTurn?.routerTrace?.observe(event),
+            });
+            activeRouter = memberRouter;
+            payload = JSON.stringify({
+              kind: 'CHAT',
+              message: promptMessage,
+              deliveryChannel,
+              ...buildVoiceTurnHint(this.home, deliveryChannel, MEMBER_ALLOWED_PLUGINS),
+              execution: this.factory.nativeTools ? 'native' : 'snapshot',
+              cwd: process.cwd(),
+              memoryDirectory: { total: 0, pinnedCount: 0, items: [] },
+              memberPrivacyNotice: '当前为家庭成员语音对话：仅可操作客厅/全屋公开智能家居，严禁透露或查询机主私人记忆、持仓与后台工作。',
+            });
+          } else {
+            activeRouter = this.router!;
+            const imChannels = this.store.listImChannelViews()
+              .filter(c => c.enabled)
+              .map(({ id, platform, name, loginStatus, defaultTarget }) => ({ id, platform, name, loginStatus, defaultTarget }));
+            const promptMemoryDirectory = compactRouterChatMemoryDirectory(
+              this.store.memoryDirectory(deliveryChannel === 'xiaoai' ? 10 : 12),
+            );
+            const promptAutoRecalled = autoRecalled.map(({ synapses: _synapses, neighbors, ...hit }) => ({
+              ...hit,
+              snippet: hit.snippet.length > 200 ? `${hit.snippet.slice(0, 200)}…` : hit.snippet,
+              ...(neighbors?.length
+                ? {
+                    neighbors: neighbors.slice(0, 2).map(n => ({
+                      ...n,
+                      preview: n.preview.length > 100 ? `${n.preview.slice(0, 100)}…` : n.preview,
+                    })),
+                  }
+                : {}),
+            }));
+            const includeRecentContext = !this.router?.leafId;
+            let promptContext = includeRecentContext
+              ? (this.factory.mode === 'real' ? compactRouterChatRecentContext(recentContext) : recentContext)
+              : undefined;
+            if (!includeRecentContext) {
+              // Fastpath turns (e.g. MiOT/TV-IR) are recorded in SQLite without entering Router's SDK session;
+              // bridge only unseen turns after lastRouterChatSeq whenever an unseen fastpath turn exists.
+              const unseenItems = chat.history(currentMessage.seq, 8).items
+                .filter(m => m.seq > this.lastRouterChatSeq);
+              if (unseenItems.some(isFastpathMessage)) {
+                const formattedPrior = unseenItems.map(({ id, role, text, mode, status, taskIds, paths }) => ({
+                  id,
+                  role,
+                  mode,
+                  text: text.slice(-4096),
+                  truncated: text.length > 4096,
+                  status,
+                  taskIds,
+                  fileCount: paths.length,
+                }));
+                promptContext = compactRouterChatRecentContext(formattedPrior, 6);
+              }
             }
-          }
-          const promptWorks = compactRouterChatWorks(knownWorks, deliveryChannel === 'xiaoai' ? 2 : 3);
-          resetChatContextClock(context);
-          const result = await trace.run(
-            this.router!,
-            JSON.stringify({
+            const promptWorks = compactRouterChatWorks(knownWorks, deliveryChannel === 'xiaoai' ? 2 : 3);
+            payload = JSON.stringify({
               kind: 'CHAT',
               message: promptMessage,
               deliveryChannel,
@@ -820,13 +918,15 @@ export class Coordinator {
               ...(promptAutoRecalled.length ? { autoRecalled: promptAutoRecalled } : {}),
               ...(subconscious ? { subconscious } : {}),
               works: promptWorks,
-            }),
-            attemptController.signal,
-          );
+            });
+          }
+
+          resetChatContextClock(context);
+          const result = await trace.run(activeRouter, payload, attemptController.signal);
           accrueChatRun(context);
           if (context.controller.signal.aborted) throw context.controller.signal.reason;
           if ((context.mergeVersion !== attemptVersion || this.hasInboundHold(currentMessage.origin)) && !context.hasSideEffectTool && !this.closing) {
-            if (preTurnLeafId !== undefined) this.router?.rewind?.(preTurnLeafId);
+            if (!isMemberSpeaker && preTurnLeafId !== undefined) this.router?.rewind?.(preTurnLeafId);
             continue;
           }
           context.settled = true;
@@ -838,14 +938,17 @@ export class Coordinator {
             chat.routeState(message.id, 'completed');
             chat.update(message.id, { status: 'completed' });
             for (const id of chat.get(message.id).taskIds) chat.link(reply.id, id);
-            if (subconscious) this.store.advanceSubconsciousTurn(subconscious.pendingInsight?.id, this.subconscious.now());
-            this.checkpoint();
+            if (!isMemberSpeaker) {
+              if (subconscious) this.store.advanceSubconsciousTurn(subconscious.pendingInsight?.id, this.subconscious.now());
+              this.lastRouterChatSeq = Math.max(this.lastRouterChatSeq, currentMessage.seq, reply.seq);
+              this.checkpoint();
+            }
           });
           this.notifyOutbound();
           break;
         } catch (error) {
           if ((context.mergeVersion !== attemptVersion || this.hasInboundHold(currentMessage.origin)) && !context.hasSideEffectTool && !context.controller.signal.aborted && !this.closing) {
-            if (preTurnLeafId !== undefined) this.router?.rewind?.(preTurnLeafId);
+            if (!isMemberSpeaker && preTurnLeafId !== undefined) this.router?.rewind?.(preTurnLeafId);
             continue;
           }
           context.settled = true;
@@ -862,11 +965,38 @@ export class Coordinator {
           this.notifyOutbound();
           break;
         } finally {
-          context.controller.signal.removeEventListener('abort', onUserAbort);
-          context.attemptController = undefined;
-          if (this.currentTurn === turn) this.currentTurn = undefined;
+          try {
+            memberRouter?.close();
+            memberRouter = undefined;
+          } finally {
+            context.controller.signal.removeEventListener('abort', onUserAbort);
+            context.attemptController = undefined;
+            if (this.currentTurn === turn) this.currentTurn = undefined;
+          }
         }
       }
+    }).catch((error: unknown) => {
+      if (!context.settled) {
+        context.settled = true;
+        const msgRecord = chat.get(message.id);
+        if (msgRecord.status === 'queued' || msgRecord.status === 'processing') {
+          chat.update(message.id, {
+            status: 'interrupted',
+            reason: 'F.R.I.D.A.Y. 处理前已停止；不会自动重发。',
+          });
+        }
+        if (context.replyId) {
+          const replyRecord = chat.get(context.replyId);
+          if (replyRecord.status === 'streaming') {
+            chat.update(context.replyId, {
+              status: 'interrupted',
+              reason: 'F.R.I.D.A.Y. 回复未完成；已保留公开输出和真实错误轨迹，不自动重放。',
+            });
+          }
+        }
+        this.notifyOutbound();
+      }
+      if (!this.closing) throw error;
     }).finally(() => {
       this.subconscious.touchChatActivity();
       this.chatRuns.delete(message.id);
@@ -874,7 +1004,6 @@ export class Coordinator {
     });
 
     this.chatJobs.add(pending);
-    this.routerQueue = pending.then(() => {}, () => {});
     return message;
   }
 
@@ -1001,13 +1130,15 @@ export class Coordinator {
     return true;
   }
 
-  private serialRouter<T>(run: Run, work: () => Promise<T>): Promise<T> {
-    const next = this.routerQueue.then(async () => {
+  private serialRouter<T>(
+    run: Run,
+    work: () => Promise<T>,
+    priority: 'interactive' | 'background' = 'background',
+  ): Promise<T> {
+    return this.enqueueRouter(priority, async () => {
       if (!this.valid(run)) throw new Error('Task no longer active');
       return work();
     });
-    this.routerQueue = next.then(() => {}, () => {});
-    return next;
   }
 
   submit(requestId: string, prompt: string, paths: string[], limitMs: number, chatWork?: ChatWork): Promise<Task> {
@@ -1508,7 +1639,7 @@ export class Coordinator {
               run.replyId = undefined;
               this.notifyOutbound();
             }
-          });
+          }, 'interactive');
           await this.waitForFollowupOrStop(run);
           if (!this.valid(run)) return;
           const resumedTask = this.store.get(task.id);
@@ -1955,6 +2086,7 @@ export class Coordinator {
     for (const run of this.runs.values()) {
       this.stop(run.id, '服务关闭；工作暂停，不会自动重放', 'paused');
     }
+    this.drainRouterQueues(new Error('Service is shutting down'));
     await Promise.allSettled([...this.submissions]);
     await this.subconscious.awaitSettled();
     if (this.executor) await this.executor.close();

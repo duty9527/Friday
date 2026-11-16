@@ -5,7 +5,7 @@ import type { AgentTool } from '../agent.js';
 import { publicData } from '../conversation.js';
 import type { ImGateway } from '../im.js';
 import { resolveEnv } from '../paths.js';
-import { listPluginViews, runPlugin } from '../plugin.js';
+import { listPluginsSync, listPluginViews, runPlugin } from '../plugin.js';
 import { integer, text } from '../protocol.js';
 import { reconcileRuntimeSessionAfterTool } from '../session.js';
 import type { Store, Task } from '../store.js';
@@ -33,6 +33,12 @@ import { dedupeAttachments, resolveMessageAttachments, resolveTaskAttachments, t
 export const WORKER_PROFILES = new Set<WorkerProfile>(['general', 'coding', 'research', 'review']);
 export const MODEL_TIERS = new Set<ModelTier>(['fast', 'balanced', 'strong']);
 export const READONLY_ROUTER_TOOLS = new Set(['recall_messages', 'search_memory', 'inspect_work']);
+export const MEMBER_ALLOWED_PLUGINS = new Set(['miot', 'tv-ir', 'tv-agent']);
+
+export interface RouterToolsOptions {
+  allowedPlugins?: ReadonlySet<string>;
+  toolNames?: ReadonlySet<string>;
+}
 
 export interface RouterTurnScope {
   chatContext?: ChatRun;
@@ -179,8 +185,9 @@ export function parseStringArray(value: unknown, label: string, maxItems = 16, m
   return value.map(item => text(item, label, maxLen));
 }
 
-export function buildRunPluginDescription(home: string): string {
-  const plugins = listPluginViews(home).filter(p => p.enabled !== false);
+export function buildRunPluginDescription(home: string, allowedPlugins?: ReadonlySet<string>): string {
+  const plugins = listPluginViews(home)
+    .filter(p => p.enabled !== false && (!allowedPlugins || allowedPlugins.has(p.name)));
   const pluginList = plugins.length
     ? `Available plugins: ${plugins.map(p => {
         const detail = p.promptHint?.trim() || (p.actions.length ? p.actions.join(', ') : p.description.trim());
@@ -190,17 +197,24 @@ export function buildRunPluginDescription(home: string): string {
   return `List or run local Node script plugins. Input JSON {action?: "list"|"run", plugin?, pluginAction?, args?}. ${pluginList}`;
 }
 
-export function buildVoiceTurnHint(home: string, deliveryChannel: string): { voiceModeConstraint?: string } {
+export function buildVoiceTurnHint(
+  home: string,
+  deliveryChannel: string,
+  allowedPlugins?: ReadonlySet<string>,
+): { voiceModeConstraint?: string } {
   if (deliveryChannel !== 'xiaoai') return {};
   const enabledPlugins = listPluginViews(home)
-    .filter(p => p.enabled !== false && (p.voiceFastpath || p.promptHint || p.actions.length))
+    .filter(p => p.enabled !== false && (!allowedPlugins || allowedPlugins.has(p.name)) && (p.voiceFastpath || p.promptHint || p.actions.length))
     .map(p => `"${p.name}"${p.promptHint ? `(${p.promptHint})` : p.actions.length ? `[${p.actions.slice(0, 6).join(',')}]` : ''}`);
   const pluginClause = enabledPlugins.length
     ? `(4) 设备控制、定时提醒或即时查询优先直接调用匹配插件的 run_plugin（避免派发缓慢的 start_work Worker），已知可用插件：${enabledPlugins.join('；')}。闭合确认加 [[END]]，仅需消歧追问时加 [[LISTEN]]。`
     : '(4) 即时控制或状态查询优先直接调用匹配的 run_plugin，并在闭合确认后加 [[END]]，仅需追问确认时加 [[LISTEN]]。';
+  const switchClause = allowedPlugins
+    ? '1句话报核心结论'
+    : '1句话报核心结论并询问切换到文字端，或按要求调用 switch_channel';
   return {
     voiceModeConstraint:
-      `当前直连语音音箱TTS外放：(1) 普通回复与任务派发确认必须极致简短口语（<=25字）；(2) 期待用户继续说话/确认/追问时结尾必须加 [[LISTEN]]，严禁同时使用 [[END]]；本轮彻底结束时才以“。”结尾并加 [[END]]；(3) 长篇内容或复杂报告严禁在音箱朗读，1句话报核心结论并询问切换到文字端，或按要求调用 switch_channel；${pluginClause}`,
+      `当前直连语音音箱TTS外放：(1) 普通回复与任务派发确认必须极致简短口语（<=25字）；(2) 期待用户继续说话/确认/追问时结尾必须加 [[LISTEN]]，严禁同时使用 [[END]]；本轮彻底结束时才以“。”结尾并加 [[END]]；(3) 长篇内容或复杂报告严禁在音箱朗读，${switchClause}；${pluginClause}`,
   };
 }
 
@@ -288,7 +302,13 @@ export function buildToolRequestId(
   return createHash('sha256').update(JSON.stringify([scope, callId ?? randomUUID(), kind])).digest('hex');
 }
 
-export function createRouterTools(host: RouterToolsHost, requestIdFn: (messageId: string, callId: string | undefined, kind: string) => string): AgentTool[] {
+export function createRouterTools(
+  host: RouterToolsHost,
+  requestIdFn: (messageId: string, callId: string | undefined, kind: string) => string,
+  options?: RouterToolsOptions,
+): AgentTool[] {
+  const allowedPlugins = options?.allowedPlugins;
+  const toolNames = options?.toolNames;
   const routeTool = async (name: string, input: string, callId: string, execute: () => Promise<string>): Promise<string> => {
     const turn = host.getTurn();
     if (turn?.chatContext) accrueChatRun(turn.chatContext);
@@ -735,21 +755,32 @@ export function createRouterTools(host: RouterToolsHost, requestIdFn: (messageId
     },
   }, {
     name: 'run_plugin',
-    description: buildRunPluginDescription(host.home),
+    description: buildRunPluginDescription(host.home, allowedPlugins),
     execute: async input => {
       if (host.isClosing()) throw new Error('Service is shutting down');
       const args = toolInput(input, ['action', 'plugin', 'pluginAction', 'args', 'summary']);
       const mode = args.action === undefined ? (args.plugin ? 'run' : 'list') : text(args.action, 'action', 32);
       if (mode === 'list') {
-        return JSON.stringify({ plugins: listPluginViews(host.home) });
+        const plugins = listPluginViews(host.home)
+          .filter(p => !allowedPlugins || allowedPlugins.has(p.name));
+        return JSON.stringify({ plugins });
       }
       if (mode !== 'run') throw new Error(`Unknown run_plugin action: ${mode}`);
       const pluginName = text(args.plugin, 'plugin', 64);
+      if (allowedPlugins && !allowedPlugins.has(pluginName)) {
+        throw new Error(`家庭成员会话无权调用插件 "${pluginName}"；仅允许公共智能家居插件`);
+      }
+      const manifest = listPluginsSync(host.home).find(p => p.name === pluginName);
+      if (manifest && manifest.enabled === false) {
+        throw new Error(`插件 "${pluginName}" 在当前平台或配置下已被禁用`);
+      }
       const subAction = args.pluginAction === undefined ? 'status' : text(args.pluginAction, 'pluginAction', 64);
       const pluginArgs = args.args && typeof args.args === 'object' && !Array.isArray(args.args)
         ? args.args as Record<string, unknown>
         : {};
-      const result = await runPlugin(host.home, pluginName, subAction, pluginArgs);
+      const turn = host.getTurn();
+      const signal = turn?.chatContext?.attemptController?.signal ?? turn?.chatContext?.controller.signal;
+      const result = await runPlugin(host.home, pluginName, subAction, pluginArgs, undefined, { signal });
       return JSON.stringify(result);
     },
   }, {
@@ -851,7 +882,8 @@ export function createRouterTools(host: RouterToolsHost, requestIdFn: (messageId
     },
   }];
 
-  return tools.map(tool => ({
+  const selectedTools = toolNames ? tools.filter(tool => toolNames.has(tool.name)) : tools;
+  return selectedTools.map(tool => ({
     ...tool,
     description: `${tool.description} Optional summary: one short public explanation of this action, not private reasoning.`,
     execute: (input: string, callId?: string) => {

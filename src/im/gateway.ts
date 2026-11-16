@@ -392,7 +392,7 @@ export class ImGateway {
       accountId: channel.accountId,
       conversationId: inbound.target ?? inbound.senderId,
       senderId: inbound.senderId,
-      ...(inbound.speaker ? { speakerId: inbound.speaker.id, speakerName: inbound.speaker.name } : {}),
+      ...(inbound.speaker ? { speakerId: inbound.speaker.id, speakerName: inbound.speaker.name, speakerRole: inbound.speaker.role } : {}),
       replyToMessageId: inbound.externalId,
       replyWebhook: inbound.replyWebhook,
       contextToken: inbound.contextToken,

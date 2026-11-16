@@ -50,6 +50,9 @@ export class SourceChangedError extends Error {}
 export const unsettled = (op: Operation): boolean =>
   ['requested', 'started', 'cancel_requested', 'unknown'].includes(op.status);
 
+export const CLOCK_DRIFT_MAX_MS = 1_500;
+export const HEARTBEAT_STALL_MAX_MS = 15_000;
+
 export const taskStatusNeedsNotice = (status: TaskStatus): boolean =>
   ['paused', 'cancelled', 'failed'].includes(status);
 
@@ -100,7 +103,7 @@ export function accrueTaskRun(store: Store, run: Run): boolean {
   const wallElapsed = Date.now() - run.lastWall;
   run.lastTick = now;
   run.lastWall = Date.now();
-  const known = elapsed <= 1500 && Math.abs(wallElapsed - elapsed) <= 1500;
+  const known = elapsed <= HEARTBEAT_STALL_MAX_MS && Math.abs(wallElapsed - elapsed) <= CLOCK_DRIFT_MAX_MS;
   const task = store.get(run.id);
   if (task.status === 'running' && (run.activeCalls > 0 || run.reads.size > 0)) {
     if (known) {
