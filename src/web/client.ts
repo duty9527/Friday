@@ -153,6 +153,13 @@ async function refreshView(initial = false): Promise<void> {
     timerPluginHub.renderPlugins();
     imVoiceHub.render();
     modelHub.render();
+    const healthPlugin = appState.view?.plugins?.find(p => p.name === 'health-scale');
+    const healthEnabled = healthPlugin ? healthPlugin.enabled !== false : false;
+    openHealthHubTop.hidden = !healthEnabled;
+    if (!healthEnabled && !healthHubBackdrop.hidden) {
+      healthScaleUi?.closeModal();
+      healthHubBackdrop.hidden = true;
+    }
     chatPanel.updateComposer();
     followLatestMessage();
     if (

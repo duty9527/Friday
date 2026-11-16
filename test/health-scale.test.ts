@@ -208,7 +208,7 @@ test('health-scale plugin actions handle profiles, manual records, mocked BLE sc
     const initData = initRes.data as Record<string, unknown>;
     assert.equal((initData.profiles as unknown[]).length, 0);
 
-    const noProfileMeas = await mod.runAction('measure-start', { timeoutSec: 30 }, { dataDir });
+    const noProfileMeas = await mod.runAction('measure-start', { timeoutSec: 30 }, { dataDir, spawnMeasure: () => 0 });
     assert.equal(noProfileMeas.ok, false);
     assert.equal((noProfileMeas.data as Record<string, unknown>).needsProfile, true);
 
@@ -375,7 +375,7 @@ test('health-scale config loads external targetMac/defaultProfile and measure-st
     assert.equal(profiles[0]?.name, '配置成员');
 
     // Write session file pointing to current test-runner PID (not ble_helper.py); measure-stop must NOT kill it!
-    writeFileSync(join(dataDir, 'measure-session.json'), JSON.stringify({
+    writeFileSync(join(dataDir, 'live-session.json'), JSON.stringify({
       sessionId: 'fake-non-ble',
       profileId: 'owner',
       pid: process.pid,

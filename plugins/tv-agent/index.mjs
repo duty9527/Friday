@@ -178,25 +178,45 @@ function effectiveConfig(args, paths) {
 
 /**
  * Friday's runPlugin() strips every API_KEY / TOKEN / SECRET env var, so Decision API credentials
- * are read from args.apiKey or ${SUPER_AGENT_HOME}/sdk/model-hub.json.
+ * are resolved via args.apiKey, deps.getDecisionCredentials(), or ${SUPER_AGENT_HOME}/sdk/model-hub.json.
  */
-export function resolveDecisionCredentials(args, paths) {
-  const explicitKey = typeof args.apiKey === 'string' ? args.apiKey.trim() : '';
-  const explicitBase = typeof args.baseUrl === 'string' ? args.baseUrl.trim() : '';
+export function resolveDecisionCredentials(args = {}, paths = {}, deps = {}) {
+  const explicitKey = typeof args?.apiKey === 'string' ? args.apiKey.trim() : '';
+  const explicitBase = typeof args?.baseUrl === 'string' ? args.baseUrl.trim() : '';
   if (explicitKey) {
     return { apiKey: explicitKey, baseUrl: explicitBase || DEFAULT_DECISION_BASE_URL };
   }
-  try {
-    const hub = JSON.parse(readFileSync(paths.modelHubPath, 'utf8'));
-    const apiKey = String(hub?.decision?.apiKey || hub?.providers?.google?.apiKey || '').trim();
-    if (apiKey) {
-      return {
-        apiKey,
-        baseUrl: explicitBase || String(hub?.decision?.baseUrl || '').trim() || DEFAULT_DECISION_BASE_URL,
-      };
+  const getCreds = typeof deps?.getDecisionCredentials === 'function'
+    ? deps.getDecisionCredentials
+    : (typeof paths?.getDecisionCredentials === 'function' ? paths.getDecisionCredentials : undefined);
+  if (getCreds) {
+    try {
+      const hostCreds = getCreds();
+      const hostKey = typeof hostCreds?.apiKey === 'string' ? hostCreds.apiKey.trim() : '';
+      if (hostKey) {
+        return {
+          apiKey: hostKey,
+          baseUrl: explicitBase || (typeof hostCreds?.baseUrl === 'string' ? hostCreds.baseUrl.trim() : '') || DEFAULT_DECISION_BASE_URL,
+        };
+      }
+    } catch {
+      /* fall through */
     }
-  } catch {
-    /* fall through */
+  }
+  const hubPath = deps?.modelHubPath ?? paths?.modelHubPath;
+  if (hubPath) {
+    try {
+      const hub = JSON.parse(readFileSync(hubPath, 'utf8'));
+      const apiKey = String(hub?.decision?.apiKey || hub?.providers?.google?.apiKey || '').trim();
+      if (apiKey) {
+        return {
+          apiKey,
+          baseUrl: explicitBase || String(hub?.decision?.baseUrl || '').trim() || DEFAULT_DECISION_BASE_URL,
+        };
+      }
+    } catch {
+      /* fall through */
+    }
   }
   return undefined;
 }
@@ -813,7 +833,7 @@ function resolveSafeScreenshotPath(screenshotsDir, rawSavePath) {
   if (parentRel.startsWith('..') || isAbsolute(parentRel)) {
     return { error: 'savePath 目标目录越界，已拒绝。' };
   }
-  const safePath = join(realParent, candidate.slice(dirname(candidate).length + 1));
+  const safePath = join(resolve(screenshotsDir), parentRel, candidate.slice(dirname(candidate).length + 1));
   return { path: safePath };
 }
 
@@ -848,7 +868,7 @@ async function handleAct(ctx) {
   return success('电视操作', `${body.action} 成功${res.detail ? `：${res.detail}` : ''}`, res.json);
 }
 
-function redactConfigView(cfg, configPath) {
+function redactConfigView(cfg) {
   return {
     tvHost: cfg.tvHost,
     tvToken: cfg.tvToken ? '***' : '',
@@ -857,7 +877,6 @@ function redactConfigView(cfg, configPath) {
     dlnaPort: cfg.dlnaPort,
     sshTarget: cfg.sshTarget,
     appAliases: cfg.appAliases,
-    configPath,
   };
 }
 
@@ -902,7 +921,7 @@ function handleConfig(ctx) {
     changed.push('appAliases');
   }
   if (changed.length) saveConfig(paths, next);
-  return success('电视配置', changed.length ? `已更新：${changed.join('、')}` : '当前电视配置', redactConfigView(next, paths.configPath));
+  return success('电视配置', changed.length ? `已更新：${changed.join('、')}` : '当前电视配置', redactConfigView(next));
 }
 
 // ---------------------------------------------------------------------------
@@ -1145,7 +1164,7 @@ async function handleNavigate(ctx) {
   const searchText = (typeof args.searchText === 'string' && args.searchText.trim()) || extractQuoted(goal) || '';
   const trace = [];
 
-  const creds = resolveDecisionCredentials(args, ctx.paths);
+  const creds = resolveDecisionCredentials(args, ctx.paths, ctx.deps);
   if (!creds) {
     return failure('电视导航失败', '未找到 Gemini Decision API 密钥（args.apiKey 或 model-hub.json 的 decision.apiKey / providers.google.apiKey）。');
   }

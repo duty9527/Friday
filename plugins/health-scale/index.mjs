@@ -102,7 +102,7 @@ function isPidAlive(pid) {
 
 function isBleHelperPid(pid) {
   if (!isPidAlive(pid)) return false;
-  if (process.platform !== 'linux') return true;
+  if (process.platform !== 'linux') return false;
   try {
     const cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf8');
     const argv = cmdline.split('\0').filter(Boolean);
@@ -178,91 +178,99 @@ function loadScaleConfig(configPath) {
   };
 }
 
-function resolveScalePaths(args = {}, deps = {}) {
-  const dirOverride = args.dataDir ? { dataDir: String(args.dataDir) } : {};
-  return resolvePluginPaths('health-scale', { ...deps, ...dirOverride });
+function resolveScalePaths(_args = {}, deps = {}) {
+  return resolvePluginPaths('health-scale', deps);
 }
+
+const INITIALIZED_DB_PATHS = new Set();
 
 function openDb(paths, nowMs, config) {
   ensurePrivateDir(paths.pluginDataDir);
   const dbPath = join(paths.pluginDataDir, 'health.db');
+  const dbExistsBeforeOpen = existsSync(dbPath);
   const db = new DatabaseSync(dbPath);
   db.exec(`
     PRAGMA journal_mode = WAL;
     PRAGMA busy_timeout = 5000;
-
-    CREATE TABLE IF NOT EXISTS profiles (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      sex TEXT NOT NULL,
-      age INTEGER NOT NULL,
-      height_cm REAL NOT NULL,
-      target_weight_kg REAL,
-      unit TEXT NOT NULL DEFAULT 'kg',
-      is_default INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS devices (
-      mac TEXT PRIMARY KEY,
-      address TEXT NOT NULL,
-      name TEXT NOT NULL,
-      rssi INTEGER,
-      battery INTEGER,
-      charging INTEGER,
-      protocol_ver INTEGER,
-      device_subtype INTEGER,
-      model TEXT,
-      hardware_ver TEXT,
-      software_ver TEXT,
-      manufacturer TEXT,
-      support_funs_json TEXT,
-      raw_adv_json TEXT,
-      last_seen_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS measurements (
-      id TEXT PRIMARY KEY,
-      dedup_key TEXT UNIQUE,
-      profile_id TEXT NOT NULL,
-      measured_at INTEGER NOT NULL,
-      source TEXT NOT NULL,
-      device_mac TEXT,
-      weight_kg REAL NOT NULL,
-      weight_jin REAL NOT NULL,
-      weight_lb REAL NOT NULL,
-      weight_g INTEGER NOT NULL,
-      stable INTEGER NOT NULL DEFAULT 1,
-      impedance_measured INTEGER NOT NULL DEFAULT 0,
-      adcs_json TEXT,
-      impedances_json TEXT,
-      primary_ohm REAL,
-      secondary_ohm REAL,
-      alg_type INTEGER,
-      heart_rate INTEGER,
-      battery INTEGER,
-      charging INTEGER,
-      rssi INTEGER,
-      calibration_mode INTEGER,
-      over_weight INTEGER,
-      dianji INTEGER,
-      raw_meta_json TEXT,
-      note TEXT,
-      created_at INTEGER NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_measurements_profile_time
-      ON measurements(profile_id, measured_at DESC);
   `);
 
-  const profileCount = db.prepare('SELECT COUNT(*) AS cnt FROM profiles').get().cnt;
-  if (profileCount === 0 && config?.defaultProfile) {
-    const dp = config.defaultProfile;
-    db.prepare(`
-      INSERT INTO profiles (id, name, sex, age, height_cm, target_weight_kg, unit, is_default, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-    `).run(dp.id, dp.name, dp.sex, dp.age, dp.heightCm, dp.targetWeightKg, dp.unit, nowMs, nowMs);
+  if (!dbExistsBeforeOpen || !INITIALIZED_DB_PATHS.has(dbPath)) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS profiles (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        sex TEXT NOT NULL,
+        age INTEGER NOT NULL,
+        height_cm REAL NOT NULL,
+        target_weight_kg REAL,
+        unit TEXT NOT NULL DEFAULT 'kg',
+        is_default INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS devices (
+        mac TEXT PRIMARY KEY,
+        address TEXT NOT NULL,
+        name TEXT NOT NULL,
+        rssi INTEGER,
+        battery INTEGER,
+        charging INTEGER,
+        protocol_ver INTEGER,
+        device_subtype INTEGER,
+        model TEXT,
+        hardware_ver TEXT,
+        software_ver TEXT,
+        manufacturer TEXT,
+        support_funs_json TEXT,
+        raw_adv_json TEXT,
+        last_seen_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS measurements (
+        id TEXT PRIMARY KEY,
+        dedup_key TEXT UNIQUE,
+        profile_id TEXT NOT NULL,
+        measured_at INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        device_mac TEXT,
+        weight_kg REAL NOT NULL,
+        weight_jin REAL NOT NULL,
+        weight_lb REAL NOT NULL,
+        weight_g INTEGER NOT NULL,
+        stable INTEGER NOT NULL DEFAULT 1,
+        impedance_measured INTEGER NOT NULL DEFAULT 0,
+        adcs_json TEXT,
+        impedances_json TEXT,
+        primary_ohm REAL,
+        secondary_ohm REAL,
+        alg_type INTEGER,
+        heart_rate INTEGER,
+        battery INTEGER,
+        charging INTEGER,
+        rssi INTEGER,
+        calibration_mode INTEGER,
+        over_weight INTEGER,
+        dianji INTEGER,
+        raw_meta_json TEXT,
+        note TEXT,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_measurements_profile_time
+        ON measurements(profile_id, measured_at DESC);
+    `);
+
+    const profileCount = db.prepare('SELECT COUNT(*) AS cnt FROM profiles').get().cnt;
+    if (profileCount === 0 && config?.defaultProfile) {
+      const dp = config.defaultProfile;
+      db.prepare(`
+        INSERT INTO profiles (id, name, sex, age, height_cm, target_weight_kg, unit, is_default, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+      `).run(dp.id, dp.name, dp.sex, dp.age, dp.heightCm, dp.targetWeightKg, dp.unit, nowMs, nowMs);
+    }
+
+    INITIALIZED_DB_PATHS.add(dbPath);
   }
 
   return { db, dbPath };
@@ -1742,7 +1750,19 @@ function defaultSpawnMeasure(commandArgs) {
 // Action Handlers
 // ---------------------------------------------------------------------------
 
+function disabledBleResult() {
+  return {
+    ok: false,
+    notify: true,
+    title: '当前系统已关闭蓝牙体脂秤',
+    message: '沃莱 A1 蓝牙采集依赖 Linux BlueZ D-Bus，在当前平台（' + process.platform + '）已动态关闭；仍可查看历史看板与手动补录数据。',
+  };
+}
+
 async function handleScan(ctx) {
+  if (process.platform !== 'linux' && !ctx.hasInjectedBleRunner && !ctx.hasInjectedSpawnMeasure) {
+    return disabledBleResult();
+  }
   const timeoutSec = clamp(asFiniteNumber(ctx.args.timeoutSec ?? ctx.args.timeout) ?? 4, 1, 15);
   const targetMac = normalizeMac(ctx.args.targetMac ?? ctx.config.targetMac ?? DEFAULT_SCALE_MAC);
   const namePrefix = String(ctx.args.namePrefix ?? ctx.config.namePrefix ?? DEFAULT_NAME_PREFIX).trim() || DEFAULT_NAME_PREFIX;
@@ -1794,6 +1814,9 @@ async function handleScan(ctx) {
 }
 
 async function handleMeasureStart(ctx) {
+  if (process.platform !== 'linux' && !ctx.hasInjectedBleRunner && !ctx.hasInjectedSpawnMeasure) {
+    return disabledBleResult();
+  }
   const { activeProfile } = resolveProfilesAndActive(ctx.db, ctx.args.profileId);
   if (!activeProfile) {
     return {
@@ -1914,7 +1937,8 @@ async function handleMeasureStatus(ctx) {
 
 async function handleMeasureStop(ctx) {
   const sPath = sessionFilePath(ctx.dataDir);
-  if (existsSync(sPath)) {
+  const hadSession = existsSync(sPath);
+  if (hadSession) {
     const raw = readJsonSafe(sPath, null);
     if (raw) {
       if (raw.pid) {
@@ -1928,6 +1952,9 @@ async function handleMeasureStop(ctx) {
       };
       writeJsonAtomic(sPath, next);
     }
+  }
+  if (process.platform !== 'linux' && !ctx.hasInjectedBleRunner && !ctx.hasInjectedSpawnMeasure && !hadSession) {
+    return disabledBleResult();
   }
   const { activeProfile } = resolveProfilesAndActive(ctx.db, ctx.args.profileId);
   const session = readLiveSessionSnapshot(ctx.dataDir, ctx.db, activeProfile?.id ?? null, ctx.nowMs, false);
@@ -2238,7 +2265,6 @@ function handleConfig(ctx) {
     message: `${changed ? '✅ 已保存配置' : '⚙️ 当前配置'}：targetMac=${next.targetMac || '(未绑定，按前缀扫描)'}, namePrefix=${next.namePrefix}, defaultProfile=${next.defaultProfile ? next.defaultProfile.name : '(未设置)'}`,
     data: {
       config: next,
-      configPath: paths.configPath,
     },
   };
 }
@@ -2278,6 +2304,8 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
     db,
     nowMs,
     signal: deps.signal,
+    hasInjectedBleRunner: typeof deps.bleRunner === 'function',
+    hasInjectedSpawnMeasure: typeof deps.spawnMeasure === 'function',
     bleRunner: deps.bleRunner || defaultBleRunner,
     spawnMeasure: deps.spawnMeasure || defaultSpawnMeasure,
   };

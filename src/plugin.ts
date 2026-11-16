@@ -17,6 +17,7 @@ export interface PluginManifest extends PluginView {
   dir: string;
   dataDir: string;
   enabled: boolean;
+  platforms?: string[];
   runtime: PluginRuntimeMode;
   voiceFastpath: boolean;
 }
@@ -38,6 +39,7 @@ export interface PluginExecutionContext {
   dataDir: string;
   env: Record<string, string | undefined>;
   signal: AbortSignal;
+  getDecisionCredentials?: () => { apiKey: string; baseUrl?: string } | undefined;
   callPlugin: (
     targetPlugin: string,
     action?: string,
@@ -112,7 +114,17 @@ function resolveRuntimeMode(name: string, entryPath: string, rawRuntime: unknown
   return 'subprocess';
 }
 
-function loadCachedPluginManifest(homeDir: string, pluginName: string, dir: string): PluginManifest | undefined {
+function isPlatformSupported(platforms: string[] | undefined, platform: string): boolean {
+  if (!platforms || platforms.length === 0) return true;
+  return platforms.includes(platform);
+}
+
+function loadCachedPluginManifest(
+  homeDir: string,
+  pluginName: string,
+  dir: string,
+  platform: string = process.platform,
+): PluginManifest | undefined {
   const manifestPath = join(dir, 'plugin.json');
   const defaultEntryPath = join(dir, 'index.mjs');
   const manifestStat = statBigIntSafe(manifestPath);
@@ -125,6 +137,7 @@ function loadCachedPluginManifest(homeDir: string, pluginName: string, dir: stri
     if (entryStat && cached.entryMtimeNs === entryStat.mtimeNs && cached.entrySize === entryStat.size) {
       return {
         ...cached.base,
+        enabled: cached.base.enabled && isPlatformSupported(cached.base.platforms, platform),
         dataDir: resolvePluginDataDir(homeDir, pluginName),
       };
     }
@@ -176,7 +189,10 @@ function loadCachedPluginManifest(homeDir: string, pluginName: string, dir: stri
     : actions.map(actionName => ({ name: actionName, defaultArgs: {} }));
 
   const promptHint = typeof raw.promptHint === 'string' && raw.promptHint.trim() ? raw.promptHint.trim() : undefined;
-  const enabled = raw.enabled !== false;
+  const platforms = Array.isArray(raw.platforms)
+    ? raw.platforms.map(p => String(p).trim()).filter(Boolean)
+    : undefined;
+  const staticEnabled = raw.enabled !== false;
   const runtime = resolveRuntimeMode(pluginName, entryPath, raw.runtime);
   const voiceFastpath = raw.voiceFastpath === true;
 
@@ -187,7 +203,8 @@ function loadCachedPluginManifest(homeDir: string, pluginName: string, dir: stri
     entry: entryFile,
     entryPath,
     dir,
-    enabled,
+    enabled: staticEnabled,
+    ...(platforms && platforms.length > 0 ? { platforms } : {}),
     runtime,
     ...(promptHint ? { promptHint } : {}),
     voiceFastpath,
@@ -207,6 +224,7 @@ function loadCachedPluginManifest(homeDir: string, pluginName: string, dir: stri
 
   return {
     ...base,
+    enabled: staticEnabled && isPlatformSupported(platforms, platform),
     dataDir: resolvePluginDataDir(homeDir, pluginName),
   };
 }
@@ -229,12 +247,13 @@ export function toPluginView(manifest: PluginManifest): PluginView {
 }
 
 /** Lists sanitized `PluginView` summaries suitable for `/api/view` and LLM context. */
-export function listPluginViews(home: string): PluginView[] {
-  return listPluginsSync(home).map(toPluginView);
+export function listPluginViews(home: string, options?: { platform?: string }): PluginView[] {
+  return listPluginsSync(home, options).map(toPluginView);
 }
 
-export function listPluginsSync(home: string): PluginManifest[] {
+export function listPluginsSync(home: string, options?: { platform?: string }): PluginManifest[] {
   const resolvedHome = resolveFridayHome(home);
+  const platform = options?.platform ?? process.platform;
   const seen = new Set<string>();
   const manifests: PluginManifest[] = [];
   for (const root of pluginRoots(resolvedHome)) {
@@ -248,7 +267,7 @@ export function listPluginsSync(home: string): PluginManifest[] {
     for (const entry of entries) {
       if (!entry.isDirectory() || !VALID_PLUGIN_NAME.test(entry.name) || seen.has(entry.name)) continue;
       const dir = join(root, entry.name);
-      const manifest = loadCachedPluginManifest(resolvedHome, entry.name, dir);
+      const manifest = loadCachedPluginManifest(resolvedHome, entry.name, dir, platform);
       if (!manifest) continue;
       seen.add(entry.name);
       manifests.push(manifest);
@@ -257,8 +276,8 @@ export function listPluginsSync(home: string): PluginManifest[] {
   return manifests;
 }
 
-export async function listPlugins(home: string): Promise<PluginManifest[]> {
-  return listPluginsSync(home);
+export async function listPlugins(home: string, options?: { platform?: string }): Promise<PluginManifest[]> {
+  return listPluginsSync(home, options);
 }
 
 interface InProcessPluginModule {
@@ -309,11 +328,33 @@ function buildPluginEnv(homeDir: string, pluginDataDir: string): Record<string, 
   return cleanEnv;
 }
 
+function readHostDecisionCredentials(homeDir: string): { apiKey: string; baseUrl?: string } | undefined {
+  try {
+    const hubPath = join(resolve(homeDir), 'sdk', 'model-hub.json');
+    if (!existsSync(hubPath)) return undefined;
+    const hub = JSON.parse(readFileSync(hubPath, 'utf8')) as {
+      decision?: { apiKey?: unknown; baseUrl?: unknown };
+      providers?: { google?: { apiKey?: unknown } };
+    };
+    const decisionKey = typeof hub?.decision?.apiKey === 'string' ? hub.decision.apiKey.trim() : '';
+    const googleKey = typeof hub?.providers?.google?.apiKey === 'string' ? hub.providers.google.apiKey.trim() : '';
+    const apiKey = decisionKey || googleKey;
+    if (!apiKey) return undefined;
+    const baseUrl = typeof hub?.decision?.baseUrl === 'string' && hub.decision.baseUrl.trim()
+      ? hub.decision.baseUrl.trim()
+      : undefined;
+    return { apiKey, ...(baseUrl ? { baseUrl } : {}) };
+  } catch {
+    return undefined;
+  }
+}
+
 function buildInProcessContext(
   homeDir: string,
   pluginDataDir: string,
   signal: AbortSignal,
   defaultTimeoutMs: number,
+  pluginName?: string,
 ): PluginExecutionContext {
   return {
     homeDir,
@@ -321,6 +362,9 @@ function buildInProcessContext(
     dataDir: pluginDataDir,
     env: buildPluginEnv(homeDir, pluginDataDir),
     signal,
+    ...(pluginName === 'tv-agent'
+      ? { getDecisionCredentials: () => readHostDecisionCredentials(homeDir) }
+      : {}),
     callPlugin: (targetPlugin, targetAction = 'status', targetArgs = {}, targetTimeoutMs) => {
       const cleanTarget = targetPlugin.trim();
       if (!VALID_PLUGIN_NAME.test(cleanTarget)) {
@@ -444,7 +488,7 @@ export async function runPluginInProcess(
     timeoutMs,
     `Plugin "${cleanName}" action "${action}" timed out after ${timeoutMs}ms`,
     options?.signal,
-    signal => runner(action, args, buildInProcessContext(resolvedHome, pluginDataDir, signal, timeoutMs)),
+    signal => runner(action, args, buildInProcessContext(resolvedHome, pluginDataDir, signal, timeoutMs, cleanName)),
   );
   return formatPluginResult(cleanName, action, rawResult);
 }
@@ -522,7 +566,7 @@ export async function tryPluginVoiceFastpath(
         options?.signal,
         signal => mod.handleVoiceFastpath!(
           request,
-          buildInProcessContext(resolvedHome, pluginDataDir, signal, timeoutMs),
+          buildInProcessContext(resolvedHome, pluginDataDir, signal, timeoutMs, manifest.name),
         ),
       );
       if (result && result.handled) {

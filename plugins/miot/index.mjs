@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import dgram from 'node:dgram';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -10,6 +10,7 @@ import {
   clampInt,
   errMsg,
   readConfig,
+  resolveHomeDir,
   resolvePluginPaths,
   writeConfig,
   writeJsonAtomic,
@@ -20,6 +21,7 @@ import {
   execSshText,
   parseSshSpec as sharedParseSshSpec,
   parseSshTargets as sharedParseSshTargets,
+  resolvePrivateRunDir,
   shellQuote,
 } from '../_shared/ssh.mjs';
 import { handleMiotVoiceFastpath } from './fastpath.mjs';
@@ -1092,7 +1094,7 @@ function makeCtx(args, deps) {
     udp: deps.udpCall ?? udpCall,
     sleep: deps.sleepFn ?? delay,
     now: deps.nowFn ?? Date.now,
-    fetchRows: deps.fetchHubRawRows ?? (opts => defaultFetchHubRawRows({ ...opts, sshBinaryExec: sshBin })),
+    fetchRows: deps.fetchHubRawRows ?? (opts => defaultFetchHubRawRows({ ...opts, homeDir: paths.homeDir, sshBinaryExec: sshBin })),
     tvRun,
     snapshot: undefined,
   };
@@ -1125,7 +1127,7 @@ function extractTar(tarBuffer, destDir) {
 
 /**
  * Stream the hub's devInfo.db (+ optional hot_data_v2.db) over SSH into a temp dir and read them with node:sqlite.
- * @param {{ target?: any; sshBinaryExec?: Function; timeoutMs?: number; includeHotData?: boolean }} [opts]
+ * @param {{ target?: any; sshBinaryExec?: Function; timeoutMs?: number; includeHotData?: boolean; homeDir?: string }} [opts]
  * @returns {Promise<{ devInfoRows: any[]; hotDataRows: any[] }>}
  */
 export async function defaultFetchHubRawRows({
@@ -1133,6 +1135,7 @@ export async function defaultFetchHubRawRows({
   sshBinaryExec = defaultSshBinaryExec,
   timeoutMs = HUB_FETCH_TIMEOUT_MS,
   includeHotData = true,
+  homeDir,
 } = {}) {
   const tarCmd = includeHotData === false ? HUB_DEVINFO_TAR_COMMAND : HUB_TAR_COMMAND;
   const res = await sshBinaryExec(target, tarCmd, { timeoutMs });
@@ -1140,7 +1143,15 @@ export async function defaultFetchHubRawRows({
   if (res.code !== 0 || stdout.length === 0) {
     throw new MiotError(`无法从中枢 ${target.userHost} 读取设备库 (ssh code=${res.code})：${String(res.stderr ?? '').trim().slice(0, 200) || '无输出'}`);
   }
-  const tmp = mkdtempSync(join(tmpdir(), 'friday-miot-'));
+  let baseTmpDir;
+  try {
+    const resolvedHome = typeof homeDir === 'string' && homeDir.trim() ? homeDir.trim() : resolveHomeDir();
+    baseTmpDir = resolvePrivateRunDir(resolvedHome);
+  } catch {
+    baseTmpDir = tmpdir();
+  }
+  const tmp = mkdtempSync(join(baseTmpDir, 'friday-miot-'));
+  chmodSync(tmp, 0o700);
   let devDb;
   let hotDb;
   try {
@@ -2018,7 +2029,6 @@ async function handleConfig(ctx) {
   return success('米家配置', `${changed ? '✅ 已保存配置：' : '⚙️ 当前配置：'}${text}`, {
     config: next,
     speakerResolved: speaker ? { id: speaker.id, userHost: speaker.userHost, source: speaker.source } : null,
-    configPath: paths.configPath,
   });
 }
 

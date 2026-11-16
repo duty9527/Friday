@@ -586,10 +586,9 @@ export async function runAction(action = 'status', args = {}, depsOrCtx = {}) {
         ok: true,
         notify: false,
         title: '基金插件配置',
-        message: `${changed ? '✅ 已保存基金配置' : '⚙️ 当前基金配置'}：共 ${dbHoldings.length} 只持仓（config=${paths.configPath}）。`,
+        message: `${changed ? '✅ 已保存基金配置' : '⚙️ 当前基金配置'}：共 ${dbHoldings.length} 只持仓。`,
         data: {
           config: next,
-          configPath: paths.configPath,
           dbHoldingCount: dbHoldings.length,
         },
       };

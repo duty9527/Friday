@@ -56,6 +56,7 @@ export function initTimerPluginHub(): TimerPluginHubController {
     }
     let added = 0;
     for (const plugin of plugins) {
+      if (plugin.enabled === false) continue;
       if (added >= 4) break;
       const spec = plugin.actionSpecs?.[0] ?? (plugin.actions[0] ? { name: plugin.actions[0] } : undefined);
       if (!spec) continue;
@@ -267,6 +268,9 @@ export function initTimerPluginHub(): TimerPluginHubController {
         node('strong', `${plugin.title} (${plugin.name})`, 'hub-card-title'),
         node('span', `${plugin.actions.length} 个动作`, 'hub-badge badge-teal'),
       );
+      if (plugin.enabled === false) {
+        titleGroup.append(node('span', '⏸ 当前平台/配置已禁用', 'hub-badge badge-slate'));
+      }
       head.append(titleGroup);
       card.append(head);
 

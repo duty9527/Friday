@@ -2,6 +2,9 @@
   "name": "health-scale",
   "title": "沃莱 A1 智能体脂与健康管理",
   "runtime": "in-process",
+  "platforms": [
+    "linux"
+  ],
   "promptHint": "管理体脂秤成员档案（profile-save/delete）、启动蓝牙称重（scan/measure-start/status/stop）、手动补录（record-add）或配置设备 MAC 与默认档案（config）。",
   "description": "连接沃莱 A1 (AFU-WL*) 蓝牙体脂秤，采集实时体重、双频生物电阻抗、离线历史记录与电池遥测，计算人体成分与代谢指标并持久化趋势档案；设备 MAC 与可选默认档案由 <pluginDataDir>/config.json 加载。",
   "entry": "index.mjs",

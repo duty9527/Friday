@@ -577,7 +577,7 @@ function handleConfig(args, paths) {
     message: updated
       ? `✅ 已保存配置：sshTarget=${next.sshTarget ?? '(自动发现)'}, defaultIntervalMs=${next.defaultIntervalMs ?? DEFAULT_INTERVAL_MS}, defaultFrames=${next.defaultFrames ?? '(按按键默认)'}`
       : `⚙️ 当前配置：sshTarget=${next.sshTarget ?? '(自动发现)'}, defaultIntervalMs=${next.defaultIntervalMs ?? DEFAULT_INTERVAL_MS}, defaultFrames=${next.defaultFrames ?? '(按按键默认)'}`,
-    data: { configPath: paths.configPath, config: next, updated },
+    data: { config: next, updated },
   };
 }
 
