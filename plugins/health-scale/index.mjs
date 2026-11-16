@@ -1755,7 +1755,7 @@ function disabledBleResult() {
     ok: false,
     notify: true,
     title: '当前系统已关闭蓝牙体脂秤',
-    message: '沃莱 A1 蓝牙采集依赖 Linux BlueZ D-Bus，在当前平台（' + process.platform + '）已动态关闭；仍可查看历史看板与手动补录数据。',
+    message: `沃莱 A1 蓝牙采集依赖 Linux BlueZ D-Bus，在当前平台（${process.platform}）已动态关闭。`,
   };
 }
 

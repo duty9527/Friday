@@ -68,7 +68,10 @@ test('health-scale rejects BLE actions on non-linux without stubs, ignores args.
         assert.equal(res.ok, false, `${bleAction} should return ok: false on ${process.platform}`);
         assert.equal(res.notify, true);
         assert.equal(res.title, '当前系统已关闭蓝牙体脂秤');
-        assert.match(String(res.message), /Linux BlueZ D-Bus/);
+        assert.equal(
+          res.message,
+          `沃莱 A1 蓝牙采集依赖 Linux BlueZ D-Bus，在当前平台（${process.platform}）已动态关闭。`,
+        );
       }
     }
 
