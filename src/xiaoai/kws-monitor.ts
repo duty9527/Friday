@@ -187,6 +187,20 @@ export interface XiaoaiKwsSpeakerGate {
     samples?: Float32Array;
     trimmed?: boolean;
   };
+  verifyUtteranceAsync?: (params: {
+    channel: ImChannelConfig;
+    target: XiaoaiSshTarget;
+    keyword: string;
+    samples: Float32Array;
+    sampleRate: number;
+  }) => Promise<{
+    matched: boolean;
+    speaker?: XiaoaiMatchedSpeaker;
+    score: number;
+    threshold: number;
+    samples?: Float32Array;
+    trimmed?: boolean;
+  }>;
 }
 
 export interface XiaoaiKwsWakeEvent {
@@ -2290,13 +2304,17 @@ export class XiaoaiKwsMonitor {
       const gate = this.options.speakerGate;
       const gateBypassed = gate?.isBypassed?.(worker.channel.id, worker.target.id) ?? false;
       if (gate && !gateBypassed && gate.isActive(worker.channel, worker.target)) {
-        const verdict = gate.verifyUtterance({
+        const gateParams = {
           channel: worker.channel,
           target: worker.target,
           keyword,
           samples: audioForAsr,
           sampleRate: SAMPLE_RATE,
-        });
+        };
+        const verdict = await (gate.verifyUtteranceAsync
+          ? gate.verifyUtteranceAsync(gateParams)
+          : gate.verifyUtterance(gateParams));
+        if (this.closed || worker.stopped) return;
         if (!verdict.matched) {
           console.log(
             `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: utterance rejected by speaker gate (wake="${keyword}", score=${verdict.score.toFixed(3)} < ${verdict.threshold.toFixed(3)})`,

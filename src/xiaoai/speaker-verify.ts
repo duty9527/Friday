@@ -369,6 +369,102 @@ export function trimWakeSpeechWindow(
   return samples.subarray(startSample, endSample);
 }
 
+function yieldEventLoop(): Promise<void> {
+  return new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+function buildUtteranceWindowPlan(samplesLength: number, sampleRate: number): {
+  winLen: number;
+  earlyLimit: number;
+  starts: number[];
+} {
+  // Sliding-window scan to catch "user spoke first, then TV dialogue kept VAD open"
+  const winLen = Math.round(sampleRate * 1.2);
+  const hop = Math.round(sampleRate * 0.5);
+  const earlyLimit = Math.round(sampleRate * 1.5);
+  const starts: number[] = [];
+  for (let start = 0; start + winLen <= samplesLength; start += hop) {
+    starts.push(start);
+  }
+  const lastPossible = samplesLength - winLen;
+  const prevLast = starts.at(-1);
+  if (lastPossible > 0 && (prevLast === undefined || lastPossible - prevLast >= Math.round(hop * 0.5))) {
+    starts.push(lastPossible);
+  }
+  return { winLen, earlyLimit, starts };
+}
+
+function isFullAndTailConsistentMatch(
+  fullRes: XiaoaiSpeakerMatchResult,
+  tailRes: XiaoaiSpeakerMatchResult,
+): boolean {
+  return Boolean(
+    fullRes.matched
+    && tailRes.matched
+    && (!fullRes.speaker || !tailRes.speaker || fullRes.speaker.id === tailRes.speaker.id),
+  );
+}
+
+function finalizeTrimmedUtterance(params: {
+  samples: Float32Array;
+  sampleRate: number;
+  threshold: number;
+  starts: number[];
+  winLen: number;
+  anchorProfile: XiaoaiSpeakerProfile;
+  anchorStartIdx: number;
+  bestAnchorScore: number;
+  windowScores: number[];
+}): XiaoaiSpeakerUtteranceCheck {
+  const {
+    samples,
+    sampleRate,
+    threshold,
+    starts,
+    winLen,
+    anchorProfile,
+    anchorStartIdx,
+    bestAnchorScore,
+    windowScores,
+  } = params;
+  const sustainFloor = Math.max(0.22, threshold - 0.05);
+  const anchorStart = starts[anchorStartIdx] ?? 0;
+  let lastGoodWindowEnd = anchorStart + winLen;
+  for (let offset = 1; offset < windowScores.length; offset++) {
+    const score = windowScores[offset] ?? 0;
+    const start = starts[anchorStartIdx + offset];
+    if (start === undefined) break;
+    if (score >= sustainFloor) {
+      lastGoodWindowEnd = start + winLen;
+      continue;
+    }
+    const nextScore = offset + 1 < windowScores.length ? (windowScores[offset + 1] ?? 0) : 0;
+    if (nextScore >= threshold) {
+      lastGoodWindowEnd = start + winLen;
+      continue;
+    }
+    break;
+  }
+
+  const cutEnd = Math.min(samples.length, lastGoodWindowEnd + Math.round(sampleRate * 0.15));
+  const trimmed = cutEnd < samples.length - Math.round(sampleRate * 0.35);
+  const finalSamples = trimmed ? samples.subarray(0, cutEnd) : samples;
+
+  return {
+    matched: true,
+    speaker: {
+      id: anchorProfile.id,
+      name: anchorProfile.name,
+      role: anchorProfile.role,
+      score: bestAnchorScore,
+    },
+    score: bestAnchorScore,
+    threshold,
+    samples: finalSamples,
+    trimmed,
+  };
+}
+
 export class XiaoaiSpeakerManager {
   readonly kwsDir: string;
   readonly speakerModelsDir: string;
@@ -801,13 +897,12 @@ export class XiaoaiSpeakerManager {
     });
   }
 
-  verifyAndTrimUtterance(
+  private verifyShortOrInactiveUtterance(
+    threshold: number,
     samples: Float32Array,
-    sampleRate = SPEAKER_SAMPLE_RATE,
+    sampleRate: number,
     opts?: { speakerVerify?: boolean; thresholdOverride?: number },
-  ): XiaoaiSpeakerUtteranceCheck {
-    const data = this.loadRegistry();
-    const threshold = clampThreshold(opts?.thresholdOverride ?? data.threshold, data.threshold);
+  ): XiaoaiSpeakerUtteranceCheck | undefined {
     if (!this.isVerificationActive(opts)) {
       return { matched: true, score: 1, threshold, samples, trimmed: false };
     }
@@ -827,41 +922,44 @@ export class XiaoaiSpeakerManager {
       });
       return { ...res, samples, trimmed: false };
     }
+    return undefined;
+  }
+
+  private matchTailSlice(
+    samples: Float32Array,
+    sampleRate: number,
+    threshold: number,
+    opts?: { speakerVerify?: boolean },
+  ): XiaoaiSpeakerMatchResult {
+    const tailLen = Math.round(sampleRate * 1.2);
+    const tailSlice = samples.subarray(Math.max(0, samples.length - tailLen));
+    const tailThreshold = Math.max(0.22, threshold - 0.06);
+    return this.matchSamples(tailSlice, sampleRate, {
+      speakerVerify: opts?.speakerVerify,
+      thresholdOverride: tailThreshold,
+    });
+  }
+
+  verifyAndTrimUtterance(
+    samples: Float32Array,
+    sampleRate = SPEAKER_SAMPLE_RATE,
+    opts?: { speakerVerify?: boolean; thresholdOverride?: number },
+  ): XiaoaiSpeakerUtteranceCheck {
+    const data = this.loadRegistry();
+    const threshold = clampThreshold(opts?.thresholdOverride ?? data.threshold, data.threshold);
+    const quick = this.verifyShortOrInactiveUtterance(threshold, samples, sampleRate, opts);
+    if (quick) return quick;
 
     const fullRes = this.matchSamples(samples, sampleRate, {
       speakerVerify: opts?.speakerVerify,
       thresholdOverride: threshold,
     });
-    const tailLen = Math.round(sampleRate * 1.2);
-    const tailSlice = samples.subarray(Math.max(0, samples.length - tailLen));
-    const tailThreshold = Math.max(0.22, threshold - 0.06);
-    const tailRes = this.matchSamples(tailSlice, sampleRate, {
-      speakerVerify: opts?.speakerVerify,
-      thresholdOverride: tailThreshold,
-    });
-
-    if (
-      fullRes.matched
-      && tailRes.matched
-      && (!fullRes.speaker || !tailRes.speaker || fullRes.speaker.id === tailRes.speaker.id)
-    ) {
+    const tailRes = this.matchTailSlice(samples, sampleRate, threshold, opts);
+    if (isFullAndTailConsistentMatch(fullRes, tailRes)) {
       return { ...fullRes, samples, trimmed: false };
     }
 
-    // Sliding-window scan to catch "user spoke first, then TV dialogue kept VAD open"
-    const winLen = Math.round(sampleRate * 1.2);
-    const hop = Math.round(sampleRate * 0.5);
-    const earlyLimit = Math.round(sampleRate * 1.5);
-    const starts: number[] = [];
-    for (let start = 0; start + winLen <= samples.length; start += hop) {
-      starts.push(start);
-    }
-    const lastPossible = samples.length - winLen;
-    const prevLast = starts.at(-1);
-    if (lastPossible > 0 && (prevLast === undefined || lastPossible - prevLast >= Math.round(hop * 0.5))) {
-      starts.push(lastPossible);
-    }
-
+    const { winLen, earlyLimit, starts } = buildUtteranceWindowPlan(samples.length, sampleRate);
     let anchorProfile: XiaoaiSpeakerProfile | undefined;
     let anchorStartIdx = -1;
     let bestAnchorScore = 0;
@@ -897,7 +995,6 @@ export class XiaoaiSpeakerManager {
       };
     }
 
-    const sustainFloor = Math.max(0.22, threshold - 0.05);
     const windowScores: number[] = [];
     for (let i = anchorStartIdx; i < starts.length; i++) {
       const start = starts[i];
@@ -909,41 +1006,103 @@ export class XiaoaiSpeakerManager {
       windowScores.push(score);
     }
 
-    const anchorStart = starts[anchorStartIdx] ?? 0;
-    let lastGoodWindowEnd = anchorStart + winLen;
-    for (let offset = 1; offset < windowScores.length; offset++) {
-      const score = windowScores[offset] ?? 0;
-      const start = starts[anchorStartIdx + offset];
-      if (start === undefined) break;
-      if (score >= sustainFloor) {
-        lastGoodWindowEnd = start + winLen;
-        continue;
-      }
-      const nextScore = offset + 1 < windowScores.length ? (windowScores[offset + 1] ?? 0) : 0;
-      if (nextScore >= threshold) {
-        lastGoodWindowEnd = start + winLen;
-        continue;
-      }
-      break;
+    return finalizeTrimmedUtterance({
+      samples,
+      sampleRate,
+      threshold,
+      starts,
+      winLen,
+      anchorProfile,
+      anchorStartIdx,
+      bestAnchorScore,
+      windowScores,
+    });
+  }
+
+  async verifyAndTrimUtteranceAsync(
+    samples: Float32Array,
+    sampleRate = SPEAKER_SAMPLE_RATE,
+    opts?: { speakerVerify?: boolean; thresholdOverride?: number },
+  ): Promise<XiaoaiSpeakerUtteranceCheck> {
+    const data = this.loadRegistry();
+    const threshold = clampThreshold(opts?.thresholdOverride ?? data.threshold, data.threshold);
+    const quick = this.verifyShortOrInactiveUtterance(threshold, samples, sampleRate, opts);
+    if (quick) return quick;
+
+    await yieldEventLoop();
+    const fullRes = this.matchSamples(samples, sampleRate, {
+      speakerVerify: opts?.speakerVerify,
+      thresholdOverride: threshold,
+    });
+    await yieldEventLoop();
+    const tailRes = this.matchTailSlice(samples, sampleRate, threshold, opts);
+    if (isFullAndTailConsistentMatch(fullRes, tailRes)) {
+      await yieldEventLoop();
+      return { ...fullRes, samples, trimmed: false };
     }
 
-    const cutEnd = Math.min(samples.length, lastGoodWindowEnd + Math.round(sampleRate * 0.15));
-    const trimmed = cutEnd < samples.length - Math.round(sampleRate * 0.35);
-    const finalSamples = trimmed ? samples.subarray(0, cutEnd) : samples;
+    const { winLen, earlyLimit, starts } = buildUtteranceWindowPlan(samples.length, sampleRate);
+    let anchorProfile: XiaoaiSpeakerProfile | undefined;
+    let anchorStartIdx = -1;
+    let bestAnchorScore = 0;
 
-    return {
-      matched: true,
-      speaker: {
-        id: anchorProfile.id,
-        name: anchorProfile.name,
-        role: anchorProfile.role,
-        score: bestAnchorScore,
-      },
-      score: bestAnchorScore,
+    for (let i = 0; i < starts.length; i++) {
+      const start = starts[i];
+      if (start === undefined) continue;
+      if (start > earlyLimit) break;
+      await yieldEventLoop();
+      const slice = samples.subarray(start, start + winLen);
+      const winMatch = this.matchSamples(slice, sampleRate, {
+        speakerVerify: opts?.speakerVerify,
+        thresholdOverride: threshold,
+      });
+      if (winMatch.matched && winMatch.speaker) {
+        const matchedSpeakerId = winMatch.speaker.id;
+        const found = data.profiles.find((p) => p.id === matchedSpeakerId);
+        if (found) {
+          anchorProfile = found;
+          anchorStartIdx = i;
+          bestAnchorScore = winMatch.score;
+          break;
+        }
+      }
+    }
+
+    if (!anchorProfile || anchorStartIdx < 0) {
+      await yieldEventLoop();
+      return {
+        ...fullRes,
+        matched: false,
+        samples,
+        trimmed: false,
+        reason: fullRes.reason ?? 'below_threshold',
+      };
+    }
+
+    const windowScores: number[] = [];
+    for (let i = anchorStartIdx; i < starts.length; i++) {
+      const start = starts[i];
+      if (start === undefined) continue;
+      await yieldEventLoop();
+      const slice = samples.subarray(start, start + winLen);
+      const emb = this.extractEmbedding(slice, sampleRate);
+      const score = emb ? scoreEmbeddingAgainstProfile(emb, anchorProfile) : 0;
+      if (score > bestAnchorScore) bestAnchorScore = score;
+      windowScores.push(score);
+    }
+
+    await yieldEventLoop();
+    return finalizeTrimmedUtterance({
+      samples,
+      sampleRate,
       threshold,
-      samples: finalSamples,
-      trimmed,
-    };
+      starts,
+      winLen,
+      anchorProfile,
+      anchorStartIdx,
+      bestAnchorScore,
+      windowScores,
+    });
   }
 
   close(): void {

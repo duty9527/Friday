@@ -6,11 +6,14 @@ import {
   computeSemanticContentHash,
   cosineSimilarity,
   deserializeEmbedding,
+  EN_STOPWORDS,
+  extractConceptTerms,
   l2Normalize,
   normalizeCwd,
   normalizeTopicForDedup,
   serializeEmbedding,
   tokenizeSearchQuery,
+  ZH_STOPWORDS,
   type SemanticEmbedder,
 } from '../semantic.js';
 import type { ContextSearchHit, MemoryCard, MemoryDirectory, MemorySynapse, SynapseRelation } from '../view.js';
@@ -108,6 +111,42 @@ function decodeMemoryRow(row: Record<string, unknown>): MemoryCard {
     card.importance = Number(row.importance);
   }
   return card;
+}
+
+function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, ch => `\\${ch}`);
+}
+
+function extractLexicalSqlKeywords(rawQuery: string): string[] {
+  const trimmed = rawQuery.trim();
+  if (!trimmed) return [];
+  const { lowerQuery, tokens } = tokenizeSearchQuery(trimmed);
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (term: string) => {
+    const clean = term.trim().toLowerCase();
+    if (!clean || seen.has(clean)) return;
+    seen.add(clean);
+    out.push(clean);
+  };
+
+  for (const token of tokens) {
+    if (token.length < 2 || token.length > 64) continue;
+    if (EN_STOPWORDS.has(token) || ZH_STOPWORDS.has(token)) continue;
+    const isPureCjk = /^[\u4e00-\u9fff\u3400-\u4dbf]+$/.test(token);
+    if (!isPureCjk || token.length <= 6) {
+      push(token);
+    }
+  }
+  for (const concept of extractConceptTerms(trimmed)) {
+    if (concept.length >= 2 && concept.length <= 64) {
+      push(concept);
+    }
+  }
+  if (out.length === 0 && lowerQuery.length > 0) {
+    push(lowerQuery.slice(0, 64));
+  }
+  return out.slice(0, 16);
 }
 
 /**
@@ -664,6 +703,94 @@ export class MemoryStore {
     return { totalActive, truncated: totalActive > items.length, items };
   }
 
+  private collectExtendedMemoryCandidates(options: {
+    includeSuperseded: boolean;
+    queryText?: string;
+    queryVec?: Float32Array;
+    semanticThreshold: number;
+    cwd?: string;
+    excludeCwdConflict?: boolean;
+  }): MemoryCard[] {
+    const baseCards = this.listMemories({
+      includeSuperseded: options.includeSuperseded,
+      limit: 300,
+    });
+    const byId = new Map<string, MemoryCard>(baseCards.map(card => [card.id, card]));
+    const skippedIds = new Set<string>();
+
+    const queryVec = options.queryVec;
+    if (queryVec) {
+      const vecMatches: Array<{ memoryId: string; sim: number; updatedAt: number }> = [];
+      for (const [memoryId, cached] of this.embeddingCache) {
+        if (byId.has(memoryId)) continue;
+        if (cached.vector.length !== queryVec.length) continue;
+        if (this.semantic && cached.modelId !== this.semantic.modelId) continue;
+        const sim = cosineSimilarity(queryVec, cached.vector);
+        if (sim >= options.semanticThreshold) {
+          vecMatches.push({ memoryId, sim, updatedAt: cached.updatedAt });
+        }
+      }
+      if (vecMatches.length > 0) {
+        vecMatches.sort((a, b) => b.sim - a.sim || b.updatedAt - a.updatedAt);
+        const topIds = vecMatches.slice(0, 100).map(item => item.memoryId);
+        const chunkSize = 50;
+        const supersededFilter = options.includeSuperseded ? '' : ' AND superseded_by IS NULL';
+        for (let offset = 0; offset < topIds.length; offset += chunkSize) {
+          const chunk = topIds.slice(offset, offset + chunkSize);
+          const placeholders = chunk.map(() => '?').join(',');
+          const rows = this.db.prepare(
+            `SELECT ${MEMORY_SELECT_COLS} FROM memories WHERE id IN (${placeholders})${supersededFilter}`,
+          ).all(...chunk);
+          for (const row of rows) {
+            const card = decodeMemoryRow(row);
+            if (options.excludeCwdConflict && hasCwdConflict(options.cwd, card.cwd)) {
+              skippedIds.add(card.id);
+              continue;
+            }
+            byId.set(card.id, card);
+          }
+        }
+      }
+    }
+
+    const qText = options.queryText?.trim() ?? '';
+    if (baseCards.length >= 300 && qText) {
+      const keywords = extractLexicalSqlKeywords(qText);
+      if (keywords.length > 0) {
+        const clauses: string[] = [];
+        const args: Array<string | number> = [];
+        if (!options.includeSuperseded) {
+          clauses.push('superseded_by IS NULL');
+        }
+        const excludeIds = [...byId.keys(), ...skippedIds];
+        if (excludeIds.length > 0) {
+          clauses.push(`id NOT IN (${excludeIds.map(() => '?').join(',')})`);
+          args.push(...excludeIds);
+        }
+        const likeParts: string[] = [];
+        for (const kw of keywords) {
+          const topicPattern = `%${escapeLikePattern(kw)}%`;
+          const bodyPattern = `%${escapeLikePattern(kw.replace(/\\/g, '\\\\'))}%`;
+          likeParts.push("(topic LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\')");
+          args.push(topicPattern, bodyPattern);
+        }
+        clauses.push(`(${likeParts.join(' OR ')})`);
+        const where = ` WHERE ${clauses.join(' AND ')}`;
+        const rows = this.db.prepare(
+          `SELECT ${MEMORY_SELECT_COLS} FROM memories${where} ORDER BY updated_at DESC, rowid DESC LIMIT ?`,
+        ).all(...args, 100);
+        for (const row of rows) {
+          const card = decodeMemoryRow(row);
+          if (byId.has(card.id)) continue;
+          if (options.excludeCwdConflict && hasCwdConflict(options.cwd, card.cwd)) continue;
+          byId.set(card.id, card);
+        }
+      }
+    }
+
+    return [...byId.values()];
+  }
+
   memoriesForContext(options: {
     memoryIds?: string[];
     cwd?: string;
@@ -716,11 +843,19 @@ export class MemoryStore {
       addedNeighbors++;
     }
 
-    const activePool = selected.size < limit ? this.listMemories({ includeSuperseded: false, limit: 300 }) : [];
-
     // (c) Semantic (cosine >= 0.48) or strong lexical match against queryText/queryEmbedding
     const qText = options.queryText?.trim() ?? '';
     const qVec = options.queryEmbedding ? l2Normalize(options.queryEmbedding) : undefined;
+    const activePool = selected.size < limit
+      ? this.collectExtendedMemoryCandidates({
+          includeSuperseded: false,
+          queryText: qText,
+          queryVec: qVec,
+          semanticThreshold: 0.48,
+          cwd: options.cwd,
+          excludeCwdConflict: true,
+        })
+      : [];
     if (selected.size < limit && (qText || qVec)) {
       const lowerQ = qText.toLowerCase();
       const matched: Array<{ card: MemoryCard; score: number }> = [];
@@ -852,7 +987,15 @@ export class MemoryStore {
     const hits: ContextSearchHit[] = [];
     const directMemoryHits = new Map<string, { card: MemoryCard; hit: ContextSearchHit }>();
     if (scope === 'all' || scope === 'memories') {
-      const cards = this.listMemories({ includeSuperseded: options.includeSuperseded ?? false, limit: 300 });
+      const includeSuperseded = options.includeSuperseded ?? false;
+      const cards = this.collectExtendedMemoryCandidates({
+        includeSuperseded,
+        queryText: rawQuery,
+        queryVec,
+        semanticThreshold: 0.42,
+        cwd: options.cwd,
+        excludeCwdConflict: false,
+      });
       const cardById = new Map(cards.map(c => [c.id, c]));
       for (const card of cards) {
         const header = `${card.topic} ${card.tags.join(' ')} ${card.cwd ?? ''}`;
@@ -895,7 +1038,16 @@ export class MemoryStore {
       for (const { card: seedCard, hit: seedHit } of topSeeds) {
         for (const syn of seedCard.synapses ?? []) {
           if (syn.weight < 0.60) continue;
-          const targetCard = cardById.get(syn.targetId);
+          let targetCard = cardById.get(syn.targetId);
+          if (!targetCard) {
+            try {
+              const fetched = this.getMemory(syn.targetId);
+              if (includeSuperseded || !fetched.supersededBy) {
+                targetCard = fetched;
+                cardById.set(fetched.id, fetched);
+              }
+            } catch { /* ignore missing target */ }
+          }
           if (!targetCard) continue;
           if (hasCwdConflict(seedCard.cwd, targetCard.cwd) || hasCwdConflict(options.cwd, targetCard.cwd)) continue;
           const directTarget = directMemoryHits.get(targetCard.id);

@@ -228,6 +228,13 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
               thresholdOverride: opts.speakerThreshold,
             });
           },
+          verifyUtteranceAsync: ({ channel, samples, sampleRate }) => {
+            const opts = parseXiaoaiApiOptions(channel.apiBase);
+            return this.getSpeakerManager().verifyAndTrimUtteranceAsync(samples, sampleRate, {
+              speakerVerify: opts.speakerVerify,
+              thresholdOverride: opts.speakerThreshold,
+            });
+          },
         },
         onWake: async (event) => {
           return handleXiaoaiKeywordWake({
