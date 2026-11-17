@@ -23,7 +23,9 @@ import {
 } from '../../xiaoai/ssh.js';
 import {
   bumpXiaoaiSpeechEpoch,
+  DEFAULT_OWNER_WAKE_GREETINGS,
   handleXiaoaiKeywordWake,
+  prewarmXiaoaiWakeGreetings,
   sendXiaoaiSpeech,
 } from '../../xiaoai/tts-player.js';
 import {
@@ -79,6 +81,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
   private readonly speakerEnroll = new XiaoaiSpeakerEnrollController();
   private readonly fastpathSessions = new BoundedMap<string, FastpathSessionEntry>(128);
   private readonly outboundChains = new Map<string, Promise<void>>();
+  private readonly prewarmedTargets = new Set<string>();
 
   constructor(private readonly ctx: ImGatewayContext) {}
 
@@ -92,6 +95,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     this.speakerEnroll.clear();
     this.fastpathSessions.clear();
     this.outboundChains.clear();
+    this.prewarmedTargets.clear();
     await closeXiaoaiSshConnections().catch(() => {});
   }
 
@@ -237,11 +241,17 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
           },
         },
         onWake: async (event) => {
+          if (event.reWake) {
+            this.fastpathSessions.delete(`${event.channel.id}:${event.target.id}`);
+          }
           return handleXiaoaiKeywordWake({
             channel: event.channel,
             target: event.target,
             keyword: event.keyword,
             chime: event.chime,
+            wakeDurationMs: event.wakeDurationMs,
+            urgent: event.urgent,
+            speaker: event.speaker,
             sshRunner: this.deps?.sshRunner,
           });
         },
@@ -293,6 +303,19 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
       });
     }
     this.kwsMonitor.sync(channels);
+    if (!this.deps?.sshRunner) {
+      for (const ch of channels) {
+        if (!ch.enabled || ch.platform !== 'xiaoai') continue;
+        const apiOpts = parseXiaoaiApiOptions(ch.apiBase);
+        if (!apiOpts.kws || !apiOpts.kwsChime) continue;
+        for (const target of parseXiaoaiSshTargets(ch.apiBase)) {
+          const targetKey = `${ch.id}:${target.id}:${target.userHost}:${target.port ?? 22}`;
+          if (this.prewarmedTargets.has(targetKey)) continue;
+          this.prewarmedTargets.add(targetKey);
+          void prewarmXiaoaiWakeGreetings(target, DEFAULT_OWNER_WAKE_GREETINGS).catch(() => {});
+        }
+      }
+    }
   }
 
   /** Handle speaker voiceprint enrollment/commands and plugin voice fastpaths before routing to Coordinator. */

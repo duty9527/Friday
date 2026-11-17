@@ -6,6 +6,8 @@ export {
   DEFAULT_SPEAKER_MODEL_URLS,
   ensureXiaoaiSpeakerModel,
   trimWakeSpeechWindow,
+  measureWakeSpeechDurationMs,
+  trimShortUtteranceSilence,
   XiaoaiSpeakerManager,
   type XiaoaiSpeakerExtractor,
   type XiaoaiSpeakerProfile,

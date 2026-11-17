@@ -369,6 +369,127 @@ export function trimWakeSpeechWindow(
   return samples.subarray(startSample, endSample);
 }
 
+/**
+ * Measures the active speech duration (ms) of the trailing wake phrase inside a KWS slice,
+ * stripping leading/trailing room noise so short urgent wakes can be distinguished from relaxed ones.
+ */
+export function measureWakeSpeechDurationMs(
+  samples: Float32Array,
+  sampleRate = SPEAKER_SAMPLE_RATE,
+): number {
+  if (samples.length === 0 || sampleRate <= 0) {
+    return 0;
+  }
+
+  const frameLen = Math.max(1, Math.round(sampleRate * 0.025));
+  const numFrames = Math.ceil(samples.length / frameLen);
+  const frameRms: number[] = [];
+  for (let f = 0; f < numFrames; f++) {
+    const start = f * frameLen;
+    const end = Math.min(samples.length, start + frameLen);
+    let sumSq = 0;
+    for (let i = start; i < end; i++) {
+      const v = samples[i] ?? 0;
+      sumSq += v * v;
+    }
+    frameRms.push(Math.sqrt(sumSq / Math.max(1, end - start)));
+  }
+
+  const p10Rms = percentileValue(frameRms, 0.10);
+  const tailStart = Math.max(0, numFrames - Math.ceil(1.50 / 0.025));
+  const p90Rms = percentileValue(frameRms.slice(tailStart), 0.90);
+
+  if (p90Rms <= 1e-6) {
+    return 0;
+  }
+  if (p90Rms <= p10Rms * 1.35) {
+    return p90Rms < 0.0005 ? 0 : Math.round((samples.length / sampleRate) * 1000);
+  }
+
+  const activeGate = Math.max(p10Rms * 2.2, p90Rms * 0.18);
+  let endFrame = numFrames - 1;
+  for (let i = numFrames - 1; i >= 0; i--) {
+    if ((frameRms[i] ?? 0) >= activeGate) {
+      endFrame = i;
+      break;
+    }
+  }
+
+  let startFrame = endFrame;
+  let belowStreak = 0;
+  const maxGapFrames = 10;
+  const maxSpanFrames = Math.ceil(1.70 / 0.025);
+  for (let i = endFrame; i >= 0; i--) {
+    if (endFrame - i + 1 > maxSpanFrames) {
+      break;
+    }
+    if ((frameRms[i] ?? 0) >= activeGate) {
+      startFrame = i;
+      belowStreak = 0;
+    } else {
+      belowStreak++;
+      if (belowStreak > maxGapFrames) {
+        break;
+      }
+    }
+  }
+
+  return Math.max(25, Math.round((((endFrame - startFrame + 1) * frameLen) / sampleRate) * 1000));
+}
+
+/**
+ * Strips leading/trailing room silence from short captured utterances before speaker embedding
+ * extraction so pre-roll and endpointing tail silence do not dilute short commands.
+ */
+export function trimShortUtteranceSilence(
+  samples: Float32Array,
+  sampleRate = SPEAKER_SAMPLE_RATE,
+): Float32Array {
+  const minSamples = sampleRate === SPEAKER_SAMPLE_RATE
+    ? MIN_SPEAKER_VERIFY_SAMPLES
+    : Math.round(sampleRate * 0.25);
+  if (samples.length <= minSamples || sampleRate <= 0) {
+    return samples;
+  }
+
+  const frameLen = Math.max(1, Math.round(sampleRate * 0.025));
+  const numFrames = Math.ceil(samples.length / frameLen);
+  const frameRms: number[] = [];
+  for (let f = 0; f < numFrames; f++) {
+    const start = f * frameLen;
+    const end = Math.min(samples.length, start + frameLen);
+    let sumSq = 0;
+    for (let i = start; i < end; i++) {
+      const v = samples[i] ?? 0;
+      sumSq += v * v;
+    }
+    frameRms.push(Math.sqrt(sumSq / Math.max(1, end - start)));
+  }
+
+  const p10Rms = percentileValue(frameRms, 0.10);
+  const p90Rms = percentileValue(frameRms, 0.90);
+  if (p90Rms <= 1e-6 || p90Rms <= p10Rms * 1.4) {
+    return samples;
+  }
+
+  const gate = Math.max(p10Rms * 2.0, p90Rms * 0.16);
+  let firstFrame = -1;
+  let lastFrame = -1;
+  for (let i = 0; i < numFrames; i++) {
+    if ((frameRms[i] ?? 0) >= gate) {
+      if (firstFrame < 0) firstFrame = i;
+      lastFrame = i;
+    }
+  }
+  if (firstFrame < 0 || lastFrame < firstFrame) {
+    return samples;
+  }
+
+  const start = Math.max(0, (firstFrame - 1) * frameLen);
+  const end = Math.min(samples.length, (lastFrame + 2) * frameLen);
+  return end - start >= minSamples ? samples.subarray(start, end) : samples;
+}
+
 function yieldEventLoop(): Promise<void> {
   return new Promise<void>((resolve) => setImmediate(resolve));
 }
@@ -916,7 +1037,8 @@ export class XiaoaiSpeakerManager {
       const effectiveThreshold = isShortClip && opts?.thresholdOverride === undefined
         ? Math.max(0.32, threshold - 0.04)
         : threshold;
-      const res = this.matchSamples(samples, sampleRate, {
+      const evalSamples = isShortClip ? trimShortUtteranceSilence(samples, sampleRate) : samples;
+      const res = this.matchSamples(evalSamples, sampleRate, {
         speakerVerify: opts?.speakerVerify,
         thresholdOverride: effectiveThreshold,
       });

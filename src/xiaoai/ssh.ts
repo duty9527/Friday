@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { resolveFridayHome, resolvePrivateRunDir } from '../paths.js';
 
@@ -238,13 +239,58 @@ export function parseXiaoaiSshTargets(apiBase?: string): XiaoaiSshTarget[] {
   return targets;
 }
 
-export function buildXiaoaiWakeCommand(options?: { chime?: boolean }): string {
+export function getXiaoaiWakeCacheFileName(greetingText: string): string {
+  const hash = createHash('sha1').update(greetingText.trim()).digest('hex').slice(0, 10);
+  return `wake_${hash}.audio`;
+}
+
+function buildWakeCacheStoreSnippet(greetingText: string, cacheFile: string): string {
+  const qGreeting = `'${escapeShellSingleQuote(greetingText)}'`;
+  return [
+    `CF="$CDIR/${cacheFile}";`,
+    `if [ ! -s "$CF" ] && [ -s "/tmp/friday_wake_cache/${cacheFile}" ]; then CF="/tmp/friday_wake_cache/${cacheFile}"; fi;`,
+    'if [ ! -s "$CF" ] && [ -x /usr/bin/gen-tts ] && [ -r /usr/share/libubox/jshn.sh ]; then',
+    `_res=$(/usr/bin/gen-tts ${qGreeting} 2>/dev/null || true);`,
+    'if [ -n "$_res" ]; then',
+    '_p=$(. /usr/share/libubox/jshn.sh; json_init; json_load "$_res" 2>/dev/null; json_get_var _info info; json_cleanup; json_init; json_load "$_info" 2>/dev/null; json_get_var _path path; json_cleanup; printf \'%s\' "$_path");',
+    'if [ -n "$_p" ] && [ -s "$_p" ]; then mv -f "$_p" "$CF" 2>/dev/null || cp -f "$_p" "$CF" 2>/dev/null || true; rm -f "$_p" 2>/dev/null || true; fi;',
+    'fi;',
+    'fi;',
+  ].join(' ');
+}
+
+export function buildXiaoaiWakeCommand(options?: { chime?: boolean; greetingText?: string }): string {
   const pauseCmd = 'rm -f /tmp/friday_speaking; (ubus -t 1 call mediaplayer player_play_operation \'{"action":"pause"}\' >/dev/null 2>&1 || mphelper pause >/dev/null 2>&1 || true)';
-  const chimeCmd = options?.chime === false
-    ? ''
-    : `(ubus -t 2 call qplayer play '{"play":"${XIAOAI_WAKE_CHIME_PATH}"}' >/dev/null 2>&1 || /usr/bin/miplayer -f '${XIAOAI_WAKE_CHIME_PATH}' </dev/null >/dev/null 2>&1 || true); `;
-  const ledCmd = 'tok="$$_$(date +%s)"; echo "$tok" >/tmp/friday_led_tok; (/bin/shut_led 2 >/dev/null 2>&1 || true); (/bin/show_led 1 >/dev/null 2>&1 || true); (sh -c \'sleep 12; [ "$(cat /tmp/friday_led_tok 2>/dev/null)" = "\'"$tok"\'" ] && /bin/shut_led 1 >/dev/null 2>&1 || true\' </dev/null >/dev/null 2>&1 &)';
-  return `${pauseCmd}; ${chimeCmd}${ledCmd}`;
+  const fallbackPlay = `ubus -t 2 call qplayer play '{"play":"${XIAOAI_WAKE_CHIME_PATH}"}' >/dev/null 2>&1 || /usr/bin/miplayer -f '${XIAOAI_WAKE_CHIME_PATH}' </dev/null >/dev/null 2>&1 || true`;
+  const chimeCmd = options?.chime === false ? '' : `(${fallbackPlay}); `;
+  const ledCmd = 'tok="$$_$(date +%s)"; echo "$tok" >/tmp/friday_led_tok; (/bin/shut_led 2 >/dev/null 2>&1 || true); (/bin/show_led 1 >/dev/null 2>&1 || true); (sh -c \'sleep 15; [ "$(cat /tmp/friday_led_tok 2>/dev/null)" = "\'"$tok"\'" ] && /bin/shut_led 1 >/dev/null 2>&1 || true\' </dev/null >/dev/null 2>&1 &)';
+  const cleanGreeting = options?.greetingText?.replace(/["\\$`\r\n]/g, '').trim();
+  if (options?.chime === false || !cleanGreeting) {
+    return `${pauseCmd}; ${chimeCmd}${ledCmd}`;
+  }
+  const cacheFile = getXiaoaiWakeCacheFileName(cleanGreeting);
+  const playGreetingCmd = [
+    '(',
+    'CDIR=/data/friday_wake_cache;',
+    'mkdir -p "$CDIR" 2>/dev/null || { CDIR=/tmp/friday_wake_cache; mkdir -p "$CDIR" 2>/dev/null || true; };',
+    buildWakeCacheStoreSnippet(cleanGreeting, cacheFile),
+    `if [ -s "$CF" ]; then /usr/bin/miplayer -f "$CF" </dev/null >/dev/null 2>&1 || true; else ${fallbackPlay}; fi`,
+    ')',
+  ].join(' ');
+  return `${pauseCmd}; ${ledCmd}; ${playGreetingCmd}`;
+}
+
+export function buildXiaoaiWakePrewarmCommand(phrases: readonly string[]): string {
+  const cleaned = [...new Set(phrases.map(p => p.replace(/["\\$`\r\n]/g, '').trim()).filter(Boolean))];
+  if (cleaned.length === 0) {
+    return 'true';
+  }
+  const steps = cleaned.map(phrase => buildWakeCacheStoreSnippet(phrase, getXiaoaiWakeCacheFileName(phrase)));
+  return [
+    'CDIR=/data/friday_wake_cache;',
+    'mkdir -p "$CDIR" 2>/dev/null || { CDIR=/tmp/friday_wake_cache; mkdir -p "$CDIR" 2>/dev/null || exit 0; };',
+    ...steps,
+  ].join(' ');
 }
 
 export function buildXiaoaiLedCommand(mode: 'listen' | 'think' | 'off'): string {

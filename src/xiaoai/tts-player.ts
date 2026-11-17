@@ -10,6 +10,7 @@ import {
 } from './cloud-auth.js';
 import {
   buildXiaoaiWakeCommand,
+  buildXiaoaiWakePrewarmCommand,
   defaultSshRunner,
   escapeShellSingleQuote,
   parseXiaoaiApiOptions,
@@ -89,11 +90,73 @@ export function resetXiaoaiRuntimeState(): void {
   xiaoaiSpeechEpochs.clear();
 }
 
+export const XIAOAI_URGENT_WAKE_MAX_MS = 900;
+
+export const DEFAULT_OWNER_WAKE_GREETINGS = [
+  '在的，老板',
+  '早上好，老板',
+  '中午好，老板',
+  '下午好，老板',
+  '晚上好，老板',
+] as const;
+
+export function resolveXiaoaiWakeGreeting(params?: {
+  keyword?: string;
+  wakeDurationMs?: number;
+  urgent?: boolean;
+  now?: Date | number;
+  speaker?: { name?: string; role?: 'owner' | 'member' };
+}): string {
+  const title = params?.speaker?.role === 'member' && params.speaker.name?.trim()
+    ? params.speaker.name.trim()
+    : '老板';
+  let isUrgent: boolean;
+  if (params?.urgent === true) {
+    isUrgent = true;
+  } else if (params?.urgent === false) {
+    isUrgent = false;
+  } else if (typeof params?.wakeDurationMs === 'number' && Number.isFinite(params.wakeDurationMs) && params.wakeDurationMs > 0) {
+    isUrgent = params.wakeDurationMs < XIAOAI_URGENT_WAKE_MAX_MS;
+  } else {
+    const kwLen = params?.keyword?.trim().length ?? 0;
+    isUrgent = kwLen > 0 && kwLen <= 3;
+  }
+  if (isUrgent) {
+    return `在的，${title}`;
+  }
+  const date = params?.now instanceof Date
+    ? params.now
+    : typeof params?.now === 'number'
+      ? new Date(params.now)
+      : new Date();
+  const hour = date.getHours();
+  if (hour >= 5 && hour < 11) return `早上好，${title}`;
+  if (hour >= 11 && hour < 14) return `中午好，${title}`;
+  if (hour >= 14 && hour < 18) return `下午好，${title}`;
+  return `晚上好，${title}`;
+}
+
+export async function prewarmXiaoaiWakeGreetings(
+  target: XiaoaiSshTarget,
+  phrases: readonly string[] = DEFAULT_OWNER_WAKE_GREETINGS,
+  sshRunner: XiaoaiSshRunner = defaultSshRunner,
+): Promise<void> {
+  const cmd = buildXiaoaiWakePrewarmCommand(phrases);
+  const res = await sshRunner(target, cmd, { timeoutMs: 20_000 }).catch(() => undefined);
+  if (res && res.code !== 0 && res.stderr.trim()) {
+    console.warn(`[xiaoai-ssh] wake greeting prewarm warning for ${target.id}: ${res.stderr.trim()}`);
+  }
+}
+
 export async function handleXiaoaiKeywordWake(params: {
   channel: ImChannelConfig;
   target: XiaoaiSshTarget;
   keyword: string;
   chime?: boolean;
+  wakeDurationMs?: number;
+  urgent?: boolean;
+  speaker?: { name?: string; role?: 'owner' | 'member' };
+  now?: Date | number;
   sshRunner?: XiaoaiSshRunner;
 }): Promise<{ woken: boolean; suppressed: boolean }> {
   const { channel, target, keyword } = params;
@@ -104,13 +167,25 @@ export async function handleXiaoaiKeywordWake(params: {
   const apiOptions = parseXiaoaiApiOptions(channel.apiBase);
   const sshRunner = params.sshRunner ?? defaultSshRunner;
   const useChime = params.chime !== undefined ? params.chime : apiOptions.kwsChime;
+  const greetingText = useChime
+    ? resolveXiaoaiWakeGreeting({
+        keyword,
+        wakeDurationMs: params.wakeDurationMs,
+        urgent: params.urgent,
+        speaker: params.speaker,
+        now: params.now,
+      })
+    : undefined;
   const res = await sshRunner(
     target,
-    buildXiaoaiWakeCommand({ chime: useChime }),
-    { timeoutMs: 8_000 },
+    buildXiaoaiWakeCommand({ chime: useChime, greetingText }),
+    { timeoutMs: 12_000 },
   );
   if (res.code !== 0) {
     throw new Error(res.stderr.trim() || `小爱唤醒触发失败 (exit=${res.code})`);
+  }
+  if (useChime) {
+    markXiaoaiSpeakingGuard(channel.id, target.id, 450, true);
   }
   return { woken: true, suppressed: false };
 }

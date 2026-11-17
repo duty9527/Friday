@@ -21,6 +21,10 @@ import {
   resetXiaoaiRuntimeState,
   parseXiaoaiWebhookPayload,
   pollXiaoaiChannel,
+  getXiaoaiWakeCacheFileName,
+  buildXiaoaiWakeCommand,
+  buildXiaoaiWakePrewarmCommand,
+  resolveXiaoaiWakeGreeting,
   handleXiaoaiKeywordWake,
   sendXiaoaiSpeech,
   setXiaoaiSpeakerLed,
@@ -47,6 +51,8 @@ import {
 } from '../src/xiaoai-kws.js';
 import {
   SPEAKER_SAMPLE_RATE,
+  measureWakeSpeechDurationMs,
+  trimShortUtteranceSilence,
   trimWakeSpeechWindow,
   XiaoaiSpeakerEnrollController,
   XiaoaiSpeakerManager,
@@ -3266,6 +3272,198 @@ test('XiaoaiKwsMonitor idleEnergyGate skips ONNX inference on silence, replays 4
     await delay(25);
     assert.equal(spotterChunks.length, countAfterHibernate, 'spotter stays silent after hibernation');
     assert.equal(vadCalls, vadAfterHibernate, 'VAD stays silent after hibernation');
+
+    monitor.close();
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('XiaoAI wake greeting selection, duration measurement, short-clip silence trimming, and POSIX cache scripts', () => {
+  // 1. Urgency (<900ms vs >=900ms) and 4 time-of-day greeting windows + member address
+  const atHour = (hour: number, minute = 0) => new Date(2026, 10, 17, hour, minute, 0, 0);
+  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '星期五', wakeDurationMs: 620, now: atHour(8, 30) }), '在的，老板');
+  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '你好星期五', wakeDurationMs: 780, now: atHour(23, 15) }), '在的，老板');
+  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '你好星期五', urgent: true, now: atHour(15, 0) }), '在的，老板');
+
+  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '星期五', wakeDurationMs: 1_150, now: atHour(8, 30) }), '早上好，老板');
+  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '你好星期五', wakeDurationMs: 1_150, now: atHour(12, 15) }), '中午好，老板');
+  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '你好星期五', wakeDurationMs: 1_150, now: atHour(15, 40) }), '下午好，老板');
+  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '你好星期五', wakeDurationMs: 1_150, now: atHour(23, 10) }), '晚上好，老板');
+  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '你好星期五', wakeDurationMs: 1_150, now: atHour(2, 0) }), '晚上好，老板');
+
+  const wife = { name: '太太', role: 'member' as const };
+  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '星期五', wakeDurationMs: 650, speaker: wife, now: atHour(15, 0) }), '在的，太太');
+  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '你好星期五', wakeDurationMs: 1_150, speaker: wife, now: atHour(15, 40) }), '下午好，太太');
+
+  // 2. Active speech duration measurement inside 1.8s KWS ring buffer (leading noise stripped)
+  const ringShort = concatAudio(synthToneSamples(200, 1_100, 0.002), synthToneSamples(200, 620, 0.25));
+  const durShort = measureWakeSpeechDurationMs(ringShort, SPEAKER_SAMPLE_RATE);
+  assert.ok(durShort >= 500 && durShort < 850, `Expected urgent short wake ~620ms, got ${durShort}ms`);
+
+  const ringRelaxed = concatAudio(synthToneSamples(200, 600, 0.002), synthToneSamples(200, 1_180, 0.25));
+  const durRelaxed = measureWakeSpeechDurationMs(ringRelaxed, SPEAKER_SAMPLE_RATE);
+  assert.ok(durRelaxed >= 950 && durRelaxed <= 1_400, `Expected relaxed wake ~1180ms, got ${durRelaxed}ms`);
+
+  // 3. trimShortUtteranceSilence removes leading pre-roll and trailing endpointing silence
+  const paddedShort = concatAudio(
+    synthToneSamples(200, 350, 0.001),
+    synthToneSamples(200, 650, 0.22),
+    synthToneSamples(200, 350, 0.001),
+  );
+  const trimmedShort = trimShortUtteranceSilence(paddedShort, SPEAKER_SAMPLE_RATE);
+  assert.ok(trimmedShort.length < Math.round(SPEAKER_SAMPLE_RATE * 0.9), `Expected trimmed short speech <0.9s, got ${trimmedShort.length}`);
+  assert.ok(trimmedShort.length >= Math.round(SPEAKER_SAMPLE_RATE * 0.55));
+
+  // 4. POSIX sh -n validation & invariant guards for wake / prewarm commands
+  const wakeCmd = buildXiaoaiWakeCommand({ chime: true, greetingText: '晚上好，老板' });
+  const prewarmCmd = buildXiaoaiWakePrewarmCommand(['在的，老板', '下午好，老板']);
+  execFileSync('sh', ['-n', '-c', wakeCmd], { stdio: 'pipe' });
+  execFileSync('sh', ['-n', '-c', prewarmCmd], { stdio: 'pipe' });
+  assert.equal(wakeCmd.includes('text_to_speech'), false, 'Wake command must use gen-tts wrapper to preserve TTS counters');
+  assert.equal(prewarmCmd.includes('text_to_speech'), false);
+  assert.ok(wakeCmd.includes('/usr/bin/gen-tts'));
+  assert.ok(wakeCmd.includes(getXiaoaiWakeCacheFileName('晚上好，老板')));
+  assert.ok(wakeCmd.includes('wakeup_zai_01.wav'), 'Wake command must retain native wav fallback');
+
+  // 5. Expanded homophones for bare "星期五" and prefixed homophone commands
+  assert.deepEqual(extractLeadingXiaoaiWakeKeyword('星期吾。'), { keyword: '星期五', remainder: '' });
+  assert.deepEqual(extractLeadingXiaoaiWakeKeyword('星七五。'), { keyword: '星期五', remainder: '' });
+  assert.deepEqual(extractLeadingXiaoaiWakeKeyword('你好星七五，现在几点了'), { keyword: '你好星期五', remainder: '现在几点了' });
+});
+
+test('XiaoaiKwsMonitor re-triggers urgent wake greeting instead of cancelling when "星期五" is repeated inside capturing window', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-rewake-'));
+  try {
+    let audioStream: PassThrough | undefined;
+    const wakeScoreNext = 0.335;
+    let utteranceScoreNext = 0.335;
+    const asrQueue = ['星期五。', '星期五。', '现在几点了'];
+    const wakeEvents: Array<{ keyword: string; chime?: boolean; urgent?: boolean; reWake?: boolean }> = [];
+    const cancelEvents: Array<{ keyword: string; reason: string }> = [];
+    const utteranceEvents: Array<{ keyword: string; text: string }> = [];
+
+    const channel: ImChannelConfig = {
+      id: 'xiaoai-rewake',
+      platform: 'xiaoai',
+      name: '小爱重唤醒测试',
+      enabled: true,
+      notifyAll: false,
+      allowedSenders: [],
+      apiBase: 'ssh://lx06=root@192.0.2.104',
+      inboundCount: 0,
+      outboundCount: 0,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+
+    const monitor = new XiaoaiKwsMonitor({
+      homeDir: home,
+      cooldownMs: 30,
+      probeDurationMs: 25,
+      chimeDiscardMs: 20,
+      maxWaitSpeechMs: 1_500,
+      endSilenceMs: 60,
+      asrWakeRescue: false,
+      idleEnergyGate: false,
+      sshRunner: async () => ({ stdout: '', stderr: '', code: 0 }),
+      streamFactory: () => {
+        audioStream = new PassThrough();
+        return { stdout: audioStream, sampleFormat: 's16le', kill: () => audioStream?.end(), onClose: () => {} };
+      },
+      spotterFactory: () => {
+        let peak = 0;
+        return {
+          createStream: () => ({}),
+          acceptWaveform: (_s, samples) => {
+            for (const v of samples) {
+              const abs = Math.abs(v);
+              if (abs > peak) peak = abs;
+            }
+          },
+          isReady: () => peak >= 0.7,
+          decode: () => {},
+          getResult: () => (peak >= 0.7 ? '星期五' : ''),
+          reset: () => { peak = 0; },
+        };
+      },
+      recognizerFactory: () => ({
+        transcribe: async () => asrQueue.shift() ?? '',
+      }),
+      vadFactory: () => ({
+        isSpeech: (samples) => computeRms(samples) >= 0.02,
+        reset: () => {},
+      }),
+      speakerGate: {
+        isActive: () => true,
+        verifyWake: () => ({ matched: true, score: wakeScoreNext, threshold: 0.32, speaker: { id: 'spk-1', name: '主人', role: 'owner', score: wakeScoreNext } }),
+        verifyUtterance: ({ samples }) => ({
+          matched: utteranceScoreNext >= 0.41,
+          score: utteranceScoreNext,
+          threshold: 0.41,
+          ...(utteranceScoreNext >= 0.41 ? { speaker: { id: 'spk-1', name: '主人', role: 'owner' as const, score: utteranceScoreNext } } : {}),
+          samples,
+        }),
+      },
+      onWake: async (ev) => {
+        wakeEvents.push({
+          keyword: ev.keyword,
+          chime: ev.chime,
+          ...(ev.urgent !== undefined ? { urgent: ev.urgent } : {}),
+          ...(ev.reWake !== undefined ? { reWake: ev.reWake } : {}),
+        });
+        return { woken: true, suppressed: false };
+      },
+      onCaptureCancel: (ev) => {
+        cancelEvents.push({ keyword: ev.keyword, reason: ev.reason });
+      },
+      onUtterance: (ev) => {
+        utteranceEvents.push({ keyword: ev.keyword, text: ev.text });
+      },
+    });
+
+    monitor.sync([channel]);
+    await until(() => Boolean(audioStream));
+
+    const writeChunked = (amp: number, totalMs: number, chunkMs = 20) => {
+      for (let off = 0; off < totalMs; off += chunkMs) {
+        const dur = Math.min(chunkMs, totalMs - off);
+        audioStream!.write(encodeFloat32ToS16Le(synthToneSamples(200, dur, amp)));
+      }
+    };
+
+    // 1. Initial bare wake (20ms wake + 60ms silent probe) -> two-step capturing
+    writeChunked(0.75, 20);
+    writeChunked(0, 60);
+    await until(() => wakeEvents.length === 1 && monitor.isCapturing('xiaoai-rewake', 'lx06'));
+
+    // Flush chime discard, then repeat bare "星期五" with utterance score 0.335 (< 0.410, >= 0.320 wake gate)
+    await delay(25);
+    writeChunked(0, 40);
+    utteranceScoreNext = 0.335;
+    writeChunked(0.18, 600);
+    writeChunked(0, 120);
+    await until(() => wakeEvents.length === 2 && monitor.isCapturing('xiaoai-rewake', 'lx06'));
+    assert.equal(cancelEvents.length, 0, 'Repeated bare wake must not cancel/turn off LED');
+    assert.deepEqual(wakeEvents[1], { keyword: '星期五', chime: true, urgent: true, reWake: true });
+
+    // 2. Repeat bare "星期五" again with high score (>= 0.410) -> still re-wakes instead of firing empty cancel
+    await delay(25);
+    writeChunked(0, 40);
+    utteranceScoreNext = 0.82;
+    writeChunked(0.18, 600);
+    writeChunked(0, 120);
+    await until(() => wakeEvents.length === 3 && monitor.isCapturing('xiaoai-rewake', 'lx06'));
+    assert.equal(cancelEvents.length, 0);
+    assert.deepEqual(wakeEvents[2], { keyword: '星期五', chime: true, urgent: true, reWake: true });
+
+    // 3. Finally speak the real command inside the re-armed capturing window -> delivered to onUtterance
+    await delay(25);
+    writeChunked(0, 40);
+    writeChunked(0.18, 600);
+    writeChunked(0, 120);
+    await until(() => utteranceEvents.length === 1);
+    assert.deepEqual(utteranceEvents[0], { keyword: '星期五', text: '现在几点了' });
 
     monitor.close();
   } finally {
