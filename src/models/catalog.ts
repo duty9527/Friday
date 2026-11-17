@@ -295,6 +295,13 @@ type RuntimeModelList = ReturnType<ModelRuntime['getModels']>;
 type RuntimeModelItem = RuntimeModelList[number];
 
 const PROVIDERS_TO_NORMALIZE = ['deepseek', 'anthropic', 'openai', 'openai-codex', 'google'] as const;
+const PRISTINE_SDK_MODELS = new Map<string, Map<string, RuntimeModelItem>>();
+
+/** Returns the untouched built-in SDK metadata for a model before fictional-ID catalog pruning. */
+export function getPristineSdkModel(providerId: string, modelId: string): RuntimeModelItem | undefined {
+  const norm = normalizeProviderId(providerId) ?? providerId;
+  return PRISTINE_SDK_MODELS.get(norm)?.get(modelId);
+}
 
 /** Augments the SDK runtime catalog with real upstream model IDs and prunes fictional codenames. */
 export function ensureRealProviderCatalog(runtime: ModelRuntime, targetProviderId?: string): void {
@@ -306,6 +313,14 @@ export function ensureRealProviderCatalog(runtime: ModelRuntime, targetProviderI
     const existing = runtime.getModels(providerId);
     const template = existing[0];
     if (!template) continue;
+    let pristineMap = PRISTINE_SDK_MODELS.get(providerId);
+    if (!pristineMap) {
+      pristineMap = new Map<string, RuntimeModelItem>();
+      PRISTINE_SDK_MODELS.set(providerId, pristineMap);
+    }
+    for (const m of existing) {
+      if (!pristineMap.has(m.id)) pristineMap.set(m.id, m);
+    }
     const defaults = FALLBACK_PROVIDER_MODELS[providerId] ?? [];
     const existingById = new Map(existing.map(m => [m.id, m]));
     const filtered = existing.filter(m => !FICTIONAL_SDK_MODEL_IDS.has(m.id));

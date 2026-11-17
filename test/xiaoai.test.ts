@@ -26,6 +26,7 @@ import {
   buildXiaoaiWakeCommand,
   buildXiaoaiWakePrewarmCommand,
   resolveXiaoaiWakeGreeting,
+  tightenWakeAudioToWavBufferWithFfmpeg,
   handleXiaoaiKeywordWake,
   sendXiaoaiSpeech,
   setXiaoaiSpeakerLed,
@@ -1319,7 +1320,7 @@ test('Router HOST_EVENT snapshot compaction and S32LE single-mic ambient/AGC hel
 
 test('XiaoAI KWS keywords auto-sync, follow-up cancel parsing, and Router non-thinking model setup', async () => {
   // 1. DEFAULT_XIAOAI_KEYWORDS covers all wake variants & zero-initial sandhi without comment lines
-  assert.equal(XIAOAI_KEYWORDS_VERSION, 'v4');
+  assert.equal(XIAOAI_KEYWORDS_VERSION, 'v5');
   const joined = DEFAULT_XIAOAI_KEYWORDS.join('\n');
   for (const tag of ['@星期五', '@你好星期五', '@嘿星期五', '@嗨星期五', '@喂星期五', '@呼叫星期五']) {
     assert.ok(joined.includes(tag), `Missing wake keyword ${tag}`);
@@ -1504,6 +1505,22 @@ test('XiaoAI continuous follow-up confirmation dialog and cross-endpoint switch_
   assert.equal(shouldContinueXiaoaiDialog('告诉我音箱能不能用蓝牙连手机就行。'), true);
   assert.equal(shouldContinueXiaoaiDialog('有需要随时跟我说。[[END]]'), false);
   assert.deepEqual(stripXiaoaiDialogDirective('确定要删除吗？ [[LISTEN]]'), { text: '确定要删除吗？', directive: 'listen' });
+  assert.deepEqual(stripXiaoaiDialogDirective('好，数据已经记下了。[END]'), { text: '好，数据已经记下了。', directive: 'end' });
+  assert.deepEqual(stripXiaoaiDialogDirective('已经重新开始测量，请赤脚上秤，45秒内。[ [END] ]'), { text: '已经重新开始测量，请赤脚上秤，45秒内。', directive: 'end' });
+  assert.deepEqual(stripXiaoaiDialogDirective('要再试一次吗？[LISTEN]'), { text: '要再试一次吗？', directive: 'listen' });
+  assert.deepEqual(stripXiaoaiDialogDirective('要再试一次吗？[ [ LISTEN ] ]'), { text: '要再试一次吗？', directive: 'listen' });
+  assert.deepEqual(stripXiaoaiDialogDirective('好的。【END】'), { text: '好的。', directive: 'end' });
+  assert.deepEqual(stripXiaoaiDialogDirective('继续说？【【LISTEN】】'), { text: '继续说？', directive: 'listen' });
+  assert.deepEqual(stripXiaoaiDialogDirective('详见 [end](https://example.com) 说明'), { text: '详见 [end](https://example.com) 说明' });
+  assert.equal(shouldContinueXiaoaiDialog('好，数据已经记下了。[END]'), false);
+  assert.equal(shouldContinueXiaoaiDialog('已经重新开始测量，请赤脚上秤，45秒内。[ [END] ]'), false);
+  assert.equal(shouldContinueXiaoaiDialog('要再试一次吗？[LISTEN]'), true);
+  assert.equal(shouldContinueXiaoaiDialog('要再试一次吗？[ [ LISTEN ] ]'), true);
+  assert.equal(sanitizeForSpeech('好，数据已经记下了。[END]'), '好，数据已经记下了。');
+  assert.equal(sanitizeForSpeech('已经重新开始测量，请赤脚上秤，45秒内。[ [END] ]'), '已经重新开始测量，请赤脚上秤，45秒内。');
+  assert.equal(sanitizeForSpeech('要再试一次吗？[ [ LISTEN ] ]'), '要再试一次吗？');
+  assert.equal(sanitizeForSpeech('好的。【END】'), '好的。');
+  assert.equal(sanitizeForSpeech('详见 [end](https://example.com) 说明'), '详见 end 说明');
   assert.equal(sanitizeForSpeech('请问定几点？[[LISTEN]]'), '请问定几点？');
   assert.equal(sanitizeForSpeech('要我现在去查这台音箱支不支持蓝牙输入？</br>'), '要我现在去查这台音箱支不支持蓝牙输入？');
 
@@ -3326,6 +3343,23 @@ test('XiaoAI wake greeting selection, duration measurement, short-clip silence t
   assert.ok(wakeCmd.includes('/usr/bin/gen-tts'));
   assert.ok(wakeCmd.includes(getXiaoaiWakeCacheFileName('晚上好老板')));
   assert.ok(wakeCmd.includes('wakeup_zai_01.wav'), 'Wake command must retain native wav fallback');
+  assert.ok(wakeCmd.includes('$WAVF') && wakeCmd.includes('/usr/bin/aplay -D notify -q'), 'Wake command should prefer trimmed WAV over aplay');
+
+  const sampleMp3 = execFileSync(
+    'ffmpeg',
+    [
+      '-hide_banner', '-loglevel', 'error', '-f', 'lavfi',
+      '-i', 'aevalsrc=0:d=0.15[sil];aevalsrc=0.3*sin(2*PI*500*t):d=0.45[tone];[sil][tone]concat=n=2:v=0:a=1',
+      '-ar', '16000', '-ac', '1', '-c:a', 'libmp3lame', '-b:a', '32k', '-f', 'mp3', 'pipe:1',
+    ],
+    { stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  const wavBuf = await tightenWakeAudioToWavBufferWithFfmpeg(sampleMp3);
+  assert.ok(wavBuf, 'tightenWakeAudioToWavBufferWithFfmpeg should produce a WAV buffer');
+  assert.equal(wavBuf.subarray(0, 4).toString('ascii'), 'RIFF');
+  assert.equal(wavBuf.subarray(8, 12).toString('ascii'), 'WAVE');
+  const wavPcmDurationSec = (wavBuf.length - 44) / (16_000 * 2);
+  assert.ok(wavPcmDurationSec >= 0.35 && wavPcmDurationSec <= 0.52, `Expected 150ms leading silence trimmed (<0.52s), got ${wavPcmDurationSec.toFixed(3)}s`);
 
   // 5. Expanded homophones for bare "星期五" and prefixed homophone commands
   assert.deepEqual(extractLeadingXiaoaiWakeKeyword('星期吾。'), { keyword: '星期五', remainder: '' });
@@ -3484,6 +3518,103 @@ test('XiaoaiKwsMonitor re-triggers urgent wake greeting instead of cancelling wh
     writeChunked(0, 120);
     await until(() => utteranceEvents.length === 1);
     assert.deepEqual(utteranceEvents[0], { keyword: '星期五', text: '现在几点了' });
+
+    monitor.close();
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('XiaoaiKwsMonitor early 120ms right-context lookahead flush triggers streaming wake before 300ms asr-rescue', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-early-flush-'));
+  try {
+    let audioStream: PassThrough | undefined;
+    let asrRescueCalls = 0;
+    const wakeEvents: Array<{ keyword: string; chime?: boolean }> = [];
+
+    const channel: ImChannelConfig = {
+      id: 'xiaoai-early-flush',
+      platform: 'xiaoai',
+      name: '小爱早触发测试',
+      enabled: true,
+      notifyAll: false,
+      allowedSenders: [],
+      apiBase: 'ssh://lx06=root@192.0.2.104',
+      inboundCount: 0,
+      outboundCount: 0,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+
+    const monitor = new XiaoaiKwsMonitor({
+      homeDir: home,
+      cooldownMs: 30,
+      probeDurationMs: 25,
+      chimeDiscardMs: 20,
+      maxWaitSpeechMs: 1_500,
+      endSilenceMs: 60,
+      asrWakeRescue: true,
+      idleEnergyGate: false,
+      sshRunner: async () => ({ stdout: '', stderr: '', code: 0 }),
+      streamFactory: () => {
+        audioStream = new PassThrough();
+        return { stdout: audioStream, sampleFormat: 's16le', kill: () => audioStream?.end(), onClose: () => {} };
+      },
+      spotterFactory: () => {
+        let speechSamples = 0;
+        let trailingSilenceSamples = 0;
+        return {
+          createStream: () => ({}),
+          acceptWaveform: (_s, samples) => {
+            if (computeRms(samples) >= 0.05) {
+              speechSamples += samples.length;
+              trailingSilenceSamples = 0;
+            } else if (speechSamples >= 3_840) {
+              trailingSilenceSamples += samples.length;
+            }
+          },
+          isReady: () => speechSamples >= 3_840 && trailingSilenceSamples >= 2_240,
+          decode: () => {},
+          getResult: () => (speechSamples >= 3_840 && trailingSilenceSamples >= 2_240 ? '星期五' : ''),
+          reset: () => {
+            speechSamples = 0;
+            trailingSilenceSamples = 0;
+          },
+        };
+      },
+      recognizerFactory: () => ({
+        transcribe: async () => {
+          asrRescueCalls++;
+          return '星期五。';
+        },
+      }),
+      vadFactory: () => ({
+        isSpeech: (samples) => computeRms(samples) >= 0.02,
+        reset: () => {},
+      }),
+      onWake: async (ev) => {
+        wakeEvents.push({ keyword: ev.keyword, chime: ev.chime });
+        return { woken: true, suppressed: false };
+      },
+    });
+
+    monitor.sync([channel]);
+    await until(() => Boolean(audioStream));
+
+    const writeChunked = (amp: number, totalMs: number, chunkMs = 20) => {
+      for (let off = 0; off < totalMs; off += chunkMs) {
+        const dur = Math.min(chunkMs, totalMs - off);
+        audioStream!.write(encodeFloat32ToS16Le(synthToneSamples(200, dur, amp)));
+      }
+    };
+
+    // 280ms speech followed by 180ms silence: early 160ms zero flush at 120ms fires streaming KWS,
+    // then the remaining 60ms completes the 25ms probe window well before the 300ms offline asr-rescue path.
+    writeChunked(0.18, 280);
+    writeChunked(0, 180);
+    await until(() => wakeEvents.length === 1);
+    assert.equal(wakeEvents[0]?.keyword, '星期五');
+    assert.equal(asrRescueCalls, 0, 'Streaming KWS should wake on 120ms early flush without falling back to offline ASR rescue');
 
     monitor.close();
   } finally {

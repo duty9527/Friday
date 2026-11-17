@@ -766,7 +766,11 @@ export class Coordinator {
         const memoryDirectory = isMemberSpeaker
           ? { totalActive: 0, truncated: false, items: [] }
           : this.store.memoryDirectory(24);
-        const autoRecalled = !isMemberSpeaker && currentMessage.text.trim()
+        const bareQuery = currentMessage.text.replace(/[。，,！!？?、；;：\s]+/g, '');
+        const skipTrivialRecall = bareQuery.length === 0
+          || /^(?:好|好的|好嘞|行|可以|不用了?|不需要|不要了?|算了|对|对啊|是的|没错|嗯|发吧|再来一次|再试一次|试一次吧|继续|开始吧)$/.test(bareQuery)
+          || (currentMessage.origin?.channel === 'xiaoai' && bareQuery.length <= 4);
+        const autoRecalled = !isMemberSpeaker && !skipTrivialRecall
           ? (await this.store.searchContextAsync({ query: currentMessage.text, limit: 3, touch: false }))
               .hits
               .filter(hit => hit.score >= 46 && !(hit.kind === 'message' && hit.messageId === message.id))
@@ -1938,8 +1942,11 @@ export class Coordinator {
         const calibratedScore = current.qualityGate?.source === 'gemini-decision-1'
           ? current.qualityGate.score
           : undefined;
+        const shouldCapScore = run.acceptedByRouter === false || current.qualityGate?.shouldSupplement === true;
         const effectiveQualityScore = status === 'completed'
-          ? (run.acceptedByRouter === false ? Math.min(calibratedScore ?? 1.2, 1.2) : calibratedScore)
+          ? (shouldCapScore
+              ? (calibratedScore !== undefined ? Math.min(calibratedScore, 1.2) : (run.acceptedByRouter === false ? 1.2 : undefined))
+              : calibratedScore)
           : undefined;
         this.modelHub.recordTaskOutcome(current.workerModel, status === 'completed', current.activeMs, effectiveQualityScore);
       }

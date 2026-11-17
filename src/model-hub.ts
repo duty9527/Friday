@@ -39,6 +39,7 @@ import {
   ensureRealProviderCatalog,
   FALLBACK_PROVIDER_MODELS,
   FEATURED_PROVIDERS,
+  getPristineSdkModel,
   isOfficialOpenCodeUrl,
   isOpenCodeProvider,
   maskKey,
@@ -214,6 +215,11 @@ export class ModelHub {
     return base;
   }
 
+  private findReferenceModel(runtime: ModelRuntime, providerId: string, modelId: string) {
+    return this.getBaseModels(runtime, providerId).find(m => m.id === modelId)
+      ?? getPristineSdkModel(providerId, modelId);
+  }
+
   private async resolveProviderApiKey(runtime: ModelRuntime, providerId: string, inlineApiKey?: string): Promise<string | undefined> {
     if (inlineApiKey?.trim()) return inlineApiKey.trim();
     const persistedKey = this.state.providers[providerId]?.apiKey?.trim();
@@ -310,7 +316,7 @@ export class ModelHub {
         }
         for (const customId of cfg.customModels ?? []) {
           if (customId && !catalogMap.has(customId)) {
-            const bm = baseById.get(customId);
+            const bm = baseById.get(customId) ?? getPristineSdkModel(providerId, customId);
             catalogMap.set(customId, {
               id: customId,
               name: bm?.name ?? customId,
@@ -334,19 +340,35 @@ export class ModelHub {
             api: effectiveApi,
             ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}),
             models: [...catalogMap.values()].map(entry => {
-              const bm = baseById.get(entry.id);
+              const bm = baseById.get(entry.id) ?? getPristineSdkModel(providerId, entry.id);
               const preserveBuiltinProtocol = Boolean(bm && officialOpenCode);
+              const effectiveReasoning = entry.reasoning ?? Boolean(bm?.reasoning);
+              const resolvedApi = preserveBuiltinProtocol ? bm!.api : (cfg.baseUrl ? 'openai-completions' : (bm?.api ?? effectiveApi));
+              const existingMap = (bm as { thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>> } | undefined)?.thinkingLevelMap;
+              const thinkingLevelMap = existingMap
+                ?? (effectiveReasoning && (resolvedApi === 'openai-responses' || resolvedApi === 'openai-codex-responses')
+                  ? { off: null, minimal: null }
+                  : undefined);
+              const cost = (entry.costInput > 0 || entry.costOutput > 0)
+                ? { input: entry.costInput, output: entry.costOutput, cacheRead: 0, cacheWrite: 0 }
+                : (!cfg.baseUrl && bm?.cost)
+                  ? bm.cost
+                  : { input: entry.costInput, output: entry.costOutput, cacheRead: 0, cacheWrite: 0 };
+              const maxTokens = (!cfg.baseUrl && bm?.maxTokens && (!entry.maxTokens || (entry.maxTokens === 16_384 && bm.maxTokens > 16_384)))
+                ? bm.maxTokens
+                : (entry.maxTokens || bm?.maxTokens || 16_384);
               return {
                 ...(bm ?? {}),
                 id: entry.id,
                 name: entry.name || bm?.name || entry.id,
-                api: preserveBuiltinProtocol ? bm!.api : (cfg.baseUrl ? 'openai-completions' : (bm?.api ?? effectiveApi)),
+                api: resolvedApi,
                 baseUrl: preserveBuiltinProtocol ? bm!.baseUrl : (cfg.baseUrl || bm?.baseUrl || effectiveBaseUrl),
-                reasoning: entry.reasoning ?? Boolean(bm?.reasoning),
+                reasoning: effectiveReasoning,
+                ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
                 input: entry.supportsImages ? ['text', 'image'] : ['text'],
-                cost: bm?.cost ?? { input: entry.costInput, output: entry.costOutput, cacheRead: 0, cacheWrite: 0 },
+                cost,
                 contextWindow: entry.contextWindow || bm?.contextWindow || 128_000,
-                maxTokens: entry.maxTokens || bm?.maxTokens || 16_384,
+                maxTokens,
               };
             }),
           });
@@ -403,10 +425,13 @@ export class ModelHub {
     modelId: string,
     reasoning: boolean,
   ): ThinkingLevel[] {
-    const sdkModel = this.getBaseModels(runtime, providerId).find(m => m.id === modelId)
+    const sdkModel = this.findReferenceModel(runtime, providerId, modelId)
       ?? runtime.getModel(providerId, modelId);
     if (sdkModel) {
       return getNativeThinkingLevels(sdkModel as { reasoning?: boolean; thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>> });
+    }
+    if (reasoning && (providerId === 'openai' || providerId === 'openai-codex')) {
+      return getNativeThinkingLevels({ reasoning: true, thinkingLevelMap: { off: null, minimal: null } });
     }
     return getNativeThinkingLevels({ reasoning });
   }
@@ -485,8 +510,20 @@ export class ModelHub {
   private buildProviderCatalogModels(runtime: ModelRuntime, providerId: string, persisted?: PersistedProviderConfig): ModelCatalogEntry[] {
     const hasRemoteModels = Boolean(persisted?.fetchedModels?.length);
     const rawModels = runtime.getModels(providerId);
-    return (hasRemoteModels
-      ? persisted!.fetchedModels!
+    const entries = hasRemoteModels
+      ? persisted!.fetchedModels!.map((m): ModelCatalogEntry => {
+          if (persisted?.baseUrl) return m;
+          const ref = this.findReferenceModel(runtime, providerId, m.id);
+          if (!ref) return m;
+          return {
+            ...m,
+            costInput: (m.costInput ?? 0) > 0 ? m.costInput : (ref.cost?.input ?? 0),
+            costOutput: (m.costOutput ?? 0) > 0 ? m.costOutput : (ref.cost?.output ?? 0),
+            maxTokens: (m.maxTokens && !(m.maxTokens === 16_384 && (ref.maxTokens ?? 0) > 16_384))
+              ? m.maxTokens
+              : (ref.maxTokens ?? m.maxTokens),
+          };
+        })
       : rawModels.length
         ? rawModels.map((m): ModelCatalogEntry => ({
             id: m.id,
@@ -498,8 +535,8 @@ export class ModelHub {
             costInput: m.cost?.input ?? 0,
             costOutput: m.cost?.output ?? 0,
           }))
-        : (FALLBACK_PROVIDER_MODELS[providerId] ?? [])
-    ).map(m => ({
+        : (FALLBACK_PROVIDER_MODELS[providerId] ?? []);
+    return entries.map(m => ({
       ...m,
       thinkingLevels: m.thinkingLevels?.length
         ? m.thinkingLevels
@@ -600,7 +637,10 @@ export class ModelHub {
         const selLevels = typeof sel === 'string' ? undefined : sel?.thinkingLevels;
         if (typeof selId === 'string' && selId.trim()) addToPool(selId.trim(), selLevels);
       }
-      if (id === this.currentTiers.provider) {
+      const hasExplicitSelection = (persisted?.selectedModels ?? []).some(sel =>
+        Boolean((typeof sel === 'string' ? sel : sel?.id)?.trim()),
+      );
+      if (id === this.currentTiers.provider && !hasExplicitSelection) {
         for (const tierName of ['balanced', 'strong', 'fast'] as const) addToPool(this.currentTiers[tierName]);
       }
     }
@@ -1184,13 +1224,14 @@ export class ModelHub {
       }
     }
 
-    const baseModel = this.getBaseModels(runtime, provider).find(m => m.id === modelId);
+    const baseModel = this.findReferenceModel(runtime, provider, modelId);
     const runtimeModel = runtime.getModel(provider, modelId) ?? baseModel;
     const fallbackCatalogEntry = FALLBACK_PROVIDER_MODELS[provider]?.find(m => m.id === modelId);
 
     // Clone into a probe-local descriptor so live runtime state is never mutated during probe.
     type RuntimeModelType = NonNullable<ReturnType<ModelRuntime['getModel']>>;
-    let probeModel: RuntimeModelType | undefined;
+    type ProbeRuntimeModel = RuntimeModelType & { thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>> };
+    let probeModel: ProbeRuntimeModel | undefined;
     if (inlineBaseUrl) {
       const preserveBuiltinProtocol = Boolean(baseModel && isOfficialOpenCodeUrl(provider, inlineBaseUrl));
       const sourceInput = runtimeModel?.input ?? (fallbackCatalogEntry?.supportsImages ? ['text', 'image'] : ['text']);
@@ -1211,9 +1252,16 @@ export class ModelHub {
         },
         contextWindow: runtimeModel?.contextWindow ?? fallbackCatalogEntry?.contextWindow ?? 128_000,
         maxTokens: runtimeModel?.maxTokens ?? fallbackCatalogEntry?.maxTokens ?? 16_384,
-      } as RuntimeModelType;
+      } as ProbeRuntimeModel;
     } else if (runtimeModel) {
-      probeModel = { ...runtimeModel };
+      probeModel = { ...runtimeModel } as ProbeRuntimeModel;
+    }
+    if (
+      probeModel?.reasoning
+      && !probeModel.thinkingLevelMap
+      && (probeModel.api === 'openai-responses' || probeModel.api === 'openai-codex-responses')
+    ) {
+      probeModel.thinkingLevelMap = { off: null, minimal: null };
     }
 
     const supportsImages = Boolean(probeModel?.input.includes('image'));
@@ -1299,20 +1347,36 @@ export class ModelHub {
           models: [probeModel],
         });
       }
-      const res = await callRuntime.completeSimple(
-        probeModel,
+      const probeLevels = getNativeThinkingLevels(probeModel);
+      const pickedLevel = probeModel.reasoning && !probeLevels.includes('off')
+        ? clampNativeThinkingLevel(probeLevels, 'low')
+        : undefined;
+      const probeReasoning: Exclude<ThinkingLevel, 'off'> | undefined =
+        pickedLevel && pickedLevel !== 'off' ? pickedLevel : undefined;
+      const runProbe = (reasoning?: Exclude<ThinkingLevel, 'off'>) => callRuntime.completeSimple(
+        probeModel!,
         {
           systemPrompt: 'You are F.R.I.D.A.Y. (also known as Friday / 星期五) running a quick connectivity probe. Address the human as "老板" and reply in 1 short sentence in Simplified Chinese.',
           messages: [{ role: 'user', content: promptText, timestamp: Date.now() }],
         },
         {
-          maxTokens: 512,
+          maxTokens: probeModel!.reasoning ? 1024 : 512,
+          ...(reasoning ? { reasoning } : {}),
           sessionId: probeSessionId,
           ...(openCodeHeaders ? { headers: openCodeHeaders } : {}),
           ...(resolvedKey ? { apiKey: resolvedKey } : {}),
           signal: AbortSignal.timeout(15_000),
         },
       );
+      let res = await runProbe(probeReasoning);
+      if (
+        res.stopReason === 'error'
+        && probeModel.reasoning
+        && probeReasoning !== 'low'
+        && /reasoning\.effort|unsupported_value.*'none'/i.test(res.errorMessage ?? '')
+      ) {
+        res = await runProbe('low');
+      }
       const latencyMs = Math.max(1, Date.now() - start);
       if (res.stopReason === 'error' || res.stopReason === 'aborted') {
         const result: ModelProbeResult = {

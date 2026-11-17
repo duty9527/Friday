@@ -10,6 +10,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
+import { cpus } from 'node:os';
 import { join } from 'node:path';
 import { cosineSimilarity, l2Normalize } from '../semantic.js';
 import { normalizeUtteranceSamples } from './kws-monitor.js';
@@ -231,7 +232,7 @@ function defaultSpeakerExtractorFactory(config: { modelPath: string }): XiaoaiSp
   };
   const extractor = new sherpa.SpeakerEmbeddingExtractor({
     model: config.modelPath,
-    numThreads: 1,
+    numThreads: Math.min(2, Math.max(1, cpus().length)),
     provider: 'cpu',
     debug: 0,
   });
@@ -1008,9 +1009,10 @@ export class XiaoaiSpeakerManager {
     }
     const wakeAudio = trimWakeSpeechWindow(samples, sampleRate);
     const isBareWake = keyword.trim() === '星期五';
+    const isUltraShortWake = wakeAudio.length <= Math.round(sampleRate * 0.95);
     const wakeThreshold = isBareWake
-      ? Math.max(0.26, baseThreshold - 0.13)
-      : Math.max(0.24, baseThreshold - 0.12);
+      ? Math.max(0.26, baseThreshold - (isUltraShortWake ? 0.17 : 0.14))
+      : Math.max(0.24, baseThreshold - 0.13);
     return this.matchSamples(wakeAudio, sampleRate, {
       speakerVerify: opts?.speakerVerify,
       thresholdOverride: wakeThreshold,

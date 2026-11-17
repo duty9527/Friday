@@ -448,7 +448,12 @@ export async function resolveRuntimeMessageSession(
     });
 
     const cleanCurText = currentMessage.text.replace(/\s+/g, ' ').trim();
-    if (semantic?.isReady() && cleanCurText && !STANDALONE_OPENER_RE.test(cleanCurText)) {
+    if (
+      semantic?.isReady()
+      && cleanCurText
+      && !STANDALONE_OPENER_RE.test(cleanCurText)
+      && !(heuristic?.same && options?.skipAiContinuity)
+    ) {
       try {
         const latestSnippet = [ctx.prevUser.text.trim(), ctx.lastAssistantText.trim().slice(0, 240)]
           .filter(Boolean)

@@ -2,6 +2,7 @@
   "name": "health-scale",
   "title": "沃莱 A1 智能体脂与健康管理",
   "runtime": "in-process",
+  "voiceFastpath": true,
   "platforms": [
     "linux"
   ],

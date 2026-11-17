@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import type { ModelCatalogEntry } from '../view.js';
-import { DEFAULT_PROVIDER_ENDPOINTS, isOpenCodeProvider } from './catalog.js';
+import { DEFAULT_PROVIDER_ENDPOINTS, getPristineSdkModel, isOpenCodeProvider } from './catalog.js';
 
 /** Fetches available chat models from a provider's remote /models HTTP endpoint. */
 export async function fetchRemoteModelsFromEndpoint(
@@ -46,7 +46,7 @@ export async function fetchRemoteModelsFromEndpoint(
       if (!methods.includes('generateContent')) continue;
       const id = item.name.replace(/^models\//, '');
       if (/(?:tts|image-generation|embedding|aqa|imagen|veo|robotics|computer-use|audio)/i.test(id)) continue;
-      const baseModel = baseById.get(id);
+      const baseModel = baseById.get(id) ?? getPristineSdkModel(providerId, id);
       entries.push({
         id,
         name: item.displayName || baseModel?.name || id,
@@ -91,7 +91,7 @@ export async function fetchRemoteModelsFromEndpoint(
     const entries: ModelCatalogEntry[] = [];
     for (const item of rawList) {
       if (!item.id) continue;
-      const baseModel = baseById.get(item.id);
+      const baseModel = baseById.get(item.id) ?? getPristineSdkModel(providerId, item.id);
       entries.push({
         id: item.id,
         name: item.display_name || baseModel?.name || item.id,
@@ -164,7 +164,7 @@ export async function fetchRemoteModelsFromEndpoint(
     const id = (item.id || item.slug || '').trim();
     if (!id) continue;
     if (/^(?:tts-|whisper-|dall-e-|text-embedding-|omni-moderation-|babbage-|davinci-)/i.test(id)) continue;
-    const baseModel = baseById.get(id);
+    const baseModel = baseById.get(id) ?? getPristineSdkModel(providerId, id);
     const supportsImages = Array.isArray(item.input_modalities)
       ? item.input_modalities.includes('image')
       : Boolean(baseModel?.input.includes('image'));

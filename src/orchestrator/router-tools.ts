@@ -5,7 +5,7 @@ import type { AgentTool } from '../agent.js';
 import { publicData } from '../conversation.js';
 import type { ImGateway } from '../im.js';
 import { resolveEnv } from '../paths.js';
-import { listPluginsSync, listPluginViews, runPlugin } from '../plugin.js';
+import { listPluginsSync, listPluginViews, runPlugin, type PluginRunResult } from '../plugin.js';
 import { integer, text } from '../protocol.js';
 import { reconcileRuntimeSessionAfterTool } from '../session.js';
 import type { Store, Task } from '../store.js';
@@ -221,7 +221,62 @@ export function buildVoiceTurnHint(
     : '1句话报核心结论并询问切换到文字端，或按要求调用 switch_channel';
   return {
     voiceModeConstraint:
-      `当前直连语音音箱TTS外放：(1) 普通回复与任务派发确认必须极致简短口语（<=25字）；(2) 期待用户继续说话/确认/追问时结尾必须加 [[LISTEN]]，严禁同时使用 [[END]]；本轮彻底结束时才以“。”结尾并加 [[END]]；(3) 长篇内容或复杂报告严禁在音箱朗读，${switchClause}；${pluginClause}`,
+      `当前直连语音音箱TTS外放：(1) 普通回复与任务派发确认必须极致简短口语（<=25字）；(2) 期待用户继续说话/确认/追问时结尾必须加 [[LISTEN]]，严禁同时使用 [[END]]；本轮彻底结束时才以“。”结尾并加 [[END]]（控制标记必须紧贴写成双层方括号 [[END]] 或 [[LISTEN]]，严禁写成单括号 [END] 或带空格 [ [END] ]）；(3) 长篇内容或复杂报告严禁在音箱朗读，${switchClause}；${pluginClause}`,
+  };
+}
+
+function stripHealthScaleRecordItems(record: unknown): unknown {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return record;
+  const rec = record as Record<string, unknown>;
+  const { adcs: _adcs, rawPayload: _rawPayload, rawMeta: _rawMeta, ...rest } = rec;
+  if (rest.metrics && typeof rest.metrics === 'object' && !Array.isArray(rest.metrics)) {
+    const { items: _items, ...scalarMetrics } = rest.metrics as Record<string, unknown>;
+    rest.metrics = scalarMetrics;
+  }
+  return rest;
+}
+
+function compactHealthScaleDashboard(dashboard: Record<string, unknown>): Record<string, unknown> {
+  const next: Record<string, unknown> = { ...dashboard };
+  if (next.latest !== undefined) {
+    next.latest = stripHealthScaleRecordItems(next.latest);
+  }
+  if (Array.isArray(next.records)) {
+    next.recordsCount = next.records.length;
+    next.recentRecords = next.records.slice(0, 3).map(stripHealthScaleRecordItems);
+    delete next.records;
+  }
+  return next;
+}
+
+/** Strips verbose per-indicator arrays and full measurement history from `health-scale` tool outputs for Router context efficiency. */
+export function compactPluginResultForRouter(
+  result: PluginRunResult,
+  subAction: string,
+  pluginArgs: Record<string, unknown>,
+): PluginRunResult {
+  if (
+    result.plugin !== 'health-scale'
+    || subAction === 'dashboard'
+    || pluginArgs.includeRecords === true
+    || !result.data
+    || typeof result.data !== 'object'
+    || Array.isArray(result.data)
+  ) {
+    return result;
+  }
+  const data = { ...(result.data as Record<string, unknown>) };
+  if (data.session && typeof data.session === 'object' && !Array.isArray(data.session)) {
+    const { notifications: _notifications, ...restSession } = data.session as Record<string, unknown>;
+    data.session = restSession;
+  }
+  if (data.dashboard && typeof data.dashboard === 'object' && !Array.isArray(data.dashboard)) {
+    data.dashboard = compactHealthScaleDashboard(data.dashboard as Record<string, unknown>);
+    return { ...result, data };
+  }
+  return {
+    ...result,
+    data: compactHealthScaleDashboard(data),
   };
 }
 
@@ -810,7 +865,7 @@ export function createRouterTools(
       const turn = host.getTurn();
       const signal = turn?.chatContext?.attemptController?.signal ?? turn?.chatContext?.controller.signal;
       const result = await runPlugin(host.home, pluginName, subAction, pluginArgs, undefined, { signal });
-      return JSON.stringify(result);
+      return JSON.stringify(compactPluginResultForRouter(result, subAction, pluginArgs));
     },
   }, {
     name: 'send_file',

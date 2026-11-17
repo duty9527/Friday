@@ -287,12 +287,17 @@ function hasReliableStats(candidate: DecisionRouteCandidate): boolean {
   return ((candidate.successCount ?? 0) + (candidate.failCount ?? 0)) >= MIN_STATS_SAMPLE_SIZE;
 }
 
+const STRONG_MODEL_ID_RE = /(?:^|[-_./:])(?:opus|o1|o3|o4|reasoner|r1|deepseek-r1|grok-4|qwen-max|glm-4\.5|pro|ultra|terra|astra|argon)(?:$|[-_./:\d])/i;
+const FAST_MODEL_ID_RE = /(?:^|[-_./:])(?:flash|mini|haiku|turbo|nano|lite|luna)(?:$|[-_./:\d])/i;
+const CODING_MODEL_ID_RE = /(?:claude|codex|gemini|gpt-(?:4\.1|4o|[5-9]|\d{2})|(?:^|[-_./:])(?:o3|o4)(?:$|[-_./:])|coder|deepseek|glm-4\.5|kimi-k[23]|qwen3)/i;
+
 function candidateQualityRank(candidate: DecisionRouteCandidate): number {
   let rank = 0;
   if (hasReliableStats(candidate)) {
-    if (candidate.avgQualityScore !== undefined) rank += candidate.avgQualityScore * 15;
+    if (candidate.avgQualityScore !== undefined) rank += Math.max(0, (candidate.avgQualityScore - 1.5) * 6);
     if ((candidate.failCount ?? 0) > (candidate.successCount ?? 0)) rank -= 20;
   }
+  if ((candidate.latencyMs ?? 0) >= 600_000) rank -= 6;
   if (candidate.reasoning) rank += 12;
   if (candidate.supportsImages) rank += 6;
   if (candidate.contextWindow >= 256_000) rank += 6;
@@ -410,15 +415,15 @@ export function classifyModelSpecialties(
     tier = 'strong';
   } else if (sampleTiers?.fast === modelId && sampleTiers?.fast !== sampleTiers?.balanced) {
     tier = 'fast';
-  } else if (/(?:opus|o1|o3|o4|reasoner|deepseek-r1|grok-4|qwen-max|glm-4\.5|pro)/i.test(id)) {
+  } else if (STRONG_MODEL_ID_RE.test(id)) {
     tier = 'strong';
-  } else if (/(?:flash|mini|haiku|turbo|nano|lite)/i.test(id)) {
+  } else if (FAST_MODEL_ID_RE.test(id)) {
     tier = 'fast';
   }
 
   const specialties: string[] = [];
   if (
-    /(?:claude|codex|gemini|gpt-5|gpt-4\.1|gpt-4o|o3|o4|coder|deepseek|glm-4\.5|kimi-k2)/i.test(id)
+    CODING_MODEL_ID_RE.test(id)
     || providerId === 'anthropic'
     || providerId === 'openai-codex'
   ) {
@@ -489,16 +494,16 @@ export function selectHeuristicRoute(
       } else if (isComplex) {
         score += depth >= 4 ? 42 + (depth - 4) * 6 : depth * 6;
         if (entry.reasoning) score += 32;
-        if (entry.specialties.includes('深度推理') || /(?:opus|o1|o3|o4|reasoner|deepseek-r1|grok-4|pro)/i.test(entry.modelId)) {
+        if (entry.specialties.includes('深度推理') || STRONG_MODEL_ID_RE.test(entry.modelId)) {
           score += 24;
         }
       } else if (isSimple) {
         score += depth <= 2 ? 42 - depth * 4 : Math.max(-15, 16 - depth * 6);
-        if (/(?:flash|mini|haiku|turbo|nano|lite)/i.test(entry.modelId)) score += 28;
-        if (/(?:opus|o1|o3|o4|reasoner|pro)/i.test(entry.modelId) || entry.reasoning) score -= 12;
+        if (FAST_MODEL_ID_RE.test(entry.modelId)) score += 28;
+        if (STRONG_MODEL_ID_RE.test(entry.modelId) || entry.reasoning) score -= 12;
       } else {
         score += 36 - Math.abs(depth - 3) * 10;
-        if (/(?:sonnet|flash|gpt-4\.1|gpt-4o|deepseek-chat|gemini-2\.5)/i.test(entry.modelId)) score += 18;
+        if (/(?:sonnet|flash|gpt-4\.1|gpt-4o|gpt-6-sol|gpt-6\.1-sol|deepseek-chat|gemini-2\.5|carbon|hydrogen)/i.test(entry.modelId)) score += 18;
       }
 
       if (needsVision) {
@@ -506,7 +511,7 @@ export function selectHeuristicRoute(
       }
       if (needsCoding) {
         if (entry.specialties.includes('代码工程')) score += 26;
-        if (/(?:claude-sonnet|claude-opus|gemini|gpt-5|gpt-4\.1|gpt-4o|codex|deepseek|qwen.*coder)/i.test(entry.modelId)) score += 18;
+        if (CODING_MODEL_ID_RE.test(entry.modelId)) score += 18;
       }
       if (needsLongContext) {
         if (entry.contextWindow >= 500_000) score += 32;
@@ -569,10 +574,21 @@ export async function decideWorkerRoute(
     byKey.set(item.key, { candidate: item.candidate, level: item.level });
   }
 
+  const complexityTier = inferTaskComplexityTier({
+    instruction: task.instruction,
+    profile: task.profile,
+    fileCount: task.fileCount,
+    isTimer: task.isTimer,
+  });
+  const preferredThinkingLevel = task.preferredLevel
+    ?? (complexityTier === 'strong' ? 'high' : complexityTier === 'fast' ? 'low' : 'medium');
+
   const inputPayload = JSON.stringify({
     instruction: task.instruction.slice(0, 2000),
     ...(task.contextBrief ? { contextBrief: task.contextBrief.slice(0, 1200) } : {}),
     profile: task.profile ?? 'general',
+    complexityTier,
+    preferredThinkingLevel,
     fileCount: task.fileCount ?? 0,
     hasImages: Boolean(task.hasImages),
     isTimer: Boolean(task.isTimer),
@@ -582,7 +598,7 @@ export async function decideWorkerRoute(
     const res = await requestGeminiDecisions(credentials, inputPayload, {
       route: {
         type: 'choice',
-        instructions: 'Select the optimal "provider/model@thinkingLevel" candidate balancing capability, reasoning depth, vision/context requirements, cost, latency, and empirical quality for this task.',
+        instructions: 'Select the optimal "provider/model@thinkingLevel" candidate for this task. Match model capability class, pricing tier, and reasoning depth to complexityTier and preferredThinkingLevel: for "strong" or complex coding/debugging/research tasks, prefer full-capability flagship or balanced models over lightweight flash/mini/lite/luna models even when a lightweight model has prior stats; do not lock onto models with prior stats when stronger uncalibrated models in the pool better fit the task.',
         criteria,
       },
       needs_quality_gate: {

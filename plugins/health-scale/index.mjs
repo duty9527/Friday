@@ -2338,6 +2338,173 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
   }
 }
 
+const HEALTH_FASTPATH_EXCLUDE_RE = /(?:然后|顺便|并且|微信|网页|档案|身高|年龄|性别|新建|添加成员|删除|删掉|移除|补录|设为默认|改回|配置|为什么|怎么)/;
+const HEALTH_FASTPATH_START_RE = /^(?:请|帮我|麻烦|现在|重新|再)?(?:开始|启动)?(?:测量体重|测一下体重|称一下体重|称体重|测体重|开始称重|上秤测量|上秤称重|测体脂|量体重)(?:吧|呗|一下)?$/;
+const HEALTH_FASTPATH_RETRY_RE = /^(?:再试一次|重试一次|试一次|重新测(?:一下|一次)?|再测一次|再来一次)(?:吧|呗)?$/;
+const HEALTH_FASTPATH_STOP_RE = /^(?:请|帮我|麻烦)?(?:停止|取消|结束)(?:称重|测量体重|测体重|体脂测量|上秤)(?:吧|一下)?$/;
+const HEALTH_FASTPATH_STATUS_DIRECT_RE = /^(?:帮我)?(?:查一下|看看|看下|播报)?(?:我(?:现在|最新|最近)?的?)?(?:最新|最近)?(?:体重|体脂(?:率)?|称重数据|称重结果|测量结果)(?:是多少|多少|怎么样|出来了吗|有了吗)?$/;
+const HEALTH_FASTPATH_STATUS_RECENT_RE = /^(?:(?:现在)?(?:体脂秤|称重)?(?:同步|同到|收到|测到|有|出)?(?:新|最新)?(?:体重|称重|测量)?(?:数据|结果)?了吗|称好了吗|测好了吗|称上了吗|同步了吗)$/;
+
+function stripHealthFastpathText(rawText) {
+  return String(rawText || '')
+    .replace(/<\|[^|]*\|>/g, '')
+    .trim()
+    .replace(/^(?:(?:你好|您好|嗨|嘿|喂)[，,\s]*)?(?:星期五|小爱同学?|friday)[，,。！!？?、：\s]*/i, '')
+    .replace(/[。，,！!？?\s]+$/g, '')
+    .trim();
+}
+
+function formatFastpathWeightSpeech(latest, deltas) {
+  if (!latest) return '当前还没有体重测量记录。';
+  const kg = Number(latest.weightKg);
+  const jin = Number(latest.weightJin ?? kg * 2);
+  const kgText = kg.toFixed(2).replace(/\.?0+$/, '');
+  const jinText = jin.toFixed(1).replace(/\.0$/, '');
+  const parts = [`最新体重${kgText}公斤，合${jinText}斤`];
+  if (deltas && deltas.prevDiffKg !== null && deltas.prevDiffKg !== undefined) {
+    const diff = Number(deltas.prevDiffKg);
+    if (Math.abs(diff) < 0.005) {
+      parts.push('与上次持平');
+    } else {
+      const diffText = Math.abs(diff).toFixed(2).replace(/\.?0+$/, '');
+      parts.push(`比上次${diff > 0 ? '重' : '轻'}了${diffText}公斤`);
+    }
+  }
+  const bf = latest.metrics?.bodyFatPercent;
+  const bmi = latest.metrics?.bmi;
+  if (bf !== null && bf !== undefined && bmi !== null && bmi !== undefined) {
+    parts.push(`体脂率${bf}%，BMI ${bmi}`);
+  }
+  return `${parts.join('，')}。`;
+}
+
+/**
+ * In-process voice fastpath for unambiguous health-scale commands (start/retry/stop/status).
+ * Leaves profile edits, deletions, and open-ended follow-ups to the Router LLM.
+ */
+export async function handleVoiceFastpath(request, context = {}) {
+  if (!request || typeof request !== 'object' || request.sessionState?.event === 'assistant_reply') {
+    return { handled: false };
+  }
+  const text = stripHealthFastpathText(request.text);
+  if (!text || text.length > 32 || HEALTH_FASTPATH_EXCLUDE_RE.test(text)) {
+    return { handled: false };
+  }
+
+  const paths = resolveScalePaths({}, context);
+  const nowMs = typeof context.nowFn === 'function' ? context.nowFn() : Date.now();
+  const live = readJsonSafe(sessionFilePath(paths.pluginDataDir), null);
+  const liveAgeMs = live ? nowMs - Number(live.updatedAt || live.startedAt || 0) : Number.POSITIVE_INFINITY;
+  const recentStartSession = Boolean(live && Number.isFinite(liveAgeMs) && liveAgeMs >= 0 && liveAgeMs <= 180_000);
+  const recentQuerySession = Boolean(live && Number.isFinite(liveAgeMs) && liveAgeMs >= 0 && liveAgeMs <= 300_000);
+  const inFollowUp = Boolean(request.sessionState?.healthScaleFollowUp);
+
+  if (inFollowUp && /^(?:不用了?|不需要|不要了?|算了|不用再试了?)$/i.test(text)) {
+    return {
+      handled: true,
+      plugin: 'health-scale',
+      action: 'follow-up-cancel',
+      ok: true,
+      speech: '好的，那先不测了。',
+      followUp: false,
+      clearSessionState: true,
+    };
+  }
+
+  if (HEALTH_FASTPATH_START_RE.test(text) || ((recentStartSession || inFollowUp) && HEALTH_FASTPATH_RETRY_RE.test(text))) {
+    const res = await runAction('measure-start', {}, context);
+    return {
+      handled: true,
+      plugin: 'health-scale',
+      action: 'measure-start',
+      ok: Boolean(res.ok),
+      speech: res.ok
+        ? '好，已经开始监听体脂秤，现在赤脚上秤吧，限时45秒。'
+        : (res.message || '暂时无法启动蓝牙测量。'),
+      followUp: false,
+      clearSessionState: true,
+      data: res.data,
+    };
+  }
+
+  if (HEALTH_FASTPATH_STOP_RE.test(text)) {
+    const res = await runAction('measure-stop', {}, context);
+    return {
+      handled: true,
+      plugin: 'health-scale',
+      action: 'measure-stop',
+      ok: Boolean(res.ok),
+      speech: res.ok ? '好的，已停止体重测量。' : (res.message || '停止测量失败。'),
+      followUp: false,
+      clearSessionState: true,
+      data: res.data,
+    };
+  }
+
+  const directQuery = HEALTH_FASTPATH_STATUS_DIRECT_RE.test(text);
+  const contextualQuery = recentQuerySession && HEALTH_FASTPATH_STATUS_RECENT_RE.test(text);
+  if (directQuery || contextualQuery) {
+    const action = recentQuerySession ? 'measure-status' : 'status';
+    const res = await runAction(action, {}, context);
+    if (!res.ok) {
+      return {
+        handled: true,
+        plugin: 'health-scale',
+        action,
+        ok: false,
+        speech: res.message || '查询体重数据失败。',
+        followUp: false,
+        clearSessionState: true,
+      };
+    }
+    const session = res.data?.session;
+    const dashboard = res.data?.dashboard ?? res.data;
+    const latest = dashboard?.latest;
+    const deltas = dashboard?.deltas;
+    if (session && ['scanning', 'connecting', 'measuring'].includes(session.phase)) {
+      return {
+        handled: true,
+        plugin: 'health-scale',
+        action,
+        ok: true,
+        speech: '还在等待体脂秤稳定读数，请赤脚站稳。',
+        followUp: false,
+        clearSessionState: true,
+        data: { session },
+      };
+    }
+    if (
+      session
+      && session.phase === 'timeout'
+      && (!latest || Number(latest.measuredAt || 0) < Number(session.startedAt || 0))
+    ) {
+      return {
+        handled: true,
+        plugin: 'health-scale',
+        action,
+        ok: true,
+        speech: '刚才45秒超时没收到稳定信号，请确认手机App没占着蓝牙。要再试一次吗？',
+        followUp: true,
+        followUpWaitMs: 8_000,
+        sessionState: { healthScaleFollowUp: true, idleTtlMs: 30_000 },
+        data: { session },
+      };
+    }
+    return {
+      handled: true,
+      plugin: 'health-scale',
+      action,
+      ok: true,
+      speech: formatFastpathWeightSpeech(latest, deltas),
+      followUp: false,
+      clearSessionState: true,
+      data: { latest, deltas },
+    };
+  }
+
+  return { handled: false };
+}
+
 async function main() {
   const action = process.argv[2] || 'status';
   let args = {};

@@ -6,6 +6,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Coordinator } from '../src/coordinator.js';
+import { classifyModelSpecialties } from '../src/decision.js';
+import { ModelHub } from '../src/model-hub.js';
 import { Store } from '../src/store.js';
 import type { AgentFactory } from '../src/agent.js';
 import type { QualityGateAssessment, ThinkingLevel } from '../src/view.js';
@@ -738,6 +740,245 @@ test('Gemini Decision 1: isolates pre-Jev history via epoch migration, tags gemi
     }
   } finally {
     await mock.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('Worker classification avoids ge[mini] substring bug, tags gpt-6 coding, and includes complexityTier in route payload', async () => {
+  const argon = classifyModelSpecialties('google', 'gemini-4-argon', {
+    reasoning: true,
+    supportsImages: true,
+    contextWindow: 1_048_576,
+  });
+  assert.equal(argon.tier, 'strong');
+  assert.equal(argon.specialties.includes('极速响应'), false, 'gemini must not match mini substring');
+  assert.ok(argon.specialties.includes('代码工程'));
+
+  const carbon = classifyModelSpecialties('google', 'gemini-4-carbon', {
+    reasoning: true,
+    supportsImages: true,
+    contextWindow: 1_048_576,
+  });
+  assert.equal(carbon.tier, 'balanced');
+  assert.equal(carbon.specialties.includes('极速响应'), false);
+  assert.ok(carbon.specialties.includes('代码工程'));
+
+  const terra = classifyModelSpecialties('openai', 'gpt-6.1-terra', {
+    reasoning: true,
+    supportsImages: true,
+    contextWindow: 500_000,
+  });
+  assert.equal(terra.tier, 'strong');
+  assert.ok(terra.specialties.includes('代码工程'));
+
+  const gpt6Sol = classifyModelSpecialties('openai', 'gpt-6-sol', {
+    reasoning: true,
+    supportsImages: true,
+    contextWindow: 272_000,
+  });
+  assert.equal(gpt6Sol.tier, 'balanced');
+  assert.ok(gpt6Sol.specialties.includes('代码工程'));
+
+  const luna = classifyModelSpecialties('openai', 'gpt-6-luna', {
+    reasoning: true,
+    supportsImages: true,
+    contextWindow: 272_000,
+  });
+  assert.equal(luna.tier, 'fast');
+  assert.ok(luna.specialties.includes('代码工程'));
+
+  const flash38 = classifyModelSpecialties('google', 'gemini-3.8-flash', {
+    reasoning: true,
+    supportsImages: true,
+    contextWindow: 1_048_576,
+  });
+  assert.equal(flash38.tier, 'fast');
+  assert.ok(flash38.specialties.includes('极速响应'));
+
+  const mock = await withMockDecisionServer(req => {
+    if (req.questions.route) {
+      const keys = Object.keys((req.questions.route.criteria as Record<string, string>) ?? {});
+      const argonKey = keys.find(k => k.startsWith('google/gemini-4-argon@')) ?? keys[0]!;
+      return {
+        body: {
+          answers: {
+            route: { type: 'choice', choice: argonKey, confidence: 0.72 },
+            needs_quality_gate: { type: 'noul', noul: 0.9, confidence: 0.95 },
+          },
+        },
+      };
+    }
+    return {
+      body: {
+        answers: {
+          completion: { type: 'score', score: 2.34, confidence: 0.53 },
+          should_supplement: { type: 'noul', noul: 0.688, confidence: 0.8 },
+          missing_aspect: { type: 'choice', choice: 'incomplete_requirements', confidence: 0.8 },
+        },
+      },
+    };
+  });
+
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-jev-order-'));
+  try {
+    await mkdir(join(home, 'sdk'), { recursive: true });
+    await writeFile(join(home, 'sdk', 'model-hub.json'), JSON.stringify({
+      workerProvider: 'openai',
+      routerProvider: 'openai',
+      providers: {
+        openai: {
+          apiKey: 'sk-openai-order',
+          selectedModels: [{ id: 'gpt-6-luna' }, { id: 'gpt-6.1-terra' }],
+          fetchedModels: [
+            { id: 'gpt-6-luna', name: 'GPT-6-Luna', supportsImages: true, reasoning: true, contextWindow: 272_000, maxTokens: 16_384, costInput: 0, costOutput: 0 },
+            { id: 'gpt-6.1-terra', name: 'GPT-6.1 Terra', supportsImages: true, reasoning: true, contextWindow: 500_000, maxTokens: 16_384, costInput: 0, costOutput: 0 },
+            { id: 'gpt-6.1-sol', name: 'GPT-6.1-Sol', supportsImages: true, reasoning: true, contextWindow: 500_000, maxTokens: 16_384, costInput: 0, costOutput: 0 },
+          ],
+        },
+        google: {
+          apiKey: 'sk-google-order',
+          selectedModels: [{ id: 'gemini-4-argon' }],
+          fetchedModels: [
+            { id: 'gemini-4-argon', name: 'Gemini 4 Argon', supportsImages: true, reasoning: true, contextWindow: 1_048_576, maxTokens: 32_768, costInput: 0, costOutput: 0 },
+          ],
+        },
+      },
+      statsEpoch: 'jev-era-v1',
+      modelStats: {
+        'openai/gpt-6-luna': { successCount: 26, failCount: 0, avgQualityScore: 2.49, updatedAt: Date.now() },
+      },
+      decision: { enabled: true, apiKey: 'jev-order-key', baseUrl: mock.baseUrl },
+    }), 'utf8');
+
+    const factory: AgentFactory = {
+      mode: 'offline',
+      nativeTools: true,
+      async create(role, _id, tools) {
+        return {
+          close() {},
+          async prompt(text) {
+            const event = JSON.parse(text) as Record<string, unknown>;
+            if (role === 'worker') return '已完成重构';
+            if (event.kind === 'CHAT') {
+              await tools.find(t => t.name === 'start_work')!.execute(JSON.stringify({
+                instruction: '重构核心状态机并发锁架构并全面排查潜在风险',
+                profile: 'coding',
+                cwd: home,
+              }));
+              return '已安排';
+            }
+            return `完成：${String(event.report ?? '')}`;
+          },
+        };
+      },
+    };
+
+    const coordinator = new Coordinator(home, factory);
+    try {
+      await coordinator.ready();
+      const hubBefore = await coordinator.modelHub.getView();
+      assert.equal(
+        hubBefore.modelPool?.some(m => m.spec === 'openai/gpt-6.1-sol'),
+        false,
+        'unselected currentTiers default must not be injected when selectedModels is non-empty',
+      );
+      const terraEntry = hubBefore.modelPool?.find(m => m.spec === 'openai/gpt-6.1-terra');
+      assert.ok(terraEntry?.specialties.includes('代码工程'));
+
+      coordinator.chat('req-order-1', '重构核心状态机');
+      await until(() => coordinator.store.list().some(t => t.status === 'completed'));
+
+      const routeReq = mock.requests.find(r => Boolean(r.questions.route))!;
+      assert.equal(routeReq.input.complexityTier, 'strong');
+      assert.equal(routeReq.input.preferredThinkingLevel, 'high');
+
+      // shouldSupplement=true caps recorded avgQualityScore <= 1.2 even when raw score was 2.34
+      const hubAfter = await coordinator.modelHub.getView();
+      const argonAfter = hubAfter.modelPool?.find(m => m.spec === 'google/gemini-4-argon');
+      assert.equal(argonAfter?.avgQualityScore, 1.2);
+    } finally {
+      await coordinator.close();
+    }
+  } finally {
+    await mock.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('ModelHub preserves pristine SDK metadata for fetched gpt-6.1-sol and probes without unsupported reasoning.effort=none', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-hub-gpt61sol-'));
+  const observedEfforts: Array<unknown> = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    if (!url.startsWith('https://api.openai.com/')) {
+      return origFetch(input, init);
+    }
+    const rawBody = typeof init?.body === 'string' ? init.body : '';
+    const parsed = rawBody ? JSON.parse(rawBody) as { reasoning?: { effort?: unknown } } : {};
+    const effort = parsed.reasoning?.effort;
+    observedEfforts.push(effort);
+    if (effort === 'none') {
+      return new Response(JSON.stringify({
+        error: {
+          code: 'unsupported_value',
+          message: "Unsupported value: 'none' is not supported with the 'gpt-6.1-sol' model. Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'.",
+          param: 'reasoning.effort',
+          type: 'invalid_request_error',
+        },
+      }), { status: 400, headers: { 'content-type': 'application/json' } });
+    }
+    const sse = [
+      `data: ${JSON.stringify({ type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: 'msg_probe', role: 'assistant', status: 'in_progress', content: [] } })}\n\n`,
+      `data: ${JSON.stringify({ type: 'response.output_text.delta', output_index: 0, content_index: 0, delta: '老板，我是 gpt-6.1-sol，连接正常。' })}\n\n`,
+      `data: ${JSON.stringify({ type: 'response.output_item.done', output_index: 0, item: { type: 'message', id: 'msg_probe', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: '老板，我是 gpt-6.1-sol，连接正常。' }] } })}\n\n`,
+      `data: ${JSON.stringify({ type: 'response.completed', response: { id: 'resp_probe', status: 'completed', usage: { input_tokens: 10, output_tokens: 8, total_tokens: 18 } } })}\n\n`,
+    ].join('');
+    return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+  }) as typeof fetch;
+
+  try {
+    await mkdir(join(home, 'sdk'), { recursive: true });
+    await writeFile(join(home, 'sdk', 'model-hub.json'), JSON.stringify({
+      workerProvider: 'openai',
+      routerProvider: 'openai',
+      providers: {
+        openai: {
+          apiKey: 'sk-openai-probe-test',
+          selectedModels: [{ id: 'gpt-6.1-terra' }],
+          fetchedModels: [
+            { id: 'gpt-6.1-sol', name: 'GPT-6.1-Sol', supportsImages: true, reasoning: true, contextWindow: 500_000, maxTokens: 16_384, costInput: 0, costOutput: 0 },
+            { id: 'gpt-6.1-terra', name: 'GPT-6.1 Terra', supportsImages: true, reasoning: true, contextWindow: 500_000, maxTokens: 16_384, costInput: 0, costOutput: 0 },
+          ],
+        },
+      },
+    }), 'utf8');
+
+    const hub = new ModelHub(
+      home,
+      'real',
+      { provider: 'openai', router: 'gpt-4.1', fast: 'gpt-6.1-sol', balanced: 'gpt-6.1-sol', strong: 'gpt-6.1-sol', available: ['gpt-6.1-sol'] },
+      'openai',
+    );
+    await hub.init();
+    try {
+      const view = await hub.getView();
+      const openaiView = view.providers.find(p => p.id === 'openai')!;
+      const solCatalog = openaiView.models.find(m => m.id === 'gpt-6.1-sol')!;
+      assert.deepEqual(solCatalog.thinkingLevels, ['low', 'medium', 'high', 'xhigh', 'max']);
+      assert.equal(solCatalog.costInput, 2);
+      assert.equal(solCatalog.maxTokens, 128_000);
+
+      const probeRes = await hub.probe({ model: 'openai/gpt-6.1-sol' });
+      assert.equal(probeRes.ok, true, probeRes.error ?? 'probe should succeed without effort=none error');
+      assert.match(probeRes.reply ?? '', /连接正常/);
+      assert.equal(observedEfforts.length, 1);
+      assert.ok(observedEfforts[0] === 'low' || observedEfforts[0] === 'medium', `unexpected reasoning.effort=${String(observedEfforts[0])}`);
+    } finally {
+      await hub.close();
+    }
+  } finally {
+    globalThis.fetch = origFetch;
     await rm(home, { recursive: true, force: true });
   }
 });

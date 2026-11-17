@@ -16,6 +16,7 @@ type HealthModule = {
   encodeTimeAndUserInfo27(opts: Record<string, unknown>): Buffer;
   computeFullHealthReport(opts: Record<string, unknown>): Record<string, unknown> | null;
   runAction(action: string, args?: Record<string, unknown>, deps?: Record<string, unknown>): Promise<Record<string, unknown>>;
+  handleVoiceFastpath(request: Record<string, unknown>, context?: Record<string, unknown>): Promise<Record<string, unknown>>;
 };
 
 // Dynamic import of ESM plugin module (same pattern as test/miot.test.ts)
@@ -408,5 +409,103 @@ test('Friday plugin registry discovers health-scale and runs dashboard in-proces
     assert.ok(Array.isArray(data.profiles));
   } finally {
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('health-scale handleVoiceFastpath handles start, retry, stop, status queries and leaves profile edits to Router', async () => {
+  const mod = await loadPluginModule();
+  const dataDir = mkdtempSync(join(tmpdir(), 'health-scale-fastpath-'));
+  try {
+    await mod.runAction('profile-save', {
+      id: 'owner',
+      name: 'Boss',
+      sex: 'male',
+      age: 26,
+      heightCm: 176,
+      targetWeightKg: 80,
+      unit: 'kg',
+      setDefault: true,
+    }, { dataDir, nowFn: () => 1_700_000_000_000 });
+
+    await mod.runAction('record-add', {
+      weightKg: 79.60,
+      impedanceOhm: 500,
+    }, { dataDir, nowFn: () => 1_700_000_010_000 });
+
+    await mod.runAction('record-add', {
+      weightKg: 79.65,
+      impedanceOhm: 498,
+    }, { dataDir, nowFn: () => 1_700_000_020_000 });
+
+    // Non-fastpath profile creation must delegate to Router
+    const editSkip = await mod.handleVoiceFastpath(
+      { text: '帮郭蛋蛋新建档案身高164', channelId: 'xiaoai-lx06', platform: 'xiaoai' },
+      { dataDir, nowFn: () => 1_700_000_030_000 },
+    );
+    assert.equal(editSkip.handled, false);
+
+    // Direct weight query works even without a live session
+    const queryRes = await mod.handleVoiceFastpath(
+      { text: '最新体重是多少？', channelId: 'xiaoai-lx06', platform: 'xiaoai' },
+      { dataDir, nowFn: () => 1_700_000_030_000 },
+    );
+    assert.equal(queryRes.handled, true);
+    assert.equal(queryRes.action, 'status');
+    assert.match(String(queryRes.speech), /79\.65公斤.*159\.3斤/);
+    assert.equal(queryRes.followUp, false);
+
+    // Timeout session triggers contextual follow-up prompt + retry support
+    writeFileSync(join(dataDir, 'live-session.json'), JSON.stringify({
+      sessionId: 'meas-timeout',
+      profileId: 'owner',
+      pid: null,
+      phase: 'timeout',
+      startedAt: 1_700_000_025_000,
+      updatedAt: 1_700_000_070_000,
+      message: '测量等待 45 秒超时',
+    }));
+    const syncTimeoutRes = await mod.handleVoiceFastpath(
+      { text: '现在同步数据了吗？', channelId: 'xiaoai-lx06', platform: 'xiaoai' },
+      { dataDir, nowFn: () => 1_700_000_080_000 },
+    );
+    assert.equal(syncTimeoutRes.handled, true);
+    assert.equal(syncTimeoutRes.followUp, true);
+    assert.equal((syncTimeoutRes.sessionState as Record<string, unknown>)?.healthScaleFollowUp, true);
+
+    // Contextual retry in follow-up starts measurement
+    if (process.platform === 'linux') {
+      const retryRes = await mod.handleVoiceFastpath(
+        {
+          text: '再试一次吧。',
+          channelId: 'xiaoai-lx06',
+          platform: 'xiaoai',
+          sessionState: syncTimeoutRes.sessionState as Record<string, unknown>,
+        },
+        { dataDir, nowFn: () => 1_700_000_085_000, spawnMeasure: () => 0 },
+      );
+      assert.equal(retryRes.handled, true);
+      assert.equal(retryRes.action, 'measure-start');
+      assert.equal(retryRes.ok, true);
+      assert.match(String(retryRes.speech), /赤脚上秤/);
+      assert.equal(retryRes.clearSessionState, true);
+
+      const startRes = await mod.handleVoiceFastpath(
+        { text: '测量体重。', channelId: 'xiaoai-lx06', platform: 'xiaoai' },
+        { dataDir, nowFn: () => 1_700_000_090_000, spawnMeasure: () => 0 },
+      );
+      assert.equal(startRes.handled, true);
+      assert.equal(startRes.action, 'measure-start');
+      assert.equal(startRes.ok, true);
+
+      const stopRes = await mod.handleVoiceFastpath(
+        { text: '停止称重', channelId: 'xiaoai-lx06', platform: 'xiaoai' },
+        { dataDir, nowFn: () => 1_700_000_095_000 },
+      );
+      assert.equal(stopRes.handled, true);
+      assert.equal(stopRes.action, 'measure-stop');
+      assert.equal(stopRes.ok, true);
+    }
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true });
   }
 });

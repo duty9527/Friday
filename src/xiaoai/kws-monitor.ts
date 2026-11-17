@@ -24,32 +24,32 @@ import {
   isXiaoaiFollowUpCancel,
 } from './utterance-utils.js';
 
-export const XIAOAI_KEYWORDS_VERSION = 'v4';
+export const XIAOAI_KEYWORDS_VERSION = 'v5';
 
 export const DEFAULT_XIAOAI_KEYWORDS = [
   // 星期五 (bare wake word + universal catch-all when prefix is slurred)
-  'x īng q ī w ǔ :1.35 #0.19 @星期五',
-  'x īng q ì w ǔ :1.35 #0.19 @星期五',
-  'x īng q í w ǔ :1.35 #0.19 @星期五',
-  'x īng q ǐ w ǔ :1.30 #0.20 @星期五',
-  'x īng q i w ǔ :1.30 #0.20 @星期五',
-  'x íng q ī w ǔ :1.30 #0.20 @星期五',
-  'x íng q í w ǔ :1.30 #0.20 @星期五',
-  'x īn q ī w ǔ :1.35 #0.19 @星期五',
-  'x īn q ì w ǔ :1.35 #0.19 @星期五',
-  'x īn q í w ǔ :1.35 #0.19 @星期五',
-  'x īn q ǐ w ǔ :1.30 #0.20 @星期五',
-  'x īn q i w ǔ :1.30 #0.20 @星期五',
-  'x ìn q ī w ǔ :1.30 #0.20 @星期五',
-  'x ìn q ì w ǔ :1.30 #0.20 @星期五',
-  'x ìn q í w ǔ :1.30 #0.20 @星期五',
-  'x īng q ī w ù :1.30 #0.20 @星期五',
-  'x īn q ī w ù :1.30 #0.20 @星期五',
-  'x īn q ì w ù :1.30 #0.20 @星期五',
-  'x īng q ī w ú :1.30 #0.20 @星期五',
-  'x īn q ī w ú :1.30 #0.20 @星期五',
-  'x īng q í w ú :1.30 #0.20 @星期五',
-  'x īn q í w ú :1.30 #0.20 @星期五',
+  'x īng q ī w ǔ :1.45 #0.18 @星期五',
+  'x īng q ì w ǔ :1.45 #0.18 @星期五',
+  'x īng q í w ǔ :1.45 #0.18 @星期五',
+  'x īng q ǐ w ǔ :1.40 #0.19 @星期五',
+  'x īng q i w ǔ :1.40 #0.19 @星期五',
+  'x íng q ī w ǔ :1.40 #0.19 @星期五',
+  'x íng q í w ǔ :1.40 #0.19 @星期五',
+  'x īn q ī w ǔ :1.45 #0.18 @星期五',
+  'x īn q ì w ǔ :1.45 #0.18 @星期五',
+  'x īn q í w ǔ :1.45 #0.18 @星期五',
+  'x īn q ǐ w ǔ :1.40 #0.19 @星期五',
+  'x īn q i w ǔ :1.40 #0.19 @星期五',
+  'x ìn q ī w ǔ :1.40 #0.19 @星期五',
+  'x ìn q ì w ǔ :1.40 #0.19 @星期五',
+  'x ìn q í w ǔ :1.40 #0.19 @星期五',
+  'x īng q ī w ù :1.40 #0.19 @星期五',
+  'x īn q ī w ù :1.40 #0.19 @星期五',
+  'x īn q ì w ù :1.40 #0.19 @星期五',
+  'x īng q ī w ú :1.40 #0.19 @星期五',
+  'x īn q ī w ú :1.40 #0.19 @星期五',
+  'x īng q í w ú :1.40 #0.19 @星期五',
+  'x īn q í w ú :1.40 #0.19 @星期五',
   // 你好星期五
   'n ǐ h ǎo x īng q ī w ǔ :1.4 #0.18 @你好星期五',
   'n í h ǎo x īng q ī w ǔ :1.4 #0.18 @你好星期五',
@@ -115,7 +115,7 @@ export const DEFAULT_XIAOAI_KEYWORDS = [
 
 const SAMPLE_RATE = 16_000;
 const DEFAULT_COOLDOWN_MS = 1_200;
-const DEFAULT_PROBE_DURATION_MS = 160;
+const DEFAULT_PROBE_DURATION_MS = 95;
 const DEFAULT_CHIME_DISCARD_MS = 320;
 const DEFAULT_MAX_WAIT_SPEECH_MS = 4_500;
 const DEFAULT_FOLLOWUP_WAIT_SPEECH_MS = 8_000;
@@ -387,6 +387,7 @@ interface ActiveWorker {
   kwsBurstSpeechSamples: number;
   kwsBurstSilenceSamples: number;
   kwsBurstMaxRms: number;
+  kwsBurstFlushedLookahead: boolean;
   kwsRescueId: number;
   kwsRescueInFlight: boolean;
   kwsPostRescueChunks: Float32Array[];
@@ -1169,6 +1170,7 @@ export class XiaoaiKwsMonitor {
         kwsBurstSpeechSamples: 0,
         kwsBurstSilenceSamples: 0,
         kwsBurstMaxRms: 0,
+        kwsBurstFlushedLookahead: false,
         kwsRescueId: 0,
         kwsRescueInFlight: false,
         kwsPostRescueChunks: [],
@@ -1338,6 +1340,7 @@ export class XiaoaiKwsMonitor {
     worker.kwsBurstSpeechSamples = 0;
     worker.kwsBurstSilenceSamples = 0;
     worker.kwsBurstMaxRms = 0;
+    worker.kwsBurstFlushedLookahead = false;
     if (abortInFlight) {
       worker.kwsRescueId++;
       worker.kwsRescueInFlight = false;
@@ -1582,6 +1585,17 @@ export class XiaoaiKwsMonitor {
 
     if (this.asrWakeRescue) {
       this.updateAsrWakeRescueBurst(worker, spotter, samples, chunkRms, isFgSpeech);
+      if (
+        !worker.kwsRescueInFlight
+        && !worker.kwsBurstFlushedLookahead
+        && worker.kwsBurstSpeechSamples >= msToSamples(240)
+        && worker.kwsBurstSilenceSamples >= msToSamples(120)
+      ) {
+        worker.kwsBurstFlushedLookahead = true;
+        if (this.feedSpotterAndCheckWake(worker, spotter, new Float32Array(msToSamples(160)), 0)) {
+          return;
+        }
+      }
     }
 
     this.maybeHibernateKwsAfterChunk(worker, spotter, chunkRms);
@@ -1673,6 +1687,7 @@ export class XiaoaiKwsMonitor {
     if (isFgSpeech) {
       worker.kwsBurstSpeechSamples += samples.length;
       worker.kwsBurstSilenceSamples = 0;
+      worker.kwsBurstFlushedLookahead = false;
     } else {
       worker.kwsBurstSilenceSamples += samples.length;
     }
@@ -2043,7 +2058,7 @@ export class XiaoaiKwsMonitor {
     worker.currentMaxWaitMs = this.maxWaitSpeechMs;
     worker.probeChunks = [];
     worker.probeSamples = 0;
-    worker.probeSkipSamplesRemaining = Math.min(msToSamples(60), Math.floor(probeTarget / 3));
+    worker.probeSkipSamplesRemaining = Math.min(msToSamples(45), Math.floor(probeTarget / 2));
     worker.probeSawSpeech = false;
     worker.vad?.reset();
     void spotter;

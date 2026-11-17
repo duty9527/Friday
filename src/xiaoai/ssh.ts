@@ -61,7 +61,7 @@ export function buildXiaoaiSshArgs(
     ? [
         '-o', 'ControlMaster=auto',
         '-o', `ControlPath=${controlPath}`,
-        '-o', 'ControlPersist=60',
+        '-o', 'ControlPersist=1800',
       ]
     : [
         '-o', 'ControlMaster=no',
@@ -268,13 +268,16 @@ function buildWakeCacheStoreSnippet(greetingText: string, cacheFile: string): st
 }
 
 export function buildXiaoaiWakeCommand(options?: { chime?: boolean; greetingText?: string }): string {
-  const pauseCmd = 'rm -f /tmp/friday_speaking; (ubus -t 1 call mediaplayer player_play_operation \'{"action":"pause"}\' >/dev/null 2>&1 || mphelper pause >/dev/null 2>&1 || true)';
+  const prepCmd = 'rm -f /tmp/friday_speaking';
+  const pauseCmd = '((ubus -t 1 call mediaplayer player_play_operation \'{"action":"pause"}\' >/dev/null 2>&1 || mphelper pause >/dev/null 2>&1 || true) </dev/null >/dev/null 2>&1 &)';
   const fallbackPlay = `ubus -t 2 call qplayer play '{"play":"${XIAOAI_WAKE_CHIME_PATH}"}' >/dev/null 2>&1 || /usr/bin/miplayer -f '${XIAOAI_WAKE_CHIME_PATH}' </dev/null >/dev/null 2>&1 || true`;
-  const chimeCmd = options?.chime === false ? '' : `(${fallbackPlay}); `;
   const ledCmd = 'tok="$$_$(date +%s)"; echo "$tok" >/tmp/friday_led_tok; (/bin/shut_led 2 >/dev/null 2>&1 || true); (/bin/show_led 1 >/dev/null 2>&1 || true); (sh -c \'sleep 15; [ "$(cat /tmp/friday_led_tok 2>/dev/null)" = "\'"$tok"\'" ] && /bin/shut_led 1 >/dev/null 2>&1 || true\' </dev/null >/dev/null 2>&1 &)';
   const cleanGreeting = options?.greetingText?.replace(/["\\$`\r\n]/g, '').trim();
-  if (options?.chime === false || !cleanGreeting) {
-    return `${pauseCmd}; ${chimeCmd}${ledCmd}`;
+  if (options?.chime === false) {
+    return `${prepCmd}; ${ledCmd}; ${pauseCmd}`;
+  }
+  if (!cleanGreeting) {
+    return `${prepCmd}; ${ledCmd}; ${pauseCmd}; (${fallbackPlay})`;
   }
   const cacheFile = getXiaoaiWakeCacheFileName(cleanGreeting);
   const playGreetingCmd = [
@@ -282,10 +285,12 @@ export function buildXiaoaiWakeCommand(options?: { chime?: boolean; greetingText
     'CDIR=/data/friday_wake_cache;',
     'mkdir -p "$CDIR" 2>/dev/null || { CDIR=/tmp/friday_wake_cache; mkdir -p "$CDIR" 2>/dev/null || true; };',
     buildWakeCacheStoreSnippet(cleanGreeting, cacheFile),
-    `if [ -s "$CF" ]; then /usr/bin/miplayer -f "$CF" </dev/null >/dev/null 2>&1 || true; else ${fallbackPlay}; fi`,
+    'WAVF="$CF.wav";',
+    `if [ ! -s "$WAVF" ] && [ -s "/tmp/friday_wake_cache/${cacheFile}.wav" ]; then WAVF="/tmp/friday_wake_cache/${cacheFile}.wav"; fi;`,
+    `if [ -s "$WAVF" ]; then (/usr/bin/aplay -D notify -q "$WAVF" </dev/null >/dev/null 2>&1 || /usr/bin/qplayer "$WAVF" </dev/null >/dev/null 2>&1 || /usr/bin/miplayer -f "$WAVF" </dev/null >/dev/null 2>&1 || true); elif [ -s "$CF" ]; then /usr/bin/miplayer -f "$CF" </dev/null >/dev/null 2>&1 || true; else ${fallbackPlay}; fi`,
     ')',
   ].join(' ');
-  return `${pauseCmd}; ${ledCmd}; ${playGreetingCmd}`;
+  return `${prepCmd}; ${ledCmd}; ${pauseCmd}; ${playGreetingCmd}`;
 }
 
 export function buildXiaoaiWakePrewarmCommand(phrases: readonly string[]): string {

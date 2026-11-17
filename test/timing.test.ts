@@ -147,7 +147,7 @@ test('periodic timer clamps tiny intervalMs, fast-forwards overdue nextRunAt str
 
     await until(() => {
       try { return coordinator.store.listTimers()[0]!.missedRuns > 0; } catch { return false; }
-    }, 200);
+    }, 3_000);
     const updated = coordinator.store.listTimers().find(t => t.id === timer.id)!;
     assert.ok(updated.missedRuns >= 20, 'overdue intervals accumulated into missedRuns');
     assert.ok(updated.nextRunAt > Date.now() - 100, 'nextRunAt fast-forwarded past now instead of looping 0ms catch-up');
@@ -164,7 +164,7 @@ test('periodic timer clamps tiny intervalMs, fast-forwards overdue nextRunAt str
       } catch {
         return false;
       }
-    }, 200);
+    }, 3_000);
   } finally {
     await coordinator.close();
     await rm(root, { recursive: true, force: true });

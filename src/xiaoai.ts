@@ -40,6 +40,7 @@ export {
   DEFAULT_OWNER_WAKE_GREETINGS,
   resolveXiaoaiWakeGreeting,
   tightenWakeMp3BufferWithFfmpeg,
+  tightenWakeAudioToWavBufferWithFfmpeg,
   prewarmXiaoaiWakeGreetings,
   handleXiaoaiKeywordWake,
   sendXiaoaiSpeech,

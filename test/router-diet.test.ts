@@ -24,6 +24,7 @@ import {
   compactRouterChatRecentContext,
   compactRouterChatWorks,
 } from '../src/coordinator.js';
+import { compactPluginResultForRouter } from '../src/orchestrator/router-tools.js';
 import type { ModelHub } from '../src/model-hub.js';
 import { resolveRuntimeMessageSession } from '../src/session.js';
 import { Store } from '../src/store.js';
@@ -69,35 +70,35 @@ test('prepareRouterSessionModel preserves real contextWindow while disabling CoT
   assert.equal(missingWindow.thinkingLevelMap?.off, 'off');
 });
 
-test('pruneRouterContextMessages trims 405 messages cleanly on HOST_EVENT boundary with 10-msg KV-cache stability', () => {
+test('pruneRouterContextMessages trims 409 messages cleanly on HOST_EVENT boundary with 24-msg KV-cache stability', () => {
   type SimMsg = { id: number; role: string; content: unknown; toolsAdded?: unknown[] };
 
-  assert.equal(ROUTER_CONTEXT_KEEP_MAX, 20);
-  assert.equal(ROUTER_CONTEXT_PRUNE_STEP, 10);
+  assert.equal(ROUTER_CONTEXT_KEEP_MAX, 24);
+  assert.equal(ROUTER_CONTEXT_PRUNE_STEP, 24);
   assert.equal(ROUTER_HISTORICAL_TOOL_RESULT_MAX_CHARS, 480);
   assert.equal(ROUTER_HISTORICAL_ASSISTANT_TEXT_MAX_CHARS, 600);
   assert.equal(ROUTER_HISTORICAL_TOOL_ARG_MAX_CHARS, 360);
 
-  // Build <= 30 messages (keepMax=20 + step=10): returned as-is
+  // Build <= 48 messages (keepMax=24 + step=24): returned as-is
   const small: SimMsg[] = [];
-  for (let i = 0; i < 15; i++) {
+  for (let i = 0; i < 24; i++) {
     small.push({ id: i * 2, role: 'user', content: [{ type: 'text', text: `HOST_EVENT\n{"kind":"CHAT","turn":${i}}` }] });
     small.push({ id: i * 2 + 1, role: 'assistant', content: [{ type: 'text', text: `ok ${i}` }] });
   }
-  assert.equal(small.length, 30);
+  assert.equal(small.length, 48);
   assert.equal(pruneRouterContextMessages(small), small);
 
-  // Build realistic 405-message Router transcript where index 380 (rawDrop for 405 with keepMax=20, step=10)
+  // Build realistic 409-message Router transcript where index 384 (rawDrop for 409 with keepMax=24, step=24)
   // lands directly in the middle of an assistant toolCall -> toolResult sequence!
   const messages: SimMsg[] = [];
   let turnNum = 0;
-  while (messages.length < 378) {
+  while (messages.length < 382) {
     messages.push({
       id: messages.length,
       role: 'user',
       content: [{ type: 'text', text: `HOST_EVENT\n{"kind":"CHAT","turn":${turnNum}}` }],
     });
-    if (turnNum % 2 === 0 && messages.length <= 374) {
+    if (turnNum % 2 === 0 && messages.length <= 378) {
       messages.push({
         id: messages.length,
         role: 'assistant',
@@ -116,49 +117,49 @@ test('pruneRouterContextMessages trims 405 messages cleanly on HOST_EVENT bounda
     });
     turnNum++;
   }
-  assert.equal(messages.length, 378);
+  assert.equal(messages.length, 382);
 
-  // Index 378: user HOST_EVENT, 379: assistant toolCall, 380 (rawDrop!): toolResult, 381: non-HOST_EVENT user note,
-  // 382: assistant final reply, 383: clean HOST_EVENT user turn boundary!
+  // Index 382: user HOST_EVENT, 383: assistant toolCall, 384 (rawDrop!): toolResult, 385: non-HOST_EVENT user note,
+  // 386: assistant final reply, 387: clean HOST_EVENT user turn boundary!
   messages.push({
-    id: 378,
+    id: 382,
     role: 'user',
     content: [{ type: 'text', text: 'HOST_EVENT\n{"kind":"CHAT","turn":"pre-boundary"}' }],
   });
   messages.push({
-    id: 379,
+    id: 383,
     role: 'assistant',
     content: [{ type: 'toolCall', id: 'tc-split-guard', name: 'inspect_work', arguments: '{}' }],
   });
   messages.push({
-    id: 380,
+    id: 384,
     role: 'toolResult',
     content: [{ type: 'text', text: 'must-not-be-orphaned-at-head' }],
   });
   messages.push({
-    id: 381,
+    id: 385,
     role: 'user',
     content: [{ type: 'text', text: 'plain internal note without host event header' }],
   });
   messages.push({
-    id: 382,
+    id: 386,
     role: 'assistant',
     content: [{ type: 'text', text: 'done pre-boundary' }],
   });
   messages.push({
-    id: 383,
+    id: 387,
     role: 'user',
     content: [{ type: 'text', text: 'HOST_EVENT\n{"kind":"CHAT","turn":"clean-anchor"}' }],
   });
   messages.push({
-    id: 384,
+    id: 388,
     role: 'assistant',
     content: [{ type: 'text', text: 'clean-anchor-reply' }],
   });
 
-  while (messages.length < 404) {
+  while (messages.length < 408) {
     const idx = messages.length;
-    if ((idx - 385) % 2 === 0) {
+    if ((idx - 389) % 2 === 0) {
       messages.push({
         id: idx,
         role: 'user',
@@ -172,38 +173,38 @@ test('pruneRouterContextMessages trims 405 messages cleanly on HOST_EVENT bounda
       });
     }
   }
-  // Index 404 -> total length = 405 (active user turn at tail)
+  // Index 408 -> total length = 409 (active user turn at tail)
   messages.push({
-    id: 404,
+    id: 408,
     role: 'user',
     content: [{ type: 'text', text: 'HOST_EVENT\n{"kind":"CHAT","turn":"latest"}' }],
   });
-  assert.equal(messages.length, 405);
+  assert.equal(messages.length, 409);
 
-  const pruned405 = pruneRouterContextMessages(messages);
-  assert.equal(pruned405[0]?.id, 383, 'slices cleanly at first HOST_EVENT user turn >= rawDrop (380), never orphaning toolResult 380');
-  assert.equal(pruned405[0]?.role, 'user');
-  assert.equal(pruned405.length, 405 - 383);
-  assert.equal(pruned405.some(m => m.id === 380), false);
+  const pruned409 = pruneRouterContextMessages(messages);
+  assert.equal(pruned409[0]?.id, 387, 'slices cleanly at first HOST_EVENT user turn >= rawDrop (384), never orphaning toolResult 384');
+  assert.equal(pruned409[0]?.role, 'user');
+  assert.equal(pruned409.length, 409 - 387);
+  assert.equal(pruned409.some(m => m.id === 384), false);
 
-  // Verify KV-cache chunk stability: growing from 405 up to 409 keeps the EXACT same slice head (id === 383)
+  // Verify KV-cache chunk stability: growing from 409 up to 431 keeps the EXACT same slice head (id === 387)
   const grown = [...messages];
-  for (let len = 406; len <= 409; len++) {
+  for (let len = 410; len <= 431; len++) {
     grown.push(
       len % 2 === 1
         ? { id: len - 1, role: 'assistant', content: [{ type: 'text', text: `r-${len}` }] }
         : { id: len - 1, role: 'user', content: [{ type: 'text', text: `HOST_EVENT\n{"kind":"CHAT","len":${len}}` }] },
     );
     const prunedNext = pruneRouterContextMessages(grown);
-    assert.equal(prunedNext[0]?.id, 383, `slice anchor stays pinned at 383 for length ${len}`);
+    assert.equal(prunedNext[0]?.id, 387, `slice anchor stays pinned at 387 for length ${len}`);
   }
 
-  // At 410 (next 10-message step: rawDrop advances from 380 to 390), anchor advances cleanly to >= 390
-  grown.push({ id: 409, role: 'user', content: [{ type: 'text', text: 'HOST_EVENT\n{"kind":"CHAT","len":410}' }] });
-  assert.equal(grown.length, 410);
-  const pruned410 = pruneRouterContextMessages(grown);
-  assert.ok((pruned410[0]?.id ?? 0) >= 390, 'anchor advances once 10-message chunk fills');
-  assert.equal(pruned410[0]?.role, 'user');
+  // At 432 (next 24-message step: rawDrop advances from 384 to 408), anchor advances cleanly to >= 408
+  grown.push({ id: 431, role: 'user', content: [{ type: 'text', text: 'HOST_EVENT\n{"kind":"CHAT","len":432}' }] });
+  assert.equal(grown.length, 432);
+  const pruned432 = pruneRouterContextMessages(grown);
+  assert.ok((pruned432[0]?.id ?? 0) >= 408, 'anchor advances once 24-message chunk fills');
+  assert.equal(pruned432[0]?.role, 'user');
 
   // Leading SDK system message (systemPrompt + toolsAdded) is preserved at index 0 when present
   const withSystem: SimMsg[] = [
@@ -213,7 +214,7 @@ test('pruneRouterContextMessages trims 405 messages cleanly on HOST_EVENT bounda
   const prunedWithSystem = pruneRouterContextMessages(withSystem);
   assert.equal(prunedWithSystem[0]?.role, 'system');
   assert.equal(prunedWithSystem[0]?.id, -1);
-  assert.equal(prunedWithSystem[1]?.id, 383);
+  assert.equal(prunedWithSystem[1]?.id, 387);
 
   // Backward fallback when no HOST_EVENT user boundary exists ahead in [rawDrop, rawDrop + step]
   const longToolTurn: SimMsg[] = [];
@@ -221,9 +222,9 @@ test('pruneRouterContextMessages trims 405 messages cleanly on HOST_EVENT bounda
     longToolTurn.push({ id: longToolTurn.length, role: 'user', content: `HOST_EVENT\n{"kind":"CHAT","t":${i}}` });
     longToolTurn.push({ id: longToolTurn.length, role: 'assistant', content: [{ type: 'text', text: 'ok' }] });
   }
-  // Index 8 is the last clean HOST_EVENT user turn before a 26-message tool loop (total length = 35, rawDrop = 10)
+  // Index 8 is the last clean HOST_EVENT user turn before a 40-message tool loop (total length = 49, rawDrop = 24)
   longToolTurn.push({ id: 8, role: 'user', content: 'HOST_EVENT\n{"kind":"CHAT","t":"long-loop"}' });
-  while (longToolTurn.length < 35) {
+  while (longToolTurn.length < 49) {
     const id = longToolTurn.length;
     longToolTurn.push(
       id % 2 === 1
@@ -231,7 +232,7 @@ test('pruneRouterContextMessages trims 405 messages cleanly on HOST_EVENT bounda
         : { id, role: 'toolResult', content: [{ type: 'text', text: `res-${id}` }] },
     );
   }
-  assert.equal(longToolTurn.length, 35);
+  assert.equal(longToolTurn.length, 49);
   const prunedFallback = pruneRouterContextMessages(longToolTurn);
   assert.equal(prunedFallback[0]?.id, 8, 'falls back backwards to clean HOST_EVENT boundary 8 instead of splitting tool loop');
 });
@@ -1341,4 +1342,80 @@ test('Dreamer connect_synapse forbids explicit synapses and caps weak associatio
     await coordinator.close();
     await rm(home, { recursive: true, force: true });
   }
+});
+
+test('compactPluginResultForRouter shrinks bloated health-scale measure-status payloads while keeping core metrics', () => {
+  const items = Array.from({ length: 18 }, (_, i) => ({
+    key: `metric_${i}`,
+    label: `指标${i}`,
+    value: 10 + i,
+    unit: '%',
+    status: 'normal',
+    advice: 'A'.repeat(120),
+  }));
+  const records = Array.from({ length: 25 }, (_, i) => ({
+    id: `m-${i}`,
+    measuredAt: 1_794_937_800_000 - i * 86_400_000,
+    weightKg: 79.65 - i * 0.1,
+    weightJin: 159.3 - i * 0.2,
+    source: 'live',
+    adcs: [500, 460],
+    rawMeta: { extra: 'R'.repeat(120) },
+    metrics: {
+      weightKg: 79.65 - i * 0.1,
+      bmi: 25.7,
+      bodyFatPercent: 15.9,
+      bodyScore: 86,
+      items,
+    },
+  }));
+  const rawResult = {
+    ok: true,
+    plugin: 'health-scale',
+    action: 'measure-status',
+    notify: false,
+    title: '体脂测量完成',
+    message: '测量完成，体重 79.65 kg',
+    data: {
+      session: {
+        sessionId: 'meas-1',
+        phase: 'completed',
+        notifications: Array.from({ length: 40 }, () => ({ hex: 'AC27'.repeat(10) })),
+      },
+      dashboard: {
+        activeProfile: { id: 'owner', name: 'Boss' },
+        latest: records[0],
+        deltas: { prevDiffKg: 0.05 },
+        records,
+      },
+    },
+  };
+
+  const rawJson = JSON.stringify(rawResult);
+  assert.ok(rawJson.length > 30_000);
+
+  const compacted = compactPluginResultForRouter(rawResult, 'measure-status', {});
+  const compactedJson = JSON.stringify(compacted);
+  assert.ok(compactedJson.length < 3_000, `Expected compacted JSON < 3000 chars, got ${compactedJson.length}`);
+  const compactedData = compacted.data as {
+    session: { phase: string; notifications?: unknown };
+    dashboard: {
+      latest: { weightKg: number; metrics: { bodyFatPercent: number; items?: unknown } };
+      records?: unknown;
+      recordsCount: number;
+      recentRecords: unknown[];
+    };
+  };
+  assert.equal(compactedData.session.phase, 'completed');
+  assert.equal(compactedData.session.notifications, undefined);
+  assert.equal(compactedData.dashboard.latest.weightKg, 79.65);
+  assert.equal(compactedData.dashboard.latest.metrics.bodyFatPercent, 15.9);
+  assert.equal(compactedData.dashboard.latest.metrics.items, undefined);
+  assert.equal(compactedData.dashboard.records, undefined);
+  assert.equal(compactedData.dashboard.recordsCount, 25);
+  assert.equal(compactedData.dashboard.recentRecords.length, 3);
+
+  // Dashboard action & explicit includeRecords: true remain untouched
+  assert.equal(compactPluginResultForRouter(rawResult, 'dashboard', {}), rawResult);
+  assert.equal(compactPluginResultForRouter(rawResult, 'measure-status', { includeRecords: true }), rawResult);
 });

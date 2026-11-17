@@ -193,6 +193,29 @@ export async function tightenWakeMp3BufferWithFfmpeg(inputMp3: Buffer): Promise<
   return res.stdout;
 }
 
+export async function tightenWakeAudioToWavBufferWithFfmpeg(inputMp3: Buffer): Promise<Buffer | undefined> {
+  if (inputMp3.length < 400) return undefined;
+  const res = await runBinaryChild(
+    'ffmpeg',
+    [
+      '-hide_banner', '-loglevel', 'error', '-f', 'mp3', '-i', 'pipe:0',
+      '-af', 'silenceremove=start_periods=1:start_silence=0.01:start_threshold=-40dB:stop_periods=-1:stop_duration=0.045:stop_silence=0.03:stop_threshold=-42dB',
+      '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', '-f', 'wav', 'pipe:1',
+    ],
+    inputMp3,
+    10_000,
+  );
+  if (
+    res.code !== 0
+    || res.stdout.length < 800
+    || res.stdout.length > 256_000
+    || res.stdout.subarray(0, 4).toString('ascii') !== 'RIFF'
+  ) {
+    return undefined;
+  }
+  return res.stdout;
+}
+
 export async function prewarmXiaoaiWakeGreetings(
   target: XiaoaiSshTarget,
   phrases: readonly string[] = DEFAULT_OWNER_WAKE_GREETINGS,
@@ -215,13 +238,19 @@ export async function prewarmXiaoaiWakeGreetings(
   const uniquePhrases = [...new Set(phrases.map(p => p.replace(/["\\$`\r\n]/g, '').trim()).filter(Boolean))];
   for (const phrase of uniquePhrases) {
     const cacheFile = getXiaoaiWakeCacheFileName(phrase);
-    const readCmd = `for d in /data/friday_wake_cache /tmp/friday_wake_cache; do if [ -s "$d/${cacheFile}" ] && [ ! -f "$d/${cacheFile}.tight" ]; then cat "$d/${cacheFile}"; break; fi; done`;
+    const readCmd = `for d in /data/friday_wake_cache /tmp/friday_wake_cache; do if [ -s "$d/${cacheFile}" ] && { [ ! -s "$d/${cacheFile}.wav" ] || [ ! -f "$d/${cacheFile}.tight" ]; }; then cat "$d/${cacheFile}"; break; fi; done`;
     const readRes = await runBinaryChild('ssh', ['-T', ...buildXiaoaiSshArgs(target, readCmd, controlPath)], undefined, 10_000);
     if (readRes.code !== 0 || readRes.stdout.length < 400) continue;
+    const tightenedWav = await tightenWakeAudioToWavBufferWithFfmpeg(readRes.stdout);
+    if (tightenedWav) {
+      const writeWavCmd = `CDIR=/data/friday_wake_cache; [ -d "$CDIR" ] || CDIR=/tmp/friday_wake_cache; WF="$CDIR/${cacheFile}.wav"; cat > "$WF.tmp" && [ -s "$WF.tmp" ] && mv -f "$WF.tmp" "$WF"; rm -f "$WF.tmp" 2>/dev/null || true`;
+      await runBinaryChild('ssh', ['-T', ...buildXiaoaiSshArgs(target, writeWavCmd, controlPath)], tightenedWav, 10_000);
+    }
     const tightened = await tightenWakeMp3BufferWithFfmpeg(readRes.stdout);
-    if (!tightened) continue;
-    const writeCmd = `CDIR=/data/friday_wake_cache; [ -d "$CDIR" ] || CDIR=/tmp/friday_wake_cache; CF="$CDIR/${cacheFile}"; cat > "$CF.tmp" && [ -s "$CF.tmp" ] && mv -f "$CF.tmp" "$CF" && : > "$CF.tight"; rm -f "$CF.tmp" 2>/dev/null || true`;
-    await runBinaryChild('ssh', ['-T', ...buildXiaoaiSshArgs(target, writeCmd, controlPath)], tightened, 10_000);
+    if (tightened) {
+      const writeCmd = `CDIR=/data/friday_wake_cache; [ -d "$CDIR" ] || CDIR=/tmp/friday_wake_cache; CF="$CDIR/${cacheFile}"; if [ ! -f "$CF.tight" ]; then cat > "$CF.tmp" && [ -s "$CF.tmp" ] && mv -f "$CF.tmp" "$CF" && : > "$CF.tight"; rm -f "$CF.tmp" 2>/dev/null || true; fi`;
+      await runBinaryChild('ssh', ['-T', ...buildXiaoaiSshArgs(target, writeCmd, controlPath)], tightened, 10_000);
+    }
   }
 }
 

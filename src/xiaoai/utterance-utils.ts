@@ -204,12 +204,33 @@ export function stripXiaoaiDialogDirective(text: string): {
 } {
   if (!text) return { text: '' };
   let directive: 'listen' | 'end' | undefined;
+  const directiveRe =
+    /\s*(?:\[\s*\[\s*(LISTEN|CONTINUE_DIALOG|END|END_DIALOG)\s*\]\s*\]|【\s*(?:【|\[)?\s*(LISTEN|CONTINUE_DIALOG|END|END_DIALOG)\s*(?:】|\])?\s*】|\[\s*(LISTEN|CONTINUE_DIALOG|END|END_DIALOG)\s*\](?!\s*[(\[]))\s*/gi;
   const stripped = text
-    .replace(/\s*\[\[\s*(LISTEN|CONTINUE_DIALOG|END|END_DIALOG)\s*\]\]\s*/gi, (_m, rawTag: string) => {
-      const upper = rawTag.toUpperCase();
-      directive = upper.startsWith('LISTEN') || upper.startsWith('CONTINUE') ? 'listen' : 'end';
-      return '';
-    })
+    .replace(
+      directiveRe,
+      (
+        fullMatch: string,
+        dblTag: string | undefined,
+        fwTag: string | undefined,
+        sglTag: string | undefined,
+        offset: number,
+        fullStr: string,
+      ) => {
+        const rawTag = dblTag ?? fwTag ?? sglTag ?? '';
+        const upper = rawTag.toUpperCase();
+        if (sglTag && upper !== 'CONTINUE_DIALOG' && upper !== 'END_DIALOG') {
+          const isExactUppercase = sglTag === upper;
+          const after = fullStr.slice(offset + fullMatch.length);
+          const isAtTail = /^[。！!？?.,;；\s]*$/.test(after);
+          if (!isExactUppercase && !isAtTail) {
+            return fullMatch;
+          }
+        }
+        directive = upper.startsWith('LISTEN') || upper.startsWith('CONTINUE') ? 'listen' : 'end';
+        return '';
+      },
+    )
     .trim();
   return { text: stripped, ...(directive ? { directive } : {}) };
 }
@@ -264,6 +285,8 @@ export function sanitizeForSpeech(text: string): string {
   result = result.replace(/```[\s\S]*$/g, '（代码详情已同步至控制台）');
 
   result = result.replace(/!?\[([^\]]*)\]\((?:[^()\s]+|\([^)]*\))+\)/g, (_m, label: string) => label);
+  result = result.replace(/[\[【]+[\s[\]【】]*(?:LISTEN|CONTINUE_DIALOG|END|END_DIALOG)[\s[\]【】]*[\]】]+/gi, '');
+  result = result.replace(/\[\s*\]|【\s*】/g, '');
   result = result.replace(/https?:\/\/[^\s，。！？；、（）【】《》"'<>]+/gi, '（链接见控制台）');
 
   result = result.replace(/<\/?[a-zA-Z][a-zA-Z0-9]*(?:\s+[^<>]*)?\/?>/g, '');

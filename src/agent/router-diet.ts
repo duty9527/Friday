@@ -73,8 +73,8 @@ export function compactHostEventText(text: string, isHistorical: boolean): strin
   }
 }
 
-export const ROUTER_CONTEXT_KEEP_MAX = 20;
-export const ROUTER_CONTEXT_PRUNE_STEP = 10;
+export const ROUTER_CONTEXT_KEEP_MAX = 24;
+export const ROUTER_CONTEXT_PRUNE_STEP = 24;
 export const ROUTER_HISTORICAL_TOOL_RESULT_MAX_CHARS = 480;
 export const ROUTER_HISTORICAL_ASSISTANT_TEXT_MAX_CHARS = 600;
 export const ROUTER_HISTORICAL_TOOL_ARG_MAX_CHARS = 360;
