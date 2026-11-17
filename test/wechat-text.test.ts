@@ -55,3 +55,63 @@ test('WeChat iLink preserves multiline text in direct and conversation outbound 
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test('WeChat iLink maps [bot:<expr>] inline tags and sends [[sticker:<expr>]] GIF via image_item + /sticker command', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'friday-wechat-sticker-'));
+  const store = new Store(home);
+  const gateway = new ImGateway({ store } as any);
+  const originalFetch = globalThis.fetch;
+  const sentMessages: Array<Record<string, any>> = [];
+  let uploadCount = 0;
+
+  globalThis.fetch = (async (url, init) => {
+    const u = String(url);
+    if (u.endsWith('/ilink/bot/getuploadurl')) {
+      return Response.json({ ret: 0, upload_param: `param-${++uploadCount}` });
+    }
+    if (u.startsWith('https://novac2c.cdn.weixin.qq.com/c2c/upload')) {
+      return new Response(null, { status: 200, headers: { 'x-encrypted-param': `dl-${uploadCount}` } });
+    }
+    if (u.endsWith('/ilink/bot/sendmessage')) {
+      sentMessages.push(JSON.parse(String(init?.body)));
+      return Response.json({ ret: 0 });
+    }
+    throw new Error(`Unexpected fetch: ${u}`);
+  }) as typeof fetch;
+
+  try {
+    store.saveImChannel({
+      id: 'wx-sticker', platform: 'wechat', name: 'sticker test', enabled: true,
+      notifyAll: false, botToken: 'test-token', accountId: 'test-bot',
+      apiBase: 'https://wechat.invalid', defaultTarget: 'test-user',
+      allowedSenders: ['test-user'], contextTokens: { 'test-user': 'test-context' },
+      pollIntervalMs: 5000, inboundCount: 0, outboundCount: 0,
+      createdAt: Date.now(), updatedAt: Date.now(),
+    });
+
+    await gateway.sendToChannel('wx-sticker', '搞定啦 [bot:happy] [[sticker:inspecting]]');
+    assert.equal(sentMessages.length, 2);
+    assert.equal(sentMessages[0]!.msg.item_list[0].type, 1);
+    assert.equal(sentMessages[0]!.msg.item_list[0].text_item.text, '搞定啦 [庆祝]');
+    assert.equal(sentMessages[1]!.msg.item_list[0].type, 2);
+    assert.equal(sentMessages[1]!.msg.item_list[0].image_item.media.encrypt_query_param, 'dl-1');
+
+    const cmdResult = await gateway.ingestMessage({
+      channelId: 'wx-sticker',
+      externalId: 'cmd-sticker-1',
+      senderId: 'test-user',
+      target: 'test-user',
+      text: '/sticker calm',
+      contextToken: 'test-context',
+    });
+    assert.equal(cmdResult.action, 'command_sticker');
+    assert.equal(sentMessages.length, 3, 'pure sticker command sends image item without blank text message');
+    assert.equal(sentMessages[2]!.msg.item_list[0].type, 2);
+    assert.equal(sentMessages[2]!.msg.item_list[0].image_item.media.encrypt_query_param, 'dl-2');
+  } finally {
+    await gateway.close();
+    globalThis.fetch = originalFetch;
+    store.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});

@@ -14,6 +14,7 @@ import {
   type ImWebhookResponse,
 } from '../types.js';
 import { parseWechatIlinkMessage } from './wechat-ilink.js';
+import { BOT_EXPRESSION_META, transformOutboundBotExpressions } from '../../web/shared/bot-expressions.js';
 
 function extractXmlTag(xml: string, tag: string): string | undefined {
   const cdata = new RegExp(`<${tag}><!\\[CDATA\\[([\\s\\S]*?)\\]\\]><\\/${tag}>`, 'i').exec(xml);
@@ -43,6 +44,10 @@ export class WechatWebhookAdapter implements ImChannelAdapter {
     if (channel.botToken) {
       headers.authorization = `Bearer ${channel.botToken}`;
     }
+    const mapped = transformOutboundBotExpressions(text, 'wechat');
+    const finalText = (!mapped.text.trim() && mapped.stickers.length > 0)
+      ? mapped.stickers.map(expr => BOT_EXPRESSION_META[expr].wechatFallback).join(' ')
+      : mapped.text;
     const res = await fetch(url, {
       method: 'POST',
       headers,
@@ -50,8 +55,8 @@ export class WechatWebhookAdapter implements ImChannelAdapter {
       body: JSON.stringify({
         msgtype: 'text',
         touser: options?.target,
-        text: { content: text },
-        content: text,
+        text: { content: finalText },
+        content: finalText,
       }),
     });
     if (!res.ok) {

@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { renderQrSvgDataUrl, renderQrTerminal } from '../../qrcode.js';
 import type { ImChannelConfig } from '../../store.js';
 import type { ChatMessage, ImChannelView, WechatQrLoginSession } from '../../view.js';
-import { deliverWechatFile } from '../../wechat-file.js';
+import { deliverWechatFile, deliverWechatImage, resolveBotStickerPath } from '../../wechat-file.js';
+import { BOT_EXPRESSION_META, transformOutboundBotExpressions } from '../../web/shared/bot-expressions.js';
 import {
   BoundedMap,
   buildRequestSignal,
@@ -186,31 +187,56 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
     const contextToken = options.contextToken
       ?? channel.contextTokens?.[options.target]
       ?? '';
-    await callIlinkApi({
-      base,
-      botToken: channel.botToken ?? '',
-      path: '/ilink/bot/sendmessage',
-      timeoutMs: 30_000,
-      shutdownSignal: this.ctx.shutdownSignal,
-      httpErrorLabel: '微信 iLink 发送失败:',
-      bizErrorLabel: '微信 iLink 业务发送失败',
-      body: {
-        msg: {
-          from_user_id: channel.accountId ?? '',
-          to_user_id: options.target,
-          client_id: `friday-${randomUUID()}`,
-          message_type: 2,
-          message_state: 2,
-          context_token: contextToken,
-          item_list: [
-            {
-              type: 1,
-              text_item: { text },
-            },
-          ],
+    const { text: outText, stickers } = transformOutboundBotExpressions(text, 'wechat');
+    const canSendStickers = Boolean(channel.botToken && contextToken);
+    const effectiveText = (!canSendStickers && !outText.trim() && stickers.length > 0)
+      ? stickers.map(expr => BOT_EXPRESSION_META[expr].wechatFallback).join(' ')
+      : outText;
+
+    if (effectiveText.trim().length > 0 || stickers.length === 0) {
+      await callIlinkApi({
+        base,
+        botToken: channel.botToken ?? '',
+        path: '/ilink/bot/sendmessage',
+        timeoutMs: 30_000,
+        shutdownSignal: this.ctx.shutdownSignal,
+        httpErrorLabel: '微信 iLink 发送失败:',
+        bizErrorLabel: '微信 iLink 业务发送失败',
+        body: {
+          msg: {
+            from_user_id: channel.accountId ?? '',
+            to_user_id: options.target,
+            client_id: `friday-${randomUUID()}`,
+            message_type: 2,
+            message_state: 2,
+            context_token: contextToken,
+            item_list: [
+              {
+                type: 1,
+                text_item: { text: effectiveText },
+              },
+            ],
+          },
         },
-      },
-    });
+      });
+    }
+
+    if (canSendStickers && stickers.length > 0) {
+      const headers = buildWechatIlinkHeaders(channel.botToken!);
+      for (const expr of stickers) {
+        await deliverWechatImage({
+          filePath: resolveBotStickerPath(expr),
+          target: options.target,
+          contextToken,
+          contextTokenUpdatedAt: channel.contextTokenUpdatedAt?.[options.target] ?? channel.lastInboundAt,
+          accountId: channel.accountId,
+          base,
+          headers,
+          channelId: channel.id,
+          signal: this.ctx.shutdownSignal,
+        });
+      }
+    }
   }
 
   async poll(channel: ImChannelConfig): Promise<{ receivedAny: boolean }> {

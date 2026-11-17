@@ -1,5 +1,9 @@
 import type { ChatMessage, MainView, TraceEvent } from '../view.js';
 import { activeStatus as active } from './model.js';
+import {
+  createLiveBotAvatar,
+  deriveFridayBotState,
+} from './shared/bot-avatar.js';
 import { consumeSseStream } from './shared/auth-http.js';
 import { element, node } from './shared/dom.js';
 import { errorText } from './shared/format.js';
@@ -30,8 +34,99 @@ const modelHubBackdrop = element<HTMLElement>('model-hub-backdrop');
 const healthHubBackdrop = element<HTMLElement>('health-hub-backdrop');
 const messagesEl = element('messages');
 const worksEl = element('works');
+const companionEl = element('companion-avatar');
 
-const chatPanel = initChatPanel();
+const companionAvatar = createLiveBotAvatar({
+  size: 38,
+  interactive: true,
+  idPrefix: 'friday-companion',
+});
+companionEl.replaceChildren(companionAvatar.svg);
+companionEl.addEventListener('keydown', event => {
+  if (event.key === 'Enter' || event.key === ' ') {
+    event.preventDefault();
+    companionAvatar.poke('bounce');
+  }
+});
+window.addEventListener('pointermove', event => {
+  const rect = companionEl.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+  const cx = rect.left + rect.width / 2;
+  const cy = rect.top + rect.height / 2;
+  companionAvatar.setGaze((event.clientX - cx) / 360, -(event.clientY - cy) / 280);
+}, { passive: true });
+window.addEventListener('pointerleave', () => {
+  companionAvatar.setGaze(0, 0);
+});
+
+let staleConnection = false;
+let transientCompanionState: 'finished' | 'failed' | undefined;
+let transientCompanionTimer: ReturnType<typeof setTimeout> | undefined;
+const trackedActiveMessages = new Set<string>();
+const trackedActiveWorks = new Set<string>();
+
+function syncCompanionState(): void {
+  if (transientCompanionState && appState.ready && !appState.authExpired) {
+    companionAvatar.setState(transientCompanionState);
+    return;
+  }
+  const next = deriveFridayBotState({
+    ready: appState.ready,
+    authExpired: appState.authExpired,
+    staleConnection,
+    sending: appState.sending,
+    draftTyping: chatPanel.isDraftTyping(),
+    messages: appState.messages.values(),
+    works: appState.view?.works ?? [],
+  });
+  companionAvatar.setState(next);
+}
+
+function triggerTransientCompanion(state: 'finished' | 'failed', durationMs: number): void {
+  if (transientCompanionTimer) clearTimeout(transientCompanionTimer);
+  transientCompanionState = state;
+  companionAvatar.setState(state);
+  transientCompanionTimer = setTimeout(() => {
+    transientCompanionTimer = undefined;
+    transientCompanionState = undefined;
+    syncCompanionState();
+  }, durationMs);
+}
+
+function trackCompanionTransitions(initial = false): void {
+  let completedNow = false;
+  let failedNow = false;
+
+  if (!initial) {
+    for (const id of trackedActiveMessages) {
+      const msg = appState.messages.get(id);
+      if (!msg || active(msg.status)) continue;
+      if (msg.status === 'failed') failedNow = true;
+      else if (msg.status === 'completed' && msg.role === 'assistant') completedNow = true;
+    }
+    for (const id of trackedActiveWorks) {
+      const work = appState.view?.works.find(item => item.id === id);
+      if (!work || work.status === 'queued' || work.status === 'running') continue;
+      if (work.status === 'failed') failedNow = true;
+      else if (work.status === 'completed') completedNow = true;
+    }
+  }
+
+  trackedActiveMessages.clear();
+  for (const msg of appState.messages.values()) {
+    if (active(msg.status)) trackedActiveMessages.add(msg.id);
+  }
+  trackedActiveWorks.clear();
+  for (const work of appState.view?.works ?? []) {
+    if (work.status === 'queued' || work.status === 'running') trackedActiveWorks.add(work.id);
+  }
+
+  if (failedNow) triggerTransientCompanion('failed', 2500);
+  else if (completedNow) triggerTransientCompanion('finished', 2300);
+  else syncCompanionState();
+}
+
+const chatPanel = initChatPanel({ onDraftActivity: syncCompanionState });
 const tracePanel = initTracePanel();
 const memoryHub = initMemoryHub();
 const timerPluginHub = initTimerPluginHub();
@@ -62,8 +157,10 @@ function connection(text: string, stale = false): void {
     text = '访问链接已失效。请从当前服务的本地启动链接重新进入（服务重启后需使用新链接）。';
     stale = true;
   }
+  staleConnection = stale;
   connectionEl.textContent = text;
   connectionEl.parentElement?.classList.toggle('stale', stale);
+  syncCompanionState();
 }
 
 function closeAllHubModals(): void {
@@ -94,6 +191,7 @@ function expireAuthentication(): void {
   imVoiceHub.render();
   modelHub.render();
   chatPanel.renderMessages();
+  syncCompanionState();
 }
 
 function followLatestMessage(): void {
@@ -162,6 +260,7 @@ async function refreshView(initial = false): Promise<void> {
     }
     chatPanel.updateComposer();
     followLatestMessage();
+    trackCompanionTransitions(initial);
     if (
       !initial
       && appState.selection.type === 'task'
@@ -245,7 +344,10 @@ async function connect(): Promise<void> {
         if (generation !== appState.connectionGeneration) return;
         chatPanel.mergeMessages(changed);
         await chatPanel.hydrateParents();
-        if (changed.length) chatPanel.renderMessages();
+        if (changed.length) {
+          chatPanel.renderMessages();
+          trackCompanionTransitions(false);
+        }
         appState.cursor = Math.max(appState.cursor, batch.cursor);
         appState.retryDelay = 500;
         const runtimeStatus = appState.view?.health.executorAvailable === false ? '执行器不可用，服务降级' : '后台服务持续运行';

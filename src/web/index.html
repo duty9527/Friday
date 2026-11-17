@@ -59,7 +59,10 @@
     </aside>
     <main class="sheet">
       <div class="titlebar">
-        <h1>与 F.R.I.D.A.Y. 对话</h1>
+        <div class="titlebar-brand">
+          <span id="companion-avatar" class="companion-avatar" role="button" tabindex="0" aria-label="F.R.I.D.A.Y. 动态头像（点击互动）" title="点击与 F.R.I.D.A.Y. 互动"></span>
+          <h1>与 F.R.I.D.A.Y. 对话</h1>
+        </div>
         <button id="stop-work" type="button" disabled>停止选中任务</button>
       </div>
       <div class="connection-bar" role="status" aria-live="polite"><span id="connection">正在连接…</span><button id="reconnect" type="button">重新连接</button></div>
@@ -75,7 +78,14 @@
             <textarea id="draft" rows="3" maxlength="16384" placeholder="输入指令或问题…" aria-label="消息输入" disabled></textarea>
             <details id="paths-disclosure" class="paths-disclosure"><summary>工作路径（可选）</summary><label for="paths">文件或文件夹绝对路径（每行一个）</label><textarea id="paths" rows="2" spellcheck="false" placeholder="/Users/用户名/项目/README.md" disabled></textarea></details>
             <p id="send-error" class="error" role="alert"></p>
-            <div class="composer-bottom"><span class="meta">Enter 发送 · Shift + Enter 换行</span><button id="send" class="primary" type="submit" disabled>发送 ↑</button></div>
+            <div id="bot-emote-tray" class="bot-emote-tray" hidden role="group" aria-label="插入 F.R.I.D.A.Y. 小表情"></div>
+            <div class="composer-bottom">
+              <div class="composer-meta-group">
+                <button id="emote-toggle" class="emote-toggle-btn" type="button" aria-expanded="false" aria-controls="bot-emote-tray" disabled>小表情 ▾</button>
+                <span class="meta">Enter 发送 · Shift + Enter 换行</span>
+              </div>
+              <button id="send" class="primary" type="submit" disabled>发送 ↑</button>
+            </div>
           </form>
         </section>
         <aside class="trace" aria-label="执行轨迹">

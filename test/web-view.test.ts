@@ -4,6 +4,13 @@ import { mergeMessages, orderConversation, routeLabel, routeState, spanDuration,
 import { layoutBrainGraph } from '../src/web/brain.js';
 import { buildOverviewFlowchart, buildSessionFlowchart, type MindmapSession, type MindmapTaskFlow } from '../src/web/mindmap-data.js';
 import { consumeSseStream, isValidAccessToken, LEGACY_TOKEN_STORAGE_KEY, resolveBootstrapToken, TOKEN_STORAGE_KEY } from '../src/web/shared/auth-http.js';
+import { computePoseFrame, deriveFridayBotState, renderBotStaticSvgString } from '../src/web/shared/bot-avatar.js';
+import {
+  BOT_EXPRESSIONS,
+  inferMessageBotExpression,
+  tokenizeBotMessageText,
+  transformOutboundBotExpressions,
+} from '../src/web/shared/bot-expressions.js';
 import type { ChatMessage, TraceEvent } from '../src/view.js';
 
 const message = (id: string, seq: number, role: 'user' | 'assistant', replyTo?: string, version = seq): ChatMessage =>
@@ -337,4 +344,75 @@ test('auth-http token validation, fragment stripping, legacy storage migration, 
     }),
     /daemon down/,
   );
+});
+
+test('bot avatar 3D projection, static SVG rendering, state derivation, and inline expression parsing', () => {
+  const neutral = computePoseFrame({ expr: 'neutral', ry: 0 });
+  const happy = computePoseFrame({ expr: 'happy', ry: -12 });
+  assert.match(neutral.bodyPath, /^M[\d.-]+ [\d.-]+.*Z$/);
+  assert.notEqual(neutral.eyeLeft.d, happy.eyeLeft.d);
+  assert.equal(neutral.eyeLeft.opacity, 1);
+
+  const turnedAway = computePoseFrame({ expr: 'neutral', ry: 180 });
+  assert.equal(turnedAway.eyeLeft.opacity, 0, 'eyes hide cleanly when head spins 180 degrees away');
+
+  for (const expr of BOT_EXPRESSIONS) {
+    const svg = renderBotStaticSvgString({ size: 64, expr, background: 'transparent' });
+    assert.match(svg, /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg"/);
+    assert.match(svg, /<mask id="/);
+  }
+
+  assert.equal(deriveFridayBotState({
+    ready: false, authExpired: false, staleConnection: false, sending: false, draftTyping: false, messages: [], works: [],
+  }), 'sleeping');
+  assert.equal(deriveFridayBotState({
+    ready: true, authExpired: false, staleConnection: false, sending: false, draftTyping: true, messages: [], works: [],
+  }), 'listening');
+  assert.equal(deriveFridayBotState({
+    ready: true, authExpired: false, staleConnection: false, sending: false, draftTyping: false,
+    messages: [{ role: 'user', status: 'processing', routing: { status: 'processing', actions: [{ kind: 'search_memory' }] } }],
+    works: [],
+  }), 'searching');
+  assert.equal(deriveFridayBotState({
+    ready: true, authExpired: false, staleConnection: false, sending: false, draftTyping: false,
+    messages: [{ role: 'assistant', status: 'streaming' }], works: [],
+  }), 'streaming');
+  assert.equal(deriveFridayBotState({
+    ready: true, authExpired: false, staleConnection: false, sending: false, draftTyping: false,
+    messages: [], works: [{ status: 'running', pendingQuestion: { question: '确认?' } }],
+  }), 'waiting');
+  assert.equal(deriveFridayBotState({
+    ready: true, authExpired: false, staleConnection: false, sending: false, draftTyping: false,
+    messages: [], works: [{ status: 'running' }],
+  }), 'working');
+  assert.equal(deriveFridayBotState({
+    ready: true, authExpired: false, staleConnection: false, sending: false, draftTyping: false,
+    messages: [], works: [],
+  }), 'idle');
+
+  const tokens = tokenizeBotMessageText('收到 [bot:happy] 马上查 [bot:打量] [bot:invalid_name] <img src=x> [[sticker:confused]]');
+  assert.deepEqual(tokens, [
+    { kind: 'text', value: '收到 ' },
+    { kind: 'emote', expr: 'happy', raw: '[bot:happy]' },
+    { kind: 'text', value: ' 马上查 ' },
+    { kind: 'emote', expr: 'inspecting', raw: '[bot:打量]' },
+    { kind: 'text', value: ' [bot:invalid_name] <img src=x> ' },
+    { kind: 'sticker', expr: 'confused', raw: '[[sticker:confused]]' },
+  ]);
+  assert.equal(inferMessageBotExpression('太棒了 [bot:surprised]'), 'surprised');
+  assert.equal(inferMessageBotExpression('搞定啦 [庆祝]'), 'happy');
+
+  const plainMultiline = 'Line 1\r\nLine 2\n\n[旺柴]';
+  assert.deepEqual(transformOutboundBotExpressions(plainMultiline, 'wechat'), {
+    text: plainMultiline,
+    stickers: [],
+  });
+  assert.deepEqual(transformOutboundBotExpressions('搞定啦 [bot:happy] [[sticker:happy]]', 'wechat'), {
+    text: '搞定啦 [庆祝]',
+    stickers: ['happy'],
+  });
+  assert.deepEqual(transformOutboundBotExpressions('搞定啦 [bot:happy] [[sticker:happy]]', 'xiaoai'), {
+    text: '搞定啦',
+    stickers: [],
+  });
 });

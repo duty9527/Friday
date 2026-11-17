@@ -1,5 +1,10 @@
 import type { ImChannelConfig } from '../store.js';
 import type { ImGatewayContext, ImInboundMessage, ImSendOptions } from './types.js';
+import {
+  BOT_EXPRESSIONS,
+  BOT_EXPRESSION_META,
+  normalizeBotExpression,
+} from '../web/shared/bot-expressions.js';
 
 /** Check whether an inbound text message matches an instant IM slash command. */
 export function isInstantImCommand(text: string, hasMedia: boolean): boolean {
@@ -9,6 +14,9 @@ export function isInstantImCommand(text: string, hasMedia: boolean): boolean {
     || text === '/works'
     || text === '/memories'
     || text === '/timers'
+    || text === '/sticker'
+    || text === '/stickers'
+    || text.startsWith('/sticker ')
     || text.startsWith('/stop ')
     || text.startsWith('/resume ')
   );
@@ -97,6 +105,41 @@ export async function tryHandleImSlashCommand(params: {
     const resumed = ctx.coordinator.resume(targetWork.id);
     await ctx.sendToChannel(channel.id, `▶️ 已恢复运行工作 [${resumed.id.slice(0, 8)}]: 状态 ${resumed.status}`, replyOpts).catch(() => {});
     return { ok: true, action: 'command_resume' };
+  }
+
+  if (text === '/sticker' || text === '/stickers' || text.startsWith('/sticker ')) {
+    const arg = text.startsWith('/sticker ') ? text.slice(9).trim() : '';
+    if (!arg) {
+      const list = BOT_EXPRESSIONS.map(e => `${e}(${BOT_EXPRESSION_META[e].label})`).join(' · ');
+      await ctx.sendToChannel(
+        channel.id,
+        `🤖 F.R.I.D.A.Y. 动态表情包支持：${list}\n发送 /sticker <表情名>（如 /sticker happy）或 /sticker all 一次领取全套 9 款动图，长按即可添加到微信表情！[[sticker:happy]]`,
+        replyOpts,
+      ).catch(() => {});
+      return { ok: true, action: 'command_sticker_help' };
+    }
+    if (arg.toLowerCase() === 'all' || arg === '全部') {
+      await ctx.sendToChannel(
+        channel.id,
+        '✨ 正在发送全套 9 款 F.R.I.D.A.Y. 动态表情包，收到后长按图片即可添加到微信表情：',
+        replyOpts,
+      ).catch(() => {});
+      for (const expr of BOT_EXPRESSIONS) {
+        await ctx.sendToChannel(channel.id, `[[sticker:${expr}]]`, replyOpts).catch(() => {});
+      }
+      return { ok: true, action: 'command_sticker_all' };
+    }
+    const expr = normalizeBotExpression(arg);
+    if (!expr) {
+      await ctx.sendToChannel(
+        channel.id,
+        `⚠️ 未找到表情 "${arg}"，可选：${BOT_EXPRESSIONS.join(', ')}`,
+        replyOpts,
+      ).catch(() => {});
+      return { ok: true, action: 'command_sticker_not_found' };
+    }
+    await ctx.sendToChannel(channel.id, `[[sticker:${expr}]]`, replyOpts).catch(() => {});
+    return { ok: true, action: 'command_sticker' };
   }
 
   return undefined;

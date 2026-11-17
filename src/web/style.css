@@ -324,12 +324,38 @@ label {
   min-height:0;
 }
 .titlebar {
-  padding:22px 24px 18px;
+  padding:18px 24px 16px;
   display:flex;
   align-items:center;
   justify-content:space-between;
   gap:16px;
   border-bottom:1px solid var(--border);
+}
+.titlebar-brand {
+  display:inline-flex;
+  align-items:center;
+  gap:12px;
+  min-width:0;
+}
+.titlebar-brand h1 {
+  margin-bottom:0;
+}
+.companion-avatar {
+  width:38px;
+  height:38px;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  flex-shrink:0;
+  cursor:pointer;
+  border-radius:10px;
+  transition:transform .15s ease;
+}
+.companion-avatar:hover {
+  transform:scale(1.06);
+}
+.companion-avatar:active {
+  transform:scale(0.96);
 }
 .connection-bar {
   display:flex;
@@ -391,12 +417,34 @@ label {
   margin-bottom:8px;
 }
 .speaker-avatar {
-  width:22px;
-  height:22px;
-  border-radius:50%;
-  background:url("/avatar.png") center/cover no-repeat;
-  box-shadow:0 0 0 1px rgba(245,158,11,0.35);
+  width:26px;
+  height:26px;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
   flex-shrink:0;
+  vertical-align:middle;
+  cursor:pointer;
+}
+.bot-inline-emote {
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  width:20px;
+  height:20px;
+  vertical-align:-4px;
+  margin:0 2px;
+  cursor:pointer;
+}
+.bot-inline-sticker {
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  width:46px;
+  height:46px;
+  vertical-align:middle;
+  margin:2px 4px;
+  cursor:pointer;
 }
 .speaker time {
   margin-left:auto;
@@ -549,6 +597,37 @@ label {
   align-items:center;
   gap:12px;
   margin-top:8px;
+}
+.composer-meta-group {
+  display:flex;
+  align-items:center;
+  gap:10px;
+  flex-wrap:wrap;
+  min-width:0;
+}
+.emote-toggle-btn {
+  min-height:28px;
+  padding:2px 9px;
+  font-size:12px;
+}
+.bot-emote-tray {
+  display:flex;
+  flex-wrap:wrap;
+  gap:6px;
+  padding:8px;
+  margin-top:8px;
+  background:var(--raised);
+  border:1px solid var(--border);
+  border-radius:8px;
+}
+.bot-emote-item {
+  display:inline-flex;
+  align-items:center;
+  gap:5px;
+  min-height:30px;
+  padding:3px 9px;
+  font-size:12px;
+  border-radius:6px;
 }
 .primary {
   background:var(--primary);
@@ -2037,7 +2116,7 @@ pre {
   button,select,summary {
     min-height:44px;
   }
-  .message-actions button,.connection-bar button {
+  .message-actions button,.connection-bar button,.emote-toggle-btn,.bot-emote-item {
     min-height:36px;
   }
   .work-row {

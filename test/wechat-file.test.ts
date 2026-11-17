@@ -1,10 +1,17 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, symlink, link, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, symlink, link, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createDecipheriv } from 'node:crypto';
-import { deliverWechatFile, readStagedAttachment, MAX_ATTACHMENT_BYTES } from '../src/wechat-file.js';
+import {
+  deliverWechatFile,
+  deliverWechatImage,
+  readStagedAttachment,
+  resolveBotStickerPath,
+  MAX_ATTACHMENT_BYTES,
+} from '../src/wechat-file.js';
+import { BOT_EXPRESSIONS } from '../src/web/shared/bot-expressions.js';
 import { ImGateway } from '../src/im.js';
 
 test('mock attachment protocol, padding/decryption and failure stages', async () => {
@@ -149,4 +156,50 @@ test('deliverWechatFile surfaces clear session-expiry diagnostics when sendmessa
   );
   assert.equal(calls, 3);
  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('bundled animated GIF stickers exist and deliverWechatImage encrypts & posts type=2 image_item', async () => {
+  for (const expr of BOT_EXPRESSIONS) {
+    const stickerBytes = await readFile(resolveBotStickerPath(expr));
+    assert.equal(stickerBytes.subarray(0, 6).toString('ascii'), 'GIF89a', `${expr} sticker must be GIF89a`);
+  }
+
+  const happyPath = resolveBotStickerPath('happy');
+  const plainSticker = await readFile(happyPath);
+  let calls = 0;
+  let hexKey = '';
+  const mock = (async (url: any, init: any) => {
+    calls++;
+    if (calls === 1) {
+      assert.match(String(url), /getuploadurl$/);
+      const body = JSON.parse(init.body);
+      assert.equal(body.media_type, 1);
+      assert.equal(body.rawsize, plainSticker.length);
+      hexKey = body.aeskey;
+      return Response.json({ ret: 0, upload_param: 'sticker-param' });
+    }
+    if (calls === 2) {
+      assert.equal(new URL(url).origin, 'https://novac2c.cdn.weixin.qq.com');
+      const cipher = Buffer.from(init.body);
+      const decipher = createDecipheriv('aes-128-ecb', Buffer.from(hexKey, 'hex'), null);
+      assert.deepEqual(Buffer.concat([decipher.update(cipher), decipher.final()]), plainSticker);
+      return new Response(null, { status: 200, headers: { 'x-encrypted-param': 'sticker-dl-param' } });
+    }
+    const body = JSON.parse(init.body);
+    const item = body.msg.item_list[0];
+    assert.equal(item.type, 2);
+    assert.equal(item.image_item.media.encrypt_query_param, 'sticker-dl-param');
+    assert.equal(Buffer.from(item.image_item.media.aes_key, 'base64').toString(), hexKey);
+    assert.ok(item.image_item.mid_size > plainSticker.length);
+    return Response.json({ ret: 0 });
+  }) as typeof fetch;
+
+  await deliverWechatImage({
+    filePath: happyPath,
+    target: 'owner',
+    contextToken: 'ctx-1',
+    base: 'https://example.invalid',
+    headers: {},
+  }, mock);
+  assert.equal(calls, 3);
 });

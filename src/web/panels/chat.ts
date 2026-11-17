@@ -7,6 +7,17 @@ import {
   routeState,
 } from '../model.js';
 import { ApiError } from '../shared/auth-http.js';
+import {
+  createLiveBotAvatar,
+  createStaticBotSvg,
+  type BotAvatarController,
+} from '../shared/bot-avatar.js';
+import {
+  BOT_EXPRESSIONS,
+  BOT_EXPRESSION_META,
+  inferMessageBotExpression,
+  tokenizeBotMessageText,
+} from '../shared/bot-expressions.js';
 import { button, element, node } from '../shared/dom.js';
 import { errorText, statusText, timestamp } from '../shared/format.js';
 import { api, appState, hooks } from '../state.js';
@@ -18,12 +29,13 @@ export interface ChatPanelController {
   renderMessages: () => void;
   renderRoutingDetail: () => void;
   jumpMessage: (id: string) => Promise<void>;
+  isDraftTyping: () => boolean;
 }
 
 /**
  * Initializes the main conversation panel, message composer, and per-message routing inspector.
  */
-export function initChatPanel(): ChatPanelController {
+export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatPanelController {
   const messagesEl = element('messages');
   const scrollEl = element('messages-scroll');
   const olderBtn = element<HTMLButtonElement>('older');
@@ -32,10 +44,73 @@ export function initChatPanel(): ChatPanelController {
   const draftEl = element<HTMLTextAreaElement>('draft');
   const pathsEl = element<HTMLTextAreaElement>('paths');
   const sendBtn = element<HTMLButtonElement>('send');
+  const emoteToggleBtn = element<HTMLButtonElement>('emote-toggle');
+  const emoteTrayEl = element('bot-emote-tray');
   const sendErrorEl = element('send-error');
   const routingDetailEl = element('routing-detail');
 
   let routingDetailRequest = 0;
+  let draftTypingActive = false;
+  let draftTypingTimer: ReturnType<typeof setTimeout> | undefined;
+  const liveMessageAvatars = new Map<string, BotAvatarController>();
+
+  function setDraftTyping(activeFlag: boolean): void {
+    if (draftTypingTimer) {
+      clearTimeout(draftTypingTimer);
+      draftTypingTimer = undefined;
+    }
+    if (activeFlag) {
+      const changed = !draftTypingActive;
+      draftTypingActive = true;
+      draftTypingTimer = setTimeout(() => {
+        draftTypingTimer = undefined;
+        draftTypingActive = false;
+        options?.onDraftActivity?.();
+      }, 2400);
+      if (changed) options?.onDraftActivity?.();
+    } else if (draftTypingActive) {
+      draftTypingActive = false;
+      options?.onDraftActivity?.();
+    }
+  }
+
+  function insertBotEmote(tag: string): void {
+    if (draftEl.disabled || draftEl.readOnly) return;
+    const start = draftEl.selectionStart ?? draftEl.value.length;
+    const end = draftEl.selectionEnd ?? start;
+    const before = draftEl.value.slice(0, start);
+    const after = draftEl.value.slice(end);
+    const needLeadSpace = before.length > 0 && !/\s$/.test(before);
+    const needTrailSpace = after.length > 0 && !/^\s/.test(after);
+    const snippet = `${needLeadSpace ? ' ' : ''}${tag}${needTrailSpace ? ' ' : ''}`;
+    draftEl.value = `${before}${snippet}${after}`;
+    const caret = before.length + snippet.length;
+    draftEl.focus();
+    draftEl.setSelectionRange(caret, caret);
+    emoteTrayEl.hidden = true;
+    emoteToggleBtn.setAttribute('aria-expanded', 'false');
+    setDraftTyping(true);
+    updateComposer();
+  }
+
+  for (const expr of BOT_EXPRESSIONS) {
+    const meta = BOT_EXPRESSION_META[expr];
+    const itemBtn = node('button', '', 'bot-emote-item');
+    itemBtn.type = 'button';
+    itemBtn.title = `插入 [bot:${expr}] (${meta.label})`;
+    itemBtn.append(createStaticBotSvg({ size: 20, expr }), node('span', meta.label));
+    itemBtn.addEventListener('click', () => {
+      insertBotEmote(`[bot:${expr}]`);
+    });
+    emoteTrayEl.append(itemBtn);
+  }
+
+  emoteToggleBtn.addEventListener('click', () => {
+    if (emoteToggleBtn.disabled) return;
+    const nextOpen = emoteTrayEl.hidden;
+    emoteTrayEl.hidden = !nextOpen;
+    emoteToggleBtn.setAttribute('aria-expanded', String(nextOpen));
+  });
 
   function updateComposer(): void {
     const locked = !appState.ready || appState.authExpired;
@@ -43,6 +118,12 @@ export function initChatPanel(): ChatPanelController {
     pathsEl.disabled = locked;
     draftEl.readOnly = appState.sending || appState.uncertain;
     pathsEl.readOnly = appState.sending || appState.uncertain;
+    const emoteLocked = locked || appState.sending || appState.uncertain;
+    emoteToggleBtn.disabled = emoteLocked;
+    if (emoteLocked && !emoteTrayEl.hidden) {
+      emoteTrayEl.hidden = true;
+      emoteToggleBtn.setAttribute('aria-expanded', 'false');
+    }
     sendBtn.disabled = locked || appState.sending || (!appState.uncertain && !draftEl.value.trim());
     sendBtn.textContent = appState.sending ? '正在发送…' : appState.uncertain ? '重试原请求' : '发送 ↑';
   }
@@ -242,6 +323,16 @@ export function initChatPanel(): ChatPanelController {
     const focus = document.activeElement instanceof HTMLElement ? document.activeElement.dataset.actionKey : undefined;
     const contents = document.createDocumentFragment();
     const ordered = orderConversation(appState.messages.values());
+    let latestAssistantId: string | undefined;
+    for (let i = ordered.length - 1; i >= 0; i--) {
+      const candidate = ordered[i];
+      if (candidate && candidate.role === 'assistant' && candidate.source !== 'system') {
+        latestAssistantId = candidate.id;
+        break;
+      }
+    }
+    const keptLiveIds = new Set<string>();
+
     for (const message of ordered) {
       const systemNotice = message.source === 'system';
       const article = node('article', '', `message ${message.role === 'user' ? 'user-message' : 'router-message'}`);
@@ -252,6 +343,40 @@ export function initChatPanel(): ChatPanelController {
       if (message.role === 'assistant' && !systemNotice) {
         const avatar = node('span', '', 'speaker-avatar');
         avatar.setAttribute('aria-hidden', 'true');
+        const inferredExpr = inferMessageBotExpression(message.text);
+        if (active(message.status) || message.id === latestAssistantId) {
+          keptLiveIds.add(message.id);
+          let ctrl = liveMessageAvatars.get(message.id);
+          if (!ctrl) {
+            ctrl = createLiveBotAvatar({
+              size: 26,
+              compact: true,
+              interactive: true,
+              idPrefix: `friday-msg-${message.id.replace(/[^a-zA-Z0-9_-]/g, '')}`,
+            });
+            liveMessageAvatars.set(message.id, ctrl);
+          }
+          if (message.status === 'streaming') {
+            ctrl.setState('streaming');
+            ctrl.setExpression(inferredExpr ?? 'auto');
+          } else if (message.status === 'queued' || message.status === 'processing') {
+            ctrl.setState('thinking');
+            ctrl.setExpression('auto');
+          } else if (message.status === 'failed' || message.status === 'interrupted') {
+            ctrl.setState('idle');
+            ctrl.setExpression(inferredExpr ?? 'sad');
+          } else {
+            ctrl.setState('idle');
+            ctrl.setExpression(inferredExpr ?? 'auto');
+          }
+          avatar.append(ctrl.svg);
+        } else {
+          avatar.append(createStaticBotSvg({
+            size: 26,
+            expr: inferredExpr ?? 'neutral',
+            interactivePoke: true,
+          }));
+        }
         speaker.append(avatar);
       }
       speaker.append(node('span', message.role === 'user' ? '你' : systemNotice ? '系统 · 工作状态（非模型回复）' : 'F.R.I.D.A.Y.'));
@@ -265,7 +390,27 @@ export function initChatPanel(): ChatPanelController {
       speaker.append(time);
       const full = message.text || (active(message.status) ? '等待公开回复…' : '没有公开文本。');
       const visible = full.slice(0, 4000);
-      const textBlock = node('div', visible, 'message-text');
+      const textBlock = node('div', '', 'message-text');
+      const tokens = tokenizeBotMessageText(visible);
+      if (!tokens.length) {
+        textBlock.textContent = visible;
+      } else {
+        for (const token of tokens) {
+          if (token.kind === 'text') {
+            textBlock.append(document.createTextNode(token.value));
+          } else if (token.kind === 'emote') {
+            const wrap = node('span', '', 'bot-inline-emote');
+            wrap.title = `F.R.I.D.A.Y. 小表情：${BOT_EXPRESSION_META[token.expr].label}`;
+            wrap.append(createStaticBotSvg({ size: 20, expr: token.expr, interactivePoke: true }));
+            textBlock.append(wrap);
+          } else {
+            const wrap = node('span', '', 'bot-inline-sticker');
+            wrap.title = `F.R.I.D.A.Y. 动态表情：${BOT_EXPRESSION_META[token.expr].label}`;
+            wrap.append(createStaticBotSvg({ size: 46, expr: token.expr, interactivePoke: true }));
+            textBlock.append(wrap);
+          }
+        }
+      }
       article.append(speaker);
       if (message.replyTo) {
         const source = appState.messages.get(message.replyTo);
@@ -313,6 +458,12 @@ export function initChatPanel(): ChatPanelController {
     }
     if (!contents.childNodes.length) {
       contents.append(node('p', '从这里开始。直接描述目标，F.R.I.D.A.Y. 会在同一个对话中持续回复。', 'empty'));
+    }
+    for (const [id, ctrl] of liveMessageAvatars) {
+      if (!keptLiveIds.has(id)) {
+        ctrl.destroy();
+        liveMessageAvatars.delete(id);
+      }
     }
     messagesEl.replaceChildren(contents);
     olderBtn.hidden = !appState.historyHasMore;
@@ -390,6 +541,9 @@ export function initChatPanel(): ChatPanelController {
       appState.uncertain = false;
       draftEl.value = '';
       pathsEl.value = '';
+      setDraftTyping(false);
+      emoteTrayEl.hidden = true;
+      emoteToggleBtn.setAttribute('aria-expanded', 'false');
       renderMessages();
       hooks.selectTrace({ type: 'message', id: accepted.id, label: submitted.text.slice(0, 80) });
       scrollEl.scrollTop = scrollEl.scrollHeight;
@@ -434,7 +588,10 @@ export function initChatPanel(): ChatPanelController {
     event.preventDefault();
     void send();
   });
-  draftEl.addEventListener('input', updateComposer);
+  draftEl.addEventListener('input', () => {
+    setDraftTyping(draftEl.value.trim().length > 0);
+    updateComposer();
+  });
   let composing = false;
   draftEl.addEventListener('compositionstart', () => { composing = true; });
   draftEl.addEventListener('compositionend', () => { composing = false; });
@@ -467,5 +624,6 @@ export function initChatPanel(): ChatPanelController {
     renderMessages,
     renderRoutingDetail,
     jumpMessage,
+    isDraftTyping: () => draftTypingActive,
   };
 }

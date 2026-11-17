@@ -267,6 +267,8 @@ export function sanitizeForSpeech(text: string): string {
   result = result.replace(/https?:\/\/[^\s，。！？；、（）【】《》"'<>]+/gi, '（链接见控制台）');
 
   result = result.replace(/<\/?[a-zA-Z][a-zA-Z0-9]*(?:\s+[^<>]*)?\/?>/g, '');
+  result = result.replace(/\[\[\s*sticker:[^\[\]\s]{1,24}\s*\]\]/gi, '');
+  result = result.replace(/\[bot:[^\[\]\s]{1,24}\]/gi, '');
   result = result.replace(/\[([^\[\]\s]{1,12})\]/g, (full, tag: string) =>
     WECHAT_EMOJI_TAGS.has(tag.toLowerCase()) ? '' : full,
   );

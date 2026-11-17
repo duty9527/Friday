@@ -17,6 +17,7 @@ import { WechatIlinkAdapter } from './channels/wechat-ilink.js';
 import { WechatWebhookAdapter } from './channels/wechat-webhook.js';
 import { XiaoaiChannelAdapter } from './channels/xiaoai.js';
 import { isInstantImCommand, tryHandleImSlashCommand } from './commands.js';
+import { transformOutboundBotExpressions } from '../web/shared/bot-expressions.js';
 import {
   BoundedMap,
   DEFAULT_WECHAT_ILINK_BASE,
@@ -585,7 +586,11 @@ export class ImGateway {
             } else {
               const cleanText = stripXiaoaiDialogDirective(bodyText).text;
               if (!cleanText) continue;
-              await this.sendToChannel(ch.id, cleanText, {
+              const outboundText = route.channel === 'wechat'
+                ? cleanText
+                : transformOutboundBotExpressions(cleanText, route.channel).text;
+              if (!outboundText) continue;
+              await this.sendToChannel(ch.id, outboundText, {
                 target: route.conversationId,
                 replyToMessageId: route.replyToMessageId,
                 replyWebhook: route.replyWebhook,
