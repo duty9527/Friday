@@ -118,3 +118,35 @@ test('CDN missing header, signed URL redaction, and full URL allowlist', async (
   }
  } finally { await rm(root, { recursive:true, force:true }); }
 });
+
+test('deliverWechatFile surfaces clear session-expiry diagnostics when sendmessage returns ret=-2', async () => {
+ const root = await mkdtemp(join(tmpdir(), 'ilink-ret-neg2-'));
+ try {
+  await writeFile(join(root, 'report.md'), '# hello');
+  let calls = 0;
+  const mock = (async () => {
+   calls++;
+   if (calls === 1) return Response.json({ ret: 0, upload_param: 'opaque' });
+   if (calls === 2) return new Response(null, { status: 200, headers: { 'x-encrypted-param': 'enc' } });
+   return Response.json({ ret: -2 });
+  }) as typeof fetch;
+  await assert.rejects(
+   deliverWechatFile({
+    root,
+    name: 'report.md',
+    target: 'owner',
+    contextToken: 'stale-ctx',
+    contextTokenUpdatedAt: Date.now() - 120 * 60_000,
+    base: 'https://example.invalid',
+    headers: {},
+   }, mock),
+   (error: Error) => {
+    assert.doesNotMatch(error.message, /secret|PRIVATE|https:|token=/);
+    assert.match(error.message, /business failure \(ret=-2, errcode=unset\)/);
+    assert.match(error.message, /WeChat reply session expired after \d+m without inbound WeChat message/);
+    return true;
+   },
+  );
+  assert.equal(calls, 3);
+ } finally { await rm(root, { recursive: true, force: true }); }
+});

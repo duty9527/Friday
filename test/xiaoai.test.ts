@@ -2203,6 +2203,27 @@ test('XiaoaiSpeakerManager multi-speaker profiles, TV-tail trimming, and command
     assert.equal(rescuedRes.trimmed, true);
     assert.ok(rescuedRes.samples.length <= Math.round(SPEAKER_SAMPLE_RATE * 1.9));
 
+    // Lazy sliding-window evaluation stops early once TV speech begins instead of scanning entire 8s tail
+    let lazyExtractCalls = 0;
+    const countingFactory = () => {
+      const inner = extractorFactory();
+      return {
+        dim: inner.dim,
+        extract(samples: Float32Array, sampleRate: number) {
+          lazyExtractCalls++;
+          return inner.extract(samples, sampleRate);
+        },
+        free: () => inner.free?.(),
+      };
+    };
+    const lazyManager = new XiaoaiSpeakerManager({ homeDir: home, extractorFactory: countingFactory });
+    const longTailClip = concatAudio(synthToneSamples(200, 1200), synthToneSamples(3200, 8000));
+    const lazyRes = lazyManager.verifyAndTrimUtterance(longTailClip, SPEAKER_SAMPLE_RATE);
+    assert.equal(lazyRes.matched, true);
+    assert.equal(lazyRes.trimmed, true);
+    assert.ok(lazyRes.samples.length <= Math.round(SPEAKER_SAMPLE_RATE * 2.1));
+    assert.ok(lazyExtractCalls <= 7, `Expected lazy sliding-window scan (<=7 extracts), got ${lazyExtractCalls}`);
+
     // Configure rename/role & removing owner promotes remaining member to owner
     manager.configure({ threshold: 0.48, rename: { target: '老婆', name: '太太' } });
     assert.equal(manager.findProfile('太太')?.name, '太太');

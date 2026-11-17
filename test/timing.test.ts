@@ -6,7 +6,16 @@ import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Coordinator } from '../src/coordinator.js';
-import { BoundedCounterMap, BoundedFingerprintMap } from '../src/orchestrator/chat-coalescer.js';
+import {
+  accrueChatRun,
+  BoundedCounterMap,
+  BoundedFingerprintMap,
+  CLOCK_DRIFT_MAX_MS,
+  HEARTBEAT_STALL_MAX_MS,
+  type ChatRun,
+} from '../src/orchestrator/chat-coalescer.js';
+import { accrueTaskRun, TASK_ACTIVE_PERSIST_INTERVAL_MS, type Run } from '../src/orchestrator/worker-runner.js';
+import { Store } from '../src/store.js';
 import { privateHome } from '../src/files.js';
 import { abortableDelay, offlineFactory, type AgentFactory } from '../src/agent.js';
 import { until } from './helpers/async.js';
@@ -180,4 +189,105 @@ test('BoundedCounterMap enforces TTL expiry and BoundedFingerprintMap evicts lea
   assert.equal(lru.get('k2'), undefined);
   assert.equal(lru.get('k1'), 'v1');
   assert.equal(lru.get('k3'), 'v3');
+});
+
+test('accrueChatRun and accrueTaskRun tolerate multi-second stalls, throttle saves, and abort on real clock skew', async () => {
+  const root = await mkdtemp(join(await realpath(tmpdir()), 'sa-clock-accrue-'));
+  const origPerfNow = performance.now.bind(performance);
+  const origDateNow = Date.now;
+  let monoNow = 10_000;
+  let wallNow = 1_790_000_000_000;
+  performance.now = () => monoNow;
+  Date.now = () => wallNow;
+  const store = new Store(root);
+  try {
+    const chat: ChatRun = {
+      message: {
+        id: 'm1', seq: 1, version: 1, at: wallNow, role: 'user', text: 'hi',
+        status: 'processing', mode: 'offline', paths: [], taskIds: [],
+      },
+      controller: new AbortController(),
+      revisions: new Map(),
+      clock: { lastTick: monoNow, lastWall: wallNow, activeMs: 0 },
+      firstAt: wallNow,
+      coalesceUntil: 0,
+      mergeVersion: 0,
+    };
+
+    // 3,000ms synchronous event-loop stall (both clocks advance together) must NOT abort Router.
+    monoNow += 3_000;
+    wallNow += 3_000;
+    accrueChatRun(chat);
+    assert.equal(chat.controller.signal.aborted, false);
+    assert.equal(chat.clock!.activeMs, 3_000);
+
+    // Wall-clock skew > CLOCK_DRIFT_MAX_MS must abort.
+    monoNow += 200;
+    wallNow += CLOCK_DRIFT_MAX_MS + 1_000;
+    accrueChatRun(chat);
+    assert.equal(chat.controller.signal.aborted, true);
+
+    // Stall > HEARTBEAT_STALL_MAX_MS must abort even without wall skew.
+    const stalledChat: ChatRun = {
+      ...chat,
+      controller: new AbortController(),
+      clock: { lastTick: monoNow, lastWall: wallNow, activeMs: 0 },
+    };
+    monoNow += HEARTBEAT_STALL_MAX_MS + 500;
+    wallNow += HEARTBEAT_STALL_MAX_MS + 500;
+    accrueChatRun(stalledChat);
+    assert.equal(stalledChat.controller.signal.aborted, true);
+
+    // Task accrual: throttles store.save() on flush=false, flushes on flush=true, and detects skew.
+    const task = {
+      id: 't-accrue', requestId: 'req-accrue', fingerprint: 'fp', prompt: 'work',
+      files: [], status: 'running' as const, revision: 0, mode: 'offline' as const, createdAt: wallNow,
+      activeMs: 0, limitMs: 600_000,
+    };
+    store.create(task);
+    let saveCount = 0;
+    const origSave = store.save.bind(store);
+    store.save = (t) => { saveCount++; return origSave(t); };
+
+    const run: Run = {
+      id: task.id, revision: 0, controller: new AbortController(),
+      jobs: 1, activeCalls: 1, clockUncertain: false,
+      reads: new Map(), completions: [], lastTick: monoNow, lastWall: wallNow,
+    };
+
+    // 3,000ms event-loop stall (> 2,500ms persist interval) succeeds & persists once.
+    monoNow += 3_000;
+    wallNow += 3_000;
+    assert.equal(accrueTaskRun(store, run, false), true);
+    assert.equal(run.clockUncertain, false);
+    assert.equal(saveCount, 1);
+    assert.equal(store.get(task.id).activeMs, 3_000);
+
+    // Five 200ms ticks (total 1,000ms < TASK_ACTIVE_PERSIST_INTERVAL_MS) skip SQLite writes.
+    assert.equal(TASK_ACTIVE_PERSIST_INTERVAL_MS, 2_500);
+    for (let i = 0; i < 5; i++) {
+      monoNow += 200;
+      wallNow += 200;
+      assert.equal(accrueTaskRun(store, run, false), true);
+    }
+    assert.equal(saveCount, 1);
+    assert.equal(run.pendingActiveMs, 1_000);
+
+    // Boundary flush=true commits pendingActiveMs immediately.
+    assert.equal(accrueTaskRun(store, run, true), true);
+    assert.equal(saveCount, 2);
+    assert.equal(run.pendingActiveMs, 0);
+    assert.equal(store.get(task.id).activeMs, 4_000);
+
+    // Real clock skew marks run.clockUncertain = true.
+    monoNow += 200;
+    wallNow += CLOCK_DRIFT_MAX_MS + 1_000;
+    assert.equal(accrueTaskRun(store, run, false), false);
+    assert.equal(run.clockUncertain, true);
+  } finally {
+    performance.now = origPerfNow;
+    Date.now = origDateNow;
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });

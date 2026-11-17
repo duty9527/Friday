@@ -851,6 +851,13 @@ function defaultVadFactory(config: { vadModelPath: string; speechRmsThreshold: n
   let wakeRefRms = 0;
   const trailingSilenceFlushSamples = msToSamples(320);
   let trailingZeroFlushedSamples = trailingSilenceFlushSamples;
+  let bufferedSamples = 0;
+  const maxBufferedSamples = msToSamples(20_000);
+  const hardResetSamples = msToSamples(26_000);
+  const resetVad = () => {
+    vad.reset();
+    bufferedSamples = 0;
+  };
   return {
     observeAmbient: (samples, precomputedRms) => {
       noiseRms = updateAmbientNoiseRms(noiseRms, precomputedRms ?? computeRms(samples));
@@ -868,13 +875,16 @@ function defaultVadFactory(config: { vadModelPath: string; speechRmsThreshold: n
       if (rawRms < minSpeechRms * lowGateFactor) {
         if (vadActive || trailingZeroFlushedSamples < trailingSilenceFlushSamples) {
           vad.acceptWaveform(new Float32Array(samples.length));
+          bufferedSamples += samples.length;
           while (!vad.isEmpty()) {
             vad.pop();
           }
           trailingZeroFlushedSamples += samples.length;
-          if (!vad.isDetected() && trailingZeroFlushedSamples >= trailingSilenceFlushSamples) {
-            vad.reset();
+          if ((!vad.isDetected() && trailingZeroFlushedSamples >= trailingSilenceFlushSamples) || bufferedSamples >= hardResetSamples) {
+            resetVad();
           }
+        } else if (bufferedSamples >= maxBufferedSamples && !vadActive) {
+          resetVad();
         }
         if (rawRms > 0 && rawRms <= noiseRms * 2.0) {
           noiseRms = updateAmbientNoiseRms(noiseRms, rawRms);
@@ -893,18 +903,23 @@ function defaultVadFactory(config: { vadModelPath: string; speechRmsThreshold: n
         vadInput = boosted;
       }
       vad.acceptWaveform(vadInput);
+      bufferedSamples += vadInput.length;
       let sawSegment = !vad.isEmpty();
       while (!vad.isEmpty()) {
         vad.pop();
         sawSegment = true;
       }
-      const detected = vad.isDetected()
+      const vadDetectedNow = vad.isDetected();
+      if ((sawSegment && !vadDetectedNow) || (bufferedSamples >= maxBufferedSamples && !vadDetectedNow) || bufferedSamples >= hardResetSamples) {
+        resetVad();
+      }
+      const detected = vadDetectedNow
         || sawSegment
         || (samples.length < 512 && computeRms(vadInput) >= 0.045);
       return detected && rawRms >= (vadActive ? minSpeechRms * 0.75 : minSpeechRms);
     },
     reset: () => {
-      vad.reset();
+      resetVad();
       trailingZeroFlushedSamples = trailingSilenceFlushSamples;
     },
   };

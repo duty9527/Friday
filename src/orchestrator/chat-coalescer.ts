@@ -90,7 +90,7 @@ export function accrueChatRun(context: ChatRun): void {
   const wallElapsed = wall - context.clock.lastWall;
   context.clock.lastTick = now;
   context.clock.lastWall = wall;
-  if (elapsed > HEARTBEAT_STALL_MAX_MS || Math.abs(wallElapsed - elapsed) > CLOCK_DRIFT_MAX_MS) {
+  if (elapsed < 0 || elapsed > HEARTBEAT_STALL_MAX_MS || Math.abs(wallElapsed - elapsed) > CLOCK_DRIFT_MAX_MS) {
     context.controller.abort(new Error('Clock/heartbeat gap; Router progress interrupted without replay'));
   } else {
     context.clock.activeMs += elapsed;

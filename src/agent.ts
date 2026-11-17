@@ -17,6 +17,7 @@ export {
   logoutOAuth,
   NATIVE_TOOL_NAMES,
   nativeDefinitions,
+  normalizeCustomToolInput,
   prepareRouterSessionModel,
   READONLY_TOOL_NAMES,
   readonlyDefinitions,

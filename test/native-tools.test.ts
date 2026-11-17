@@ -12,7 +12,7 @@ import { Coordinator } from '../src/coordinator.js';
 import { Executor } from '../src/executor.js';
 import { snapshot } from '../src/files.js';
 import { Store, type Operation } from '../src/store.js';
-import { nativeShellOperations, NativeCommandInterrupted } from '../src/native-shell.js';
+import { nativeShellOperations, NativeCommandInterrupted, NativeCommandTimeoutError } from '../src/native-shell.js';
 
 // Local model fixture requests real SDK tools; no external provider or user filesystem is used.
 test('native SDK Worker searches, reads, writes, edits and runs foreground Bash in the actual cwd', { timeout: 20000 }, async () => {
@@ -41,7 +41,11 @@ test('native SDK Worker searches, reads, writes, edits and runs foreground Bash 
     assert.deepEqual(names, [...NATIVE_TOOL_NAMES].sort());
     const results = body.messages.filter((message: { role: string }) => message.role === 'tool');
     if (!stall) for (const result of results) assert.doesNotMatch(JSON.stringify(result), /Error:|ENOENT|not found|failed with exit code/);
-    const step = nonzero ? (results.length === 0 ? ['bash', { command: 'exit 255' }] : undefined) : timeout ? ['bash', { command: 'printf x >> timeout-effect.txt; sleep 30', timeout: 0.2 }] : stall ? ['bash', { command: 'echo $$ > shell.pid; printf started > started.txt; sleep 30; printf escaped > escaped.txt' }] : steps[results.length];
+    if (timeout && results.length === 1) {
+      assert.match(JSON.stringify(results[0]), /partial-before-timeout/);
+      assert.match(JSON.stringify(results[0]), /Command timed out after 0\.2 seconds/);
+    }
+    const step = nonzero ? (results.length === 0 ? ['bash', { command: 'exit 255' }] : undefined) : timeout ? (results.length === 0 ? ['bash', { command: 'printf x >> timeout-effect.txt; printf partial-before-timeout; sleep 30', timeout: 0.2 }] : undefined) : stall ? ['bash', { command: 'echo $$ > shell.pid; printf started > started.txt; sleep 30; printf escaped > escaped.txt' }] : steps[results.length];
     const delta = step ? { role: 'assistant', tool_calls: [{ index: 0, id: `call_${results.length}_${stall}`, type: 'function', function: { name: step[0], arguments: JSON.stringify(step[1]) } }] }
       : { role: 'assistant', content: 'All seven native tools verified.' };
     response.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -132,14 +136,13 @@ test('native SDK Worker searches, reads, writes, edits and runs foreground Bash 
       const beforeTimeout = requests;
       coordinator.chat('native-timeout', 'a command may commit a side effect before timing out');
       for (let i = 0; i < 200; i++) {
-        if (coordinator.store.list()[2]?.status === 'paused') break;
+        if (coordinator.store.list()[2]?.status === 'completed') break;
         await delay(20);
       }
       const timed = coordinator.store.list()[2]!;
-      assert.equal(timed.status, 'paused');
-      assert.ok(coordinator.store.operations(timed.id).some(operation => operation.status === 'unknown'));
-      await delay(50);
-      assert.equal(requests - beforeTimeout, 1, 'timeout aborts the model loop instead of allowing an automatic retry');
+      assert.equal(timed.status, 'completed', 'command-own timeout surfaces to Worker instead of pausing the whole task');
+      assert.equal(coordinator.store.operations(timed.id)[0]!.status, 'failed');
+      assert.equal(requests - beforeTimeout, 2, 'Worker receives the timeout error and settles on the follow-up turn');
       assert.equal(await readFile(join(cwd, 'timeout-effect.txt'), 'utf8'), 'x');
 
       timeout = false; nonzero = true;
@@ -156,7 +159,7 @@ test('native SDK Worker searches, reads, writes, edits and runs foreground Bash 
     try {
       recovered.recover();
       assert.equal(recovered.list()[1]!.status, 'paused');
-      assert.equal(recovered.list()[2]!.status, 'paused');
+      assert.equal(recovered.list()[2]!.status, 'completed');
       await assert.rejects(access(join(cwd, 'escaped.txt')));
     } finally { recovered.close(); }
   } finally {
@@ -192,7 +195,7 @@ test('native shell distinguishes explicit exit 255 from actual signal terminatio
   assert.deepEqual(await shell.exec('exit 255', process.cwd(), settings), { exitCode: 255 });
   assert.deepEqual(await shell.exec('exit 1', process.cwd(), settings), { exitCode: 1 });
   await assert.rejects(shell.exec('kill -TERM $$', process.cwd(), settings), NativeCommandInterrupted);
-  await assert.rejects(shell.exec('sleep 5', process.cwd(), { ...settings, timeout: 0.02 }), NativeCommandInterrupted);
+  await assert.rejects(shell.exec('sleep 5', process.cwd(), { ...settings, timeout: 0.02 }), NativeCommandTimeoutError);
 });
 
 test('Coordinator lazy-starts Executor when nativeTools=true without idle child process', async () => {

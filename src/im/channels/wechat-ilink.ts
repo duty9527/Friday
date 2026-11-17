@@ -282,6 +282,7 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
         name: name.trim(),
         target: options.target,
         contextToken,
+        contextTokenUpdatedAt: channel.contextTokenUpdatedAt?.[options.target] ?? channel.lastInboundAt,
         accountId: channel.accountId,
         base: (channel.apiBase ?? DEFAULT_WECHAT_ILINK_BASE).replace(/\/$/, ''),
         headers: buildWechatIlinkHeaders(channel.botToken),

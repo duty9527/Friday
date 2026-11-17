@@ -33,6 +33,7 @@ export interface ImChannelConfig {
   accountId?: string;
   syncBuf?: string;
   contextTokens?: Record<string, string>;
+  contextTokenUpdatedAt?: Record<string, number>;
   webhookUrl?: string;
   secret?: string;
   defaultTarget?: string;

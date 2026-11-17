@@ -179,6 +179,13 @@ export function parseModelTier(value: unknown): ModelTier | undefined {
 
 export function parseStringArray(value: unknown, label: string, maxItems = 16, maxLen = 128): string[] | undefined {
   if (value === undefined) return undefined;
+  if (typeof value === 'string' && value.trim().startsWith('[')) {
+    try {
+      value = JSON.parse(value.trim());
+    } catch {
+      // Fall through to validation error below.
+    }
+  }
   if (!Array.isArray(value) || value.length > maxItems || !value.every(item => typeof item === 'string')) {
     throw new Error(`${label} must be an array of at most ${maxItems} strings`);
   }
@@ -759,13 +766,30 @@ export function createRouterTools(
     execute: async input => {
       if (host.isClosing()) throw new Error('Service is shutting down');
       const args = toolInput(input, ['action', 'plugin', 'pluginAction', 'args', 'summary']);
-      const mode = args.action === undefined ? (args.plugin ? 'run' : 'list') : text(args.action, 'action', 32);
+      const rawAction = args.action === undefined ? undefined : text(args.action, 'action', 64).trim();
+      const hasPlugin = args.plugin !== undefined;
+      let mode: 'list' | 'run';
+      let inferredSubAction: string | undefined;
+      let inferredArgAction: string | undefined;
+      if (rawAction === undefined) {
+        mode = hasPlugin ? 'run' : 'list';
+      } else if (rawAction === 'list' || rawAction === 'run') {
+        mode = rawAction;
+      } else if (hasPlugin) {
+        mode = 'run';
+        if (args.pluginAction === undefined) {
+          inferredSubAction = rawAction;
+        } else {
+          inferredArgAction = rawAction;
+        }
+      } else {
+        throw new Error(`Unknown run_plugin action: ${rawAction}`);
+      }
       if (mode === 'list') {
         const plugins = listPluginViews(host.home)
           .filter(p => !allowedPlugins || allowedPlugins.has(p.name));
         return JSON.stringify({ plugins });
       }
-      if (mode !== 'run') throw new Error(`Unknown run_plugin action: ${mode}`);
       const pluginName = text(args.plugin, 'plugin', 64);
       if (allowedPlugins && !allowedPlugins.has(pluginName)) {
         throw new Error(`家庭成员会话无权调用插件 "${pluginName}"；仅允许公共智能家居插件`);
@@ -774,10 +798,15 @@ export function createRouterTools(
       if (manifest && manifest.enabled === false) {
         throw new Error(`插件 "${pluginName}" 在当前平台或配置下已被禁用`);
       }
-      const subAction = args.pluginAction === undefined ? 'status' : text(args.pluginAction, 'pluginAction', 64);
+      const subAction = args.pluginAction === undefined
+        ? (inferredSubAction ?? 'status')
+        : text(args.pluginAction, 'pluginAction', 64);
       const pluginArgs = args.args && typeof args.args === 'object' && !Array.isArray(args.args)
-        ? args.args as Record<string, unknown>
+        ? { ...(args.args as Record<string, unknown>) }
         : {};
+      if (inferredArgAction && pluginArgs.action === undefined) {
+        pluginArgs.action = inferredArgAction;
+      }
       const turn = host.getTurn();
       const signal = turn?.chatContext?.attemptController?.signal ?? turn?.chatContext?.controller.signal;
       const result = await runPlugin(host.home, pluginName, subAction, pluginArgs, undefined, { signal });

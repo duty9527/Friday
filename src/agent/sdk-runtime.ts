@@ -17,7 +17,7 @@ import {
   type AgentSession,
   type ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
-import { obj, str } from '@earendil-works/pi-schema';
+import { obj, opt, str } from '@earendil-works/pi-schema';
 import { clampNativeThinkingLevel, getNativeThinkingLevels, type ThinkingLevel } from '../decision.js';
 import { messageImages } from '../message-images.js';
 import {
@@ -303,6 +303,35 @@ export function extractCurrentTurnAssistantText(
     throw new Error('Model returned no report');
   }
   return text;
+}
+
+/** Normalizes tool call arguments from either `{ input }` string wrappers or direct object fields. */
+export function normalizeCustomToolInput(args: unknown): string {
+  if (typeof args === 'string') return args;
+  if (!args || typeof args !== 'object' || Array.isArray(args)) {
+    throw new Error('Tool input must be a string or JSON object');
+  }
+  const { input: rawInput, ...rest } = args as Record<string, unknown>;
+  const hasRest = Object.keys(rest).length > 0;
+  if (typeof rawInput === 'string') {
+    if (!hasRest) return rawInput;
+    try {
+      const parsed: unknown = JSON.parse(rawInput.trim());
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return JSON.stringify({ ...rest, ...(parsed as Record<string, unknown>) });
+      }
+    } catch {
+      return rawInput;
+    }
+    return rawInput;
+  }
+  if (rawInput !== undefined && rawInput !== null && typeof rawInput === 'object' && !Array.isArray(rawInput)) {
+    return JSON.stringify({ ...rest, ...(rawInput as Record<string, unknown>) });
+  }
+  if (rawInput === undefined) {
+    return JSON.stringify(rest);
+  }
+  throw new Error('Tool input must be a string or JSON object');
 }
 
 export class SdkAgent implements AgentPort {
@@ -654,13 +683,11 @@ export async function realFactory(home: string, config: {
         name: tool.name,
         label: tool.name,
         description: tool.description,
-        parameters: obj({ input: str({ description: 'Exact file ID for reads; structured JSON for Router work tools, as specified by the tool description' }) }),
+        parameters: obj({ input: opt(str({ description: 'Exact file ID for reads; structured JSON for Router work tools, as specified by the tool description' })) }, { open: true }),
         execute: async (_id, args, signal) => {
           signal?.throwIfAborted();
-          if (!args || typeof args !== 'object' || !('input' in args) || typeof args.input !== 'string') {
-            throw new Error('Tool input must be a string');
-          }
-          return { content: [{ type: 'text', text: await tool.execute(args.input, _id) }], details: {} };
+          const normalized = normalizeCustomToolInput(args);
+          return { content: [{ type: 'text', text: await tool.execute(normalized, _id) }], details: {} };
         },
       }));
       if (native) customTools.push(...nativeDefinitions(cwd, options));

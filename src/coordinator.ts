@@ -2071,12 +2071,13 @@ export class Coordinator {
     if (this.currentTurn?.chatContext) accrueChatRun(this.currentTurn.chatContext);
     for (const run of this.runs.values()) {
       if (run.stopping) continue;
-      if (!accrueTaskRun(this.store, run)) {
+      if (!accrueTaskRun(this.store, run, false)) {
         this.stop(run.id, '检测到时钟或心跳缺口，无法证明活跃用时；工作暂停', 'paused');
         continue;
       }
       const task = this.store.get(run.id);
-      if (task.status === 'running' && task.activeMs >= task.limitMs) {
+      if (task.status === 'running' && task.activeMs + (run.pendingActiveMs ?? 0) >= task.limitMs) {
+        accrueTaskRun(this.store, run, true);
         this.stop(task.id, '已达到活跃执行时限；工作暂停。需要继续时请重新提供输入', 'paused');
       }
     }

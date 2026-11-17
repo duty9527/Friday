@@ -995,6 +995,7 @@ export class XiaoaiSpeakerManager {
       };
     }
 
+    const sustainFloor = Math.max(0.22, threshold - 0.05);
     const windowScores: number[] = [];
     for (let i = anchorStartIdx; i < starts.length; i++) {
       const start = starts[i];
@@ -1004,6 +1005,13 @@ export class XiaoaiSpeakerManager {
       const score = emb ? scoreEmbeddingAgainstProfile(emb, anchorProfile) : 0;
       if (score > bestAnchorScore) bestAnchorScore = score;
       windowScores.push(score);
+      if (
+        windowScores.length >= 3
+        && (windowScores[windowScores.length - 2] ?? 0) < sustainFloor
+        && score < threshold
+      ) {
+        break;
+      }
     }
 
     return finalizeTrimmedUtterance({
@@ -1079,6 +1087,7 @@ export class XiaoaiSpeakerManager {
       };
     }
 
+    const sustainFloor = Math.max(0.22, threshold - 0.05);
     const windowScores: number[] = [];
     for (let i = anchorStartIdx; i < starts.length; i++) {
       const start = starts[i];
@@ -1089,6 +1098,13 @@ export class XiaoaiSpeakerManager {
       const score = emb ? scoreEmbeddingAgainstProfile(emb, anchorProfile) : 0;
       if (score > bestAnchorScore) bestAnchorScore = score;
       windowScores.push(score);
+      if (
+        windowScores.length >= 3
+        && (windowScores[windowScores.length - 2] ?? 0) < sustainFloor
+        && score < threshold
+      ) {
+        break;
+      }
     }
 
     await yieldEventLoop();

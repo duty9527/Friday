@@ -194,6 +194,7 @@ export class ImGateway {
       accountId: input.accountId !== undefined ? (input.accountId.trim() || undefined) : existing?.accountId,
       syncBuf: existing?.syncBuf,
       contextTokens: existing?.contextTokens,
+      contextTokenUpdatedAt: existing?.contextTokenUpdatedAt,
       webhookUrl: input.webhookUrl !== undefined ? (input.webhookUrl.trim() || undefined) : existing?.webhookUrl,
       secret: input.secret !== undefined ? (input.secret.trim() || undefined) : existing?.secret,
       defaultTarget: input.defaultTarget !== undefined ? (input.defaultTarget.trim() || undefined) : existing?.defaultTarget,
@@ -353,6 +354,10 @@ export class ImGateway {
       channel.contextTokens = {
         ...(channel.contextTokens ?? {}),
         [inbound.senderId]: inbound.contextToken,
+      };
+      channel.contextTokenUpdatedAt = {
+        ...(channel.contextTokenUpdatedAt ?? {}),
+        [inbound.senderId]: Date.now(),
       };
     }
     channel.updatedAt = Date.now();

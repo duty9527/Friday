@@ -18,6 +18,8 @@ export interface Run {
   stopping?: 'paused' | 'cancelled' | 'failed';
   lastTick: number;
   lastWall: number;
+  pendingActiveMs?: number;
+  lastPersistedAt?: number;
   trace?: PromptTrace;
   replyId?: string;
   wakeFollowup?: () => void;
@@ -52,6 +54,7 @@ export const unsettled = (op: Operation): boolean =>
 
 export const CLOCK_DRIFT_MAX_MS = 1_500;
 export const HEARTBEAT_STALL_MAX_MS = 15_000;
+export const TASK_ACTIVE_PERSIST_INTERVAL_MS = 2_500;
 
 export const taskStatusNeedsNotice = (status: TaskStatus): boolean =>
   ['paused', 'cancelled', 'failed'].includes(status);
@@ -97,21 +100,37 @@ export function resolveTaskAttachments(store: Store, task: Task, runAttachments?
   return dedupeAttachments(collected);
 }
 
-export function accrueTaskRun(store: Store, run: Run): boolean {
+export function accrueTaskRun(store: Store, run: Run, flush = true): boolean {
   const now = performance.now();
+  const wall = Date.now();
   const elapsed = now - run.lastTick;
-  const wallElapsed = Date.now() - run.lastWall;
+  const wallElapsed = wall - run.lastWall;
   run.lastTick = now;
-  run.lastWall = Date.now();
-  const known = elapsed <= HEARTBEAT_STALL_MAX_MS && Math.abs(wallElapsed - elapsed) <= CLOCK_DRIFT_MAX_MS;
+  run.lastWall = wall;
+  const known = elapsed >= 0 && elapsed <= HEARTBEAT_STALL_MAX_MS && Math.abs(wallElapsed - elapsed) <= CLOCK_DRIFT_MAX_MS;
   const task = store.get(run.id);
   if (task.status === 'running' && (run.activeCalls > 0 || run.reads.size > 0)) {
     if (known) {
-      task.activeMs += elapsed;
-      store.save(task);
+      const pending = (run.pendingActiveMs ?? 0) + elapsed;
+      run.pendingActiveMs = pending;
+      if (
+        flush
+        || task.activeMs + pending >= task.limitMs
+        || now - (run.lastPersistedAt ?? 0) >= TASK_ACTIVE_PERSIST_INTERVAL_MS
+      ) {
+        task.activeMs += pending;
+        run.pendingActiveMs = 0;
+        run.lastPersistedAt = now;
+        store.save(task);
+      }
     } else {
       run.clockUncertain = true;
     }
+  } else if (flush && (run.pendingActiveMs ?? 0) > 0) {
+    task.activeMs += run.pendingActiveMs!;
+    run.pendingActiveMs = 0;
+    run.lastPersistedAt = now;
+    store.save(task);
   }
   return !run.clockUncertain;
 }

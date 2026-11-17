@@ -5,7 +5,9 @@ import { mkdir, mkdtemp, readFile, realpath, rm, readdir, writeFile } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
-import { realFactory, offlineFactory, loginOAuth, logoutOAuth } from '../src/agent.js';
+import { realFactory, offlineFactory, loginOAuth, logoutOAuth, normalizeCustomToolInput } from '../src/agent.js';
+import { createRouterTools } from '../src/orchestrator/router-tools.js';
+import { Store } from '../src/store.js';
 import { ModelHub } from '../src/model-hub.js';
 
 test('real mode never falls back when configuration is missing', async () => {
@@ -207,6 +209,123 @@ test('ModelHub.saveState serializes concurrent writes and probe does not mutate 
     assert.equal(runtime.getModel('openai', 'gpt-4.1')?.baseUrl, origOpenAiUrl);
     await hub.close();
   } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('normalizeCustomToolInput and Router tools accept direct fields, stringified arrays, and run_plugin action collisions', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-tool-norm-'));
+  const pluginDir = join(home, 'plugins', 'tv-agent');
+  await mkdir(pluginDir, { recursive: true });
+  await writeFile(join(pluginDir, 'plugin.json'), JSON.stringify({
+    name: 'tv-agent',
+    title: 'TV Agent',
+    entry: 'index.mjs',
+    actions: ['act'],
+  }));
+  await writeFile(join(pluginDir, 'index.mjs'), `
+    const action = process.argv[2] || '';
+    const args = JSON.parse(process.argv[3] || '{}');
+    process.stdout.write(JSON.stringify({ ok: true, data: { action, args } }) + '\\n');
+  `);
+
+  assert.equal(normalizeCustomToolInput('plain-id'), 'plain-id');
+  assert.equal(normalizeCustomToolInput({ input: '{"a":1}' }), '{"a":1}');
+  assert.deepEqual(
+    JSON.parse(normalizeCustomToolInput({ input: '{"instruction":"retry"}', taskId: 'task-1' })),
+    { taskId: 'task-1', instruction: 'retry' },
+  );
+  assert.deepEqual(
+    JSON.parse(normalizeCustomToolInput({ topic: 'direct', content: 'body' })),
+    { topic: 'direct', content: 'body' },
+  );
+
+  // Verify open schema + normalization end-to-end through realFactory + SDK tool validation
+  let turn = 0;
+  const server = createServer(async (req, res) => {
+    let raw = '';
+    for await (const chunk of req) raw += chunk;
+    void raw;
+    turn++;
+    const packet = (delta: unknown, finish: string | null) => ({
+      id: `chatcmpl-${turn}`,
+      object: 'chat.completion.chunk',
+      created: 1,
+      model: 'fixture-model',
+      choices: [{ index: 0, delta, finish_reason: finish }],
+    });
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    if (turn === 1) {
+      res.end(
+        `data: ${JSON.stringify(packet({ role: 'assistant', tool_calls: [{ index: 0, id: 'call_direct_1', type: 'function', function: { name: 'save_memory', arguments: JSON.stringify({ topic: '直接字段记忆', content: '无 input 包装也能校验通过', tags: '["alpha","beta"]' }) } }] }, null))}\n\n`
+        + `data: ${JSON.stringify(packet({}, 'tool_calls'))}\n\n`
+        + `data: [DONE]\n\n`,
+      );
+    } else {
+      res.end(
+        `data: ${JSON.stringify(packet({ role: 'assistant', content: 'saved ok' }, null))}\n\n`
+        + `data: ${JSON.stringify(packet({}, 'stop'))}\n\n`
+        + `data: [DONE]\n\n`,
+      );
+    }
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const addr = server.address();
+  assert.ok(addr && typeof addr !== 'string');
+
+  const store = new Store(home);
+  try {
+    const routerTools = createRouterTools({
+      home,
+      store,
+      im: {} as never,
+      isClosing: () => false,
+      getTurn: () => undefined,
+      hasInboundHold: () => false,
+      runs: new Map(),
+      reportAutoDispatches: { get: () => 0, increment: () => 1 } as never,
+      concurrentTasksInCwd: () => [],
+      newChatWork: async () => { throw new Error('unused'); },
+      followup: () => { throw new Error('unused'); },
+      stop: () => { throw new Error('unused'); },
+      resume: () => { throw new Error('unused'); },
+      addTimer: () => { throw new Error('unused'); },
+      toggleTimer: () => { throw new Error('unused'); },
+      removeTimer: () => false,
+      resolveChannelOrigin: () => undefined,
+    }, (_m, _c, k) => k);
+
+    const runtime = await ModelRuntime.create({ refreshOnCreate: false, modelsPath: null, authPath: join(home, 'sdk', 'auth.json') });
+    runtime.registerProvider('fixture', {
+      baseUrl: `http://127.0.0.1:${addr.port}/v1`,
+      api: 'openai-completions',
+      apiKey: 'fixture-key',
+      models: [{ id: 'fixture-model', name: 'Fixture', reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32768, maxTokens: 2048 }],
+    });
+    const factory = await realFactory(home, { provider: 'fixture', model: 'fixture-model', apiKey: 'fixture-key', retry: { enabled: false } }, runtime);
+    const router = await factory.create('router', 'router-direct-tools', routerTools);
+    try {
+      const reply = await router.prompt('save something', new AbortController().signal);
+      assert.equal(reply, 'saved ok');
+      const memories = store.listMemories();
+      assert.equal(memories.length, 1);
+      assert.equal(memories[0]!.topic, '直接字段记忆');
+      assert.deepEqual(memories[0]!.tags, ['alpha', 'beta']);
+    } finally {
+      router.close();
+    }
+
+    // Verify run_plugin recovers when duplicate top-level action ("click") overwrites action ("run")
+    const runPluginTool = routerTools.find(t => t.name === 'run_plugin')!;
+    const rawCollision = '{"action": "run", "args": {"id": "n44"}, "plugin": "tv-agent", "pluginAction": "act", "action": "click"}';
+    const pluginOut = JSON.parse(await runPluginTool.execute(rawCollision)) as { ok: boolean; action: string; data: { action: string; args: Record<string, unknown> } };
+    assert.equal(pluginOut.ok, true);
+    assert.equal(pluginOut.action, 'act');
+    assert.deepEqual(pluginOut.data, { action: 'act', args: { id: 'n44', action: 'click' } });
+  } finally {
+    store.close();
     server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));
     await rm(home, { recursive: true, force: true });
