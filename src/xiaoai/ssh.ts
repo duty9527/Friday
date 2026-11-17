@@ -52,6 +52,36 @@ export function escapeShellSingleQuote(value: string): string {
   return value.replace(/'/g, "'\\''");
 }
 
+export function buildXiaoaiSshArgs(
+  target: XiaoaiSshTarget,
+  remoteCommand: string,
+  controlPath?: string,
+): string[] {
+  const controlArgs = controlPath
+    ? [
+        '-o', 'ControlMaster=auto',
+        '-o', `ControlPath=${controlPath}`,
+        '-o', 'ControlPersist=60',
+      ]
+    : [
+        '-o', 'ControlMaster=no',
+        '-o', 'ControlPath=none',
+      ];
+  return [
+    '-o', 'BatchMode=yes',
+    '-o', 'StrictHostKeyChecking=accept-new',
+    '-o', 'ConnectTimeout=5',
+    '-o', 'HostKeyAlgorithms=+ssh-rsa',
+    '-o', 'PubkeyAcceptedKeyTypes=+ssh-rsa',
+    ...controlArgs,
+    '-o', 'ServerAliveInterval=15',
+    '-o', 'ServerAliveCountMax=2',
+    ...(target.port ? ['-p', String(target.port)] : []),
+    target.userHost,
+    remoteCommand,
+  ];
+}
+
 function runSshOnce(
   target: XiaoaiSshTarget,
   remoteCommand: string,
@@ -59,29 +89,7 @@ function runSshOnce(
   controlPath?: string,
 ): Promise<{ stdout: string; stderr: string; code: number }> {
   return new Promise((resolve, reject) => {
-    const controlArgs = controlPath
-      ? [
-          '-o', 'ControlMaster=auto',
-          '-o', `ControlPath=${controlPath}`,
-          '-o', 'ControlPersist=60',
-        ]
-      : [
-          '-o', 'ControlMaster=no',
-          '-o', 'ControlPath=none',
-        ];
-    const args = [
-      '-o', 'BatchMode=yes',
-      '-o', 'StrictHostKeyChecking=accept-new',
-      '-o', 'ConnectTimeout=5',
-      '-o', 'HostKeyAlgorithms=+ssh-rsa',
-      '-o', 'PubkeyAcceptedKeyTypes=+ssh-rsa',
-      ...controlArgs,
-      '-o', 'ServerAliveInterval=15',
-      '-o', 'ServerAliveCountMax=2',
-      ...(target.port ? ['-p', String(target.port)] : []),
-      target.userHost,
-      remoteCommand,
-    ];
+    const args = buildXiaoaiSshArgs(target, remoteCommand, controlPath);
     execFile('ssh', args, { timeout: timeoutMs }, (error, stdout, stderr) => {
       if (error) {
         const errWithCode = error as Error & { code?: number | string };

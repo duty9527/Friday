@@ -153,7 +153,7 @@ export function isXiaoaiFollowUpCancel(
   if (options?.includeEnrollVariants) {
     const cleaned = stripTrailingPunctuation(trimmed);
     if (!cleaned) return false;
-    return /^(?:(?:不用了?|不要了?|算了(?:吧)?)[，,\s]*)?(?:取消|退出|算了(?:吧)?|不录了?|停止录入|取消录入|退出录入|不用了?|不要了?|结束(?:录入)?)(?:吧|啦)?$/.test(
+    return /^(?:(?:不用了?|不要了?|算了(?:吧)?)[，,\s]*)?(?:取消|退出|算了(?:吧)?|不录了?|停止录入|取消录入|退出录入|不用了?|不要了?|没事了?|退一?下|闭嘴|结束(?:录入)?)(?:吧|呗|啦|咯|呀|啊)?$/.test(
       cleaned,
     );
   }
@@ -290,6 +290,28 @@ export function sanitizeForSpeech(text: string): string {
   result = result.replace(/\s*([。！？；：，、])\s*/g, '$1');
 
   return result.trim();
+}
+
+/**
+ * Smooths overly fragmented comma pauses in short conversational Chinese TTS replies
+ * (especially around "老板" and short acknowledgements) while keeping natural breaks before long clauses.
+ */
+export function smoothXiaoaiTtsProsody(segment: string): string {
+  if (!segment) return '';
+  let out = segment;
+  out = out.replace(
+    /(^|[。！？；!?;，,]\s*)([\u4e00-\u9fa5A-Za-z0-9]{1,6})[，,]\s*老板(?=$|[。！？；!?;，,]|[\u4e00-\u9fa5])/g,
+    '$1$2老板',
+  );
+  out = out.replace(
+    /(^|[。！？；!?;]\s*)老板[，,]\s*(?=[\u4e00-\u9fa5A-Za-z0-9]{1,12}(?:$|[。！？；!?;，,]))/g,
+    '$1老板',
+  );
+  out = out.replace(
+    /(^|[。！？；!?;]\s*)((?:好的|好嘞|好哒|好|行|行的|可以|明白|收到|没问题|妥了|搞定|稍等|抱歉|不好意思|对不起|放心|是的|没错|对|嗯|噢|哦|诶)(?:老板)?)[，,]\s*(?=[^，,。！？；!?;、：:\s]{1,10}(?:$|[。！？；!?;，,]))/g,
+    '$1$2',
+  );
+  return out;
 }
 
 export function splitSpeechSegments(text: string, maxSegmentChars = 160): string[] {

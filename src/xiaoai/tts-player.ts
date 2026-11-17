@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { BoundedMap, buildRequestSignal } from '../im/types.js';
 import type { ImChannelConfig } from '../store.js';
@@ -9,17 +10,20 @@ import {
   selectTargetMinaDevices,
 } from './cloud-auth.js';
 import {
+  buildXiaoaiSshArgs,
   buildXiaoaiWakeCommand,
   buildXiaoaiWakePrewarmCommand,
   defaultSshRunner,
   escapeShellSingleQuote,
+  getXiaoaiWakeCacheFileName,
   parseXiaoaiApiOptions,
   parseXiaoaiSshTargets,
+  resolveXiaoaiSshControlPath,
   SSH_PLAY_STATUS_COMMAND,
   type XiaoaiSshRunner,
   type XiaoaiSshTarget,
 } from './ssh.js';
-import { splitSpeechSegments } from './utterance-utils.js';
+import { smoothXiaoaiTtsProsody, splitSpeechSegments } from './utterance-utils.js';
 
 export interface XiaoaiSendOptions {
   target?: string;
@@ -93,11 +97,11 @@ export function resetXiaoaiRuntimeState(): void {
 export const XIAOAI_URGENT_WAKE_MAX_MS = 900;
 
 export const DEFAULT_OWNER_WAKE_GREETINGS = [
-  '在的，老板',
-  '早上好，老板',
-  '中午好，老板',
-  '下午好，老板',
-  '晚上好，老板',
+  '在的老板',
+  '早上好老板',
+  '中午好老板',
+  '下午好老板',
+  '晚上好老板',
 ] as const;
 
 export function resolveXiaoaiWakeGreeting(params?: {
@@ -122,7 +126,7 @@ export function resolveXiaoaiWakeGreeting(params?: {
     isUrgent = kwLen > 0 && kwLen <= 3;
   }
   if (isUrgent) {
-    return `在的，${title}`;
+    return `在的${title}`;
   }
   const date = params?.now instanceof Date
     ? params.now
@@ -130,10 +134,63 @@ export function resolveXiaoaiWakeGreeting(params?: {
       ? new Date(params.now)
       : new Date();
   const hour = date.getHours();
-  if (hour >= 5 && hour < 11) return `早上好，${title}`;
-  if (hour >= 11 && hour < 14) return `中午好，${title}`;
-  if (hour >= 14 && hour < 18) return `下午好，${title}`;
-  return `晚上好，${title}`;
+  if (hour >= 5 && hour < 11) return `早上好${title}`;
+  if (hour >= 11 && hour < 14) return `中午好${title}`;
+  if (hour >= 14 && hour < 18) return `下午好${title}`;
+  return `晚上好${title}`;
+}
+
+function runBinaryChild(
+  cmd: string,
+  args: readonly string[],
+  input?: Buffer,
+  timeoutMs = 10_000,
+): Promise<{ code: number; stdout: Buffer }> {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, { stdio: ['pipe', 'pipe', 'ignore'] });
+    const chunks: Buffer[] = [];
+    let settled = false;
+    const finish = (code: number) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ code, stdout: Buffer.concat(chunks) });
+    };
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch { /* ignore */ }
+      finish(124);
+    }, timeoutMs);
+    timer.unref?.();
+    child.stdout.on('data', (chunk: Buffer) => {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+    child.stdin.on('error', () => {});
+    child.once('error', () => finish(1));
+    child.once('close', (code) => finish(typeof code === 'number' ? code : 1));
+    if (input) {
+      child.stdin.end(input);
+    } else {
+      child.stdin.end();
+    }
+  });
+}
+
+export async function tightenWakeMp3BufferWithFfmpeg(inputMp3: Buffer): Promise<Buffer | undefined> {
+  if (inputMp3.length < 400) return undefined;
+  const res = await runBinaryChild(
+    'ffmpeg',
+    [
+      '-hide_banner', '-loglevel', 'error', '-f', 'mp3', '-i', 'pipe:0',
+      '-af', 'silenceremove=start_periods=1:start_silence=0.01:start_threshold=-42dB:stop_periods=-1:stop_duration=0.045:stop_silence=0.035:stop_threshold=-42dB',
+      '-ar', '16000', '-ac', '1', '-c:a', 'libmp3lame', '-b:a', '32k', '-f', 'mp3', 'pipe:1',
+    ],
+    inputMp3,
+    10_000,
+  );
+  if (res.code !== 0 || res.stdout.length < 400 || res.stdout.length > inputMp3.length * 1.5) {
+    return undefined;
+  }
+  return res.stdout;
 }
 
 export async function prewarmXiaoaiWakeGreetings(
@@ -142,9 +199,29 @@ export async function prewarmXiaoaiWakeGreetings(
   sshRunner: XiaoaiSshRunner = defaultSshRunner,
 ): Promise<void> {
   const cmd = buildXiaoaiWakePrewarmCommand(phrases);
-  const res = await sshRunner(target, cmd, { timeoutMs: 20_000 }).catch(() => undefined);
+  const res = await sshRunner(target, cmd, { timeoutMs: 25_000 }).catch(() => undefined);
   if (res && res.code !== 0 && res.stderr.trim()) {
     console.warn(`[xiaoai-ssh] wake greeting prewarm warning for ${target.id}: ${res.stderr.trim()}`);
+  }
+  if (sshRunner !== defaultSshRunner) {
+    return;
+  }
+  let controlPath: string | undefined;
+  try {
+    controlPath = resolveXiaoaiSshControlPath();
+  } catch {
+    controlPath = undefined;
+  }
+  const uniquePhrases = [...new Set(phrases.map(p => p.replace(/["\\$`\r\n]/g, '').trim()).filter(Boolean))];
+  for (const phrase of uniquePhrases) {
+    const cacheFile = getXiaoaiWakeCacheFileName(phrase);
+    const readCmd = `for d in /data/friday_wake_cache /tmp/friday_wake_cache; do if [ -s "$d/${cacheFile}" ] && [ ! -f "$d/${cacheFile}.tight" ]; then cat "$d/${cacheFile}"; break; fi; done`;
+    const readRes = await runBinaryChild('ssh', ['-T', ...buildXiaoaiSshArgs(target, readCmd, controlPath)], undefined, 10_000);
+    if (readRes.code !== 0 || readRes.stdout.length < 400) continue;
+    const tightened = await tightenWakeMp3BufferWithFfmpeg(readRes.stdout);
+    if (!tightened) continue;
+    const writeCmd = `CDIR=/data/friday_wake_cache; [ -d "$CDIR" ] || CDIR=/tmp/friday_wake_cache; CF="$CDIR/${cacheFile}"; cat > "$CF.tmp" && [ -s "$CF.tmp" ] && mv -f "$CF.tmp" "$CF" && : > "$CF.tight"; rm -f "$CF.tmp" 2>/dev/null || true`;
+    await runBinaryChild('ssh', ['-T', ...buildXiaoaiSshArgs(target, writeCmd, controlPath)], tightened, 10_000);
   }
 }
 
@@ -282,16 +359,17 @@ export async function sendXiaoaiSpeech(
     for (let i = 0; i < segments.length; i++) {
       if (isEpochCancelled()) break;
       const seg = segments[i]!;
-      const estimatedSpeechMs = Math.min(18_000, Math.max(2_200, seg.length * 190 + 900));
+      const spokenSeg = smoothXiaoaiTtsProsody(seg) || seg;
+      const estimatedSpeechMs = Math.min(18_000, Math.max(2_200, spokenSeg.length * 190 + 900));
       markXiaoaiSpeakingGuard(channel.id, target.id, estimatedSpeechMs);
-      const jsonPayload = JSON.stringify({ text: seg, save: 0 });
-      const cmd = `rm -f /tmp/friday_led_tok; touch /tmp/friday_speaking; (/bin/shut_led 1 >/dev/null 2>&1; /bin/shut_led 2 >/dev/null 2>&1 || true); ubus call mibrain text_to_speech '${escapeShellSingleQuote(jsonPayload)}' >/dev/null 2>&1 || /usr/sbin/tts_play.sh '${escapeShellSingleQuote(seg)}'`;
+      const jsonPayload = JSON.stringify({ text: spokenSeg, save: 0 });
+      const cmd = `rm -f /tmp/friday_led_tok; touch /tmp/friday_speaking; (/bin/shut_led 1 >/dev/null 2>&1; /bin/shut_led 2 >/dev/null 2>&1 || true); ubus call mibrain text_to_speech '${escapeShellSingleQuote(jsonPayload)}' >/dev/null 2>&1 || /usr/sbin/tts_play.sh '${escapeShellSingleQuote(spokenSeg)}'`;
       const res = await sshRunner(target, cmd, { timeoutMs: 12_000 });
       if (res.code !== 0) {
         throw new Error(res.stderr.trim() || `小爱 SSH TTS 失败 (exit=${res.code})`);
       }
       if (i < segments.length - 1 || options?.waitForCompletion) {
-        await waitForXiaoaiSegmentPlayback(target, sshRunner, seg.length, isEpochCancelled);
+        await waitForXiaoaiSegmentPlayback(target, sshRunner, spokenSeg.length, isEpochCancelled);
         if (i === segments.length - 1 && !isEpochCancelled()) {
           markXiaoaiSpeakingGuard(channel.id, target.id, 350, true);
         }
@@ -322,13 +400,14 @@ export async function sendXiaoaiSpeech(
     }
 
     for (const seg of segments) {
+      const spokenSeg = smoothXiaoaiTtsProsody(seg) || seg;
       await callMinaRemoteUbus(
         minaBase,
         resolved.session,
         targetDeviceId,
         'mibrain',
         'text_to_speech',
-        JSON.stringify({ text: seg, save: 0 }),
+        JSON.stringify({ text: spokenSeg, save: 0 }),
         fetchFn,
       );
     }

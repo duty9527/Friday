@@ -39,6 +39,7 @@ export {
   XIAOAI_URGENT_WAKE_MAX_MS,
   DEFAULT_OWNER_WAKE_GREETINGS,
   resolveXiaoaiWakeGreeting,
+  tightenWakeMp3BufferWithFfmpeg,
   prewarmXiaoaiWakeGreetings,
   handleXiaoaiKeywordWake,
   sendXiaoaiSpeech,
@@ -49,6 +50,7 @@ export {
   stripXiaoaiDialogDirective,
   shouldContinueXiaoaiDialog,
   sanitizeForSpeech,
+  smoothXiaoaiTtsProsody,
   splitSpeechSegments,
   shouldInterceptXiaoaiQuery,
 } from './xiaoai/utterance-utils.js';

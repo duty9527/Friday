@@ -10,6 +10,7 @@ import { PassThrough } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   sanitizeForSpeech,
+  smoothXiaoaiTtsProsody,
   splitSpeechSegments,
   shouldInterceptXiaoaiQuery,
   shouldContinueXiaoaiDialog,
@@ -3279,22 +3280,22 @@ test('XiaoaiKwsMonitor idleEnergyGate skips ONNX inference on silence, replays 4
   }
 });
 
-test('XiaoAI wake greeting selection, duration measurement, short-clip silence trimming, and POSIX cache scripts', () => {
-  // 1. Urgency (<900ms vs >=900ms) and 4 time-of-day greeting windows + member address
+test('XiaoAI wake greeting selection, duration measurement, short-clip silence trimming, prosody smoothing, and POSIX cache scripts', async () => {
+  // 1. Urgency (<900ms vs >=900ms) and 4 time-of-day greeting windows + member address (no comma pauses)
   const atHour = (hour: number, minute = 0) => new Date(2026, 10, 17, hour, minute, 0, 0);
-  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '星期五', wakeDurationMs: 620, now: atHour(8, 30) }), '在的，老板');
-  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '你好星期五', wakeDurationMs: 780, now: atHour(23, 15) }), '在的，老板');
-  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '你好星期五', urgent: true, now: atHour(15, 0) }), '在的，老板');
+  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '星期五', wakeDurationMs: 620, now: atHour(8, 30) }), '在的老板');
+  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '你好星期五', wakeDurationMs: 780, now: atHour(23, 15) }), '在的老板');
+  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '你好星期五', urgent: true, now: atHour(15, 0) }), '在的老板');
 
-  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '星期五', wakeDurationMs: 1_150, now: atHour(8, 30) }), '早上好，老板');
-  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '你好星期五', wakeDurationMs: 1_150, now: atHour(12, 15) }), '中午好，老板');
-  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '你好星期五', wakeDurationMs: 1_150, now: atHour(15, 40) }), '下午好，老板');
-  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '你好星期五', wakeDurationMs: 1_150, now: atHour(23, 10) }), '晚上好，老板');
-  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '你好星期五', wakeDurationMs: 1_150, now: atHour(2, 0) }), '晚上好，老板');
+  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '星期五', wakeDurationMs: 1_150, now: atHour(8, 30) }), '早上好老板');
+  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '你好星期五', wakeDurationMs: 1_150, now: atHour(12, 15) }), '中午好老板');
+  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '你好星期五', wakeDurationMs: 1_150, now: atHour(15, 40) }), '下午好老板');
+  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '你好星期五', wakeDurationMs: 1_150, now: atHour(23, 10) }), '晚上好老板');
+  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '你好星期五', wakeDurationMs: 1_150, now: atHour(2, 0) }), '晚上好老板');
 
   const wife = { name: '太太', role: 'member' as const };
-  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '星期五', wakeDurationMs: 650, speaker: wife, now: atHour(15, 0) }), '在的，太太');
-  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '你好星期五', wakeDurationMs: 1_150, speaker: wife, now: atHour(15, 40) }), '下午好，太太');
+  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '星期五', wakeDurationMs: 650, speaker: wife, now: atHour(15, 0) }), '在的太太');
+  assert.equal(resolveXiaoaiWakeGreeting({ keyword: '你好星期五', wakeDurationMs: 1_150, speaker: wife, now: atHour(15, 40) }), '下午好太太');
 
   // 2. Active speech duration measurement inside 1.8s KWS ring buffer (leading noise stripped)
   const ringShort = concatAudio(synthToneSamples(200, 1_100, 0.002), synthToneSamples(200, 620, 0.25));
@@ -3316,20 +3317,39 @@ test('XiaoAI wake greeting selection, duration measurement, short-clip silence t
   assert.ok(trimmedShort.length >= Math.round(SPEAKER_SAMPLE_RATE * 0.55));
 
   // 4. POSIX sh -n validation & invariant guards for wake / prewarm commands
-  const wakeCmd = buildXiaoaiWakeCommand({ chime: true, greetingText: '晚上好，老板' });
-  const prewarmCmd = buildXiaoaiWakePrewarmCommand(['在的，老板', '下午好，老板']);
+  const wakeCmd = buildXiaoaiWakeCommand({ chime: true, greetingText: '晚上好老板' });
+  const prewarmCmd = buildXiaoaiWakePrewarmCommand(['在的老板', '下午好老板']);
   execFileSync('sh', ['-n', '-c', wakeCmd], { stdio: 'pipe' });
   execFileSync('sh', ['-n', '-c', prewarmCmd], { stdio: 'pipe' });
   assert.equal(wakeCmd.includes('text_to_speech'), false, 'Wake command must use gen-tts wrapper to preserve TTS counters');
   assert.equal(prewarmCmd.includes('text_to_speech'), false);
   assert.ok(wakeCmd.includes('/usr/bin/gen-tts'));
-  assert.ok(wakeCmd.includes(getXiaoaiWakeCacheFileName('晚上好，老板')));
+  assert.ok(wakeCmd.includes(getXiaoaiWakeCacheFileName('晚上好老板')));
   assert.ok(wakeCmd.includes('wakeup_zai_01.wav'), 'Wake command must retain native wav fallback');
 
   // 5. Expanded homophones for bare "星期五" and prefixed homophone commands
   assert.deepEqual(extractLeadingXiaoaiWakeKeyword('星期吾。'), { keyword: '星期五', remainder: '' });
   assert.deepEqual(extractLeadingXiaoaiWakeKeyword('星七五。'), { keyword: '星期五', remainder: '' });
   assert.deepEqual(extractLeadingXiaoaiWakeKeyword('你好星七五，现在几点了'), { keyword: '你好星期五', remainder: '现在几点了' });
+
+  // 6. Everyday TTS prosody smoothing & enrollment exit phrases
+  assert.equal(smoothXiaoaiTtsProsody('在的，老板。'), '在的老板。');
+  assert.equal(smoothXiaoaiTtsProsody('没听清，老板再说一遍？'), '没听清老板再说一遍？');
+  assert.equal(smoothXiaoaiTtsProsody('好的，老板，客厅灯已关。'), '好的老板客厅灯已关。');
+  assert.equal(smoothXiaoaiTtsProsody('老板，现在十一点。'), '老板现在十一点。');
+  assert.equal(
+    smoothXiaoaiTtsProsody('好的，老板，我已经帮你把客厅和卧室的空调全部调到二十六度了。'),
+    '好的老板，我已经帮你把客厅和卧室的空调全部调到二十六度了。',
+  );
+  const ttsSentCmds: string[] = [];
+  await sendXiaoaiSpeech(
+    makeChannel({ apiBase: 'ssh://lx06=root@192.0.2.104', defaultTarget: 'lx06' }),
+    '没听清，老板再说一遍？',
+    { sshRunner: async (_t, remoteCmd) => { ttsSentCmds.push(remoteCmd); return { stdout: '', stderr: '', code: 0 }; } },
+  );
+  assert.ok(ttsSentCmds.some(c => c.includes('没听清老板再说一遍？')));
+  assert.equal(isEnrollCancelPhrase('退一下吧。'), true);
+  assert.equal(isEnrollCancelPhrase('没事了'), true);
 });
 
 test('XiaoaiKwsMonitor re-triggers urgent wake greeting instead of cancelling when "星期五" is repeated inside capturing window', async () => {
