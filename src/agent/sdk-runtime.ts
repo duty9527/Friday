@@ -23,7 +23,10 @@ import { messageImages } from '../message-images.js';
 import {
   buildModelTiers,
   ensureRealProviderCatalog,
+  FALLBACK_PROVIDER_MODELS,
   normalizeProviderId,
+  normalizeSelectedModels,
+  REAL_PROVIDER_DEFAULTS,
   resolveWorkerModelFromTiers,
   type PersistedModelHubState,
   type WorkerModelResolutionInput,
@@ -587,6 +590,15 @@ export class SdkAgent implements AgentPort {
   }
 }
 
+function extractSelectedModelIds(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  try {
+    return normalizeSelectedModels(raw).map(item => item.id);
+  } catch {
+    return [];
+  }
+}
+
 export async function realFactory(home: string, config: {
   provider?: string; model?: string; apiKey?: string;
   baseUrl?: string; routerModel?: string; workerModel?: string;
@@ -632,9 +644,13 @@ export async function realFactory(home: string, config: {
   const effectiveConfigProvider = config.provider ?? fallbackEntry?.id;
   const effectiveConfigApiKey = config.apiKey ?? fallbackEntry?.cfg.apiKey?.trim();
   const effectiveConfigBaseUrl = config.baseUrl ?? fallbackEntry?.cfg.baseUrl?.trim();
-  const persistedFallbackModel = fallbackEntry?.cfg.selectedModels?.[0]?.id
+  const persistedDefaultModel = fallbackEntry
+    ? (REAL_PROVIDER_DEFAULTS[fallbackEntry.id]?.balanced?.[0] ?? FALLBACK_PROVIDER_MODELS[fallbackEntry.id]?.[0]?.id)
+    : undefined;
+  const persistedFallbackModel = (fallbackEntry ? extractSelectedModelIds(fallbackEntry.cfg.selectedModels)[0] : undefined)
     ?? fallbackEntry?.cfg.customModels?.[0]
-    ?? fallbackEntry?.cfg.fetchedModels?.[0]?.id;
+    ?? fallbackEntry?.cfg.fetchedModels?.[0]?.id
+    ?? persistedDefaultModel;
   const effectiveConfigModel = config.model
     ?? persistedHub?.routerModel
     ?? persistedHub?.balancedModel
@@ -689,7 +705,7 @@ export async function realFactory(home: string, config: {
           ...runtime.getModels(provId).map(m => m.id),
           ...(cfg.customModels ?? []),
           ...(cfg.fetchedModels ?? []).map(m => m.id),
-          ...(cfg.selectedModels ?? []).map(m => m.id),
+          ...extractSelectedModelIds(cfg.selectedModels),
           ...(provId === persistedHub?.routerProvider && persistedHub?.routerModel ? [persistedHub.routerModel] : []),
         ].filter(Boolean))];
         if (modelIds.length > 0) {
@@ -796,7 +812,7 @@ export async function realFactory(home: string, config: {
     mode: 'real', nativeTools: true,
     modelTiers: currentModelTiers,
     routerProvider,
-    initialApiKey: effectiveConfigApiKey,
+    initialApiKey: config.apiKey,
     runtime,
     resolveWorkerModel: input => resolveWorkerModelFromTiers(currentModelTiers, input),
     updateModelConfig(tiers, nextRouterProvider, nextRouterModelId, disabledProviders) {

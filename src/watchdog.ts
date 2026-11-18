@@ -254,7 +254,7 @@ export class Watchdog {
 
   constructor(private readonly options: WatchdogOptions) {
     this.maxRetries = options.maxRetries ?? 3;
-    this.backoffMs = options.backoffMs ?? 1_500;
+    this.backoffMs = options.backoffMs ?? 2_000;
   }
 
   state(): WatchdogState {

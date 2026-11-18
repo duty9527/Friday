@@ -870,9 +870,57 @@ test('IPC messages batch, server drain, native-shell overflow, router-diet valid
     await fExec.cleanup();
   }
 
-  // 5. Server IPC batch `messages`, protocol timeouts & Watchdog defaults
+  // 5. Server IPC batch `messages`, protocol timeouts & Watchdog defaults + ELOCKED recovery across retries
   assert.equal(new Watchdog({ home: fFiles.home }).state().maxRetries, 3);
+  assert.equal((new Watchdog({ home: fFiles.home }) as unknown as { backoffMs: number }).backoffMs, 2_000);
   assert.equal(resolveRequestTimeoutMs({ command: 'plugin-run' }), 305_000);
+  const fWdLock = await createHome('fr-wd-lock-');
+  try {
+    let restartAttempts = 0;
+    let serviceUp = false;
+    const { createServer } = await import('node:net');
+    const { socketPath } = await import('../src/protocol.js');
+    const mockHealthSrv = createServer(sock => {
+      sock.on('data', () => {
+        if (!serviceUp) {
+          sock.destroy();
+          return;
+        }
+        sock.end(JSON.stringify({ ok: true, result: { status: 'ready', executorAvailable: true, pid: process.pid } }) + '\n');
+      });
+    });
+    await new Promise<void>(resolve => mockHealthSrv.listen(socketPath(fWdLock.home), () => resolve()));
+    try {
+      const wdLock = new Watchdog({
+        home: fWdLock.home,
+        maxRetries: 3,
+        backoffMs: 10,
+        restartService: async () => {
+          restartAttempts++;
+          if (restartAttempts < 3) {
+            const err = new Error('ELOCKED: Lock file is already being held');
+            (err as Error & { code?: string }).code = 'ELOCKED';
+            throw err;
+          }
+          serviceUp = true;
+        },
+      });
+      const s1 = await wdLock.checkOnce();
+      assert.equal(s1.status, 'recovering');
+      assert.equal(s1.failures, 1);
+      const s2 = await wdLock.checkOnce();
+      assert.equal(s2.status, 'recovering');
+      assert.equal(s2.failures, 2);
+      const s3 = await wdLock.checkOnce();
+      assert.equal(s3.status, 'healthy');
+      assert.equal(s3.failures, 0);
+      assert.equal(restartAttempts, 3);
+    } finally {
+      mockHealthSrv.close();
+    }
+  } finally {
+    await fWdLock.cleanup();
+  }
   const fSrv = await createHome('fr-srv-');
   const svc = await serve({ home: fSrv.home, mode: 'offline' });
   try {
@@ -924,7 +972,9 @@ test('[sdk-runtime] model-hub.json startup fallback, atomic updateModelConfig, m
   });
   try {
     // Boot with empty config (no env vars, no auth.json) -> loads persisted openrouter & siliconflow seamlessly
+    // AND keeps initialApiKey === undefined so ModelHub won't misclassify persisted keys as envProviderKeys
     const factory = await realFactory(f.home, {}, runtime);
+    assert.equal(factory.initialApiKey, undefined);
     assert.equal(factory.routerProvider, 'openrouter');
     assert.equal(factory.modelTiers?.router, 'anthropic/claude-sonnet-4');
 
@@ -940,5 +990,30 @@ test('[sdk-runtime] model-hub.json startup fallback, atomic updateModelConfig, m
     worker.close();
   } finally {
     await f.cleanup();
+  }
+
+  // Also verify historical string selectedModels & apiKey-only non-deepseek/google providers recover cleanly
+  for (const hubSeed of [
+    { providers: { openai: { enabled: true, apiKey: 'sk-openai-only' } } },
+    { routerProvider: 'openai', providers: { openai: { enabled: true, apiKey: 'sk-openai-str', selectedModels: ['gpt-4.1'] } } },
+  ]) {
+    const fOai = await createHome('fr-sdk-oai-');
+    try {
+      const sdkOai = join(fOai.home, 'sdk');
+      await mkdir(sdkOai, { recursive: true });
+      await writeFile(join(sdkOai, 'model-hub.json'), JSON.stringify(hubSeed));
+      const rtOai = await ModelRuntime.create({
+        authPath: join(sdkOai, 'auth.json'),
+        modelsPath: null,
+        modelsStorePath: join(sdkOai, 'models-cache.json'),
+        refreshOnCreate: false,
+      });
+      const oaiFactory = await realFactory(fOai.home, {}, rtOai);
+      assert.equal(oaiFactory.initialApiKey, undefined);
+      assert.equal(oaiFactory.routerProvider, 'openai');
+      assert.equal(oaiFactory.modelTiers?.router, 'gpt-4.1');
+    } finally {
+      await fOai.cleanup();
+    }
   }
 });
