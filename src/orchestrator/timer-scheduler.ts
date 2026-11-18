@@ -111,6 +111,7 @@ export interface TimerSchedulerHost {
 
 export class TimerScheduler {
   private readonly runningPluginTimers = new Set<string>();
+  private readonly submittingTaskTimers = new Set<string>();
 
   constructor(private readonly host: TimerSchedulerHost) {}
 
@@ -176,6 +177,7 @@ export class TimerScheduler {
 
   removeTimer(id: string): boolean {
     this.runningPluginTimers.delete(id);
+    this.submittingTaskTimers.delete(id);
     return this.host.store.deleteTimer(id);
   }
 
@@ -187,7 +189,7 @@ export class TimerScheduler {
     return timer.origin;
   }
 
-  private triggerTimer(timer: Timer): void {
+  private triggerTimer(timer: Timer, plannedRunAt?: number): void {
     const now = Date.now();
     timer.lastRunAt = now;
     timer.pendingCatchup = false;
@@ -253,6 +255,8 @@ export class TimerScheduler {
       return;
     }
 
+    if (this.submittingTaskTimers.has(timer.id)) return;
+    const fireSlot = plannedRunAt ?? now;
     const timerMsgId = randomUUID();
     const message = this.host.store.conversation.create({
       id: timerMsgId,
@@ -265,7 +269,8 @@ export class TimerScheduler {
       paths: [],
       mode: this.host.mode,
     });
-    const requestId = `timer:${timer.id}:${now}`;
+    const requestId = `timer:${timer.id}:${fireSlot}`;
+    this.submittingTaskTimers.add(timer.id);
     this.host.store.saveTimer(timer);
     void this.host.submit(
       requestId,
@@ -277,13 +282,14 @@ export class TimerScheduler {
       if (this.host.isClosing()) return;
       const current = this.host.store.listTimers().find(item => item.id === timer.id);
       if (current) {
-        current.activeTaskId = task.id;
-        this.host.store.saveTimer(current);
+        this.host.store.saveTimer({ ...current, activeTaskId: task.id });
       }
     }).catch(err => {
       if (this.host.isClosing()) return;
       const errMsg = err instanceof Error ? err.message : '定时任务提交失败';
       this.host.store.notice('system', 'timer_failed', `定时任务「${timer.name}」触发失败：${errMsg}`);
+    }).finally(() => {
+      this.submittingTaskTimers.delete(timer.id);
     });
   }
 
@@ -291,11 +297,13 @@ export class TimerScheduler {
     if (this.host.isClosing()) return;
     const now = Date.now();
     for (const timer of this.host.store.listTimers()) {
-      let active = this.runningPluginTimers.has(timer.id);
+      let active = this.runningPluginTimers.has(timer.id) || this.submittingTaskTimers.has(timer.id);
       if (timer.activeTaskId) {
         let taskActive = false;
         try {
-          taskActive = ['queued', 'running'].includes(this.host.store.get(timer.activeTaskId).status);
+          taskActive = ['queued', 'running', 'paused', 'waiting_approval'].includes(
+            this.host.store.get(timer.activeTaskId).status,
+          );
         } catch {
           taskActive = false;
         }
@@ -308,10 +316,11 @@ export class TimerScheduler {
       }
       if (!timer.enabled) continue;
       if (now >= timer.nextRunAt) {
+        const plannedSlot = Number.isFinite(timer.nextRunAt) ? timer.nextRunAt : now;
         if (timer.once) {
           timer.enabled = false;
           timer.pendingCatchup = false;
-          this.triggerTimer(timer);
+          this.triggerTimer(timer, plannedSlot);
           continue;
         }
         const safeIntervalMs = clampTimerIntervalMs(timer.intervalMs);
@@ -330,10 +339,10 @@ export class TimerScheduler {
           timer.pendingCatchup = true;
           this.host.store.saveTimer(timer);
         } else {
-          this.triggerTimer(timer);
+          this.triggerTimer(timer, plannedSlot);
         }
       } else if (!active && timer.pendingCatchup) {
-        this.triggerTimer(timer);
+        this.triggerTimer(timer, Number.isFinite(timer.nextRunAt) ? timer.nextRunAt : now);
       }
     }
   }

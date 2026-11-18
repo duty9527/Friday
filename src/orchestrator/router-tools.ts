@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, writeFile } from 'node:fs/promises';
-import { basename, join } from 'node:path';
+import { constants } from 'node:fs';
+import { lstat, mkdir, open } from 'node:fs/promises';
+import { basename, join, resolve, sep } from 'node:path';
 import type { AgentTool } from '../agent.js';
 import { publicData } from '../conversation.js';
 import type { ImGateway } from '../im.js';
@@ -346,9 +347,66 @@ function requireActiveChat(host: RouterToolsHost): ChatRun {
   return context;
 }
 
-function getValidatedWork(store: Store, context: ChatRun, id: string): Task {
+export function isOriginAccessible(
+  callerOrigin?: MessageOrigin,
+  targetOrigin?: MessageOrigin,
+): boolean {
+  if (!callerOrigin?.channel || callerOrigin.channel === 'local') return true;
+  if (!targetOrigin?.channel || targetOrigin.channel === 'local') return false;
+  if (targetOrigin.channel !== callerOrigin.channel) return false;
+  if (callerOrigin.channelId && targetOrigin.channelId !== callerOrigin.channelId) return false;
+  if (callerOrigin.speakerRole === 'member' && targetOrigin.speakerRole !== 'member') return false;
+  if (callerOrigin.speakerId && targetOrigin.speakerId && callerOrigin.speakerId !== targetOrigin.speakerId) {
+    return false;
+  }
+  const callerPeer = callerOrigin.senderId ?? callerOrigin.conversationId;
+  const targetPeer = targetOrigin.senderId ?? targetOrigin.conversationId;
+  if (callerPeer && targetPeer) {
+    return callerPeer === targetPeer;
+  }
+  if (callerPeer || targetPeer) return false;
+  return Boolean(callerOrigin.channelId && callerOrigin.channelId === targetOrigin.channelId);
+}
+
+export function resolveReportChainKey(store: Store, task: Task): string {
+  let cur: Task | undefined = task;
+  const visited = new Set<string>();
+  while (cur && !visited.has(cur.id)) {
+    if (cur.originMessageId) return cur.originMessageId;
+    visited.add(cur.id);
+    if (!cur.parentTaskId) return cur.id;
+    const parentId = cur.parentTaskId;
+    try {
+      cur = store.get(parentId);
+    } catch {
+      return parentId;
+    }
+  }
+  return task.originMessageId ?? task.id;
+}
+
+function getCallerOrigin(host: RouterToolsHost, context: ChatRun): MessageOrigin | undefined {
+  const turn = host.getTurn();
+  return turn?.chatContext?.message.origin
+    ?? turn?.activeReportTask?.origin
+    ?? turn?.reportChatContext?.message.origin
+    ?? context.message.origin;
+}
+
+function assertOriginAccessible(
+  callerOrigin: MessageOrigin | undefined,
+  targetOrigin: MessageOrigin | undefined,
+  resourceLabel = '该任务或会话资源',
+): void {
+  if (!isOriginAccessible(callerOrigin, targetOrigin)) {
+    throw new Error(`权限不足：当前 IM 会话无权访问或操作其他会话的${resourceLabel}`);
+  }
+}
+
+function getValidatedWork(store: Store, context: ChatRun, id: string, callerOrigin?: MessageOrigin): Task {
   const task = store.get(id);
-  if (context.revisions.get(id) !== task.revision) {
+  assertOriginAccessible(callerOrigin, task.origin, '任务');
+  if (context.revisions.get(task.id) !== task.revision) {
     throw new Error('Work changed or was stopped while Router was responding; inspect its current state before retrying');
   }
   return task;
@@ -414,8 +472,12 @@ export function createRouterTools(
       workerModel: typeof args.model === 'string' && args.model.trim() ? String(publicData(args.model.trim().slice(0, 120))) : undefined,
     };
     if (action.taskId) {
-      try { action.taskLabel = String(publicData(host.store.get(action.taskId).prompt.slice(0, 240))); }
-      catch { /* The original tool reports unknown or invalid targets. */ }
+      try {
+        const targetTask = host.store.get(action.taskId);
+        if (isOriginAccessible(getCallerOrigin(host, context), targetTask.origin)) {
+          action.taskLabel = String(publicData(targetTask.prompt.slice(0, 240)));
+        }
+      } catch { /* The original tool reports unknown or invalid targets. */ }
     }
     const routeParent = turn?.routerTrace?.toolSpan(callId);
     if (typeof args.summary === 'string' && args.summary.trim()) {
@@ -496,8 +558,9 @@ export function createRouterTools(
     execute: async (input, callId) => {
       const turn = host.getTurn();
       const context = requireActiveChat(host);
+      const callerOrigin = getCallerOrigin(host, context);
       const inReportTurn = !turn?.chatContext && Boolean(turn?.activeReportTask);
-      const reportChainKey = inReportTurn ? (turn!.activeReportTask!.originMessageId ?? turn!.activeReportTask!.id) : undefined;
+      const reportChainKey = inReportTurn ? resolveReportChainKey(host.store, turn!.activeReportTask!) : undefined;
       if (reportChainKey && host.reportAutoDispatches.get(reportChainKey) >= 2) {
         throw new Error('Autonomous supplementary dispatch limit (2) reached for this request; deliver current findings to the Boss before starting further tasks');
       }
@@ -505,7 +568,7 @@ export function createRouterTools(
       const instruction = text(args.instruction, 'instruction');
       if (args.sourceMessageId && args.sourceTaskId) throw new Error('Use one authorized source');
       const source = args.sourceTaskId
-        ? getValidatedWork(host.store, context, text(args.sourceTaskId, 'sourceTaskId', 128))
+        ? getValidatedWork(host.store, context, text(args.sourceTaskId, 'sourceTaskId', 128), callerOrigin)
         : (inReportTurn && !args.sourceMessageId ? turn!.activeReportTask : undefined);
       if (source && ['queued', 'running'].includes(source.status) && source.id !== turn?.activeReportTask?.id) {
         throw new Error('Work is still active: use continue_work to append a follow-up instead of copying it');
@@ -515,6 +578,7 @@ export function createRouterTools(
       let attachments = resolveMessageAttachments(host.store, context.message);
       if (args.sourceMessageId) {
         const message = host.store.conversation.get(text(args.sourceMessageId, 'sourceMessageId', 128));
+        assertOriginAccessible(callerOrigin, message.origin, '消息');
         if (message.role !== 'user') throw new Error('Only user messages authorize file paths');
         paths = message.paths;
         attachments = resolveMessageAttachments(host.store, message);
@@ -564,13 +628,14 @@ export function createRouterTools(
     execute: async (input, callId) => {
       const turn = host.getTurn();
       const context = requireActiveChat(host);
+      const callerOrigin = getCallerOrigin(host, context);
       const inReportTurn = !turn?.chatContext && Boolean(turn?.activeReportTask);
-      const reportChainKey = inReportTurn ? (turn!.activeReportTask!.originMessageId ?? turn!.activeReportTask!.id) : undefined;
+      const reportChainKey = inReportTurn ? resolveReportChainKey(host.store, turn!.activeReportTask!) : undefined;
       if (reportChainKey && host.reportAutoDispatches.get(reportChainKey) >= 2) {
         throw new Error('Autonomous supplementary dispatch limit (2) reached for this request; deliver current findings to the Boss before starting further tasks');
       }
       const args = toolInput(input, ['taskId', 'instruction', 'cwd', 'contextBrief', 'memoryIds', 'profile', 'tier', 'model', 'summary']);
-      const task = getValidatedWork(host.store, context, text(args.taskId, 'taskId', 128));
+      const task = getValidatedWork(host.store, context, text(args.taskId, 'taskId', 128), callerOrigin);
       const instruction = text(args.instruction, 'instruction');
       const contextBrief = args.contextBrief === undefined ? undefined : text(args.contextBrief, 'contextBrief', 16_384);
       const memoryIds = parseStringArray(args.memoryIds, 'memoryIds');
@@ -644,8 +709,11 @@ export function createRouterTools(
     execute: async input => {
       const turn = host.getTurn();
       const context = requireActiveChat(host);
+      const callerOrigin = getCallerOrigin(host, context);
       const args = toolInput(input, ['taskId', 'summary']);
       const task = host.store.get(text(args.taskId, 'taskId', 128));
+      assertOriginAccessible(callerOrigin, task.origin, '任务');
+      context.revisions.set(task.id, task.revision);
       if (turn?.chatContext || turn?.activeReportTask?.originMessageId) {
         host.store.conversation.link(context.message.id, task.id);
       }
@@ -676,7 +744,8 @@ export function createRouterTools(
     name: 'recall_messages',
     description: 'Read older pages of the current transcript without starting a new session. Input JSON {beforeSeq?} for a truncated page, or {messageId} for full text.',
     execute: async input => {
-      requireActiveChat(host);
+      const context = requireActiveChat(host);
+      const callerOrigin = getCallerOrigin(host, context);
       const args = toolInput(input, ['beforeSeq', 'messageId', 'summary']);
       const compact = (message: ChatMessage, full: boolean) => ({
         id: message.id,
@@ -689,9 +758,16 @@ export function createRouterTools(
         taskIds: message.taskIds,
         fileCount: message.paths.length,
       });
-      if (args.messageId) return JSON.stringify(compact(host.store.conversation.get(text(args.messageId, 'messageId', 128)), true));
+      if (args.messageId) {
+        const msg = host.store.conversation.get(text(args.messageId, 'messageId', 128));
+        assertOriginAccessible(callerOrigin, msg.origin, '消息');
+        return JSON.stringify(compact(msg, true));
+      }
       const page = host.store.conversation.history(args.beforeSeq === undefined ? undefined : integer(args.beforeSeq, 0, 1, Number.MAX_SAFE_INTEGER));
-      return JSON.stringify({ ...page, items: page.items.map(message => compact(message, false)) });
+      const visibleItems = callerOrigin?.channel && callerOrigin.channel !== 'local'
+        ? page.items.filter(message => isOriginAccessible(callerOrigin, message.origin))
+        : page.items;
+      return JSON.stringify({ ...page, items: visibleItems.map(message => compact(message, false)) });
     },
   }, {
     name: 'search_memory',
@@ -759,8 +835,9 @@ export function createRouterTools(
     execute: async input => {
       const turn = host.getTurn();
       const context = requireActiveChat(host);
+      const callerOrigin = getCallerOrigin(host, context);
       const args = toolInput(input, ['taskId', 'summary']);
-      const selected = getValidatedWork(host.store, context, text(args.taskId, 'taskId', 128));
+      const selected = getValidatedWork(host.store, context, text(args.taskId, 'taskId', 128), callerOrigin);
       if (turn?.chatContext || turn?.activeReportTask?.originMessageId) {
         host.store.conversation.link(context.message.id, selected.id);
       }
@@ -773,8 +850,9 @@ export function createRouterTools(
     execute: async input => {
       const turn = host.getTurn();
       const context = requireActiveChat(host);
+      const callerOrigin = getCallerOrigin(host, context);
       const args = toolInput(input, ['taskId', 'extendMs', 'summary']);
-      const selected = getValidatedWork(host.store, context, text(args.taskId, 'taskId', 128));
+      const selected = getValidatedWork(host.store, context, text(args.taskId, 'taskId', 128), callerOrigin);
       if (turn?.chatContext || turn?.activeReportTask?.originMessageId) {
         host.store.conversation.link(context.message.id, selected.id);
       }
@@ -788,31 +866,51 @@ export function createRouterTools(
     execute: async input => {
       const turn = host.getTurn();
       const context = requireActiveChat(host);
+      const callerOrigin = getCallerOrigin(host, context);
       const args = toolInput(input, ['action', 'id', 'name', 'instruction', 'intervalMs', 'delayMs', 'dailyAt', 'once', 'plugin', 'pluginAction', 'deliverChannelId', 'deliverTarget', 'cwd', 'enabled', 'summary']);
       const action = text(args.action, 'action', 32);
-      if (action === 'list') return JSON.stringify({ timers: host.store.listTimers() });
+      if (action === 'list') {
+        const timers = host.store.listTimers().filter(t => isOriginAccessible(callerOrigin, t.origin));
+        return JSON.stringify({ timers });
+      }
       if (action === 'add') {
+        const deliverChannelId = args.deliverChannelId === undefined ? undefined : text(args.deliverChannelId, 'deliverChannelId', 128);
+        const deliverTarget = args.deliverTarget === undefined ? undefined : text(args.deliverTarget, 'deliverTarget', 128);
+        if (callerOrigin?.channel && callerOrigin.channel !== 'local' && (deliverChannelId || deliverTarget)) {
+          const targetOrigin = host.resolveChannelOrigin(deliverChannelId ?? callerOrigin.channel, deliverTarget);
+          assertOriginAccessible(callerOrigin, targetOrigin, '定时投递目标');
+        }
         const delayMs = args.delayMs === undefined ? undefined : clampTimerIntervalMs(integer(args.delayMs, 60_000, 500, 604_800_000));
         const timer = host.addTimer(
           text(args.name ?? (args.once || delayMs !== undefined ? '定时提醒' : '定时任务'), 'name', 120),
           text(args.instruction ?? (args.plugin ? `执行插件 ${String(args.plugin)}/${String(args.pluginAction ?? 'status')}` : '定时巡检'), 'instruction'),
           clampTimerIntervalMs(integer(args.intervalMs, 60_000, 500, 604_800_000)),
           args.cwd === undefined ? undefined : text(args.cwd, 'cwd', 4096),
-          turn?.chatContext?.message.origin ?? turn?.activeReportTask?.origin ?? context.message.origin,
+          turn?.chatContext?.deliveryOrigin ?? turn?.chatContext?.message.origin ?? turn?.activeReportTask?.origin ?? context.message.origin,
           {
             dailyAt: args.dailyAt === undefined ? undefined : text(args.dailyAt, 'dailyAt', 16),
             delayMs,
             once: args.once === undefined ? undefined : Boolean(args.once),
             plugin: args.plugin === undefined ? undefined : text(args.plugin, 'plugin', 64),
             pluginAction: args.pluginAction === undefined ? undefined : text(args.pluginAction, 'pluginAction', 64),
-            deliverChannelId: args.deliverChannelId === undefined ? undefined : text(args.deliverChannelId, 'deliverChannelId', 128),
-            deliverTarget: args.deliverTarget === undefined ? undefined : text(args.deliverTarget, 'deliverTarget', 128),
+            deliverChannelId,
+            deliverTarget,
           },
         );
         return JSON.stringify({ timer });
       }
-      if (action === 'toggle') return JSON.stringify({ timer: host.toggleTimer(text(args.id, 'id', 128), Boolean(args.enabled)) });
-      if (action === 'remove') return JSON.stringify({ removed: host.removeTimer(text(args.id, 'id', 128)) });
+      if (action === 'toggle') {
+        const id = text(args.id, 'id', 128);
+        const existing = host.store.getTimer(id);
+        assertOriginAccessible(callerOrigin, existing.origin, '定时器');
+        return JSON.stringify({ timer: host.toggleTimer(id, Boolean(args.enabled)) });
+      }
+      if (action === 'remove') {
+        const id = text(args.id, 'id', 128);
+        const existing = host.store.getTimer(id);
+        assertOriginAccessible(callerOrigin, existing.origin, '定时器');
+        return JSON.stringify({ removed: host.removeTimer(id) });
+      }
       throw new Error(`Unknown timer action: ${action}`);
     },
   }, {
@@ -878,7 +976,12 @@ export function createRouterTools(
       if (!fileName || fileName === '.' || fileName === '..' || basename(fileName) !== fileName || /[\\/\x00-\x1f]/.test(fileName)) {
         throw new Error('Invalid attachment name');
       }
-      const currentOrigin = turn?.chatContext?.message.origin ?? turn?.activeReportTask?.origin;
+      const currentOrigin = turn?.chatContext?.deliveryOrigin
+        ?? turn?.chatContext?.message.origin
+        ?? turn?.reportChatContext?.deliveryOrigin
+        ?? turn?.reportChatContext?.message.origin
+        ?? (turn?.activeReportTask ? host.runs.get(turn.activeReportTask.id)?.deliveryOrigin : undefined)
+        ?? turn?.activeReportTask?.origin;
       const origin = (currentOrigin?.channel === 'wechat' || currentOrigin?.channel === 'telegram')
         ? currentOrigin
         : (!currentOrigin?.channel || currentOrigin.channel === 'local' || currentOrigin.channel === 'xiaoai')
@@ -892,9 +995,28 @@ export function createRouterTools(
       }
       if (args.content !== undefined) {
         const contentText = text(args.content, 'content', 65_536);
-        const outboxRoot = resolveEnv('FRIDAY_WECHAT_ATTACHMENT_DIR', 'SUPER_AGENT_WECHAT_ATTACHMENT_DIR') || join(host.home, 'wechat-files');
+        const outboxRoot = resolve(resolveEnv('FRIDAY_WECHAT_ATTACHMENT_DIR', 'SUPER_AGENT_WECHAT_ATTACHMENT_DIR') || join(host.home, 'wechat-files'));
         await mkdir(outboxRoot, { recursive: true, mode: 0o700 });
-        await writeFile(join(outboxRoot, fileName), contentText, { encoding: 'utf8', mode: 0o600 });
+        const rootStat = await lstat(outboxRoot);
+        if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+          throw new Error('Outbox directory cannot be a symbolic link');
+        }
+        const targetPath = resolve(outboxRoot, fileName);
+        if (!targetPath.startsWith(`${outboxRoot}${sep}`)) {
+          throw new Error('Invalid attachment path');
+        }
+        let handle: Awaited<ReturnType<typeof open>> | undefined;
+        try {
+          handle = await open(targetPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+          await handle.writeFile(contentText, 'utf8');
+        } catch (err) {
+          const code = err && typeof err === 'object' && 'code' in err ? String(err.code) : '';
+          if (code === 'EEXIST') throw new Error(`暂存区已存在同名文件 "${fileName}"，拒绝静默覆盖`);
+          if (code === 'ELOOP') throw new Error('Outbox target cannot be a symbolic link');
+          throw err;
+        } finally {
+          await handle?.close();
+        }
       }
       if (origin.channel === 'telegram') {
         await host.im.sendTelegramAttachment(origin.channelId, fileName, {
@@ -919,8 +1041,11 @@ export function createRouterTools(
       const args = toolInput(input, ['channel', 'target', 'voiceNotice', 'summary']);
       const channelSpec = text(args.channel, 'channel', 128).trim();
       const targetSpec = args.target === undefined ? undefined : text(args.target, 'target', 128).trim();
-      const prevOrigin = turn?.chatContext?.message.origin
+      const prevOrigin = turn?.chatContext?.deliveryOrigin
+        ?? turn?.chatContext?.message.origin
+        ?? (turn?.activeReportTask ? host.runs.get(turn.activeReportTask.id)?.deliveryOrigin : undefined)
         ?? turn?.activeReportTask?.origin
+        ?? turn?.reportChatContext?.deliveryOrigin
         ?? turn?.reportChatContext?.message.origin;
       const nextOrigin = host.resolveChannelOrigin(channelSpec, targetSpec);
       if (!nextOrigin) {
@@ -928,24 +1053,24 @@ export function createRouterTools(
       }
       if (turn?.chatContext) {
         turn.chatContext.hasSideEffectTool = true;
-        turn.chatContext.message.origin = nextOrigin;
-        host.store.conversation.update(turn.chatContext.message.id, { origin: nextOrigin });
+        turn.chatContext.deliveryOrigin = nextOrigin;
         if (turn.chatContext.replyId) {
           host.store.conversation.update(turn.chatContext.replyId, { origin: nextOrigin });
         }
       }
       if (turn?.reportChatContext) {
-        turn.reportChatContext.message.origin = nextOrigin;
+        turn.reportChatContext.deliveryOrigin = nextOrigin;
         if (turn.reportChatContext.replyId) {
           host.store.conversation.update(turn.reportChatContext.replyId, { origin: nextOrigin });
         }
       }
       if (turn?.activeReportTask) {
-        turn.activeReportTask.origin = nextOrigin;
-        host.store.save(turn.activeReportTask);
         const activeRun = host.runs.get(turn.activeReportTask.id);
-        if (activeRun?.replyId) {
-          host.store.conversation.update(activeRun.replyId, { origin: nextOrigin });
+        if (activeRun) {
+          activeRun.deliveryOrigin = nextOrigin;
+          if (activeRun.replyId) {
+            host.store.conversation.update(activeRun.replyId, { origin: nextOrigin });
+          }
         }
       }
       if (

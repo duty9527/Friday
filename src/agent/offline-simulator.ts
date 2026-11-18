@@ -378,7 +378,10 @@ export function offlineFactory(delayMs = 100): AgentFactory {
           if (files) for (const file of files) {
             if (!read.has(file.id)) { await call('start_read', file.id); read.add(file.id); }
           }
-          for (const item of (event.followups as Array<{ text?: string }> | undefined) ?? []) {
+          for (const item of [
+            ...((event.priorFollowups as Array<{ text?: string }> | undefined) ?? []),
+            ...((event.followups as Array<{ text?: string }> | undefined) ?? []),
+          ]) {
             if (item.text && !notes.includes(item.text)) notes.push(item.text);
           }
           const promptText = String(event.prompt ?? (event.input as { prompt?: string } | undefined)?.prompt ?? '');

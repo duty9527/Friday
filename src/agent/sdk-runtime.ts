@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
   createAgentSession,
@@ -23,7 +23,9 @@ import { messageImages } from '../message-images.js';
 import {
   buildModelTiers,
   ensureRealProviderCatalog,
+  normalizeProviderId,
   resolveWorkerModelFromTiers,
+  type PersistedModelHubState,
   type WorkerModelResolutionInput,
 } from '../models/catalog.js';
 import { NativeCommandInterrupted, nativeShellOperations } from '../native-shell.js';
@@ -146,6 +148,45 @@ function modelLookupError(runtime: ModelRuntime, provider: string, model: string
     + `${models.length > MAX_LISTED ? `, and ${models.length - MAX_LISTED} more` : ''}. Unknown SDK model: ${provider}/${model}`;
 }
 
+function resolveProviderAndModelSpec(
+  runtime: ModelRuntime,
+  rawSpec: string,
+  fallbackProvider: string,
+  persistedProviders?: PersistedModelHubState['providers'],
+  disabledProviders?: Set<string>,
+): { provider: string; modelId: string; explicitlyPrefixed: boolean } {
+  const raw = rawSpec.trim();
+  const slash = raw.indexOf('/');
+  if (slash <= 0) {
+    return { provider: fallbackProvider, modelId: raw, explicitlyPrefixed: false };
+  }
+  if (runtime.getModel(fallbackProvider, raw)) {
+    return { provider: fallbackProvider, modelId: raw, explicitlyPrefixed: false };
+  }
+  const head = raw.slice(0, slash);
+  const tail = raw.slice(slash + 1);
+  const normHead = normalizeProviderId(head) ?? head;
+  if (head === fallbackProvider || normHead === fallbackProvider) {
+    return { provider: fallbackProvider, modelId: tail, explicitlyPrefixed: true };
+  }
+  const knownProviders = new Set<string>(runtime.getProviders().map(item => item.id));
+  if (persistedProviders) {
+    for (const id of Object.keys(persistedProviders)) knownProviders.add(id);
+  }
+  const matchedProvider = knownProviders.has(head)
+    ? head
+    : knownProviders.has(normHead)
+      ? normHead
+      : undefined;
+  if (!matchedProvider) {
+    return { provider: fallbackProvider, modelId: raw, explicitlyPrefixed: false };
+  }
+  if (disabledProviders?.has(matchedProvider) || runtime.getModel(matchedProvider, tail) || persistedProviders?.[matchedProvider]) {
+    return { provider: matchedProvider, modelId: tail, explicitlyPrefixed: true };
+  }
+  return { provider: fallbackProvider, modelId: raw, explicitlyPrefixed: false };
+}
+
 export async function loginOAuth(
   home: string,
   provider = 'openai',
@@ -216,7 +257,12 @@ export function nativeDefinitions(cwd: string, options?: AgentOptions): ToolDefi
       spawnHook: context => {
         const env = { ...context.env };
         for (const key of Object.keys(env)) {
-          if (/(?:API_KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i.test(key)) delete env[key];
+          if (
+            /(?:API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|COOKIE|PRIVATE_KEY|AUTHORIZATION|WEBHOOK|CONNECTION_STRING|DATABASE_URL|REDIS_URL|MONGO(?:DB)?_UR[IL]|POSTGRES(?:QL)?_URL|MYSQL_URL|AMQP_URL)|(?:^|_)(?:PASS|AUTH|DSN)(?:$|_)/i.test(key)
+            || (typeof env[key] === 'string' && /(?:URL|URI)$/i.test(key) && /:\/\/[^:/@\s]+:[^/@\s]+@/.test(env[key]!))
+          ) {
+            delete env[key];
+          }
         }
         return { ...context, env };
       },
@@ -396,7 +442,7 @@ export class SdkAgent implements AgentPort {
         const compStatus = event.aborted ? 'interrupted' : event.errorMessage ? 'failed' : 'completed';
         try {
           this.onModelUsage?.({
-            actor: 'compaction',
+            actor: this.role === 'dreamer' ? 'dreamer' : 'compaction',
             provider: this.session.model?.provider || this.configuredModel?.provider || 'unknown',
             model: this.session.model?.id || this.configuredModel?.id || 'unknown',
             status: compStatus,
@@ -549,8 +595,61 @@ export async function realFactory(home: string, config: {
 }, suppliedRuntime?: ModelRuntime): Promise<AgentFactory> {
   const sdkDir = join(home, 'sdk');
   const authPath = join(sdkDir, 'auth.json');
-  const hasDefaultModelProvider = config.provider === 'deepseek' || config.provider === 'google' || config.provider === 'google-vertex' || config.provider === 'gemini';
-  if ((!config.provider || (!config.model && !hasDefaultModelProvider) || !config.apiKey) && !suppliedRuntime && !existsSync(authPath)) {
+  const hubPath = join(sdkDir, 'model-hub.json');
+  let persistedHub: PersistedModelHubState | undefined;
+  if (existsSync(hubPath)) {
+    try {
+      const parsed = JSON.parse(await readFile(hubPath, 'utf8')) as Partial<PersistedModelHubState>;
+      if (parsed && typeof parsed === 'object' && parsed.providers && typeof parsed.providers === 'object') {
+        persistedHub = { ...parsed, providers: parsed.providers };
+      }
+    } catch {
+      // Ignore malformed model-hub.json while resolving startup fallback
+    }
+  }
+  const enabledPersistedEntry = (prov?: string) => {
+    if (!prov || !persistedHub) return undefined;
+    const exact = persistedHub.providers[prov];
+    if (exact && exact.enabled !== false && exact.apiKey?.trim()) return { id: prov, cfg: exact };
+    const norm = normalizeProviderId(prov);
+    const normalized = norm ? persistedHub.providers[norm] : undefined;
+    if (norm && normalized && normalized.enabled !== false && normalized.apiKey?.trim()) return { id: norm, cfg: normalized };
+    return undefined;
+  };
+  const firstPersistedEntry = () => {
+    if (!persistedHub) return undefined;
+    for (const candidate of [
+      persistedHub.routerProvider,
+      persistedHub.workerProvider,
+      ...Object.keys(persistedHub.providers),
+    ]) {
+      const entry = enabledPersistedEntry(candidate);
+      if (entry) return entry;
+    }
+    return undefined;
+  };
+  const fallbackEntry = config.provider ? enabledPersistedEntry(config.provider) : firstPersistedEntry();
+  const effectiveConfigProvider = config.provider ?? fallbackEntry?.id;
+  const effectiveConfigApiKey = config.apiKey ?? fallbackEntry?.cfg.apiKey?.trim();
+  const effectiveConfigBaseUrl = config.baseUrl ?? fallbackEntry?.cfg.baseUrl?.trim();
+  const persistedFallbackModel = fallbackEntry?.cfg.selectedModels?.[0]?.id
+    ?? fallbackEntry?.cfg.customModels?.[0]
+    ?? fallbackEntry?.cfg.fetchedModels?.[0]?.id;
+  const effectiveConfigModel = config.model
+    ?? persistedHub?.routerModel
+    ?? persistedHub?.balancedModel
+    ?? persistedHub?.strongModel
+    ?? persistedHub?.fastModel
+    ?? persistedFallbackModel;
+  const hasDefaultModelProvider = effectiveConfigProvider === 'deepseek'
+    || effectiveConfigProvider === 'google'
+    || effectiveConfigProvider === 'google-vertex'
+    || effectiveConfigProvider === 'gemini';
+  if (
+    (!effectiveConfigProvider || (!effectiveConfigModel && !hasDefaultModelProvider) || !effectiveConfigApiKey)
+    && !suppliedRuntime
+    && !existsSync(authPath)
+  ) {
     throw new Error(REAL_CONFIG_ERROR);
   }
   await mkdir(sdkDir, { recursive: true, mode: 0o700 });
@@ -560,34 +659,13 @@ export async function realFactory(home: string, config: {
   });
   ensureRealProviderCatalog(runtime);
 
-  const oauthProviders = (await runtime.listCredentials()).filter(item => item.type === 'oauth').map(item => item.providerId);
-  const rawProvider = config.provider ?? (oauthProviders.includes('openai') ? 'openai' : oauthProviders.length === 1 ? oauthProviders[0] : undefined);
-  const provider = rawProvider === 'gemini' && !config.baseUrl && runtime.getModels('gemini').length === 0 ? 'google' : rawProvider;
-  const hasOAuth = Boolean(provider && oauthProviders.includes(provider));
-  const model = config.model
-    ?? ((provider === 'openai' || provider === 'openai-codex') && hasOAuth ? 'gpt-4.1'
-      : provider === 'deepseek' ? 'deepseek-chat'
-      : (provider === 'google' || provider === 'google-vertex' || provider === 'gemini') ? 'gemini-2.5-flash'
-      : undefined);
-  if (!provider || !model || (!config.apiKey && !hasOAuth)) {
-    throw new Error(REAL_CONFIG_ERROR);
-  }
-  const rawRouterModel = config.routerModel ?? model;
-  let routerProvider = provider;
-  let routerModelId = rawRouterModel;
-  if (rawRouterModel.includes('/')) {
-    const slash = rawRouterModel.indexOf('/');
-    routerProvider = rawRouterModel.slice(0, slash);
-    routerModelId = rawRouterModel.slice(slash + 1);
-  } else if (!config.baseUrl && !runtime.getModel(provider, rawRouterModel) && runtime.getModel('deepseek', rawRouterModel)) {
-    routerProvider = 'deepseek';
-  }
-  const workerModelId = config.workerModel ?? model;
-  const fastOverride = config.fastModel ?? resolveEnv('FRIDAY_FAST_MODEL', 'SUPER_AGENT_FAST_MODEL');
-  const balancedOverride = config.balancedModel ?? resolveEnv('FRIDAY_BALANCED_MODEL', 'SUPER_AGENT_BALANCED_MODEL');
-  const strongOverride = config.strongModel ?? resolveEnv('FRIDAY_STRONG_MODEL', 'SUPER_AGENT_STRONG_MODEL');
-  const inferModelInput = (id: string): Array<'text' | 'image'> => {
-    const catalogModel = runtime.getModel(provider, id) ?? runtime.getModel(routerProvider, id);
+  const disabledProviderSet = new Set<string>(
+    Object.entries(persistedHub?.providers ?? {})
+      .filter(([, cfg]) => cfg?.enabled === false)
+      .map(([id]) => id),
+  );
+  const inferModelInput = (id: string, provId = 'openai'): Array<'text' | 'image'> => {
+    const catalogModel = runtime.getModel(provId, id);
     if (catalogModel?.input.includes('image')) return ['text', 'image'];
     if (
       resolveEnv('FRIDAY_VISION', 'SUPER_AGENT_VISION') === '1'
@@ -597,61 +675,152 @@ export async function realFactory(home: string, config: {
     }
     return ['text'];
   };
-  if (config.baseUrl) {
+
+  // Pre-register persisted provider custom URLs / custom & fetched models so startup resolves
+  // multi-slash and UI-configured providers cleanly even before Coordinator calls modelHub.init().
+  for (const [provId, cfg] of Object.entries(persistedHub?.providers ?? {})) {
+    if (!cfg || cfg.enabled === false) continue;
+    const baseUrl = cfg.baseUrl?.trim();
+    if (baseUrl) {
+      let parsedUrl: URL | undefined;
+      try { parsedUrl = new URL(baseUrl); } catch { parsedUrl = undefined; }
+      if (parsedUrl && (parsedUrl.protocol === 'http:' || parsedUrl.protocol === 'https:')) {
+        const modelIds = [...new Set([
+          ...runtime.getModels(provId).map(m => m.id),
+          ...(cfg.customModels ?? []),
+          ...(cfg.fetchedModels ?? []).map(m => m.id),
+          ...(cfg.selectedModels ?? []).map(m => m.id),
+          ...(provId === persistedHub?.routerProvider && persistedHub?.routerModel ? [persistedHub.routerModel] : []),
+        ].filter(Boolean))];
+        if (modelIds.length > 0) {
+          runtime.registerProvider(provId, {
+            baseUrl,
+            api: 'openai-completions',
+            ...(cfg.apiKey?.trim() ? { apiKey: cfg.apiKey.trim() } : {}),
+            models: modelIds.map(id => {
+              const fetched = cfg.fetchedModels?.find(m => m.id === id);
+              return {
+                id,
+                name: fetched?.name ?? id,
+                reasoning: fetched?.reasoning ?? false,
+                input: fetched?.supportsImages ? ['text', 'image'] : inferModelInput(id, provId),
+                cost: { input: fetched?.costInput ?? 0, output: fetched?.costOutput ?? 0, cacheRead: 0, cacheWrite: 0 },
+                contextWindow: fetched?.contextWindow ?? 128_000,
+                maxTokens: fetched?.maxTokens ?? 8192,
+              };
+            }),
+          });
+        }
+      }
+    }
+    if (cfg.apiKey?.trim()) {
+      await runtime.setRuntimeApiKey(provId, cfg.apiKey.trim());
+    }
+  }
+
+  const oauthProviders = (await runtime.listCredentials()).filter(item => item.type === 'oauth').map(item => item.providerId);
+  const rawProvider = effectiveConfigProvider ?? (oauthProviders.includes('openai') ? 'openai' : oauthProviders.length === 1 ? oauthProviders[0] : undefined);
+  const provider = rawProvider === 'gemini' && !effectiveConfigBaseUrl && runtime.getModels('gemini').length === 0 ? 'google' : rawProvider;
+  const hasOAuth = Boolean(provider && oauthProviders.includes(provider));
+  const model = effectiveConfigModel
+    ?? ((provider === 'openai' || provider === 'openai-codex') && hasOAuth ? 'gpt-4.1'
+      : provider === 'deepseek' ? 'deepseek-chat'
+      : (provider === 'google' || provider === 'google-vertex' || provider === 'gemini') ? 'gemini-2.5-flash'
+      : undefined);
+  if (!provider || !model || (!effectiveConfigApiKey && !hasOAuth)) {
+    throw new Error(REAL_CONFIG_ERROR);
+  }
+  const rawRouterModel = config.routerModel ?? persistedHub?.routerModel ?? model;
+  const rawWorkerModel = config.workerModel ?? persistedHub?.balancedModel ?? persistedHub?.strongModel ?? persistedHub?.fastModel ?? model;
+  const fastOverride = config.fastModel ?? persistedHub?.fastModel ?? resolveEnv('FRIDAY_FAST_MODEL', 'SUPER_AGENT_FAST_MODEL');
+  const balancedOverride = config.balancedModel ?? persistedHub?.balancedModel ?? resolveEnv('FRIDAY_BALANCED_MODEL', 'SUPER_AGENT_BALANCED_MODEL');
+  const strongOverride = config.strongModel ?? persistedHub?.strongModel ?? resolveEnv('FRIDAY_STRONG_MODEL', 'SUPER_AGENT_STRONG_MODEL');
+
+  if (effectiveConfigBaseUrl) {
     let parsedUrl: URL;
-    try { parsedUrl = new URL(config.baseUrl); } catch { throw new Error(`Invalid SUPER_AGENT_BASE_URL: ${config.baseUrl}`); }
+    try { parsedUrl = new URL(effectiveConfigBaseUrl); } catch { throw new Error(`Invalid SUPER_AGENT_BASE_URL: ${effectiveConfigBaseUrl}`); }
     if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') throw new Error('SUPER_AGENT_BASE_URL must use http or https');
-    const ids = [...new Set([model, routerModelId, workerModelId, fastOverride, balancedOverride, strongOverride].filter((x): x is string => Boolean(x)))];
+    const preIds = [model, rawRouterModel, rawWorkerModel, fastOverride, balancedOverride, strongOverride]
+      .filter((x): x is string => Boolean(x))
+      .map(spec => {
+        const resolved = resolveProviderAndModelSpec(runtime, spec, provider, persistedHub?.providers, disabledProviderSet);
+        return resolved.provider === provider ? resolved.modelId : spec.includes('/') && !runtime.getModel(resolved.provider, resolved.modelId) ? spec : undefined;
+      })
+      .filter((x): x is string => Boolean(x));
+    const ids = [...new Set([...runtime.getModels(provider).map(m => m.id), ...preIds])];
     runtime.registerProvider(provider, {
-      baseUrl: config.baseUrl, api: 'openai-completions', ...(config.apiKey ? { apiKey: config.apiKey } : {}),
-      models: ids.map(id => ({ id, name: id, reasoning: false, input: inferModelInput(id), cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128_000, maxTokens: 8192 })),
+      baseUrl: effectiveConfigBaseUrl, api: 'openai-completions', ...(effectiveConfigApiKey ? { apiKey: effectiveConfigApiKey } : {}),
+      models: ids.map(id => ({ id, name: id, reasoning: false, input: inferModelInput(id, provider), cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128_000, maxTokens: 8192 })),
     });
   }
-  if (!config.apiKey) {
-    await runtime.refresh({ allowNetwork: false, providers: [...new Set([provider, routerProvider])] });
+
+  let routerSpec = resolveProviderAndModelSpec(runtime, rawRouterModel, provider, persistedHub?.providers, disabledProviderSet);
+  if (!routerSpec.explicitlyPrefixed && !effectiveConfigBaseUrl && !runtime.getModel(routerSpec.provider, routerSpec.modelId) && runtime.getModel('deepseek', rawRouterModel)) {
+    routerSpec = { provider: 'deepseek', modelId: rawRouterModel, explicitlyPrefixed: false };
+  }
+  let routerProvider = routerSpec.provider;
+  let routerModelId = routerSpec.modelId;
+  const workerSpec = resolveProviderAndModelSpec(runtime, rawWorkerModel, provider, persistedHub?.providers, disabledProviderSet);
+  const workerProvider = workerSpec.provider;
+  const workerModelId = workerSpec.modelId;
+
+  if (!effectiveConfigApiKey) {
+    await runtime.refresh({ allowNetwork: false, providers: [...new Set([provider, routerProvider, workerProvider])] });
   }
   const routerModel = runtime.getModel(routerProvider, routerModelId);
   if (!routerModel) throw new Error(modelLookupError(runtime, routerProvider, routerModelId));
-  const workerModel = runtime.getModel(provider, workerModelId);
-  if (!workerModel) throw new Error(modelLookupError(runtime, provider, workerModelId));
-  if (config.apiKey) {
-    await runtime.setRuntimeApiKey(provider, config.apiKey);
+  const workerModel = runtime.getModel(workerProvider, workerModelId);
+  if (!workerModel) throw new Error(modelLookupError(runtime, workerProvider, workerModelId));
+  if (effectiveConfigApiKey) {
+    await runtime.setRuntimeApiKey(provider, effectiveConfigApiKey);
   }
   if (routerProvider !== provider) {
     const routerKey = resolveEnv('FRIDAY_ROUTER_API_KEY', 'SUPER_AGENT_ROUTER_API_KEY')
+      ?? persistedHub?.providers[routerProvider]?.apiKey?.trim()
       ?? (routerProvider === 'deepseek' ? resolveEnv('DEEPSEEK_API_KEY') : undefined)
-      ?? config.apiKey;
+      ?? effectiveConfigApiKey;
     if (routerKey) await runtime.setRuntimeApiKey(routerProvider, routerKey);
   }
   let activeProvider = provider;
   let activeRouterModel = routerModel;
   let activeWorkerModel = workerModel;
-  let disabledProviderSet = new Set<string>();
+  let currentDisabledProviders = disabledProviderSet;
   let currentModelTiers = buildModelTiers(runtime, provider, routerModelId, workerModelId, {
     fastModel: fastOverride,
     balancedModel: balancedOverride,
     strongModel: strongOverride,
     explicitWorkerModel: Boolean(config.workerModel),
-    hasCustomBaseUrl: Boolean(config.baseUrl),
+    hasCustomBaseUrl: Boolean(effectiveConfigBaseUrl),
   });
   const factoryObj: AgentFactory = {
     mode: 'real', nativeTools: true,
     modelTiers: currentModelTiers,
     routerProvider,
-    initialApiKey: config.apiKey,
+    initialApiKey: effectiveConfigApiKey,
     runtime,
     resolveWorkerModel: input => resolveWorkerModelFromTiers(currentModelTiers, input),
     updateModelConfig(tiers, nextRouterProvider, nextRouterModelId, disabledProviders) {
-      if (disabledProviders) disabledProviderSet = new Set(disabledProviders);
+      const nextDisabled = disabledProviders ? new Set(disabledProviders) : currentDisabledProviders;
+      const switchingRouter = nextRouterProvider !== routerProvider || nextRouterModelId !== routerModelId;
+      if (switchingRouter && nextDisabled.has(nextRouterProvider)) {
+        throw new Error(`提供方 "${nextRouterProvider}" 已禁用，无法切换 Router 模型`);
+      }
+      const nextR = runtime.getModel(nextRouterProvider, nextRouterModelId);
+      if (!nextR) {
+        throw new Error(modelLookupError(runtime, nextRouterProvider, nextRouterModelId));
+      }
+      const balancedSpec = resolveProviderAndModelSpec(runtime, tiers.balanced, tiers.provider, persistedHub?.providers, nextDisabled);
+      const strongSpec = resolveProviderAndModelSpec(runtime, tiers.strong, tiers.provider, persistedHub?.providers, nextDisabled);
+      const nextW = runtime.getModel(balancedSpec.provider, balancedSpec.modelId)
+        ?? runtime.getModel(strongSpec.provider, strongSpec.modelId);
+      currentDisabledProviders = nextDisabled;
       currentModelTiers = tiers;
       factoryObj.modelTiers = tiers;
       factoryObj.routerProvider = nextRouterProvider;
       routerProvider = nextRouterProvider;
       routerModelId = nextRouterModelId;
       activeProvider = tiers.provider;
-      const nextR = runtime.getModel(nextRouterProvider, nextRouterModelId);
-      if (nextR) activeRouterModel = nextR;
-      const nextW = runtime.getModel(activeProvider, tiers.balanced) ?? runtime.getModel(activeProvider, tiers.strong);
+      activeRouterModel = nextR;
       if (nextW) activeWorkerModel = nextW;
     },
     async create(role, id, tools, options) {
@@ -664,20 +833,22 @@ export async function realFactory(home: string, config: {
         : undefined;
       if ((role === 'worker' || role === 'dreamer' || role === 'distiller') && requestedWorkerModel) {
         try {
-          let targetProvider = activeProvider;
-          let targetModelId = requestedWorkerModel;
-          if (requestedWorkerModel.includes('/')) {
-            const slash = requestedWorkerModel.indexOf('/');
-            targetProvider = requestedWorkerModel.slice(0, slash);
-            targetModelId = requestedWorkerModel.slice(slash + 1);
-            if (disabledProviderSet.has(targetProvider)) {
-              throw new Error(`提供方 "${targetProvider}" 已禁用，无法调用`);
-            }
+          const spec = resolveProviderAndModelSpec(
+            runtime,
+            requestedWorkerModel,
+            activeProvider,
+            persistedHub?.providers,
+            currentDisabledProviders,
+          );
+          let targetProvider = spec.provider;
+          const targetModelId = spec.modelId;
+          if (currentDisabledProviders.has(targetProvider)) {
+            throw new Error(`提供方 "${targetProvider}" 已禁用，无法调用`);
           }
-          let custom = !disabledProviderSet.has(targetProvider) ? runtime.getModel(targetProvider, targetModelId) : undefined;
-          if (!custom && !requestedWorkerModel.includes('/')) {
+          let custom = !currentDisabledProviders.has(targetProvider) ? runtime.getModel(targetProvider, targetModelId) : undefined;
+          if (!custom && !spec.explicitlyPrefixed) {
             for (const prov of runtime.getProviders()) {
-              if (disabledProviderSet.has(prov.id)) continue;
+              if (currentDisabledProviders.has(prov.id)) continue;
               const found = runtime.getModel(prov.id, targetModelId);
               if (found) {
                 custom = found;
@@ -687,35 +858,35 @@ export async function realFactory(home: string, config: {
             }
             if (!custom) {
               for (const prov of runtime.getProviders()) {
-                if (disabledProviderSet.has(prov.id) && runtime.getModel(prov.id, targetModelId)) {
+                if (currentDisabledProviders.has(prov.id) && runtime.getModel(prov.id, targetModelId)) {
                   throw new Error(`提供方 "${prov.id}" 已禁用，无法调用`);
                 }
               }
             }
           }
-          if (!custom && config.baseUrl && targetProvider === activeProvider && !disabledProviderSet.has(activeProvider)) {
+          if (!custom && effectiveConfigBaseUrl && targetProvider === activeProvider && !currentDisabledProviders.has(activeProvider)) {
             const existing = runtime.getModels(activeProvider).map(item => item.id);
             const ids = [...new Set([...existing, targetModelId])];
             runtime.registerProvider(activeProvider, {
-              baseUrl: config.baseUrl, api: 'openai-completions', ...(config.apiKey ? { apiKey: config.apiKey } : {}),
-              models: ids.map(item => ({ id: item, name: item, reasoning: false, input: inferModelInput(item), cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128_000, maxTokens: 8192 })),
+              baseUrl: effectiveConfigBaseUrl, api: 'openai-completions', ...(effectiveConfigApiKey ? { apiKey: effectiveConfigApiKey } : {}),
+              models: ids.map(item => ({ id: item, name: item, reasoning: false, input: inferModelInput(item, activeProvider), cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128_000, maxTokens: 8192 })),
             });
             custom = runtime.getModel(activeProvider, targetModelId);
           }
-          if (disabledProviderSet.has(targetProvider)) {
+          if (currentDisabledProviders.has(targetProvider)) {
             throw new Error(`提供方 "${targetProvider}" 已禁用，无法调用`);
           }
           if (!custom) throw new Error(modelLookupError(runtime, targetProvider, targetModelId));
           selectedModel = custom;
           effectiveProvider = targetProvider;
         } catch (err) {
-          if (role !== 'distiller' || disabledProviderSet.has(routerProvider)) throw err;
+          if (role !== 'distiller' || currentDisabledProviders.has(routerProvider)) throw err;
           selectedModel = activeRouterModel;
           effectiveProvider = routerProvider;
         }
       }
-      if (disabledProviderSet.has(effectiveProvider)) {
-        if (role === 'distiller' && !disabledProviderSet.has(routerProvider)) {
+      if (currentDisabledProviders.has(effectiveProvider)) {
+        if (role === 'distiller' && !currentDisabledProviders.has(routerProvider)) {
           selectedModel = activeRouterModel;
           effectiveProvider = routerProvider;
         } else {
@@ -763,7 +934,11 @@ export async function realFactory(home: string, config: {
         modelRuntime: runtime,
         model: sessionModel,
         thinkingLevel: effectiveThinkingLevel,
-        resourceLoader: resourceLoader(`${systemPrompt}${promptSuffix}`),
+        resourceLoader: resourceLoader(
+          role === 'router'
+            ? () => `${buildAgentSystemPrompts({ home, role, native, profile: options?.profile }).systemPrompt}${promptSuffix}`
+            : `${systemPrompt}${promptSuffix}`,
+        ),
         tools: customTools.map(tool => tool.name),
         customTools,
         sessionManager: manager,
@@ -786,9 +961,9 @@ export async function realFactory(home: string, config: {
       return new SdkAgent(
         session,
         options?.onEvent,
-        () => (disabledProviderSet.has(effectiveProvider) ? effectiveProvider : undefined),
+        () => (currentDisabledProviders.has(effectiveProvider) ? effectiveProvider : undefined),
         role === 'router'
-          ? () => (disabledProviderSet.has(activeWorkerModel.provider) ? undefined : prepareRouterSessionModel(activeWorkerModel))
+          ? () => (currentDisabledProviders.has(activeWorkerModel.provider) ? undefined : prepareRouterSessionModel(activeWorkerModel))
           : undefined,
         role,
         role === 'router' ? () => prepareRouterSessionModel(activeRouterModel) : undefined,

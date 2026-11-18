@@ -155,7 +155,15 @@ function compactToolCallArguments(
         if (compacted.length <= maxChars) return { changed: true, value: compacted };
       }
     } catch { /* treat as raw string */ }
-    return { changed: true, value: truncateWithSuffix(args, maxChars, '…') };
+    let fallbackLen = Math.max(4, maxChars - 20);
+    while (fallbackLen >= 0) {
+      const candidate = JSON.stringify({ _compacted: truncateWithSuffix(args, fallbackLen, '…') });
+      if (candidate.length <= maxChars || fallbackLen === 0) {
+        return { changed: true, value: candidate };
+      }
+      fallbackLen = Math.floor(fallbackLen * 0.6);
+    }
+    return { changed: true, value: JSON.stringify({ _compacted: '…' }) };
   }
   if (!isPlainRecord(args)) return { changed: false, value: args };
   const serialized = JSON.stringify(args);

@@ -217,11 +217,11 @@ test('ModelHub.saveState serializes concurrent writes and probe does not mutate 
 
 test('normalizeCustomToolInput and Router tools accept direct fields, stringified arrays, and run_plugin action collisions', async () => {
   const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-tool-norm-'));
-  const pluginDir = join(home, 'plugins', 'tv-agent');
+  const pluginDir = join(home, 'plugins', 'test-tv-probe');
   await mkdir(pluginDir, { recursive: true });
   await writeFile(join(pluginDir, 'plugin.json'), JSON.stringify({
-    name: 'tv-agent',
-    title: 'TV Agent',
+    name: 'test-tv-probe',
+    title: 'TV Agent Probe',
     entry: 'index.mjs',
     actions: ['act'],
   }));
@@ -319,7 +319,7 @@ test('normalizeCustomToolInput and Router tools accept direct fields, stringifie
 
     // Verify run_plugin recovers when duplicate top-level action ("click") overwrites action ("run")
     const runPluginTool = routerTools.find(t => t.name === 'run_plugin')!;
-    const rawCollision = '{"action": "run", "args": {"id": "n44"}, "plugin": "tv-agent", "pluginAction": "act", "action": "click"}';
+    const rawCollision = '{"action": "run", "args": {"id": "n44"}, "plugin": "test-tv-probe", "pluginAction": "act", "action": "click"}';
     const pluginOut = JSON.parse(await runPluginTool.execute(rawCollision)) as { ok: boolean; action: string; data: { action: string; args: Record<string, unknown> } };
     assert.equal(pluginOut.ok, true);
     assert.equal(pluginOut.action, 'act');

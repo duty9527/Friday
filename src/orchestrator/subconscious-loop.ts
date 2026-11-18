@@ -68,23 +68,57 @@ export function isRunningUnderNodeTest(): boolean {
     || process.execArgv.some(arg => arg === '--test' || arg.startsWith('--test-'));
 }
 
+const HOMEOSTASIS_LAST_AT_META_KEY = 'subconscious_homeostasis_at';
+const HOMEOSTASIS_MIN_INTERVAL_MS = 12 * 3600_000;
+
+function extractBalancedJsonObjects(raw: string): string[] {
+  const out: string[] = [];
+  let inString = false;
+  let escape = false;
+  let depth = 0;
+  let start = -1;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]!;
+    if (inString) {
+      if (escape) { escape = false; continue; }
+      if (ch === '\\') { escape = true; continue; }
+      if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === '{') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === '}' && depth > 0) {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        out.push(raw.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+  return out;
+}
+
 export function parseDreamResidue(raw: string): { impression: string; insight?: string; salience: 'faint' | 'vivid' } | undefined {
   const trimmed = raw.trim();
   if (!trimmed) return undefined;
-  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(trimmed)?.[1]?.trim();
-  const candidate = fenced ?? (() => {
-    const start = trimmed.indexOf('{');
-    const end = trimmed.lastIndexOf('}');
-    return start >= 0 && end > start ? trimmed.slice(start, end + 1) : undefined;
-  })();
-  if (candidate) {
+  let unwrapped = trimmed;
+  const openFence = /^```(?:json)?[ \t]*\r?\n/.exec(unwrapped);
+  const closeFence = /\r?\n```[ \t]*$/.exec(unwrapped);
+  if (openFence && closeFence && closeFence.index >= openFence[0].length) {
+    unwrapped = unwrapped.slice(openFence[0].length, closeFence.index).trim();
+  }
+  const candidates = [unwrapped, ...extractBalancedJsonObjects(unwrapped), ...(unwrapped !== trimmed ? extractBalancedJsonObjects(trimmed) : [])];
+  for (const candidate of candidates) {
+    if (!candidate.startsWith('{')) continue;
     try {
       const parsed = JSON.parse(candidate) as Record<string, unknown>;
       const impression = typeof parsed.impression === 'string' ? parsed.impression.trim() : '';
       const insight = typeof parsed.insight === 'string' && parsed.insight.trim() ? parsed.insight.trim() : undefined;
       const salience = parsed.salience === 'vivid' && insight ? 'vivid' : 'faint';
       if (impression) return { impression, ...(insight ? { insight } : {}), salience };
-    } catch { /* fallback to plain text impression */ }
+    } catch { /* try next balanced object */ }
   }
   return { impression: trimmed.replace(/\s+/g, ' ').slice(0, 280), salience: 'faint' };
 }
@@ -105,6 +139,9 @@ export class SubconsciousController {
   private lastSubconsciousCheckAt = 0;
   private lastDistillCheckAt = 0;
   private distillFailureStreak = 0;
+  private dreamFailureStreak = 0;
+  private dreamRetryAfter = 0;
+  private lastHomeostasisAt = 0;
   private nextLatencyMs?: number;
   private dreamRun?: { controller: AbortController; promise: Promise<void>; startedAt: number };
   private readonly pendingDistillTaskIds: string[] = [];
@@ -184,7 +221,7 @@ export class SubconsciousController {
       this.queuedDistillTaskSet.delete(candidateId);
       try {
         const candidate = this.host.store.get(candidateId);
-        if (candidate.status === 'completed') {
+        if (candidate.status === 'completed' && candidate.origin?.speakerRole !== 'member') {
           task = candidate;
           taskId = candidateId;
           break;
@@ -324,7 +361,13 @@ export class SubconsciousController {
 
     const state = this.host.store.distillerState();
     const pendingMsgs = this.host.store.conversation.allMessages(60)
-      .filter(m => m.seq > state.lastMessageSeq && m.status === 'completed' && m.source !== 'system' && m.text.trim().length > 0)
+      .filter(m =>
+        m.seq > state.lastMessageSeq
+        && m.status === 'completed'
+        && m.source !== 'system'
+        && m.origin?.speakerRole !== 'member'
+        && m.text.trim().length > 0,
+      )
       .sort((a, b) => a.seq - b.seq);
     if (!pendingMsgs.length) return;
     this.startIdleChatDistillRun(pendingMsgs);
@@ -337,6 +380,7 @@ export class SubconsciousController {
       this.lastActivityAt = now;
       return;
     }
+    if (now < this.dreamRetryAfter) return;
     const checkIntervalMs = this.host.runtime?.checkIntervalMs ?? 60_000;
     if (now - this.lastSubconsciousCheckAt < checkIntervalMs) return;
     this.lastSubconsciousCheckAt = now;
@@ -379,11 +423,19 @@ export class SubconsciousController {
   ): Promise<void> {
     const startWall = this.now();
     try {
-      // Phase 1 (NREM Light / Deep Homeostasis): 0-token synaptic scaling & stale stub pruning
-      this.host.store.homeostaticSleepPass(startWall);
+      // Phase 1 (NREM Light / Deep Homeostasis): 0-token synaptic scaling & stale stub pruning (at most once per 12h)
+      const persistedHomeostasis = this.host.store.conversation.meta<{ at?: number }>(HOMEOSTASIS_LAST_AT_META_KEY)?.at ?? 0;
+      const lastHomeostasis = Math.max(this.lastHomeostasisAt, persistedHomeostasis);
+      if (startWall - lastHomeostasis >= HOMEOSTASIS_MIN_INTERVAL_MS) {
+        this.host.store.homeostaticSleepPass(startWall);
+        this.lastHomeostasisAt = startWall;
+        this.host.store.conversation.setMeta(HOMEOSTASIS_LAST_AT_META_KEY, { at: startWall });
+      }
       if (controller.signal.aborted || this.host.isClosing()) return;
 
       if (!enterRem) {
+        this.dreamFailureStreak = 0;
+        this.dreamRetryAfter = 0;
         const nextLatencyMs = this.sampleLatencyMs();
         this.nextLatencyMs = nextLatencyMs;
         this.host.store.recordDreamOutcome({
@@ -498,6 +550,8 @@ export class SubconsciousController {
         }), combinedSignal);
         if (controller.signal.aborted || this.host.isClosing()) throw controller.signal.reason ?? new Error('Aroused');
         const residue = parseDreamResidue(rawOutput);
+        this.dreamFailureStreak = 0;
+        this.dreamRetryAfter = 0;
         const nextLatencyMs = this.sampleLatencyMs();
         this.nextLatencyMs = nextLatencyMs;
         this.host.store.recordDreamOutcome({
@@ -512,7 +566,7 @@ export class SubconsciousController {
       } finally {
         dreamer.close();
       }
-    } catch {
+    } catch (error) {
       if (controller.signal.aborted && !this.host.isClosing()) {
         const anchor = material.rawStubs[0]?.topic
           ?? material.distantMemories[0]?.topic
@@ -531,6 +585,11 @@ export class SubconsciousController {
             },
           });
         }
+      } else if (!this.host.isClosing()) {
+        this.dreamFailureStreak = Math.min(this.dreamFailureStreak + 1, 6);
+        const backoffMs = Math.min(4 * 3600_000, 5 * 60_000 * (2 ** (this.dreamFailureStreak - 1)));
+        this.dreamRetryAfter = this.now() + backoffMs;
+        console.warn(`[friday] Subconscious sleep cycle failed (streak=${this.dreamFailureStreak}, retryInMs=${backoffMs}):`, error instanceof Error ? error.message : String(error));
       }
     }
   }

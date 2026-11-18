@@ -160,6 +160,8 @@ test('a follow-up taken before a worker failure stays visible as undelivered, an
   await writeFile(input, 'authorized input');
   let failNextWorkerPrompt = false;
   let readOnce = false;
+  let markFollowupArmed!: () => void;
+  const followupArmed = new Promise<void>(resolve => { markFollowupArmed = resolve; });
   const factory: AgentFactory = {
     mode: 'offline',
     async create(role, _id, tools) {
@@ -167,6 +169,7 @@ test('a follow-up taken before a worker failure stays visible as undelivered, an
         async prompt(text, signal) {
           const event = JSON.parse(text) as { kind: string; followups?: Array<{ id: string }> };
           if (role === 'worker') {
+            if (readOnce) await followupArmed;
             if (failNextWorkerPrompt) throw new Error('fixture worker prompt failed after accepting the follow-up');
             if (!readOnce) { readOnce = true; await tools.find(tool => tool.name === 'start_read')!.execute('f0'); return 'read requested'; }
             await abortableDelay(30_000, signal);
@@ -189,6 +192,7 @@ test('a follow-up taken before a worker failure stays visible as undelivered, an
     coordinator.followup(task.id, 'fu-1', 'IMPORTANT USER FOLLOWUP TEXT');
     assert.ok(coordinator.store.notices(0).some(notice => notice.kind === 'followup'), 'fixture: the follow-up was accepted');
     failNextWorkerPrompt = true;
+    markFollowupArmed();
     // The worker is prompted again with the follow-up; that prompt fails.
     await until(() => coordinator.store.get(task.id).status !== 'running');
     assert.deepEqual(coordinator.store.events(task.id).map(event => event.state), ['failed'],

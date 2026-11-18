@@ -10,6 +10,7 @@ export const HEARTBEAT_STALL_MAX_MS = 15_000;
 
 export interface ChatRun {
   message: ChatMessage;
+  deliveryOrigin?: MessageOrigin;
   controller: AbortController;
   revisions: Map<string, number>;
   replyId?: string;
