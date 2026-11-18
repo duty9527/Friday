@@ -624,10 +624,8 @@ export function initUsageHub(): UsageHubController {
     }
 
     if (usageHubBackdrop.hidden && !force) {
-      appState.dirtyModals.add('usage');
       return;
     }
-    appState.dirtyModals.delete('usage');
 
     updateToolbarControls();
     if (report) {

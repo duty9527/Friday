@@ -558,6 +558,8 @@ export class GoldenBrainStage {
   private sceneLayer?: HTMLCanvasElement;
   private backBlurLayer?: HTMLCanvasElement;
   private bloomLayer?: HTMLCanvasElement;
+  private wideBloomLayer?: HTMLCanvasElement;
+  private onVisibilityChange?: () => void;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -569,6 +571,7 @@ export class GoldenBrainStage {
       this.sceneLayer = document.createElement('canvas');
       this.backBlurLayer = document.createElement('canvas');
       this.bloomLayer = document.createElement('canvas');
+      this.wideBloomLayer = document.createElement('canvas');
     }
     this.bindEvents();
     if (typeof ResizeObserver !== 'undefined') {
@@ -591,6 +594,7 @@ export class GoldenBrainStage {
     }
     this.notifySelection();
     this.renderFrame(0);
+    this.wakeAnimation();
   }
 
   getSelectedId(): string | undefined {
@@ -603,6 +607,12 @@ export class GoldenBrainStage {
 
   setAutoRotate(next: boolean): boolean {
     this.autoRotate = next;
+    if (next) {
+      this.wakeAnimation();
+    } else if (!this.needsAnimation()) {
+      this.pauseRaf();
+      this.renderFrame(0);
+    }
     return this.autoRotate;
   }
 
@@ -610,6 +620,7 @@ export class GoldenBrainStage {
     this.immersive = next;
     this.syncCanvasSize();
     this.renderFrame(0);
+    this.wakeAnimation();
   }
 
   isImmersive(): boolean {
@@ -625,6 +636,7 @@ export class GoldenBrainStage {
     this.velX = 0;
     this.velY = 0;
     this.autoRotate = true;
+    this.wakeAnimation();
   }
 
   focusMemory(id: string | undefined, animate = true) {
@@ -641,32 +653,69 @@ export class GoldenBrainStage {
       this.velY = 0;
     }
     this.notifySelection();
-    if (!this.running) this.renderFrame(0);
+    if (!this.running || !animate) this.renderFrame(0);
+    this.wakeAnimation();
+  }
+
+  private needsAnimation(): boolean {
+    if (typeof document !== 'undefined' && document.hidden) return false;
+    if (!this.running) return false;
+    if (this.autoRotate || this.dragging) return true;
+    if (this.targetRotY !== undefined && this.targetRotX !== undefined) return true;
+    return Math.abs(this.velY) > 0.0002 || Math.abs(this.velX) > 0.0002;
+  }
+
+  private pauseRaf() {
+    if (this.rafId) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = 0;
+    }
+  }
+
+  private readonly rafTick = (now: number) => {
+    this.rafId = 0;
+    if (!this.needsAnimation()) {
+      if (this.running && !(typeof document !== 'undefined' && document.hidden)) {
+        this.renderFrame(0);
+      }
+      return;
+    }
+    const dt = clamp((now - this.lastTs) / 1000, 0.001, 0.05);
+    this.lastTs = now;
+    this.renderFrame(dt);
+    if (this.needsAnimation()) {
+      this.rafId = requestAnimationFrame(this.rafTick);
+    }
+  };
+
+  private wakeAnimation() {
+    if (!this.needsAnimation() || this.rafId) return;
+    this.lastTs = performance.now();
+    this.rafId = requestAnimationFrame(this.rafTick);
   }
 
   start() {
-    if (this.running) return;
+    if (this.running) {
+      this.wakeAnimation();
+      return;
+    }
     this.running = true;
     this.syncCanvasSize();
-    this.lastTs = performance.now();
-    const tick = (now: number) => {
-      if (!this.running) return;
-      const dt = clamp((now - this.lastTs) / 1000, 0.001, 0.05);
-      this.lastTs = now;
-      this.renderFrame(dt);
-      this.rafId = requestAnimationFrame(tick);
-    };
-    this.rafId = requestAnimationFrame(tick);
+    this.renderFrame(0);
+    this.wakeAnimation();
   }
 
   stop() {
     this.running = false;
-    if (this.rafId) cancelAnimationFrame(this.rafId);
-    this.rafId = 0;
+    this.pauseRaf();
   }
 
   dispose() {
     this.stop();
+    if (this.onVisibilityChange && typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.onVisibilityChange);
+      this.onVisibilityChange = undefined;
+    }
     this.resizeObserver?.disconnect();
     this.resizeObserver = undefined;
   }
@@ -685,23 +734,36 @@ export class GoldenBrainStage {
     const dpr = Math.min(2, window.devicePixelRatio || 1);
     const targetW = Math.round(w * dpr);
     const targetH = Math.round(h * dpr);
+    let resized = false;
     if (this.canvas.width !== targetW || this.canvas.height !== targetH) {
       this.canvas.width = targetW;
       this.canvas.height = targetH;
+      resized = true;
     }
     if (this.sceneLayer && (this.sceneLayer.width !== targetW || this.sceneLayer.height !== targetH)) {
       this.sceneLayer.width = targetW;
       this.sceneLayer.height = targetH;
     }
-    const halfW = Math.max(130, Math.round(w * 0.5));
-    const halfH = Math.max(120, Math.round(h * 0.5));
-    if (this.backBlurLayer && (this.backBlurLayer.width !== halfW || this.backBlurLayer.height !== halfH)) {
-      this.backBlurLayer.width = halfW;
-      this.backBlurLayer.height = halfH;
+    const backW = Math.max(96, Math.round(w * 0.35));
+    const backH = Math.max(84, Math.round(h * 0.35));
+    if (this.backBlurLayer && (this.backBlurLayer.width !== backW || this.backBlurLayer.height !== backH)) {
+      this.backBlurLayer.width = backW;
+      this.backBlurLayer.height = backH;
     }
-    if (this.bloomLayer && (this.bloomLayer.width !== halfW || this.bloomLayer.height !== halfH)) {
-      this.bloomLayer.width = halfW;
-      this.bloomLayer.height = halfH;
+    const bloomW = Math.max(64, Math.round(w * 0.25));
+    const bloomH = Math.max(56, Math.round(h * 0.25));
+    if (this.bloomLayer && (this.bloomLayer.width !== bloomW || this.bloomLayer.height !== bloomH)) {
+      this.bloomLayer.width = bloomW;
+      this.bloomLayer.height = bloomH;
+    }
+    const wideW = Math.max(28, Math.round(w * 0.10));
+    const wideH = Math.max(24, Math.round(h * 0.10));
+    if (this.wideBloomLayer && (this.wideBloomLayer.width !== wideW || this.wideBloomLayer.height !== wideH)) {
+      this.wideBloomLayer.width = wideW;
+      this.wideBloomLayer.height = wideH;
+    }
+    if (resized && !this.rafId) {
+      this.renderFrame(0);
     }
   }
 
@@ -828,13 +890,14 @@ export class GoldenBrainStage {
     const sCtx = this.sceneLayer?.getContext('2d');
     const bCtx = this.backBlurLayer?.getContext('2d');
     const bloomCtx = this.bloomLayer?.getContext('2d');
+    const wideBloomCtx = this.wideBloomLayer?.getContext('2d');
 
-    if (sCtx && bCtx && bloomCtx && this.sceneLayer && this.backBlurLayer && this.bloomLayer) {
-      // === PASS A: Soft out-of-focus background amber weave & far-hemisphere neurons ("虚") ===
+    if (sCtx && bCtx && bloomCtx && wideBloomCtx && this.sceneLayer && this.backBlurLayer && this.bloomLayer && this.wideBloomLayer) {
+      // === PASS A: Soft out-of-focus background amber weave & far-hemisphere neurons (mip-downscaled hardware defocus) ===
       bCtx.save();
       bCtx.setTransform(1, 0, 0, 1, 0, 0);
       bCtx.clearRect(0, 0, this.backBlurLayer.width, this.backBlurLayer.height);
-      bCtx.scale(0.5, 0.5);
+      bCtx.scale(this.backBlurLayer.width / Math.max(1, w), this.backBlurLayer.height / Math.max(1, h));
       bCtx.globalCompositeOperation = 'lighter';
 
       this.drawInteriorWeave(bCtx, cx, cy, sphereR, 'back');
@@ -846,11 +909,11 @@ export class GoldenBrainStage {
       bCtx.restore();
 
       mainCtx.save();
+      mainCtx.imageSmoothingEnabled = true;
+      mainCtx.imageSmoothingQuality = 'high';
       mainCtx.globalCompositeOperation = 'lighter';
-      mainCtx.filter = 'blur(3.6px)';
-      mainCtx.globalAlpha = 0.92;
+      mainCtx.globalAlpha = 0.88;
       mainCtx.drawImage(this.backBlurLayer, 0, 0, this.canvas.width, this.canvas.height);
-      mainCtx.filter = 'none';
       mainCtx.restore();
 
       // === PASS B: Continuous Fenestrated Holographic Rune Rings, Core Vortex & Front Neurons ("实") ===
@@ -869,29 +932,36 @@ export class GoldenBrainStage {
       }
       sCtx.restore();
 
-      // === PASS C: Lush Cinema-Grade Multi-Radius Golden Optical Bloom ===
+      // === PASS C: Multi-Mip Bilinear Golden Optical Bloom (avoids 4x per-frame CPU ctx.filter blur) ===
       bloomCtx.save();
       bloomCtx.setTransform(1, 0, 0, 1, 0, 0);
+      bloomCtx.imageSmoothingEnabled = true;
+      bloomCtx.imageSmoothingQuality = 'high';
       bloomCtx.clearRect(0, 0, this.bloomLayer.width, this.bloomLayer.height);
-      bloomCtx.filter = 'blur(5.8px)';
       bloomCtx.drawImage(this.sceneLayer, 0, 0, this.bloomLayer.width, this.bloomLayer.height);
       bloomCtx.restore();
 
+      wideBloomCtx.save();
+      wideBloomCtx.setTransform(1, 0, 0, 1, 0, 0);
+      wideBloomCtx.imageSmoothingEnabled = true;
+      wideBloomCtx.imageSmoothingQuality = 'high';
+      wideBloomCtx.clearRect(0, 0, this.wideBloomLayer.width, this.wideBloomLayer.height);
+      wideBloomCtx.drawImage(this.bloomLayer, 0, 0, this.wideBloomLayer.width, this.wideBloomLayer.height);
+      wideBloomCtx.restore();
+
       mainCtx.save();
+      mainCtx.imageSmoothingEnabled = true;
+      mainCtx.imageSmoothingQuality = 'high';
       mainCtx.globalCompositeOperation = 'lighter';
-      // 1. Wide warm golden-amber atmospheric halation
-      mainCtx.filter = 'blur(15px)';
+      // 1. Wide warm golden-amber atmospheric halation from 0.10x mip layer
       mainCtx.globalAlpha = 0.56;
-      mainCtx.drawImage(this.bloomLayer, 0, 0, this.canvas.width, this.canvas.height);
+      mainCtx.drawImage(this.wideBloomLayer, 0, 0, this.canvas.width, this.canvas.height);
       // 2. Tight luminous gold plasma aura hugging every carved rune arc
-      mainCtx.filter = 'none';
-      mainCtx.globalAlpha = 0.70;
+      mainCtx.globalAlpha = 0.68;
       mainCtx.drawImage(this.bloomLayer, 0, 0, this.canvas.width, this.canvas.height);
-      // 3. Sculpted holographic filigree with subtle optical softening
-      mainCtx.filter = 'blur(0.4px)';
-      mainCtx.globalAlpha = 0.90;
+      // 3. Sculpted holographic filigree
+      mainCtx.globalAlpha = 0.92;
       mainCtx.drawImage(this.sceneLayer, 0, 0);
-      mainCtx.filter = 'none';
       mainCtx.restore();
     }
 
@@ -1745,6 +1815,18 @@ export class GoldenBrainStage {
   }
 
   private bindEvents() {
+    if (typeof document !== 'undefined') {
+      this.onVisibilityChange = () => {
+        if (document.hidden) {
+          this.pauseRaf();
+        } else {
+          if (!this.rafId && this.running) this.renderFrame(0);
+          this.wakeAnimation();
+        }
+      };
+      document.addEventListener('visibilitychange', this.onVisibilityChange);
+    }
+
     this.canvas.addEventListener('pointerdown', e => {
       this.dragging = true;
       this.dragMoved = false;
@@ -1755,6 +1837,7 @@ export class GoldenBrainStage {
       this.targetRotX = undefined;
       this.targetRotY = undefined;
       this.canvas.setPointerCapture(e.pointerId);
+      this.wakeAnimation();
     });
 
     this.canvas.addEventListener('pointermove', e => {
@@ -1774,6 +1857,8 @@ export class GoldenBrainStage {
         this.userOrbX = clamp(this.userOrbX + dRx, -0.95, 0.95);
         this.velY = dx * 0.0024;
         this.velX = dy * 0.0024;
+        if (!this.rafId) this.renderFrame(0);
+        this.wakeAnimation();
         return;
       }
       const hit = this.hitTest(e.clientX, e.clientY);
@@ -1781,6 +1866,7 @@ export class GoldenBrainStage {
       if (nextHover !== this.hoveredId) {
         this.hoveredId = nextHover;
         this.canvas.classList.toggle('is-hovering-node', Boolean(nextHover));
+        if (!this.rafId) this.renderFrame(0);
       }
     });
 
@@ -1796,6 +1882,7 @@ export class GoldenBrainStage {
           this.focusMemory(hit.id, true);
         }
       }
+      this.wakeAnimation();
     };
 
     this.canvas.addEventListener('pointerup', releasePointer);
@@ -1804,6 +1891,7 @@ export class GoldenBrainStage {
       if (!this.dragging && this.hoveredId) {
         this.hoveredId = undefined;
         this.canvas.classList.remove('is-hovering-node');
+        if (!this.rafId) this.renderFrame(0);
       }
     });
 
@@ -1811,6 +1899,7 @@ export class GoldenBrainStage {
       e.preventDefault();
       const factor = e.deltaY > 0 ? 0.92 : 1.08;
       this.zoom = clamp(this.zoom * factor, 0.72, 1.68);
+      if (!this.rafId) this.renderFrame(0);
     }, { passive: false });
   }
 }

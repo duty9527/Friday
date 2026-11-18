@@ -1,17 +1,43 @@
 #!/usr/bin/env node
 import { execFileSync } from 'node:child_process';
-import { copyFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { copyFile, mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { renderBotStaticSvgString } from '../dist/web/shared/bot-avatar.js';
-import { BOT_EXPRESSIONS } from '../dist/web/shared/bot-expressions.js';
+import { basename, dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const DIST_AVATAR_MODULE = join(REPO_ROOT, 'dist', 'web', 'shared', 'bot-avatar.js');
+const DIST_EXPR_MODULE = join(REPO_ROOT, 'dist', 'web', 'shared', 'bot-expressions.js');
 const ASSETS_DIR = join(REPO_ROOT, 'assets');
 const STICKERS_DIR = join(ASSETS_DIR, 'stickers');
 const WEB_AVATAR_PATH = join(REPO_ROOT, 'src', 'web', 'avatar.png');
 const DIST_WEB_AVATAR_PATH = join(REPO_ROOT, 'dist', 'web', 'avatar.png');
+
+function assertPreflightDependencies() {
+  if (!existsSync(DIST_AVATAR_MODULE) || !existsSync(DIST_EXPR_MODULE)) {
+    throw new Error('Compiled web shared modules are missing in dist/web/shared/. Run `npm run build` before generating bot assets.');
+  }
+  for (const tool of ['rsvg-convert', 'magick']) {
+    try {
+      execFileSync(tool, ['--version'], { stdio: 'ignore' });
+    } catch {
+      throw new Error(`Required external binary "${tool}" is not available on PATH.`);
+    }
+  }
+}
+
+async function atomicInstallFile(stagedPath, targetPath) {
+  await mkdir(dirname(targetPath), { recursive: true });
+  const tempTarget = join(dirname(targetPath), `.tmp-${process.pid}-${basename(targetPath)}`);
+  try {
+    await copyFile(stagedPath, tempTarget);
+    await rename(tempTarget, targetPath);
+  } catch (err) {
+    await rm(tempTarget, { force: true }).catch(() => {});
+    throw err;
+  }
+}
 
 function renderSvgToPng(svgMarkup, outPath, sizePx) {
   execFileSync('rsvg-convert', ['-w', String(sizePx), '-h', String(sizePx), '-o', outPath], {
@@ -141,12 +167,17 @@ function stickerPose(expr, frameIdx, totalFrames) {
 }
 
 async function main() {
-  await mkdir(ASSETS_DIR, { recursive: true });
-  await mkdir(STICKERS_DIR, { recursive: true });
+  assertPreflightDependencies();
+  const [{ renderBotStaticSvgString }, { BOT_EXPRESSIONS }] = await Promise.all([
+    import(pathToFileURL(DIST_AVATAR_MODULE).href),
+    import(pathToFileURL(DIST_EXPR_MODULE).href),
+  ]);
 
   const workDir = await mkdtemp(join(tmpdir(), 'friday-bot-assets-'));
+  const stagedFiles = [];
   try {
-    // 1. Static PNGs (1024x1024 assets + 128x128 web icon)
+    // 1. Stage static PNGs (1024x1024 assets + 128x128 web icon) in workDir first
+    const stagedTransparent = join(workDir, 'avatar-transparent.png');
     const transparentSvg = renderBotStaticSvgString({
       size: 1024,
       expr: 'neutral',
@@ -157,8 +188,10 @@ async function main() {
       baseRadius: 54,
       background: 'transparent',
     });
-    renderSvgToPng(transparentSvg, join(ASSETS_DIR, 'avatar-transparent.png'), 1024);
+    renderSvgToPng(transparentSvg, stagedTransparent, 1024);
+    stagedFiles.push({ src: stagedTransparent, dst: join(ASSETS_DIR, 'avatar-transparent.png') });
 
+    const stagedWebAvatar = join(workDir, 'web-avatar.png');
     const webAvatarSvg = renderBotStaticSvgString({
       size: 128,
       expr: 'neutral',
@@ -169,8 +202,11 @@ async function main() {
       baseRadius: 54,
       background: 'transparent',
     });
-    renderSvgToPng(webAvatarSvg, WEB_AVATAR_PATH, 128);
-    await copyFile(WEB_AVATAR_PATH, DIST_WEB_AVATAR_PATH).catch(() => {});
+    renderSvgToPng(webAvatarSvg, stagedWebAvatar, 128);
+    stagedFiles.push({ src: stagedWebAvatar, dst: WEB_AVATAR_PATH });
+    if (existsSync(dirname(DIST_WEB_AVATAR_PATH))) {
+      stagedFiles.push({ src: stagedWebAvatar, dst: DIST_WEB_AVATAR_PATH });
+    }
 
     const bgSpecs = [
       { name: 'avatar.png', background: 'dark-glow' },
@@ -179,6 +215,7 @@ async function main() {
     ];
     for (const spec of bgSpecs) {
       const tmpPng = join(workDir, `raw-${spec.name}`);
+      const stagedOut = join(workDir, spec.name);
       const svg = renderBotStaticSvgString({
         size: 1024,
         expr: 'neutral',
@@ -190,10 +227,11 @@ async function main() {
         background: spec.background,
       });
       renderSvgToPng(svg, tmpPng, 1024);
-      flattenPng24(tmpPng, join(ASSETS_DIR, spec.name));
+      flattenPng24(tmpPng, stagedOut);
+      stagedFiles.push({ src: stagedOut, dst: join(ASSETS_DIR, spec.name) });
     }
 
-    // 2. 9 Transparent Animated GIF Stickers (200x200) for WeChat iLink image_item
+    // 2. Stage 9 Transparent Animated GIF Stickers (200x200) for WeChat iLink image_item
     const totalFrames = 20;
     for (const expr of BOT_EXPRESSIONS) {
       const exprDir = join(workDir, `sticker-${expr}`);
@@ -215,7 +253,7 @@ async function main() {
         renderSvgToPng(svg, framePng, 200);
         framePaths.push(framePng);
       }
-      const gifPath = join(STICKERS_DIR, `bot-${expr}.gif`);
+      const stagedGif = join(workDir, `bot-${expr}.gif`);
       execFileSync(
         'magick',
         [
@@ -228,10 +266,16 @@ async function main() {
           ...framePaths,
           '-layers',
           'OptimizeTransparency',
-          gifPath,
+          stagedGif,
         ],
         { stdio: 'inherit' },
       );
+      stagedFiles.push({ src: stagedGif, dst: join(STICKERS_DIR, `bot-${expr}.gif`) });
+    }
+
+    // 3. All assets generated cleanly; atomically swap them into final destinations
+    for (const item of stagedFiles) {
+      await atomicInstallFile(item.src, item.dst);
     }
 
     console.log('Generated F.R.I.D.A.Y. bot PNG avatars and 9 animated GIF stickers.');

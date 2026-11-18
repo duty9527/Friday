@@ -17,15 +17,62 @@ export function orderConversation<T extends Pick<ChatMessage, 'seq'>>(items: Ite
   return [...items].sort((a, b) => a.seq - b.seq);
 }
 
-export function routeLabel(action: Pick<RouteAction, 'kind'>): string {
-  return { new_work: '新建工作', followup: '补充已有工作（未新建）', related_work: '关联新执行（新建工作）',
-    inspect: '查询工作', stop: '请求停止工作', resume: '恢复暂停工作', recall: '回看历史',
-    search_memory: '检索全局记忆', save_memory: '沉淀长期记忆', timer: '管理定时任务', plugin: '执行功能插件', send_file: '发送微信附件', switch_channel: '切换回复通道', reply: '仅回复（未派发后台工作）' }[action.kind];
+export const MAX_TRACE_EVENTS = 1500;
+
+export function mergeTraceWindow(
+  existing: readonly TraceEvent[],
+  incoming: readonly TraceEvent[],
+  direction: 'live' | 'earlier' | 'recent',
+  limit = MAX_TRACE_EVENTS,
+): { events: TraceEvent[]; trimmedEarlier: boolean } {
+  const merged = new Map<number, TraceEvent>();
+  for (const event of existing) merged.set(event.seq, event);
+  for (const event of incoming) merged.set(event.seq, event);
+  const sorted = [...merged.values()].sort((a, b) => a.seq - b.seq);
+  if (direction !== 'earlier' && sorted.length > limit) {
+    return { events: sorted.slice(sorted.length - limit), trimmedEarlier: true };
+  }
+  return { events: sorted, trimmedEarlier: false };
 }
+
+export function routeLabel(action: Pick<RouteAction, 'kind'>): string {
+  const labels: Record<string, string> = {
+    new_work: '新建工作',
+    followup: '补充已有工作（未新建）',
+    related_work: '关联新执行（新建工作）',
+    inspect: '查询工作',
+    stop: '请求停止工作',
+    resume: '恢复暂停工作',
+    recall: '回看历史',
+    search_memory: '检索全局记忆',
+    save_memory: '沉淀长期记忆',
+    timer: '管理定时任务',
+    plugin: '执行功能插件',
+    send_file: '发送微信附件',
+    switch_channel: '切换回复通道',
+    reply: '仅回复（未派发后台工作）',
+  };
+  return labels[action.kind] ?? `动作（${action.kind || '未知'}）`;
+}
+
 export function routeState(action: Pick<RouteAction, 'status' | 'kind' | 'delivery'>): string {
-  if (action.status !== 'accepted') return { pending: '正在处理，尚未受理', failed: '动作失败', interrupted: '进度未确认' }[action.status];
-  if (action.kind === 'followup') return { pending: '已受理，等待 Worker 处理', processing: 'Worker 正在处理补充',
-    done: 'Worker 已处理补充，结果另行交付', failed: '补充要求未确认处理' }[action.delivery ?? 'pending'] ?? '已受理，处理状态未记录';
+  if (action.status !== 'accepted') {
+    const states: Record<string, string> = {
+      pending: '正在处理，尚未受理',
+      failed: '动作失败',
+      interrupted: '进度未确认',
+    };
+    return states[action.status] ?? `状态：${action.status || '未记录'}`;
+  }
+  if (action.kind === 'followup') {
+    const deliveries: Record<string, string> = {
+      pending: '已受理，等待 Worker 处理',
+      processing: 'Worker 正在处理补充',
+      done: 'Worker 已处理补充，结果另行交付',
+      failed: '补充要求未确认处理',
+    };
+    return deliveries[action.delivery ?? 'pending'] ?? '已受理，处理状态未记录';
+  }
   return action.kind === 'reply' ? 'F.R.I.D.A.Y. 已回复'
     : action.kind === 'inspect' || action.kind === 'recall' || action.kind === 'search_memory' ? '查询已完成'
     : action.kind === 'save_memory' ? '记忆已更新'

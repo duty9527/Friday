@@ -428,12 +428,16 @@ export function initHealthScaleUi(): HealthScaleUiController {
     }
   }
 
+  let dashboardFetchSeq = 0;
+
   async function refreshHealthDashboard(options: { profileId?: string; quiet?: boolean } = {}) {
+    const seq = ++dashboardFetchSeq;
     const targetProfileId = options.profileId ?? healthDashboard?.activeProfileId ?? undefined;
     const args: Record<string, unknown> = {};
     if (targetProfileId) args.profileId = targetProfileId;
     try {
       const res = await runHealthPlugin<HealthDashboardData>('dashboard', args);
+      if (seq !== dashboardFetchSeq) return;
       if (!res.ok || !res.data) {
         if (!options.quiet) setHealthActionStatus(res.message || '读取健康看板失败', 'err');
         return;
@@ -445,16 +449,19 @@ export function initHealthScaleUi(): HealthScaleUiController {
         scheduleHealthMeasurePoll(750);
       }
     } catch (err) {
+      if (seq !== dashboardFetchSeq) return;
       if (!options.quiet) setHealthActionStatus(`读取健康数据失败：${errorText(err)}`, 'err');
     }
   }
 
   async function pollHealthMeasureOnce() {
     if (healthHubBackdrop.hidden || appState.authExpired) return;
+    const seq = ++dashboardFetchSeq;
     try {
       const args: Record<string, unknown> = {};
       if (healthDashboard?.activeProfileId) args.profileId = healthDashboard.activeProfileId;
       const res = await runHealthPlugin<{ session: HealthLiveSession | null; dashboard: HealthDashboardData }>('measure-status', args);
+      if (seq !== dashboardFetchSeq) return;
       if (!res.ok || !res.data) {
         scheduleHealthMeasurePoll(1200);
         return;
@@ -1373,7 +1380,15 @@ export function initHealthScaleUi(): HealthScaleUiController {
       const hrRaw = healthManualHr.value.trim();
       if (hrRaw !== '' && Number.isFinite(Number(hrRaw))) args.heartRate = Number(hrRaw);
       const timeRaw = healthManualTime.value.trim();
-      if (timeRaw !== '') args.measuredAt = new Date(timeRaw).getTime();
+      if (timeRaw !== '') {
+        const parsedAt = new Date(timeRaw).getTime();
+        if (!Number.isFinite(parsedAt)) {
+          setHealthActionStatus('请输入有效的测量时间格式', 'warn');
+          healthManualTime.focus();
+          return;
+        }
+        args.measuredAt = parsedAt;
+      }
 
       const res = await runHealthPlugin<HealthDashboardData>('record-add', args);
       if (!res.ok || !res.data) {

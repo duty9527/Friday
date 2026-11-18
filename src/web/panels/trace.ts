@@ -1,6 +1,7 @@
 import type { TraceEvent } from '../../view.js';
 import {
   activeStatus as active,
+  mergeTraceWindow,
   record,
   routeState,
   spanDuration,
@@ -140,6 +141,21 @@ export function initTracePanel(): TracePanelController {
       ));
       return;
     }
+    const rawBySpan = new Map<string, TraceEvent[]>();
+    const rawByParentSpan = new Map<string, TraceEvent[]>();
+    for (const event of appState.traceEvents) {
+      if (event.kind === 'visible_text' || event.kind === 'thinking') continue;
+      if (event.spanId) {
+        const group = rawBySpan.get(event.spanId);
+        if (group) group.push(event);
+        else rawBySpan.set(event.spanId, [event]);
+      }
+      if (event.parentSpanId) {
+        const group = rawByParentSpan.get(event.parentSpanId);
+        if (group) group.push(event);
+        else rawByParentSpan.set(event.parentSpanId, [event]);
+      }
+    }
     const list = node('ul', '', 'timeline');
     for (const step of steps) {
       const item = node('li', '', `timeline-step ${step.actor}${active(step.status) ? ' live' : ''}`);
@@ -177,10 +193,13 @@ export function initTracePanel(): TracePanelController {
       }
       if (step.exitCode !== undefined) item.append(node('p', `退出码 ${step.exitCode}`, 'meta'));
       if (step.error) item.append(node('p', `错误：${step.error}`, 'error'));
-      const raw = appState.traceEvents.filter(
-        event => (event.spanId === step.id || event.parentSpanId === step.id || event.spanId === step.parentTool)
-          && event.kind !== 'visible_text' && event.kind !== 'thinking',
-      );
+      const rawMap = new Map<number, TraceEvent>();
+      for (const ev of rawBySpan.get(step.id) ?? []) rawMap.set(ev.seq, ev);
+      for (const ev of rawByParentSpan.get(step.id) ?? []) rawMap.set(ev.seq, ev);
+      if (step.parentTool) {
+        for (const ev of rawBySpan.get(step.parentTool) ?? []) rawMap.set(ev.seq, ev);
+      }
+      const raw = [...rawMap.values()].sort((a, b) => a.seq - b.seq);
       const details = node('details', '', 'step-records');
       const records = node('pre');
       // Raw records are built only when opened: a live window can hold hundreds of events per step.
@@ -297,22 +316,40 @@ export function initTracePanel(): TracePanelController {
     if (appState.selectedEvent !== undefined || appState.selectedSpan) renderEventDetail();
   }
 
+  let activeTracePromise: Promise<void> | undefined;
+  let traceRunSeq = 0;
+
+  function queueDirection(direction: 'live' | 'earlier' | 'recent'): void {
+    const priority = { live: 1, earlier: 2, recent: 3 } as const;
+    if (!appState.traceQueuedDirection || priority[direction] >= priority[appState.traceQueuedDirection]) {
+      appState.traceQueuedDirection = direction;
+    }
+  }
+
   async function fillProcessStart(): Promise<void> {
     if (appState.traceMode !== 'steps') return;
     const generation = appState.selectionGeneration;
     const starts = new Set(['F.R.I.D.A.Y. 处理新输入', 'F.R.I.D.A.Y. 派发任务', 'Worker 接收任务']);
     for (let page = 0; page < 4; page++) {
-      if (generation !== appState.selectionGeneration || !appState.traceHasEarlier || appState.traceBusy) return;
+      if (appState.traceBusy && activeTracePromise) {
+        await activeTracePromise;
+      }
+      if (generation !== appState.selectionGeneration || !appState.traceHasEarlier) return;
       const steps = timelineSteps(appState.traceEvents);
       if (!steps.length || starts.has(steps[0]!.title)) return;
       await loadTrace('earlier');
+      if (traceRetryBtn.hidden === false) return;
     }
   }
 
   async function loadTrace(direction: 'live' | 'earlier' | 'recent' = 'live'): Promise<void> {
     if (!appState.ready || appState.authExpired) return;
-    if (appState.traceBusy) { appState.traceAgain = true; return; }
+    if (appState.traceBusy) {
+      queueDirection(direction);
+      return;
+    }
     const generation = appState.selectionGeneration;
+    const runSeq = ++traceRunSeq;
     const latest = direction === 'live';
     const anchor = direction === 'earlier' ? appState.traceEvents[0]?.seq : latest ? appState.traceAfter : undefined;
     const params = new URLSearchParams();
@@ -322,33 +359,45 @@ export function initTracePanel(): TracePanelController {
     traceMoreBtn.disabled = true;
     traceErrorEl.textContent = '';
     traceRetryBtn.hidden = true;
-    try {
-      const events = await api<TraceEvent[]>(`/api/trace?${params}`);
-      if (generation !== appState.selectionGeneration) return;
-      const merged = new Map(appState.traceEvents.map(event => [event.seq, event]));
-      for (const event of events) merged.set(event.seq, event);
-      appState.traceEvents = [...merged.values()].sort((a, b) => a.seq - b.seq);
-      appState.traceAfter = Math.max(appState.traceAfter, events.at(-1)?.seq ?? 0);
-      if (direction === 'live') appState.traceHasMore = events.length === 60;
-      const full = events.length === 60;
-      if (direction === 'recent' || direction === 'earlier') appState.traceHasEarlier = full;
-      renderTrace();
-    } catch (error) {
-      if (generation === appState.selectionGeneration) {
-        traceErrorEl.textContent = `轨迹读取失败：${errorText(error)}`;
-        traceRetryBtn.hidden = false;
-      }
-    } finally {
-      if (generation === appState.selectionGeneration) {
-        appState.traceBusy = false;
-        traceMoreBtn.disabled = false;
-        syncTraceMore();
-        if ((appState.traceMode !== 'events' && appState.selection.type !== 'all' && appState.traceHasMore) || (appState.traceAgain && !appState.traceHasMore)) {
-          appState.traceAgain = false;
-          void loadTrace('live');
+    let failed = false;
+    const run = (async () => {
+      try {
+        const events = await api<TraceEvent[]>(`/api/trace?${params}`);
+        if (generation !== appState.selectionGeneration) return;
+        const window = mergeTraceWindow(appState.traceEvents, events, direction);
+        appState.traceEvents = window.events;
+        appState.traceAfter = Math.max(appState.traceAfter, events.at(-1)?.seq ?? 0);
+        if (direction === 'live') appState.traceHasMore = events.length === 60;
+        const full = events.length === 60;
+        if (direction === 'recent' || direction === 'earlier') appState.traceHasEarlier = full;
+        else if (window.trimmedEarlier) appState.traceHasEarlier = true;
+        renderTrace();
+      } catch (error) {
+        failed = true;
+        if (generation === appState.selectionGeneration) {
+          traceErrorEl.textContent = `轨迹读取失败：${errorText(error)}`;
+          traceRetryBtn.hidden = false;
+        }
+      } finally {
+        if (generation === appState.selectionGeneration) {
+          appState.traceBusy = false;
+          traceMoreBtn.disabled = false;
+          if (traceRunSeq === runSeq) activeTracePromise = undefined;
+          syncTraceMore();
+          const queued = appState.traceQueuedDirection;
+          appState.traceQueuedDirection = undefined;
+          if (!failed && !appState.authExpired) {
+            if (queued) {
+              void loadTrace(queued);
+            } else if (appState.traceMode !== 'events' && appState.selection.type !== 'all' && appState.traceHasMore) {
+              void loadTrace('live');
+            }
+          }
         }
       }
-    }
+    })();
+    activeTracePromise = run;
+    return run;
   }
 
   function renderWorkDetail(): void {
@@ -482,7 +531,8 @@ export function initTracePanel(): TracePanelController {
     appState.traceHasMore = false;
     appState.traceHasEarlier = false;
     appState.traceBusy = false;
-    appState.traceAgain = false;
+    appState.traceQueuedDirection = undefined;
+    activeTracePromise = undefined;
     appState.selectedEvent = undefined;
     appState.selectedSpan = undefined;
     appState.workData = undefined;

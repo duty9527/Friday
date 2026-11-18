@@ -167,25 +167,33 @@ function bareModelKey(modelId) {
   return slash >= 0 ? lower.slice(slash + 1) : lower;
 }
 
-async function fetchModelsDevCatalog() {
+async function fetchModelsDevCatalog(allowOfflineFallback) {
   try {
     const res = await fetch('https://models.dev/api.json', {
       headers: { Accept: 'application/json' },
       signal: AbortSignal.timeout(15_000),
     });
     if (!res.ok) {
-      console.warn(`[sync-model-prices] models.dev HTTP ${res.status}; falling back to SDK catalog only`);
+      throw new Error(`models.dev HTTP ${res.status}`);
+    }
+    const payload = await res.json();
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload) || Object.keys(payload).length === 0) {
+      throw new Error('models.dev returned an empty or invalid catalog payload');
+    }
+    return payload;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (allowOfflineFallback) {
+      console.warn(`[sync-model-prices] Failed to fetch models.dev (${msg}); continuing with --offline-sdk-only`);
       return {};
     }
-    return await res.json();
-  } catch (err) {
-    console.warn(`[sync-model-prices] Failed to fetch models.dev (${err instanceof Error ? err.message : String(err)}); falling back to SDK catalog only`);
-    return {};
+    throw new Error(`[sync-model-prices] Aborting without modifying fallback-prices.ts (${msg}). Pass --offline-sdk-only to force offline SDK-only sync.`);
   }
 }
 
 async function main() {
-  const modelsDev = await fetchModelsDevCatalog();
+  const allowOfflineFallback = process.argv.includes('--offline-sdk-only');
+  const modelsDev = await fetchModelsDevCatalog(allowOfflineFallback);
   const runtime = await ModelRuntime.create({ refreshOnCreate: false, modelsPath: null });
 
   const barePrices = new Map();
@@ -230,8 +238,9 @@ async function main() {
   // 2) Authoritative providers from models.dev (both provider-qualified and bare fallback)
   for (const pid of AUTHORITATIVE_PROVIDERS) {
     const prov = modelsDev[pid];
-    if (!prov?.models) continue;
-    for (const [mid, model] of Object.entries(prov.models)) {
+    if (!prov?.models || typeof prov.models !== 'object') continue;
+    for (const mid of Object.keys(prov.models).sort((a, b) => a.localeCompare(b))) {
+      const model = prov.models[mid];
       const tuple = toTuple(model?.cost, mid);
       if (!tuple) continue;
       recordProvider(pid, mid, tuple);
@@ -239,32 +248,40 @@ async function main() {
     }
   }
 
-  // 3) Bundled @earendil-works/pi-coding-agent SDK catalog (authoritative providers first, then rest)
+  // 3) Bundled @earendil-works/pi-coding-agent SDK catalog (authoritative providers first, then deterministic sorted rest)
   const sdkProviderIds = runtime.getProviders().map(p => p.id);
   const orderedSdkProviders = [
     ...AUTHORITATIVE_PROVIDERS.filter(p => sdkProviderIds.includes(p)),
-    ...sdkProviderIds.filter(p => !AUTHORITATIVE_PROVIDERS.includes(p)),
+    ...sdkProviderIds.filter(p => !AUTHORITATIVE_PROVIDERS.includes(p)).sort((a, b) => a.localeCompare(b)),
   ];
   for (const pid of orderedSdkProviders) {
-    for (const model of runtime.getModels(pid)) {
+    const isAuthoritative = AUTHORITATIVE_PROVIDERS.includes(pid);
+    for (const model of [...runtime.getModels(pid)].sort((a, b) => a.id.localeCompare(b.id))) {
       const tuple = toTuple(model.cost, model.id);
       if (!tuple) continue;
       recordProvider(pid, model.id, tuple);
-      recordBare(model.id, tuple);
+      if (isAuthoritative || FRIDAY_PROVIDER_SET.has(pid.toLowerCase())) {
+        recordBare(model.id, tuple);
+      }
     }
   }
 
-  // 4) Remaining providers from models.dev (e.g. openrouter, together, etc.)
-  for (const [pid, prov] of Object.entries(modelsDev)) {
-    if (AUTHORITATIVE_PROVIDERS.includes(pid) || !prov?.models) continue;
-    for (const [mid, model] of Object.entries(prov.models)) {
+  // 4) Remaining Friday providers from models.dev (provider-scoped only; never pollute global barePrices)
+  for (const pid of Object.keys(modelsDev).sort((a, b) => a.localeCompare(b))) {
+    if (AUTHORITATIVE_PROVIDERS.includes(pid)) continue;
+    if (!FRIDAY_PROVIDER_SET.has(pid.toLowerCase())) continue;
+    const prov = modelsDev[pid];
+    if (!prov?.models || typeof prov.models !== 'object') continue;
+    for (const mid of Object.keys(prov.models).sort((a, b) => a.localeCompare(b))) {
+      const model = prov.models[mid];
       const tuple = toTuple(model?.cost, mid);
       if (!tuple) continue;
-      if (FRIDAY_PROVIDER_SET.has(pid.toLowerCase())) {
-        recordProvider(pid, mid, tuple);
-      }
-      recordBare(mid, tuple);
+      recordProvider(pid, mid, tuple);
     }
+  }
+
+  if (providerModelPrices.size === 0 || barePrices.size === 0) {
+    throw new Error('[sync-model-prices] Refusing to overwrite fallback-prices.ts with empty catalog results');
   }
 
   const sortedProviders = Object.fromEntries(

@@ -21,10 +21,8 @@ const staticMimeTypes: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.js': 'application/javascript; charset=utf-8',
-  '.map': 'application/json; charset=utf-8',
   '.png': 'image/png',
   '.woff2': 'font/woff2',
-  '.txt': 'text/plain; charset=utf-8',
 };
 const adjacentWebRoot = resolve(fileURLToPath(new URL('./web/', import.meta.url)));
 const webRoot = existsSync(resolve(adjacentWebRoot, 'client.js'))
@@ -54,10 +52,22 @@ function resolveStaticAsset(pathname: string): { filePath: string; mime: string 
   return mime ? { filePath, mime } : undefined;
 }
 const policy = "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
-function send(response: ServerResponse, status: number, result: unknown) {
-  if (response.destroyed) return;
-  response.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
-  response.end(JSON.stringify(result));
+function send(
+  response: ServerResponse,
+  status: number,
+  result: unknown,
+  options?: { close?: boolean; incoming?: IncomingMessage },
+) {
+  if (response.destroyed) {
+    if (options?.close) options.incoming?.destroy();
+    return;
+  }
+  const headers: Record<string, string> = { 'content-type': 'application/json; charset=utf-8' };
+  if (options?.close) headers.connection = 'close';
+  response.writeHead(status, headers);
+  response.end(JSON.stringify(result), () => {
+    if (options?.close) options.incoming?.destroy();
+  });
 }
 async function rawBytes(request: IncomingMessage): Promise<Buffer> {
   if (Number(request.headers['content-length']) > REQUEST_LIMIT) throw new HttpFailure(413, 'Request exceeds 64 KiB limit');
@@ -85,11 +95,48 @@ async function body(request: IncomingMessage): Promise<Record<string, unknown>> 
   return value as Record<string, unknown>;
 }
 async function bridge(home: string, command: unknown): Promise<unknown> {
+  const encoded = JSON.stringify(command);
+  if (encoded === undefined || Buffer.byteLength(`${encoded}\n`, 'utf8') > REQUEST_LIMIT) {
+    throw new HttpFailure(413, 'Request exceeds 64 KiB IPC limit');
+  }
   try { return await request(home, command); }
   catch (error) {
     const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
-    if (['ENOENT', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT'].includes(String(code)) || (error instanceof Error && /^(Service request timed out|Service closed without a response|Response too large|Invalid service response)/.test(error.message))) throw new HttpFailure(503, '协调服务连接不可用；已记录的内容不会因断线而重发。');
+    if (['ENOENT', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT'].includes(String(code)) || (error instanceof Error && /^(Service request timed out|Service closed without a response|Response too large|Response exceeds limit|Invalid service response)/.test(error.message))) throw new HttpFailure(503, '协调服务连接不可用；已记录的内容不会因断线而重发。');
+    if (error instanceof Error && error.message === 'Request is too large') throw new HttpFailure(413, 'Request exceeds 64 KiB IPC limit');
     throw new HttpFailure(400, error instanceof Error ? error.message : 'Service request failed');
+  }
+}
+
+async function mapWithConcurrency<T, R>(items: readonly T[], limit: number, worker: (item: T) => Promise<R>): Promise<R[]> {
+  if (items.length === 0) return [];
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const idx = nextIndex++;
+      if (idx >= items.length) return;
+      results[idx] = await worker(items[idx]!);
+    }
+  }));
+  return results;
+}
+
+function isValidHttpHostHeader(rawHost: unknown): rawHost is string {
+  if (typeof rawHost !== 'string' || !rawHost || rawHost.length > 255 || /[\s\\/@]/.test(rawHost)) {
+    return false;
+  }
+  try {
+    const parsed = new URL(`http://${rawHost}`);
+    return Boolean(parsed.hostname)
+      && !parsed.username
+      && !parsed.password
+      && parsed.pathname === '/'
+      && !parsed.search
+      && !parsed.hash;
+  } catch {
+    return false;
   }
 }
 
@@ -175,13 +222,17 @@ function createSseBroadcaster(home: string) {
 
           const batch = await bridge(home, { command: 'updates', after: minCursor }) as { events: TraceEvent[]; cursor: number; head: number };
           if (controller.signal.aborted || clients.size === 0) break;
-          lastHead = Math.max(lastHead, batch.head);
+          lastHead = batch.head < lastHead ? batch.head : Math.max(lastHead, batch.head);
           const now = Date.now();
 
           for (const client of [...clients]) {
             if (client.draining) {
               if (now - client.drainingSince > 15_000) removeClient(client);
               continue;
+            }
+            const cursorRolledBack = batch.head < client.cursor;
+            if (cursorRolledBack) {
+              client.cursor = 0;
             }
             const relevant = batch.events.length
               ? batch.events.filter(event => event.seq > client.cursor)
@@ -193,6 +244,10 @@ function createSseBroadcaster(home: string) {
                 : { events: relevant, cursor: clientCursor, head: batch.head };
               if (writeClient(client, `event: updates\ndata: ${JSON.stringify(payload)}\n\n`)) {
                 client.cursor = clientCursor;
+                client.heartbeat = now;
+              }
+            } else if (cursorRolledBack) {
+              if (writeClient(client, `event: updates\ndata: ${JSON.stringify({ events: [], cursor: 0, head: batch.head, reset: true })}\n\n`)) {
                 client.heartbeat = now;
               }
             } else {
@@ -312,26 +367,44 @@ export async function startWeb(options: { home: string; port?: number }): Promis
     response.setHeader('cross-origin-resource-policy', 'same-origin');
     response.setHeader('cross-origin-opener-policy', 'same-origin');
     void (async () => {
-      if (incoming.headers.host !== host) throw new HttpFailure(403, 'Invalid local Host');
+      if (!isValidHttpHostHeader(incoming.headers.host)) throw new HttpFailure(403, 'Invalid local Host');
       const origin = `http://${host}`;
-      const url = new URL(incoming.url ?? '/', origin);
+      let url: URL;
+      try {
+        url = new URL(incoming.url ?? '/', origin);
+      } catch {
+        throw new HttpFailure(400, 'Malformed request URL');
+      }
       if (url.origin !== origin) throw new HttpFailure(403, 'Invalid request origin');
       if (url.pathname.startsWith('/im/webhook/')) {
-        const channelId = decodeURIComponent(url.pathname.slice('/im/webhook/'.length));
+        if ('origin' in incoming.headers || 'sec-fetch-site' in incoming.headers) {
+          throw new HttpFailure(403, 'Cross-site browser webhook access is forbidden');
+        }
+        let channelId: string;
+        try {
+          channelId = decodeURIComponent(url.pathname.slice('/im/webhook/'.length));
+        } catch {
+          throw new HttpFailure(400, 'Malformed IM webhook channel ID');
+        }
         if (!channelId) throw new HttpFailure(404, 'Missing IM channel ID');
-        const raw = incoming.method === 'GET' ? '' : (await rawBytes(incoming)).toString('utf8');
+        if (channelId.includes('/') || channelId.includes('\0')) {
+          throw new HttpFailure(400, 'Invalid IM channel ID');
+        }
+        const method = incoming.method ?? 'POST';
+        const raw = method === 'GET' || method === 'HEAD' ? '' : (await rawBytes(incoming)).toString('utf8');
         const result = await bridge(home, {
           command: 'im-webhook',
           channelId,
-          method: incoming.method ?? 'POST',
+          method,
           query: url.searchParams.toString(),
           headers: incoming.headers,
           rawBody: raw,
         }) as { status: number; body: string; contentType: string };
         response.writeHead(result.status, { 'content-type': result.contentType });
-        response.end(result.body);
+        response.end(method === 'HEAD' ? undefined : result.body);
         return;
       }
+      if (incoming.headers.host !== host) throw new HttpFailure(403, 'Invalid local Host');
       if (!url.pathname.startsWith('/api/')) {
         if (!['GET', 'HEAD'].includes(incoming.method ?? '')) throw new HttpFailure(404, 'Not found');
         const rawPath = (incoming.url ?? '/').split('?')[0] ?? '/';
@@ -343,7 +416,13 @@ export async function startWeb(options: { home: string; port?: number }): Promis
         response.end(incoming.method === 'HEAD' ? undefined : bytes);
         return;
       }
-      if ((incoming.headers.origin && incoming.headers.origin !== origin) || incoming.headers['sec-fetch-site'] === 'cross-site') throw new HttpFailure(403, 'Cross-origin API access is forbidden');
+      const secFetchSite = incoming.headers['sec-fetch-site'];
+      if (
+        (incoming.headers.origin && incoming.headers.origin !== origin)
+        || (typeof secFetchSite === 'string' && secFetchSite !== 'same-origin' && secFetchSite !== 'none')
+      ) {
+        throw new HttpFailure(403, 'Cross-origin API access is forbidden');
+      }
       const authorization = incoming.headers.authorization;
       const supplied = Buffer.from(typeof authorization === 'string' ? authorization : '');
       if (supplied.length !== credential.length || !timingSafeEqual(supplied, credential)) throw new HttpFailure(401, '请使用 web 命令输出的本地访问链接；访问令牌缺失或已失效。');
@@ -362,6 +441,49 @@ export async function startWeb(options: { home: string; port?: number }): Promis
         if (url.pathname === '/api/stream') { sseBroadcaster.add(response, numeric('after') ?? 0); return; }
         if (url.pathname === '/api/voiceprints') {
           send(response, 200, sanitizeVoiceprint(await bridge(home, { command: 'voice-status' })));
+          return;
+        }
+        if (url.pathname === '/api/messages') {
+          const ids: string[] = [];
+          const seen = new Set<string>();
+          for (const rawParam of search.getAll('ids')) {
+            for (const part of rawParam.split(',')) {
+              const id = part.trim();
+              if (!id) continue;
+              if (id.length > 128) throw new HttpFailure(400, 'Invalid message ID');
+              if (seen.has(id)) continue;
+              seen.add(id);
+              ids.push(id);
+              if (ids.length > 200) throw new HttpFailure(400, 'Too many message IDs requested');
+            }
+          }
+          if (ids.length === 0) {
+            send(response, 200, { items: [] });
+            return;
+          }
+          let items: unknown[];
+          try {
+            const res = await bridge(home, { command: 'messages', ids });
+            items = Array.isArray(res)
+              ? res
+              : (res && typeof res === 'object' && 'items' in res && Array.isArray((res as { items: unknown }).items)
+                ? (res as { items: unknown[] }).items
+                : []);
+          } catch (error) {
+            if (!(error instanceof HttpFailure) || error.status !== 400 || !/Unknown command/i.test(error.message)) {
+              throw error;
+            }
+            const fetched = await mapWithConcurrency(ids, 8, async messageId => {
+              try {
+                return await bridge(home, { command: 'message', messageId });
+              } catch (itemError) {
+                if (itemError instanceof HttpFailure && itemError.status === 503) throw itemError;
+                return undefined;
+              }
+            });
+            items = fetched.filter(item => item !== undefined && item !== null);
+          }
+          send(response, 200, { items });
           return;
         }
         let command: Record<string, unknown>;
@@ -423,10 +545,21 @@ export async function startWeb(options: { home: string; port?: number }): Promis
         send(response, 200, command === 'voice-config' ? sanitizeVoiceprint(res) : res);
       } else throw new HttpFailure(405, 'Method not allowed');
     })().catch(error => {
-      if (response.headersSent) { response.end(); return; }
-      incoming.resume();
-      send(response, error instanceof HttpFailure ? error.status : 500,
-        { error: error instanceof HttpFailure ? error.message : 'Web request failed' });
+      const status = error instanceof HttpFailure ? error.status : 500;
+      const shouldClose = [401, 403, 413, 415].includes(status) || !incoming.complete;
+      if (response.headersSent) {
+        response.end(() => {
+          if (shouldClose) incoming.destroy();
+        });
+        return;
+      }
+      if (!shouldClose) incoming.resume();
+      send(
+        response,
+        status,
+        { error: error instanceof HttpFailure ? error.message : 'Web request failed' },
+        shouldClose ? { close: true, incoming } : undefined,
+      );
     });
   });
   server.maxConnections = 64;

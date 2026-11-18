@@ -2182,19 +2182,19 @@ pre {
   font-size:13px;
 }
 .health-status-banner.tone-ok {
-  border-color:rgba(34,197,94,.45);
-  background:rgba(34,197,94,.10);
-  color:#86efac;
+  border-color:rgba(22,163,74,.45);
+  background:rgba(34,197,94,.12);
+  color:#166534;
 }
 .health-status-banner.tone-warn {
-  border-color:rgba(245,158,11,.45);
-  background:rgba(245,158,11,.10);
-  color:#fcd34d;
+  border-color:rgba(217,119,6,.45);
+  background:rgba(245,158,11,.14);
+  color:#92400e;
 }
 .health-status-banner.tone-err {
-  border-color:rgba(239,68,68,.55);
+  border-color:rgba(220,38,38,.45);
   background:rgba(239,68,68,.12);
-  color:#fca5a5;
+  color:#991b1b;
 }
 .health-hero-grid {
   display:grid;
@@ -2422,11 +2422,11 @@ pre {
 .dot-low { fill:#f59e0b; }
 .dot-high { fill:#fb923c; }
 .dot-critical { fill:#ef4444; }
-.rating-badge-excellent { background:rgba(34,197,94,.16); color:#4ade80; border-color:rgba(34,197,94,.4); }
-.rating-badge-normal { background:rgba(56,189,248,.16); color:#7dd3fc; border-color:rgba(56,189,248,.4); }
-.rating-badge-low { background:rgba(245,158,11,.16); color:#fcd34d; border-color:rgba(245,158,11,.4); }
-.rating-badge-high { background:rgba(251,146,60,.16); color:#fdba74; border-color:rgba(251,146,60,.4); }
-.rating-badge-critical { background:rgba(239,68,68,.18); color:#fca5a5; border-color:rgba(239,68,68,.45); }
+.rating-badge-excellent { background:rgba(34,197,94,.14); color:#166534; border-color:rgba(22,163,74,.4); }
+.rating-badge-normal { background:rgba(14,165,233,.14); color:#075985; border-color:rgba(2,132,199,.4); }
+.rating-badge-low { background:rgba(245,158,11,.16); color:#92400e; border-color:rgba(217,119,6,.45); }
+.rating-badge-high { background:rgba(249,115,22,.14); color:#9a3412; border-color:rgba(234,88,12,.45); }
+.rating-badge-critical { background:rgba(239,68,68,.14); color:#991b1b; border-color:rgba(220,38,38,.45); }
 .health-metric-foot {
   display:flex;
   justify-content:space-between;

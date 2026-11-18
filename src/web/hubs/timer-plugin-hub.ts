@@ -136,10 +136,8 @@ export function initTimerPluginHub(): TimerPluginHubController {
     timerTopBadge.textContent = timers.length ? `${activeCount}/${timers.length}` : '0';
 
     if (timerHubBackdrop.hidden && !force) {
-      appState.dirtyModals.add('timer');
       return;
     }
-    appState.dirtyModals.delete('timer');
 
     renderDynamicTimerPresets(plugins);
 
@@ -238,10 +236,8 @@ export function initTimerPluginHub(): TimerPluginHubController {
     pluginTopBadge.textContent = String(plugins.length);
 
     if (pluginHubBackdrop.hidden && !force) {
-      appState.dirtyModals.add('plugin');
       return;
     }
-    appState.dirtyModals.delete('plugin');
 
     const kpiFrag = document.createDocumentFragment();
     kpiFrag.append(
