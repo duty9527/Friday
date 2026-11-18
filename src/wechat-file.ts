@@ -59,6 +59,7 @@ interface WechatMediaDeliveryBase {
   headers: Record<string, string>;
   channelId?: string;
   signal?: AbortSignal;
+  isBindingCurrent?: () => boolean;
 }
 
 async function deliverEncryptedWechatMedia(
@@ -82,6 +83,9 @@ async function deliverEncryptedWechatMedia(
       const encrypted = Buffer.concat([cipher.update(plain), cipher.final()]);
       const filekey = randomBytes(16).toString('hex');
       const post = async (endpoint: string, body: unknown) => {
+        if (input.isBindingCurrent && !input.isBindingCurrent()) {
+          throw new Error('Attachment cancelled because the WeChat binding changed');
+        }
         const res = await transport(`${input.base}/ilink/bot/${endpoint}`, {
           method: 'POST',
           headers: input.headers,

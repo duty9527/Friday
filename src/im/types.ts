@@ -11,6 +11,15 @@ import type { XiaoaiSpeakerExtractor } from '../xiaoai/speaker-verify.js';
 export const DEFAULT_WECHAT_ILINK_BASE = 'https://ilinkai.weixin.qq.com';
 export const DEFAULT_NETWORK_TIMEOUT_MS = 15_000;
 
+export function resolveImDeliveryTarget(channel: ImChannelConfig, explicitTarget?: string): string | undefined {
+  if (channel.platform === 'wechat' && channel.botToken && !channel.webhookUrl) {
+    const target = explicitTarget ?? channel.defaultTarget;
+    // Cached contexts and allowlists are not a source of default recipients.
+    return target && (!channel.allowedSenders.length || channel.allowedSenders.includes(target)) ? target : undefined;
+  }
+  return explicitTarget ?? channel.defaultTarget ?? Object.keys(channel.contextTokens ?? {})[0] ?? channel.allowedSenders[0];
+}
+
 export interface XiaoaiMatchedSpeaker {
   id: string;
   name: string;

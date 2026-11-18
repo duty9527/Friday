@@ -29,10 +29,20 @@ function normalizeHoldingInput(raw) {
     throw new Error('基金持仓必须包含 code 与 name');
   }
   const fundType = String(raw?.fundType ?? 'other').trim() || 'other';
-  const proxySymbol = String(raw?.proxySymbol ?? '').trim();
-  const proxyName = String(raw?.proxyName ?? proxySymbol).trim();
-  const rawRatio = Number(raw?.positionRatio ?? 0.95);
-  const positionRatio = Number.isFinite(rawRatio) && rawRatio > 0 && rawRatio <= 1 ? rawRatio : 0.95;
+  const isAStock = fundType === 'a_stock';
+  let proxySymbol = String(raw?.proxySymbol ?? '').trim();
+  if (isAStock && !proxySymbol && /^\d{6}$/.test(code)) {
+    const prefix = code.startsWith('6')
+      ? 'sh'
+      : (code.startsWith('4') || code.startsWith('8') || code.startsWith('92'))
+        ? 'bj'
+        : 'sz';
+    proxySymbol = `${prefix}${code}`;
+  }
+  const proxyName = String(raw?.proxyName ?? (isAStock ? name : proxySymbol)).trim();
+  const defaultRatio = isAStock ? 1 : 0.95;
+  const rawRatio = Number(raw?.positionRatio ?? defaultRatio);
+  const positionRatio = Number.isFinite(rawRatio) && rawRatio > 0 && rawRatio <= 1 ? rawRatio : defaultRatio;
   const cost = Number(raw?.cost ?? raw?.initAmount ?? 0);
   if (!Number.isFinite(cost) || cost < 0) {
     throw new Error(`基金 ${code} 的 cost 必须为非负数字`);
@@ -208,13 +218,21 @@ function isWeekend(ts = Date.now()) {
   return getShanghaiTimeParts(ts).isWeekend;
 }
 
-function extractQuoteDate(quoteTime) {
-  const s = String(quoteTime ?? '').trim();
-  const compact = /^(\d{4})(\d{2})(\d{2})/.exec(s);
-  if (compact) return `${compact[1]}-${compact[2]}-${compact[3]}`;
-  const dash = /^(\d{4})[-/](\d{2})[-/](\d{2})/.exec(s);
-  if (dash) return `${dash[1]}-${dash[2]}-${dash[3]}`;
-  return '';
+/**
+ * Parse Tencent quote timestamp across A-share (YYYYMMDDHHmmss),
+ * HK (YYYY/MM/DD HH:mm:ss), and US (YYYY-MM-DD HH:mm:ss) formats.
+ * @param {unknown} raw
+ * @returns {{ quoteDate: string; quoteStamp: string } | null}
+ */
+export function parseQuoteTimestamp(raw) {
+  const s = String(raw ?? '').trim();
+  const m = /^(\d{4})[-/]?(\d{2})[-/]?(\d{2})(?:[\sT]*(\d{2}):?(\d{2}):?(\d{2}))?$/.exec(s);
+  if (!m) return null;
+  const [, y, mo, d, hh = '00', mm = '00', ss = '00'] = m;
+  return {
+    quoteDate: `${y}-${mo}-${d}`,
+    quoteStamp: `${y}-${mo}-${d} ${hh}:${mm}:${ss}`,
+  };
 }
 
 /**
@@ -272,7 +290,13 @@ async function fetchMarketQuotes(symbols, fetchFn = fetch, signal) {
   const unique = [...new Set(symbols.filter(Boolean))];
   if (!unique.length) return new Map();
   const url = `https://qt.gtimg.cn/q=${unique.join(',')}`;
-  const res = await fetchFn(url, { signal: buildRequestSignal(10_000, signal) });
+  const res = await fetchFn(url, {
+    headers: {
+      'Cache-Control': 'no-cache',
+      Pragma: 'no-cache',
+    },
+    signal: buildRequestSignal(10_000, signal),
+  });
   if (!res.ok) throw new Error(`Tencent quote HTTP ${res.status}`);
   const text = new TextDecoder('gbk').decode(await res.arrayBuffer());
   const map = new Map();
@@ -283,13 +307,21 @@ async function fetchMarketQuotes(symbols, fetchFn = fetch, signal) {
     const raw = line.slice(eq + 1).trim().replace(/^"|"$/g, '').replace(/";$/, '');
     const parts = raw.split('~');
     if (parts.length < 35) continue;
+    const price = Number(parts[3]);
+    const prevClose = Number(parts[4]);
+    const changePct = Number(parts[32]);
+    const quoteTime = String(parts[30] || '').trim();
+    const parsedTime = parseQuoteTimestamp(quoteTime);
+    if (!(price > 0) || !(prevClose > 0) || !Number.isFinite(changePct) || !parsedTime) continue;
     map.set(key, {
       symbol: key,
       name: parts[1] || key,
-      price: Number(parts[3] || 0),
-      prevClose: Number(parts[4] || 0),
-      changePct: Number(parts[32] || 0),
-      quoteTime: String(parts[30] || ''),
+      price,
+      prevClose,
+      changePct,
+      quoteTime,
+      quoteDate: parsedTime.quoteDate,
+      quoteStamp: parsedTime.quoteStamp,
     });
   }
   return map;
@@ -313,6 +345,9 @@ async function syncAllNavs(db, holdings, opts = {}) {
   `);
 
   for (const h of holdings) {
+    if (String(h.fund_type || h.fundType) === 'a_stock') {
+      continue;
+    }
     const code = String(h.code);
     try {
       const history = await fetchFundNavHistory(code, 10, opts.fetchFn ?? fetch, opts.signal);
@@ -332,6 +367,49 @@ async function syncAllNavs(db, holdings, opts = {}) {
 }
 
 /**
+ * @param {Array<Record<string, any>>} groupRows
+ */
+function calcGroupSummary(groupRows) {
+  const count = groupRows.length;
+  if (count === 0) {
+    return {
+      count: 0,
+      cost: 0,
+      totalCost: 0,
+      asset: 0,
+      totalAsset: 0,
+      dailyPnl: 0,
+      totalDailyPnl: 0,
+      dailyPnlPct: 0,
+      totalPnl: 0,
+      totalPnlPct: 0,
+      holdings: /** @type {Array<Record<string, any>>} */ ([]),
+    };
+  }
+  const cost = Number(groupRows.reduce((sum, r) => sum + Number(r.cost ?? 0), 0).toFixed(2));
+  const asset = Number(groupRows.reduce((sum, r) => sum + Number(r.currentAsset ?? 0), 0).toFixed(2));
+  const dailyPnl = Number(groupRows.reduce((sum, r) => sum + Number(r.dailyPnl ?? 0), 0).toFixed(2));
+  const totalPnl = Number((asset - cost).toFixed(2));
+  const totalPnlPct = cost > 0 ? Number(((totalPnl / cost) * 100).toFixed(2)) : 0;
+  const prevAsset = asset - dailyPnl;
+  const dailyPnlPct = prevAsset > 0 ? Number(((dailyPnl / prevAsset) * 100).toFixed(2)) : 0;
+
+  return {
+    count,
+    cost,
+    totalCost: cost,
+    asset,
+    totalAsset: asset,
+    dailyPnl,
+    totalDailyPnl: dailyPnl,
+    dailyPnlPct,
+    totalPnl,
+    totalPnlPct,
+    holdings: groupRows,
+  };
+}
+
+/**
  * @param {import('node:sqlite').DatabaseSync} db
  * @param {'status' | 'noon' | 'settle'} mode
  * @param {boolean} offline
@@ -346,15 +424,16 @@ async function computeValuation(db, mode = 'noon', offline = false, opts = {}) {
 
   if (holdings.length === 0) {
     const title = mode === 'settle'
-      ? `# 🌙 基金晚间正式结算 · ${today}`
+      ? `# 🌙 持仓晚间结算 · ${today} 21:30`
       : mode === 'noon'
-        ? `# ☀️ 基金午间持仓估值 · ${today}`
-        : `# 📊 基金实时持仓状态 · ${today}`;
+        ? `# ☀️ 持仓午间估值 · ${today} 12:00`
+        : `# 📊 持仓总览 · ${today}`;
+    const emptyGroup = calcGroupSummary([]);
     return {
       today,
       title,
       empty: true,
-      message: `${title}\n\n当前尚未配置任何基金持仓。请使用 \`add-holding\` 添加基金，或在 \`config.json\` 的 \`holdings\` 中导入持仓列表。`,
+      message: `${title}\n\n当前尚未配置任何持仓。请使用 \`add-holding\` 添加，或在 \`config.json\` 的 \`holdings\` 中导入持仓列表。`,
       summary: {
         totalCost: 0,
         totalAsset: 0,
@@ -362,6 +441,8 @@ async function computeValuation(db, mode = 'noon', offline = false, opts = {}) {
         dailyPnlPct: 0,
         totalPnl: 0,
         totalPnlPct: 0,
+        stocks: { ...emptyGroup },
+        funds: { ...emptyGroup },
         holdings: [],
       },
     };
@@ -377,14 +458,13 @@ async function computeValuation(db, mode = 'noon', offline = false, opts = {}) {
     try {
       quotes = await fetchMarketQuotes(symbols, opts.fetchFn ?? fetch, opts.signal);
     } catch {
-      // Fallback to 0% intraday change if quote API fails
+      // Keep empty quotes map so each row degrades explicitly with quoteMissing=true
     }
   }
 
+  const isTradingWindow = !shTime.isWeekend && shTime.minutesOfDay >= 9 * 60 + 30;
+  /** @type {Array<Record<string, any>>} */
   const rows = [];
-  let totalCost = 0;
-  let totalAsset = 0;
-  let totalDailyPnl = 0;
 
   for (const h of refreshedHoldings) {
     const code = String(h.code);
@@ -394,6 +474,72 @@ async function computeValuation(db, mode = 'noon', offline = false, opts = {}) {
     const positionRatio = Number(h.position_ratio);
     const proxySymbol = String(h.proxy_symbol);
     const proxyName = String(h.proxy_name || proxySymbol || '跟踪标的');
+    const isAStock = String(h.fund_type || h.fundType) === 'a_stock';
+
+    if (isAStock) {
+      const quote = proxySymbol ? quotes.get(proxySymbol) : undefined;
+      const quoteMissing = !offline && !quote;
+      const quoteDate = quote?.quoteDate || '';
+      const quoteStamp = quote?.quoteStamp || '';
+      const isQuoteStale = !offline && Boolean(quote && (quoteDate !== today || !isTradingWindow));
+      const fallbackNav = Number(h.last_nav) > 0 ? Number(h.last_nav) : 0;
+      const currentPrice = quote ? quote.price : fallbackNav;
+      const prevClose = quote ? (isQuoteStale ? quote.price : quote.prevClose) : currentPrice;
+      const changePct = quote && !isQuoteStale ? Number(quote.changePct) : 0;
+      const currentAsset = Number((shares * currentPrice).toFixed(2));
+      const dailyPnl = quote && !isQuoteStale ? Number((shares * (currentPrice - prevClose)).toFixed(2)) : 0;
+      const totalPnl = Number((currentAsset - cost).toFixed(2));
+      const totalPnlPct = cost > 0 ? Number(((totalPnl / cost) * 100).toFixed(2)) : 0;
+      const costPrice = shares > 0 ? Number((cost / shares).toFixed(3)) : 0;
+      const priceText = currentPrice.toFixed(currentPrice < 10 ? 3 : 2);
+      let navSource = `ℹ️ 最近价格(${String(h.last_nav_date || today)})`;
+      if (quoteMissing) {
+        navSource = `⚠️ 行情未取到(无有效实时报价，沿用最近记录价 ${priceText}，当日盈亏置 0)`;
+      } else if (isQuoteStale) {
+        navSource = quoteDate !== today
+          ? `⚠️ 数据过期(非当日行情，数据日期 ${quoteDate}，报价时间 ${quoteStamp}，前收 ${priceText})`
+          : `📅 休市/盘前(报价时间 ${quoteStamp}，沿用价格 ${priceText})`;
+      } else if (quote) {
+        navSource = mode === 'settle'
+          ? `✅ 腾讯行情收盘价(${quoteStamp})`
+          : `⚡ 腾讯行情(现价 ${priceText}，报价时间 ${quoteStamp})`;
+      }
+
+      if (mode === 'settle' && quote?.price && !isQuoteStale) {
+        db.prepare(`
+          INSERT INTO nav_history (code, nav_date, nav, acc_nav, daily_return, fetched_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+          ON CONFLICT(code, nav_date) DO UPDATE SET
+            nav=excluded.nav, acc_nav=excluded.acc_nav, daily_return=excluded.daily_return, fetched_at=excluded.fetched_at
+        `).run(code, today, quote.price, quote.price, quote.changePct, nowFn());
+        db.prepare('UPDATE holdings SET last_nav=?, last_nav_date=?, updated_at=? WHERE code=?')
+          .run(quote.price, today, nowFn(), code);
+      }
+
+      rows.push({
+        code,
+        name,
+        isAStock: true,
+        shares,
+        cost: Number(cost.toFixed(2)),
+        costPrice,
+        baseNav: prevClose,
+        baseNavDate: quoteMissing ? String(h.last_nav_date || today) : (isQuoteStale ? quoteDate : today),
+        currentNav: currentPrice,
+        changePct: Number(changePct.toFixed(2)),
+        currentAsset,
+        dailyPnl,
+        totalPnl,
+        totalPnlPct,
+        navSource,
+        hasTodayOfficialNav: !offline && !quoteMissing && !isQuoteStale,
+        quoteDate: quoteDate || undefined,
+        quoteStamp: quoteStamp || undefined,
+        quoteMissing,
+        quoteStale: isQuoteStale,
+      });
+      continue;
+    }
 
     const navRows = /** @type {Array<Record<string, unknown>>} */ (
       db.prepare('SELECT * FROM nav_history WHERE code=? ORDER BY nav_date DESC LIMIT 3').all(code)
@@ -407,18 +553,23 @@ async function computeValuation(db, mode = 'noon', offline = false, opts = {}) {
       ? { nav: Number(secondNav.nav), navDate: String(secondNav.nav_date) }
       : undefined;
 
-    const quote = proxySymbol ? quotes.get(proxySymbol) : undefined;
-    const rawProxyPct = quote ? Number(quote.changePct) : 0;
-    const proxyChangePct = Number.isFinite(rawProxyPct) ? rawProxyPct : 0;
-    const quoteDate = quote ? extractQuoteDate(quote.quoteTime) : '';
-    const isTradingWindow = !shTime.isWeekend && shTime.minutesOfDay >= 9 * 60 + 30;
-    const isFreshQuoteForToday = Boolean(
-      quote &&
-      isTradingWindow &&
-      (!quoteDate || (quoteDate === today && quoteDate > latestNavObj.navDate)),
-    );
-
     const hasTodayOfficialNav = latestNavObj.navDate === today;
+    const quote = proxySymbol ? quotes.get(proxySymbol) : undefined;
+    const isUsProxy = proxySymbol.toLowerCase().startsWith('us');
+    const quoteDate = quote?.quoteDate || '';
+    const quoteStamp = quote?.quoteStamp || '';
+    const isQuoteFresh = Boolean(
+      quote && (
+        isUsProxy
+          ? (quoteDate === today || (latestNavObj.navDate && quoteDate > latestNavObj.navDate))
+          : (isTradingWindow && quoteDate === today)
+      ),
+    );
+    const quoteMissing = !offline && Boolean(proxySymbol) && !hasTodayOfficialNav && !quote;
+    const quoteStale = !offline && Boolean(proxySymbol) && !hasTodayOfficialNav && Boolean(quote) && !isQuoteFresh;
+    const rawProxyPct = quote && isQuoteFresh ? Number(quote.changePct) : 0;
+    const proxyChangePct = Number.isFinite(rawProxyPct) ? rawProxyPct : 0;
+
     let baseNav = latestNavObj.nav;
     let currentNav = latestNavObj.nav;
     let changePct = 0;
@@ -434,24 +585,38 @@ async function computeValuation(db, mode = 'noon', offline = false, opts = {}) {
       currentNav = latestNavObj.nav;
       changePct = 0;
       navSource = `ℹ️ 最近净值(${latestNavObj.navDate})`;
-    } else if (!offline && !isFreshQuoteForToday) {
-      // Never re-apply previous trading day's proxy changePct during weekends, holidays, or pre-09:30 CST.
+    } else if (quoteMissing) {
       baseNav = latestNavObj.nav;
       currentNav = latestNavObj.nav;
       changePct = 0;
-      navSource = quoteDate
-        ? `📅 休市/盘前(沿用${latestNavObj.navDate}净值)`
-        : `⏳ 暂无今日行情(沿用${latestNavObj.navDate}净值)`;
+      navSource = `⚠️ 行情未取到(锚定${proxyName}[${proxySymbol}]无有效报价，沿用${latestNavObj.navDate}净值${latestNavObj.nav.toFixed(4)})`;
+    } else if (quoteStale) {
+      baseNav = latestNavObj.nav;
+      currentNav = latestNavObj.nav;
+      changePct = 0;
+      navSource = quoteDate !== today
+        ? `⚠️ 数据过期(锚定${proxyName}数据日期 ${quoteDate} 非今日[${today}]，报价时间 ${quoteStamp}，沿用${latestNavObj.navDate}净值${latestNavObj.nav.toFixed(4)})`
+        : `📅 休市/盘前(锚定${proxyName}报价时间 ${quoteStamp}，沿用${latestNavObj.navDate}净值${latestNavObj.nav.toFixed(4)})`;
     } else if (mode === 'settle') {
       baseNav = latestNavObj.nav;
       changePct = Number((proxyChangePct * positionRatio).toFixed(2));
       currentNav = Number((baseNav * (1 + changePct / 100)).toFixed(4));
-      navSource = `⏳ 净值待更新(前值${latestNavObj.navDate}:${latestNavObj.nav.toFixed(4)}, 按${proxyName} ${signNum(proxyChangePct)}%预估)`;
+      const stampSuffix = quoteStamp
+        ? isUsProxy && quoteDate !== today
+          ? `，美东报价 ${quoteStamp}[数据日期 ${quoteDate}]`
+          : `，报价时间 ${quoteStamp}`
+        : '';
+      navSource = `⏳ 净值待更新(前值${latestNavObj.navDate}:${latestNavObj.nav.toFixed(4)}, 按${proxyName} ${signNum(proxyChangePct)}%预估${stampSuffix})`;
     } else {
       baseNav = latestNavObj.nav;
       changePct = Number((proxyChangePct * positionRatio).toFixed(2));
       currentNav = Number((baseNav * (1 + changePct / 100)).toFixed(4));
-      navSource = `盘中估值(锚定${proxyName} ${signNum(proxyChangePct)}%)`;
+      const stampSuffix = quoteStamp
+        ? isUsProxy && quoteDate !== today
+          ? `，美东报价 ${quoteStamp}[数据日期 ${quoteDate}]`
+          : `，报价时间 ${quoteStamp}`
+        : '';
+      navSource = `盘中估值(锚定${proxyName} ${signNum(proxyChangePct)}%${stampSuffix})`;
     }
 
     const currentAsset = Number((shares * currentNav).toFixed(2));
@@ -459,13 +624,10 @@ async function computeValuation(db, mode = 'noon', offline = false, opts = {}) {
     const totalPnl = Number((currentAsset - cost).toFixed(2));
     const totalPnlPct = cost > 0 ? Number(((totalPnl / cost) * 100).toFixed(2)) : 0;
 
-    totalCost += cost;
-    totalAsset += currentAsset;
-    totalDailyPnl += dailyPnl;
-
     rows.push({
       code,
       name,
+      isAStock: false,
       shares: Number(shares.toFixed(2)),
       cost: Number(cost.toFixed(2)),
       baseNav: Number(baseNav.toFixed(4)),
@@ -478,13 +640,20 @@ async function computeValuation(db, mode = 'noon', offline = false, opts = {}) {
       totalPnlPct,
       navSource,
       hasTodayOfficialNav,
+      quoteDate: quoteDate || undefined,
+      quoteStamp: quoteStamp || undefined,
+      quoteMissing,
+      quoteStale,
     });
   }
 
-  totalCost = Number(totalCost.toFixed(2));
-  totalAsset = Number(totalAsset.toFixed(2));
-  totalDailyPnl = Number(totalDailyPnl.toFixed(2));
-  const totalPnl = Number((totalAsset - totalCost).toFixed(2));
+  const stocks = calcGroupSummary(rows.filter(r => Boolean(r.isAStock)));
+  const funds = calcGroupSummary(rows.filter(r => !r.isAStock));
+
+  const totalCost = Number((stocks.cost + funds.cost).toFixed(2));
+  const totalAsset = Number((stocks.asset + funds.asset).toFixed(2));
+  const totalDailyPnl = Number((stocks.dailyPnl + funds.dailyPnl).toFixed(2));
+  const totalPnl = Number((stocks.totalPnl + funds.totalPnl).toFixed(2));
   const totalPnlPct = totalCost > 0 ? Number(((totalPnl / totalCost) * 100).toFixed(2)) : 0;
   const prevAsset = totalAsset - totalDailyPnl;
   const dailyPnlPct = prevAsset > 0 ? Number(((totalDailyPnl / prevAsset) * 100).toFixed(2)) : 0;
@@ -508,28 +677,59 @@ async function computeValuation(db, mode = 'noon', offline = false, opts = {}) {
   }
 
   const title = mode === 'settle'
-    ? `# 🌙 基金晚间正式结算 · ${today} 21:30`
+    ? `# 🌙 持仓晚间结算 · ${today} 21:30`
     : mode === 'noon'
-      ? `# ☀️ 基金午间持仓估值 · ${today} 12:00`
-      : `# 📊 基金实时持仓与收益状态 · ${today}`;
-  const dailyLabel = mode === 'settle' ? '结算' : '预估';
+      ? `# ☀️ 持仓午间估值 · ${today} 12:00`
+      : `# 📊 持仓总览 · ${today}`;
 
   const lines = [
     title,
     '',
-    `💰 **总资产** ${totalAsset.toFixed(2)} 元 ｜ **成本** ${totalCost.toFixed(2)} 元`,
-    `📈 **当日${dailyLabel}** ${signNum(totalDailyPnl)} 元（**${signNum(dailyPnlPct)}%**）`,
-    `🏦 **累计** ${signNum(totalPnl)} 元（**${signNum(totalPnlPct)}%**）`,
+    `💰 **总资产** ${totalAsset.toFixed(2)} ｜ **成本** ${totalCost.toFixed(2)} ｜ **当日** ${signNum(totalDailyPnl)} 元（${signNum(dailyPnlPct)}%） ｜ **累计** ${signNum(totalPnl)} 元（${signNum(totalPnlPct)}%）`,
     '',
-    `## 📋 明细（${rows.length} 只）`,
-    '',
+    '## 【📈 股票】',
   ];
 
-  for (const r of rows) {
-    const icon = r.dailyPnl > 0 ? '🔴' : r.dailyPnl < 0 ? '🟢' : '⚪';
+  if (stocks.count === 0) {
+    lines.push('暂无持仓');
+  } else {
     lines.push(
-      `- ${icon} **${r.name}** \`${r.code}\`：资产 ${r.currentAsset.toFixed(2)}（成本 ${r.cost.toFixed(2)} / ${r.shares.toFixed(2)} 份）｜当日 ${signNum(r.dailyPnl)}（${signNum(r.changePct)}%）｜累计 ${signNum(r.totalPnl)}（${signNum(r.totalPnlPct)}%）｜净值 ${r.currentNav.toFixed(4)} · ${r.navSource}`,
+      `**资产** ${stocks.asset.toFixed(2)} ｜ **成本** ${stocks.cost.toFixed(2)} ｜ **当日** ${signNum(stocks.dailyPnl)} 元（${signNum(stocks.dailyPnlPct)}%） ｜ **累计** ${signNum(stocks.totalPnl)} 元（${signNum(stocks.totalPnlPct)}%）`,
+      '',
     );
+    for (const r of stocks.holdings) {
+      const icon = r.quoteStale || r.quoteMissing ? '⚠️' : r.dailyPnl > 0 ? '🔴' : r.dailyPnl < 0 ? '🟢' : '⚪';
+      const dailySeg = r.quoteMissing
+        ? '当日 行情未取到'
+        : r.quoteStale
+          ? (r.quoteDate && r.quoteDate !== today ? `当日 数据过期(${r.quoteDate})` : '当日 休市/盘前')
+          : `当日 ${signNum(r.dailyPnl)}（${signNum(r.changePct)}%）`;
+      lines.push(
+        `- ${icon} **${r.name}** \`${r.code}\` ｜ 现价 ${r.currentNav.toFixed(r.currentNav < 10 ? 3 : 2)} / 成本价 ${r.costPrice.toFixed(3)} / ${r.shares} 股 ｜ 市值 ${r.currentAsset.toFixed(2)} ｜ ${dailySeg} ｜ 累计 ${signNum(r.totalPnl)}（${signNum(r.totalPnlPct)}%） ｜ ${r.navSource}`,
+      );
+    }
+  }
+
+  lines.push('', '## 【🏦 基金】');
+
+  if (funds.count === 0) {
+    lines.push('暂无持仓');
+  } else {
+    lines.push(
+      `**资产** ${funds.asset.toFixed(2)} ｜ **成本** ${funds.cost.toFixed(2)} ｜ **当日** ${signNum(funds.dailyPnl)} 元（${signNum(funds.dailyPnlPct)}%） ｜ **累计** ${signNum(funds.totalPnl)} 元（${signNum(funds.totalPnlPct)}%）`,
+      '',
+    );
+    for (const r of funds.holdings) {
+      const icon = r.quoteStale || r.quoteMissing ? '⚠️' : r.dailyPnl > 0 ? '🔴' : r.dailyPnl < 0 ? '🟢' : '⚪';
+      const dailySeg = r.quoteMissing
+        ? '当日 行情未取到'
+        : r.quoteStale
+          ? (r.quoteDate && r.quoteDate !== today ? `当日 数据过期(${r.quoteDate})` : '当日 休市/盘前')
+          : `当日 ${signNum(r.dailyPnl)}（${signNum(r.changePct)}%）`;
+      lines.push(
+        `- ${icon} **${r.name}** \`${r.code}\` ｜ 净值 ${r.currentNav.toFixed(4)} / ${r.shares.toFixed(2)} 份 ｜ 市值 ${r.currentAsset.toFixed(2)} ｜ ${dailySeg} ｜ 累计 ${signNum(r.totalPnl)}（${signNum(r.totalPnlPct)}%） ｜ ${r.navSource}`,
+      );
+    }
   }
 
   lines.push(
@@ -551,6 +751,8 @@ async function computeValuation(db, mode = 'noon', offline = false, opts = {}) {
       dailyPnlPct,
       totalPnl,
       totalPnlPct,
+      stocks,
+      funds,
       holdings: rows,
     },
   };
@@ -783,14 +985,27 @@ export async function runAction(action = 'status', args = {}, depsOrCtx = {}) {
       let initNavDate = String(existing.init_nav_date);
       if (typeof safeArgs.navDate === 'string' && safeArgs.navDate.trim()) {
         initNavDate = safeArgs.navDate.trim();
-        const history = await fetchFundNavHistory(code, 20, fetchFn, signal);
-        const matched = history.find(item => item.navDate === initNavDate);
-        if (!matched || !Number.isFinite(matched.nav) || matched.nav <= 0) {
-          throw new Error(`未找到 ${code} 在 ${initNavDate} 的正式净值`);
-        }
-        initNav = matched.nav;
-        if (safeArgs.shares === undefined) {
-          shares = Number((initAmount / initNav).toFixed(4));
+        if (String(existing.fund_type) === 'a_stock') {
+          if (safeArgs.initNav !== undefined) {
+            const parsedInitNav = Number(safeArgs.initNav);
+            if (!Number.isFinite(parsedInitNav) || parsedInitNav <= 0) {
+              return { ok: false, notify: false, title: '更新基金失败', message: 'initNav 必须是大于 0 的有限数字。' };
+            }
+            initNav = parsedInitNav;
+            if (safeArgs.shares === undefined) {
+              shares = Number((initAmount / initNav).toFixed(4));
+            }
+          }
+        } else {
+          const history = await fetchFundNavHistory(code, 20, fetchFn, signal);
+          const matched = history.find(item => item.navDate === initNavDate);
+          if (!matched || !Number.isFinite(matched.nav) || matched.nav <= 0) {
+            throw new Error(`未找到 ${code} 在 ${initNavDate} 的正式净值`);
+          }
+          initNav = matched.nav;
+          if (safeArgs.shares === undefined) {
+            shares = Number((initAmount / initNav).toFixed(4));
+          }
         }
       } else if (safeArgs.initAmount !== undefined && safeArgs.shares === undefined) {
         const currentNav = Number(existing.last_nav) > 0 ? Number(existing.last_nav) : initNav;

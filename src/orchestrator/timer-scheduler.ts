@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { resolveImDeliveryTarget } from '../im/types.js';
 import { runPlugin } from '../plugin.js';
 import { formatFlowSessionId } from '../session.js';
 import type { Store, Task, Timer } from '../store.js';
@@ -64,11 +65,9 @@ export function resolveStoreChannelOrigin(
     : (channels.find(c => c.enabled && (c.id === normalizedSpec || c.platform === normalizedSpec || c.name === trimmed))
       ?? channels.find(c => c.id === normalizedSpec || c.platform === normalizedSpec || c.name === trimmed));
   if (ch && ch.enabled) {
-    const target = deliverTarget
-      ?? ch.defaultTarget
-      ?? Object.keys(ch.contextTokens ?? {})[0]
-      ?? ch.allowedSenders[0]
-      ?? 'default';
+    const resolvedTarget = resolveImDeliveryTarget(ch, deliverTarget);
+    if (!resolvedTarget && ch.platform === 'wechat' && ch.botToken && !ch.webhookUrl) return undefined;
+    const target = resolvedTarget ?? 'default';
     return {
       channel: ch.platform,
       channelId: ch.id,
@@ -183,8 +182,8 @@ export class TimerScheduler {
 
   resolveTimerOrigin(timer: Timer): MessageOrigin | undefined {
     if (timer.deliverChannelId) {
-      const resolved = resolveStoreChannelOrigin(this.host.store, timer.deliverChannelId, timer.deliverTarget);
-      if (resolved) return resolved;
+      // A configured destination must not fall back to the stored origin of a previous binding.
+      return resolveStoreChannelOrigin(this.host.store, timer.deliverChannelId, timer.deliverTarget);
     }
     return timer.origin;
   }
@@ -193,7 +192,6 @@ export class TimerScheduler {
     const now = Date.now();
     timer.lastRunAt = now;
     timer.pendingCatchup = false;
-    const origin = this.resolveTimerOrigin(timer);
     if (timer.plugin) {
       const pluginName = timer.plugin;
       const pluginAction = timer.pluginAction ?? 'status';
@@ -216,6 +214,7 @@ export class TimerScheduler {
           this.host.store.notice('system', 'timer_plugin_silent', `定时插件「${timer.name}」(${pluginName}/${pluginAction}) 已执行（静默跳过通知）`);
           return;
         }
+        const origin = this.resolveTimerOrigin(timer);
         const timerMsgId = randomUUID();
         const timerSessionId = formatFlowSessionId(timerMsgId);
         const userMsg = this.host.store.conversation.create({
@@ -257,6 +256,7 @@ export class TimerScheduler {
 
     if (this.submittingTaskTimers.has(timer.id)) return;
     const fireSlot = plannedRunAt ?? now;
+    const origin = this.resolveTimerOrigin(timer);
     const timerMsgId = randomUUID();
     const message = this.host.store.conversation.create({
       id: timerMsgId,

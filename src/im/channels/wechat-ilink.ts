@@ -35,6 +35,7 @@ const WECHAT_QR_SESSION_TTL_MS = 10 * 60_000;
 interface InternalWechatQrSession extends WechatQrLoginSession {
   apiBase: string;
   createdAt: number;
+  allowedSenders?: string[];
   inFlightPromise?: Promise<void>;
 }
 
@@ -290,23 +291,32 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
       },
     });
 
-    let receivedAny = false;
-    if (Array.isArray(data.msgs)) {
-      receivedAny = data.msgs.length > 0;
-      for (const msg of data.msgs) {
-        const inbound = parseWechatIlinkMessage(channel.id, msg, channel.accountId);
-        if (inbound) {
-          this.ctx.markTrustedWechatInbound(inbound);
-          await this.ctx.ingestMessage(inbound);
-        }
+    const currentBinding = () => {
+      const current = this.ctx.coordinator.store.getImChannel(channel.id);
+      return current.enabled && current.platform === 'wechat' && current.botToken === channel.botToken
+        && current.accountId === channel.accountId
+        && (!channel.defaultTarget || current.defaultTarget === channel.defaultTarget)
+        ? current : undefined;
+    };
+    // getupdates is a long poll. Its result and cursor belong to the login that started it.
+    if (!currentBinding()) return { receivedAny: false };
+    const messages = Array.isArray(data.msgs) ? data.msgs : [];
+    for (const msg of messages) {
+      if (!currentBinding()) return { receivedAny: false };
+      const inbound = parseWechatIlinkMessage(channel.id, msg, channel.accountId);
+      if (inbound) {
+        this.ctx.markTrustedWechatInbound(inbound);
+        await this.ctx.ingestMessage(inbound);
       }
     }
-    if (typeof data.get_updates_buf === 'string' && data.get_updates_buf !== channel.syncBuf) {
-      const current = this.ctx.coordinator.store.getImChannel(channel.id);
-      current.syncBuf = data.get_updates_buf;
-      this.ctx.coordinator.store.saveImChannel(current);
+    if (typeof data.get_updates_buf === 'string') {
+      const current = currentBinding();
+      if (current && data.get_updates_buf !== current.syncBuf) {
+        current.syncBuf = data.get_updates_buf;
+        this.ctx.coordinator.store.saveImChannel(current);
+      }
     }
-    return { receivedAny };
+    return { receivedAny: messages.length > 0 };
   }
 
   async sendAttachment(
@@ -329,6 +339,16 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
     ) {
       throw new Error('微信附件发送未获授权或缺少会话凭证');
     }
+    const currentBinding = () => {
+      try {
+        const latest = this.ctx.coordinator.store.getImChannel(channelId);
+        return !latest.webhookUrl && latest.botToken === channel.botToken && latest.accountId === channel.accountId
+          && latest.defaultTarget === channel.defaultTarget && this.isPeerAuthorized(latest, options.target)
+          ? latest : undefined;
+      } catch {
+        return undefined;
+      }
+    };
     if (resolveEnv('FRIDAY_WECHAT_ATTACHMENT_DIR', 'SUPER_AGENT_WECHAT_ATTACHMENT_DIR') === undefined) {
       await mkdir(root, { recursive: true, mode: 0o700 }).catch(() => {});
     }
@@ -343,18 +363,23 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
         base: (channel.apiBase ?? DEFAULT_WECHAT_ILINK_BASE).replace(/\/$/, ''),
         headers: buildWechatIlinkHeaders(channel.botToken),
         signal: this.ctx.shutdownSignal,
+        isBindingCurrent: () => Boolean(currentBinding()),
       });
-      const latest = this.ctx.coordinator.store.getImChannel(channelId);
-      latest.outboundCount++;
-      latest.lastOutboundAt = Date.now();
-      latest.lastError = undefined;
-      latest.updatedAt = Date.now();
-      this.ctx.coordinator.store.saveImChannel(latest);
+      const latest = currentBinding();
+      if (latest) {
+        latest.outboundCount++;
+        latest.lastOutboundAt = Date.now();
+        latest.lastError = undefined;
+        latest.updatedAt = Date.now();
+        this.ctx.coordinator.store.saveImChannel(latest);
+      }
     } catch (error) {
-      const latest = this.ctx.coordinator.store.getImChannel(channelId);
-      latest.lastError = sanitizeImError(error, [channel.botToken, channel.secret]);
-      latest.updatedAt = Date.now();
-      this.ctx.coordinator.store.saveImChannel(latest);
+      const latest = currentBinding();
+      if (latest) {
+        latest.lastError = sanitizeImError(error, [channel.botToken, channel.secret]);
+        latest.updatedAt = Date.now();
+        this.ctx.coordinator.store.saveImChannel(latest);
+      }
       throw error;
     }
   }
@@ -382,31 +407,17 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
     ) {
       return { ok: false, action: 'rejected', reason: 'attachment_not_authorized' };
     }
-    if (resolveEnv('FRIDAY_WECHAT_ATTACHMENT_DIR', 'SUPER_AGENT_WECHAT_ATTACHMENT_DIR') === undefined) {
-      await mkdir(root, { recursive: true, mode: 0o700 }).catch(() => {});
-    }
     try {
-      await deliverWechatFile({
-        root,
-        name: rawText.slice(6).trim(),
+      await this.sendAttachment(channel.id, rawText.slice(6), {
         target: inbound.senderId,
         contextToken: inbound.contextToken,
-        accountId: channel.accountId,
-        base: (channel.apiBase ?? DEFAULT_WECHAT_ILINK_BASE).replace(/\/$/, ''),
-        headers: buildWechatIlinkHeaders(channel.botToken),
-        signal: this.ctx.shutdownSignal,
       });
-      channel.outboundCount++;
-      channel.lastOutboundAt = Date.now();
-      channel.lastError = undefined;
-      this.ctx.coordinator.store.saveImChannel(channel);
       return { ok: true, action: 'attachment_sent' };
     } catch (error) {
-      channel.lastError = sanitizeImError(error, [channel.botToken, channel.secret]);
-      this.ctx.coordinator.store.saveImChannel(channel);
+      const message = sanitizeImError(error, [channel.botToken, channel.secret]);
       await this.ctx.sendToChannel(
         channel.id,
-        `⚠️ 附件发送失败（请确认文件存在于附件目录且文件名合法）：${channel.lastError}`,
+        `⚠️ 附件发送失败（请确认文件存在于附件目录且文件名合法）：${message}`,
         replyOpts,
       ).catch(() => {});
       return { ok: false, action: 'attachment_failed', reason: 'delivery_failed' };
@@ -428,6 +439,7 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
       existing = this.ctx.coordinator.store.listImChannels().find(ch => ch.platform === 'wechat');
     }
 
+    if (existing && existing.platform !== 'wechat') throw new Error('仅支持对微信通道发起扫码绑定');
     const channelId = existing?.id ?? input?.id?.trim() ?? 'wechat-clawbot';
     const channelName = (input?.name?.trim() || existing?.name || '微信个人号 (扫码绑定)').slice(0, 120);
     const apiBase = (input?.apiBase?.trim() || existing?.apiBase || DEFAULT_WECHAT_ILINK_BASE).replace(/\/$/, '');
@@ -436,9 +448,8 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
       id: channelId,
       platform: 'wechat',
       name: channelName,
-      apiBase,
+      apiBase: existing?.botToken ? existing.apiBase : apiBase,
       notifyAll: input?.notifyAll ?? existing?.notifyAll ?? false,
-      allowedSenders: input?.allowedSenders ?? existing?.allowedSenders,
     });
 
     const url = `${apiBase}/ilink/bot/get_bot_qrcode?bot_type=3`;
@@ -478,8 +489,14 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
       status: 'wait',
       apiBase,
       createdAt: Date.now(),
+      allowedSenders: input?.allowedSenders,
       channel: channelView,
     };
+    for (const previous of this.qrSessions.values()) {
+      if (previous.channelId === channelId && (previous.status === 'wait' || previous.status === 'scaned')) {
+        previous.status = 'expired';
+      }
+    }
     this.qrSessions.set(sessionId, session);
     return this.toPublicQrSession(session);
   }
@@ -497,7 +514,7 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
     if (!session) {
       throw new Error('未找到进行中的微信扫码会话，请重新发起扫码绑定');
     }
-    if (session.status === 'confirmed' || session.status === 'expired') {
+    if (session.status === 'confirmed' || session.status === 'expired' || session.status === 'error') {
       return this.toPublicQrSession(session);
     }
 
@@ -542,6 +559,8 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
         throw new Error(`轮询二维码状态失败: HTTP ${res.status}`);
       }
       const data = await res.json() as Record<string, unknown>;
+      if (session.status === 'expired' || this.qrSessions.get(session.sessionId) !== session
+        || Date.now() - session.createdAt >= WECHAT_QR_SESSION_TTL_MS) return;
       const rawStatus = String(data.status ?? 'wait').toLowerCase();
       session.error = undefined;
       if (rawStatus === 'scaned' || rawStatus === 'scanned') {
@@ -556,39 +575,37 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
           ? data.baseurl.trim().replace(/\/$/, '')
           : session.apiBase;
 
-        if (!botToken) {
-          throw new Error('微信扫码已确认，但未返回 bot_token');
-        }
-
         const channel = this.ctx.coordinator.store.getImChannel(session.channelId);
-        const accountChanged = Boolean(accountId && channel.accountId && accountId !== channel.accountId);
-        const tokenChanged = Boolean(channel.botToken && botToken !== channel.botToken);
-        channel.enabled = true;
-        channel.botToken = botToken;
-        channel.accountId = accountId ?? channel.accountId;
-        channel.apiBase = returnedBaseUrl;
-        if (accountChanged || tokenChanged) {
+        if (channel.platform !== 'wechat') throw new Error('扫码绑定的微信通道已变更');
+        const incomplete = !botToken || !accountId || !userId;
+        const bindingChanged = incomplete || channel.botToken !== botToken || channel.accountId !== accountId
+          || channel.defaultTarget !== userId;
+        if (bindingChanged) {
           channel.syncBuf = undefined;
           channel.pollOffset = undefined;
-          channel.contextTokens = {};
-          channel.contextTokenUpdatedAt = {};
+          channel.contextTokens = undefined;
+          channel.contextTokenUpdatedAt = undefined;
+          channel.lastInboundAt = undefined;
+          this.clearChannelTyping(channel.id);
         }
-        if (userId) {
-          if (!channel.defaultTarget || accountChanged) {
-            channel.defaultTarget = userId;
-          }
-          if (!channel.allowedSenders.includes(userId)) {
-            channel.allowedSenders = [...channel.allowedSenders, userId];
-          }
-        }
-        channel.lastError = undefined;
+        channel.enabled = !incomplete;
+        channel.botToken = incomplete ? undefined : botToken;
+        channel.accountId = incomplete ? undefined : accountId;
+        channel.defaultTarget = incomplete ? undefined : userId;
+        channel.apiBase = returnedBaseUrl;
+        // A new QR owner replaces the old binding's implicit authorization. Only carry over
+        // additional peers explicitly provided for this QR, or peers from the unchanged binding.
+        const allow = session.allowedSenders ?? (bindingChanged ? [] : channel.allowedSenders);
+        channel.allowedSenders = incomplete || !userId ? [] : [...new Set([userId, ...allow.map(s => s.trim()).filter(Boolean)])];
+        channel.lastError = incomplete ? '微信已确认扫码，但未返回完整绑定身份；已暂停投递，请重新扫码绑定。' : undefined;
         channel.updatedAt = Date.now();
         this.ctx.coordinator.store.saveImChannel(channel);
         this.host.syncPollers();
 
-        session.status = 'confirmed';
+        session.status = incomplete ? 'error' : 'confirmed';
+        session.error = channel.lastError;
         session.accountId = channel.accountId;
-        session.userId = userId ?? channel.defaultTarget;
+        session.userId = channel.defaultTarget;
         session.channel = this.ctx.coordinator.store.toImChannelView(channel);
       } else if (rawStatus === 'expired' || rawStatus === 'canceled' || rawStatus === 'cancelled') {
         session.status = 'expired';
@@ -644,7 +661,8 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
       && channel.botToken
       && !channel.webhookUrl
       && !replyWebhook
-      && userId,
+      && userId
+      && (!channel.allowedSenders.length || channel.allowedSenders.includes(userId)),
     );
   }
 

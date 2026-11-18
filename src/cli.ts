@@ -340,6 +340,8 @@ async function main() {
             return;
           } else if (status === 'expired') {
             throw new Error('二维码已过期，请重新执行 friday im login');
+          } else if (status === 'error') {
+            throw new Error(String(current.error ?? '二维码登录失败，请重新执行 friday im login'));
           }
         }
         throw new Error('等待微信扫码超时，请重新执行 friday im login');

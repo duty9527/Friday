@@ -1024,6 +1024,17 @@ export function createRouterTools(
           ...(origin.replyToMessageId ? { replyToMessageId: origin.replyToMessageId } : {}),
         });
       } else {
+        let currentChannelAccountId: string | undefined;
+        let hasStoredChannel = false;
+        try {
+          currentChannelAccountId = host.store.getImChannel(origin.channelId).accountId;
+          hasStoredChannel = true;
+        } catch {
+          hasStoredChannel = false;
+        }
+        if (hasStoredChannel && origin.accountId !== undefined && origin.accountId !== currentChannelAccountId) {
+          throw new Error('微信账号已换绑，拒绝向旧会话发送附件；请从当前微信会话重新请求');
+        }
         await host.im.sendWechatAttachment(origin.channelId, fileName, {
           target,
           contextToken: origin.contextToken,

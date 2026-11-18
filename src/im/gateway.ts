@@ -32,6 +32,7 @@ import {
   isAllowedReplyWebhook,
   isSuspiciousBrowserWebhookRequest,
   jsonWebhookResponse,
+  resolveImDeliveryTarget,
   sanitizeImError,
   type CoordinatorWithHooks,
   type ImChannelAdapter,
@@ -332,19 +333,21 @@ export class ImGateway {
     return deleted;
   }
 
-  async testChannel(id: string, customText?: string): Promise<{ ok: boolean; channel: ImChannelView }> {
+  async testChannel(id: string, customText?: string): Promise<{ ok: boolean; target?: string; channel: ImChannelView }> {
     const channel = this.coordinator.store.getImChannel(id);
     const text = customText?.trim() || (channel.platform === 'xiaoai'
       ? `星期五语音链路自检成功，通道${channel.name}已连接。`
       : `🤖 [FRIDAY 神经链路自检] 通道「${channel.name}」(${channel.platform}) 已成功连接至 F.R.I.D.A.Y.。`);
-    await this.sendToChannel(channel.id, text);
-    return { ok: true, channel: this.coordinator.store.toImChannelView(this.coordinator.store.getImChannel(id)) };
+    const target = resolveImDeliveryTarget(channel);
+    await this.sendToChannel(channel.id, text, { target });
+    return { ok: true, target, channel: this.coordinator.store.toImChannelView(this.coordinator.store.getImChannel(id)) };
   }
 
   async sendToChannel(channelId: string, text: string, options?: ImSendOptions): Promise<void> {
     const channel = this.coordinator.store.getImChannel(channelId);
+    if (!channel.enabled) throw new Error('IM 通道已停用');
     const explicitTarget = options?.target && options.target !== 'default' ? options.target : undefined;
-    const target = explicitTarget ?? channel.defaultTarget ?? Object.keys(channel.contextTokens ?? {})[0] ?? channel.allowedSenders[0];
+    const target = resolveImDeliveryTarget(channel, explicitTarget);
     const resolvedOpts: ImSendOptions = { ...options, target };
     const adapter = this.selectOutboundAdapter(channel, options);
     try {
