@@ -589,7 +589,15 @@ test('ModelHub, parseModelSpec, discovery, decision & UsageStore hardening', asy
     }
 
     // 3. ModelHub: env key non-persistence, env rotation, routerModel validation, baseUrl clearing, HTTP safety, cross-origin protection
-    const tiers = offlineFactory(5).modelTiers!;
+    const baseTiers = offlineFactory(5).modelTiers!;
+    const tiers = {
+      ...baseTiers,
+      provider: 'deepseek',
+      router: 'deepseek-chat',
+      fast: 'deepseek-chat',
+      balanced: 'deepseek-chat',
+      strong: 'deepseek-reasoner',
+    };
     const hub = new ModelHub(home, 'offline', { ...tiers }, 'deepseek');
     await hub.init({ deepseek: 'sk-env-secret-v1' });
     await hub.configure({ providerId: 'deepseek', customModels: ['deepseek-chat'] });
@@ -605,7 +613,54 @@ test('ModelHub, parseModelSpec, discovery, decision & UsageStore hardening', asy
       () => hub.configure({ routerProvider: 'deepseek', routerModel: 'deepseek/does-not-exist-999' }),
       /未找到主控模型/,
     );
+    await assert.rejects(
+      () => hub.configure({ routerProvider: 'custom-unknown', routerModel: 'custom-unknown/does-not-exist' }),
+      /未找到主控模型/,
+    );
     assert.equal((await hub.getView()).routerModel, tiers.router);
+
+    // Switching routerProvider alone without routerModel aligns routerModel to target provider's catalog/default
+    const alignedView = await hub.configure({ providerId: 'openai', apiKey: 'sk-openai-align', routerProvider: 'openai' });
+    assert.equal(alignedView.routerProvider, 'openai');
+    assert.notEqual(alignedView.routerModel, tiers.router, 'routerModel aligns away from previous deepseek model');
+    assert.ok(
+      alignedView.providers.find(p => p.id === 'openai')?.models.some(m => m.id === alignedView.routerModel),
+      'aligned routerModel exists in openai catalog',
+    );
+    // Reset router back to deepseek for subsequent assertions
+    await hub.configure({ routerProvider: 'deepseek', routerModel: 'deepseek/deepseek-chat' });
+
+    // Reopening from model-hub.json with routerProvider='openai' and omitted routerModel aligns before onTiersUpdated runs
+    const alignHome = await mkdtemp(join(await realpath(tmpdir()), 'sa-hub-align-reopen-'));
+    try {
+      await mkdir(join(alignHome, 'sdk'), { recursive: true });
+      await writeFile(
+        join(alignHome, 'sdk', 'model-hub.json'),
+        JSON.stringify({
+          routerProvider: 'openai',
+          providers: { openai: { apiKey: 'sk-openai-reopen', selectedModels: ['gpt-4.1'] } },
+        }),
+      );
+      const seenUpdates: Array<{ provider: string; model: string }> = [];
+      const reopenHub = new ModelHub(
+        alignHome,
+        'offline',
+        { ...tiers, provider: 'deepseek', router: 'deepseek-chat' },
+        'deepseek',
+        undefined,
+        (_tiers, rProv, rModel) => {
+          seenUpdates.push({ provider: rProv, model: rModel });
+        },
+      );
+      await reopenHub.init();
+      const reopenedView = await reopenHub.getView();
+      assert.equal(reopenedView.routerProvider, 'openai');
+      assert.notEqual(reopenedView.routerModel, 'deepseek-chat');
+      assert.ok(seenUpdates.length > 0 && seenUpdates.at(-1)!.provider === 'openai' && seenUpdates.at(-1)!.model !== 'deepseek-chat');
+      await reopenHub.close();
+    } finally {
+      await rm(alignHome, { recursive: true, force: true });
+    }
 
     // Non-loopback plaintext HTTP with credentials rejects
     await assert.rejects(

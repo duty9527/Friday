@@ -445,7 +445,21 @@ export class ModelHub {
       const defaultSample = baseModels[0];
       const fallbackModels = FALLBACK_PROVIDER_MODELS[providerId] ?? [];
 
-      if (cfg.fetchedModels?.length || cfg.baseUrl || cfg.customModels?.length || (!baseModels.length && fallbackModels.length)) {
+      const activeRouterProv = normalizeProviderId(this.state.routerProvider) ?? this.currentRouterProvider;
+      const customRouterModelId = cfg.baseUrl && providerId === activeRouterProv
+        ? this.state.routerModel?.trim()
+        : undefined;
+      const selectedModelIds = Array.isArray(cfg.selectedModels)
+        ? normalizeSelectedModels(cfg.selectedModels).map(s => s.id)
+        : [];
+      if (
+        cfg.fetchedModels?.length
+        || cfg.baseUrl
+        || cfg.customModels?.length
+        || selectedModelIds.length
+        || Boolean(customRouterModelId)
+        || (!baseModels.length && fallbackModels.length)
+      ) {
         const catalogMap = new Map<string, ModelCatalogEntry>();
         for (const m of cfg.fetchedModels ?? []) {
           catalogMap.set(m.id, m);
@@ -467,7 +481,12 @@ export class ModelHub {
             if (!catalogMap.has(fm.id)) catalogMap.set(fm.id, fm);
           }
         }
-        for (const customId of cfg.customModels ?? []) {
+        const extraModelIds = [
+          ...(cfg.customModels ?? []),
+          ...selectedModelIds,
+          ...(customRouterModelId ? [customRouterModelId] : []),
+        ];
+        for (const customId of extraModelIds) {
           if (customId && !catalogMap.has(customId)) {
             const bm = baseById.get(customId) ?? getPristineSdkModel(providerId, customId);
             catalogMap.set(customId, {
@@ -568,6 +587,18 @@ export class ModelHub {
       this.state.routerProvider = routerProvider;
       this.state.routerModel = routerModel;
     }
+    if (routerProvider !== 'offline') {
+      const persistedRouterCfg = this.state.providers[routerProvider];
+      if (!this.isRouterModelAvailableInProvider(runtime, routerProvider, routerModel, persistedRouterCfg)) {
+        const aligned = this.pickDefaultRouterModelForProvider(runtime, routerProvider, persistedRouterCfg);
+        if (aligned) {
+          routerModel = aligned;
+          if (this.state.routerProvider !== undefined || this.state.routerModel !== undefined) {
+            this.state.routerModel = aligned;
+          }
+        }
+      }
+    }
     if (workerProvider !== 'offline') {
       const workerPoolDefault = this.cachedCatalog.find(p => p.providerId === workerProvider)?.modelId;
       const defaultWorker = this.state.strongModel ?? this.state.balancedModel ?? workerPoolDefault ?? this.currentTiers.strong;
@@ -590,6 +621,42 @@ export class ModelHub {
     // 模型池依赖最新的 Worker 档位，档位更新后重建一次
     await this.rebuildPoolCache(runtime);
     this.onTiersUpdated?.(this.currentTiers, this.currentRouterProvider, this.currentTiers.router, this.disabledProviders());
+  }
+
+  private isRouterModelAvailableInProvider(
+    runtime: ModelRuntime,
+    providerId: string,
+    modelId: string | undefined,
+    persisted?: PersistedProviderConfig,
+  ): boolean {
+    const clean = modelId?.trim();
+    if (!clean) return false;
+    if (runtime.getModel(providerId, clean) || getPristineSdkModel(providerId, clean)) return true;
+    if (persisted?.customModels?.includes(clean)) return true;
+    if (Array.isArray(persisted?.selectedModels) && normalizeSelectedModels(persisted.selectedModels).some(s => s.id === clean)) return true;
+    return this.buildProviderCatalogModels(runtime, providerId, persisted).some(m => m.id === clean);
+  }
+
+  private pickDefaultRouterModelForProvider(
+    runtime: ModelRuntime,
+    providerId: string,
+    persisted?: PersistedProviderConfig,
+  ): string | undefined {
+    const catalog = this.buildProviderCatalogModels(runtime, providerId, persisted);
+    const sampleDefault = catalog[0]?.id ?? 'default';
+    const tiers = buildModelTiers(runtime, providerId, sampleDefault, sampleDefault, {
+      hasCustomBaseUrl: Boolean(persisted?.baseUrl),
+    });
+    if (catalog.some(m => m.id === tiers.balanced)) return tiers.balanced;
+    if (catalog.length > 0) return catalog[0]!.id;
+    const firstRuntime = runtime.getModels(providerId)[0]?.id;
+    if (firstRuntime) return firstRuntime;
+    const customFirst = persisted?.customModels?.map(m => m.trim()).find(Boolean);
+    if (customFirst) return customFirst;
+    const selectedFirst = Array.isArray(persisted?.selectedModels)
+      ? normalizeSelectedModels(persisted.selectedModels)[0]?.id
+      : undefined;
+    return selectedFirst || undefined;
   }
 
   private resolveCatalogThinkingLevels(
@@ -1413,6 +1480,7 @@ export class ModelHub {
     }
 
     let nextRouterModel = this.state.routerModel;
+    let routerModelAligned = false;
     if (input.routerModel !== undefined && input.routerModel.trim()) {
       const rawRouter = input.routerModel.trim();
       const parsedRouter = parseModelSpec(rawRouter, {
@@ -1429,17 +1497,24 @@ export class ModelHub {
       }
       if (resolvedProv && resolvedProv !== 'offline') {
         const pendingCfg = nextProviders[resolvedProv];
-        const catalog = this.buildProviderCatalogModels(runtime, resolvedProv, pendingCfg);
-        const inCustom = Boolean(pendingCfg?.customModels?.includes(parsedRouter.modelId));
-        const inCatalog = catalog.some(m => m.id === parsedRouter.modelId)
-          || Boolean(runtime.getModel(resolvedProv, parsedRouter.modelId))
-          || Boolean(getPristineSdkModel(resolvedProv, parsedRouter.modelId));
-        if (catalog.length > 0 && !inCatalog && !inCustom) {
+        const available = this.isRouterModelAvailableInProvider(runtime, resolvedProv, parsedRouter.modelId, pendingCfg);
+        if (!available && !pendingCfg?.baseUrl) {
           throw new Error(`在提供方 "${resolvedProv}" 目录中未找到主控模型 "${parsedRouter.modelId}"`);
         }
       }
       nextRouterProvider = resolvedProv;
       nextRouterModel = parsedRouter.modelId;
+    } else if (explicitRouterProvider && nextRouterProvider !== 'offline') {
+      const pendingCfg = nextProviders[nextRouterProvider];
+      const currentCandidate = nextRouterModel ?? this.currentTiers.router;
+      if (!this.isRouterModelAvailableInProvider(runtime, nextRouterProvider, currentCandidate, pendingCfg)) {
+        const aligned = this.pickDefaultRouterModelForProvider(runtime, nextRouterProvider, pendingCfg);
+        if (!aligned) {
+          throw new Error(`提供方 "${nextRouterProvider}" 当前没有可用的主控模型，请先配置模型或拉取模型列表`);
+        }
+        nextRouterModel = aligned;
+        routerModelAligned = true;
+      }
     }
 
     // Commit validated changes atomically to memory before syncing / persisting.
@@ -1470,11 +1545,11 @@ export class ModelHub {
       delete this.state.balancedModel;
       delete this.state.strongModel;
     }
-    if (input.routerProvider !== undefined && input.routerProvider.trim() || input.routerModel !== undefined && input.routerModel.trim()) {
+    if ((input.routerProvider !== undefined && input.routerProvider.trim()) || (input.routerModel !== undefined && input.routerModel.trim())) {
       this.state.routerProvider = nextRouterProvider;
       this.currentRouterProvider = nextRouterProvider;
     }
-    if (input.routerModel !== undefined && input.routerModel.trim()) {
+    if ((input.routerModel !== undefined && input.routerModel.trim()) || routerModelAligned) {
       this.state.routerModel = nextRouterModel;
     }
     if (input.fastModel !== undefined) {
