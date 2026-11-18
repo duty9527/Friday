@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
-import { BoundedMap, buildRequestSignal } from '../im/types.js';
+import { BoundedMap, buildRequestSignal, isAllowedReplyWebhook, sanitizeImError } from '../im/types.js';
 import type { ImChannelConfig } from '../store.js';
 import {
   callMinaRemoteUbus,
@@ -36,8 +36,10 @@ export interface XiaoaiSendOptions {
 }
 
 const MAX_RUNTIME_ENTRIES = 64;
+const MAX_BINARY_CHILD_STDOUT_BYTES = 4 * 1024 * 1024;
 const xiaoaiSpeakingGuards = new BoundedMap<string, { until: number }>(MAX_RUNTIME_ENTRIES);
 const xiaoaiSpeechEpochs = new BoundedMap<string, number>(MAX_RUNTIME_ENTRIES);
+const xiaoaiPendingWakes = new BoundedMap<string, Promise<void>>(MAX_RUNTIME_ENTRIES);
 
 function xiaoaiRuntimeKey(channelId: string, targetId: string): string {
   return `${channelId}:${targetId}`;
@@ -149,12 +151,13 @@ function runBinaryChild(
   return new Promise((resolve) => {
     const child = spawn(cmd, args, { stdio: ['pipe', 'pipe', 'ignore'] });
     const chunks: Buffer[] = [];
+    let totalBytes = 0;
     let settled = false;
-    const finish = (code: number) => {
+    const finish = (code: number, empty = false) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve({ code, stdout: Buffer.concat(chunks) });
+      resolve({ code, stdout: empty ? Buffer.alloc(0) : Buffer.concat(chunks) });
     };
     const timer = setTimeout(() => {
       try { child.kill('SIGKILL'); } catch { /* ignore */ }
@@ -162,7 +165,15 @@ function runBinaryChild(
     }, timeoutMs);
     timer.unref?.();
     child.stdout.on('data', (chunk: Buffer) => {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      totalBytes += buf.length;
+      if (totalBytes > MAX_BINARY_CHILD_STDOUT_BYTES) {
+        try { child.kill('SIGKILL'); } catch { /* ignore */ }
+        chunks.length = 0;
+        finish(1, true);
+        return;
+      }
+      chunks.push(buf);
     });
     child.stdin.on('error', () => {});
     child.once('error', () => finish(1));
@@ -282,11 +293,22 @@ export async function handleXiaoaiKeywordWake(params: {
         now: params.now,
       })
     : undefined;
-  const res = await sshRunner(
+  const runtimeKey = xiaoaiRuntimeKey(channel.id, target.id);
+  const wakePromise = sshRunner(
     target,
     buildXiaoaiWakeCommand({ chime: useChime, greetingText }),
     { timeoutMs: 12_000 },
   );
+  const trackedWake = wakePromise.then(() => {}, () => {});
+  xiaoaiPendingWakes.set(runtimeKey, trackedWake);
+  let res: { stdout: string; stderr: string; code: number };
+  try {
+    res = await wakePromise;
+  } finally {
+    if (xiaoaiPendingWakes.get(runtimeKey) === trackedWake) {
+      xiaoaiPendingWakes.delete(runtimeKey);
+    }
+  }
   if (res.code !== 0) {
     throw new Error(res.stderr.trim() || `小爱唤醒触发失败 (exit=${res.code})`);
   }
@@ -305,10 +327,11 @@ async function waitForXiaoaiSegmentPlayback(
   sshRunner: XiaoaiSshRunner,
   segmentLength: number,
   isCancelled?: () => boolean,
-): Promise<void> {
-  if (isCancelled?.()) return;
+  shutdownSignal?: AbortSignal,
+): Promise<'completed' | 'unknown' | 'cancelled'> {
+  if (isCancelled?.() || shutdownSignal?.aborted) return 'cancelled';
   const probe = await sshRunner(target, SSH_PLAY_STATUS_COMMAND, { timeoutMs: 4_000 }).catch(() => undefined);
-  if (!probe || probe.code !== 0 || !probe.stdout.trim()) return;
+  if (!probe || probe.code !== 0 || !probe.stdout.trim()) return 'unknown';
 
   const startedAt = Date.now();
   let sawPlaying = isXiaoaiPlayerPlaying(probe.stdout);
@@ -316,21 +339,26 @@ async function waitForXiaoaiSegmentPlayback(
   const maxWaitMs = Math.min(45_000, Math.max(6_000, segmentLength * 350));
 
   while (Date.now() - startedAt < maxWaitMs) {
-    if (isCancelled?.()) return;
-    if (sawPlaying || Date.now() - startedAt >= startGraceMs) {
-      if (!sawPlaying) return;
+    if (isCancelled?.() || shutdownSignal?.aborted) return 'cancelled';
+    if (!sawPlaying && Date.now() - startedAt >= startGraceMs) {
+      return 'unknown';
     }
-    await delay(220);
-    if (isCancelled?.()) return;
+    try {
+      await delay(220, undefined, shutdownSignal ? { signal: shutdownSignal } : undefined);
+    } catch {
+      return 'cancelled';
+    }
+    if (isCancelled?.() || shutdownSignal?.aborted) return 'cancelled';
     const res = await sshRunner(target, SSH_PLAY_STATUS_COMMAND, { timeoutMs: 4_000 }).catch(() => undefined);
-    if (!res || res.code !== 0 || !res.stdout.trim()) return;
+    if (!res || res.code !== 0 || !res.stdout.trim()) return sawPlaying ? 'completed' : 'unknown';
     const playing = isXiaoaiPlayerPlaying(res.stdout);
     if (playing) {
       sawPlaying = true;
       continue;
     }
-    if (sawPlaying) return;
+    if (sawPlaying) return 'completed';
   }
+  return sawPlaying ? 'completed' : 'unknown';
 }
 
 export async function sendXiaoaiSpeech(
@@ -340,7 +368,11 @@ export async function sendXiaoaiSpeech(
 ): Promise<{ segments: string[]; mode: 'webhook' | 'ssh' | 'cloud' }> {
   const sshTargets = parseXiaoaiSshTargets(channel.apiBase);
   const fetchFn = options?.fetchImpl ?? globalThis.fetch;
-  const webhookUrl = options?.replyWebhook?.trim()
+  const requestedReplyWebhook = options?.replyWebhook?.trim();
+  if (requestedReplyWebhook && !isAllowedReplyWebhook('xiaoai', requestedReplyWebhook, channel)) {
+    throw new Error('拒绝向未授权的小爱回调地址发送语音');
+  }
+  const webhookUrl = requestedReplyWebhook
     || (sshTargets.length === 0 ? channel.webhookUrl?.trim() : undefined);
 
   if (webhookUrl) {
@@ -348,21 +380,28 @@ export async function sendXiaoaiSpeech(
     if (segments.length === 0) return { segments: [], mode: 'webhook' };
 
     const headers: Record<string, string> = { 'content-type': 'application/json' };
-    if (channel.botToken) {
+    const sameAsConfiguredWebhook = Boolean(channel.webhookUrl?.trim() && webhookUrl === channel.webhookUrl.trim());
+    if (channel.botToken && sameAsConfiguredWebhook) {
       headers.authorization = `Bearer ${channel.botToken}`;
     }
-    const res = await fetchFn(webhookUrl, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        msgtype: 'tts',
-        target: options?.target ?? channel.defaultTarget ?? 'default',
-        text: segments.join(' '),
-        segments,
-        rawText,
-      }),
-      signal: buildRequestSignal(15_000, options?.shutdownSignal),
-    });
+    let res: Response;
+    try {
+      res = await fetchFn(webhookUrl, {
+        method: 'POST',
+        headers,
+        redirect: 'error',
+        body: JSON.stringify({
+          msgtype: 'tts',
+          target: options?.target ?? channel.defaultTarget ?? 'default',
+          text: segments.join(' '),
+          segments,
+          rawText,
+        }),
+        signal: buildRequestSignal(15_000, options?.shutdownSignal),
+      });
+    } catch (err) {
+      throw new Error(sanitizeImError(err, [channel.botToken, channel.secret]));
+    }
     if (!res.ok) {
       throw new Error(`小爱 Webhook 发送失败: HTTP ${res.status}`);
     }
@@ -374,22 +413,34 @@ export async function sendXiaoaiSpeech(
     if (segments.length === 0) return { segments: [], mode: 'ssh' };
 
     const requestedTarget = options?.target?.trim() || channel.defaultTarget?.trim();
-    const matched = requestedTarget
+    const matched = requestedTarget && requestedTarget !== 'default'
       ? sshTargets.find(t => t.id === requestedTarget || t.userHost === requestedTarget)
       : undefined;
+    if (requestedTarget && requestedTarget !== 'default' && !matched) {
+      throw new Error(`未找到匹配的小爱 SSH 目标设备: ${requestedTarget}`);
+    }
     const target = matched ?? sshTargets[0];
     if (!target) {
       throw new Error('小爱 SSH 目标列表为空');
     }
 
     const sshRunner = options?.sshRunner ?? defaultSshRunner;
+    const runtimeKey = xiaoaiRuntimeKey(channel.id, target.id);
+    const pendingWake = xiaoaiPendingWakes.get(runtimeKey);
+    if (pendingWake) {
+      await Promise.race([
+        pendingWake,
+        delay(1_500, undefined, options?.shutdownSignal ? { signal: options.shutdownSignal } : undefined).catch(() => {}),
+      ]);
+    }
     const speechEpoch = getXiaoaiSpeechEpoch(channel.id, target.id);
     const isEpochCancelled = () => getXiaoaiSpeechEpoch(channel.id, target.id) !== speechEpoch;
     for (let i = 0; i < segments.length; i++) {
-      if (isEpochCancelled()) break;
+      if (isEpochCancelled() || options?.shutdownSignal?.aborted) break;
       const seg = segments[i]!;
       const spokenSeg = smoothXiaoaiTtsProsody(seg) || seg;
       const estimatedSpeechMs = Math.min(18_000, Math.max(2_200, spokenSeg.length * 190 + 900));
+      const segStartedAt = Date.now();
       markXiaoaiSpeakingGuard(channel.id, target.id, estimatedSpeechMs);
       const jsonPayload = JSON.stringify({ text: spokenSeg, save: 0 });
       const cmd = `rm -f /tmp/friday_led_tok; touch /tmp/friday_speaking; (/bin/shut_led 1 >/dev/null 2>&1; /bin/shut_led 2 >/dev/null 2>&1 || true); ubus call mibrain text_to_speech '${escapeShellSingleQuote(jsonPayload)}' >/dev/null 2>&1 || /usr/sbin/tts_play.sh '${escapeShellSingleQuote(spokenSeg)}'`;
@@ -398,9 +449,31 @@ export async function sendXiaoaiSpeech(
         throw new Error(res.stderr.trim() || `小爱 SSH TTS 失败 (exit=${res.code})`);
       }
       if (i < segments.length - 1 || options?.waitForCompletion) {
-        await waitForXiaoaiSegmentPlayback(target, sshRunner, spokenSeg.length, isEpochCancelled);
-        if (i === segments.length - 1 && !isEpochCancelled()) {
-          markXiaoaiSpeakingGuard(channel.id, target.id, 350, true);
+        const outcome = await waitForXiaoaiSegmentPlayback(
+          target,
+          sshRunner,
+          spokenSeg.length,
+          isEpochCancelled,
+          options?.shutdownSignal,
+        );
+        if (outcome === 'completed') {
+          if (i === segments.length - 1 && !isEpochCancelled()) {
+            markXiaoaiSpeakingGuard(channel.id, target.id, 350, true);
+          }
+        } else if (outcome === 'unknown' && !isEpochCancelled()) {
+          // Playback status could not be confirmed: preserve remaining estimated speech guard
+          // (do NOT shrink to 350ms), and wait remainingMs before starting any subsequent segment.
+          const remainingMs = Math.max(0, estimatedSpeechMs - (Date.now() - segStartedAt));
+          if (i < segments.length - 1 && remainingMs > 0) {
+            await delay(
+              Math.min(remainingMs, 15_000),
+              undefined,
+              options?.shutdownSignal ? { signal: options.shutdownSignal } : undefined,
+            ).catch(() => {});
+          }
+          if (i === segments.length - 1 && !isEpochCancelled()) {
+            markXiaoaiSpeakingGuard(channel.id, target.id, Math.max(350, remainingMs), true);
+          }
         }
       } else {
         markXiaoaiSpeakingGuard(channel.id, target.id, estimatedSpeechMs);
@@ -414,22 +487,29 @@ export async function sendXiaoaiSpeech(
     if (segments.length === 0) return { segments: [], mode: 'cloud' };
 
     const { accountBase, minaBase } = getCloudBases(channel.apiBase);
-    const resolved = await resolveCloudSession(channel, accountBase, minaBase, fetchFn, false);
-    let targetDeviceId = options?.target?.trim()
-      || channel.defaultTarget?.trim()
-      || resolved.session.deviceId;
+    const resolved = await resolveCloudSession(channel, accountBase, minaBase, fetchFn, false, options?.shutdownSignal);
+    const explicitTarget = options?.target?.trim() && options.target.trim() !== 'default'
+      ? options.target.trim()
+      : channel.defaultTarget?.trim();
+    let targetDeviceId = explicitTarget || resolved.session.deviceId;
 
     if (!targetDeviceId) {
-      const { devices } = await fetchMinaDeviceList(minaBase, resolved.session, fetchFn);
-      const selected = selectTargetMinaDevices(devices, undefined, undefined)[0];
+      const { devices } = await fetchMinaDeviceList(minaBase, resolved.session, fetchFn, options?.shutdownSignal);
+      const selected = selectTargetMinaDevices(devices, explicitTarget, resolved.session.deviceId)[0];
       targetDeviceId = selected?.deviceID;
     }
     if (!targetDeviceId) {
       throw new Error('小米云模式下未找到可用的小爱音箱设备ID');
     }
 
-    for (const seg of segments) {
+    const speechEpoch = getXiaoaiSpeechEpoch(channel.id, targetDeviceId);
+    const isEpochCancelled = () => getXiaoaiSpeechEpoch(channel.id, targetDeviceId) !== speechEpoch;
+    for (let i = 0; i < segments.length; i++) {
+      if (isEpochCancelled() || options?.shutdownSignal?.aborted) break;
+      const seg = segments[i]!;
       const spokenSeg = smoothXiaoaiTtsProsody(seg) || seg;
+      const estimatedSpeechMs = Math.min(18_000, Math.max(1_800, spokenSeg.length * 190 + 700));
+      markXiaoaiSpeakingGuard(channel.id, targetDeviceId, estimatedSpeechMs);
       await callMinaRemoteUbus(
         minaBase,
         resolved.session,
@@ -438,7 +518,15 @@ export async function sendXiaoaiSpeech(
         'text_to_speech',
         JSON.stringify({ text: spokenSeg, save: 0 }),
         fetchFn,
+        options?.shutdownSignal,
       );
+      if (i < segments.length - 1 && !isEpochCancelled() && !options?.shutdownSignal?.aborted) {
+        await delay(
+          estimatedSpeechMs,
+          undefined,
+          options?.shutdownSignal ? { signal: options.shutdownSignal } : undefined,
+        ).catch(() => {});
+      }
     }
     return { segments, mode: 'cloud' };
   }

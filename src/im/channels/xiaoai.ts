@@ -35,7 +35,9 @@ import {
 import {
   BoundedMap,
   finalizeWebhookInbound,
+  isAllowedReplyWebhook,
   jsonWebhookResponse,
+  parseJsonObjectBody,
   readHeaderValue,
   safeEqual,
   type ImChannelAdapter,
@@ -49,6 +51,7 @@ import {
 const DEFAULT_CONTINUOUS_IDLE_TTL_MS = 60_000;
 const DEFAULT_CONTINUOUS_CAPTURE_WAIT_MS = 10_000;
 const DEFAULT_CONTINUOUS_MAX_UTTERANCE_MS = 2_800;
+const MEMBER_ALLOWED_PLUGINS = new Set(['miot', 'tv-ir', 'tv-agent']);
 
 interface FastpathSessionEntry {
   pluginName?: string;
@@ -66,7 +69,10 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 function resolveSshTarget(channel: ImChannelConfig, targetId?: string): XiaoaiSshTarget | undefined {
   const targets = parseXiaoaiSshTargets(channel.apiBase);
   if (!targets.length) return undefined;
-  return targets.find(t => t.id === targetId || t.userHost === targetId) ?? targets[0];
+  if (targetId && targetId !== 'default') {
+    return targets.find(t => t.id === targetId || t.userHost === targetId);
+  }
+  return targets[0];
 }
 
 /** Channel adapter for Xiaomi XiaoAI speakers (MiNA cloud, SSH, KWS, voiceprint, and plugin fastpaths). */
@@ -131,13 +137,17 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
   async poll(channel: ImChannelConfig): Promise<{ receivedAny: boolean }> {
     if (!isXiaoaiPollable(channel)) return { receivedAny: false };
     const suppressUnverifiedPoll = parseXiaoaiSshTargets(channel.apiBase).length > 0
-      && parseXiaoaiApiOptions(channel.apiBase).kws
-      && Boolean(this.kwsMonitor?.hasActiveWorker(channel.id))
       && this.isSpeakerGateEnforced(channel);
     if (suppressUnverifiedPoll) {
       return { receivedAny: false };
     }
-    const result = await pollXiaoaiChannel(channel, this.deps);
+    const result = await pollXiaoaiChannel(channel, {
+      ...this.deps,
+      shutdownSignal: this.ctx.shutdownSignal,
+    });
+    for (const inbound of result.messages) {
+      await this.ctx.ingestMessage(inbound);
+    }
     if (
       (result.nextPollOffset !== undefined && result.nextPollOffset !== channel.pollOffset)
       || (result.nextSyncBuf !== undefined && result.nextSyncBuf !== channel.syncBuf)
@@ -148,9 +158,6 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
       if (result.nextSyncBuf !== undefined) current.syncBuf = result.nextSyncBuf;
       current.lastError = undefined;
       this.ctx.coordinator.store.saveImChannel(current);
-    }
-    for (const inbound of result.messages) {
-      await this.ctx.ingestMessage(inbound);
     }
     return { receivedAny: result.messages.length > 0 };
   }
@@ -165,14 +172,24 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     if (method !== 'POST') {
       return jsonWebhookResponse(405, { error: 'Method not allowed' });
     }
-    if (channel.secret) {
-      const headerSecret = readHeaderValue(headers, 'x-xiaoai-secret')
-        ?? readHeaderValue(headers, 'authorization')?.replace(/^Bearer\s+/i, '').trim()
-        ?? query.get('secret')
-        ?? '';
-      if (!headerSecret || !safeEqual(headerSecret, channel.secret)) {
-        return jsonWebhookResponse(403, { error: 'Invalid XiaoAI webhook secret' });
-      }
+    const secret = channel.secret?.trim();
+    if (!secret) {
+      return jsonWebhookResponse(403, { error: 'XiaoAI webhook secret is required' });
+    }
+    const headerSecret = readHeaderValue(headers, 'x-xiaoai-secret')
+      ?? readHeaderValue(headers, 'authorization')?.replace(/^Bearer\s+/i, '').trim()
+      ?? query.get('secret')
+      ?? '';
+    if (!headerSecret || !safeEqual(headerSecret, secret)) {
+      return jsonWebhookResponse(403, { error: 'Invalid XiaoAI webhook secret' });
+    }
+    const parsed = parseJsonObjectBody(rawBody || '{}');
+    if (!parsed.ok) {
+      return jsonWebhookResponse(400, { error: 'Invalid JSON payload' });
+    }
+    const rawReplyWebhook = typeof parsed.data.replyWebhook === 'string' ? parsed.data.replyWebhook.trim() : undefined;
+    if (rawReplyWebhook && !isAllowedReplyWebhook('xiaoai', rawReplyWebhook, channel)) {
+      return jsonWebhookResponse(400, { error: 'Untrusted replyWebhook URL' });
     }
     return finalizeWebhookInbound(this.ctx, parseXiaoaiWebhookPayload(channel.id, rawBody));
   }
@@ -745,16 +762,22 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     const wasContinuous = Boolean(prevEntry?.state.continuous || prevEntry?.state.tvRemoteActive);
     const sshTarget = resolveSshTarget(channel, targetId);
 
-    const request: VoiceFastpathRequest = {
+    const request = {
       text: inbound.text,
       channelId: channel.id,
       platform: channel.platform,
       targetId,
       senderId: inbound.senderId,
-      ...(inbound.speaker ? { speakerId: inbound.speaker.id, speakerName: inbound.speaker.name } : {}),
+      ...(inbound.speaker
+        ? {
+            speakerId: inbound.speaker.id,
+            speakerName: inbound.speaker.name,
+            speakerRole: inbound.speaker.role,
+          }
+        : {}),
       explicitWake: inbound.explicitWake,
       ...(prevEntry ? { sessionState: prevEntry.state } : {}),
-    };
+    } as VoiceFastpathRequest;
 
     const startedAt = Date.now();
     let result: VoiceFastpathResult | undefined;
@@ -767,6 +790,17 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     }
 
     if (this.ctx.isClosing()) return undefined;
+
+    if (
+      inbound.speaker?.role === 'member'
+      && result?.handled
+      && (!result.plugin || !MEMBER_ALLOWED_PLUGINS.has(result.plugin))
+    ) {
+      console.warn(
+        `[xiaoai-fastpath] blocked member access to plugin "${result.plugin ?? 'unknown'}" for ${channel.id}/${targetId}`,
+      );
+      return { ok: false, action: 'voice_fastpath_denied' };
+    }
 
     if (!result?.handled) {
       if (wasContinuous && inbound.explicitWake) {
@@ -810,7 +844,9 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
         accountId: channel.accountId,
         conversationId: targetId,
         senderId: inbound.senderId,
-        ...(inbound.speaker ? { speakerId: inbound.speaker.id, speakerName: inbound.speaker.name } : {}),
+        ...(inbound.speaker
+          ? { speakerId: inbound.speaker.id, speakerName: inbound.speaker.name, speakerRole: inbound.speaker.role }
+          : {}),
         replyToMessageId: inbound.externalId,
         replyWebhook: inbound.replyWebhook,
         contextToken: inbound.contextToken,
@@ -989,7 +1025,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     this.enqueueDirectSpeech(channel.id, targetId, snapshot.message);
     void (async () => {
       try {
-        await manager.ensureModelReady();
+        await manager.ensureModelReady(this.ctx.shutdownSignal);
         if (this.ctx.isClosing()) return;
         const current = this.speakerEnroll.getStatus(sessionId);
         if (!current || current.status !== 'preparing_model') return;
@@ -1072,6 +1108,25 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     const cmd = parseSpeakerVoiceCommand(inbound.text);
     if (!cmd) return undefined;
 
+    if (cmd.kind === 'whoami') {
+      const status = manager.getStatus();
+      let reply: string;
+      if (inbound.speaker) {
+        reply = `你是${inbound.speaker.name}。`;
+      } else if (status.profiles.length === 0) {
+        reply = '目前还没有录入任何声纹，你可以说录入我的声纹。';
+      } else if (!status.enabled) {
+        reply = '声纹识别当前已暂停，请通过主人终端或管理后台重新开启。';
+      } else {
+        reply = '当前暂未匹配到你的声纹，请先由主人为你录入声纹。';
+      }
+      this.enqueueDirectSpeech(channel.id, targetId, reply);
+      return { ok: true, action: 'voice_whoami' };
+    }
+
+    const profiles = manager.listProfiles();
+    const isVerifiedOwner = inbound.speaker?.role === 'owner';
+
     if (cmd.kind === 'enroll') {
       const targets = parseXiaoaiSshTargets(channel.apiBase);
       const apiOpts = parseXiaoaiApiOptions(channel.apiBase);
@@ -1083,16 +1138,21 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
         );
         return { ok: true, action: 'voice_enroll_unsupported' };
       }
+
+      if (profiles.length > 0 && !isVerifiedOwner) {
+        this.enqueueDirectSpeech(channel.id, targetId, '只有主人本人或命令行可以重新录入主人声纹或新增成员声纹。');
+        return { ok: true, action: 'voice_enroll_denied' };
+      }
+
       this.fastpathSessions.delete(`${channel.id}:${targetId}`);
 
-      const profiles = manager.listProfiles();
       const speakerName = (
         cmd.targetName?.trim()
         || inbound.speaker?.name
         || (profiles.length === 0 ? '主人' : `成员${profiles.length + 1}`)
       ).slice(0, 40);
       const existing = manager.findProfile(speakerName);
-      if (existing?.role === 'owner' && inbound.speaker && inbound.speaker.role !== 'owner') {
+      if (existing?.role === 'owner' && !isVerifiedOwner) {
         this.enqueueDirectSpeech(channel.id, targetId, '只有主人本人或命令行可以重新录入主人声纹。');
         return { ok: true, action: 'voice_enroll_denied' };
       }
@@ -1111,23 +1171,11 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
       return { ok: true, action: 'voice_enroll_started' };
     }
 
-    if (cmd.kind === 'whoami') {
-      const status = manager.getStatus();
-      let reply: string;
-      if (inbound.speaker) {
-        reply = `你是${inbound.speaker.name}。`;
-      } else if (status.profiles.length === 0) {
-        reply = '目前还没有录入任何声纹，你可以说录入我的声纹。';
-      } else if (!status.enabled) {
-        reply = '声纹识别当前已暂停，你可以说开启声纹识别。';
-      } else {
-        reply = '当前暂未匹配到你的声纹，你可以说录入声纹。';
-      }
-      this.enqueueDirectSpeech(channel.id, targetId, reply);
-      return { ok: true, action: 'voice_whoami' };
-    }
-
     if (cmd.kind === 'list') {
+      if (profiles.length > 0 && !isVerifiedOwner) {
+        this.enqueueDirectSpeech(channel.id, targetId, '只有主人本人或命令行可以查看声纹列表。');
+        return { ok: true, action: 'voice_list_denied' };
+      }
       const status = manager.getStatus();
       const reply = status.profiles.length === 0
         ? '当前还没有录入任何声纹。'
@@ -1137,6 +1185,10 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     }
 
     if (cmd.kind === 'remove') {
+      if (!isVerifiedOwner) {
+        this.enqueueDirectSpeech(channel.id, targetId, '只有主人本人或命令行可以删除主人声纹或成员声纹。');
+        return { ok: true, action: 'voice_remove_denied' };
+      }
       const targetName = cmd.targetName?.trim() || inbound.speaker?.name;
       if (!targetName) {
         this.enqueueDirectSpeech(channel.id, targetId, '请说出要删除谁的声纹，比如删除小明的声纹。');
@@ -1147,10 +1199,6 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
         this.enqueueDirectSpeech(channel.id, targetId, `没有找到名为${targetName}的声纹。`);
         return { ok: true, action: 'voice_remove_not_found' };
       }
-      if (found.role === 'owner' && inbound.speaker && inbound.speaker.role !== 'owner') {
-        this.enqueueDirectSpeech(channel.id, targetId, '只有主人本人或命令行可以删除主人声纹。');
-        return { ok: true, action: 'voice_remove_denied' };
-      }
       const res = manager.removeSpeaker(found.id);
       const reply = res.remaining === 0
         ? `已删除${found.name}的声纹，当前已没有已录入声纹。`
@@ -1160,7 +1208,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     }
 
     if (cmd.kind === 'clear') {
-      if (inbound.speaker && inbound.speaker.role !== 'owner') {
+      if (!isVerifiedOwner) {
         this.enqueueDirectSpeech(channel.id, targetId, '只有主人或命令行可以清空全部声纹。');
         return { ok: true, action: 'voice_clear_denied' };
       }
@@ -1173,8 +1221,8 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     }
 
     if (cmd.kind === 'toggle') {
-      if (!cmd.enabled && inbound.speaker && inbound.speaker.role !== 'owner') {
-        this.enqueueDirectSpeech(channel.id, targetId, '只有主人或命令行可以暂停声纹识别。');
+      if (!isVerifiedOwner) {
+        this.enqueueDirectSpeech(channel.id, targetId, '只有主人或命令行可以开关或暂停声纹识别。');
         return { ok: true, action: 'voice_toggle_denied' };
       }
       const status = manager.configure({ enabled: cmd.enabled });

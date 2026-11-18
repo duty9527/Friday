@@ -434,6 +434,8 @@ function parseStepsPhrase(
   return steps.length > 0 ? steps : undefined;
 }
 
+const TV_REMOTE_GUARD_RE = /(?:别|不要|不用|不能|不可以|先不|不必|没必要|稍后|等一?会(?:儿)?|(?:\d+|[一二两三四五六七八九十半]+)\s*(?:秒|分钟|小时)(?:之?后|以后|后)|明天|今晚|为什么|怎么)/;
+
 /**
  * @deprecated Pure phrase parser shim for TV remote entry detection.
  */
@@ -443,7 +445,7 @@ export function parseTvRemoteEntryUtterance(
   options?: { defaultFrames?: number },
 ): TvRemoteEntryParseResult {
   const cleaned = stripUtteranceFiller(rawText);
-  if (!cleaned) return { matched: false, initialSteps: [] };
+  if (!cleaned || TV_REMOTE_GUARD_RE.test(cleaned)) return { matched: false, initialSteps: [] };
 
   const match = ENTRY_REMOTE_MODE_RE.exec(cleaned);
   if (!match) return { matched: false, initialSteps: [] };
@@ -476,6 +478,10 @@ export function parseTvRemoteInModeUtterance(
 
   if (EXIT_REMOTE_MODE_RE.test(cleaned)) {
     return { kind: 'exit' };
+  }
+
+  if (TV_REMOTE_GUARD_RE.test(cleaned)) {
+    return { kind: 'unrecognized' };
   }
 
   const entryCheck = parseTvRemoteEntryUtterance(cleaned, learnedKeys, options);

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import type { ImInboundMessage } from '../im/types.js';
+import { buildRequestSignal, sanitizeImError, type ImInboundMessage } from '../im/types.js';
 import type { ImChannelConfig } from '../store.js';
 import {
   defaultSshRunner,
@@ -274,9 +274,18 @@ async function pollSshTargets(
   };
 }
 
+function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  return host === 'localhost' || host === '::1' || host === '127.0.0.1' || host.startsWith('127.');
+}
+
 export function getCloudBases(apiBase?: string): { accountBase: string; minaBase: string; profileBase: string } {
   const trimmed = apiBase?.trim();
   if (trimmed && /^https?:\/\//i.test(trimmed)) {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === 'http:' && !isLoopbackHost(parsed.hostname)) {
+      throw new Error('小米云 apiBase 非本机回环地址时必须使用 HTTPS');
+    }
     const base = trimmed.replace(/\/+$/, '');
     return {
       accountBase: `${base}/account`,
@@ -367,12 +376,18 @@ async function loginXiaomiCloud(
   accountBase: string,
   minaBase: string,
   fetchFn: typeof fetch,
+  shutdownSignal?: AbortSignal,
 ): Promise<XiaoaiCloudSession> {
   const step1Url = `${accountBase}/pass/serviceLogin?sid=micoapi&_json=true`;
-  const step1Res = await fetchFn(step1Url, {
-    method: 'GET',
-    signal: AbortSignal.timeout(15_000),
-  });
+  let step1Res: Response;
+  try {
+    step1Res = await fetchFn(step1Url, {
+      method: 'GET',
+      signal: buildRequestSignal(15_000, shutdownSignal),
+    });
+  } catch (err) {
+    throw new Error(sanitizeImError(err, [password]));
+  }
   if (!step1Res.ok) {
     throw new Error(`小米账号 serviceLogin 失败: HTTP ${step1Res.status}`);
   }
@@ -391,15 +406,20 @@ async function loginXiaomiCloud(
   });
   const step1CookieStr = Object.entries(step1Cookies).map(([k, v]) => `${k}=${v}`).join('; ');
 
-  const step2Res = await fetchFn(`${accountBase}/pass/serviceLoginAuth2`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/x-www-form-urlencoded',
-      ...(step1CookieStr ? { cookie: step1CookieStr } : {}),
-    },
-    body: authForm.toString(),
-    signal: AbortSignal.timeout(15_000),
-  });
+  let step2Res: Response;
+  try {
+    step2Res = await fetchFn(`${accountBase}/pass/serviceLoginAuth2`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        ...(step1CookieStr ? { cookie: step1CookieStr } : {}),
+      },
+      body: authForm.toString(),
+      signal: buildRequestSignal(15_000, shutdownSignal),
+    });
+  } catch (err) {
+    throw new Error(sanitizeImError(err, [password]));
+  }
   if (!step2Res.ok) {
     throw new Error(`小米账号 serviceLoginAuth2 失败: HTTP ${step2Res.status}`);
   }
@@ -424,11 +444,16 @@ async function loginXiaomiCloud(
     const stsUrl = /^https?:\/\//i.test(rawLocation)
       ? rawLocation
       : `${minaBase.replace(/\/mina$/, '')}${rawLocation.startsWith('/') ? '' : '/'}${rawLocation}`;
-    const stsRes = await fetchFn(stsUrl, {
-      method: 'GET',
-      redirect: 'manual',
-      signal: AbortSignal.timeout(15_000),
-    });
+    let stsRes: Response;
+    try {
+      stsRes = await fetchFn(stsUrl, {
+        method: 'GET',
+        redirect: 'manual',
+        signal: buildRequestSignal(15_000, shutdownSignal),
+      });
+    } catch (err) {
+      throw new Error(sanitizeImError(err, [password, ssecurity]));
+    }
     if (!stsRes.ok && stsRes.status >= 400) {
       throw new Error(`小米 login_sts 失败: HTTP ${stsRes.status}`);
     }
@@ -465,6 +490,7 @@ export async function resolveCloudSession(
   minaBase: string,
   fetchFn: typeof fetch,
   forceRefresh = false,
+  shutdownSignal?: AbortSignal,
 ): Promise<{ session: XiaoaiCloudSession; syncBufToSave?: string; isPasswordAuth: boolean }> {
   const tokenSession = parseTokenJson(channel.botToken, channel.accountId);
   if (tokenSession) {
@@ -482,7 +508,7 @@ export async function resolveCloudSession(
     }
   }
 
-  const session = await loginXiaomiCloud(channel.accountId, channel.botToken, accountBase, minaBase, fetchFn);
+  const session = await loginXiaomiCloud(channel.accountId, channel.botToken, accountBase, minaBase, fetchFn, shutdownSignal);
   const syncBufToSave = JSON.stringify({ mode: 'cloud', session } satisfies XiaoaiCloudSyncState);
   return { session, syncBufToSave, isPasswordAuth: true };
 }
@@ -501,14 +527,20 @@ export async function fetchMinaDeviceList(
   minaBase: string,
   session: XiaoaiCloudSession,
   fetchFn: typeof fetch,
+  shutdownSignal?: AbortSignal,
 ): Promise<{ devices: MinaDevice[]; unauthorized: boolean }> {
   const requestId = `friday_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
   const url = `${minaBase}/admin/v2/device_list?master=0&requestId=${encodeURIComponent(requestId)}`;
-  const res = await fetchFn(url, {
-    method: 'GET',
-    headers: { cookie: buildMinaCookie(session) },
-    signal: AbortSignal.timeout(15_000),
-  });
+  let res: Response;
+  try {
+    res = await fetchFn(url, {
+      method: 'GET',
+      headers: { cookie: buildMinaCookie(session) },
+      signal: buildRequestSignal(15_000, shutdownSignal),
+    });
+  } catch (err) {
+    throw new Error(sanitizeImError(err, [session.serviceToken, session.ssecurity]));
+  }
   if (res.status === 401 || res.status === 403) {
     return { devices: [], unauthorized: true };
   }
@@ -549,10 +581,9 @@ export function selectTargetMinaDevices(
 ): MinaDevice[] {
   const wanted = preferredTarget?.trim() || sessionDeviceId?.trim();
   if (wanted) {
-    const matched = devices.filter(
+    return devices.filter(
       d => d.deviceID === wanted || d.name === wanted || d.alias === wanted || d.serialNumber === wanted,
     );
-    if (matched.length > 0) return matched;
   }
   const online = devices.filter(d => !d.presence || d.presence.toLowerCase() === 'online');
   return online.length > 0 ? online : devices.slice(0, 1);
@@ -563,14 +594,20 @@ async function fetchMinaConversations(
   session: XiaoaiCloudSession,
   device: MinaDevice,
   fetchFn: typeof fetch,
+  shutdownSignal?: AbortSignal,
 ): Promise<{ records: MinaConversationRecord[]; unauthorized: boolean }> {
   const hardware = device.hardware ?? session.hardware ?? 'LX06';
   const url = `${profileBase}/device_profile/v2/conversation?source=dialogu&hardware=${encodeURIComponent(hardware)}&limit=5`;
-  const res = await fetchFn(url, {
-    method: 'GET',
-    headers: { cookie: buildMinaCookie(session, device.deviceID) },
-    signal: AbortSignal.timeout(15_000),
-  });
+  let res: Response;
+  try {
+    res = await fetchFn(url, {
+      method: 'GET',
+      headers: { cookie: buildMinaCookie(session, device.deviceID) },
+      signal: buildRequestSignal(15_000, shutdownSignal),
+    });
+  } catch (err) {
+    throw new Error(sanitizeImError(err, [session.serviceToken, session.ssecurity]));
+  }
   if (res.status === 401 || res.status === 403) {
     return { records: [], unauthorized: true };
   }
@@ -624,6 +661,7 @@ export async function callMinaRemoteUbus(
   method: string,
   message: string,
   fetchFn: typeof fetch,
+  shutdownSignal?: AbortSignal,
 ): Promise<void> {
   const form = new URLSearchParams({
     deviceId,
@@ -632,15 +670,20 @@ export async function callMinaRemoteUbus(
     path,
     requestId: `friday_${randomUUID().replace(/-/g, '').slice(0, 16)}`,
   });
-  const res = await fetchFn(`${minaBase}/remote/ubus`, {
-    method: 'POST',
-    headers: {
-      cookie: buildMinaCookie(session),
-      'content-type': 'application/x-www-form-urlencoded',
-    },
-    body: form.toString(),
-    signal: AbortSignal.timeout(15_000),
-  });
+  let res: Response;
+  try {
+    res = await fetchFn(`${minaBase}/remote/ubus`, {
+      method: 'POST',
+      headers: {
+        cookie: buildMinaCookie(session),
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body: form.toString(),
+      signal: buildRequestSignal(15_000, shutdownSignal),
+    });
+  } catch (err) {
+    throw new Error(sanitizeImError(err, [session.serviceToken, session.ssecurity]));
+  }
   if (!res.ok) {
     throw new Error(`MiNA /remote/ubus (${path}.${method}) 失败: HTTP ${res.status}`);
   }
@@ -657,22 +700,23 @@ export async function callMinaRemoteUbus(
 async function pollCloudChannel(
   channel: ImChannelConfig,
   fetchFn: typeof fetch,
+  shutdownSignal?: AbortSignal,
 ): Promise<XiaoaiPollResult> {
   const { accountBase, minaBase, profileBase } = getCloudBases(channel.apiBase);
   const apiOptions = parseXiaoaiApiOptions(channel.apiBase);
 
-  let resolved = await resolveCloudSession(channel, accountBase, minaBase, fetchFn, false);
-  let { devices, unauthorized } = await fetchMinaDeviceList(minaBase, resolved.session, fetchFn);
+  let resolved = await resolveCloudSession(channel, accountBase, minaBase, fetchFn, false, shutdownSignal);
+  let { devices, unauthorized } = await fetchMinaDeviceList(minaBase, resolved.session, fetchFn, shutdownSignal);
   if (unauthorized && resolved.isPasswordAuth) {
-    resolved = await resolveCloudSession(channel, accountBase, minaBase, fetchFn, true);
-    ({ devices, unauthorized } = await fetchMinaDeviceList(minaBase, resolved.session, fetchFn));
+    resolved = await resolveCloudSession(channel, accountBase, minaBase, fetchFn, true, shutdownSignal);
+    ({ devices, unauthorized } = await fetchMinaDeviceList(minaBase, resolved.session, fetchFn, shutdownSignal));
   }
   if (unauthorized) {
     throw new Error('小米云会话已过期或未授权');
   }
 
   const targetDevices = selectTargetMinaDevices(devices, channel.defaultTarget, resolved.session.deviceId);
-  if (targetDevices.length === 0 && resolved.session.deviceId) {
+  if (targetDevices.length === 0 && resolved.session.deviceId && !channel.defaultTarget?.trim()) {
     targetDevices.push({
       deviceID: resolved.session.deviceId,
       hardware: resolved.session.hardware,
@@ -684,7 +728,7 @@ async function pollCloudChannel(
   const collected: Array<{ device: MinaDevice; record: MinaConversationRecord }> = [];
 
   for (const device of targetDevices) {
-    const conv = await fetchMinaConversations(profileBase, resolved.session, device, fetchFn);
+    const conv = await fetchMinaConversations(profileBase, resolved.session, device, fetchFn, shutdownSignal);
     if (conv.unauthorized) {
       throw new Error('小米云对话历史接口未授权');
     }
@@ -724,6 +768,7 @@ async function pollCloudChannel(
         'player_play_operation',
         '{"action":"pause"}',
         fetchFn,
+        shutdownSignal,
       ).catch(err => {
         console.warn(`[xiaoai-cloud] pause failed for ${device.deviceID}: ${err instanceof Error ? err.message : 'error'}`);
       });
@@ -750,14 +795,14 @@ async function pollCloudChannel(
 
 export async function pollXiaoaiChannel(
   channel: ImChannelConfig,
-  deps?: { sshRunner?: XiaoaiSshRunner; fetchImpl?: typeof fetch },
+  deps?: { sshRunner?: XiaoaiSshRunner; fetchImpl?: typeof fetch; shutdownSignal?: AbortSignal },
 ): Promise<XiaoaiPollResult> {
   const sshTargets = parseXiaoaiSshTargets(channel.apiBase);
   if (sshTargets.length > 0) {
     return pollSshTargets(channel, sshTargets, deps?.sshRunner ?? defaultSshRunner);
   }
   if (channel.accountId && channel.botToken) {
-    return pollCloudChannel(channel, deps?.fetchImpl ?? globalThis.fetch);
+    return pollCloudChannel(channel, deps?.fetchImpl ?? globalThis.fetch, deps?.shutdownSignal);
   }
   return { messages: [] };
 }

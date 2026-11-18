@@ -1,7 +1,19 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { chmodSync, lstatSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resolveFridayHome, resolvePrivateRunDir } from '../paths.js';
+
+const UNIX_SUN_PATH_SAFE_MAX = 100;
+const CONTROL_HASH_EXPANDED_LEN = 40;
+const SSH_USER_HOST_RE = /^[A-Za-z0-9._-]+@(?:\[[A-Za-z0-9:]+\]|[A-Za-z0-9._-]+)$/;
+
+export function isValidSshUserHost(userHost: string): boolean {
+  const trimmed = userHost.trim();
+  if (!trimmed || trimmed.startsWith('-')) return false;
+  return SSH_USER_HOST_RE.test(trimmed);
+}
 
 export interface XiaoaiSshTarget {
   id: string;        // e.g. 'oh2p' | 'lx06' | 'default'
@@ -42,10 +54,33 @@ export function setDefaultXiaoaiSshHome(homeDir: string): void {
   configuredSshHomeDir = homeDir;
 }
 
-export function resolveXiaoaiSshControlPath(homeDir?: string): string {
+function ensureSafePrivateDir(dir: string): void {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const stat = lstatSync(dir);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(`Unsafe SSH ControlPath directory: ${dir}`);
+  }
+  if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+    throw new Error(`SSH ControlPath directory owned by another user: ${dir}`);
+  }
+  if (stat.mode & 0o077) {
+    chmodSync(dir, 0o700);
+  }
+}
+
+export function resolveXiaoaiSshControlPath(homeDir?: string): string | undefined {
   const baseHome = resolveFridayHome(homeDir ?? configuredSshHomeDir);
   const runDir = resolvePrivateRunDir(baseHome);
-  return join(runDir, 'ssh-ctl-%C');
+  const candidate = join(runDir, 'ssh-ctl-%C');
+  const candidateLen = Buffer.byteLength(candidate, 'utf8') - 2 + CONTROL_HASH_EXPANDED_LEN;
+  if (candidateLen < UNIX_SUN_PATH_SAFE_MAX) {
+    return candidate;
+  }
+  const shortDir = join(tmpdir(), `fr-ssh-${createHash('sha1').update(baseHome).digest('hex').slice(0, 8)}`);
+  ensureSafePrivateDir(shortDir);
+  const fallback = join(shortDir, '%C');
+  const fallbackLen = Buffer.byteLength(fallback, 'utf8') - 2 + CONTROL_HASH_EXPANDED_LEN;
+  return fallbackLen < UNIX_SUN_PATH_SAFE_MAX ? fallback : undefined;
 }
 
 export function escapeShellSingleQuote(value: string): string {
@@ -57,6 +92,9 @@ export function buildXiaoaiSshArgs(
   remoteCommand: string,
   controlPath?: string,
 ): string[] {
+  if (!isValidSshUserHost(target.userHost)) {
+    throw new Error(`无效的 SSH userHost 格式: ${target.userHost}`);
+  }
   const controlArgs = controlPath
     ? [
         '-o', 'ControlMaster=auto',
@@ -77,6 +115,7 @@ export function buildXiaoaiSshArgs(
     '-o', 'ServerAliveInterval=15',
     '-o', 'ServerAliveCountMax=2',
     ...(target.port ? ['-p', String(target.port)] : []),
+    '--',
     target.userHost,
     remoteCommand,
   ];
@@ -119,8 +158,10 @@ export const defaultSshRunner: XiaoaiSshRunner = async (target, remoteCommand, o
   let controlPath: string | undefined;
   try {
     controlPath = resolveXiaoaiSshControlPath(options?.homeDir);
-    const trackKey = `${controlPath}\0${target.userHost}:${target.port ?? 22}`;
-    activeControlMasters.set(trackKey, { target, controlPath });
+    if (controlPath) {
+      const trackKey = `${controlPath}\0${target.userHost}:${target.port ?? 22}`;
+      activeControlMasters.set(trackKey, { target, controlPath });
+    }
   } catch (err) {
     console.warn(
       `[xiaoai-ssh] failed to prepare private ControlPath, falling back to non-multiplexed SSH: ${
@@ -142,10 +183,15 @@ export async function closeXiaoaiSshConnections(): Promise<void> {
   await Promise.all(
     entries.map(({ target, controlPath }) =>
       new Promise<void>(resolve => {
+        if (!isValidSshUserHost(target.userHost)) {
+          resolve();
+          return;
+        }
         const args = [
           '-O', 'exit',
           '-o', `ControlPath=${controlPath}`,
           ...(target.port ? ['-p', String(target.port)] : []),
+          '--',
           target.userHost,
         ];
         execFile('ssh', args, { timeout: 2_000 }, () => resolve());
@@ -221,15 +267,19 @@ export function parseXiaoaiSshTargets(apiBase?: string): XiaoaiSshTarget[] {
 
     let userHost = addr;
     let port: number | undefined;
-    const portMatch = /^(.+):(\d+)$/.exec(addr);
-    if (portMatch && portMatch[1] && portMatch[2]) {
-      const parsedPort = Number(portMatch[2]);
-      if (Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535) {
-        userHost = portMatch[1].trim();
-        port = parsedPort;
+    const lastColon = addr.lastIndexOf(':');
+    const lastBracket = addr.lastIndexOf(']');
+    if (lastColon > lastBracket && lastColon > 0) {
+      const maybePort = addr.slice(lastColon + 1);
+      if (/^\d+$/.test(maybePort)) {
+        const parsedPort = Number(maybePort);
+        if (Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535) {
+          userHost = addr.slice(0, lastColon).trim();
+          port = parsedPort;
+        }
       }
     }
-    if (!userHost) continue;
+    if (!isValidSshUserHost(userHost)) continue;
 
     const id = hasExplicitId
       ? explicitId
@@ -270,11 +320,12 @@ function buildWakeCacheStoreSnippet(greetingText: string, cacheFile: string): st
 export function buildXiaoaiWakeCommand(options?: { chime?: boolean; greetingText?: string }): string {
   const prepCmd = 'rm -f /tmp/friday_speaking';
   const pauseCmd = '((ubus -t 1 call mediaplayer player_play_operation \'{"action":"pause"}\' >/dev/null 2>&1 || mphelper pause >/dev/null 2>&1 || true) </dev/null >/dev/null 2>&1 &)';
+  const syncPauseCmd = '(ubus -t 1 call mediaplayer player_play_operation \'{"action":"pause"}\' >/dev/null 2>&1 || mphelper pause >/dev/null 2>&1 || true)';
   const fallbackPlay = `ubus -t 2 call qplayer play '{"play":"${XIAOAI_WAKE_CHIME_PATH}"}' >/dev/null 2>&1 || /usr/bin/miplayer -f '${XIAOAI_WAKE_CHIME_PATH}' </dev/null >/dev/null 2>&1 || true`;
   const ledCmd = 'tok="$$_$(date +%s)"; echo "$tok" >/tmp/friday_led_tok; (/bin/shut_led 2 >/dev/null 2>&1 || true); (/bin/show_led 1 >/dev/null 2>&1 || true); (sh -c \'sleep 15; [ "$(cat /tmp/friday_led_tok 2>/dev/null)" = "\'"$tok"\'" ] && /bin/shut_led 1 >/dev/null 2>&1 || true\' </dev/null >/dev/null 2>&1 &)';
   const cleanGreeting = options?.greetingText?.replace(/["\\$`\r\n]/g, '').trim();
   if (options?.chime === false) {
-    return `${prepCmd}; ${ledCmd}; ${pauseCmd}`;
+    return `${prepCmd}; ${ledCmd}; ${syncPauseCmd}`;
   }
   if (!cleanGreeting) {
     return `${prepCmd}; ${ledCmd}; ${pauseCmd}; (${fallbackPlay})`;

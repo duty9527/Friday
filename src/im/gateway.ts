@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
+import { resolveEnv } from '../paths.js';
 import { tryPluginVoiceFastpath } from '../plugin.js';
 import { sanitizePublicReply } from '../reply-filter.js';
 import type { ImChannelConfig } from '../store.js';
@@ -28,7 +29,10 @@ import { transformOutboundBotExpressions } from '../web/shared/bot-expressions.j
 import {
   BoundedMap,
   DEFAULT_WECHAT_ILINK_BASE,
+  isAllowedReplyWebhook,
+  isSuspiciousBrowserWebhookRequest,
   jsonWebhookResponse,
+  sanitizeImError,
   type CoordinatorWithHooks,
   type ImChannelAdapter,
   type ImGatewayContext,
@@ -42,6 +46,18 @@ import {
 } from './types.js';
 
 const OUTBOUND_FALLBACK_POLL_MS = 1_500;
+const OUTBOUND_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000, 60_000];
+const IM_OUTBOUND_CURSOR_META = 'im_outbound_cursor';
+const IM_OUTBOUND_DELIVERED_META = 'im_outbound_delivered';
+const MAX_PERSISTED_DELIVERED = 200;
+
+function isTransientImError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error ?? '');
+  if (/拒绝向未授权|无效的|缺少|disabled|not found|not authorized|HTTP 400\b|HTTP 401\b|HTTP 403\b|HTTP 404\b/i.test(msg)) {
+    return false;
+  }
+  return true;
+}
 
 /**
  * Multi-platform IM gateway orchestrating inbound normalization, outbound delivery,
@@ -59,8 +75,11 @@ export class ImGateway {
 
   private trustedFileRequests = new WeakSet<ImInboundMessage>();
   private trustedMediaRequests = new WeakSet<ImInboundMessage>();
+  private trustedTelegramRequests = new WeakSet<ImInboundMessage>();
   private seenMessageVersions = new BoundedMap<string, number>(2_000);
+  private outboundRetryQueue = new Map<string, { version: number; attempts: number; nextRetryAt: number }>();
   private pollTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private pollBackoffMs = new Map<string, number>();
   private pollingActive = new Set<string>();
   private tgTypingSessions = new Map<string, {
     channelId: string;
@@ -99,6 +118,9 @@ export class ImGateway {
       markTrustedWechatInbound: (inbound) => {
         this.trustedFileRequests.add(inbound);
         this.trustedMediaRequests.add(inbound);
+      },
+      markTrustedTelegramInbound: (inbound) => {
+        this.trustedTelegramRequests.add(inbound);
       },
       scheduleChannelPoll: (channelId, delayMs) => this.scheduleChannelPoll(channelId, delayMs),
       runVoiceFastpath: (request) => tryPluginVoiceFastpath(this.homeDir, request, {
@@ -139,9 +161,25 @@ export class ImGateway {
 
   start(): void {
     this.started = true;
-    this.cursor = this.coordinator.store.conversation.latestSeq();
-    for (const item of this.coordinator.store.conversation.history(undefined, 50).items) {
-      this.seenMessageVersions.set(item.id, item.version);
+    const conv = this.coordinator.store.conversation;
+    const savedDelivered = conv?.meta?.<Record<string, number>>(IM_OUTBOUND_DELIVERED_META);
+    if (savedDelivered && typeof savedDelivered === 'object') {
+      for (const [id, version] of Object.entries(savedDelivered)) {
+        if (typeof version === 'number') {
+          this.seenMessageVersions.set(id, version);
+        }
+      }
+    }
+    const savedCursor = conv?.meta?.<number>(IM_OUTBOUND_CURSOR_META);
+    if (typeof savedCursor === 'number' && Number.isFinite(savedCursor) && savedCursor >= 0) {
+      this.cursor = savedCursor;
+    } else {
+      this.cursor = conv.latestSeq();
+      for (const item of conv.history(undefined, 50).items) {
+        this.seenMessageVersions.set(item.id, item.version);
+      }
+      conv?.setMeta?.(IM_OUTBOUND_CURSOR_META, this.cursor);
+      this.persistDeliveredVersions();
     }
     this.unsubscribeOutbound?.();
     this.unsubscribeOutbound = this.coordinator.subscribeOutbound?.(() => {
@@ -153,6 +191,7 @@ export class ImGateway {
     }, OUTBOUND_FALLBACK_POLL_MS);
     this.watchTimer.unref();
     this.syncPollers();
+    this.scheduleOutboundFlush();
   }
 
   async close(): Promise<void> {
@@ -207,26 +246,36 @@ export class ImGateway {
     if (input.id) {
       try { existing = this.coordinator.store.getImChannel(input.id); } catch { /* new channel */ }
     }
+    const nextBotToken = input.botToken !== undefined ? (input.botToken.trim() || undefined) : existing?.botToken;
+    const nextAccountId = input.accountId !== undefined ? (input.accountId.trim() || undefined) : existing?.accountId;
+    const nextApiBase = input.apiBase !== undefined ? (input.apiBase.trim() || undefined) : existing?.apiBase;
+    const credentialsChanged = Boolean(
+      existing && (
+        nextBotToken !== existing.botToken
+        || nextAccountId !== existing.accountId
+        || nextApiBase !== existing.apiBase
+      ),
+    );
     const config: ImChannelConfig = {
       id: existing?.id ?? input.id ?? randomUUID(),
       platform: input.platform,
       name,
       enabled: input.enabled ?? existing?.enabled ?? true,
       notifyAll: input.notifyAll ?? existing?.notifyAll ?? false,
-      botToken: input.botToken !== undefined ? (input.botToken.trim() || undefined) : existing?.botToken,
-      accountId: input.accountId !== undefined ? (input.accountId.trim() || undefined) : existing?.accountId,
-      syncBuf: existing?.syncBuf,
-      contextTokens: existing?.contextTokens,
-      contextTokenUpdatedAt: existing?.contextTokenUpdatedAt,
+      botToken: nextBotToken,
+      accountId: nextAccountId,
+      syncBuf: credentialsChanged ? undefined : existing?.syncBuf,
+      contextTokens: credentialsChanged ? undefined : existing?.contextTokens,
+      contextTokenUpdatedAt: credentialsChanged ? undefined : existing?.contextTokenUpdatedAt,
       webhookUrl: input.webhookUrl !== undefined ? (input.webhookUrl.trim() || undefined) : existing?.webhookUrl,
       secret: input.secret !== undefined ? (input.secret.trim() || undefined) : existing?.secret,
       defaultTarget: input.defaultTarget !== undefined ? (input.defaultTarget.trim() || undefined) : existing?.defaultTarget,
       allowedSenders: input.allowedSenders !== undefined
         ? [...new Set(input.allowedSenders.map(s => s.trim()).filter(Boolean))]
         : (existing?.allowedSenders ?? []),
-      apiBase: input.apiBase !== undefined ? (input.apiBase.trim() || undefined) : existing?.apiBase,
+      apiBase: nextApiBase,
       pollIntervalMs: input.pollIntervalMs ?? existing?.pollIntervalMs ?? (input.platform === 'xiaoai' ? 800 : 1500),
-      pollOffset: existing?.pollOffset,
+      pollOffset: credentialsChanged ? undefined : existing?.pollOffset,
       inboundCount: existing?.inboundCount ?? 0,
       outboundCount: existing?.outboundCount ?? 0,
       lastInboundAt: existing?.lastInboundAt,
@@ -236,6 +285,7 @@ export class ImGateway {
       updatedAt: now,
     };
     this.coordinator.store.saveImChannel(config);
+    this.pollBackoffMs.delete(config.id);
     this.syncPollers();
     return this.coordinator.store.toImChannelView(config);
   }
@@ -263,6 +313,7 @@ export class ImGateway {
       this.wechatIlinkAdapter.clearChannelTyping(id);
       this.clearChannelTelegramTyping(id);
     }
+    this.pollBackoffMs.delete(id);
     this.syncPollers();
     return this.coordinator.store.toImChannelView(channel);
   }
@@ -273,9 +324,12 @@ export class ImGateway {
       clearTimeout(timer);
       this.pollTimers.delete(id);
     }
+    this.pollBackoffMs.delete(id);
     this.wechatIlinkAdapter.clearChannelTyping(id);
     this.clearChannelTelegramTyping(id);
-    return this.coordinator.store.deleteImChannel(id);
+    const deleted = this.coordinator.store.deleteImChannel(id);
+    this.syncPollers();
+    return deleted;
   }
 
   async testChannel(id: string, customText?: string): Promise<{ ok: boolean; channel: ImChannelView }> {
@@ -303,7 +357,7 @@ export class ImGateway {
       this.coordinator.store.saveImChannel(latest);
     } catch (error) {
       const latest = this.coordinator.store.getImChannel(channelId);
-      latest.lastError = error instanceof Error ? error.message : 'Outbound send failed';
+      latest.lastError = sanitizeImError(error, [latest.botToken, latest.secret]);
       latest.updatedAt = Date.now();
       this.coordinator.store.saveImChannel(latest);
       throw error;
@@ -317,6 +371,9 @@ export class ImGateway {
     headers: Record<string, string | string[] | undefined>,
     rawBody: string,
   ): Promise<ImWebhookResponse> {
+    if (isSuspiciousBrowserWebhookRequest(headers)) {
+      return jsonWebhookResponse(403, { error: 'Forbidden cross-origin webhook request' });
+    }
     let channel: ImChannelConfig;
     try {
       channel = this.coordinator.store.getImChannel(channelId);
@@ -325,6 +382,16 @@ export class ImGateway {
     }
     if (!channel.enabled) {
       return jsonWebhookResponse(403, { error: 'IM channel is disabled' });
+    }
+    if (
+      (channel.platform === 'wechat' && channel.botToken && !channel.webhookUrl)
+      || (channel.platform === 'telegram' && channel.botToken && !channel.webhookUrl)
+      || (channel.platform === 'xiaoai' && isXiaoaiPollable(channel) && !channel.webhookUrl)
+    ) {
+      return jsonWebhookResponse(403, { error: 'Webhook disabled for polling/SSH channel' });
+    }
+    if (!channel.secret?.trim()) {
+      return jsonWebhookResponse(403, { error: 'IM webhook secret is required' });
     }
 
     const adapter = this.selectWebhookAdapter(channel);
@@ -445,13 +512,12 @@ export class ImGateway {
       channel.platform !== 'telegram'
       || !channel.enabled
       || !channel.botToken
-      || channel.webhookUrl
       || !root
       || !target
     ) {
       throw new Error('Telegram 通道未启用或缺少 botToken / 目标 Chat ID');
     }
-    if (process.env.FRIDAY_WECHAT_ATTACHMENT_DIR === undefined) {
+    if (resolveEnv('FRIDAY_WECHAT_ATTACHMENT_DIR', 'SUPER_AGENT_WECHAT_ATTACHMENT_DIR') === undefined) {
       await mkdir(root, { recursive: true, mode: 0o700 }).catch(() => {});
     }
     const cleanName = fileName.trim();
@@ -469,7 +535,7 @@ export class ImGateway {
       this.coordinator.store.saveImChannel(latest);
     } catch (error) {
       const latest = this.coordinator.store.getImChannel(channelId);
-      latest.lastError = error instanceof Error ? error.message : 'Telegram attachment delivery failed';
+      latest.lastError = sanitizeImError(error, [latest.botToken, latest.secret]);
       latest.updatedAt = Date.now();
       this.coordinator.store.saveImChannel(latest);
       throw error;
@@ -483,9 +549,7 @@ export class ImGateway {
     if (channel.allowedSenders.length > 0) {
       const candidates = [
         inbound.senderId,
-        inbound.senderUsername,
         inbound.senderUsername ? `@${inbound.senderUsername}` : undefined,
-        inbound.senderName,
       ].filter((v): v is string => Boolean(v));
       const allowed = channel.allowedSenders.some(rule => candidates.includes(rule));
       if (!allowed) {
@@ -502,9 +566,17 @@ export class ImGateway {
     if (existing) return { ok: true, action: 'routed_to_chat', messageId: existing.id };
 
     const authorizedPeer = this.isWechatPeerAuthorized(channel, inbound.senderId);
+    const safeReplyWebhook = inbound.replyWebhook && isAllowedReplyWebhook(channel.platform, inbound.replyWebhook, channel)
+      ? inbound.replyWebhook
+      : undefined;
     channel.inboundCount++;
     channel.lastInboundAt = Date.now();
-    if (!channel.defaultTarget && inbound.target) {
+    if (
+      !channel.defaultTarget
+      && channel.allowedSenders.length > 0
+      && inbound.target
+      && inbound.target === inbound.senderId
+    ) {
       channel.defaultTarget = inbound.target;
     }
     if (inbound.contextToken && inbound.senderId) {
@@ -524,7 +596,7 @@ export class ImGateway {
     const replyOpts: ImSendOptions = {
       target: inbound.target ?? inbound.senderId,
       replyToMessageId: inbound.externalId,
-      replyWebhook: inbound.replyWebhook,
+      replyWebhook: safeReplyWebhook,
       contextToken: inbound.contextToken,
     };
 
@@ -533,15 +605,18 @@ export class ImGateway {
       if (xiaoaiHandled) return xiaoaiHandled;
     }
 
+    const trustedTelegram = this.trustedTelegramRequests.delete(inbound);
     const parsedCmd = parseImSlashCommand(rawText);
     if (parsedCmd?.command === '/file') {
       if (channel.platform === 'telegram') {
+        const tgAllowed = channel.allowedSenders.length > 0 && channel.allowedSenders.includes(inbound.senderId);
+        const tgPrivate = Boolean(inbound.senderId && inbound.target === inbound.senderId);
+        if (!trustedTelegram || !channel.enabled || !channel.botToken || !replyOpts.target || !tgAllowed || !tgPrivate) {
+          return { ok: false, action: 'rejected', reason: 'attachment_not_authorized' };
+        }
         if (!parsedCmd.arg) {
           await this.sendToChannel(channel.id, '⚠️ 用法: /file <文件名>', replyOpts).catch(() => {});
           return { ok: true, action: 'command_file_help' };
-        }
-        if (!channel.enabled || !channel.botToken || channel.webhookUrl || !replyOpts.target) {
-          return { ok: false, action: 'rejected', reason: 'attachment_not_authorized' };
         }
         try {
           await this.sendTelegramAttachment(channel.id, parsedCmd.arg, {
@@ -550,26 +625,31 @@ export class ImGateway {
           });
           return { ok: true, action: 'attachment_sent' };
         } catch (error) {
-          const msg = error instanceof Error ? error.message : 'Telegram attachment failed';
-          const root = this.wechatAttachmentDir() ?? join(this.homeDir, 'wechat-files');
+          const safeMsg = sanitizeImError(error, [channel.botToken, channel.secret]);
           await this.sendToChannel(
             channel.id,
-            `⚠️ 附件发送失败（请确认文件已放入目录 ${root}）：${msg}`,
+            `⚠️ 附件发送失败（请确认文件存在于附件目录且文件名合法）：${safeMsg}`,
             replyOpts,
           ).catch(() => {});
           return { ok: false, action: 'attachment_failed', reason: 'delivery_failed' };
         }
       }
+      const trustedFile = this.trustedFileRequests.delete(inbound);
       if (rawText.startsWith('/file ') || parsedCmd.arg) {
         return this.wechatIlinkAdapter.handleSlashFileCommand({
           channel,
           inbound,
           rawText: parsedCmd.normalized,
           authorizedPeer,
-          trustedFile: this.trustedFileRequests.delete(inbound),
+          trustedFile,
           replyOpts,
         });
       }
+      if (!trustedFile || !authorizedPeer || !inbound.contextToken || inbound.target !== inbound.senderId) {
+        return { ok: false, action: 'rejected', reason: 'attachment_not_authorized' };
+      }
+      await this.sendToChannel(channel.id, '⚠️ 用法: /file <文件名>', replyOpts).catch(() => {});
+      return { ok: true, action: 'command_file_help' };
     }
 
     const attachments: ReceivedAttachment[] = [];
@@ -585,13 +665,13 @@ export class ImGateway {
       senderId: inbound.senderId,
       ...(inbound.speaker ? { speakerId: inbound.speaker.id, speakerName: inbound.speaker.name, speakerRole: inbound.speaker.role } : {}),
       replyToMessageId: inbound.externalId,
-      replyWebhook: inbound.replyWebhook,
+      replyWebhook: safeReplyWebhook,
       contextToken: inbound.contextToken,
     };
     const holdActive = !isInstantCommand && hasMedia;
     if (!isInstantCommand && replyOpts.target) {
-      this.wechatIlinkAdapter.retainTyping(channel.id, replyOpts.target, ingestTypingRef, inbound.contextToken, inbound.replyWebhook);
-      if (channel.platform === 'telegram' && channel.botToken && !channel.webhookUrl) {
+      this.wechatIlinkAdapter.retainTyping(channel.id, replyOpts.target, ingestTypingRef, inbound.contextToken, safeReplyWebhook);
+      if (channel.platform === 'telegram' && channel.botToken) {
         this.retainTelegramTyping(channel.id, replyOpts.target, ingestTypingRef, true);
       }
     }
@@ -604,15 +684,23 @@ export class ImGateway {
           && inbound.target === inbound.senderId;
         for (const item of inbound.mediaItems.slice(0, 4)) {
           attachments.push(authorized
-            ? await receiveMedia(join(this.homeDir, 'inbound-media'), item)
+            ? await receiveMedia(join(this.homeDir, 'inbound-media'), item, fetch, { signal: this.shutdownController.signal })
             : { kind: Number(item.type) === 2 ? 'image' : 'file', name: 'attachment', status: 'failed', error: '附件未下载：来源未经 iLink 轮询认证或发送人未获精确授权。' });
         }
         if (inbound.mediaItems.length > 4) {
           attachments.push({ kind: 'file', name: 'remaining attachments', status: 'failed', error: '单条消息最多接收4个附件。' });
         }
       } else if (channel.platform === 'telegram' && inbound.telegramMedia?.length) {
+        const tgMediaAuthorized = Boolean(
+          trustedTelegram
+          && channel.botToken
+          && channel.allowedSenders.length > 0
+          && channel.allowedSenders.includes(inbound.senderId),
+        );
         for (const item of inbound.telegramMedia.slice(0, 4)) {
-          attachments.push(await this.telegramAdapter.downloadMedia(channel, item, join(this.homeDir, 'inbound-media')));
+          attachments.push(tgMediaAuthorized
+            ? await this.telegramAdapter.downloadMedia(channel, item, join(this.homeDir, 'inbound-media'))
+            : { kind: item.kind, name: item.fileName || 'attachment', status: 'failed', error: '附件未下载：来源未经 Telegram 轮询/验签认证或发送人未获精确 ID 授权。' });
         }
         if (inbound.telegramMedia.length > 4) {
           attachments.push({ kind: 'file', name: 'remaining attachments', status: 'failed', error: '单条消息最多接收4个附件。' });
@@ -643,8 +731,8 @@ export class ImGateway {
         attachments,
       );
       if (['queued', 'processing'].includes(userMsg.status) && replyOpts.target) {
-        this.wechatIlinkAdapter.retainTyping(channel.id, replyOpts.target, `msg:${userMsg.id}`, inbound.contextToken, inbound.replyWebhook);
-        if (this.started && channel.platform === 'telegram' && channel.botToken && !channel.webhookUrl) {
+        this.wechatIlinkAdapter.retainTyping(channel.id, replyOpts.target, `msg:${userMsg.id}`, inbound.contextToken, safeReplyWebhook);
+        if (this.started && channel.platform === 'telegram' && channel.botToken) {
           this.retainTelegramTyping(channel.id, replyOpts.target, `msg:${userMsg.id}`, false);
         }
       }
@@ -736,6 +824,114 @@ export class ImGateway {
     return this.xiaoaiAdapter.cancelVoiceprintEnrollment(sessionId);
   }
 
+  private persistDeliveredVersions(): void {
+    const entries = [...this.seenMessageVersions.entries()].slice(-MAX_PERSISTED_DELIVERED);
+    this.coordinator.store.conversation?.setMeta?.(
+      IM_OUTBOUND_DELIVERED_META,
+      Object.fromEntries(entries),
+    );
+  }
+
+  private async deliverOutboundMessage(
+    msg: ChatMessage,
+    priorAttempts = 0,
+  ): Promise<'delivered' | 'skipped' | 'retry'> {
+    if (msg.origin?.channel === 'xiaoai' && msg.status === 'interrupted') {
+      this.seenMessageVersions.set(msg.id, msg.version);
+      this.outboundRetryQueue.delete(msg.id);
+      return 'skipped';
+    }
+
+    const rawBody = (msg.text || msg.reason || (msg.status === 'completed' ? '' : `(${msg.status})`)).trim();
+    if (!rawBody) {
+      this.seenMessageVersions.set(msg.id, msg.version);
+      this.outboundRetryQueue.delete(msg.id);
+      return 'skipped';
+    }
+    const bodyText = sanitizePublicReply(rawBody, msg.taskIds ?? [], this.homeDir).trim();
+    if (!bodyText) {
+      this.seenMessageVersions.set(msg.id, msg.version);
+      this.outboundRetryQueue.delete(msg.id);
+      return 'skipped';
+    }
+
+    const route = msg.origin;
+    if (!route?.channelId || !route.conversationId || !route.senderId || route.channel === 'local') {
+      this.seenMessageVersions.set(msg.id, msg.version);
+      this.outboundRetryQueue.delete(msg.id);
+      return 'skipped';
+    }
+    if (route.channel === 'dingtalk' && !route.replyWebhook) {
+      this.seenMessageVersions.set(msg.id, msg.version);
+      this.outboundRetryQueue.delete(msg.id);
+      return 'skipped';
+    }
+
+    let ch: ImChannelConfig;
+    try {
+      ch = this.coordinator.store.getImChannel(route.channelId);
+    } catch {
+      this.seenMessageVersions.set(msg.id, msg.version);
+      this.outboundRetryQueue.delete(msg.id);
+      return 'skipped';
+    }
+    if (!ch.enabled || ch.platform !== route.channel || ch.accountId !== route.accountId) {
+      this.seenMessageVersions.set(msg.id, msg.version);
+      this.outboundRetryQueue.delete(msg.id);
+      return 'skipped';
+    }
+
+    if (route.channel === 'xiaoai') {
+      this.xiaoaiAdapter.enqueueOutbound(ch.id, msg, bodyText, route);
+      this.seenMessageVersions.set(msg.id, msg.version);
+      this.outboundRetryQueue.delete(msg.id);
+      return 'delivered';
+    }
+
+    const cleanText = stripXiaoaiDialogDirective(bodyText).text;
+    if (!cleanText) {
+      this.seenMessageVersions.set(msg.id, msg.version);
+      this.outboundRetryQueue.delete(msg.id);
+      return 'skipped';
+    }
+    const outboundText = (
+      route.channel === 'wechat'
+      || (route.channel === 'telegram' && ch.botToken && !ch.webhookUrl)
+    )
+      ? cleanText
+      : transformOutboundBotExpressions(cleanText, route.channel).text;
+    if (!outboundText) {
+      this.seenMessageVersions.set(msg.id, msg.version);
+      this.outboundRetryQueue.delete(msg.id);
+      return 'skipped';
+    }
+
+    try {
+      await this.sendToChannel(ch.id, outboundText, {
+        target: route.conversationId,
+        replyToMessageId: route.replyToMessageId,
+        replyWebhook: route.replyWebhook,
+        contextToken: route.contextToken,
+      });
+      this.seenMessageVersions.set(msg.id, msg.version);
+      this.outboundRetryQueue.delete(msg.id);
+      return 'delivered';
+    } catch (error) {
+      if (!isTransientImError(error) || priorAttempts >= OUTBOUND_RETRY_DELAYS_MS.length) {
+        this.seenMessageVersions.set(msg.id, msg.version);
+        this.outboundRetryQueue.delete(msg.id);
+        return 'skipped';
+      }
+      const delayMs = OUTBOUND_RETRY_DELAYS_MS[priorAttempts] ?? 60_000;
+      this.outboundRetryQueue.set(msg.id, {
+        version: msg.version,
+        attempts: priorAttempts + 1,
+        nextRetryAt: Date.now() + delayMs,
+      });
+      return 'retry';
+    }
+  }
+
   async flushOutboundUpdates(): Promise<void> {
     if (this.closing) return;
     if (this.flushingOutbound) {
@@ -744,77 +940,93 @@ export class ImGateway {
     }
     this.flushingOutbound = true;
     try {
-      const events = this.coordinator.store.conversation.trace({}, this.cursor);
-      if (!events.length) return;
-      this.cursor = events.at(-1)?.seq ?? this.cursor;
-
-      const messageIds = [...new Set(
-        events
-          .filter(e => e.type === 'message')
-          .map(e => e.messageId)
-          .filter((id): id is string => Boolean(id)),
-      )];
-
-      const settledTypingReleases: Array<{ channelId: string; target: string; ref: string }> = [];
-      const settledTgTypingReleases: Array<{ channelId: string; target: string; ref: string }> = [];
-
-      for (const id of messageIds) {
+      let deliveredOrSettledAny = false;
+      const now = Date.now();
+      for (const [id, retry] of [...this.outboundRetryQueue.entries()]) {
+        if (this.closing) break;
+        if (now < retry.nextRetryAt) continue;
         let msg: ChatMessage;
         try {
           msg = this.coordinator.store.conversation.get(id);
         } catch {
-          this.wechatIlinkAdapter.syncTypingForMissingMessage(id, settledTypingReleases);
-          this.syncTelegramTypingForMissingMessage(id, settledTgTypingReleases);
+          this.outboundRetryQueue.delete(id);
           continue;
         }
-        this.wechatIlinkAdapter.syncTypingFromMessage(msg, settledTypingReleases);
-        this.syncTelegramTypingFromMessage(msg, settledTgTypingReleases);
-        const prevVersion = this.seenMessageVersions.get(msg.id) ?? -1;
-        if (msg.version <= prevVersion) continue;
-        if (msg.role !== 'assistant' || !['completed', 'failed', 'interrupted'].includes(msg.status)) continue;
-        this.seenMessageVersions.set(msg.id, msg.version);
+        const seenVer = this.seenMessageVersions.get(msg.id) ?? -1;
+        if (msg.version <= seenVer || msg.version > retry.version) {
+          this.outboundRetryQueue.delete(id);
+          continue;
+        }
+        const outcome = await this.deliverOutboundMessage(msg, retry.attempts);
+        if (outcome !== 'retry') {
+          deliveredOrSettledAny = true;
+        }
+      }
 
-        if (msg.origin?.channel === 'xiaoai' && msg.status === 'interrupted') continue;
+      let scanCursor = this.cursor;
+      let blockedCursor: number | undefined;
+      while (!this.closing) {
+        const events = this.coordinator.store.conversation.trace({}, scanCursor);
+        if (!events.length) break;
+        const batchStartCursor = scanCursor;
+        scanCursor = events.at(-1)?.seq ?? scanCursor;
 
-        const rawBody = (msg.text || msg.reason || (msg.status === 'completed' ? '' : `(${msg.status})`)).trim();
-        if (!rawBody) continue;
-        const bodyText = sanitizePublicReply(rawBody, msg.taskIds ?? [], this.homeDir).trim();
-        if (!bodyText) continue;
+        const messageIds = [...new Set(
+          events
+            .filter(e => e.type === 'message')
+            .map(e => e.messageId)
+            .filter((id): id is string => Boolean(id)),
+        )];
 
-        const route = msg.origin;
-        if (!route?.channelId || !route.conversationId || !route.senderId || route.channel === 'local') continue;
-        if (route.channel === 'dingtalk' && !route.replyWebhook) continue;
-        try {
-          const ch = this.coordinator.store.getImChannel(route.channelId);
-          if (ch.enabled && ch.platform === route.channel && ch.accountId === route.accountId) {
-            if (route.channel === 'xiaoai') {
-              this.xiaoaiAdapter.enqueueOutbound(ch.id, msg, bodyText, route);
-            } else {
-              const cleanText = stripXiaoaiDialogDirective(bodyText).text;
-              if (!cleanText) continue;
-              const outboundText = (
-                route.channel === 'wechat'
-                || (route.channel === 'telegram' && ch.botToken && !ch.webhookUrl)
-              )
-                ? cleanText
-                : transformOutboundBotExpressions(cleanText, route.channel).text;
-              if (!outboundText) continue;
-              await this.sendToChannel(ch.id, outboundText, {
-                target: route.conversationId,
-                replyToMessageId: route.replyToMessageId,
-                replyWebhook: route.replyWebhook,
-                contextToken: route.contextToken,
-              });
+        const settledTypingReleases: Array<{ channelId: string; target: string; ref: string }> = [];
+        const settledTgTypingReleases: Array<{ channelId: string; target: string; ref: string }> = [];
+
+        for (const id of messageIds) {
+          let msg: ChatMessage;
+          try {
+            msg = this.coordinator.store.conversation.get(id);
+          } catch {
+            this.wechatIlinkAdapter.syncTypingForMissingMessage(id, settledTypingReleases);
+            this.syncTelegramTypingForMissingMessage(id, settledTgTypingReleases);
+            continue;
+          }
+          this.wechatIlinkAdapter.syncTypingFromMessage(msg, settledTypingReleases);
+          this.syncTelegramTypingFromMessage(msg, settledTgTypingReleases);
+          const prevVersion = this.seenMessageVersions.get(msg.id) ?? -1;
+          if (msg.version <= prevVersion) continue;
+          if (msg.role !== 'assistant' || !['completed', 'failed', 'interrupted'].includes(msg.status)) continue;
+
+          const pendingRetry = this.outboundRetryQueue.get(msg.id);
+          if (pendingRetry && pendingRetry.version === msg.version) {
+            if (Date.now() < pendingRetry.nextRetryAt) {
+              if (blockedCursor === undefined) blockedCursor = batchStartCursor;
+              continue;
             }
           }
-        } catch { /* recorded in channel.lastError */ }
+
+          const outcome = await this.deliverOutboundMessage(msg, pendingRetry?.attempts ?? 0);
+          if (outcome === 'retry') {
+            if (blockedCursor === undefined) blockedCursor = batchStartCursor;
+          } else {
+            deliveredOrSettledAny = true;
+          }
+        }
+
+        for (const item of settledTypingReleases) {
+          this.wechatIlinkAdapter.releaseTyping(item.channelId, item.target, item.ref);
+        }
+        for (const item of settledTgTypingReleases) {
+          this.releaseTelegramTyping(item.channelId, item.target, item.ref);
+        }
       }
 
-      for (const item of settledTypingReleases) {
-        this.wechatIlinkAdapter.releaseTyping(item.channelId, item.target, item.ref);
+      const nextCursor = blockedCursor ?? (this.outboundRetryQueue.size === 0 ? scanCursor : this.cursor);
+      if (nextCursor > this.cursor) {
+        this.cursor = nextCursor;
+        this.coordinator.store.conversation?.setMeta?.(IM_OUTBOUND_CURSOR_META, this.cursor);
       }
-      for (const item of settledTgTypingReleases) {
-        this.releaseTelegramTyping(item.channelId, item.target, item.ref);
+      if (deliveredOrSettledAny) {
+        this.persistDeliveredVersions();
       }
     } finally {
       this.flushingOutbound = false;
@@ -859,7 +1071,7 @@ export class ImGateway {
     } catch {
       return;
     }
-    if (!channel.enabled || channel.platform !== 'telegram' || !channel.botToken || channel.webhookUrl) {
+    if (!channel.enabled || channel.platform !== 'telegram' || !channel.botToken) {
       return;
     }
     const key = `${channelId}\0${target}`;
@@ -882,7 +1094,7 @@ export class ImGateway {
         }
         try {
           const latest = this.coordinator.store.getImChannel(channelId);
-          if (!latest.enabled || latest.platform !== 'telegram' || !latest.botToken || latest.webhookUrl) {
+          if (!latest.enabled || latest.platform !== 'telegram' || !latest.botToken) {
             this.clearChannelTelegramTyping(channelId);
             return;
           }
@@ -928,18 +1140,25 @@ export class ImGateway {
     msg: ChatMessage,
     releases: Array<{ channelId: string; target: string; ref: string }>,
   ): void {
+    const settled = ['completed', 'failed', 'interrupted'].includes(msg.status);
     if (msg.origin?.channel === 'telegram' && msg.origin.channelId && msg.origin.conversationId) {
       const active = (msg.role === 'user' && ['queued', 'processing'].includes(msg.status))
         || (msg.role === 'assistant' && msg.status === 'streaming');
       if (active) {
         this.retainTelegramTyping(msg.origin.channelId, msg.origin.conversationId, `msg:${msg.id}`, false);
-      } else if (['completed', 'failed', 'interrupted'].includes(msg.status)) {
+        return;
+      }
+      if (settled) {
         releases.push({
           channelId: msg.origin.channelId,
           target: msg.origin.conversationId,
           ref: `msg:${msg.id}`,
         });
+        return;
       }
+    }
+    if (settled) {
+      this.syncTelegramTypingForMissingMessage(msg.id, releases);
     }
   }
 
@@ -956,6 +1175,9 @@ export class ImGateway {
     if (channel.platform === 'telegram') return this.telegramAdapter;
     if (channel.platform === 'dingtalk') return this.dingtalkAdapter;
     if (channel.platform === 'wechat') {
+      if (channel.botToken && !channel.webhookUrl) {
+        return this.wechatIlinkAdapter;
+      }
       return channel.botToken && !options?.replyWebhook && !channel.webhookUrl
         ? this.wechatIlinkAdapter
         : this.wechatWebhookAdapter;
@@ -971,10 +1193,10 @@ export class ImGateway {
   }
 
   private selectPollAdapter(channel: ImChannelConfig): { adapter: ImChannelAdapter; defaultIntervalMs: number } | undefined {
-    if (channel.platform === 'telegram' && channel.botToken) {
+    if (channel.platform === 'telegram' && channel.botToken && !channel.webhookUrl) {
       return { adapter: this.telegramAdapter, defaultIntervalMs: 1500 };
     }
-    if (channel.platform === 'wechat' && channel.botToken) {
+    if (channel.platform === 'wechat' && channel.botToken && !channel.webhookUrl) {
       return { adapter: this.wechatIlinkAdapter, defaultIntervalMs: 1200 };
     }
     if (channel.platform === 'xiaoai' && isXiaoaiPollable(channel)) {
@@ -1031,13 +1253,34 @@ export class ImGateway {
 
     this.pollingActive.add(channelId);
     let receivedAny = false;
+    let pollFailed = false;
     try {
       const outcome = await selected.adapter.poll(channel);
       receivedAny = Boolean(outcome?.receivedAny);
-    } catch (error) {
+      this.pollBackoffMs.delete(channelId);
       try {
         const latest = this.coordinator.store.getImChannel(channelId);
-        latest.lastError = error instanceof Error ? error.message : `${channel.platform} poll error`;
+        if (latest.lastError) {
+          latest.lastError = undefined;
+          latest.updatedAt = Date.now();
+          this.coordinator.store.saveImChannel(latest);
+        }
+      } catch { /* channel removed */ }
+    } catch (error) {
+      pollFailed = true;
+      try {
+        const latest = this.coordinator.store.getImChannel(channelId);
+        const isAuthExpired = Boolean((error as { authExpired?: boolean } | null)?.authExpired);
+        if (isAuthExpired) {
+          latest.enabled = false;
+          this.pollBackoffMs.delete(channelId);
+        } else {
+          const baseInterval = latest.pollIntervalMs ?? selected.defaultIntervalMs;
+          const prevBackoff = this.pollBackoffMs.get(channelId) ?? baseInterval;
+          this.pollBackoffMs.set(channelId, Math.min(60_000, Math.max(baseInterval * 2, prevBackoff * 2)));
+        }
+        latest.lastError = sanitizeImError(error, [latest.botToken, latest.secret, latest.apiBase]);
+        latest.updatedAt = Date.now();
         this.coordinator.store.saveImChannel(latest);
       } catch { /* channel removed */ }
     } finally {
@@ -1047,7 +1290,10 @@ export class ImGateway {
         const stillPollable = latest.enabled && Boolean(this.selectPollAdapter(latest));
         if (stillPollable && !this.closing) {
           const baseInterval = latest.pollIntervalMs ?? selected.defaultIntervalMs;
-          this.scheduleChannelPoll(channelId, receivedAny ? Math.min(baseInterval, 80) : baseInterval);
+          const delayMs = pollFailed
+            ? (this.pollBackoffMs.get(channelId) ?? baseInterval)
+            : (receivedAny ? Math.min(baseInterval, 80) : baseInterval);
+          this.scheduleChannelPoll(channelId, delayMs);
         }
       } catch { /* channel removed */ }
     }

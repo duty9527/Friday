@@ -19,7 +19,7 @@ export async function messageImages(text: string, supportsImages: boolean) {
     if (attachment.kind !== 'image' || attachment.status !== 'ready' || !attachment.path) continue;
     if (!supportsImages) { notes.push('当前模型配置不支持图像输入；图片已保存，但本轮不能看图。不可声称已看到图片内容。'); continue; }
     try {
-      const file = await open(attachment.path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      const file = await open(attachment.path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
       try {
         const stat = await file.stat();
         if (!stat.isFile() || stat.size > MEDIA_LIMIT || (attachment.bytes !== undefined && stat.size !== attachment.bytes)) {

@@ -2,10 +2,10 @@
  * Host-layer hygiene for text the Router speaks to the Boss. The prompt already forbids these, but the
  * Router model does not always comply, so the host strips them deterministically before delivery:
  * - task / record IDs (full UUIDs anywhere, and short prefixes of known task IDs);
- * - internal staging paths under the service home (wechat-files, inbound-media, tasks, sdk, run).
+ * - internal staging paths under the service home (wechat-files, inbound-media, tasks, sdk, run, xiaoai-kws, plugins, state.sqlite).
  */
 const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
-const INTERNAL_SUBDIRS = '(?:wechat-files|inbound-media|tasks|sdk|run)';
+const INTERNAL_SUBDIRS = '(?:wechat-files|inbound-media|tasks|sdk|run|xiaoai-kws|plugins|state\\.sqlite)';
 const STAGING_PATH = new RegExp(
   `\`?(?:~|\\/(?:home|Users)\\/[^/\\s\`]+)\\/(?:\\.friday|\\.super-agent)\\/${INTERNAL_SUBDIRS}\\b[^\\s\`，。；、,;)）]*\`?`,
   'g',
