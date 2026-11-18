@@ -213,6 +213,7 @@ export interface MessageOrigin {
   channelId?: string; accountId?: string; conversationId?: string; senderId?: string;
   speakerId?: string; speakerName?: string; speakerRole?: 'owner' | 'member';
   replyToMessageId?: string; replyWebhook?: string; contextToken?: string;
+  messageThreadId?: number;
 }
 export interface AttachmentView {
   kind: 'image' | 'file';

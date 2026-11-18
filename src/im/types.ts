@@ -10,6 +10,7 @@ import type { XiaoaiSpeakerExtractor } from '../xiaoai/speaker-verify.js';
 
 export const DEFAULT_WECHAT_ILINK_BASE = 'https://ilinkai.weixin.qq.com';
 export const DEFAULT_NETWORK_TIMEOUT_MS = 15_000;
+export const WECHAT_PROACTIVE_WINDOW_MS = 22 * 60 * 60_000;
 
 export function resolveImDeliveryTarget(channel: ImChannelConfig, explicitTarget?: string): string | undefined {
   if (channel.platform === 'wechat' && channel.botToken && !channel.webhookUrl) {
@@ -18,6 +19,20 @@ export function resolveImDeliveryTarget(channel: ImChannelConfig, explicitTarget
     return target && (!channel.allowedSenders.length || channel.allowedSenders.includes(target)) ? target : undefined;
   }
   return explicitTarget ?? channel.defaultTarget ?? Object.keys(channel.contextTokens ?? {})[0] ?? channel.allowedSenders[0];
+}
+
+export function findFallbackTelegramChannel(
+  channels: ImChannelConfig[],
+): { channel: ImChannelConfig; target: string } | undefined {
+  for (const ch of channels) {
+    if (ch.enabled && ch.platform === 'telegram' && (ch.botToken || ch.webhookUrl)) {
+      const target = resolveImDeliveryTarget(ch);
+      if (target && !target.startsWith('-')) {
+        return { channel: ch, target };
+      }
+    }
+  }
+  return undefined;
 }
 
 export interface XiaoaiMatchedSpeaker {
@@ -71,6 +86,7 @@ export interface ImInboundMessage {
   mediaItems?: Record<string, unknown>[];
   telegramMedia?: TelegramMediaItem[];
   callbackQueryId?: string;
+  messageThreadId?: number;
 }
 
 export interface ImWebhookResponse {
@@ -86,6 +102,7 @@ export interface ImSendOptions {
   contextToken?: string;
   waitForCompletion?: boolean;
   replyMarkup?: Record<string, unknown>;
+  messageThreadId?: number;
 }
 
 export interface FastpathTurnInput {

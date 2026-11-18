@@ -151,12 +151,15 @@ async function deliverEncryptedWechatMedia(
         : error instanceof Error && error.name === 'TimeoutError'
           ? 'transport timeout'
           : 'local read or transport failure';
-      if (/^iLink sendmessage business failure \(ret=-2\b/.test(detail)) {
+      if (/^iLink (?:getuploadurl|sendmessage) business failure \(ret=-2\b/.test(detail)) {
         const ageMin = typeof input.contextTokenUpdatedAt === 'number' && Number.isFinite(input.contextTokenUpdatedAt) && input.contextTokenUpdatedAt > 0
           ? Math.max(0, Math.round((Date.now() - input.contextTokenUpdatedAt) / 60_000))
           : undefined;
         const ageHint = ageMin !== undefined ? ` after ${ageMin}m without inbound WeChat message` : '';
-        throw new Error(`Attachment delivery failed (${detail}; WeChat reply session expired${ageHint} — ask user to send a message on WeChat to refresh session before retrying); no automatic retry`);
+        throw Object.assign(
+          new Error(`Attachment delivery failed (${detail}; WeChat reply session expired${ageHint} — ask user to send a message on WeChat to refresh session before retrying); no automatic retry`),
+          { sessionWindowExpired: true },
+        );
       }
       throw new Error(`Attachment delivery failed (${detail}); no automatic retry`);
     }

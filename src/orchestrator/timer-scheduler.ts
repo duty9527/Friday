@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { resolveImDeliveryTarget } from '../im/types.js';
+import { findFallbackTelegramChannel, resolveImDeliveryTarget } from '../im/types.js';
 import { runPlugin } from '../plugin.js';
 import { formatFlowSessionId } from '../session.js';
 import type { Store, Task, Timer } from '../store.js';
@@ -188,6 +188,35 @@ export class TimerScheduler {
     return timer.origin;
   }
 
+  private resolveTriggerOriginWithFallback(timer: Timer): { origin: MessageOrigin | undefined; fallbackNote?: string } {
+    const primary = this.resolveTimerOrigin(timer);
+    if (primary) return { origin: primary };
+    if (timer.deliverChannelId) {
+      const trimmed = timer.deliverChannelId.trim();
+      const normalizedSpec = CHANNEL_ALIAS_MAP[trimmed.toLowerCase()] ?? trimmed;
+      const channels = this.host.store.listImChannels();
+      const targetChannel = channels.find(c => c.id === normalizedSpec || c.platform === normalizedSpec || c.name === trimmed);
+      const targetsWechat = normalizedSpec === 'wechat' || targetChannel?.platform === 'wechat';
+      if (targetsWechat) {
+        const fb = findFallbackTelegramChannel(channels);
+        if (fb) {
+          return {
+            origin: {
+              channel: 'telegram',
+              channelId: fb.channel.id,
+              accountId: fb.channel.accountId,
+              conversationId: fb.target,
+              senderId: fb.target,
+              replyWebhook: fb.channel.webhookUrl,
+            },
+            fallbackNote: '微信通道当前未激活或已停用，本次定时推送已自动通过 Telegram 兜底投递。',
+          };
+        }
+      }
+    }
+    return { origin: undefined };
+  }
+
   private triggerTimer(timer: Timer, plannedRunAt?: number): void {
     const now = Date.now();
     timer.lastRunAt = now;
@@ -214,7 +243,8 @@ export class TimerScheduler {
           this.host.store.notice('system', 'timer_plugin_silent', `定时插件「${timer.name}」(${pluginName}/${pluginAction}) 已执行（静默跳过通知）`);
           return;
         }
-        const origin = this.resolveTimerOrigin(timer);
+        const { origin, fallbackNote } = this.resolveTriggerOriginWithFallback(timer);
+        const deliveredText = fallbackNote ? `${res.message}\n\n> ℹ️ ${fallbackNote}` : res.message;
         const timerMsgId = randomUUID();
         const timerSessionId = formatFlowSessionId(timerMsgId);
         const userMsg = this.host.store.conversation.create({
@@ -235,7 +265,7 @@ export class TimerScheduler {
           source: 'system',
           origin,
           sessionId: timerSessionId,
-          text: res.message,
+          text: deliveredText,
           status: 'completed',
           paths: [],
           mode: this.host.mode,
@@ -256,7 +286,7 @@ export class TimerScheduler {
 
     if (this.submittingTaskTimers.has(timer.id)) return;
     const fireSlot = plannedRunAt ?? now;
-    const origin = this.resolveTimerOrigin(timer);
+    const { origin } = this.resolveTriggerOriginWithFallback(timer);
     const timerMsgId = randomUUID();
     const message = this.host.store.conversation.create({
       id: timerMsgId,

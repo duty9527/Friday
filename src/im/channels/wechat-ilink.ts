@@ -18,13 +18,21 @@ import {
   type ImSendOptions,
 } from '../types.js';
 
-const WECHAT_ILINK_AUTH_EXPIRED_CODES = new Set([-14, -2, -401, 401, 403, 40001, 42001]);
+const WECHAT_ILINK_AUTH_EXPIRED_CODES = new Set([-14, -401, 401, 403, 40001, 42001]);
 
 export class WechatIlinkAuthExpiredError extends Error {
   readonly authExpired = true;
   constructor(message = '微信 iLink 登录态已失效，请重新扫码绑定') {
     super(message);
     this.name = 'WechatIlinkAuthExpiredError';
+  }
+}
+
+export class WechatIlinkSessionWindowExpiredError extends Error {
+  readonly sessionWindowExpired = true;
+  constructor(message = '微信 iLink 会话互动窗口已过期或未激活（请在微信向机器人发送任意消息以刷新会话）') {
+    super(message);
+    this.name = 'WechatIlinkSessionWindowExpiredError';
   }
 }
 
@@ -162,6 +170,9 @@ async function callIlinkApi<T extends { ret?: number; errcode?: number; errmsg?:
         ? data.ret
         : undefined;
     if (code !== undefined) {
+      if (code === -2 && params.path !== '/ilink/bot/getupdates') {
+        throw new WechatIlinkSessionWindowExpiredError(`${params.httpErrorLabel} 会话互动窗口已过期 (code=-2)`);
+      }
       if (WECHAT_ILINK_AUTH_EXPIRED_CODES.has(code)) {
         throw new WechatIlinkAuthExpiredError(`${params.httpErrorLabel} 登录态已过期 (code=${code})`);
       }
@@ -210,14 +221,17 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
     return channel.allowedSenders.includes(senderId);
   }
 
+  private resolveContextToken(channel: ImChannelConfig, target: string, fallbackToken?: string): string {
+    const cached = channel.contextTokens?.[target];
+    return (cached && cached.trim()) ? cached : (fallbackToken ?? '');
+  }
+
   async send(channel: ImChannelConfig, text: string, options?: ImSendOptions): Promise<void> {
     if (!options?.target) {
       throw new Error('微信扫码通道尚未绑定对话目标（请先在手机微信向机器人发送一条消息以激活会话，或配置 defaultTarget）');
     }
     const base = (channel.apiBase ?? DEFAULT_WECHAT_ILINK_BASE).replace(/\/$/, '');
-    const contextToken = options.contextToken
-      ?? channel.contextTokens?.[options.target]
-      ?? '';
+    const contextToken = this.resolveContextToken(channel, options.target, options.contextToken);
     const { text: outText, stickers } = transformOutboundBotExpressions(text, 'wechat');
     const canSendStickers = Boolean(channel.botToken && contextToken);
     const effectiveText = (!canSendStickers && !outText.trim() && stickers.length > 0)
@@ -326,7 +340,7 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
   ): Promise<void> {
     const channel = this.ctx.coordinator.store.getImChannel(channelId);
     const root = this.attachmentDir();
-    const contextToken = options.contextToken ?? channel.contextTokens?.[options.target] ?? '';
+    const contextToken = this.resolveContextToken(channel, options.target, options.contextToken);
     if (
       channel.platform !== 'wechat'
       || !channel.enabled

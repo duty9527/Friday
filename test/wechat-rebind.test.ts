@@ -178,3 +178,137 @@ test('an incomplete WeChat QR confirmation cannot deliver using the previous tar
     await close();
   }
 });
+
+test('WeChat prefers fresh contextTokens, treats ret=-2 as session expiry without disabling channel, and falls back system pushes to Telegram', async t => {
+  const { store, gateway, close } = await setup();
+  const wxSends: Array<{ context_token: string; text: string }> = [];
+  const tgSends: Array<{ chat_id: string; text: string }> = [];
+  let failWechatWithRetMinus2 = false;
+
+  t.mock.method(globalThis, 'fetch', async (url: string | URL, init?: RequestInit) => {
+    const u = new URL(url);
+    if (u.pathname.endsWith('/sendmessage')) {
+      const body = JSON.parse(String(init?.body)) as { msg: { context_token: string; item_list: Array<{ text_item: { text: string } }> } };
+      if (failWechatWithRetMinus2) {
+        return Response.json({ ret: -2, errmsg: 'session expired' });
+      }
+      wxSends.push({ context_token: body.msg.context_token, text: body.msg.item_list[0]!.text_item.text });
+      return Response.json({ ret: 0 });
+    }
+    if (/\/bot[^/]+\/sendMessage$/.test(u.pathname)) {
+      const body = JSON.parse(String(init?.body)) as { chat_id: string; text: string };
+      tgSends.push(body);
+      return Response.json({ ok: true, result: { message_id: tgSends.length } });
+    }
+    throw new Error(`Unexpected endpoint: ${u.pathname}`);
+  });
+
+  try {
+    // 1. Channel cached contextTokens['old@im.wechat'] overrides stale options.contextToken
+    await gateway.sendToChannel(id, 'fresh-ctx-check', { target: oldUser, contextToken: 'stale-task-ctx' });
+    assert.equal(wxSends.length, 1);
+    assert.equal(wxSends[0]?.context_token, 'old-context');
+
+    // 2. Without Telegram configured, ret=-2 does NOT disable channel and does NOT queue retries
+    failWechatWithRetMinus2 = true;
+    await assert.rejects(
+      gateway.sendToChannel(id, 'expired-check', { target: oldUser }),
+      /会话互动窗口已过期/,
+    );
+    assert.equal(store.getImChannel(id).enabled, true, 'ret=-2 must not disable WeChat channel');
+
+    store.conversation.create({
+      id: 'u-wx-user', role: 'user', source: 'router', text: 'q', status: 'completed', mode: 'offline', paths: [],
+      origin: { channel: 'wechat', channelId: id, accountId: 'old@im.bot', conversationId: oldUser, senderId: oldUser },
+    });
+    store.conversation.create({
+      id: 'a-wx-user', replyTo: 'u-wx-user', role: 'assistant', source: 'router', text: 'user reply not leaked',
+      status: 'completed', mode: 'offline', paths: [],
+      origin: { channel: 'wechat', channelId: id, accountId: 'old@im.bot', conversationId: oldUser, senderId: oldUser },
+    });
+    await (gateway as unknown as { flushOutboundUpdates(): Promise<void> }).flushOutboundUpdates();
+    assert.equal(((gateway as unknown as { outboundRetryQueue: Map<string, unknown> }).outboundRetryQueue).size, 0, 'ret=-2 must not retry 5 times');
+
+    // 3. With enabled private Telegram channel, system proactive pushes fall back automatically
+    const now = Date.now();
+    store.saveImChannel({
+      id: 'tg-fallback', platform: 'telegram', name: 'Livis', enabled: true, notifyAll: false,
+      botToken: '123456:TG-TOKEN', accountId: '@livis_bot', defaultTarget: '5094804721',
+      allowedSenders: [], inboundCount: 0, outboundCount: 0, createdAt: now, updatedAt: now,
+    });
+
+    // 3a. Non-system user reply still does NOT leak to Telegram even when Telegram exists
+    store.conversation.create({
+      id: 'a-wx-user-2', replyTo: 'u-wx-user', role: 'assistant', source: 'router', text: 'still private to wechat',
+      status: 'completed', mode: 'offline', paths: [],
+      origin: { channel: 'wechat', channelId: id, accountId: 'old@im.bot', conversationId: oldUser, senderId: oldUser },
+    });
+    await (gateway as unknown as { flushOutboundUpdates(): Promise<void> }).flushOutboundUpdates();
+    assert.equal(tgSends.length, 0);
+
+    // 3b. System proactive push hitting ret=-2 falls back to Telegram
+    store.conversation.create({
+      id: 'a-sys-ret2', role: 'assistant', source: 'system', text: '📊 午间持仓报告 A',
+      status: 'completed', mode: 'offline', paths: [],
+      origin: { channel: 'wechat', channelId: id, accountId: 'old@im.bot', conversationId: oldUser, senderId: oldUser },
+    });
+    await (gateway as unknown as { flushOutboundUpdates(): Promise<void> }).flushOutboundUpdates();
+    assert.equal(tgSends.length, 1);
+    assert.equal(tgSends[0]?.chat_id, '5094804721');
+    assert.match(tgSends[0]?.text ?? '', /午间持仓报告 A/);
+    assert.match(tgSends[0]?.text ?? '', /ret=-2/);
+
+    // 3c. System proactive push with >22h stale contextTokenUpdatedAt routes directly to Telegram pre-send
+    failWechatWithRetMinus2 = false;
+    const chStale = store.getImChannel(id);
+    chStale.contextTokenUpdatedAt = { [oldUser]: now - 23 * 60 * 60_000 };
+    store.saveImChannel(chStale);
+    store.conversation.create({
+      id: 'a-sys-stale', role: 'assistant', source: 'system', text: '🌙 晚间结算报告 B',
+      status: 'completed', mode: 'offline', paths: [],
+      origin: { channel: 'wechat', channelId: id, accountId: 'old@im.bot', conversationId: oldUser, senderId: oldUser },
+    });
+    await (gateway as unknown as { flushOutboundUpdates(): Promise<void> }).flushOutboundUpdates();
+    assert.equal(tgSends.length, 2);
+    assert.match(tgSends[1]?.text ?? '', /晚间结算报告 B/);
+    assert.match(tgSends[1]?.text ?? '', /22 小时/);
+    assert.equal(wxSends.length, 1, 'stale pre-send fallback skipped doomed WeChat request');
+
+    // 3d. Outbound flush + TimerScheduler trigger fall back to Telegram when WeChat is disabled
+    const chDisabled = store.getImChannel(id);
+    chDisabled.enabled = false;
+    store.saveImChannel(chDisabled);
+    store.conversation.create({
+      id: 'a-sys-disabled', role: 'assistant', source: 'system', text: '📊 持仓报告 C',
+      status: 'completed', mode: 'offline', paths: [],
+      origin: { channel: 'wechat', channelId: id, accountId: 'old@im.bot', conversationId: oldUser, senderId: oldUser },
+    });
+    await (gateway as unknown as { flushOutboundUpdates(): Promise<void> }).flushOutboundUpdates();
+    assert.equal(tgSends.length, 3);
+    assert.match(tgSends[2]?.text ?? '', /微信通道已停用/);
+
+    const submittedOrigins: Array<unknown> = [];
+    const scheduler = new TimerScheduler({
+      home: store.home,
+      store,
+      mode: 'offline',
+      closingSignal: new AbortController().signal,
+      isClosing: () => false,
+      jobs: new Set(),
+      submit: async (_reqId, _prompt, _paths, _limitMs, opts) => {
+        const msg = opts.originMessageId ? store.conversation.get(opts.originMessageId) : undefined;
+        submittedOrigins.push(msg?.origin);
+        return { id: 'mock-task', status: 'queued' } as never;
+      },
+      notifyOutbound: () => {},
+    });
+    const wxTimer = scheduler.addTimer('基金推送', 'run', 60_000, undefined, undefined, { deliverChannelId: id });
+    assert.equal(scheduler.resolveTimerOrigin(wxTimer), undefined);
+    (scheduler as unknown as { triggerTimer(timer: typeof wxTimer): void }).triggerTimer(wxTimer);
+    assert.equal(submittedOrigins.length, 1);
+    assert.equal((submittedOrigins[0] as { channel?: string; conversationId?: string })?.channel, 'telegram');
+    assert.equal((submittedOrigins[0] as { channel?: string; conversationId?: string })?.conversationId, '5094804721');
+  } finally {
+    await close();
+  }
+});

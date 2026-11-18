@@ -15,7 +15,6 @@ import { TELEGRAM_BOT_COMMANDS } from '../commands.js';
 import {
   buildRequestSignal,
   DEFAULT_NETWORK_TIMEOUT_MS,
-  finalizeWebhookInbound,
   jsonWebhookResponse,
   parseJsonObjectBody,
   readHeaderValue,
@@ -32,6 +31,7 @@ import {
 
 const TELEGRAM_MAX_TEXT_LEN = 4_000;
 const TELEGRAM_MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+const TELEGRAM_ALLOWED_UPDATES = ['message', 'edited_message', 'callback_query', 'my_chat_member'];
 const MIME_EXT: Record<string, string> = {
   'image/png': '.png',
   'image/jpeg': '.jpg',
@@ -212,6 +212,9 @@ export function parseTelegramUpdate(channelId: string, update: Record<string, un
     const senderUsername = typeof from.username === 'string' && from.username.trim() ? from.username.trim() : undefined;
     const senderName = [from.first_name, from.last_name].filter(Boolean).join(' ') || senderUsername || senderId;
     const target = String(chat.id ?? from.id ?? senderId);
+    const messageThreadId = typeof cqMsg.message_thread_id === 'number' && Number.isSafeInteger(cqMsg.message_thread_id)
+      ? cqMsg.message_thread_id
+      : undefined;
     return {
       channelId,
       externalId: `cq:${cqId}`,
@@ -221,6 +224,7 @@ export function parseTelegramUpdate(channelId: string, update: Record<string, un
       target,
       text: data,
       callbackQueryId: cqId,
+      ...(messageThreadId !== undefined ? { messageThreadId } : {}),
     };
   }
 
@@ -267,6 +271,9 @@ export function parseTelegramUpdate(channelId: string, update: Record<string, un
   const senderName = [from.first_name, from.last_name].filter(Boolean).join(' ') || senderUsername || senderId;
   const target = String(chat.id ?? senderId);
   const externalId = String(msg.message_id ?? update.update_id ?? randomUUID());
+  const messageThreadId = typeof msg.message_thread_id === 'number' && Number.isSafeInteger(msg.message_thread_id)
+    ? msg.message_thread_id
+    : undefined;
   return {
     channelId,
     externalId,
@@ -276,7 +283,42 @@ export function parseTelegramUpdate(channelId: string, update: Record<string, un
     target,
     text,
     ...(telegramMedia.length ? { telegramMedia } : {}),
+    ...(messageThreadId !== undefined ? { messageThreadId } : {}),
   };
+}
+
+function asTelegramObject(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : undefined;
+}
+
+function hasBotMention(message: Record<string, unknown>, accountId?: string): boolean {
+  const handle = accountId?.replace(/^@/, '').toLowerCase();
+  if (!handle || !/^[a-z0-9_]+$/.test(handle)) return false;
+  const hasEntity = (text: unknown, entities: unknown) => typeof text === 'string' && Array.isArray(entities)
+    && entities.some((entity: unknown) => {
+      const e = asTelegramObject(entity);
+      if (!e || typeof e.offset !== 'number' || !Number.isSafeInteger(e.offset) || e.offset < 0
+        || typeof e.length !== 'number' || !Number.isSafeInteger(e.length) || e.length <= 0) return false;
+      // Telegram offsets are UTF-16 code units, like String.slice. Use the untrimmed text.
+      const token = text.slice(e.offset, e.offset + e.length).toLowerCase();
+      return (e.type === 'mention' && token === `@${handle}`)
+        || (e.type === 'bot_command' && /^\/[a-z0-9_]+@([a-z0-9_]+)$/.exec(token)?.[1] === handle);
+    });
+  return hasEntity(message.text, message.entities) || hasEntity(message.caption, message.caption_entities);
+}
+
+function isReplyToBot(message: Record<string, unknown>, accountId?: string): boolean {
+  const handle = accountId?.replace(/^@/, '').toLowerCase();
+  if (!handle || !/^[a-z0-9_]+$/.test(handle)) return false;
+  const reply = asTelegramObject(message.reply_to_message);
+  // Ignore Telegram Forum Topic implicit parent replies to topic-creation service messages.
+  if (!reply || reply.forum_topic_created) return false;
+  const replyFrom = asTelegramObject(reply.from);
+  return Boolean(
+    replyFrom?.is_bot
+    && typeof replyFrom.username === 'string'
+    && replyFrom.username.trim().toLowerCase() === handle,
+  );
 }
 
 /** Channel adapter for Telegram Bot API (`getMe`, `setMyCommands`, `sendMessage`, `sendAnimation`, `sendDocument`, `getUpdates`, media & webhook). */
@@ -349,14 +391,18 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
     } catch { /* best-effort */ }
   }
 
-  async sendTyping(channel: ImChannelConfig, chatId: string): Promise<void> {
+  async sendTyping(channel: ImChannelConfig, chatId: string, messageThreadId?: number): Promise<void> {
     if (!channel.botToken || !chatId) return;
     try {
       const base = normalizeTelegramApiBase(channel.apiBase);
       await fetch(`${base}/bot${channel.botToken}/sendChatAction`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, action: 'typing' }),
+        body: JSON.stringify({
+          chat_id: chatId,
+          action: 'typing',
+          ...(messageThreadId !== undefined ? { message_thread_id: messageThreadId } : {}),
+        }),
         signal: buildRequestSignal(5_000, this.ctx.shutdownSignal),
       });
     } catch { /* best-effort; silent on minimal mocks or transient failures */ }
@@ -485,6 +531,7 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
       caption?: string;
       animation?: boolean;
       replyMarkup?: Record<string, unknown>;
+      messageThreadId?: number;
     },
   ): Promise<void> {
     return runBoundedMediaTask(async () => {
@@ -507,6 +554,9 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
 
       const form = new FormData();
       form.append('chat_id', options.target);
+      if (options.messageThreadId !== undefined) {
+        form.append('message_thread_id', String(options.messageThreadId));
+      }
       if (options.replyToMessageId && /^\d+$/.test(options.replyToMessageId)) {
         form.append('reply_to_message_id', options.replyToMessageId);
       }
@@ -566,10 +616,12 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
 
       if (cleanText.trim().length > 0) {
         const chunks = splitTelegramText(cleanText, TELEGRAM_MAX_TEXT_LEN);
+        const groupTarget = options?.target && /^-\d+$/.test(options.target) ? options.target : undefined;
         for (let i = 0; i < chunks.length; i++) {
           const payload: Record<string, unknown> = {
             chat_id: options?.target,
             text: chunks[i],
+            ...(options?.messageThreadId !== undefined ? { message_thread_id: options.messageThreadId } : {}),
           };
           if (i === 0 && options?.replyToMessageId && /^\d+$/.test(options.replyToMessageId)) {
             payload.reply_to_message_id = Number(options.replyToMessageId);
@@ -577,7 +629,27 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
           if (i === chunks.length - 1 && options?.replyMarkup) {
             payload.reply_markup = options.replyMarkup;
           }
-          await this.postSendMessage(sendUrl, channel.botToken, payload);
+          try {
+            await this.postSendMessage(sendUrl, channel.botToken, payload);
+            if (groupTarget) {
+              console.info('[telegram-group-send]', JSON.stringify({
+                chatId: groupTarget,
+                messageId: payload.reply_to_message_id,
+                threadId: options?.messageThreadId,
+                action: 'accepted',
+              }));
+            }
+          } catch (error) {
+            if (groupTarget) {
+              console.warn('[telegram-group-send]', JSON.stringify({
+                chatId: groupTarget,
+                messageId: payload.reply_to_message_id,
+                threadId: options?.messageThreadId,
+                action: 'failed',
+              }));
+            }
+            throw error;
+          }
         }
       }
 
@@ -593,6 +665,7 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
               target: options!.target!,
               replyToMessageId: i === 0 && cleanText.trim().length === 0 ? options?.replyToMessageId : undefined,
               animation: true,
+              ...(options?.messageThreadId !== undefined ? { messageThreadId: options.messageThreadId } : {}),
               ...(attachReplyMarkup ? { replyMarkup: attachReplyMarkup } : {}),
             },
           );
@@ -600,6 +673,7 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
           const fallbackPayload: Record<string, unknown> = {
             chat_id: options?.target,
             text: BOT_EXPRESSION_META[expr].plainEmoji,
+            ...(options?.messageThreadId !== undefined ? { message_thread_id: options.messageThreadId } : {}),
           };
           if (i === 0 && cleanText.trim().length === 0 && options?.replyToMessageId && /^\d+$/.test(options.replyToMessageId)) {
             fallbackPayload.reply_to_message_id = Number(options.replyToMessageId);
@@ -642,7 +716,7 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
   async poll(channel: ImChannelConfig): Promise<{ receivedAny: boolean }> {
     if (!channel.botToken) return { receivedAny: false };
     const base = normalizeTelegramApiBase(channel.apiBase);
-    const params = new URLSearchParams({ timeout: '0' });
+    const params = new URLSearchParams({ timeout: '0', allowed_updates: JSON.stringify(TELEGRAM_ALLOWED_UPDATES) });
     if (channel.pollOffset !== undefined) {
       params.set('offset', String(channel.pollOffset));
     }
@@ -664,11 +738,7 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
     }
     const receivedAny = data.result.length > 0;
     for (const update of data.result) {
-      const inbound = parseTelegramUpdate(channel.id, update);
-      if (inbound) {
-        this.ctx.markTrustedTelegramInbound?.(inbound);
-        await this.ctx.ingestMessage(inbound);
-      }
+      await this.ingestUpdate(channel, update, 'poll');
       const updateId = Number(update.update_id);
       if (Number.isSafeInteger(updateId)) {
         const current = this.ctx.coordinator.store.getImChannel(channel.id);
@@ -701,11 +771,84 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
     if (!parsed.ok) {
       return jsonWebhookResponse(400, { error: 'Invalid JSON payload' });
     }
-    const inbound = parseTelegramUpdate(channel.id, parsed.data);
-    if (inbound) {
-      this.ctx.markTrustedTelegramInbound?.(inbound);
+    return jsonWebhookResponse(200, await this.ingestUpdate(channel, parsed.data, 'webhook'));
+  }
+
+  private async ingestUpdate(channel: ImChannelConfig, update: Record<string, unknown>, transport: 'poll' | 'webhook') {
+    const membership = asTelegramObject(update.my_chat_member);
+    const callback = asTelegramObject(update.callback_query);
+    const msg = asTelegramObject(callback ? callback.message : (update.message ?? update.edited_message));
+    const chat = asTelegramObject((membership ?? msg)?.chat);
+    const chatType = chat?.type;
+    const isGroup = chatType === 'group' || chatType === 'supergroup';
+    const audit = (action: string) => console.info('[telegram-group-update]', JSON.stringify({
+      transport,
+      updateId: Number.isSafeInteger(update.update_id) ? update.update_id : undefined,
+      chatId: Number.isSafeInteger(chat?.id) ? chat?.id : undefined,
+      chatType,
+      messageId: Number.isSafeInteger(msg?.message_id) ? msg?.message_id : undefined,
+      threadId: Number.isSafeInteger(msg?.message_thread_id) ? msg?.message_thread_id : undefined,
+      action,
+    }));
+    if (membership) {
+      if (isGroup) {
+        const status = asTelegramObject(membership.new_chat_member)?.status;
+        audit(['member', 'administrator', 'restricted', 'left', 'kicked', 'creator'].some(s => s === status)
+          ? `membership_${status}` : 'membership_changed');
+      }
+      return { ok: true, ignored: 'membership_update' };
     }
-    return finalizeWebhookInbound(this.ctx, inbound);
+
+    if (isGroup) {
+      const from = asTelegramObject((callback ?? msg)?.from);
+      const senderId = Number.isSafeInteger(from?.id) && Number(from?.id) > 0 ? String(from?.id) : undefined;
+      const senderUsername = typeof from?.username === 'string' && from.username.trim()
+        ? `@${from.username.trim().toLowerCase()}`
+        : undefined;
+      const addressed = Boolean(
+        callback
+        || (msg && (hasBotMention(msg, channel.accountId) || isReplyToBot(msg, channel.accountId))),
+      );
+      if (!callback && msg?.sender_chat) {
+        if (addressed) audit('group_anonymous_sender');
+        return { ok: true, ignored: 'group_anonymous_sender' };
+      }
+      // Group users can invoke the assistant only by exact ID / @username. With no sender rules,
+      // use the explicitly configured/bound private recipient, never a group chat ID.
+      const senderAllowed = Boolean(
+        senderId
+        && !from?.is_bot
+        && (channel.allowedSenders.length > 0
+          ? channel.allowedSenders.some(rule => {
+              const trimmed = rule.trim();
+              if (!trimmed) return false;
+              return trimmed === senderId || (senderUsername !== undefined && trimmed.toLowerCase() === senderUsername);
+            })
+          : (channel.defaultTarget && !channel.defaultTarget.startsWith('-') && channel.defaultTarget === senderId)),
+      );
+      // Record relevant traffic, not every conversation seen with Group Privacy disabled.
+      if (!senderAllowed || !addressed) {
+        const reason = senderAllowed ? 'group_not_addressed' : 'group_sender_not_allowed';
+        if (senderAllowed || addressed) audit(reason);
+        return { ok: true, ignored: reason };
+      }
+    }
+
+    const inbound = parseTelegramUpdate(channel.id, update);
+    if (!inbound || !inbound.text.trim()) {
+      if (isGroup) audit('empty_message');
+      return { ok: true, ignored: 'empty_message' };
+    }
+    this.ctx.markTrustedTelegramInbound?.(inbound);
+    if (!isGroup) return this.ctx.ingestMessage(inbound);
+    try {
+      const outcome = await this.ctx.ingestMessage(inbound);
+      audit(outcome.reason ?? outcome.action);
+      return outcome;
+    } catch (error) {
+      audit('ingest_failed');
+      throw error;
+    }
   }
 
   private async postSendMessage(

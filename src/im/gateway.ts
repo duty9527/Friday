@@ -29,11 +29,13 @@ import { transformOutboundBotExpressions } from '../web/shared/bot-expressions.j
 import {
   BoundedMap,
   DEFAULT_WECHAT_ILINK_BASE,
+  findFallbackTelegramChannel,
   isAllowedReplyWebhook,
   isSuspiciousBrowserWebhookRequest,
   jsonWebhookResponse,
   resolveImDeliveryTarget,
   sanitizeImError,
+  WECHAT_PROACTIVE_WINDOW_MS,
   type CoordinatorWithHooks,
   type ImChannelAdapter,
   type ImGatewayContext,
@@ -53,8 +55,12 @@ const IM_OUTBOUND_DELIVERED_META = 'im_outbound_delivered';
 const MAX_PERSISTED_DELIVERED = 200;
 
 function isTransientImError(error: unknown): boolean {
+  const flags = error as { authExpired?: boolean; sessionWindowExpired?: boolean } | null;
+  if (flags?.authExpired || flags?.sessionWindowExpired) {
+    return false;
+  }
   const msg = error instanceof Error ? error.message : String(error ?? '');
-  if (/拒绝向未授权|无效的|缺少|disabled|not found|not authorized|HTTP 400\b|HTTP 401\b|HTTP 403\b|HTTP 404\b/i.test(msg)) {
+  if (/拒绝向未授权|无效的|缺少|disabled|not found|not authorized|HTTP 400\b|HTTP 401\b|HTTP 403\b|HTTP 404\b|code=-2\b|code=-14\b|会话互动窗口已过期|登录态已过期|WeChat reply session expired/i.test(msg)) {
     return false;
   }
   return true;
@@ -85,6 +91,7 @@ export class ImGateway {
   private tgTypingSessions = new Map<string, {
     channelId: string;
     target: string;
+    messageThreadId?: number;
     refs: Set<string>;
     timer?: ReturnType<typeof setInterval>;
   }>();
@@ -505,7 +512,7 @@ export class ImGateway {
   async sendTelegramAttachment(
     channelId: string,
     fileName: string,
-    options: { target: string; replyToMessageId?: string; caption?: string },
+    options: { target: string; replyToMessageId?: string; caption?: string; messageThreadId?: number },
   ): Promise<void> {
     const channel = this.coordinator.store.getImChannel(channelId);
     const explicitTarget = options.target && options.target !== 'default' ? options.target : undefined;
@@ -564,9 +571,13 @@ export class ImGateway {
       void this.telegramAdapter.answerCallbackQuery(channel, inbound.callbackQueryId);
     }
 
-    const requestId = createHash('sha256').update(`im:${channel.id}:${inbound.externalId}`).digest('hex');
+    // Telegram message_id is chat-local. Preserve the legacy private-chat key,
+    // but never deduplicate a group message against a different chat.
+    const telegramGroup = channel.platform === 'telegram' && inbound.target && /^-\d+$/.test(inbound.target);
+    const requestScope = telegramGroup ? `${channel.id}:${inbound.target}` : channel.id;
+    const requestId = createHash('sha256').update(`im:${requestScope}:${inbound.externalId}`).digest('hex');
     const existing = this.coordinator.store.conversation?.byRequest(requestId);
-    if (existing) return { ok: true, action: 'routed_to_chat', messageId: existing.id };
+    if (existing) return { ok: true, action: telegramGroup ? 'duplicate' : 'routed_to_chat', messageId: existing.id };
 
     const authorizedPeer = this.isWechatPeerAuthorized(channel, inbound.senderId);
     const safeReplyWebhook = inbound.replyWebhook && isAllowedReplyWebhook(channel.platform, inbound.replyWebhook, channel)
@@ -601,6 +612,7 @@ export class ImGateway {
       replyToMessageId: inbound.externalId,
       replyWebhook: safeReplyWebhook,
       contextToken: inbound.contextToken,
+      ...(inbound.messageThreadId !== undefined ? { messageThreadId: inbound.messageThreadId } : {}),
     };
 
     if (channel.platform === 'xiaoai') {
@@ -670,12 +682,13 @@ export class ImGateway {
       replyToMessageId: inbound.externalId,
       replyWebhook: safeReplyWebhook,
       contextToken: inbound.contextToken,
+      ...(inbound.messageThreadId !== undefined ? { messageThreadId: inbound.messageThreadId } : {}),
     };
     const holdActive = !isInstantCommand && hasMedia;
     if (!isInstantCommand && replyOpts.target) {
       this.wechatIlinkAdapter.retainTyping(channel.id, replyOpts.target, ingestTypingRef, inbound.contextToken, safeReplyWebhook);
       if (channel.platform === 'telegram' && channel.botToken) {
-        this.retainTelegramTyping(channel.id, replyOpts.target, ingestTypingRef, true);
+        this.retainTelegramTyping(channel.id, replyOpts.target, ingestTypingRef, true, inbound.messageThreadId);
       }
     }
     if (holdActive) {
@@ -736,7 +749,7 @@ export class ImGateway {
       if (['queued', 'processing'].includes(userMsg.status) && replyOpts.target) {
         this.wechatIlinkAdapter.retainTyping(channel.id, replyOpts.target, `msg:${userMsg.id}`, inbound.contextToken, safeReplyWebhook);
         if (this.started && channel.platform === 'telegram' && channel.botToken) {
-          this.retainTelegramTyping(channel.id, replyOpts.target, `msg:${userMsg.id}`, false);
+          this.retainTelegramTyping(channel.id, replyOpts.target, `msg:${userMsg.id}`, false, inbound.messageThreadId);
         }
       }
       return { ok: true, action: 'routed_to_chat', messageId: userMsg.id };
@@ -835,6 +848,25 @@ export class ImGateway {
     );
   }
 
+  private async tryFallbackSystemPushToTelegram(bodyText: string, reason: string): Promise<boolean> {
+    const cleanText = stripXiaoaiDialogDirective(bodyText).text;
+    if (!cleanText) return false;
+    const fallback = findFallbackTelegramChannel(this.coordinator.store.listImChannels());
+    if (!fallback) return false;
+    const textWithNote = `${cleanText}\n\n> ℹ️ 微信主动推送未送达（${reason}），本次已自动通过 Telegram 兜底投递。`;
+    try {
+      await this.sendToChannel(fallback.channel.id, textWithNote, { target: fallback.target });
+      this.coordinator.store.notice(
+        'system',
+        'im_wechat_fallback_telegram',
+        `微信主动推送受限（${reason}），已自动转发至 Telegram (${fallback.channel.name})`,
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private async deliverOutboundMessage(
     msg: ChatMessage,
     priorAttempts = 0,
@@ -870,18 +902,28 @@ export class ImGateway {
       return 'skipped';
     }
 
+    const isSystemWechatPush = msg.source === 'system' && route.channel === 'wechat';
     let ch: ImChannelConfig;
     try {
       ch = this.coordinator.store.getImChannel(route.channelId);
     } catch {
+      const fellBack = isSystemWechatPush
+        ? await this.tryFallbackSystemPushToTelegram(bodyText, '微信通道不存在')
+        : false;
       this.seenMessageVersions.set(msg.id, msg.version);
       this.outboundRetryQueue.delete(msg.id);
-      return 'skipped';
+      return fellBack ? 'delivered' : 'skipped';
     }
     if (!ch.enabled || ch.platform !== route.channel || ch.accountId !== route.accountId) {
+      const fellBack = isSystemWechatPush
+        ? await this.tryFallbackSystemPushToTelegram(
+            bodyText,
+            !ch.enabled ? '微信通道已停用' : '微信账号已换绑',
+          )
+        : false;
       this.seenMessageVersions.set(msg.id, msg.version);
       this.outboundRetryQueue.delete(msg.id);
-      return 'skipped';
+      return fellBack ? 'delivered' : 'skipped';
     }
 
     if (route.channel === 'xiaoai') {
@@ -909,21 +951,50 @@ export class ImGateway {
       return 'skipped';
     }
 
+    if (isSystemWechatPush && ch.botToken && !ch.webhookUrl) {
+      const hasTgFallback = Boolean(findFallbackTelegramChannel(this.coordinator.store.listImChannels()));
+      if (hasTgFallback) {
+        const freshToken = (ch.contextTokens?.[route.conversationId] || route.contextToken || '').trim();
+        const lastActiveAt = ch.contextTokenUpdatedAt?.[route.conversationId] ?? ch.lastInboundAt;
+        const windowStale = typeof lastActiveAt === 'number' && lastActiveAt > 0
+          && (Date.now() - lastActiveAt > WECHAT_PROACTIVE_WINDOW_MS);
+        if (!freshToken || windowStale) {
+          const reason = !freshToken ? '缺少微信会话激活票据' : '距上次微信互动已超 22 小时';
+          if (await this.tryFallbackSystemPushToTelegram(cleanText, reason)) {
+            this.seenMessageVersions.set(msg.id, msg.version);
+            this.outboundRetryQueue.delete(msg.id);
+            return 'delivered';
+          }
+        }
+      }
+    }
+
     try {
       await this.sendToChannel(ch.id, outboundText, {
         target: route.conversationId,
         replyToMessageId: route.replyToMessageId,
         replyWebhook: route.replyWebhook,
         contextToken: route.contextToken,
+        ...(route.messageThreadId !== undefined ? { messageThreadId: route.messageThreadId } : {}),
       });
       this.seenMessageVersions.set(msg.id, msg.version);
       this.outboundRetryQueue.delete(msg.id);
       return 'delivered';
     } catch (error) {
       if (!isTransientImError(error) || priorAttempts >= OUTBOUND_RETRY_DELAYS_MS.length) {
+        let fellBack = false;
+        if (isSystemWechatPush) {
+          const errFlags = error as { sessionWindowExpired?: boolean; authExpired?: boolean } | null;
+          const reason = errFlags?.sessionWindowExpired
+            ? '微信会话互动窗口已过期 (ret=-2)'
+            : errFlags?.authExpired
+              ? '微信登录态已失效'
+              : '微信通道发送失败';
+          fellBack = await this.tryFallbackSystemPushToTelegram(cleanText, reason);
+        }
         this.seenMessageVersions.set(msg.id, msg.version);
         this.outboundRetryQueue.delete(msg.id);
-        return 'skipped';
+        return fellBack ? 'delivered' : 'skipped';
       }
       const delayMs = OUTBOUND_RETRY_DELAYS_MS[priorAttempts] ?? 60_000;
       this.outboundRetryQueue.set(msg.id, {
@@ -1066,7 +1137,13 @@ export class ImGateway {
     }
   }
 
-  private retainTelegramTyping(channelId: string, target: string, ref: string, sendInitial: boolean): void {
+  private retainTelegramTyping(
+    channelId: string,
+    target: string,
+    ref: string,
+    sendInitial: boolean,
+    messageThreadId?: number,
+  ): void {
     if (this.closing || !target) return;
     let channel: ImChannelConfig;
     try {
@@ -1077,11 +1154,11 @@ export class ImGateway {
     if (!channel.enabled || channel.platform !== 'telegram' || !channel.botToken) {
       return;
     }
-    const key = `${channelId}\0${target}`;
+    const key = messageThreadId !== undefined ? `${channelId}\0${target}\0${messageThreadId}` : `${channelId}\0${target}`;
     let session = this.tgTypingSessions.get(key);
     const wasIdle = !session || session.refs.size === 0;
     if (!session) {
-      session = { channelId, target, refs: new Set() };
+      session = { channelId, target, messageThreadId, refs: new Set() };
       const timer = setInterval(() => {
         const currentSession = this.tgTypingSessions.get(key);
         if (!currentSession || this.closing) {
@@ -1101,7 +1178,7 @@ export class ImGateway {
             this.clearChannelTelegramTyping(channelId);
             return;
           }
-          void this.telegramAdapter.sendTyping(latest, target);
+          void this.telegramAdapter.sendTyping(latest, target, currentSession.messageThreadId);
         } catch {
           this.clearChannelTelegramTyping(channelId);
         }
@@ -1112,18 +1189,19 @@ export class ImGateway {
     }
     session.refs.add(ref);
     if (sendInitial && wasIdle) {
-      void this.telegramAdapter.sendTyping(channel, target);
+      void this.telegramAdapter.sendTyping(channel, target, messageThreadId);
     }
   }
 
   private releaseTelegramTyping(channelId: string, target: string, ref: string): void {
-    const key = `${channelId}\0${target}`;
-    const session = this.tgTypingSessions.get(key);
-    if (!session) return;
-    session.refs.delete(ref);
-    if (session.refs.size === 0) {
-      if (session.timer) clearInterval(session.timer);
-      this.tgTypingSessions.delete(key);
+    const prefix = `${channelId}\0${target}`;
+    for (const [key, session] of this.tgTypingSessions.entries()) {
+      if (key !== prefix && !key.startsWith(`${prefix}\0`)) continue;
+      session.refs.delete(ref);
+      if (session.refs.size === 0) {
+        if (session.timer) clearInterval(session.timer);
+        this.tgTypingSessions.delete(key);
+      }
     }
   }
 
@@ -1148,7 +1226,7 @@ export class ImGateway {
       const active = (msg.role === 'user' && ['queued', 'processing'].includes(msg.status))
         || (msg.role === 'assistant' && msg.status === 'streaming');
       if (active) {
-        this.retainTelegramTyping(msg.origin.channelId, msg.origin.conversationId, `msg:${msg.id}`, false);
+        this.retainTelegramTyping(msg.origin.channelId, msg.origin.conversationId, `msg:${msg.id}`, false, msg.origin.messageThreadId);
         return;
       }
       if (settled) {

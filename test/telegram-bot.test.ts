@@ -36,6 +36,7 @@ interface MockTelegramState {
   chatActions: Array<Record<string, unknown>>;
   getFileCalls: string[];
   queuedUpdates: Array<Record<string, unknown>>;
+  requestedUpdateTypes: Array<string | null>;
   failDeleteWebhook: boolean;
   failSetMyCommands: boolean;
   failSendAnimation: boolean;
@@ -55,6 +56,7 @@ async function startMockTelegramServer(): Promise<MockTelegramState> {
     chatActions: [],
     getFileCalls: [],
     queuedUpdates: [],
+    requestedUpdateTypes: [],
     failDeleteWebhook: false,
     failSetMyCommands: false,
     failSendAnimation: false,
@@ -108,6 +110,7 @@ async function startMockTelegramServer(): Promise<MockTelegramState> {
     if (/\/bot[^/]+\/getUpdates(?:\?|$)/.test(url)) {
       const parsed = new URL(url, 'http://127.0.0.1');
       const offset = Number(parsed.searchParams.get('offset') ?? '0');
+      state.requestedUpdateTypes.push(parsed.searchParams.get('allowed_updates'));
       const batch = state.queuedUpdates.filter(u => Number(u.update_id) >= offset);
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true, result: batch }));
@@ -676,6 +679,109 @@ test('Telegram slash commands, inline keyboards, callback_query, chunking, stick
       await until(() => coordinator.store.conversation.get(sendFileLocal.id).status === 'completed');
       await until(() => mock.sentDocuments.length >= 3);
       assert.ok(mock.sentDocuments[2]!.raw.toString('utf8').includes('本地会话自动路由至 Telegram 附件'));
+    } finally {
+      await coordinator.close();
+      await mock.close();
+    }
+  });
+});
+
+test('Telegram polling replies to a group mention even when its message ID already exists in private chat', async () => {
+  await withTempHome('friday-tg-group-', async home => {
+    const mock = await startMockTelegramServer();
+    const coordinator = new Coordinator(home, offlineFactory(15));
+    await coordinator.ready();
+    try {
+      const { channel } = await coordinator.im.quickConnectTelegram({
+        botToken: '123456:TEST-BOT-TOKEN', apiBase: mock.baseUrl, defaultTarget: '9001',
+      });
+      const pollThrough = async (updateId: number) => {
+        await (coordinator.im as any).pollChannel(channel.id);
+        await until(() => (coordinator.store.getImChannel(channel.id).pollOffset ?? 0) > updateId);
+      };
+      const from = { id: 9001, first_name: 'Tony' };
+      const group = { id: -100999, type: 'supergroup', title: 'Test Group' };
+      mock.queuedUpdates.push({ update_id: 1, message: {
+        message_id: 39, from, chat: { id: 9001, type: 'private' }, text: 'private chat test',
+      } });
+      await pollThrough(1);
+      await until(() => mock.sentMessages.some(m => m.chat_id === '9001' && m.reply_to_message_id === 39));
+
+      const mention = '🤖 @fridaytestbot group reply test';
+      mock.queuedUpdates.push({ update_id: 2, message: {
+        message_id: 39, from, chat: group, text: mention,
+        entities: [{ type: 'mention', offset: 3, length: '@FridayTestBot'.length }],
+      } });
+      await pollThrough(2);
+      assert.ok(coordinator.store.conversation.history().items.some(
+        m => m.role === 'user' && m.origin?.conversationId === '-100999' && m.origin.replyToMessageId === '39',
+      ), 'the group update must not deduplicate against the private message');
+      await until(() => mock.sentMessages.some(m => m.chat_id === '-100999' && m.reply_to_message_id === 39));
+      assert.equal(coordinator.store.getImChannel(channel.id).defaultTarget, '9001');
+      assert.deepEqual(JSON.parse(mock.requestedUpdateTypes.at(-1)!), ['message', 'edited_message', 'callback_query', 'my_chat_member']);
+
+      // Duplicate delivery for the same chat is still deduplicated, not sent again.
+      mock.queuedUpdates.push({ update_id: 3, edited_message: {
+        message_id: 39, from, chat: group, text: mention,
+        entities: [{ type: 'mention', offset: 3, length: '@FridayTestBot'.length }],
+      } });
+      await pollThrough(3);
+      assert.equal(mock.sentMessages.filter(m => m.chat_id === '-100999' && m.reply_to_message_id === 39).length, 1);
+      assert.equal(coordinator.store.getImChannel(channel.id).inboundCount, 2);
+    } finally {
+      await coordinator.close();
+      await mock.close();
+    }
+  });
+});
+
+test('Telegram only routes authorized, explicitly addressed group messages, supports reply-to-bot & Forum Topics, and leaves private routing intact', async () => {
+  await withTempHome('friday-tg-group-policy-', async home => {
+    const mock = await startMockTelegramServer();
+    const coordinator = new Coordinator(home, offlineFactory(15));
+    await coordinator.ready();
+    try {
+      const { channel } = await coordinator.im.quickConnectTelegram({
+        botToken: '123456:TEST-BOT-TOKEN', apiBase: mock.baseUrl, defaultTarget: '9001',
+      });
+      const from = { id: 9001, first_name: 'Tony', username: 'TonyStark' };
+      const chat = { id: -100999, type: 'supergroup', is_forum: true };
+      const text = '/id@FridayTestBot';
+      const entities = [{ type: 'bot_command', offset: 0, length: text.length }];
+      const msg = { chat, from, text, entities };
+      mock.queuedUpdates.push(
+        { update_id: 1, my_chat_member: { chat, new_chat_member: { status: 'member' } } },
+        { update_id: 2, message: { ...msg, message_id: 2, text: '/id', entities: [{ ...entities[0], length: 3 }] } },
+        { update_id: 3, message: { ...msg, message_id: 3, text: '/id@AnotherBot', entities: [{ ...entities[0], length: 14 }] } },
+        { update_id: 4, message: { ...msg, message_id: 4, entities: [] } },
+        { update_id: 5, message: { ...msg, message_id: 5, from: { id: 9123 } } },
+        { update_id: 6, message: { ...msg, message_id: 6, sender_chat: chat } },
+        { update_id: 7, message: { ...msg, message_id: 7 } },
+        { update_id: 8, message: { message_id: 8, from, chat: { id: 9001, type: 'private' }, text: '/id' } },
+        // Forum Topic implicit parent reply (forum_topic_created) without mention must NOT trigger
+        { update_id: 9, message: {
+          message_id: 9, message_thread_id: 77, from, chat, text: '普通话题聊天',
+          reply_to_message: { message_id: 77, from, forum_topic_created: { name: 'Topic' } },
+        } },
+        // Direct reply to bot's own message inside Forum Topic #77 without @mention MUST trigger & echo message_thread_id
+        { update_id: 10, message: {
+          message_id: 10, message_thread_id: 77, from, chat, text: '/id',
+          reply_to_message: { message_id: 700, from: { id: 123456, is_bot: true, username: 'FridayTestBot' } },
+        } },
+      );
+      await (coordinator.im as any).pollChannel(channel.id);
+      await until(() => coordinator.store.getImChannel(channel.id).pollOffset === 11);
+      assert.equal(coordinator.store.getImChannel(channel.id).inboundCount, 3);
+      assert.deepEqual(
+        mock.sentMessages.map(m => [m.chat_id, m.reply_to_message_id, m.message_thread_id]),
+        [
+          ['-100999', 7, undefined],
+          ['9001', 8, undefined],
+          ['-100999', 10, 77],
+        ],
+      );
+      assert.match(String(mock.sentMessages[0]?.text), /Chat ID: -100999/);
+      assert.match(String(mock.sentMessages[2]?.text), /Chat ID: -100999/);
     } finally {
       await coordinator.close();
       await mock.close();

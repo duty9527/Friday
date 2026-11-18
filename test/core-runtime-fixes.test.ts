@@ -293,6 +293,12 @@ test('[C-07][X-02][X-04][C-10] router-tools short ID, IM origin isolation, switc
     assert.equal(isOriginAccessible(wxA, localOrigin), false);
     assert.equal(isOriginAccessible(wxA, wxB), false);
     assert.equal(isOriginAccessible(wxA, wxA), true);
+    const tgPrivate = { channel: 'telegram' as const, channelId: 'tg', senderId: '1', conversationId: '1' };
+    const tgGroup = { ...tgPrivate, conversationId: '-10' };
+    assert.equal(isOriginAccessible(tgGroup, tgPrivate), false);
+    assert.equal(isOriginAccessible(tgPrivate, tgGroup), false);
+    assert.equal(isOriginAccessible(tgGroup, { ...tgGroup, conversationId: '-20' }), false);
+    assert.equal(isOriginAccessible(tgGroup, tgGroup), true);
 
     store.saveImChannel({
       id: 'wx-1',

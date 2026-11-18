@@ -355,6 +355,11 @@ export function isOriginAccessible(
   if (!targetOrigin?.channel || targetOrigin.channel === 'local') return false;
   if (targetOrigin.channel !== callerOrigin.channel) return false;
   if (callerOrigin.channelId && targetOrigin.channelId !== callerOrigin.channelId) return false;
+  // The same Telegram sender may speak in private and in several shared chats.
+  // Do not include private/other group history when preparing a group reply.
+  if (callerOrigin.channel === 'telegram'
+    && [callerOrigin.conversationId, targetOrigin.conversationId].some(id => id?.startsWith('-'))
+    && callerOrigin.conversationId !== targetOrigin.conversationId) return false;
   if (callerOrigin.speakerRole === 'member' && targetOrigin.speakerRole !== 'member') return false;
   if (callerOrigin.speakerId && targetOrigin.speakerId && callerOrigin.speakerId !== targetOrigin.speakerId) {
     return false;
@@ -1022,6 +1027,7 @@ export function createRouterTools(
         await host.im.sendTelegramAttachment(origin.channelId, fileName, {
           target,
           ...(origin.replyToMessageId ? { replyToMessageId: origin.replyToMessageId } : {}),
+          ...(origin.messageThreadId !== undefined ? { messageThreadId: origin.messageThreadId } : {}),
         });
       } else {
         let currentChannelAccountId: string | undefined;
