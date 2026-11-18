@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, statSync, type BigIntStats } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync, type BigIntStats } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { resolveFridayHome, resolvePluginDataDir } from './paths.js';
@@ -9,6 +9,9 @@ import type { PluginActionSpec, PluginRuntimeMode, PluginView } from './view.js'
 
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const BUILTIN_PLUGINS_DIR = resolve(REPO_ROOT, 'plugins');
+const MAX_PLUGIN_CALL_DEPTH = 4;
+const DEFAULT_MEMBER_ALLOWED_PLUGINS: ReadonlySet<string> = new Set(['miot', 'tv-ir', 'tv-agent']);
 
 export type { PluginRuntimeMode };
 
@@ -20,6 +23,7 @@ export interface PluginManifest extends PluginView {
   platforms?: string[];
   runtime: PluginRuntimeMode;
   voiceFastpath: boolean;
+  isBuiltin?: boolean;
 }
 
 export interface PluginRunResult {
@@ -56,6 +60,8 @@ export interface VoiceFastpathRequest {
   senderId?: string;
   speakerId?: string;
   speakerName?: string;
+  speakerRole?: 'owner' | 'member';
+  allowedPlugins?: ReadonlySet<string> | readonly string[];
   explicitWake?: boolean;
   sessionState?: Record<string, unknown>;
 }
@@ -96,8 +102,42 @@ function statBigIntSafe(filePath: string): BigIntStats | undefined {
   }
 }
 
-function pluginRoots(home: string): string[] {
-  return [join(resolve(home), 'plugins'), join(REPO_ROOT, 'plugins')];
+function pluginRoots(home: string): Array<{ root: string; isBuiltin: boolean }> {
+  return [
+    { root: BUILTIN_PLUGINS_DIR, isBuiltin: true },
+    { root: join(resolve(home), 'plugins'), isBuiltin: false },
+  ];
+}
+
+function normalizeAllowedPlugins(
+  allowed?: ReadonlySet<string> | readonly string[],
+): ReadonlySet<string> | undefined {
+  if (allowed === undefined) return undefined;
+  return allowed instanceof Set ? allowed : new Set(allowed);
+}
+
+function resolveEffectiveAllowedPlugins(
+  requestAllowed?: ReadonlySet<string> | readonly string[],
+  optionAllowed?: ReadonlySet<string> | readonly string[],
+  speakerRole?: 'owner' | 'member',
+): ReadonlySet<string> | undefined {
+  const sets: ReadonlySet<string>[] = [];
+  if (requestAllowed !== undefined) {
+    sets.push(requestAllowed instanceof Set ? requestAllowed : new Set(requestAllowed));
+  }
+  if (optionAllowed !== undefined) {
+    sets.push(optionAllowed instanceof Set ? optionAllowed : new Set(optionAllowed));
+  }
+  if (speakerRole === 'member') {
+    sets.push(DEFAULT_MEMBER_ALLOWED_PLUGINS);
+  }
+  if (sets.length === 0) return undefined;
+  const [first, ...rest] = sets;
+  const out = new Set<string>();
+  for (const item of first!) {
+    if (rest.every(s => s.has(item))) out.add(item);
+  }
+  return out;
 }
 
 function resolveRuntimeMode(name: string, entryPath: string, rawRuntime: unknown): PluginRuntimeMode {
@@ -124,17 +164,44 @@ function loadCachedPluginManifest(
   pluginName: string,
   dir: string,
   platform: string = process.platform,
+  isBuiltin = false,
+  realRootDir?: string,
 ): PluginManifest | undefined {
-  const manifestPath = join(dir, 'plugin.json');
-  const defaultEntryPath = join(dir, 'index.mjs');
+  let realDir: string;
+  try {
+    const dirStat = lstatSync(dir);
+    if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
+      MANIFEST_CACHE.delete(dir);
+      return undefined;
+    }
+    realDir = realpathSync(dir);
+    if (realRootDir) {
+      const relDir = relative(realRootDir, realDir);
+      if (!relDir || relDir === '..' || relDir.startsWith(`..${sep}`) || isAbsolute(relDir)) {
+        MANIFEST_CACHE.delete(dir);
+        return undefined;
+      }
+    }
+  } catch {
+    MANIFEST_CACHE.delete(dir);
+    return undefined;
+  }
+
+  const manifestPath = join(realDir, 'plugin.json');
+  const defaultEntryPath = join(realDir, 'index.mjs');
   const manifestStat = statBigIntSafe(manifestPath);
   const manifestMtimeNs = manifestStat?.mtimeNs ?? -1n;
   const manifestSize = manifestStat?.size ?? -1n;
 
   const cached = MANIFEST_CACHE.get(dir);
-  if (cached && cached.manifestMtimeNs === manifestMtimeNs && cached.manifestSize === manifestSize) {
+  if (
+    cached &&
+    cached.manifestMtimeNs === manifestMtimeNs &&
+    cached.manifestSize === manifestSize &&
+    cached.base.isBuiltin === isBuiltin
+  ) {
     const entryStat = statBigIntSafe(cached.base.entryPath);
-    if (entryStat && cached.entryMtimeNs === entryStat.mtimeNs && cached.entrySize === entryStat.size) {
+    if (entryStat && entryStat.isFile() && cached.entryMtimeNs === entryStat.mtimeNs && cached.entrySize === entryStat.size) {
       return {
         ...cached.base,
         enabled: cached.base.enabled && isPlatformSupported(cached.base.platforms, platform),
@@ -160,18 +227,25 @@ function loadCachedPluginManifest(
   }
 
   const entryFile = typeof raw.entry === 'string' && raw.entry.trim() ? raw.entry.trim() : 'index.mjs';
-  const entryPath = join(dir, entryFile);
-  const entryStat = statBigIntSafe(entryPath);
-  if (!entryStat) {
+  let entryPath: string;
+  try {
+    const candidate = resolve(realDir, entryFile);
+    entryPath = realpathSync(candidate);
+  } catch {
     MANIFEST_CACHE.delete(dir);
     return undefined;
   }
 
-  let sourceCode: string | undefined;
-  try {
-    sourceCode = readFileSync(entryPath, 'utf8').slice(0, 131_072);
-  } catch {
-    /* ignore read error */
+  const relEntry = relative(realDir, entryPath);
+  if (!relEntry || relEntry === '..' || relEntry.startsWith(`..${sep}`) || isAbsolute(relEntry)) {
+    MANIFEST_CACHE.delete(dir);
+    return undefined;
+  }
+
+  const entryStat = statBigIntSafe(entryPath);
+  if (!entryStat || !entryStat.isFile()) {
+    MANIFEST_CACHE.delete(dir);
+    return undefined;
   }
 
   const actions = Array.isArray(raw.actions) ? raw.actions.map(a => String(a)) : ['status'];
@@ -202,16 +276,16 @@ function loadCachedPluginManifest(
     description: typeof raw.description === 'string' ? raw.description.trim() : '',
     entry: entryFile,
     entryPath,
-    dir,
+    dir: realDir,
     enabled: staticEnabled,
     ...(platforms && platforms.length > 0 ? { platforms } : {}),
     runtime,
     ...(promptHint ? { promptHint } : {}),
     voiceFastpath,
+    isBuiltin,
     actions,
     actionSpecs,
     manifestJson,
-    sourceCode,
   };
 
   MANIFEST_CACHE.set(dir, {
@@ -256,18 +330,20 @@ export function listPluginsSync(home: string, options?: { platform?: string }): 
   const platform = options?.platform ?? process.platform;
   const seen = new Set<string>();
   const manifests: PluginManifest[] = [];
-  for (const root of pluginRoots(resolvedHome)) {
+  for (const { root, isBuiltin } of pluginRoots(resolvedHome)) {
     if (!existsSync(root)) continue;
+    let realRoot: string;
     let entries;
     try {
-      entries = readdirSync(root, { withFileTypes: true });
+      realRoot = realpathSync(root);
+      entries = readdirSync(realRoot, { withFileTypes: true });
     } catch {
       continue;
     }
     for (const entry of entries) {
       if (!entry.isDirectory() || !VALID_PLUGIN_NAME.test(entry.name) || seen.has(entry.name)) continue;
-      const dir = join(root, entry.name);
-      const manifest = loadCachedPluginManifest(resolvedHome, entry.name, dir, platform);
+      const dir = join(realRoot, entry.name);
+      const manifest = loadCachedPluginManifest(resolvedHome, entry.name, dir, platform, isBuiltin, realRoot);
       if (!manifest) continue;
       seen.add(entry.name);
       manifests.push(manifest);
@@ -349,20 +425,36 @@ function readHostDecisionCredentials(homeDir: string): { apiKey: string; baseUrl
   }
 }
 
+function isTrustedBuiltinTvAgent(manifest: PluginManifest): boolean {
+  if (!manifest.isBuiltin || manifest.name !== 'tv-agent') return false;
+  try {
+    const builtinTvAgentDir = realpathSync(join(BUILTIN_PLUGINS_DIR, 'tv-agent'));
+    return realpathSync(manifest.dir) === builtinTvAgentDir;
+  } catch {
+    return false;
+  }
+}
+
 function buildInProcessContext(
   homeDir: string,
   pluginDataDir: string,
   signal: AbortSignal,
   defaultTimeoutMs: number,
-  pluginName?: string,
+  manifest?: PluginManifest,
+  contextOptions: {
+    allowedPlugins?: ReadonlySet<string>;
+    callDepth?: number;
+  } = {},
 ): PluginExecutionContext {
+  const allowedPlugins = contextOptions.allowedPlugins;
+  const callDepth = contextOptions.callDepth ?? 0;
   return {
     homeDir,
     pluginDataDir,
     dataDir: pluginDataDir,
     env: buildPluginEnv(homeDir, pluginDataDir),
     signal,
-    ...(pluginName === 'tv-agent'
+    ...(manifest && isTrustedBuiltinTvAgent(manifest)
       ? { getDecisionCredentials: () => readHostDecisionCredentials(homeDir) }
       : {}),
     callPlugin: (targetPlugin, targetAction = 'status', targetArgs = {}, targetTimeoutMs) => {
@@ -370,13 +462,26 @@ function buildInProcessContext(
       if (!VALID_PLUGIN_NAME.test(cleanTarget)) {
         return Promise.reject(new Error(`Invalid plugin name: ${cleanTarget}`));
       }
+      const nextDepth = callDepth + 1;
+      if (nextDepth > MAX_PLUGIN_CALL_DEPTH) {
+        return Promise.reject(
+          new Error(`Plugin call depth limit (${MAX_PLUGIN_CALL_DEPTH}) exceeded invoking "${cleanTarget}"`),
+        );
+      }
+      if (allowedPlugins && !allowedPlugins.has(cleanTarget)) {
+        return Promise.reject(new Error(`Plugin "${cleanTarget}" is not allowed in caller context`));
+      }
       return runPlugin(
         homeDir,
         cleanTarget,
         targetAction,
         targetArgs,
         targetTimeoutMs ?? defaultTimeoutMs,
-        { signal },
+        {
+          signal,
+          ...(allowedPlugins ? { allowedPlugins } : {}),
+          callDepth: nextDepth,
+        },
       );
     },
   };
@@ -466,15 +571,44 @@ function findPluginManifest(home: string, name: string): { resolvedHome: string;
   return { resolvedHome, cleanName, manifest };
 }
 
+function assertPluginAllowedAndEnabled(
+  cleanName: string,
+  manifest: PluginManifest,
+  allowedPlugins?: ReadonlySet<string>,
+): void {
+  if (allowedPlugins && !allowedPlugins.has(cleanName)) {
+    throw new Error(`Plugin "${cleanName}" is not allowed in current context`);
+  }
+  if (!manifest.enabled) {
+    if (!isPlatformSupported(manifest.platforms, process.platform)) {
+      throw new Error(`Plugin "${cleanName}" is not supported on platform "${process.platform}"`);
+    }
+    throw new Error(`Plugin "${cleanName}" is disabled`);
+  }
+}
+
+export interface PluginRunOptions {
+  signal?: AbortSignal;
+  allowedPlugins?: ReadonlySet<string> | readonly string[];
+  callDepth?: number;
+}
+
 export async function runPluginInProcess(
   home: string,
   name: string,
   action = 'status',
   args: Record<string, unknown> = {},
   timeoutMs = 30_000,
-  options?: { signal?: AbortSignal },
+  options?: PluginRunOptions,
 ): Promise<PluginRunResult> {
   const { resolvedHome, cleanName, manifest } = findPluginManifest(home, name);
+  const allowedPlugins = normalizeAllowedPlugins(options?.allowedPlugins);
+  assertPluginAllowedAndEnabled(cleanName, manifest, allowedPlugins);
+  const callDepth = options?.callDepth ?? 0;
+  if (callDepth > MAX_PLUGIN_CALL_DEPTH) {
+    throw new Error(`Plugin call depth limit (${MAX_PLUGIN_CALL_DEPTH}) exceeded invoking "${cleanName}"`);
+  }
+
   const pluginDataDir = resolvePluginDataDir(resolvedHome, cleanName);
   await mkdir(pluginDataDir, { recursive: true, mode: 0o700 });
 
@@ -488,7 +622,14 @@ export async function runPluginInProcess(
     timeoutMs,
     `Plugin "${cleanName}" action "${action}" timed out after ${timeoutMs}ms`,
     options?.signal,
-    signal => runner(action, args, buildInProcessContext(resolvedHome, pluginDataDir, signal, timeoutMs, cleanName)),
+    signal => runner(
+      action,
+      args,
+      buildInProcessContext(resolvedHome, pluginDataDir, signal, timeoutMs, manifest, {
+        ...(allowedPlugins ? { allowedPlugins } : {}),
+        callDepth,
+      }),
+    ),
   );
   return formatPluginResult(cleanName, action, rawResult);
 }
@@ -499,27 +640,69 @@ export async function runPlugin(
   action = 'status',
   args: Record<string, unknown> = {},
   timeoutMs = 30_000,
-  options?: { signal?: AbortSignal },
+  options?: PluginRunOptions,
 ): Promise<PluginRunResult> {
   const { resolvedHome, cleanName, manifest } = findPluginManifest(home, name);
+  const allowedPlugins = normalizeAllowedPlugins(options?.allowedPlugins);
+  assertPluginAllowedAndEnabled(cleanName, manifest, allowedPlugins);
+  const callDepth = options?.callDepth ?? 0;
+  if (callDepth > MAX_PLUGIN_CALL_DEPTH) {
+    throw new Error(`Plugin call depth limit (${MAX_PLUGIN_CALL_DEPTH}) exceeded invoking "${cleanName}"`);
+  }
+
   if (manifest.runtime === 'in-process') {
-    return runPluginInProcess(resolvedHome, cleanName, action, args, timeoutMs, options);
+    return runPluginInProcess(resolvedHome, cleanName, action, args, timeoutMs, {
+      ...options,
+      ...(allowedPlugins ? { allowedPlugins } : {}),
+      callDepth,
+    });
   }
 
   const pluginDataDir = resolvePluginDataDir(resolvedHome, cleanName);
   await mkdir(pluginDataDir, { recursive: true, mode: 0o700 });
 
-  const { stdout } = await execFileAsync(
-    process.execPath,
-    [manifest.entryPath, action, JSON.stringify(args)],
-    {
-      cwd: manifest.dir,
-      timeout: timeoutMs,
-      maxBuffer: 4 * 1024 * 1024,
-      env: buildPluginEnv(resolvedHome, pluginDataDir),
-      ...(options?.signal ? { signal: options.signal } : {}),
-    },
-  );
+  let stdout = '';
+  try {
+    const out = await execFileAsync(
+      process.execPath,
+      [manifest.entryPath, action, JSON.stringify(args)],
+      {
+        cwd: manifest.dir,
+        timeout: timeoutMs,
+        maxBuffer: 4 * 1024 * 1024,
+        env: buildPluginEnv(resolvedHome, pluginDataDir),
+        ...(options?.signal ? { signal: options.signal } : {}),
+      },
+    );
+    stdout = out.stdout;
+  } catch (err) {
+    const e = err as { name?: string; stdout?: unknown; killed?: boolean };
+    if (options?.signal?.aborted || e?.name === 'AbortError' || e?.killed) {
+      throw err;
+    }
+    const errStdout = typeof e?.stdout === 'string'
+      ? e.stdout.trim()
+      : Buffer.isBuffer(e?.stdout)
+        ? e.stdout.toString('utf8').trim()
+        : '';
+    if (errStdout.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(errStdout) as unknown;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          const obj = parsed as Record<string, unknown>;
+          return formatPluginResult(
+            cleanName,
+            action,
+            obj.ok === undefined ? { ...obj, ok: false } : obj,
+            errStdout,
+          );
+        }
+      } catch {
+        /* non-JSON stdout falls through to rethrowing process failure */
+      }
+    }
+    throw err;
+  }
 
   const trimmed = stdout.trim();
   if (!trimmed) {
@@ -546,12 +729,21 @@ export async function runPlugin(
 export async function tryPluginVoiceFastpath(
   homeDir: string,
   request: VoiceFastpathRequest,
-  options?: { timeoutMs?: number; signal?: AbortSignal },
+  options?: {
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    allowedPlugins?: ReadonlySet<string> | readonly string[];
+  },
 ): Promise<VoiceFastpathResult | undefined> {
   const resolvedHome = resolveFridayHome(homeDir);
   const timeoutMs = options?.timeoutMs ?? 10_000;
+  const effectiveAllowed = resolveEffectiveAllowedPlugins(
+    request.allowedPlugins,
+    options?.allowedPlugins,
+    request.speakerRole,
+  );
   const candidates = listPluginsSync(resolvedHome).filter(
-    p => p.enabled && p.voiceFastpath && p.runtime === 'in-process',
+    p => p.enabled && p.voiceFastpath && p.runtime === 'in-process' && (!effectiveAllowed || effectiveAllowed.has(p.name)),
   );
   for (const manifest of candidates) {
     if (options?.signal?.aborted) return undefined;
@@ -566,7 +758,10 @@ export async function tryPluginVoiceFastpath(
         options?.signal,
         signal => mod.handleVoiceFastpath!(
           request,
-          buildInProcessContext(resolvedHome, pluginDataDir, signal, timeoutMs, manifest.name),
+          buildInProcessContext(resolvedHome, pluginDataDir, signal, timeoutMs, manifest, {
+            ...(effectiveAllowed ? { allowedPlugins: effectiveAllowed } : {}),
+            callDepth: 0,
+          }),
         ),
       );
       if (result && result.handled) {

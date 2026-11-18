@@ -18,3 +18,8 @@ venv/
 *.log
 coverage/
 *_完整聊天记录.md
+*.keystore
+*.jks
+*.apk
+*.idsig
+keystore.pass

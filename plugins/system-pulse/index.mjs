@@ -1,10 +1,12 @@
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { existsSync, statfsSync } from 'node:fs';
 import { cpus, freemem, hostname, loadavg, platform, release, totalmem, uptime } from 'node:os';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { resolveHomeDir } from '../_shared/config-store.mjs';
 
+const execFileAsync = promisify(execFile);
 const ACTIONS = ['status', 'patrol', 'remind'];
 
 /**
@@ -27,43 +29,34 @@ function collectDisk(targetPath) {
 
 /**
  * @param {string} cwd
+ * @param {AbortSignal} [signal]
  */
-function collectGit(cwd) {
+async function collectGit(cwd, signal) {
   if (!cwd || !existsSync(cwd)) return null;
+  const opts = {
+    cwd,
+    encoding: /** @type {const} */ ('utf8'),
+    timeout: 2500,
+    ...(signal ? { signal } : {}),
+  };
   try {
-    const inside = execFileSync('git', ['rev-parse', '--is-inside-work-tree'], {
-      cwd,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 2500,
-    }).trim();
-    if (inside !== 'true') return null;
-    const branch = execFileSync('git', ['branch', '--show-current'], {
-      cwd,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 2500,
-    }).trim() || 'HEAD';
-    const porcelain = execFileSync('git', ['status', '--porcelain'], {
-      cwd,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 3000,
-    }).trim();
+    const { stdout: insideRaw } = await execFileAsync('git', ['rev-parse', '--is-inside-work-tree'], opts);
+    if (insideRaw.trim() !== 'true') return null;
+    const [{ stdout: branchRaw }, { stdout: porcelainRaw }, lastCommit] = await Promise.all([
+      execFileAsync('git', ['branch', '--show-current'], opts),
+      execFileAsync('git', ['status', '--porcelain'], { ...opts, timeout: 3000 }),
+      execFileAsync('git', ['log', '-1', '--pretty=%h %s'], opts)
+        .then(r => r.stdout.trim())
+        .catch(() => ''),
+    ]);
+    const branch = branchRaw.trim() || 'HEAD';
+    const porcelain = porcelainRaw.trim();
     const dirtyCount = porcelain ? porcelain.split('\n').filter(Boolean).length : 0;
-    let lastCommit = '';
-    try {
-      lastCommit = execFileSync('git', ['log', '-1', '--pretty=%h %s'], {
-        cwd,
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'ignore'],
-        timeout: 2500,
-      }).trim();
-    } catch {
-      lastCommit = '';
-    }
     return { cwd, branch, dirtyCount, lastCommit };
-  } catch {
+  } catch (err) {
+    if (signal?.aborted || /** @type {{ name?: string }} */ (err)?.name === 'AbortError') {
+      throw err;
+    }
     return null;
   }
 }
@@ -72,7 +65,7 @@ function collectGit(cwd) {
  * @param {Record<string, unknown>} args
  * @param {import('../_shared/types.d.ts').PluginExecutionContext} context
  */
-function collectSnapshot(args, context) {
+async function collectSnapshot(args, context) {
   const coreCount = Math.max(1, cpus().length);
   const [load1 = 0, load5 = 0, load15 = 0] = loadavg().map(v => Number(v.toFixed(2)));
   const loadPerCore = Number((load1 / coreCount).toFixed(2));
@@ -85,7 +78,7 @@ function collectSnapshot(args, context) {
   const explicitCwd = typeof args.cwd === 'string' && args.cwd.trim() ? resolve(args.cwd.trim()) : '';
   const targetDir = explicitCwd || resolveHomeDir(context);
   const disk = collectDisk(existsSync(targetDir) ? targetDir : resolveHomeDir(context));
-  const git = collectGit(explicitCwd || process.cwd());
+  const git = await collectGit(explicitCwd || process.cwd(), context?.signal);
   const uptimeHours = Number((uptime() / 3600).toFixed(1));
   return {
     host: hostname(),
@@ -132,7 +125,7 @@ export async function runAction(action = 'status', args = {}, context = {}) {
     };
   }
 
-  const snap = collectSnapshot(safeArgs, context);
+  const snap = await collectSnapshot(safeArgs, context);
 
   if (name === 'patrol') {
     const maxLoadPerCore = typeof safeArgs.maxLoadPerCore === 'number' ? safeArgs.maxLoadPerCore : 2.5;
@@ -194,6 +187,7 @@ export async function runAction(action = 'status', args = {}, context = {}) {
 
 async function main() {
   const action = process.argv[2] || 'status';
+  /** @type {Record<string, unknown>} */
   let args = {};
   try {
     args = process.argv[3] ? JSON.parse(process.argv[3]) : {};

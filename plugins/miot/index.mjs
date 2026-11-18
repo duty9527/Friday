@@ -19,6 +19,7 @@ import {
   buildSshArgs as buildSharedSshArgs,
   discoverOptionalXiaoaiSshFromSqlite,
   execSshText,
+  isValidSshUserHost,
   parseSshSpec as sharedParseSshSpec,
   parseSshTargets as sharedParseSshTargets,
   resolvePrivateRunDir,
@@ -165,7 +166,8 @@ export function sanitizeOutput(value) {
 }
 
 class MiotError extends Error {
-  constructor(message, { code, data } = {}) {
+  /** @param {string} message @param {{ code?: string; data?: any }} [opts] */
+  constructor(message, { code = undefined, data = undefined } = /** @type {{ code?: string; data?: any }} */ ({})) {
     super(message);
     this.name = 'MiotError';
     this.code = code;
@@ -180,6 +182,7 @@ class MiotError extends Error {
 function getRuntimePaths(deps = {}) {
   return resolvePluginPaths('miot', deps, {
     cachePath: 'hub-cache.json',
+    tokenCachePath: 'hub-tokens.json',
   });
 }
 
@@ -261,6 +264,9 @@ export function parseSshSpec(spec, defaultId = 'default') {
 
 /** Explicit SSH flags (never rely on ~/.ssh/config aliases). */
 export function buildSshArgs(target, remoteCommand, options = {}) {
+  if (!isValidSshUserHost(target?.userHost)) {
+    throw new MiotError(`无效的 SSH userHost "${String(target?.userHost ?? '')}"`);
+  }
   return [
     ...buildSharedSshArgs(target, {
       connectTimeoutSec: 5,
@@ -272,6 +278,7 @@ export function buildSshArgs(target, remoteCommand, options = {}) {
       homeDir: options.homeDir,
     }),
     '-o', 'LogLevel=ERROR',
+    '--',
     target.userHost,
     ...(remoteCommand === undefined ? [] : [remoteCommand]),
   ];
@@ -290,8 +297,13 @@ export function defaultSshTextExec(target, remoteCommand, timeoutMs = SSH_TIMEOU
   });
 }
 
-/** Default binary SSH executor: (target, command, { input?: Buffer, timeoutMs? }) => { stdout: Buffer, stderr, code }. */
-export function defaultSshBinaryExec(target, remoteCommand, { input, timeoutMs = SSH_TIMEOUT_MS, maxBytes = 64 * 1024 * 1024, homeDir, signal } = {}) {
+/**
+ * Default binary SSH executor: (target, command, { input?: Buffer, timeoutMs? }) => { stdout: Buffer, stderr, code }.
+ * @param {import('../_shared/types.d.ts').SshTarget} target
+ * @param {string} remoteCommand
+ * @param {{ input?: Buffer; timeoutMs?: number; maxBytes?: number; homeDir?: string; signal?: AbortSignal }} [opts]
+ */
+export function defaultSshBinaryExec(target, remoteCommand, { input = undefined, timeoutMs = SSH_TIMEOUT_MS, maxBytes = 64 * 1024 * 1024, homeDir = undefined, signal = undefined } = /** @type {{ input?: Buffer; timeoutMs?: number; maxBytes?: number; homeDir?: string; signal?: AbortSignal }} */ ({})) {
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn('ssh', buildSshArgs(target, remoteCommand, { homeDir, useControlMaster: false }), { stdio: ['pipe', 'pipe', 'pipe'] });
     const out = [];
@@ -353,8 +365,9 @@ function shQuote(value) {
 /**
  * explicit arg -> config.json speakerSsh -> optional homeDir/state.sqlite im_channels(platform='xiaoai').
  * Returns `{ id, userHost, port?, source, channelId? }`.
+ * @param {{ speakerSsh?: unknown; pluginDataDir?: string; dataDir?: string; homeDir?: string }} [opts]
  */
-export async function discoverSpeakerSsh({ speakerSsh, pluginDataDir, dataDir, homeDir } = {}) {
+export async function discoverSpeakerSsh({ speakerSsh = undefined, pluginDataDir = undefined, dataDir = undefined, homeDir = undefined } = /** @type {{ speakerSsh?: unknown; pluginDataDir?: string; dataDir?: string; homeDir?: string }} */ ({})) {
   const paths = getRuntimePaths({ pluginDataDir, dataDir, homeDir });
   const config = loadConfig(paths);
   const explicit = typeof speakerSsh === 'string' ? speakerSsh.trim() : '';
@@ -629,8 +642,12 @@ function matchCustomAliasTarget(pool, customAliases, qn) {
   return hits;
 }
 
-/** Resolve a device by did / name / room-qualified name / custom alias / built-in alias / substring. Throws Chinese errors. */
-export function resolveDevice(devices, { device, did, room, customAliases } = {}) {
+/**
+ * Resolve a device by did / name / room-qualified name / custom alias / built-in alias / substring. Throws Chinese errors.
+ * @param {any[]} devices
+ * @param {{ device?: unknown; did?: unknown; room?: unknown; customAliases?: Record<string, any> }} [opts]
+ */
+export function resolveDevice(devices, { device = undefined, did = undefined, room = undefined, customAliases = undefined } = /** @type {{ device?: unknown; did?: unknown; room?: unknown; customAliases?: Record<string, any> }} */ ({})) {
   const list = Array.isArray(devices) ? devices : [];
   if (did !== undefined && did !== null && String(did).trim() !== '') {
     const wanted = String(did).trim();
@@ -908,6 +925,7 @@ export function decryptMiioPacket({ packet, tokenHex }) {
   return { devId, stamp, payload, text };
 }
 
+/** @param {any} socket @param {string} ip @param {number} port @param {Buffer} packet @param {number} timeoutMs @param {(msg: Buffer) => boolean} [accept] */
 function udpExchange(socket, ip, port, packet, timeoutMs, accept = () => true) {
   return new Promise((resolvePromise, rejectPromise) => {
     const timer = setTimeout(() => {
@@ -936,7 +954,7 @@ function udpExchange(socket, ip, port, packet, timeoutMs, accept = () => true) {
  * @param {{ ip: string; tokenHex: string; method: string; params?: any; timeoutMs?: number; port?: number }} [opts]
  * @returns {Promise<Record<string, any>>}
  */
-export async function udpCall({ ip, tokenHex, method, params, timeoutMs = DEFAULT_CONFIG.udpTimeoutMs, port = MIIO_PORT } = {}) {
+export async function udpCall({ ip, tokenHex, method, params = undefined, timeoutMs = DEFAULT_CONFIG.udpTimeoutMs, port = MIIO_PORT } = /** @type {{ ip: string; tokenHex: string; method: string; params?: any; timeoutMs?: number; port?: number }} */ ({})) {
   if (!ip) throw new MiotError('设备缺少局域网 IP。');
   miioKeyIv(tokenHex);
   const socket = dgram.createSocket('udp4');
@@ -1178,29 +1196,62 @@ export async function defaultFetchHubRawRows({
 
 const HUB_MEMORY_CACHE = (globalThis.__fridayMiotHubMemoryCache ??= new Map());
 
-function normalizeHubCacheRecord(raw) {
+function fileSig(filePath) {
+  try {
+    if (!filePath || !existsSync(filePath)) return '';
+    const st = statSync(filePath);
+    return `${st.mtimeMs}:${st.size}`;
+  } catch {
+    return '';
+  }
+}
+
+function normalizeTokenMap(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  /** @type {Record<string, string>} */
+  const out = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (typeof v === 'string' && HEX32_RE.test(v.trim())) {
+      out[k] = v.trim();
+    }
+  }
+  return out;
+}
+
+function normalizeHubCacheRecord(raw, tokenRaw) {
   if (!raw || typeof raw !== 'object' || !Array.isArray(raw.devices) || typeof raw.fetchedAt !== 'number') return undefined;
+  const legacyTokens = normalizeTokenMap(raw.tokenByDid);
+  const isolatedTokens = normalizeTokenMap(tokenRaw?.tokenByDid ?? tokenRaw);
   return {
     homeId: String(raw.homeId ?? ''),
     fetchedAt: raw.fetchedAt,
     hotDataFetchedAt: typeof raw.hotDataFetchedAt === 'number' ? raw.hotDataFetchedAt : raw.fetchedAt,
     devices: raw.devices,
-    tokenByDid: raw.tokenByDid && typeof raw.tokenByDid === 'object' ? raw.tokenByDid : {},
+    tokenByDid: { ...legacyTokens, ...isolatedTokens },
   };
 }
 
 function readHubCache(paths) {
   const mem = HUB_MEMORY_CACHE.get(paths.cachePath);
+  const cacheSig = fileSig(paths.cachePath);
+  const tokenSig = fileSig(paths.tokenCachePath);
   try {
-    if (existsSync(paths.cachePath)) {
-      const st = statSync(paths.cachePath);
-      if (mem && mem.mtimeMs === st.mtimeMs && mem.size === st.size) {
+    if (cacheSig) {
+      if (mem && mem.cacheSig === cacheSig && mem.tokenSig === tokenSig) {
         return mem.snapshot;
       }
       const raw = JSON.parse(readFileSync(paths.cachePath, 'utf8'));
-      const snapshot = normalizeHubCacheRecord(raw);
+      let tokenRaw = null;
+      if (tokenSig) {
+        try {
+          tokenRaw = JSON.parse(readFileSync(paths.tokenCachePath, 'utf8'));
+        } catch {
+          tokenRaw = null;
+        }
+      }
+      const snapshot = normalizeHubCacheRecord(raw, tokenRaw);
       if (snapshot) {
-        HUB_MEMORY_CACHE.set(paths.cachePath, { mtimeMs: st.mtimeMs, size: st.size, snapshot });
+        HUB_MEMORY_CACHE.set(paths.cachePath, { cacheSig, tokenSig, snapshot });
         return snapshot;
       }
     } else if (mem) {
@@ -1215,17 +1266,46 @@ function readHubCache(paths) {
 function writeHubCache(paths, snapshot) {
   const normalized = normalizeHubCacheRecord(snapshot);
   if (!normalized) return;
-  let mtimeMs = 0;
-  let size = 0;
   try {
-    writeSecureJson(paths.cachePath, { version: 1, ...normalized });
-    const st = statSync(paths.cachePath);
-    mtimeMs = st.mtimeMs;
-    size = st.size;
+    const publicCache = {
+      version: 1,
+      homeId: normalized.homeId,
+      fetchedAt: normalized.fetchedAt,
+      hotDataFetchedAt: normalized.hotDataFetchedAt,
+      devices: normalized.devices,
+    };
+    writeSecureJson(paths.cachePath, publicCache);
+    if (paths.tokenCachePath) {
+      writeSecureJson(paths.tokenCachePath, {
+        version: 1,
+        fetchedAt: normalized.fetchedAt,
+        tokenByDid: normalized.tokenByDid,
+      });
+    }
   } catch {
     /* cache is best effort */
   }
-  HUB_MEMORY_CACHE.set(paths.cachePath, { mtimeMs, size, snapshot: normalized });
+  HUB_MEMORY_CACHE.set(paths.cachePath, {
+    cacheSig: fileSig(paths.cachePath),
+    tokenSig: fileSig(paths.tokenCachePath),
+    snapshot: normalized,
+  });
+}
+
+function invalidateHubCache(paths) {
+  HUB_MEMORY_CACHE.delete(paths.cachePath);
+  try {
+    rmSync(paths.cachePath, { force: true });
+  } catch {
+    /* ignore */
+  }
+  if (paths.tokenCachePath) {
+    try {
+      rmSync(paths.tokenCachePath, { force: true });
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 /** Load the hub snapshot honouring cacheTtlMs (hotData) and topologyTtlMs (devInfo); falls back to stale cache on SSH failure. */
@@ -1320,8 +1400,9 @@ function stateText(device, live) {
 // ---------------------------------------------------------------------------
 
 async function handleStatus(ctx) {
-  const routerSpec = (() => { try { return routerTarget(ctx); } catch (e) { return { error: errMsg(e) }; } })();
+  const routerSpec = /** @type {any} */ ((() => { try { return routerTarget(ctx); } catch (e) { return { error: errMsg(e) }; } })());
   const speaker = await discoverSpeakerSsh({ speakerSsh: ctx.args.speakerSsh, dataDir: ctx.paths.dataDir, homeDir: ctx.paths.homeDir });
+  /** @param {any} target @param {string} cmd @returns {Promise<{ reachable: boolean; code?: number; ms?: number; out: string; err?: string; error?: string }>} */
   const probe = async (target, cmd) => {
     const startedAt = ctx.now();
     try {
@@ -1332,7 +1413,9 @@ async function handleStatus(ctx) {
     }
   };
   const [router, spk] = await Promise.all([
-    routerSpec.error ? { reachable: false, error: routerSpec.error, out: '' } : probe(routerSpec, 'echo FRIDAY_OK; pidof central_service | awk \'{print $1}\''),
+    routerSpec.error
+      ? Promise.resolve(/** @type {{ reachable: boolean; code?: number; ms?: number; out: string; err?: string; error?: string }} */ ({ reachable: false, error: routerSpec.error, out: '' }))
+      : probe(routerSpec, 'echo FRIDAY_OK; pidof central_service | awk \'{print $1}\''),
     probe(speaker, 'echo FRIDAY_OK; ubus list 2>/dev/null | grep -c mibrain'),
   ]);
   const centralPid = router.reachable ? (router.out.split('\n').map(s => s.trim()).filter(s => /^\d+$/.test(s))[0] ?? null) : null;
@@ -1444,7 +1527,8 @@ async function handleDevices(ctx) {
   });
 }
 
-async function resolveFromArgs(ctx, { defaultCategory, refresh, needHotData = false } = {}) {
+/** @param {any} ctx @param {{ defaultCategory?: string; refresh?: boolean; needHotData?: boolean }} [opts] */
+async function resolveFromArgs(ctx, { defaultCategory = undefined, refresh = undefined, needHotData = false } = /** @type {{ defaultCategory?: string; refresh?: boolean; needHotData?: boolean }} */ ({})) {
   const explicitRefresh = refresh ?? (ctx.args.refresh === true || ctx.args.refresh === 'true');
   let snap = await loadSnapshot(ctx, { refresh: explicitRefresh, needHotData });
   const { device, did, room } = ctx.args;
@@ -1555,8 +1639,12 @@ function normalizeAcFan(fan) {
   return AC_FAN_ZH[key];
 }
 
-/** Compose room-prefixed Chinese XiaoAI instructions for an IR air conditioner. */
-export function buildAcInstructions(device, { on, toggle, temperature, mode, fanSpeed } = {}) {
+/**
+ * Compose room-prefixed Chinese XiaoAI instructions for an IR air conditioner.
+ * @param {any} device
+ * @param {{ on?: unknown; toggle?: boolean; temperature?: unknown; mode?: unknown; fanSpeed?: unknown }} [opts]
+ */
+export function buildAcInstructions(device, { on = undefined, toggle = undefined, temperature = undefined, mode = undefined, fanSpeed = undefined } = /** @type {{ on?: unknown; toggle?: boolean; temperature?: unknown; mode?: unknown; fanSpeed?: unknown }} */ ({})) {
   const name = fullName(device);
   const texts = [];
   const onValue = parseBoolish(on);
@@ -1629,6 +1717,80 @@ async function setViaNlp(ctx, device, texts, dryRun) {
   return success('米家设备控制', `已通过小爱发送：${texts.join('；')}（红外设备无状态回读）`, { transport: 'xiaoai_nlp', speaker: speakerView, sent });
 }
 
+export function findProtectedRuleForDevice(cfg, device) {
+  const list = Array.isArray(cfg?.protectedDevices)
+    ? cfg.protectedDevices.map(x => String(x ?? '').trim()).filter(Boolean)
+    : [];
+  if (list.length === 0 || !device || typeof device !== 'object') return null;
+
+  const didNorm = norm(device.did);
+  const devNameNorm = norm(device.dev_name ?? device.name);
+  const roomNorm = norm(device.room_name ?? device.room);
+  const fullNorm = norm(fullName(device));
+
+  const deviceKeys = new Set(
+    [
+      didNorm,
+      devNameNorm,
+      roomNorm && devNameNorm ? `${roomNorm}${devNameNorm}` : '',
+      fullNorm,
+    ].filter(Boolean),
+  );
+
+  const customAliases = cfg?.customAliases;
+  if (customAliases && typeof customAliases === 'object' && !Array.isArray(customAliases)) {
+    for (const [aliasKey, aliasVal] of Object.entries(customAliases)) {
+      const kNorm = norm(aliasKey);
+      if (!kNorm) continue;
+      if (Array.isArray(aliasVal)) {
+        const valNorms = aliasVal.map(v => norm(v)).filter(Boolean);
+        if (deviceKeys.has(kNorm) || valNorms.some(vn => deviceKeys.has(vn))) {
+          deviceKeys.add(kNorm);
+          for (const vn of valNorms) {
+            deviceKeys.add(vn);
+            if (roomNorm) deviceKeys.add(`${roomNorm}${vn}`);
+          }
+        }
+      } else if (typeof aliasVal === 'string') {
+        const vNorm = norm(aliasVal);
+        if (vNorm && (deviceKeys.has(kNorm) || deviceKeys.has(vNorm))) {
+          deviceKeys.add(kNorm);
+          deviceKeys.add(vNorm);
+          if (roomNorm) {
+            deviceKeys.add(`${roomNorm}${kNorm}`);
+            deviceKeys.add(`${roomNorm}${vNorm}`);
+          }
+        }
+      }
+    }
+  }
+
+  for (const rule of list) {
+    const rNorm = norm(rule);
+    if (rNorm && deviceKeys.has(rNorm)) {
+      return rule;
+    }
+  }
+  return null;
+}
+
+function assertNotProtected(ctx, device, title = '米家设备受保护') {
+  const matchedRule = findProtectedRuleForDevice(ctx.cfg, device);
+  if (!matchedRule) return null;
+  const name = fullName(device);
+  const base = publicDevice(device);
+  return failure(
+    title,
+    `设备「${name}」已设为保护设备（规则：${matchedRule}），禁止控制。`,
+    {
+      blocked: true,
+      reason: 'protected_device',
+      protectedRule: matchedRule,
+      device: base,
+    },
+  );
+}
+
 async function handleSet(ctx) {
   const { args } = ctx;
   const dryRun = isDry(args);
@@ -1638,6 +1800,8 @@ async function handleSet(ctx) {
   } catch (err) {
     return failFromError('米家设备控制失败', err);
   }
+  const blocked = assertNotProtected(ctx, device, '米家设备控制失败');
+  if (blocked) return blocked;
   const name = fullName(device);
   const onValue = parseBoolish(args.on);
   const wantToggle = args.toggle === true || args.toggle === 'true' || onValue === 'toggle';
@@ -1791,6 +1955,10 @@ async function handleCook(ctx) {
   } catch (err) {
     return failFromError('空气炸锅控制失败', err);
   }
+  if (normalizedOp !== 'status') {
+    const blocked = assertNotProtected(ctx, device, '空气炸锅控制失败');
+    if (blocked) return blocked;
+  }
   const name = fullName(device);
   const base = publicDevice(device);
   if (device.category !== 'air_fryer' || device.controlChannel !== 'miio_udp') {
@@ -1905,6 +2073,8 @@ async function handleActionCall(ctx) {
   } catch (err) {
     return failFromError('米家动作失败', err);
   }
+  const blocked = assertNotProtected(ctx, device, '米家动作失败');
+  if (blocked) return blocked;
   const name = fullName(device);
   const base = publicDevice(device);
   const input = Array.isArray(args.in) ? args.in : (args.in === undefined ? [] : [args.in]);
@@ -1968,15 +2138,18 @@ async function handleCommand(ctx) {
 
 async function handleConfig(ctx) {
   const { args, paths } = ctx;
-  const next = loadConfig(paths);
+  const prev = loadConfig(paths);
+  const next = { ...prev };
   const errors = [];
   let changed = false;
+  let routerChanged = false;
   if (args.routerSsh !== undefined) {
     const v = String(args.routerSsh ?? '').trim();
     if (!v) next.routerSsh = DEFAULT_CONFIG.routerSsh;
     else if (parseSshTargets(v, 'router').length === 0) errors.push(`routerSsh "${v}" 格式应为 [id=]user@host[:port]`);
     else next.routerSsh = v;
     changed = true;
+    routerChanged = next.routerSsh !== prev.routerSsh;
   }
   if (args.speakerSsh !== undefined) {
     const v = String(args.speakerSsh ?? '').trim();
@@ -2018,7 +2191,12 @@ async function handleConfig(ctx) {
     changed = true;
   }
   if (errors.length) return failure('米家配置无效', errors.join('；'), { config: loadConfig(paths) });
-  if (changed) saveConfig(paths, next);
+  if (changed) {
+    saveConfig(paths, next);
+    if (routerChanged) {
+      invalidateHubCache(paths);
+    }
+  }
   let speaker = null;
   try {
     speaker = await discoverSpeakerSsh({ pluginDataDir: paths.pluginDataDir, dataDir: paths.dataDir, homeDir: paths.homeDir });

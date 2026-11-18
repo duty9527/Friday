@@ -26,9 +26,9 @@ import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -40,12 +40,14 @@ public final class TvAgentAccessibilityService extends AccessibilityService {
     private static volatile String lastPackageName = "";
     private static volatile String lastClassName = "";
 
-    private final Map<String, NodeSnapshot> latestNodes = new ConcurrentHashMap<>();
-    private final ExecutorService screenshotExecutor = Executors.newSingleThreadExecutor();
+    private volatile Map<String, NodeSnapshot> latestNodes = Collections.emptyMap();
+    private final Object executorLock = new Object();
+    private volatile ExecutorService screenshotExecutor = Executors.newSingleThreadExecutor();
     private final Object screenshotLock = new Object();
 
     private volatile long lastScreenshotAtMs = 0L;
     private volatile int lastScreenshotMaxWidth = 0;
+    private volatile int lastScreenshotQuality = 0;
     private volatile int lastScreenshotWidth = 0;
     private volatile int lastScreenshotHeight = 0;
     private volatile String lastScreenshotBase64 = null;
@@ -187,11 +189,36 @@ public final class TvAgentAccessibilityService extends AccessibilityService {
     public void onInterrupt() {
     }
 
+    private ExecutorService ensureScreenshotExecutor() {
+        synchronized (executorLock) {
+            if (screenshotExecutor == null || screenshotExecutor.isShutdown() || screenshotExecutor.isTerminated()) {
+                screenshotExecutor = Executors.newSingleThreadExecutor();
+            }
+            return screenshotExecutor;
+        }
+    }
+
+    private void releaseResources() {
+        latestNodes = Collections.emptyMap();
+        synchronized (screenshotLock) {
+            lastScreenshotBase64 = null;
+            lastScreenshotAtMs = 0L;
+            lastScreenshotMaxWidth = 0;
+            lastScreenshotQuality = 0;
+        }
+        synchronized (executorLock) {
+            if (screenshotExecutor != null && !screenshotExecutor.isShutdown()) {
+                screenshotExecutor.shutdownNow();
+            }
+        }
+    }
+
     @Override
     public boolean onUnbind(Intent intent) {
         if (instance == this) {
             instance = null;
         }
+        releaseResources();
         TvAgentSelfHealer.ensureAccessibilityEnabled(getApplicationContext());
         return super.onUnbind(intent);
     }
@@ -201,6 +228,7 @@ public final class TvAgentAccessibilityService extends AccessibilityService {
         if (instance == this) {
             instance = null;
         }
+        releaseResources();
         super.onDestroy();
     }
 
@@ -301,12 +329,12 @@ public final class TvAgentAccessibilityService extends AccessibilityService {
             rawCandidates = ordered;
         }
 
-        latestNodes.clear();
+        Map<String, NodeSnapshot> nextNodes = new HashMap<>(rawCandidates.size());
         JSONArray nodesArr = new JSONArray();
         for (int i = 0; i < rawCandidates.size(); i++) {
             String nodeId = "n" + i;
             NodeSnapshot snap = rawCandidates.get(i);
-            latestNodes.put(nodeId, new NodeSnapshot(
+            nextNodes.put(nodeId, new NodeSnapshot(
                     nodeId,
                     snap.text,
                     snap.desc,
@@ -323,6 +351,7 @@ public final class TvAgentAccessibilityService extends AccessibilityService {
                     snap.priorityScore));
             nodesArr.put(snap.toJson(nodeId));
         }
+        this.latestNodes = Collections.unmodifiableMap(nextNodes);
 
         JSONObject res = new JSONObject();
         res.put("ok", true);
@@ -466,7 +495,7 @@ public final class TvAgentAccessibilityService extends AccessibilityService {
                 || cls.contains("ListView")
                 || cls.contains("ScrollView")
                 || cls.contains("ViewPager")
-                || cls.contains(" BrowseFrameLayout");
+                || cls.contains("BrowseFrameLayout");
     }
 
     private static int countInteractiveDescendants(AccessibilityNodeInfo node, int depth) {
@@ -524,7 +553,8 @@ public final class TvAgentAccessibilityService extends AccessibilityService {
             long now = SystemClock.elapsedRealtime();
             if (lastScreenshotBase64 != null
                     && (now - lastScreenshotAtMs) < 900L
-                    && lastScreenshotMaxWidth == targetMaxWidth) {
+                    && lastScreenshotMaxWidth == targetMaxWidth
+                    && lastScreenshotQuality == jpegQuality) {
                 JSONObject cached = new JSONObject();
                 cached.put("ok", true);
                 cached.put("mimeType", "image/jpeg");
@@ -538,7 +568,10 @@ public final class TvAgentAccessibilityService extends AccessibilityService {
             JSONObject result = captureOnce(targetMaxWidth, jpegQuality);
             if (!result.optBoolean("ok", false)
                     && result.optInt("errorCode", -1) == AccessibilityService.ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT) {
-                if (lastScreenshotBase64 != null && (SystemClock.elapsedRealtime() - lastScreenshotAtMs) < 5000L) {
+                if (lastScreenshotBase64 != null
+                        && (SystemClock.elapsedRealtime() - lastScreenshotAtMs) < 5000L
+                        && lastScreenshotMaxWidth == targetMaxWidth
+                        && lastScreenshotQuality == jpegQuality) {
                     JSONObject fallback = new JSONObject();
                     fallback.put("ok", true);
                     fallback.put("mimeType", "image/jpeg");
@@ -559,7 +592,7 @@ public final class TvAgentAccessibilityService extends AccessibilityService {
         final CountDownLatch latch = new CountDownLatch(1);
         final JSONObject out = new JSONObject();
 
-        takeScreenshot(Display.DEFAULT_DISPLAY, screenshotExecutor, new TakeScreenshotCallback() {
+        takeScreenshot(Display.DEFAULT_DISPLAY, ensureScreenshotExecutor(), new TakeScreenshotCallback() {
             @Override
             public void onSuccess(ScreenshotResult screenshot) {
                 HardwareBuffer hwBuf = null;
@@ -600,6 +633,7 @@ public final class TvAgentAccessibilityService extends AccessibilityService {
 
                     lastScreenshotAtMs = SystemClock.elapsedRealtime();
                     lastScreenshotMaxWidth = targetMaxWidth;
+                    lastScreenshotQuality = jpegQuality;
                     lastScreenshotWidth = finalW;
                     lastScreenshotHeight = finalH;
                     lastScreenshotBase64 = b64;
@@ -859,13 +893,15 @@ public final class TvAgentAccessibilityService extends AccessibilityService {
         if (snap == null) return null;
         if (snap.nodeRef != null) {
             try {
-                snap.nodeRef.refresh();
+                if (!snap.nodeRef.refresh()) {
+                    return null;
+                }
                 if (snap.nodeRef.isVisibleToUser()) {
                     return snap.nodeRef;
                 }
             } catch (Throwable ignored) {
+                return null;
             }
-            return snap.nodeRef;
         }
         return null;
     }

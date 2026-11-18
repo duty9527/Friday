@@ -174,8 +174,12 @@ function getRuntimePaths(deps = {}) {
   });
 }
 
+/**
+ * @param {string} configPath
+ * @returns {Record<string, any>}
+ */
 function loadConfig(configPath) {
-  return readConfig(configPath, {});
+  return readConfig(configPath, /** @type {Record<string, any>} */ ({}));
 }
 
 function loadLearnedKeys(learnedPath) {
@@ -337,6 +341,7 @@ export function parseXiaoaiSshTargets(apiBase) {
 
 /**
  * Discover the target speaker SSH connection from explicit override, config.json, or optional state.sqlite.
+ * @param {{ sshTarget?: unknown; pluginDataDir?: string; dataDir?: string; homeDir?: string }} [opts]
  */
 export async function discoverSpeakerSsh({ sshTarget, pluginDataDir, dataDir, homeDir } = {}) {
   const paths = getRuntimePaths({ pluginDataDir, dataDir, homeDir });
@@ -767,8 +772,9 @@ async function handleLearn(args, deps, paths, sshRunner, sleepFn) {
   const deadline = nowFn() + timeoutMs;
   let capturedCode = '';
   try {
-    while (nowFn() < deadline) {
+    while (nowFn() < deadline && !deps.signal?.aborted) {
       await sleepFn(pollIntervalMs);
+      if (deps.signal?.aborted) break;
       const readRes = await sshRunner(discovery.target, buildLearnReadCommand(targetKey), 5_000);
       if (readRes.code !== 0) continue;
       const readJson = parseUbusJson(readRes.stdout);
@@ -785,7 +791,8 @@ async function handleLearn(args, deps, paths, sshRunner, sleepFn) {
       }
     }
   } finally {
-    await sshRunner(discovery.target, buildLearnStopCommand(targetKey), 4_000).catch(() => {});
+    const cleanupSignal = typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(4_000) : undefined;
+    await sshRunner(discovery.target, buildLearnStopCommand(targetKey), 4_000, { signal: cleanupSignal }).catch(() => {});
   }
 
   if (!capturedCode) {
@@ -846,9 +853,9 @@ async function handleLearn(args, deps, paths, sshRunner, sleepFn) {
  */
 export async function executeTvIrAction(action = 'status', args = {}, deps = {}) {
   const paths = getRuntimePaths(deps);
-  const sshRunner = deps.sshRunner ?? ((target, cmd, timeoutMs) => defaultSshRunner(target, cmd, timeoutMs, {
+  const sshRunner = deps.sshRunner ?? ((target, cmd, timeoutMs, runOpts = {}) => defaultSshRunner(target, cmd, timeoutMs, {
     homeDir: paths.homeDir,
-    signal: deps.signal,
+    signal: runOpts && 'signal' in runOpts ? runOpts.signal : deps.signal,
   }));
   const sleepFn = deps.sleep ?? delay;
   const normalizedAction = String(action || 'status').trim();

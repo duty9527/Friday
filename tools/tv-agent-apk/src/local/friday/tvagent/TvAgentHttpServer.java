@@ -15,6 +15,7 @@ import org.json.JSONObject;
 
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.EOFException;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -25,20 +26,45 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.SecureRandom;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+
+import org.json.JSONException;
 
 public final class TvAgentHttpServer {
     public static final int PORT = 8989;
     public static final String VERSION = "1.0.0";
+    private static final int MAX_HEADER_LINE_BYTES = 8192;
+    private static final int MAX_HEADER_COUNT = 64;
+    private static final int MAX_BODY_BYTES = 262_144;
+    private static final char[] HEX_DIGITS = "0123456789abcdef".toCharArray();
 
     private static final Object LOCK = new Object();
+    private static final Object TOKEN_LOCK = new Object();
     private static volatile ServerSocket serverSocket;
     private static volatile Context appContext;
-    private static final ExecutorService WORKER_POOL = Executors.newCachedThreadPool();
+    private static final ExecutorService WORKER_POOL = new ThreadPoolExecutor(
+            2,
+            16,
+            60L,
+            TimeUnit.SECONDS,
+            new ArrayBlockingQueue<Runnable>(32),
+            new ThreadPoolExecutor.AbortPolicy()
+    );
+
+    private static final class HeaderTooLargeException extends IOException {
+        HeaderTooLargeException(String message) {
+            super(message);
+        }
+    }
 
     private TvAgentHttpServer() {
     }
@@ -49,6 +75,7 @@ public final class TvAgentHttpServer {
                     ? context.getApplicationContext()
                     : context;
         }
+        ensureTokenInitialized(appContext != null ? appContext : context);
         synchronized (LOCK) {
             if (serverSocket != null && !serverSocket.isClosed() && serverSocket.isBound()) {
                 return;
@@ -77,12 +104,24 @@ public final class TvAgentHttpServer {
         while (!ss.isClosed()) {
             try {
                 final Socket client = ss.accept();
-                WORKER_POOL.execute(new Runnable() {
-                    @Override
-                    public void run() {
-                        handleClient(client);
+                try {
+                    WORKER_POOL.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            handleClient(client);
+                        }
+                    });
+                } catch (RejectedExecutionException rex) {
+                    try {
+                        sendJson(client, 503, new JSONObject().put("ok", false).put("error", "Server busy"));
+                    } catch (Throwable ignored) {
+                    } finally {
+                        try {
+                            client.close();
+                        } catch (Throwable ignored) {
+                        }
                     }
-                });
+                }
             } catch (Throwable t) {
                 if (ss.isClosed()) break;
             }
@@ -101,7 +140,7 @@ public final class TvAgentHttpServer {
             }
 
             BufferedInputStream in = new BufferedInputStream(client.getInputStream());
-            String requestLine = readLine(in);
+            String requestLine = readLine(in, MAX_HEADER_LINE_BYTES);
             if (requestLine == null || requestLine.isEmpty()) {
                 return;
             }
@@ -114,22 +153,46 @@ public final class TvAgentHttpServer {
             String rawTarget = parts[1];
 
             Map<String, String> headers = new HashMap<>();
+            int headerCount = 0;
             int contentLength = 0;
+            boolean hasContentLength = false;
             while (true) {
-                String line = readLine(in);
+                String line = readLine(in, MAX_HEADER_LINE_BYTES);
                 if (line == null || line.isEmpty()) break;
+                headerCount++;
+                if (headerCount > MAX_HEADER_COUNT) {
+                    sendJson(client, 431, new JSONObject().put("ok", false).put("error", "Too many headers"));
+                    return;
+                }
                 int colon = line.indexOf(':');
                 if (colon > 0) {
                     String k = line.substring(0, colon).trim().toLowerCase(Locale.ROOT);
                     String v = line.substring(colon + 1).trim();
                     headers.put(k, v);
                     if ("content-length".equals(k)) {
+                        hasContentLength = true;
                         try {
                             contentLength = Integer.parseInt(v);
-                        } catch (NumberFormatException ignored) {
+                        } catch (NumberFormatException nfe) {
+                            sendJson(client, 400, new JSONObject().put("ok", false).put("error", "Invalid Content-Length"));
+                            return;
+                        }
+                        if (contentLength < 0) {
+                            sendJson(client, 400, new JSONObject().put("ok", false).put("error", "Negative Content-Length"));
+                            return;
                         }
                     }
                 }
+            }
+
+            // Anti-DNS-Rebinding & anti-CSRF checks: block browser Origin and non-IP/localhost Host.
+            if (headers.containsKey("origin")) {
+                sendJson(client, 403, new JSONObject().put("ok", false).put("error", "Browser Origin not permitted"));
+                return;
+            }
+            if (!isValidHostHeader(headers.get("host"))) {
+                sendJson(client, 403, new JSONObject().put("ok", false).put("error", "Invalid Host header"));
+                return;
             }
 
             if ("OPTIONS".equals(method)) {
@@ -137,17 +200,23 @@ public final class TvAgentHttpServer {
                 return;
             }
 
-            String configuredToken = getConfiguredToken(appContext);
-            if (configuredToken != null && !configuredToken.isEmpty()) {
-                String reqToken = headers.get("x-tv-token");
-                if (!configuredToken.equals(reqToken)) {
-                    sendJson(client, 401, new JSONObject().put("ok", false).put("error", "Unauthorized X-TV-Token"));
-                    return;
-                }
+            String configuredToken = ensureTokenInitialized(appContext);
+            String reqToken = headers.get("x-tv-token");
+            if (configuredToken == null || configuredToken.isEmpty() || reqToken == null
+                    || !MessageDigest.isEqual(
+                            configuredToken.getBytes(StandardCharsets.UTF_8),
+                            reqToken.getBytes(StandardCharsets.UTF_8))) {
+                sendJson(client, 401, new JSONObject().put("ok", false).put("error", "Unauthorized X-TV-Token"));
+                return;
+            }
+
+            if (hasContentLength && contentLength > MAX_BODY_BYTES) {
+                sendJson(client, 413, new JSONObject().put("ok", false).put("error", "Payload too large"));
+                return;
             }
 
             String bodyStr = "";
-            if (contentLength > 0 && contentLength <= 262_144) {
+            if (contentLength > 0) {
                 byte[] bodyBytes = readExact(in, contentLength);
                 bodyStr = new String(bodyBytes, StandardCharsets.UTF_8);
             }
@@ -180,6 +249,20 @@ public final class TvAgentHttpServer {
             sendJson(client, 404, new JSONObject()
                     .put("ok", false)
                     .put("error", "Not found: " + method + " " + path));
+        } catch (HeaderTooLargeException htle) {
+            try {
+                sendJson(client, 431, new JSONObject()
+                        .put("ok", false)
+                        .put("error", String.valueOf(htle.getMessage())));
+            } catch (Throwable ignored) {
+            }
+        } catch (EOFException | JSONException badReq) {
+            try {
+                sendJson(client, 400, new JSONObject()
+                        .put("ok", false)
+                        .put("error", String.valueOf(badReq.getMessage())));
+            } catch (Throwable ignored) {
+            }
         } catch (SecurityException se) {
             try {
                 sendJson(client, 403, new JSONObject()
@@ -473,15 +556,88 @@ public final class TvAgentHttpServer {
         return false;
     }
 
-    private static String getConfiguredToken(Context ctx) {
+    public static String ensureTokenInitialized(Context ctx) {
         if (ctx == null) return "";
-        try {
-            Context storage = ctx.createDeviceProtectedStorageContext();
-            SharedPreferences prefs = storage.getSharedPreferences("tv_agent_prefs", Context.MODE_PRIVATE);
-            return prefs.getString("x_tv_token", "");
-        } catch (Throwable ignored) {
-            return "";
+        synchronized (TOKEN_LOCK) {
+            try {
+                Context storage = ctx.createDeviceProtectedStorageContext();
+                SharedPreferences prefs = storage.getSharedPreferences("tv_agent_prefs", Context.MODE_PRIVATE);
+                String existing = prefs.getString("x_tv_token", "");
+                if (existing != null && existing.trim().length() >= 16) {
+                    return existing.trim();
+                }
+                byte[] randomBytes = new byte[32];
+                new SecureRandom().nextBytes(randomBytes);
+                char[] hex = new char[64];
+                for (int i = 0; i < 32; i++) {
+                    int v = randomBytes[i] & 0xFF;
+                    hex[i * 2] = HEX_DIGITS[v >>> 4];
+                    hex[i * 2 + 1] = HEX_DIGITS[v & 0x0F];
+                }
+                String generated = new String(hex);
+                prefs.edit().putString("x_tv_token", generated).commit();
+                return generated;
+            } catch (Throwable ignored) {
+                return "";
+            }
         }
+    }
+
+    public static String syncTokenIfValid(Context ctx, String token) {
+        if (ctx == null) return "";
+        if (token == null) return ensureTokenInitialized(ctx);
+        String trimmed = token.trim().toLowerCase(Locale.ROOT);
+        if (!trimmed.matches("^[0-9a-f]{32,128}$")) {
+            return ensureTokenInitialized(ctx);
+        }
+        synchronized (TOKEN_LOCK) {
+            try {
+                Context storage = ctx.createDeviceProtectedStorageContext();
+                SharedPreferences prefs = storage.getSharedPreferences("tv_agent_prefs", Context.MODE_PRIVATE);
+                prefs.edit().putString("x_tv_token", trimmed).commit();
+                return trimmed;
+            } catch (Throwable ignored) {
+                return "";
+            }
+        }
+    }
+
+    private static boolean isValidHostHeader(String rawHost) {
+        if (rawHost == null) return false;
+        String h = rawHost.trim().toLowerCase(Locale.ROOT);
+        if (h.isEmpty() || h.length() > 128) return false;
+        String hostname;
+        if (h.startsWith("[")) {
+            int closeIdx = h.indexOf(']');
+            if (closeIdx <= 1) return false;
+            hostname = h.substring(1, closeIdx);
+            if (closeIdx + 1 < h.length()) {
+                String portPart = h.substring(closeIdx + 1);
+                if (!portPart.matches("^:\\d{1,5}$")) return false;
+            }
+            return hostname.matches("^[0-9a-f:]+$");
+        }
+        int colonIdx = h.indexOf(':');
+        if (colonIdx >= 0) {
+            String portPart = h.substring(colonIdx + 1);
+            if (!portPart.matches("^\\d{1,5}$")) return false;
+            hostname = h.substring(0, colonIdx);
+        } else {
+            hostname = h;
+        }
+        if ("localhost".equals(hostname)) return true;
+        if (!hostname.matches("^\\d{1,3}(?:\\.\\d{1,3}){3}$")) return false;
+        String[] octets = hostname.split("\\.");
+        if (octets.length != 4) return false;
+        for (String oct : octets) {
+            try {
+                int v = Integer.parseInt(oct);
+                if (v < 0 || v > 255) return false;
+            } catch (NumberFormatException nfe) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static int parseIntParam(Uri uri, String key, int defaultValue) {
@@ -496,7 +652,7 @@ public final class TvAgentHttpServer {
         return defaultValue;
     }
 
-    private static String readLine(InputStream in) throws IOException {
+    private static String readLine(InputStream in, int maxBytes) throws IOException {
         ByteArrayOutputStream baos = new ByteArrayOutputStream(128);
         int b;
         boolean sawByte = false;
@@ -506,7 +662,9 @@ public final class TvAgentHttpServer {
             if (b != '\r') {
                 baos.write(b);
             }
-            if (baos.size() > 8192) break;
+            if (baos.size() > maxBytes) {
+                throw new HeaderTooLargeException("HTTP header line exceeds " + maxBytes + " bytes");
+            }
         }
         if (!sawByte && baos.size() == 0) return null;
         return new String(baos.toByteArray(), StandardCharsets.UTF_8);
@@ -517,7 +675,9 @@ public final class TvAgentHttpServer {
         int offset = 0;
         while (offset < length) {
             int n = in.read(buf, offset, length - offset);
-            if (n == -1) break;
+            if (n == -1) {
+                throw new EOFException("Unexpected EOF after " + offset + " of " + length + " bytes");
+            }
             offset += n;
         }
         return buf;
@@ -539,6 +699,9 @@ public final class TvAgentHttpServer {
                 : statusCode == 401 ? "Unauthorized"
                 : statusCode == 403 ? "Forbidden"
                 : statusCode == 404 ? "Not Found"
+                : statusCode == 413 ? "Payload Too Large"
+                : statusCode == 431 ? "Request Header Fields Too Large"
+                : statusCode == 503 ? "Service Unavailable"
                 : "Internal Server Error";
         String headers = "HTTP/1.1 " + statusCode + " " + statusText + "\r\n"
                 + "Content-Type: application/json; charset=utf-8\r\n"

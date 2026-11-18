@@ -22,6 +22,7 @@ export interface PluginExecutionContext {
   dataDir?: string;
   env?: Record<string, string | undefined>;
   signal?: AbortSignal;
+  getDecisionCredentials?: () => { apiKey: string; baseUrl?: string } | undefined;
   callPlugin?: (
     targetPlugin: string,
     action?: string,
@@ -40,6 +41,8 @@ export interface VoiceFastpathRequest {
   senderId?: string;
   speakerId?: string;
   speakerName?: string;
+  speakerRole?: 'owner' | 'member';
+  allowedPlugins?: ReadonlySet<string> | readonly string[];
   explicitWake?: boolean;
   sessionState?: Record<string, unknown>;
 }
@@ -88,6 +91,6 @@ export interface SpeakerDiscoveryResult {
   id: string;
   userHost: string;
   port?: number;
-  source: 'args' | 'config' | 'sqlite' | 'none';
+  source: 'args' | 'config' | 'env' | 'sqlite' | 'none';
   channelId?: string;
 }

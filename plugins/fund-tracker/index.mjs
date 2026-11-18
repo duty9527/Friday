@@ -172,17 +172,49 @@ function openDb(paths, nowFn = Date.now) {
   return db;
 }
 
+/**
+ * Extract Asia/Shanghai wall-clock calendar & market-hour parts regardless of host TZ.
+ * @param {number} [ts]
+ */
+function getShanghaiTimeParts(ts = Date.now()) {
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    weekday: 'short',
+    hourCycle: 'h23',
+  });
+  const parts = Object.fromEntries(fmt.formatToParts(new Date(ts)).map(p => [p.type, p.value]));
+  const date = `${parts.year}-${parts.month}-${parts.day}`;
+  const hour = Number(parts.hour);
+  const minute = Number(parts.minute);
+  return {
+    date,
+    hour,
+    minute,
+    minutesOfDay: hour * 60 + minute,
+    isWeekend: parts.weekday === 'Sat' || parts.weekday === 'Sun',
+  };
+}
+
 function formatLocalDate(ts = Date.now()) {
-  const d = new Date(ts);
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
+  return getShanghaiTimeParts(ts).date;
 }
 
 function isWeekend(ts = Date.now()) {
-  const day = new Date(ts).getDay();
-  return day === 0 || day === 6;
+  return getShanghaiTimeParts(ts).isWeekend;
+}
+
+function extractQuoteDate(quoteTime) {
+  const s = String(quoteTime ?? '').trim();
+  const compact = /^(\d{4})(\d{2})(\d{2})/.exec(s);
+  if (compact) return `${compact[1]}-${compact[2]}-${compact[3]}`;
+  const dash = /^(\d{4})[-/](\d{2})[-/](\d{2})/.exec(s);
+  if (dash) return `${dash[1]}-${dash[2]}-${dash[3]}`;
+  return '';
 }
 
 /**
@@ -308,7 +340,9 @@ async function syncAllNavs(db, holdings, opts = {}) {
 async function computeValuation(db, mode = 'noon', offline = false, opts = {}) {
   const nowFn = opts.nowFn ?? Date.now;
   const holdings = listHoldingsFromDb(db);
-  const today = formatLocalDate(nowFn());
+  const nowTs = nowFn();
+  const shTime = getShanghaiTimeParts(nowTs);
+  const today = shTime.date;
 
   if (holdings.length === 0) {
     const title = mode === 'settle'
@@ -374,7 +408,15 @@ async function computeValuation(db, mode = 'noon', offline = false, opts = {}) {
       : undefined;
 
     const quote = proxySymbol ? quotes.get(proxySymbol) : undefined;
-    const proxyChangePct = quote ? Number(quote.changePct) : 0;
+    const rawProxyPct = quote ? Number(quote.changePct) : 0;
+    const proxyChangePct = Number.isFinite(rawProxyPct) ? rawProxyPct : 0;
+    const quoteDate = quote ? extractQuoteDate(quote.quoteTime) : '';
+    const isTradingWindow = !shTime.isWeekend && shTime.minutesOfDay >= 9 * 60 + 30;
+    const isFreshQuoteForToday = Boolean(
+      quote &&
+      isTradingWindow &&
+      (!quoteDate || (quoteDate === today && quoteDate > latestNavObj.navDate)),
+    );
 
     const hasTodayOfficialNav = latestNavObj.navDate === today;
     let baseNav = latestNavObj.nav;
@@ -392,6 +434,14 @@ async function computeValuation(db, mode = 'noon', offline = false, opts = {}) {
       currentNav = latestNavObj.nav;
       changePct = 0;
       navSource = `ℹ️ 最近净值(${latestNavObj.navDate})`;
+    } else if (!offline && !isFreshQuoteForToday) {
+      // Never re-apply previous trading day's proxy changePct during weekends, holidays, or pre-09:30 CST.
+      baseNav = latestNavObj.nav;
+      currentNav = latestNavObj.nav;
+      changePct = 0;
+      navSource = quoteDate
+        ? `📅 休市/盘前(沿用${latestNavObj.navDate}净值)`
+        : `⏳ 暂无今日行情(沿用${latestNavObj.navDate}净值)`;
     } else if (mode === 'settle') {
       baseNav = latestNavObj.nav;
       changePct = Number((proxyChangePct * positionRatio).toFixed(2));
@@ -439,10 +489,23 @@ async function computeValuation(db, mode = 'noon', offline = false, opts = {}) {
   const prevAsset = totalAsset - totalDailyPnl;
   const dailyPnlPct = prevAsset > 0 ? Number(((totalDailyPnl / prevAsset) * 100).toFixed(2)) : 0;
 
-  db.prepare(`
-    INSERT INTO snapshots (kind, date, total_cost, total_asset, daily_pnl, total_pnl, detail_json, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(mode, today, totalCost, totalAsset, totalDailyPnl, totalPnl, JSON.stringify(rows), nowFn());
+  db.exec('BEGIN');
+  try {
+    db.prepare('DELETE FROM snapshots WHERE kind=? AND date=?').run(mode, today);
+    db.prepare(`
+      INSERT INTO snapshots (kind, date, total_cost, total_asset, daily_pnl, total_pnl, detail_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(mode, today, totalCost, totalAsset, totalDailyPnl, totalPnl, JSON.stringify(rows), nowFn());
+    db.prepare(`
+      DELETE FROM snapshots WHERE id NOT IN (
+        SELECT id FROM snapshots ORDER BY created_at DESC, id DESC LIMIT 200
+      )
+    `).run();
+    db.exec('COMMIT');
+  } catch (err) {
+    try { db.exec('ROLLBACK'); } catch { /* ignore */ }
+    throw err;
+  }
 
   const title = mode === 'settle'
     ? `# 🌙 基金晚间正式结算 · ${today} 21:30`
@@ -540,45 +603,45 @@ export async function runAction(action = 'status', args = {}, depsOrCtx = {}) {
         writeConfig(paths.configPath, next);
         changed = true;
 
-        const existingCount = listHoldingsFromDb(db).length;
-        if (existingCount === 0 || safeArgs.replace === true || safeArgs.syncDb === true) {
-          db.exec('BEGIN');
-          try {
-            if (safeArgs.replace === true) {
-              db.prepare('DELETE FROM holdings').run();
-            }
-            const upsert = db.prepare(`
-              INSERT INTO holdings (
-                code, name, fund_type, proxy_symbol, proxy_name, position_ratio,
-                init_amount, cost, init_nav, init_nav_date, shares, last_nav, last_nav_date, updated_at
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-              ON CONFLICT(code) DO UPDATE SET
-                name=excluded.name,
-                fund_type=excluded.fund_type,
-                proxy_symbol=excluded.proxy_symbol,
-                proxy_name=excluded.proxy_name,
-                position_ratio=excluded.position_ratio,
-                init_amount=excluded.init_amount,
-                cost=excluded.cost,
-                init_nav=excluded.init_nav,
-                init_nav_date=excluded.init_nav_date,
-                shares=excluded.shares,
-                updated_at=excluded.updated_at
-            `);
-            const now = nowFn();
-            for (const item of normalized) {
-              upsert.run(
-                item.code, item.name, item.fundType, item.proxySymbol, item.proxyName, item.positionRatio,
-                item.initAmount, item.cost, item.initNav, item.initNavDate, item.shares,
-                item.initNav, item.initNavDate, now,
-              );
-            }
-            db.exec('COMMIT');
-          } catch (err) {
-            try { db.exec('ROLLBACK'); } catch { /* ignore */ }
-            throw err;
+        db.exec('BEGIN');
+        try {
+          if (safeArgs.replace === true) {
+            db.prepare('DELETE FROM holdings').run();
           }
+          const upsert = db.prepare(`
+            INSERT INTO holdings (
+              code, name, fund_type, proxy_symbol, proxy_name, position_ratio,
+              init_amount, cost, init_nav, init_nav_date, shares, last_nav, last_nav_date, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(code) DO UPDATE SET
+              name=excluded.name,
+              fund_type=excluded.fund_type,
+              proxy_symbol=excluded.proxy_symbol,
+              proxy_name=excluded.proxy_name,
+              position_ratio=excluded.position_ratio,
+              init_amount=excluded.init_amount,
+              cost=excluded.cost,
+              init_nav=excluded.init_nav,
+              init_nav_date=excluded.init_nav_date,
+              shares=excluded.shares,
+              last_nav=CASE WHEN holdings.last_nav_date <= excluded.init_nav_date THEN excluded.last_nav ELSE holdings.last_nav END,
+              last_nav_date=CASE WHEN holdings.last_nav_date <= excluded.init_nav_date THEN excluded.last_nav_date ELSE holdings.last_nav_date END,
+              updated_at=excluded.updated_at
+          `);
+          const now = nowFn();
+          for (const item of normalized) {
+            upsert.run(
+              item.code, item.name, item.fundType, item.proxySymbol, item.proxyName, item.positionRatio,
+              item.initAmount, item.cost, item.initNav, item.initNavDate, item.shares,
+              item.initNav, item.initNavDate, now,
+            );
+          }
+          db.exec('COMMIT');
+        } catch (err) {
+          try { db.exec('ROLLBACK'); } catch { /* ignore */ }
+          throw err;
         }
+        syncConfigHoldingsFromDb(db, paths);
       }
 
       const dbHoldings = listHoldingsFromDb(db);
@@ -639,6 +702,8 @@ export async function runAction(action = 'status', args = {}, depsOrCtx = {}) {
           init_nav=excluded.init_nav,
           init_nav_date=excluded.init_nav_date,
           shares=excluded.shares,
+          last_nav=CASE WHEN holdings.last_nav_date <= excluded.init_nav_date THEN excluded.last_nav ELSE holdings.last_nav END,
+          last_nav_date=CASE WHEN holdings.last_nav_date <= excluded.init_nav_date THEN excluded.last_nav_date ELSE holdings.last_nav_date END,
           updated_at=excluded.updated_at
       `).run(
         normalized.code, normalized.name, normalized.fundType, normalized.proxySymbol, normalized.proxyName,
@@ -687,24 +752,60 @@ export async function runAction(action = 'status', args = {}, depsOrCtx = {}) {
       if (!existing) {
         return { ok: false, notify: false, title: '更新基金失败', message: `未找到基金持仓 ${code}。` };
       }
-      let shares = safeArgs.shares !== undefined ? Number(safeArgs.shares) : Number(existing.shares);
-      const cost = safeArgs.cost !== undefined ? Number(safeArgs.cost) : Number(existing.cost);
+      let shares = Number(existing.shares);
+      if (safeArgs.shares !== undefined) {
+        const parsedShares = Number(safeArgs.shares);
+        if (!Number.isFinite(parsedShares) || parsedShares <= 0) {
+          return { ok: false, notify: false, title: '更新基金失败', message: 'shares 必须是大于 0 的有限数字。' };
+        }
+        shares = Number(parsedShares.toFixed(4));
+      }
+      let cost = Number(existing.cost);
+      if (safeArgs.cost !== undefined) {
+        const parsedCost = Number(safeArgs.cost);
+        if (!Number.isFinite(parsedCost) || parsedCost < 0) {
+          return { ok: false, notify: false, title: '更新基金失败', message: 'cost 必须是非负有限数字。' };
+        }
+        cost = parsedCost;
+      }
+      let initAmount = Number(existing.init_amount);
+      if (safeArgs.initAmount !== undefined) {
+        const parsedInitAmount = Number(safeArgs.initAmount);
+        if (!Number.isFinite(parsedInitAmount) || parsedInitAmount <= 0) {
+          return { ok: false, notify: false, title: '更新基金失败', message: 'initAmount 必须是大于 0 的有限数字。' };
+        }
+        initAmount = parsedInitAmount;
+      } else if (safeArgs.cost !== undefined) {
+        initAmount = cost;
+      }
+
       let initNav = Number(existing.init_nav);
       let initNavDate = String(existing.init_nav_date);
       if (typeof safeArgs.navDate === 'string' && safeArgs.navDate.trim()) {
         initNavDate = safeArgs.navDate.trim();
         const history = await fetchFundNavHistory(code, 20, fetchFn, signal);
         const matched = history.find(item => item.navDate === initNavDate);
-        if (!matched) {
+        if (!matched || !Number.isFinite(matched.nav) || matched.nav <= 0) {
           throw new Error(`未找到 ${code} 在 ${initNavDate} 的正式净值`);
         }
         initNav = matched.nav;
         if (safeArgs.shares === undefined) {
-          shares = Number((Number(existing.init_amount) / initNav).toFixed(4));
+          shares = Number((initAmount / initNav).toFixed(4));
+        }
+      } else if (safeArgs.initAmount !== undefined && safeArgs.shares === undefined) {
+        const currentNav = Number(existing.last_nav) > 0 ? Number(existing.last_nav) : initNav;
+        if (Number.isFinite(currentNav) && currentNav > 0) {
+          shares = Number((initAmount / currentNav).toFixed(4));
         }
       }
-      db.prepare('UPDATE holdings SET shares=?, cost=?, init_nav=?, init_nav_date=?, updated_at=? WHERE code=?')
-        .run(shares, cost, initNav, initNavDate, nowFn(), code);
+      db.prepare(`
+        UPDATE holdings
+        SET init_amount=?, shares=?, cost=?, init_nav=?, init_nav_date=?,
+            last_nav=CASE WHEN last_nav_date <= ? THEN ? ELSE last_nav END,
+            last_nav_date=CASE WHEN last_nav_date <= ? THEN ? ELSE last_nav_date END,
+            updated_at=?
+        WHERE code=?
+      `).run(initAmount, shares, cost, initNav, initNavDate, initNavDate, initNav, initNavDate, initNavDate, nowFn(), code);
       syncConfigHoldingsFromDb(db, paths);
       const after = /** @type {Record<string, unknown>} */ (
         db.prepare('SELECT * FROM holdings WHERE code=?').get(code)
@@ -751,6 +852,7 @@ export async function runAction(action = 'status', args = {}, depsOrCtx = {}) {
 
 async function main() {
   const action = process.argv[2] || 'status';
+  /** @type {Record<string, unknown>} */
   let args = {};
   if (process.argv[3]) {
     try { args = JSON.parse(process.argv[3]); } catch { args = {}; }

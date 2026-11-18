@@ -19,6 +19,11 @@ import {
   parseTvRemoteEntryUtterance,
   parseTvRemoteInModeUtterance,
 } from '../src/xiaoai-tv-remote.js';
+import {
+  isAssistantTvRemoteActivation as isPluginTvRemoteActivation,
+  parseTvRemoteEntryPhrase,
+  parseTvRemoteStepsPhrase,
+} from '../plugins/tv-ir/voice-fastpath.mjs';
 
 const LX06_POWER_IR_PLAY0 =
   '1000,570,600,570,600,1470,600,1470,600,570,600,1470,600,570,600,1470,600,570,600,1470,600,1470,600,10510,' +
@@ -416,10 +421,15 @@ test('tv-ir handleVoiceFastpath manages continuous remote mode, noise filtering,
   };
 
   try {
-    const enter = await handleVoiceFastpath({ text: '进入电视遥控模式' }, ctx);
+    const enter = await handleVoiceFastpath({ text: '遥控电视模式' }, ctx);
     assert.equal(enter.handled, true);
     assert.equal(enter.followUp, true);
     assert.equal(enter.sessionState?.tvRemoteActive, true);
+
+    const enterWithStep = await handleVoiceFastpath({ text: '星期五，进入遥控电视模式，先按一下菜单' }, ctx);
+    assert.equal(enterWithStep.handled, true);
+    assert.equal(enterWithStep.followUp, true);
+    assert.equal(sentCmds.length, 1);
 
     const stepRes = await handleVoiceFastpath({
       text: '向左两下再确认',
@@ -427,8 +437,56 @@ test('tv-ir handleVoiceFastpath manages continuous remote mode, noise filtering,
     }, ctx);
     assert.equal(stepRes.handled, true);
     assert.equal(stepRes.followUp, true);
-    assert.equal(sentCmds.length, 3);
+    // Continuous mode must use zero-TTS passthrough (speech === '')
+    assert.equal(stepRes.speech, '');
+    assert.equal((stepRes.data as Record<string, unknown>)?.suppressSpeech, true);
+    assert.equal((stepRes.data as Record<string, unknown>)?.recordTurn, false);
+    assert.equal(sentCmds.length, 4);
     assert.equal((stepRes.data as Record<string, unknown>)?.extendTtl, true);
+
+    // Verify leading '下' is never swallowed and '右，下，确认' / '下两下' work accurately
+    const downRes = await handleVoiceFastpath({
+      text: '下',
+      sessionState: { tvRemoteActive: true },
+    }, ctx);
+    assert.equal(downRes.handled, true);
+    assert.equal(downRes.speech, '');
+    assert.equal(sentCmds.length, 5);
+
+    const comboDown = await handleVoiceFastpath({
+      text: '右，下，确认',
+      sessionState: { tvRemoteActive: true },
+    }, ctx);
+    assert.equal(comboDown.handled, true);
+    assert.deepEqual(
+      ((comboDown.data as Record<string, unknown>)?.steps as Array<{ key: string }>).map(s => s.key),
+      ['right', 'down', 'ok'],
+    );
+    assert.equal(sentCmds.length, 8);
+
+    // Learned custom keys from learned-keys.json are recognized in fastpath
+    await mkdir(join(homeDir, 'plugins', 'tv-ir'), { recursive: true });
+    await writeFile(
+      join(homeDir, 'plugins', 'tv-ir', 'learned-keys.json'),
+      JSON.stringify({ source: { key: 'source', label: '信号源', code: '1000,570,600,10510', freq: 38000, frames: 1 } }),
+      { mode: 0o600 },
+    );
+    const learnedStep = await handleVoiceFastpath({
+      text: '切换信号源',
+      sessionState: { tvRemoteActive: true },
+    }, ctx);
+    assert.equal(learnedStep.handled, true);
+    assert.equal(learnedStep.speech, '');
+    assert.equal(sentCmds.length, 9);
+
+    // Unlearned mute without tv-agent does not throw and preserves continuous session
+    const unlearnedMute = await handleVoiceFastpath({
+      text: '静音',
+      sessionState: { tvRemoteActive: true },
+    }, ctx);
+    assert.equal(unlearnedMute.handled, true);
+    assert.equal(unlearnedMute.ok, false);
+    assert.equal(unlearnedMute.followUp, true);
 
     const noiseRes = await handleVoiceFastpath({
       text: '今天晚饭吃什么',
@@ -439,7 +497,7 @@ test('tv-ir handleVoiceFastpath manages continuous remote mode, noise filtering,
     assert.equal(noiseRes.speech, '');
     assert.equal((noiseRes.data as Record<string, unknown>)?.extendTtl, false);
     assert.equal((noiseRes.data as Record<string, unknown>)?.recordTurn, false);
-    assert.equal(sentCmds.length, 3);
+    assert.equal(sentCmds.length, 9);
 
     const wakeRes = await handleVoiceFastpath({
       text: '小爱同学打开台灯',
@@ -448,14 +506,29 @@ test('tv-ir handleVoiceFastpath manages continuous remote mode, noise filtering,
     }, ctx);
     assert.equal(wakeRes.handled, false);
 
-    const exitRes = await handleVoiceFastpath({
-      text: '退出遥控',
-      sessionState: { tvRemoteActive: true },
-    }, ctx);
-    assert.equal(exitRes.handled, true);
-    assert.equal(exitRes.clearSessionState, true);
-    assert.equal(exitRes.followUp, false);
-    assert.equal(exitRes.sessionState, null);
+    // Both "退出遥控" and docs exit word "好了" must exit cleanly
+    for (const exitWord of ['退出遥控', '好了']) {
+      const exitRes = await handleVoiceFastpath({
+        text: exitWord,
+        sessionState: { tvRemoteActive: true },
+      }, ctx);
+      assert.equal(exitRes.handled, true);
+      assert.equal(exitRes.clearSessionState, true);
+      assert.equal(exitRes.followUp, false);
+      assert.equal(exitRes.sessionState, null);
+    }
+
+    // Verify production parser functions directly on edge cases
+    assert.deepEqual(
+      parseTvRemoteStepsPhrase('下两下')?.steps,
+      [{ key: 'down', label: '下', count: 2 }],
+    );
+    assert.deepEqual(
+      parseTvRemoteStepsPhrase('按电视下键')?.steps,
+      [{ key: 'down', label: '下', count: 1 }],
+    );
+    assert.equal(parseTvRemoteEntryPhrase('遥控电视模式').matched, true);
+    assert.equal(isPluginTvRemoteActivation('好，电视已经能直接控制，要试别的键就说。[[END]]'), true);
 
     const replyRes = await handleVoiceFastpath({
       text: '',
@@ -469,16 +542,13 @@ test('tv-ir handleVoiceFastpath manages continuous remote mode, noise filtering,
   }
 });
 
-test('tv-ir handleVoiceFastpath resolves TV power conflict: prefers tv-agent when configured and falls back to IR when unconfigured or failing', async () => {
+test('tv-ir handleVoiceFastpath resolves TV power conflict: prefers tv-agent when available and falls back to IR without peeking ../tv-agent/config.json', async () => {
   const homeDir = await mkdtemp(join(tmpdir(), 'tv-ir-power-'));
   try {
     const irCalls: string[] = [];
     const agentCalls: Array<{ plugin: string; action: string; args: Record<string, unknown> }> = [];
-    const tvAgentCfgDir = join(homeDir, 'plugins', 'tv-agent');
-    await mkdir(tvAgentCfgDir, { recursive: true });
-    await writeFile(join(tvAgentCfgDir, 'config.json'), JSON.stringify({ tvHost: '192.0.2.182' }), 'utf8');
 
-    const resPreferAgent = await handleVoiceFastpath({ text: '打开电视' }, {
+    const resPreferAgent = await handleVoiceFastpath({ text: '星期五，打开电视' }, {
       homeDir,
       pluginDataDir: join(homeDir, 'plugins', 'tv-ir'),
       sshTarget: 'speaker=root@192.0.2.104',
@@ -498,7 +568,7 @@ test('tv-ir handleVoiceFastpath resolves TV power conflict: prefers tv-agent whe
     assert.equal(irCalls.length, 0);
     assert.equal((resPreferAgent.data as Record<string, unknown>)?.backend, 'tv-agent');
 
-    // Fallback to IR when tv-agent call fails
+    // Fallback to IR when tv-agent call throws
     const resFallbackErr = await handleVoiceFastpath({ text: '关电视' }, {
       homeDir,
       pluginDataDir: join(homeDir, 'plugins', 'tv-ir'),
@@ -516,9 +586,7 @@ test('tv-ir handleVoiceFastpath resolves TV power conflict: prefers tv-agent whe
     assert.equal(irCalls.length, 1);
     assert.equal((resFallbackErr.data as Record<string, unknown>)?.backend, 'tv-ir');
 
-    // Fallback directly to IR when tvHost is empty
-    await writeFile(join(tvAgentCfgDir, 'config.json'), JSON.stringify({ tvHost: '' }), 'utf8');
-    let calledWhenEmpty = false;
+    // Fallback cleanly to IR when tv-agent returns ok=false (e.g. unconfigured) or callPlugin is absent
     const resUnconfigured = await handleVoiceFastpath({ text: '打开电视' }, {
       homeDir,
       pluginDataDir: join(homeDir, 'plugins', 'tv-ir'),
@@ -528,15 +596,25 @@ test('tv-ir handleVoiceFastpath resolves TV power conflict: prefers tv-agent whe
         irCalls.push(cmd);
         return { code: 0, stdout: '{}', stderr: '' };
       },
-      callPlugin: async () => {
-        calledWhenEmpty = true;
-        return { ok: true };
-      },
+      callPlugin: async () => ({ ok: false, message: '未配置 tvHost' }),
     });
     assert.equal(resUnconfigured.handled, true);
-    assert.equal(calledWhenEmpty, false);
     assert.equal(irCalls.length, 2);
     assert.equal((resUnconfigured.data as Record<string, unknown>)?.backend, 'tv-ir');
+
+    const resNoCallPlugin = await handleVoiceFastpath({ text: '打开电视' }, {
+      homeDir,
+      pluginDataDir: join(homeDir, 'plugins', 'tv-ir'),
+      sshTarget: 'speaker=root@192.0.2.104',
+      sleep: async () => {},
+      sshRunner: async (_t: unknown, cmd: string) => {
+        irCalls.push(cmd);
+        return { code: 0, stdout: '{}', stderr: '' };
+      },
+    });
+    assert.equal(resNoCallPlugin.handled, true);
+    assert.equal(irCalls.length, 3);
+    assert.equal((resNoCallPlugin.data as Record<string, unknown>)?.backend, 'tv-ir');
   } finally {
     await rm(homeDir, { recursive: true, force: true });
   }
