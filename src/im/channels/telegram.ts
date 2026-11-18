@@ -17,8 +17,11 @@ import {
   DEFAULT_NETWORK_TIMEOUT_MS,
   finalizeWebhookInbound,
   jsonWebhookResponse,
+  parseJsonObjectBody,
   readHeaderValue,
+  runBoundedMediaTask,
   safeEqual,
+  sanitizeImError,
   type ImChannelAdapter,
   type ImGatewayContext,
   type ImInboundMessage,
@@ -135,6 +138,7 @@ function splitTelegramTokens(input: string, maxStickers = 3): { text: string; st
 
 /** Split long outbound Telegram text cleanly on paragraph, line, or sentence boundaries under 4096 chars. */
 export function splitTelegramText(text: string, maxLen = TELEGRAM_MAX_TEXT_LEN): string[] {
+  if (!text.trim()) return [];
   if (text.length <= maxLen) return [text];
   const chunks: string[] = [];
   let remaining = text;
@@ -181,14 +185,17 @@ export function splitTelegramText(text: string, maxLen = TELEGRAM_MAX_TEXT_LEN):
     }
 
     const chunk = remaining.slice(0, splitAt).replace(/\s+$/, '');
-    chunks.push(chunk.length > 0 ? chunk : remaining.slice(0, splitAt));
-    remaining = remaining.slice(splitAt).replace(/^\n+/, '');
+    if (chunk.trim().length > 0) {
+      chunks.push(chunk);
+    }
+    remaining = remaining.slice(splitAt).replace(/^\s+/, '');
   }
 
-  if (remaining.length > 0) {
-    chunks.push(remaining);
+  if (remaining.trim().length > 0) {
+    chunks.push(remaining.replace(/\s+$/, ''));
   }
-  return chunks.length > 0 ? chunks : [text.slice(0, maxLen)];
+  const nonEmpty = chunks.filter(c => c.trim().length > 0);
+  return nonEmpty.length > 0 ? nonEmpty : [text.trim().slice(0, maxLen)].filter(Boolean);
 }
 
 /** Parse a Telegram Bot API update payload (`message`, `edited_message`, `callback_query`) into a normalized inbound message. */
@@ -327,7 +334,7 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
   }
 
   async answerCallbackQuery(channel: ImChannelConfig, callbackQueryId: string, text?: string): Promise<void> {
-    if (!channel.botToken || channel.webhookUrl || !callbackQueryId) return;
+    if (!channel.botToken || !callbackQueryId) return;
     try {
       const base = normalizeTelegramApiBase(channel.apiBase);
       await fetch(`${base}/bot${channel.botToken}/answerCallbackQuery`, {
@@ -343,7 +350,7 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
   }
 
   async sendTyping(channel: ImChannelConfig, chatId: string): Promise<void> {
-    if (!channel.botToken || channel.webhookUrl || !chatId) return;
+    if (!channel.botToken || !chatId) return;
     try {
       const base = normalizeTelegramApiBase(channel.apiBase);
       await fetch(`${base}/bot${channel.botToken}/sendChatAction`, {
@@ -360,110 +367,112 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
     item: TelegramMediaItem,
     destRoot: string,
   ): Promise<ReceivedAttachment> {
-    const cleanName = item.fileName.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 255)
-      || (item.kind === 'image' ? 'photo.jpg' : 'file');
-    const result: ReceivedAttachment = { kind: item.kind, name: cleanName, status: 'failed' };
-    const token = channel.botToken;
-    try {
-      if (!token) throw new Error('Telegram 通道缺少 botToken');
-      if (item.fileSize !== undefined && item.fileSize > MEDIA_LIMIT) {
-        throw new Error('文件超过 16 MiB 限制');
-      }
-      const base = normalizeTelegramApiBase(channel.apiBase);
-      const getFileRes = await fetch(
-        `${base}/bot${token}/getFile?file_id=${encodeURIComponent(item.fileId)}`,
-        { signal: buildRequestSignal(DEFAULT_NETWORK_TIMEOUT_MS, this.ctx.shutdownSignal) },
-      );
-      if (!getFileRes.ok) {
-        throw new Error(`getFile HTTP ${getFileRes.status}`);
-      }
-      const getFileData = await getFileRes.json() as {
-        ok?: boolean;
-        result?: { file_path?: string; file_size?: number };
-        description?: string;
-      };
-      if (!getFileData.ok || typeof getFileData.result?.file_path !== 'string' || !getFileData.result.file_path) {
-        throw new Error(getFileData.description ?? 'getFile 返回结果缺少 file_path');
-      }
-      if (typeof getFileData.result.file_size === 'number' && getFileData.result.file_size > MEDIA_LIMIT) {
-        throw new Error('文件超过 16 MiB 限制');
-      }
-      const remotePath = getFileData.result.file_path.replace(/^\/+/, '');
-      if (!remotePath || remotePath.includes('..') || /^[a-z]+:\/\//i.test(remotePath)) {
-        throw new Error('非法的 Telegram 文件路径');
-      }
-
-      const fileRes = await fetch(`${base}/file/bot${token}/${remotePath}`, {
-        redirect: 'error',
-        signal: buildRequestSignal(20_000, this.ctx.shutdownSignal),
-      });
-      if (!fileRes.ok || !fileRes.body) {
-        throw new Error(`下载失败 HTTP ${fileRes.status}`);
-      }
-      const contentLen = Number(fileRes.headers.get('content-length'));
-      if (Number.isFinite(contentLen) && contentLen > MEDIA_LIMIT) {
-        throw new Error('文件超过 16 MiB 限制');
-      }
-
-      const reader = fileRes.body.getReader();
-      const chunks: Buffer[] = [];
-      let total = 0;
+    return runBoundedMediaTask(async () => {
+      const cleanName = item.fileName.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 255)
+        || (item.kind === 'image' ? 'photo.jpg' : 'file');
+      const result: ReceivedAttachment = { kind: item.kind, name: cleanName, status: 'failed' };
+      const token = channel.botToken;
       try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          total += value.byteLength;
-          if (total > MEDIA_LIMIT) {
-            throw new Error('文件超过 16 MiB 限制');
-          }
-          chunks.push(Buffer.from(value));
+        if (!token) throw new Error('Telegram 通道缺少 botToken');
+        if (item.fileSize !== undefined && item.fileSize > MEDIA_LIMIT) {
+          throw new Error('文件超过 16 MiB 限制');
         }
-      } finally {
-        await reader.cancel().catch(() => {});
-      }
+        const base = normalizeTelegramApiBase(channel.apiBase);
+        const getFileRes = await fetch(
+          `${base}/bot${token}/getFile?file_id=${encodeURIComponent(item.fileId)}`,
+          { signal: buildRequestSignal(DEFAULT_NETWORK_TIMEOUT_MS, this.ctx.shutdownSignal) },
+        );
+        if (!getFileRes.ok) {
+          throw new Error(`getFile HTTP ${getFileRes.status}`);
+        }
+        const getFileData = await getFileRes.json() as {
+          ok?: boolean;
+          result?: { file_path?: string; file_size?: number };
+          description?: string;
+        };
+        if (!getFileData.ok || typeof getFileData.result?.file_path !== 'string' || !getFileData.result.file_path) {
+          throw new Error(getFileData.description ?? 'getFile 返回结果缺少 file_path');
+        }
+        if (typeof getFileData.result.file_size === 'number' && getFileData.result.file_size > MEDIA_LIMIT) {
+          throw new Error('文件超过 16 MiB 限制');
+        }
+        const remotePath = getFileData.result.file_path.replace(/^\/+/, '');
+        if (!remotePath || remotePath.includes('..') || /^[a-z]+:\/\//i.test(remotePath)) {
+          throw new Error('非法的 Telegram 文件路径');
+        }
 
-      const bytes = Buffer.concat(chunks);
-      const detectedMime = item.kind === 'image' ? imageMime(bytes) : undefined;
-      if (item.kind === 'image' && !detectedMime) {
-        throw new Error('不支持的图片格式');
-      }
+        const fileRes = await fetch(`${base}/file/bot${token}/${remotePath}`, {
+          redirect: 'error',
+          signal: buildRequestSignal(20_000, this.ctx.shutdownSignal),
+        });
+        if (!fileRes.ok || !fileRes.body) {
+          throw new Error(`下载失败 HTTP ${fileRes.status}`);
+        }
+        const contentLen = Number(fileRes.headers.get('content-length'));
+        if (Number.isFinite(contentLen) && contentLen > MEDIA_LIMIT) {
+          throw new Error('文件超过 16 MiB 限制');
+        }
 
-      await mkdir(destRoot, { recursive: true, mode: 0o700 });
-      let stat = await lstat(destRoot);
-      if (stat.isDirectory() && !stat.isSymbolicLink() && (stat.mode & 0o077)) {
-        await chmod(destRoot, 0o700).catch(() => {});
-        stat = await lstat(destRoot);
-      }
-      if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077)) {
-        throw new Error('媒体存储目录权限不安全');
-      }
+        const reader = fileRes.body.getReader();
+        const chunks: Buffer[] = [];
+        let total = 0;
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            total += value.byteLength;
+            if (total > MEDIA_LIMIT) {
+              throw new Error('文件超过 16 MiB 限制');
+            }
+            chunks.push(Buffer.from(value));
+          }
+        } finally {
+          await reader.cancel().catch(() => {});
+        }
 
-      const ext = safeDownloadExtension(item.kind, cleanName, detectedMime);
-      const destPath = join(destRoot, `${randomUUID()}${ext}`);
-      const handle = await open(
-        destPath,
-        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-        0o600,
-      );
-      try {
-        await handle.writeFile(bytes);
-      } finally {
-        await handle.close();
-      }
+        const bytes = Buffer.concat(chunks);
+        const detectedMime = item.kind === 'image' ? imageMime(bytes) : undefined;
+        if (item.kind === 'image' && !detectedMime) {
+          throw new Error('不支持的图片格式');
+        }
 
-      const finalMime = detectedMime ?? item.mimeType;
-      return {
-        ...result,
-        status: 'ready',
-        path: destPath,
-        ...(finalMime ? { mimeType: finalMime } : {}),
-        bytes: bytes.length,
-      };
-    } catch (error) {
-      const rawMsg = error instanceof Error ? error.message : 'unknown error';
-      const safeMsg = redactBotToken(rawMsg, token).replace(/https?:\/\/\S+/g, '[url]');
-      return { ...result, error: `附件接收失败（${safeMsg}）；请重新发送。` };
-    }
+        await mkdir(destRoot, { recursive: true, mode: 0o700 });
+        let stat = await lstat(destRoot);
+        if (stat.isDirectory() && !stat.isSymbolicLink() && (stat.mode & 0o077)) {
+          await chmod(destRoot, 0o700).catch(() => {});
+          stat = await lstat(destRoot);
+        }
+        if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077)) {
+          throw new Error('媒体存储目录权限不安全');
+        }
+
+        const ext = safeDownloadExtension(item.kind, cleanName, detectedMime);
+        const destPath = join(destRoot, `${randomUUID()}${ext}`);
+        const handle = await open(
+          destPath,
+          constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+          0o600,
+        );
+        try {
+          await handle.writeFile(bytes);
+        } finally {
+          await handle.close();
+        }
+
+        const finalMime = detectedMime ?? item.mimeType;
+        return {
+          ...result,
+          status: 'ready',
+          path: destPath,
+          ...(finalMime ? { mimeType: finalMime } : {}),
+          bytes: bytes.length,
+        };
+      } catch (error) {
+        const rawMsg = error instanceof Error ? error.message : 'unknown error';
+        const safeMsg = sanitizeImError(redactBotToken(rawMsg, token), [token]);
+        return { ...result, error: `附件接收失败（${safeMsg}）；请重新发送。` };
+      }
+    });
   }
 
   async sendAttachment(
@@ -478,63 +487,67 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
       replyMarkup?: Record<string, unknown>;
     },
   ): Promise<void> {
-    if (!channel.botToken) {
-      throw new Error('Telegram 通道缺少 botToken');
-    }
-    if (!options.target) {
-      throw new Error('Telegram 通道缺少目标 Chat ID');
-    }
-    const bytes = typeof filePathOrBytes === 'string'
-      ? await readFile(filePathOrBytes)
-      : filePathOrBytes;
-    if (bytes.length < 1 || bytes.length > TELEGRAM_MAX_UPLOAD_BYTES) {
-      throw new Error('Telegram 附件大小必须在 1 字节至 50 MiB 之间');
-    }
-    const isAnimation = Boolean(options.animation && fileName.toLowerCase().endsWith('.gif'));
-    const method = isAnimation ? 'sendAnimation' : 'sendDocument';
-    const fieldName = isAnimation ? 'animation' : 'document';
-    const mimeType = isAnimation ? 'image/gif' : 'application/octet-stream';
-
-    const form = new FormData();
-    form.append('chat_id', options.target);
-    if (options.replyToMessageId && /^\d+$/.test(options.replyToMessageId)) {
-      form.append('reply_to_message_id', options.replyToMessageId);
-    }
-    if (options.caption) {
-      form.append('caption', options.caption.slice(0, 1024));
-    }
-    if (options.replyMarkup) {
-      form.append('reply_markup', JSON.stringify(options.replyMarkup));
-    }
-    form.append(fieldName, new Blob([new Uint8Array(bytes)], { type: mimeType }), fileName);
-
-    const base = normalizeTelegramApiBase(channel.apiBase);
-    let res: Response;
-    try {
-      res = await fetch(`${base}/bot${channel.botToken}/${method}`, {
-        method: 'POST',
-        body: form,
-        signal: buildRequestSignal(30_000, this.ctx.shutdownSignal),
-      });
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : 'Network error';
-      throw new Error(`Telegram ${method} 失败: ${redactBotToken(msg, channel.botToken)}`);
-    }
-    if (!res.ok) {
-      throw new Error(`Telegram ${method} 失败: HTTP ${res.status}`);
-    }
-    const rawText = await res.text().catch(() => '');
-    if (rawText) {
-      try {
-        const parsed = JSON.parse(rawText) as { ok?: boolean; description?: string };
-        if (parsed.ok === false) {
-          throw new Error(redactBotToken(parsed.description ?? `Telegram ${method} 返回失败`, channel.botToken));
-        }
-      } catch (err) {
-        if (err instanceof SyntaxError) return;
-        throw err;
+    return runBoundedMediaTask(async () => {
+      if (!channel.botToken) {
+        throw new Error('Telegram 通道缺少 botToken');
       }
-    }
+      if (!options.target) {
+        throw new Error('Telegram 通道缺少目标 Chat ID');
+      }
+      const bytes = typeof filePathOrBytes === 'string'
+        ? await readFile(filePathOrBytes)
+        : filePathOrBytes;
+      if (bytes.length < 1 || bytes.length > TELEGRAM_MAX_UPLOAD_BYTES) {
+        throw new Error('Telegram 附件大小必须在 1 字节至 50 MiB 之间');
+      }
+      const isAnimation = Boolean(options.animation && fileName.toLowerCase().endsWith('.gif'));
+      const method = isAnimation ? 'sendAnimation' : 'sendDocument';
+      const fieldName = isAnimation ? 'animation' : 'document';
+      const mimeType = isAnimation ? 'image/gif' : 'application/octet-stream';
+
+      const form = new FormData();
+      form.append('chat_id', options.target);
+      if (options.replyToMessageId && /^\d+$/.test(options.replyToMessageId)) {
+        form.append('reply_to_message_id', options.replyToMessageId);
+      }
+      if (options.caption) {
+        form.append('caption', options.caption.slice(0, 1024));
+      }
+      if (options.replyMarkup) {
+        form.append('reply_markup', JSON.stringify(options.replyMarkup));
+      }
+      const bodyView = new Uint8Array(bytes.buffer as ArrayBuffer, bytes.byteOffset, bytes.byteLength);
+      form.append(fieldName, new Blob([bodyView], { type: mimeType }), fileName);
+
+      const base = normalizeTelegramApiBase(channel.apiBase);
+      let res: Response;
+      try {
+        res = await fetch(`${base}/bot${channel.botToken}/${method}`, {
+          method: 'POST',
+          body: form,
+          redirect: 'error',
+          signal: buildRequestSignal(30_000, this.ctx.shutdownSignal),
+        });
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : 'Network error';
+        throw new Error(`Telegram ${method} 失败: ${sanitizeImError(redactBotToken(msg, channel.botToken), [channel.botToken])}`);
+      }
+      if (!res.ok) {
+        throw new Error(`Telegram ${method} 失败: HTTP ${res.status}`);
+      }
+      const rawText = await res.text().catch(() => '');
+      if (rawText) {
+        try {
+          const parsed = JSON.parse(rawText) as { ok?: boolean; description?: string };
+          if (parsed.ok === false) {
+            throw new Error(sanitizeImError(redactBotToken(parsed.description ?? `Telegram ${method} 返回失败`, channel.botToken), [channel.botToken]));
+          }
+        } catch (err) {
+          if (err instanceof SyntaxError) return;
+          throw err;
+        }
+      }
+    });
   }
 
   async send(channel: ImChannelConfig, text: string, options?: ImSendOptions): Promise<void> {
@@ -551,7 +564,7 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
       const sendUrl = `${base}/bot${channel.botToken}/sendMessage`;
       const { text: cleanText, stickers } = splitTelegramTokens(text);
 
-      if (cleanText.length > 0 || stickers.length === 0) {
+      if (cleanText.trim().length > 0) {
         const chunks = splitTelegramText(cleanText, TELEGRAM_MAX_TEXT_LEN);
         for (let i = 0; i < chunks.length; i++) {
           const payload: Record<string, unknown> = {
@@ -570,7 +583,7 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
 
       for (let i = 0; i < stickers.length; i++) {
         const expr = stickers[i]!;
-        const attachReplyMarkup = cleanText.length === 0 && i === stickers.length - 1 ? options?.replyMarkup : undefined;
+        const attachReplyMarkup = cleanText.trim().length === 0 && i === stickers.length - 1 ? options?.replyMarkup : undefined;
         try {
           await this.sendAttachment(
             channel,
@@ -578,7 +591,7 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
             `bot-${expr}.gif`,
             {
               target: options!.target!,
-              replyToMessageId: i === 0 && cleanText.length === 0 ? options?.replyToMessageId : undefined,
+              replyToMessageId: i === 0 && cleanText.trim().length === 0 ? options?.replyToMessageId : undefined,
               animation: true,
               ...(attachReplyMarkup ? { replyMarkup: attachReplyMarkup } : {}),
             },
@@ -588,7 +601,7 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
             chat_id: options?.target,
             text: BOT_EXPRESSION_META[expr].plainEmoji,
           };
-          if (i === 0 && cleanText.length === 0 && options?.replyToMessageId && /^\d+$/.test(options.replyToMessageId)) {
+          if (i === 0 && cleanText.trim().length === 0 && options?.replyToMessageId && /^\d+$/.test(options.replyToMessageId)) {
             fallbackPayload.reply_to_message_id = Number(options.replyToMessageId);
           }
           if (attachReplyMarkup) {
@@ -609,6 +622,7 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
       }
     }
     const chunks = splitTelegramText(outText, TELEGRAM_MAX_TEXT_LEN);
+    if (chunks.length === 0) return;
     const webhookUrl = channel.webhookUrl!;
     for (let i = 0; i < chunks.length; i++) {
       const payload: Record<string, unknown> = {
@@ -639,7 +653,7 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
       });
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Network error';
-      throw new Error(`Telegram getUpdates 失败: ${redactBotToken(msg, channel.botToken)}`);
+      throw new Error(`Telegram getUpdates 失败: ${sanitizeImError(redactBotToken(msg, channel.botToken), [channel.botToken])}`);
     }
     if (!res.ok) {
       throw new Error(`Telegram getUpdates HTTP ${res.status}`);
@@ -650,15 +664,16 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
     }
     const receivedAny = data.result.length > 0;
     for (const update of data.result) {
+      const inbound = parseTelegramUpdate(channel.id, update);
+      if (inbound) {
+        this.ctx.markTrustedTelegramInbound?.(inbound);
+        await this.ctx.ingestMessage(inbound);
+      }
       const updateId = Number(update.update_id);
       if (Number.isSafeInteger(updateId)) {
         const current = this.ctx.coordinator.store.getImChannel(channel.id);
         current.pollOffset = Math.max(current.pollOffset ?? 0, updateId + 1);
         this.ctx.coordinator.store.saveImChannel(current);
-      }
-      const inbound = parseTelegramUpdate(channel.id, update);
-      if (inbound) {
-        await this.ctx.ingestMessage(inbound);
       }
     }
     return { receivedAny };
@@ -674,14 +689,19 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
     if (method !== 'POST') {
       return jsonWebhookResponse(405, { error: 'Method not allowed' });
     }
-    if (channel.secret) {
-      const tokenHeader = readHeaderValue(headers, 'x-telegram-bot-api-secret-token') ?? '';
-      if (!tokenHeader || !safeEqual(tokenHeader, channel.secret)) {
-        return jsonWebhookResponse(403, { error: 'Invalid Telegram secret token' });
-      }
+    const secret = channel.secret?.trim();
+    if (!secret) {
+      return jsonWebhookResponse(403, { error: 'Telegram webhook secret is required' });
     }
-    const update = JSON.parse(rawBody || '{}') as Record<string, unknown>;
-    return finalizeWebhookInbound(this.ctx, parseTelegramUpdate(channel.id, update));
+    const tokenHeader = readHeaderValue(headers, 'x-telegram-bot-api-secret-token') ?? '';
+    if (!tokenHeader || !safeEqual(tokenHeader, secret)) {
+      return jsonWebhookResponse(403, { error: 'Invalid Telegram secret token' });
+    }
+    const parsed = parseJsonObjectBody(rawBody || '{}');
+    if (!parsed.ok) {
+      return jsonWebhookResponse(400, { error: 'Invalid JSON payload' });
+    }
+    return finalizeWebhookInbound(this.ctx, parseTelegramUpdate(channel.id, parsed.data));
   }
 
   private async postSendMessage(
@@ -695,11 +715,12 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(payload),
+        redirect: 'error',
         signal: buildRequestSignal(DEFAULT_NETWORK_TIMEOUT_MS, this.ctx.shutdownSignal),
       });
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Network error';
-      throw new Error(`Telegram 发送失败: ${redactBotToken(msg, botToken)}`);
+      throw new Error(`Telegram 发送失败: ${sanitizeImError(redactBotToken(msg, botToken), [botToken])}`);
     }
     if (!res.ok) {
       throw new Error(`Telegram 发送失败: HTTP ${res.status}`);
@@ -709,7 +730,7 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
       try {
         const data = JSON.parse(rawText) as { ok?: boolean; description?: string };
         if (data.ok === false) {
-          throw new Error(`Telegram 发送失败: ${redactBotToken(data.description ?? 'API error', botToken)}`);
+          throw new Error(`Telegram 发送失败: ${sanitizeImError(redactBotToken(data.description ?? 'API error', botToken), [botToken])}`);
         }
       } catch (err) {
         if (err instanceof SyntaxError) return;
@@ -730,16 +751,17 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
+        redirect: 'error',
         signal: buildRequestSignal(DEFAULT_NETWORK_TIMEOUT_MS, this.ctx.shutdownSignal),
       });
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Network error';
-      throw new Error(`Telegram ${method} 请求失败: ${redactBotToken(msg, token)}`);
+      throw new Error(`Telegram ${method} 请求失败: ${sanitizeImError(redactBotToken(msg, token), [token])}`);
     }
     const payload = await res.json().catch(() => ({})) as { ok?: boolean; description?: string };
     if (!res.ok || payload.ok === false) {
       const detail = payload.description
-        ? redactBotToken(payload.description, token)
+        ? sanitizeImError(redactBotToken(payload.description, token), [token])
         : `HTTP ${res.status}`;
       throw new Error(`Telegram ${method} 失败: ${detail}`);
     }

@@ -101,7 +101,10 @@ function encodeQrMatrix(text: string): boolean[][] {
 
   const lenBits = spec.version <= 9 ? 8 : 16;
   const maxPayload = Math.floor((spec.totalData * 8 - 4 - lenBits) / 8);
-  const bytes = payload.length > maxPayload ? payload.subarray(0, maxPayload) : payload;
+  if (payload.length > maxPayload) {
+    throw new Error(`QR payload exceeds Version ${spec.version}-L capacity (${payload.length} > ${maxPayload} bytes)`);
+  }
+  const bytes = payload;
 
   const bits: number[] = [];
   const pushBits = (val: number, count: number) => {

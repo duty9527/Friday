@@ -70,7 +70,7 @@ export interface XiaoaiSpeakerMatchResult {
   speaker?: { id: string; name: string; role: 'owner' | 'member'; score: number };
   score: number;
   threshold: number;
-  reason?: 'no_profiles' | 'disabled' | 'model_missing' | 'too_short' | 'extract_failed' | 'below_threshold';
+  reason?: 'no_profiles' | 'disabled' | 'model_missing' | 'registry_corrupt' | 'too_short' | 'extract_failed' | 'below_threshold';
 }
 
 export interface XiaoaiSpeakerUtteranceCheck extends XiaoaiSpeakerMatchResult {
@@ -134,11 +134,14 @@ function resolveSpeakerModelFile(speakerModelsDir: string): string | undefined {
   }
 }
 
+const MAX_SPEAKER_MODEL_BYTES = 80 * 1024 * 1024;
+
 export async function ensureXiaoaiSpeakerModel(options: {
   homeDir: string;
   speakerModelsDir?: string;
   fetchImpl?: typeof fetch;
   minBytes?: number;
+  signal?: AbortSignal;
   onProgress?: (downloadedBytes: number, totalBytes?: number) => void;
 }): Promise<string> {
   const dir = options.speakerModelsDir ?? join(options.homeDir, 'xiaoai-kws', 'speaker');
@@ -164,33 +167,48 @@ export async function ensureXiaoaiSpeakerModel(options: {
     for (const url of urls) {
       rmSync(partPath, { force: true });
       try {
+        const timeoutSignal = AbortSignal.timeout(90_000);
+        const signal = options.signal ? AbortSignal.any([timeoutSignal, options.signal]) : timeoutSignal;
         const res = await fetchFn(url, {
           method: 'GET',
           redirect: 'follow',
-          signal: AbortSignal.timeout(90_000),
+          signal,
         });
         if (!res.ok) {
           throw new Error(`HTTP ${res.status}`);
         }
         const totalHeader = Number(res.headers.get('content-length') ?? 0);
         const totalBytes = Number.isFinite(totalHeader) && totalHeader > 0 ? totalHeader : undefined;
+        if (totalBytes !== undefined && totalBytes > MAX_SPEAKER_MODEL_BYTES) {
+          throw new Error(`模型文件体积超出上限 (${totalBytes} > ${MAX_SPEAKER_MODEL_BYTES})`);
+        }
 
         let chunks: Buffer[] = [];
         let downloaded = 0;
         if (res.body && typeof res.body.getReader === 'function') {
           const reader = res.body.getReader();
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (value && value.byteLength > 0) {
-              const buf = Buffer.from(value);
-              chunks.push(buf);
-              downloaded += buf.byteLength;
-              options.onProgress?.(downloaded, totalBytes);
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              if (value && value.byteLength > 0) {
+                downloaded += value.byteLength;
+                if (downloaded > MAX_SPEAKER_MODEL_BYTES) {
+                  throw new Error(`模型下载流超出上限 (${MAX_SPEAKER_MODEL_BYTES} bytes)`);
+                }
+                const buf = Buffer.from(value);
+                chunks.push(buf);
+                options.onProgress?.(downloaded, totalBytes);
+              }
             }
+          } finally {
+            await reader.cancel().catch(() => {});
           }
         } else {
           const buf = Buffer.from(await res.arrayBuffer());
+          if (buf.byteLength > MAX_SPEAKER_MODEL_BYTES) {
+            throw new Error(`模型文件体积超出上限 (${buf.byteLength} > ${MAX_SPEAKER_MODEL_BYTES})`);
+          }
           chunks = [buf];
           downloaded = buf.byteLength;
           options.onProgress?.(downloaded, totalBytes);
@@ -520,11 +538,7 @@ function isFullAndTailConsistentMatch(
   fullRes: XiaoaiSpeakerMatchResult,
   tailRes: XiaoaiSpeakerMatchResult,
 ): boolean {
-  return Boolean(
-    fullRes.matched
-    && tailRes.matched
-    && (!fullRes.speaker || !tailRes.speaker || fullRes.speaker.id === tailRes.speaker.id),
-  );
+  return Boolean(fullRes.matched && tailRes.matched);
 }
 
 function finalizeTrimmedUtterance(params: {
@@ -552,16 +566,19 @@ function finalizeTrimmedUtterance(params: {
   const sustainFloor = Math.max(0.22, threshold - 0.05);
   const anchorStart = starts[anchorStartIdx] ?? 0;
   let lastGoodWindowEnd = anchorStart + winLen;
+  let lowStreak = 0;
   for (let offset = 1; offset < windowScores.length; offset++) {
     const score = windowScores[offset] ?? 0;
     const start = starts[anchorStartIdx + offset];
     if (start === undefined) break;
     if (score >= sustainFloor) {
+      lowStreak = 0;
       lastGoodWindowEnd = start + winLen;
       continue;
     }
+    lowStreak++;
     const nextScore = offset + 1 < windowScores.length ? (windowScores[offset + 1] ?? 0) : 0;
-    if (nextScore >= threshold) {
+    if (lowStreak === 1 && nextScore >= sustainFloor) {
       lastGoodWindowEnd = start + winLen;
       continue;
     }
@@ -596,6 +613,7 @@ export class XiaoaiSpeakerManager {
   private extractorModelPath?: string;
   private cachedMtimeMs = -1;
   private cachedData?: XiaoaiSpeakerRegistryData;
+  private registryCorrupt = false;
 
   constructor(options: XiaoaiSpeakerManagerOptions) {
     this.options = options;
@@ -607,6 +625,7 @@ export class XiaoaiSpeakerManager {
   private loadRegistry(): XiaoaiSpeakerRegistryData {
     if (!existsSync(this.registryPath)) {
       this.cachedMtimeMs = -1;
+      this.registryCorrupt = false;
       this.cachedData = defaultRegistryData();
       return this.cachedData;
     }
@@ -616,6 +635,9 @@ export class XiaoaiSpeakerManager {
         return this.cachedData;
       }
       const raw = JSON.parse(readFileSync(this.registryPath, 'utf8')) as Partial<XiaoaiSpeakerRegistryData>;
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        throw new Error('Speaker registry must be a JSON object');
+      }
       const profiles: XiaoaiSpeakerProfile[] = [];
       if (Array.isArray(raw.profiles)) {
         for (const item of raw.profiles) {
@@ -642,7 +664,11 @@ export class XiaoaiSpeakerManager {
             updatedAt: typeof p.updatedAt === 'number' ? p.updatedAt : Date.now(),
           });
         }
+        if (raw.profiles.length > 0 && profiles.length === 0) {
+          throw new Error('All speaker profiles in registry are malformed');
+        }
       }
+      this.registryCorrupt = false;
       this.cachedData = {
         version: 1,
         enabled: typeof raw.enabled === 'boolean' ? raw.enabled : true,
@@ -654,10 +680,11 @@ export class XiaoaiSpeakerManager {
       return this.cachedData;
     } catch (err) {
       console.warn(
-        '[xiaoai-speaker] 声纹档案加载失败，使用默认空档案:',
+        '[xiaoai-speaker] 声纹档案加载失败，进入 Fail-Closed 拦截状态:',
         err instanceof Error ? err.message : String(err),
       );
       this.cachedMtimeMs = -1;
+      this.registryCorrupt = true;
       this.cachedData = defaultRegistryData();
       return this.cachedData;
     }
@@ -673,6 +700,7 @@ export class XiaoaiSpeakerManager {
     } catch {
       this.cachedMtimeMs = -1;
     }
+    this.registryCorrupt = false;
     this.cachedData = data;
   }
 
@@ -681,12 +709,13 @@ export class XiaoaiSpeakerManager {
     return Boolean(resolveSpeakerModelFile(this.speakerModelsDir));
   }
 
-  async ensureModelReady(): Promise<string> {
+  async ensureModelReady(signal?: AbortSignal): Promise<string> {
     if (this.options.extractorFactory) return 'custom';
     return ensureXiaoaiSpeakerModel({
       homeDir: this.options.homeDir,
       speakerModelsDir: this.speakerModelsDir,
       fetchImpl: this.options.fetchImpl,
+      signal,
     });
   }
 
@@ -708,7 +737,7 @@ export class XiaoaiSpeakerManager {
   isVerificationActive(channelOpts?: { speakerVerify?: boolean }): boolean {
     if (channelOpts?.speakerVerify === false) return false;
     const data = this.loadRegistry();
-    return Boolean(data.enabled && data.profiles.length > 0 && this.isModelReady());
+    return Boolean(this.registryCorrupt || (data.enabled && data.profiles.length > 0));
   }
 
   getStatus(): XiaoaiSpeakerStatus {
@@ -718,7 +747,7 @@ export class XiaoaiSpeakerManager {
       enabled: data.enabled,
       threshold: data.threshold,
       wakePrecheck: data.wakePrecheck,
-      active: Boolean(data.enabled && data.profiles.length > 0 && (this.options.extractorFactory || modelPath)),
+      active: Boolean(this.registryCorrupt || (data.enabled && data.profiles.length > 0)),
       modelReady: Boolean(this.options.extractorFactory || modelPath),
       ...(modelPath ? { modelPath } : {}),
       profiles: data.profiles.map(({ centroid: _c, samples: _s, ...meta }) => meta),
@@ -932,6 +961,9 @@ export class XiaoaiSpeakerManager {
     if (opts?.speakerVerify === false) {
       return { matched: true, score: 1, threshold, reason: 'disabled' };
     }
+    if (this.registryCorrupt) {
+      return { matched: false, score: 0, threshold, reason: 'registry_corrupt' };
+    }
     if (!opts?.ignoreDisabled && !data.enabled) {
       return { matched: true, score: 1, threshold, reason: 'disabled' };
     }
@@ -939,7 +971,7 @@ export class XiaoaiSpeakerManager {
       return { matched: !opts?.ignoreDisabled, score: opts?.ignoreDisabled ? 0 : 1, threshold, reason: 'no_profiles' };
     }
     if (!this.isModelReady()) {
-      return { matched: !opts?.ignoreDisabled, score: opts?.ignoreDisabled ? 0 : 1, threshold, reason: 'model_missing' };
+      return { matched: false, score: 0, threshold, reason: 'model_missing' };
     }
     const minSamples = sampleRate === SPEAKER_SAMPLE_RATE
       ? MIN_SPEAKER_VERIFY_SAMPLES
@@ -984,9 +1016,6 @@ export class XiaoaiSpeakerManager {
     }
     return {
       matched: false,
-      ...(bestProfile
-        ? { speaker: { id: bestProfile.id, name: bestProfile.name, role: bestProfile.role, score: safeScore } }
-        : {}),
       score: safeScore,
       threshold,
       reason: 'below_threshold',
@@ -1001,8 +1030,17 @@ export class XiaoaiSpeakerManager {
   ): XiaoaiSpeakerMatchResult {
     const data = this.loadRegistry();
     const baseThreshold = clampThreshold(opts?.thresholdOverride ?? data.threshold, data.threshold);
+    if (opts?.speakerVerify === false) {
+      return { matched: true, score: 1, threshold: baseThreshold, reason: 'disabled' };
+    }
+    if (this.registryCorrupt) {
+      return { matched: false, score: 0, threshold: baseThreshold, reason: 'registry_corrupt' };
+    }
     if (!this.isVerificationActive(opts) || !data.wakePrecheck) {
       return { matched: true, score: 1, threshold: baseThreshold, reason: 'disabled' };
+    }
+    if (!this.isModelReady()) {
+      return { matched: false, score: 0, threshold: baseThreshold, reason: 'model_missing' };
     }
     if (samples.length < Math.round(sampleRate * 0.45)) {
       return { matched: true, score: 1, threshold: baseThreshold, reason: 'too_short' };
@@ -1120,8 +1158,9 @@ export class XiaoaiSpeakerManager {
     }
 
     const sustainFloor = Math.max(0.22, threshold - 0.05);
-    const windowScores: number[] = [];
-    for (let i = anchorStartIdx; i < starts.length; i++) {
+    const windowScores: number[] = [bestAnchorScore];
+    let lowStreak = 0;
+    for (let i = anchorStartIdx + 1; i < starts.length; i++) {
       const start = starts[i];
       if (start === undefined) continue;
       const slice = samples.subarray(start, start + winLen);
@@ -1129,12 +1168,11 @@ export class XiaoaiSpeakerManager {
       const score = emb ? scoreEmbeddingAgainstProfile(emb, anchorProfile) : 0;
       if (score > bestAnchorScore) bestAnchorScore = score;
       windowScores.push(score);
-      if (
-        windowScores.length >= 3
-        && (windowScores[windowScores.length - 2] ?? 0) < sustainFloor
-        && score < threshold
-      ) {
-        break;
+      if (score < sustainFloor) {
+        lowStreak++;
+        if (lowStreak >= 2) break;
+      } else {
+        lowStreak = 0;
       }
     }
 
@@ -1212,8 +1250,9 @@ export class XiaoaiSpeakerManager {
     }
 
     const sustainFloor = Math.max(0.22, threshold - 0.05);
-    const windowScores: number[] = [];
-    for (let i = anchorStartIdx; i < starts.length; i++) {
+    const windowScores: number[] = [bestAnchorScore];
+    let lowStreak = 0;
+    for (let i = anchorStartIdx + 1; i < starts.length; i++) {
       const start = starts[i];
       if (start === undefined) continue;
       await yieldEventLoop();
@@ -1222,12 +1261,11 @@ export class XiaoaiSpeakerManager {
       const score = emb ? scoreEmbeddingAgainstProfile(emb, anchorProfile) : 0;
       if (score > bestAnchorScore) bestAnchorScore = score;
       windowScores.push(score);
-      if (
-        windowScores.length >= 3
-        && (windowScores[windowScores.length - 2] ?? 0) < sustainFloor
-        && score < threshold
-      ) {
-        break;
+      if (score < sustainFloor) {
+        lowStreak++;
+        if (lowStreak >= 2) break;
+      } else {
+        lowStreak = 0;
       }
     }
 

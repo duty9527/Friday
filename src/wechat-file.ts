@@ -5,9 +5,9 @@ import { createCipheriv, createHash, randomBytes, randomUUID } from 'node:crypto
 import { fileURLToPath } from 'node:url';
 import type { BotExpression } from './web/shared/bot-expressions.js';
 
-// Local memory policy, not an upstream file-size limit. Transfers serialize per channel.
+// Local memory policy, not an upstream file-size limit. Transfers serialize process-wide.
 export const MAX_ATTACHMENT_BYTES = 16 * 1024 * 1024;
-const channelDeliveryQueues = new Map<string, Promise<void>>();
+let globalDeliveryQueue: Promise<void> = Promise.resolve();
 
 /** Reads a regular, single-link file within the 1B..16MiB bounded policy. */
 async function readRegularFileBounded(fullPath: string): Promise<Buffer> {
@@ -73,8 +73,7 @@ async function deliverEncryptedWechatMedia(
   }) => Record<string, unknown>,
   transport: typeof fetch = fetch,
 ): Promise<void> {
-  const queueKey = input.channelId?.trim() || `${input.base}:${input.accountId ?? ''}:${input.target}`;
-  const prev = channelDeliveryQueues.get(queueKey) ?? Promise.resolve();
+  const prev = globalDeliveryQueue;
   const run = prev.catch(() => {}).then(async () => {
     try {
       const plain = await readPlain();
@@ -119,7 +118,7 @@ async function deliverEncryptedWechatMedia(
         redirect: 'error',
         signal: withTimeout(60_000, input.signal),
         headers: { 'Content-Type': 'application/octet-stream' },
-        body: new Uint8Array(encrypted),
+        body: new Uint8Array(encrypted.buffer as ArrayBuffer, encrypted.byteOffset, encrypted.byteLength),
       });
       const param = res.headers.get('x-encrypted-param');
       if (res.status !== 200) throw new Error(`CDN upload HTTP ${res.status}`);
@@ -158,12 +157,7 @@ async function deliverEncryptedWechatMedia(
       throw new Error(`Attachment delivery failed (${detail}); no automatic retry`);
     }
   });
-  const settled = run.then(() => {}, () => {}).finally(() => {
-    if (channelDeliveryQueues.get(queueKey) === settled) {
-      channelDeliveryQueues.delete(queueKey);
-    }
-  });
-  channelDeliveryQueues.set(queueKey, settled);
+  globalDeliveryQueue = run.then(() => {}, () => {});
   return run;
 }
 

@@ -153,14 +153,22 @@ export async function tryHandleImSlashCommand(params: {
   });
 
   if (command === '/start') {
-    if (targetId && channel.defaultTarget !== targetId) {
+    const canAutoBindDefaultTarget = Boolean(
+      !channel.defaultTarget
+      && channel.allowedSenders.length > 0
+      && targetId
+      && targetId === inbound.senderId,
+    );
+    if (canAutoBindDefaultTarget) {
       channel.defaultTarget = targetId;
       channel.updatedAt = Date.now();
       ctx.coordinator.store.saveImChannel(channel);
     }
     const startLines = [
       '🤖 你好！我是 F.R.I.D.A.Y. 智能副手。',
-      `✅ 已将当前会话 Chat ID (${targetId}) 绑定为默认推送目标。`,
+      ...(canAutoBindDefaultTarget || (targetId && channel.defaultTarget === targetId)
+        ? [`✅ 已将当前会话 Chat ID (${targetId}) 绑定为默认推送目标。`]
+        : ['ℹ️ 当前默认推送目标保持不变（仅允许白名单私聊首次自动绑定或管理端配置）。']),
       ...(arg ? [`📌 附带参数: ${arg}`] : []),
       '',
       '你可以直接发送自然语言消息与我对话、下发后台任务或发送图片/文件分析，也可使用下方快捷按钮或 /help 查看全部命令。',

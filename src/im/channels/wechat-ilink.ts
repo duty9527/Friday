@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
+import { resolveEnv } from '../../paths.js';
 import { renderQrSvgDataUrl, renderQrTerminal } from '../../qrcode.js';
 import type { ImChannelConfig } from '../../store.js';
 import type { ChatMessage, ImChannelView, WechatQrLoginSession } from '../../view.js';
@@ -10,11 +11,22 @@ import {
   BoundedMap,
   buildRequestSignal,
   DEFAULT_WECHAT_ILINK_BASE,
+  sanitizeImError,
   type ImChannelAdapter,
   type ImGatewayContext,
   type ImInboundMessage,
   type ImSendOptions,
 } from '../types.js';
+
+const WECHAT_ILINK_AUTH_EXPIRED_CODES = new Set([-14, -2, -401, 401, 403, 40001, 42001]);
+
+export class WechatIlinkAuthExpiredError extends Error {
+  readonly authExpired = true;
+  constructor(message = '微信 iLink 登录态已失效，请重新扫码绑定') {
+    super(message);
+    this.name = 'WechatIlinkAuthExpiredError';
+  }
+}
 
 const WECHAT_TYPING_KEEPALIVE_MS = 5_000;
 const WECHAT_TYPING_TICKET_TTL_MS = 15 * 60_000;
@@ -109,7 +121,7 @@ export function parseWechatIlinkMessage(
 }
 
 /** Shared Tencent WeChat iLink Bot API POST caller eliminating duplicate headers/envelopes. */
-async function callIlinkApi<T extends { ret?: number; errcode?: number }>(params: {
+async function callIlinkApi<T extends { ret?: number; errcode?: number; errmsg?: string }>(params: {
   base: string;
   botToken: string;
   path: string;
@@ -120,22 +132,39 @@ async function callIlinkApi<T extends { ret?: number; errcode?: number }>(params
   bizErrorLabel?: string;
   checkResultCode?: boolean;
 }): Promise<T> {
-  const res = await fetch(`${params.base}${params.path}`, {
-    method: 'POST',
-    headers: buildWechatIlinkHeaders(params.botToken),
-    signal: buildRequestSignal(params.timeoutMs, params.shutdownSignal),
-    body: JSON.stringify({
-      base_info: { channel_version: '1.0.2' },
-      ...params.body,
-    }),
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${params.base}${params.path}`, {
+      method: 'POST',
+      headers: buildWechatIlinkHeaders(params.botToken),
+      redirect: 'error',
+      signal: buildRequestSignal(params.timeoutMs, params.shutdownSignal),
+      body: JSON.stringify({
+        base_info: { channel_version: '1.0.2' },
+        ...params.body,
+      }),
+    });
+  } catch (err) {
+    throw new Error(sanitizeImError(err, [params.botToken]));
+  }
   if (!res.ok) {
+    if (res.status === 401 || res.status === 403) {
+      throw new WechatIlinkAuthExpiredError(`${params.httpErrorLabel} 登录态失效 (HTTP ${res.status})`);
+    }
     throw new Error(`${params.httpErrorLabel} HTTP ${res.status}`);
   }
   const data = await res.json() as T;
   if (params.checkResultCode !== false) {
-    if ((data.ret !== undefined && data.ret !== 0) || (data.errcode !== undefined && data.errcode !== 0)) {
-      throw new Error(params.bizErrorLabel ?? `${params.httpErrorLabel}业务错误`);
+    const code = (data.errcode !== undefined && data.errcode !== 0)
+      ? data.errcode
+      : (data.ret !== undefined && data.ret !== 0)
+        ? data.ret
+        : undefined;
+    if (code !== undefined) {
+      if (WECHAT_ILINK_AUTH_EXPIRED_CODES.has(code)) {
+        throw new WechatIlinkAuthExpiredError(`${params.httpErrorLabel} 登录态已过期 (code=${code})`);
+      }
+      throw new Error(params.bizErrorLabel ?? `${params.httpErrorLabel}业务错误 (code=${code})`);
     }
   }
   return data;
@@ -168,8 +197,9 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
   }
 
   attachmentDir(): string | undefined {
-    if (process.env.FRIDAY_WECHAT_ATTACHMENT_DIR !== undefined) {
-      return process.env.FRIDAY_WECHAT_ATTACHMENT_DIR.trim() || undefined;
+    const envDir = resolveEnv('FRIDAY_WECHAT_ATTACHMENT_DIR', 'SUPER_AGENT_WECHAT_ATTACHMENT_DIR');
+    if (envDir !== undefined) {
+      return envDir.trim() || undefined;
     }
     return this.ctx.homeDir ? join(this.ctx.homeDir, 'wechat-files') : undefined;
   }
@@ -245,6 +275,7 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
     const data = await callIlinkApi<{
       ret?: number;
       errcode?: number;
+      errmsg?: string;
       get_updates_buf?: string;
       msgs?: Array<Record<string, unknown>>;
     }>({
@@ -254,7 +285,6 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
       timeoutMs: 40_000,
       shutdownSignal: this.ctx.shutdownSignal,
       httpErrorLabel: '微信 iLink getupdates',
-      checkResultCode: false,
       body: {
         get_updates_buf: channel.syncBuf ?? '',
       },
@@ -299,7 +329,7 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
     ) {
       throw new Error('微信附件发送未获授权或缺少会话凭证');
     }
-    if (process.env.FRIDAY_WECHAT_ATTACHMENT_DIR === undefined) {
+    if (resolveEnv('FRIDAY_WECHAT_ATTACHMENT_DIR', 'SUPER_AGENT_WECHAT_ATTACHMENT_DIR') === undefined) {
       await mkdir(root, { recursive: true, mode: 0o700 }).catch(() => {});
     }
     try {
@@ -322,7 +352,7 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
       this.ctx.coordinator.store.saveImChannel(latest);
     } catch (error) {
       const latest = this.ctx.coordinator.store.getImChannel(channelId);
-      latest.lastError = error instanceof Error ? error.message : 'Attachment delivery failed; no automatic retry';
+      latest.lastError = sanitizeImError(error, [channel.botToken, channel.secret]);
       latest.updatedAt = Date.now();
       this.ctx.coordinator.store.saveImChannel(latest);
       throw error;
@@ -352,7 +382,7 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
     ) {
       return { ok: false, action: 'rejected', reason: 'attachment_not_authorized' };
     }
-    if (process.env.FRIDAY_WECHAT_ATTACHMENT_DIR === undefined) {
+    if (resolveEnv('FRIDAY_WECHAT_ATTACHMENT_DIR', 'SUPER_AGENT_WECHAT_ATTACHMENT_DIR') === undefined) {
       await mkdir(root, { recursive: true, mode: 0o700 }).catch(() => {});
     }
     try {
@@ -372,11 +402,11 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
       this.ctx.coordinator.store.saveImChannel(channel);
       return { ok: true, action: 'attachment_sent' };
     } catch (error) {
-      channel.lastError = error instanceof Error ? error.message : 'Attachment delivery failed; no automatic retry';
+      channel.lastError = sanitizeImError(error, [channel.botToken, channel.secret]);
       this.ctx.coordinator.store.saveImChannel(channel);
       await this.ctx.sendToChannel(
         channel.id,
-        `⚠️ 附件发送失败（请确认文件已放入目录 ${root}）：${channel.lastError}`,
+        `⚠️ 附件发送失败（请确认文件存在于附件目录且文件名合法）：${channel.lastError}`,
         replyOpts,
       ).catch(() => {});
       return { ok: false, action: 'attachment_failed', reason: 'delivery_failed' };
@@ -427,13 +457,14 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
     const qrcode = String(data.qrcode ?? '').trim();
     const qrcodeContent = String(data.qrcode_img_content ?? data.qrcode_url ?? qrcode).trim();
     if (!qrcode || !qrcodeContent) {
-      throw new Error(`微信 iLink 返回的二维码数据不完整: ${JSON.stringify(data).slice(0, 200)}`);
+      throw new Error('微信 iLink 返回的二维码数据不完整');
     }
 
     const qrSvgDataUrl = qrcodeContent.startsWith('data:image/')
       ? qrcodeContent
       : renderQrSvgDataUrl(qrcodeContent);
-    const qrTerminal = renderQrTerminal(qrcodeContent);
+    const terminalPayload = qrcodeContent.startsWith('data:image/') ? qrcode : qrcodeContent;
+    const qrTerminal = renderQrTerminal(terminalPayload);
     const sessionId = randomUUID();
 
     const session: InternalWechatQrSession = {
@@ -530,12 +561,20 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
         }
 
         const channel = this.ctx.coordinator.store.getImChannel(session.channelId);
+        const accountChanged = Boolean(accountId && channel.accountId && accountId !== channel.accountId);
+        const tokenChanged = Boolean(channel.botToken && botToken !== channel.botToken);
         channel.enabled = true;
         channel.botToken = botToken;
         channel.accountId = accountId ?? channel.accountId;
         channel.apiBase = returnedBaseUrl;
+        if (accountChanged || tokenChanged) {
+          channel.syncBuf = undefined;
+          channel.pollOffset = undefined;
+          channel.contextTokens = {};
+          channel.contextTokenUpdatedAt = {};
+        }
         if (userId) {
-          if (!channel.defaultTarget) {
+          if (!channel.defaultTarget || accountChanged) {
             channel.defaultTarget = userId;
           }
           if (!channel.allowedSenders.includes(userId)) {
@@ -560,7 +599,7 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
       if (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
         return;
       }
-      session.error = error instanceof Error ? error.message : 'Poll QR status error';
+      session.error = sanitizeImError(error);
     }
   }
 
@@ -636,18 +675,25 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
   }
 
   syncTypingFromMessage(msg: ChatMessage, releases: Array<{ channelId: string; target: string; ref: string }>): void {
+    const settled = ['completed', 'failed', 'interrupted'].includes(msg.status);
     if (msg.origin?.channel === 'wechat' && msg.origin.channelId && msg.origin.conversationId && !msg.origin.replyWebhook) {
       const active = (msg.role === 'user' && ['queued', 'processing'].includes(msg.status))
         || (msg.role === 'assistant' && msg.status === 'streaming');
       if (active) {
         this.retainTyping(msg.origin.channelId, msg.origin.conversationId, `msg:${msg.id}`, msg.origin.contextToken);
-      } else if (['completed', 'failed', 'interrupted'].includes(msg.status)) {
+        return;
+      }
+      if (settled) {
         releases.push({
           channelId: msg.origin.channelId,
           target: msg.origin.conversationId,
           ref: `msg:${msg.id}`,
         });
+        return;
       }
+    }
+    if (settled) {
+      this.syncTypingForMissingMessage(msg.id, releases);
     }
   }
 

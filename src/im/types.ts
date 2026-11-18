@@ -116,6 +116,7 @@ export interface ImGatewayContext {
   sendToChannel(channelId: string, text: string, options?: ImSendOptions): Promise<void>;
   ingestMessage(inbound: ImInboundMessage): Promise<{ ok: boolean; action: string; messageId?: string; reason?: string }>;
   markTrustedWechatInbound(inbound: ImInboundMessage): void;
+  markTrustedTelegramInbound?(inbound: ImInboundMessage): void;
   scheduleChannelPoll(channelId: string, delayMs: number): void;
   runVoiceFastpath(request: VoiceFastpathRequest): Promise<VoiceFastpathResult | undefined>;
 }
@@ -239,3 +240,143 @@ export type InboundAttachmentContext = {
   requestId: string;
   msg: ChatMessage;
 };
+
+const MAX_CONCURRENT_MEDIA_TASKS = 2;
+let activeMediaTasks = 0;
+const mediaTaskWaiters: Array<() => void> = [];
+
+/** Process-wide FIFO concurrency limiter for inbound/outbound IM attachment transfers. */
+export async function runBoundedMediaTask<T>(fn: () => Promise<T>): Promise<T> {
+  if (activeMediaTasks >= MAX_CONCURRENT_MEDIA_TASKS) {
+    await new Promise<void>(resolve => mediaTaskWaiters.push(resolve));
+  }
+  activeMediaTasks++;
+  try {
+    return await fn();
+  } finally {
+    activeMediaTasks--;
+    const next = mediaTaskWaiters.shift();
+    next?.();
+  }
+}
+
+/** Parse a webhook JSON body strictly into a non-null plain object record. */
+export function parseJsonObjectBody(rawBody: string): { ok: true; data: Record<string, unknown> } | { ok: false } {
+  try {
+    const parsed: unknown = JSON.parse(rawBody);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { ok: false };
+    }
+    return { ok: true, data: parsed as Record<string, unknown> };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/** Reject obvious browser cross-origin CSRF attempts while allowing server-to-server webhook callers. */
+export function isSuspiciousBrowserWebhookRequest(headers: Record<string, string | string[] | undefined>): boolean {
+  const secFetchSite = readHeaderValue(headers, 'sec-fetch-site')?.trim().toLowerCase();
+  if (secFetchSite === 'cross-site' || secFetchSite === 'same-site') {
+    return true;
+  }
+  const origin = readHeaderValue(headers, 'origin')?.trim();
+  if (origin) {
+    return true;
+  }
+  return false;
+}
+
+function isPrivateOrLocalHostname(hostname: string): boolean {
+  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (!host) return true;
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) {
+    return true;
+  }
+  if (host === '::1' || host === '::' || host.startsWith('fe80:') || host.startsWith('fc') || host.startsWith('fd')) {
+    return true;
+  }
+  const v4 = host.startsWith('::ffff:') ? host.slice('::ffff:'.length) : host;
+  const ipv4Match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(v4);
+  if (ipv4Match) {
+    const a = Number(ipv4Match[1]);
+    const b = Number(ipv4Match[2]);
+    if (a === 0 || a === 10 || a === 127) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    return false;
+  }
+  // Single-label internal hostnames (e.g. `redis`, `metadata`) without a dot
+  if (!host.includes('.')) return true;
+  return false;
+}
+
+/**
+ * Validate dynamic replyWebhook / sessionWebhook URLs to block SSRF and credential exfiltration.
+ * Allows either exact origin match against the operator-configured `channel.webhookUrl`, or
+ * official platform HTTPS domains on non-private hosts.
+ */
+export function isAllowedReplyWebhook(
+  platform: ImPlatform | string,
+  rawUrl: string | undefined,
+  channel?: Pick<ImChannelConfig, 'webhookUrl'>,
+): boolean {
+  if (!rawUrl || !rawUrl.trim()) return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl.trim());
+  } catch {
+    return false;
+  }
+  if (parsed.username || parsed.password) return false;
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+
+  const configuredRaw = channel?.webhookUrl?.trim();
+  if (configuredRaw) {
+    try {
+      const configured = new URL(configuredRaw);
+      if (parsed.origin === configured.origin) {
+        return true;
+      }
+    } catch {
+      // Ignore malformed configured URL; fall through to strict public HTTPS check.
+    }
+  }
+
+  if (parsed.protocol !== 'https:') return false;
+  const host = parsed.hostname.toLowerCase();
+  if (isPrivateOrLocalHostname(host)) return false;
+
+  switch (platform) {
+    case 'dingtalk':
+      return host === 'oapi.dingtalk.com' || host.endsWith('.dingtalk.com');
+    case 'wechat':
+      return host === 'qyapi.weixin.qq.com' || host === 'ilinkai.weixin.qq.com' || host.endsWith('.weixin.qq.com');
+    case 'telegram':
+      return host === 'api.telegram.org';
+    case 'xiaoai':
+      return false;
+    default:
+      return false;
+  }
+}
+
+/** Strip tokens, credentials, and raw endpoint URLs from error strings persisted in channel status/logs. */
+export function sanitizeImError(error: unknown, secrets?: Array<string | undefined>): string {
+  let msg = error instanceof Error ? error.message : String(error ?? 'Unknown error');
+  if (secrets) {
+    for (const secret of secrets) {
+      if (secret && secret.length >= 4 && msg.includes(secret)) {
+        msg = msg.split(secret).join('<redacted>');
+      }
+    }
+  }
+  msg = msg
+    .replace(/\bbot\d+:[A-Za-z0-9_-]{8,}/g, 'bot<redacted>')
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer <redacted>')
+    .replace(/(https?:\/\/)[^/\s:@]+:[^/\s@]+@/gi, '$1<redacted>@')
+    .replace(/([?&](?:token|secret|sign|signature|access_token|botToken|password|ssecurity|passToken|serviceToken|cUserId|cookie|auth)=)[^&\s"'<>]+/gi, '$1<redacted>')
+    .replace(/(https?:\/\/[^/?#\s"'<>]+)(?:\/[^\s"'<>]*)?/gi, (_, origin: string) => `${origin}/<redacted>`);
+  return msg;
+}

@@ -6,7 +6,7 @@
 # 3. 若配置 MAC_PING_HOST 且检测到宿主机休眠，发送 WOL 魔术包唤醒并由音箱播报等待提示
 # 4. 将语音指令 POST 到 F.R.I.D.A.Y. Webhook（携带 x-xiaoai-secret 请求头）
 
-set -eu
+set -euf
 
 FRIDAY_WEBHOOK_URL="${FRIDAY_WEBHOOK_URL:-}"
 FRIDAY_SECRET="${FRIDAY_SECRET:-}"
@@ -76,14 +76,32 @@ if [ -z "$SPEAKER_ID" ]; then
   fi
 fi
 
+if [ -n "$SPEAKER_HOST" ]; then
+  case "$SPEAKER_HOST" in
+    -*)
+      echo "[xiaoai-bridge] 错误: 非法的 SPEAKER_HOST（不可由 '-' 开头）" >&2
+      exit 2
+      ;;
+  esac
+fi
+
+if [ -n "$SPEAKER_PORT" ]; then
+  case "$SPEAKER_PORT" in
+    *[!0-9]*)
+      echo "[xiaoai-bridge] 错误: SPEAKER_PORT 必须为纯数字端口" >&2
+      exit 2
+      ;;
+  esac
+fi
+
 run_speaker_cmd() {
   cmd="$1"
   if [ -z "$SPEAKER_HOST" ]; then
     sh -c "$cmd"
   elif [ -n "$SPEAKER_PORT" ]; then
-    ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -p "$SPEAKER_PORT" "$SPEAKER_HOST" "$cmd"
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -p "$SPEAKER_PORT" -- "$SPEAKER_HOST" "$cmd"
   else
-    ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa "$SPEAKER_HOST" "$cmd"
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -- "$SPEAKER_HOST" "$cmd"
   fi
 }
 
@@ -93,10 +111,10 @@ pause_native_speaker() {
 
 speak_on_speaker() {
   tts_text="$1"
-  escaped_text=$(printf '%s' "$tts_text" | tr -d '\r\n' | sed 's/\\/\\\\/g; s/"/\\"/g')
+  escaped_text=$(printf '%s' "$tts_text" | tr -d '\000-\037\177' | sed 's/\\/\\\\/g; s/"/\\"/g')
   payload="{\"text\":\"${escaped_text}\",\"save\":0}"
   escaped_payload=$(printf '%s' "$payload" | sed "s/'/'\\\\''/g")
-  escaped_plain=$(printf '%s' "$tts_text" | sed "s/'/'\\\\''/g")
+  escaped_plain=$(printf '%s' "$tts_text" | tr -d '\000-\037\177' | sed "s/'/'\\\\''/g")
   run_speaker_cmd "ubus call mibrain text_to_speech '${escaped_payload}' >/dev/null 2>&1 || /usr/sbin/tts_play.sh '${escaped_plain}' >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
 }
 
@@ -286,18 +304,36 @@ matches_prefix() {
   return 1
 }
 
+escape_single_quotes() {
+  printf '%s' "$1" | sed "s/'/'\\\\''/g"
+}
+
+json_escape() {
+  printf '%s' "$1" | tr -d '\000-\037\177' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+line_checksum() {
+  printf '%s' "$1" | cksum | awk '{print $1 "-" $2}'
+}
+
 post_to_friday() {
   query_text="$1"
-  escaped_query=$(printf '%s' "$query_text" | tr -d '\r\n' | sed 's/\\/\\\\/g; s/"/\\"/g')
-  escaped_id=$(printf '%s' "$SPEAKER_ID" | tr -d '\r\n' | sed 's/\\/\\\\/g; s/"/\\"/g')
-  escaped_prefix=$(printf '%s' "$TRIGGER_PREFIX" | tr -d '\r\n' | sed 's/\\/\\\\/g; s/"/\\"/g')
-  json_body="{\"text\":\"${escaped_query}\",\"deviceId\":\"${escaped_id}\",\"prefix\":\"${escaped_prefix}\"}"
+  msg_id="${2:-}"
+  escaped_query=$(json_escape "$query_text")
+  escaped_id=$(json_escape "$SPEAKER_ID")
+  escaped_prefix=$(json_escape "$TRIGGER_PREFIX")
+  escaped_msg_id=$(json_escape "$msg_id")
+  if [ -n "$escaped_msg_id" ]; then
+    json_body="{\"text\":\"${escaped_query}\",\"deviceId\":\"${escaped_id}\",\"prefix\":\"${escaped_prefix}\",\"msgId\":\"${escaped_msg_id}\"}"
+  else
+    json_body="{\"text\":\"${escaped_query}\",\"deviceId\":\"${escaped_id}\",\"prefix\":\"${escaped_prefix}\"}"
+  fi
 
   if command -v curl >/dev/null 2>&1; then
     if [ -n "$FRIDAY_SECRET" ]; then
-      curl -sS -m 10 -X POST "$FRIDAY_WEBHOOK_URL" \
+      escaped_curl_secret=$(json_escape "$FRIDAY_SECRET")
+      printf 'header = "x-xiaoai-secret: %s"\n' "$escaped_curl_secret" | curl -sS -m 10 -K - -X POST "$FRIDAY_WEBHOOK_URL" \
         -H "Content-Type: application/json" \
-        -H "x-xiaoai-secret: ${FRIDAY_SECRET}" \
         -d "$json_body" >/dev/null
     else
       curl -sS -m 10 -X POST "$FRIDAY_WEBHOOK_URL" \
@@ -308,9 +344,10 @@ post_to_friday() {
   fi
 
   if command -v python3 >/dev/null 2>&1; then
-    python3 - "$FRIDAY_WEBHOOK_URL" "$FRIDAY_SECRET" "$json_body" <<'PY'
-import sys, urllib.request
-url, secret, body = sys.argv[1], sys.argv[2], sys.argv[3].encode('utf-8')
+    FRIDAY_WEBHOOK_SECRET="$FRIDAY_SECRET" python3 - "$FRIDAY_WEBHOOK_URL" "$json_body" <<'PY'
+import os, sys, urllib.request
+url, body = sys.argv[1], sys.argv[2].encode('utf-8')
+secret = os.environ.get('FRIDAY_WEBHOOK_SECRET', '')
 headers = {'Content-Type': 'application/json'}
 if secret:
     headers['x-xiaoai-secret'] = secret
@@ -335,70 +372,92 @@ PY
   return 1
 }
 
-read_log_tail() {
-  run_speaker_cmd "tail -n 20 '${LOG_FILE}' 2>/dev/null || true" 2>/dev/null || true
+read_log_meta_and_delta() {
+  offset="${1:-0}"
+  last_inode="${2:-}"
+  skip_read="${3:-0}"
+  case "$offset" in ''|*[!0-9]*) offset=0 ;; esac
+  case "$last_inode" in *[!0-9A-Za-z_-]*) last_inode="" ;; esac
+  q_log=$(escape_single_quotes "$LOG_FILE")
+  remote_cmd="F='${q_log}'; [ -f \"\$F\" ] && [ ! -L \"\$F\" ] || exit 0; ino=\$(stat -c '%i' \"\$F\" 2>/dev/null || ls -i \"\$F\" 2>/dev/null | awk '{print \$1}' || true); size=\$(wc -c < \"\$F\" 2>/dev/null | tr -d ' \t\r\n'); [ -n \"\$size\" ] || exit 0; printf '__META__ %s %s\\n' \"\${ino:-0}\" \"\$size\"; [ '${skip_read}' = '1' ] && exit 0; start_off=${offset}; if [ -n '${last_inode}' ] && [ -n \"\$ino\" ] && [ \"\$ino\" != '${last_inode}' ]; then start_off=0; elif [ \"\$size\" -lt \"\$start_off\" ]; then start_off=0; fi; if [ \"\$size\" -gt \"\$start_off\" ]; then tail -c +\$((start_off + 1)) \"\$F\" 2>/dev/null || dd if=\"\$F\" bs=1 skip=\"\$start_off\" 2>/dev/null || true; fi"
+  run_speaker_cmd "$remote_cmd" 2>/dev/null || true
 }
 
-echo "[xiaoai-bridge] 已启动监听 (${SPEAKER_ID}) -> ${FRIDAY_WEBHOOK_URL}"
-last_seen_line=""
-baseline_snapshot=$(read_log_tail)
-if [ -n "$baseline_snapshot" ]; then
-  last_seen_line=$(printf '%s\n' "$baseline_snapshot" | awk 'NF{line=$0} END{print line}')
-fi
+LOG_INODE=""
+LOG_OFFSET=0
 
-while true; do
-  snapshot=$(read_log_tail)
-  if [ -n "$snapshot" ]; then
-    new_lines=""
-    if [ -z "$last_seen_line" ]; then
-      new_lines="$snapshot"
-    else
-      found_cursor=0
-      tmp_lines=""
-      old_ifs="$IFS"
-      IFS='
+init_log_cursor() {
+  meta_out=$(read_log_meta_and_delta 0 "" 1)
+  if [ -n "$meta_out" ]; then
+    first_line=$(printf '%s\n' "$meta_out" | sed -n '1p')
+    case "$first_line" in
+      __META__\ *)
+        meta_rest="${first_line#__META__ }"
+        LOG_INODE="${meta_rest%% *}"
+        LOG_OFFSET="${meta_rest#* }"
+        case "$LOG_OFFSET" in ''|*[!0-9]*) LOG_OFFSET=0 ;; esac
+        ;;
+    esac
+  fi
+}
+
+poll_log_once() {
+  snapshot=$(read_log_meta_and_delta "$LOG_OFFSET" "$LOG_INODE" 0)
+  [ -n "$snapshot" ] || return 0
+  meta_line=$(printf '%s\n' "$snapshot" | sed -n '1p')
+  case "$meta_line" in
+    __META__\ *)
+      meta_rest="${meta_line#__META__ }"
+      cur_inode="${meta_rest%% *}"
+      cur_size="${meta_rest#* }"
+      case "$cur_size" in ''|*[!0-9]*) return 0 ;; esac
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  batch_offset="$LOG_OFFSET"
+  if [ -n "$LOG_INODE" ] && [ "$cur_inode" != "$LOG_INODE" ]; then
+    batch_offset=0
+  elif [ "$cur_size" -lt "$LOG_OFFSET" ]; then
+    batch_offset=0
+  fi
+
+  LOG_INODE="$cur_inode"
+  LOG_OFFSET="$cur_size"
+
+  new_lines=$(printf '%s\n' "$snapshot" | sed '1d')
+  [ -n "$new_lines" ] || return 0
+
+  line_idx=0
+  old_ifs="$IFS"
+  IFS='
 '
-      for cur_line in $snapshot; do
-        if [ "$found_cursor" -eq 1 ]; then
-          if [ -n "$tmp_lines" ]; then
-            tmp_lines="${tmp_lines}
-${cur_line}"
-          else
-            tmp_lines="$cur_line"
-          fi
-        elif [ "$cur_line" = "$last_seen_line" ]; then
-          found_cursor=1
+  for line in $new_lines; do
+    [ -n "$line" ] || continue
+    line_idx=$((line_idx + 1))
+    if query=$(extract_query_from_line "$line"); then
+      if matches_prefix "$query"; then
+        msg_hash=$(line_checksum "$line")
+        msg_id="${SPEAKER_ID}:${cur_inode}:${batch_offset}:${line_idx}:${msg_hash}"
+        echo "[xiaoai-bridge] 捕获语音指令: ${query}"
+        pause_native_speaker
+        ensure_mac_awake
+        if ! post_to_friday "$query" "$msg_id"; then
+          echo "[xiaoai-bridge] 投递 Friday Webhook 失败" >&2
         fi
-      done
-      IFS="$old_ifs"
-      if [ "$found_cursor" -eq 1 ]; then
-        new_lines="$tmp_lines"
-      else
-        # 日志已轮转或超出 tail 窗口，取最后一条并更新基线，避免重放旧记录
-        new_lines=$(printf '%s\n' "$snapshot" | awk 'NF{line=$0} END{print line}')
       fi
     fi
+  done
+  IFS="$old_ifs"
+}
 
-    if [ -n "$new_lines" ]; then
-      old_ifs="$IFS"
-      IFS='
-'
-      for line in $new_lines; do
-        [ -n "$line" ] || continue
-        last_seen_line="$line"
-        if query=$(extract_query_from_line "$line"); then
-          if matches_prefix "$query"; then
-            echo "[xiaoai-bridge] 捕获语音指令: ${query}"
-            pause_native_speaker
-            ensure_mac_awake
-            if ! post_to_friday "$query"; then
-              echo "[xiaoai-bridge] 投递 Friday Webhook 失败" >&2
-            fi
-          fi
-        fi
-      done
-      IFS="$old_ifs"
-    fi
-  fi
-  sleep "$POLL_INTERVAL"
-done
+if [ "${FRIDAY_BRIDGE_LIB_ONLY:-0}" != "1" ]; then
+  echo "[xiaoai-bridge] 已启动监听 (${SPEAKER_ID}) -> ${FRIDAY_WEBHOOK_URL}"
+  init_log_cursor
+  while true; do
+    poll_log_once
+    sleep "$POLL_INTERVAL"
+  done
+fi

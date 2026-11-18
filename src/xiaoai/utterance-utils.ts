@@ -386,6 +386,9 @@ export function splitSpeechSegments(text: string, maxSegmentChars = 160): string
   return segments;
 }
 
+const IMPLICIT_FRIDAY_WAKE_RE =
+  /^(?:(?:你好|您好|嗨|嘿|喂|呼叫)[\s，,。！!？?、：:]*)?(?:星期五|friday)(?![a-zA-Z]|的|了|吗|呢|要|去|晚上|上午|下午|早上|中午)/i;
+
 export function shouldInterceptXiaoaiQuery(
   rawText: string,
   options?: { prefix?: string; passthroughNative?: boolean },
@@ -418,6 +421,16 @@ export function shouldInterceptXiaoaiQuery(
         return { intercept: true, query: rest };
       }
       return { intercept: false, query: '' };
+    }
+  } else {
+    const wakeMatch = IMPLICIT_FRIDAY_WAKE_RE.exec(cleaned);
+    if (wakeMatch) {
+      const rest = cleaned
+        .slice(wakeMatch[0].length)
+        .replace(LEADING_PUNCT_RE, '')
+        .trim();
+      if (!rest) return { intercept: false, query: '' };
+      return { intercept: true, query: rest };
     }
   }
 
