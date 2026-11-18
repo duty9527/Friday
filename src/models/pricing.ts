@@ -1,5 +1,12 @@
 import { normalizeProviderId, splitModelAndLevel } from './catalog.js';
+import {
+  FALLBACK_BARE_MODEL_PRICES,
+  FALLBACK_PRICES_VERSION,
+  FALLBACK_PROVIDER_MODEL_PRICES,
+  type CompactPriceTuple,
+} from './fallback-prices.js';
 
+export { FALLBACK_PRICES_VERSION };
 export const DEFAULT_USD_TO_CNY_RATE = 7.25;
 
 export type UsageCostSource = 'provider' | 'catalog' | 'estimated' | 'free' | 'unknown';
@@ -28,6 +35,7 @@ export interface NormalizedSdkUsage {
   totalTokens: number;
   providerReportedTotalUsd?: number;
   totalFromProvider?: boolean;
+  sdkCatalogTotalUsd?: number;
 }
 
 export interface UsageCostCalculationInput {
@@ -40,6 +48,7 @@ export interface UsageCostCalculationInput {
   reasoningTokens?: number;
   providerReportedTotalUsd?: number;
   totalFromProvider?: boolean;
+  sdkCatalogTotalUsd?: number;
   catalogRate?: CatalogCostRateInput;
 }
 
@@ -57,9 +66,19 @@ interface PricingRule {
   free?: boolean;
 }
 
-// Ordered from most specific to least specific within each model family.
+// Ordered from most specific to least specific within each model family (wildcard net for dated variants).
 const FALLBACK_UNIT_PRICES: readonly PricingRule[] = [
   // OpenAI
+  { pattern: /^gpt-6\.2-astra(?=$|[-_.])/i, inputUsdPer1M: 8, outputUsdPer1M: 40 },
+  { pattern: /^gpt-6\.2(?=$|[-_.])/i, inputUsdPer1M: 2, outputUsdPer1M: 10 },
+  { pattern: /^gpt-6\.1-terra(?=$|[-_.])/i, inputUsdPer1M: 1, outputUsdPer1M: 5 },
+  { pattern: /^gpt-6\.1(?=$|[-_.])/i, inputUsdPer1M: 2, outputUsdPer1M: 10 },
+  { pattern: /^gpt-6-luna(?=$|[-_.])/i, inputUsdPer1M: 0.1, outputUsdPer1M: 0.5 },
+  { pattern: /^gpt-6-astra(?=$|[-_.])/i, inputUsdPer1M: 10, outputUsdPer1M: 50 },
+  { pattern: /^gpt-6(?=$|[-_.])/i, inputUsdPer1M: 2, outputUsdPer1M: 10 },
+  { pattern: /^gpt-5\.6-luna(?=$|[-_.])/i, inputUsdPer1M: 0.2, outputUsdPer1M: 1.2 },
+  { pattern: /^gpt-5\.6-terra(?=$|[-_.])/i, inputUsdPer1M: 2, outputUsdPer1M: 12 },
+  { pattern: /^gpt-5\.6(?=$|[-_.])/i, inputUsdPer1M: 4, outputUsdPer1M: 20 },
   { pattern: /^gpt-5(?=$|[-_.])/i, inputUsdPer1M: 1.25, outputUsdPer1M: 10 },
   { pattern: /^gpt-4\.1-mini(?=$|[-_.])/i, inputUsdPer1M: 0.4, outputUsdPer1M: 1.6 },
   { pattern: /^gpt-4\.1-nano(?=$|[-_.])/i, inputUsdPer1M: 0.1, outputUsdPer1M: 0.4 },
@@ -78,6 +97,15 @@ const FALLBACK_UNIT_PRICES: readonly PricingRule[] = [
   { pattern: /^claude-(?:3[-.]5-haiku|haiku-3[-.]5)(?=$|[-_.])/i, inputUsdPer1M: 0.8, outputUsdPer1M: 4 },
 
   // Google
+  { pattern: /^gemini-4-hydrogen(?=$|[-_.])/i, inputUsdPer1M: 1.5, outputUsdPer1M: 7.5 },
+  { pattern: /^gemini-4(?=$|[-_.])/i, inputUsdPer1M: 2, outputUsdPer1M: 10 },
+  { pattern: /^gemini-omni(?=$|[-_.])/i, inputUsdPer1M: 1.5, outputUsdPer1M: 9 },
+  { pattern: /^gemini-3\.[678]-flash(?=$|[-_.])/i, inputUsdPer1M: 0.75, outputUsdPer1M: 3.75 },
+  { pattern: /^gemini-3\.5-flash-lite(?=$|[-_.])/i, inputUsdPer1M: 0.3, outputUsdPer1M: 2.5 },
+  { pattern: /^gemini-3\.5-flash(?=$|[-_.])/i, inputUsdPer1M: 1.5, outputUsdPer1M: 9 },
+  { pattern: /^gemini-3\.1-pro(?=$|[-_.])/i, inputUsdPer1M: 2, outputUsdPer1M: 12 },
+  { pattern: /^gemini-3\.1-flash-lite(?=$|[-_.])/i, inputUsdPer1M: 0.25, outputUsdPer1M: 1.5 },
+  { pattern: /^gemini-3-flash(?=$|[-_.])/i, inputUsdPer1M: 0.5, outputUsdPer1M: 3 },
   { pattern: /^gemini-2\.5-pro(?=$|[-_.])/i, inputUsdPer1M: 1.25, outputUsdPer1M: 10 },
   { pattern: /^gemini-2\.5-flash-lite(?=$|[-_.])/i, inputUsdPer1M: 0.1, outputUsdPer1M: 0.4 },
   { pattern: /^gemini-2\.5-flash(?=$|[-_.])/i, inputUsdPer1M: 0.3, outputUsdPer1M: 2.5 },
@@ -85,6 +113,9 @@ const FALLBACK_UNIT_PRICES: readonly PricingRule[] = [
   { pattern: /^gemini-decision-1(?=$|[-_.])/i, inputUsdPer1M: 0.1, outputUsdPer1M: 0.4 },
 
   // DeepSeek
+  { pattern: /^deepseek-v4\.1-flash(?=$|[-_.])/i, inputUsdPer1M: 0.15, outputUsdPer1M: 0.6 },
+  { pattern: /^deepseek-v4-pro(?=$|[-_.])/i, inputUsdPer1M: 0.66, outputUsdPer1M: 1.98 },
+  { pattern: /^deepseek-v4(?=$|[-_.])/i, inputUsdPer1M: 0.15, outputUsdPer1M: 0.6 },
   { pattern: /^deepseek-(?:reasoner|r1)(?=$|[-_.])/i, inputUsdPer1M: 0.55, outputUsdPer1M: 2.19 },
   { pattern: /^deepseek-(?:chat|v3)(?=$|[-_.])/i, inputUsdPer1M: 0.27, outputUsdPer1M: 1.1 },
 
@@ -143,6 +174,20 @@ export function roundUsd(amount: number): number {
   return Number(amount.toFixed(10));
 }
 
+function tupleToUnitPrice(tuple: CompactPriceTuple): ModelUnitPrice {
+  const [inp, out, cr, cw] = tuple;
+  if (inp === 0 && out === 0 && cr === 0 && cw === 0) {
+    return { ...ZERO_FREE_PRICE };
+  }
+  return {
+    inputUsdPer1M: inp,
+    outputUsdPer1M: out,
+    cacheReadUsdPer1M: cr >= 0 ? cr : Number((inp * 0.25).toFixed(6)),
+    cacheWriteUsdPer1M: cw >= 0 ? cw : inp,
+    source: 'estimated',
+  };
+}
+
 /** Strips `@thinkingLevel` and any `provider/` prefix, returning a lowercase bare model ID. */
 export function normalizeModelIdForPricing(model: string): string {
   const withoutLevel = splitModelAndLevel(model.trim()).model;
@@ -190,8 +235,38 @@ export function resolveModelUnitPrice(
     };
   }
 
+  const cleanedFull = splitModelAndLevel(model.trim()).model.trim().toLowerCase();
   const normalizedModel = normalizeModelIdForPricing(model);
+
+  if (normProvider && cleanedFull) {
+    const exactProvTuple = FALLBACK_PROVIDER_MODEL_PRICES[`${normProvider}/${cleanedFull}`]
+      ?? (normalizedModel ? FALLBACK_PROVIDER_MODEL_PRICES[`${normProvider}/${normalizedModel}`] : undefined);
+    if (exactProvTuple) {
+      return tupleToUnitPrice(exactProvTuple);
+    }
+  }
+
   if (normalizedModel) {
+    const exactBareTuple = (cleanedFull ? FALLBACK_BARE_MODEL_PRICES[cleanedFull] : undefined)
+      ?? FALLBACK_BARE_MODEL_PRICES[normalizedModel];
+    if (exactBareTuple) {
+      return tupleToUnitPrice(exactBareTuple);
+    }
+
+    if (/(?::free|-free)$/i.test(normalizedModel)) {
+      return { ...ZERO_FREE_PRICE };
+    }
+
+    // Try stripping common trailing date suffixes (e.g. -20260401 / -0731) on synced bare table
+    const undate = normalizedModel.replace(/-(?:20\d{6}|\d{4})$/, '');
+    if (undate !== normalizedModel) {
+      const undateTuple = (normProvider ? FALLBACK_PROVIDER_MODEL_PRICES[`${normProvider}/${undate}`] : undefined)
+        ?? FALLBACK_BARE_MODEL_PRICES[undate];
+      if (undateTuple) {
+        return tupleToUnitPrice(undateTuple);
+      }
+    }
+
     for (const rule of FALLBACK_UNIT_PRICES) {
       if (rule.pattern.test(normalizedModel)) {
         if (rule.free) {
@@ -238,6 +313,20 @@ export function calculateModelCallCost(input: UsageCostCalculationInput): UsageC
   const outputTokens = sanitizeTokenInt(input.outputTokens);
   const cacheReadTokens = sanitizeTokenInt(input.cacheReadTokens);
   const cacheWriteTokens = sanitizeTokenInt(input.cacheWriteTokens);
+
+  if (
+    unitPrice.source === 'unknown'
+    && typeof input.sdkCatalogTotalUsd === 'number'
+    && Number.isFinite(input.sdkCatalogTotalUsd)
+    && input.sdkCatalogTotalUsd > 0
+  ) {
+    return {
+      costUsd: roundUsd(input.sdkCatalogTotalUsd),
+      unitInputUsdPer1M: 0,
+      unitOutputUsdPer1M: 0,
+      costSource: 'catalog',
+    };
+  }
 
   const rawUsd = (
     inputTokens * unitPrice.inputUsdPer1M
@@ -301,13 +390,10 @@ export function normalizeSdkUsage(rawUsage: unknown): NormalizedSdkUsage | undef
     ? (u.cost as Record<string, unknown>)
     : undefined;
   const totalFromProvider = costObj?.totalFromProvider === true;
-  const rawProviderTotal = costObj?.total !== undefined ? Number(costObj.total) : undefined;
-  const providerReportedTotalUsd = totalFromProvider
-    && typeof rawProviderTotal === 'number'
-    && Number.isFinite(rawProviderTotal)
-    && rawProviderTotal > 0
-    ? rawProviderTotal
-    : undefined;
+  const rawTotalCost = costObj?.total !== undefined ? Number(costObj.total) : undefined;
+  const hasPositiveCostTotal = typeof rawTotalCost === 'number' && Number.isFinite(rawTotalCost) && rawTotalCost > 0;
+  const providerReportedTotalUsd = totalFromProvider && hasPositiveCostTotal ? rawTotalCost : undefined;
+  const sdkCatalogTotalUsd = !totalFromProvider && hasPositiveCostTotal ? rawTotalCost : undefined;
 
   return {
     inputTokens,
@@ -317,5 +403,6 @@ export function normalizeSdkUsage(rawUsage: unknown): NormalizedSdkUsage | undef
     reasoningTokens,
     totalTokens,
     ...(providerReportedTotalUsd !== undefined ? { providerReportedTotalUsd, totalFromProvider: true } : {}),
+    ...(sdkCatalogTotalUsd !== undefined ? { sdkCatalogTotalUsd } : {}),
   };
 }

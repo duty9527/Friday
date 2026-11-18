@@ -62,6 +62,7 @@ import {
   type WorkerModelResolutionInput,
 } from './models/catalog.js';
 import { fetchRemoteModelsFromEndpoint } from './models/discovery.js';
+import { resolveModelUnitPrice } from './models/pricing.js';
 import {
   accumulateDecisionEraStats,
   formatModelNotInPoolError,
@@ -167,12 +168,21 @@ export class ModelHub {
       Boolean(m?.cost && ((m.cost.input ?? 0) > 0 || (m.cost.output ?? 0) > 0));
 
     if (hasPositive(cached)) {
-      const sdkRef = hasSdkPositive(runtimeModel) ? runtimeModel : hasSdkPositive(pristine) ? pristine : undefined;
+      const cacheReadSource = (runtimeModel?.cost?.cacheRead ?? 0) > 0
+        ? runtimeModel
+        : (pristine?.cost?.cacheRead ?? 0) > 0
+          ? pristine
+          : undefined;
+      const cacheWriteSource = (runtimeModel?.cost?.cacheWrite ?? 0) > 0
+        ? runtimeModel
+        : (pristine?.cost?.cacheWrite ?? 0) > 0
+          ? pristine
+          : undefined;
       return {
         costInput: cached!.costInput,
         costOutput: cached!.costOutput,
-        ...(sdkRef?.cost?.cacheRead !== undefined ? { costCacheRead: sdkRef.cost.cacheRead } : {}),
-        ...(sdkRef?.cost?.cacheWrite !== undefined ? { costCacheWrite: sdkRef.cost.cacheWrite } : {}),
+        ...(cacheReadSource?.cost?.cacheRead !== undefined ? { costCacheRead: cacheReadSource.cost.cacheRead } : {}),
+        ...(cacheWriteSource?.cost?.cacheWrite !== undefined ? { costCacheWrite: cacheWriteSource.cost.cacheWrite } : {}),
       };
     }
     if (hasSdkPositive(runtimeModel)) {
@@ -435,11 +445,21 @@ export class ModelHub {
                 ?? (effectiveReasoning && (resolvedApi === 'openai-responses' || resolvedApi === 'openai-codex-responses')
                   ? { off: null, minimal: null }
                   : undefined);
+              const fallbackUnit = !cfg.baseUrl ? resolveModelUnitPrice(providerId, entry.id) : undefined;
+              const fallbackKnown = Boolean(fallbackUnit && fallbackUnit.source !== 'unknown');
+              const sdkCacheRead = bm?.cost?.cacheRead && bm.cost.cacheRead > 0
+                ? bm.cost.cacheRead
+                : fallbackKnown ? fallbackUnit!.cacheReadUsdPer1M : 0;
+              const sdkCacheWrite = bm?.cost?.cacheWrite && bm.cost.cacheWrite > 0
+                ? bm.cost.cacheWrite
+                : fallbackKnown ? fallbackUnit!.cacheWriteUsdPer1M : 0;
               const cost = (entry.costInput > 0 || entry.costOutput > 0)
-                ? { input: entry.costInput, output: entry.costOutput, cacheRead: 0, cacheWrite: 0 }
-                : (!cfg.baseUrl && bm?.cost)
+                ? { input: entry.costInput, output: entry.costOutput, cacheRead: sdkCacheRead, cacheWrite: sdkCacheWrite }
+                : (!cfg.baseUrl && bm?.cost && (bm.cost.input > 0 || bm.cost.output > 0))
                   ? bm.cost
-                  : { input: entry.costInput, output: entry.costOutput, cacheRead: 0, cacheWrite: 0 };
+                  : fallbackKnown
+                    ? { input: fallbackUnit!.inputUsdPer1M, output: fallbackUnit!.outputUsdPer1M, cacheRead: sdkCacheRead, cacheWrite: sdkCacheWrite }
+                    : { input: entry.costInput, output: entry.costOutput, cacheRead: 0, cacheWrite: 0 };
               const maxTokens = (!cfg.baseUrl && bm?.maxTokens && (!entry.maxTokens || (entry.maxTokens === 16_384 && bm.maxTokens > 16_384)))
                 ? bm.maxTokens
                 : (entry.maxTokens || bm?.maxTokens || 16_384);
@@ -600,27 +620,51 @@ export class ModelHub {
       ? persisted!.fetchedModels!.map((m): ModelCatalogEntry => {
           if (persisted?.baseUrl) return m;
           const ref = this.findReferenceModel(runtime, providerId, m.id);
-          if (!ref) return m;
+          const refIn = ref?.cost?.input ?? 0;
+          const refOut = ref?.cost?.output ?? 0;
+          let costInput = (m.costInput ?? 0) > 0 ? m.costInput : refIn;
+          let costOutput = (m.costOutput ?? 0) > 0 ? m.costOutput : refOut;
+          if (costInput <= 0 && costOutput <= 0) {
+            const fallback = resolveModelUnitPrice(providerId, m.id);
+            if (fallback.source !== 'unknown') {
+              costInput = fallback.inputUsdPer1M;
+              costOutput = fallback.outputUsdPer1M;
+            }
+          }
+          if (!ref) {
+            return { ...m, costInput, costOutput };
+          }
           return {
             ...m,
-            costInput: (m.costInput ?? 0) > 0 ? m.costInput : (ref.cost?.input ?? 0),
-            costOutput: (m.costOutput ?? 0) > 0 ? m.costOutput : (ref.cost?.output ?? 0),
+            costInput,
+            costOutput,
             maxTokens: (m.maxTokens && !(m.maxTokens === 16_384 && (ref.maxTokens ?? 0) > 16_384))
               ? m.maxTokens
               : (ref.maxTokens ?? m.maxTokens),
           };
         })
       : rawModels.length
-        ? rawModels.map((m): ModelCatalogEntry => ({
-            id: m.id,
-            name: m.name || m.id,
-            supportsImages: m.input.includes('image'),
-            reasoning: Boolean(m.reasoning),
-            contextWindow: m.contextWindow ?? 128_000,
-            maxTokens: m.maxTokens ?? 16_384,
-            costInput: m.cost?.input ?? 0,
-            costOutput: m.cost?.output ?? 0,
-          }))
+        ? rawModels.map((m): ModelCatalogEntry => {
+            let costInput = m.cost?.input ?? 0;
+            let costOutput = m.cost?.output ?? 0;
+            if (!persisted?.baseUrl && costInput <= 0 && costOutput <= 0) {
+              const fallback = resolveModelUnitPrice(providerId, m.id);
+              if (fallback.source !== 'unknown') {
+                costInput = fallback.inputUsdPer1M;
+                costOutput = fallback.outputUsdPer1M;
+              }
+            }
+            return {
+              id: m.id,
+              name: m.name || m.id,
+              supportsImages: m.input.includes('image'),
+              reasoning: Boolean(m.reasoning),
+              contextWindow: m.contextWindow ?? 128_000,
+              maxTokens: m.maxTokens ?? 16_384,
+              costInput,
+              costOutput,
+            };
+          })
         : (FALLBACK_PROVIDER_MODELS[providerId] ?? []);
     return entries.map(m => ({
       ...m,

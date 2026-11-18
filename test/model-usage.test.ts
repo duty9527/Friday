@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { DatabaseSync } from 'node:sqlite';
 import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -107,7 +108,8 @@ test('pricing: unit price lookup across providers, catalog override, free models
     ['dashscope', 'qwen-coder-plus-latest', 0.5, 1.5],
     ['dashscope', 'qwen-vl-max-latest', 0.8, 2.4],
     ['dashscope', 'qwen-turbo-latest', 0.05, 0.2],
-    ['dashscope', 'qwen3-32b', 0.4, 1.2],
+    ['dashscope', 'qwen3-32b', 0.7, 2.8],
+    ['custom', 'qwen3-custom-variant', 0.4, 1.2],
     ['moonshot', 'kimi-k2-0711-preview', 1, 3],
     ['moonshot', 'moonshot-v1-128k-vision-preview', 1, 3],
     ['moonshot', 'moonshot-v1-32k', 0.2, 0.6],
@@ -637,8 +639,8 @@ test('decision & realFactory SSE integration: automatic model_usage ledger captu
       assert.equal(directReport.totals.reasoningTokens, 20);
       assert.equal(directReport.totals.totalTokens, 210);
       assert.equal(directReport.byActor.worker?.calls, 1);
-      // 120 * 2.5 + 60 * 10 + 30 * (2.5 * 0.25) = 300 + 600 + 18.75 = 918.75 / 1M
-      approxEqual(directReport.totals.costUsd, 918.75 / 1_000_000, 1e-10);
+      // 120 * 2.5 + 60 * 10 + 30 * 1.25 (real OpenAI gpt-4o cacheRead rate) = 300 + 600 + 37.5 = 937.5 / 1M
+      approxEqual(directReport.totals.costUsd, 937.5 / 1_000_000, 1e-10);
     } finally {
       directStore.close();
     }
@@ -712,6 +714,115 @@ test('decision & realFactory SSE integration: automatic model_usage ledger captu
       new Promise<void>(resolve => sseServer.close(() => resolve())),
       new Promise<void>(resolve => decisionServer.close(() => resolve())),
     ]);
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('pricing & usage-store: synced fallback snapshot covers latest models and reprices unknown ledger rows on recover()', async () => {
+  const expected: Array<[string, string, number, number, number?]> = [
+    ['opencode-go', 'deepseek-v4.1-flash', 0.15, 0.6, 0.003],
+    ['google', 'gemini-3.8-flash', 0.75, 3.75, 0.075],
+    ['openai', 'gpt-6-luna', 0.1, 0.5, 0.01],
+    ['opencode-go', 'gpt-6.1-terra', 1, 5, 0.05],
+    ['openai', 'gpt-6.2-sol', 2, 10, 0.1],
+    ['openai', 'gpt-6.2-astra', 8, 40, 0.4],
+    ['google', 'gemini-4-argon', 2, 10, 0.1],
+    ['google', 'gemini-4-carbon', 2, 10, 0.1],
+    ['google', 'gemini-4-hydrogen', 1.5, 7.5, 0.075],
+    ['google', 'gemini-omni-1.2-flash', 1.5, 9, 0.15],
+  ];
+  for (const [provider, model, expIn, expOut, expCacheRead] of expected) {
+    const unit = resolveModelUnitPrice(provider, model);
+    assert.equal(unit.source, 'estimated', `source for ${provider}/${model}`);
+    assert.equal(unit.inputUsdPer1M, expIn, `input rate for ${provider}/${model}`);
+    assert.equal(unit.outputUsdPer1M, expOut, `output rate for ${provider}/${model}`);
+    if (expCacheRead !== undefined) {
+      assert.equal(unit.cacheReadUsdPer1M, expCacheRead, `cacheRead rate for ${provider}/${model}`);
+    }
+  }
+
+  // Free variants (:free / -free)
+  assert.equal(resolveModelUnitPrice('opencode', 'deepseek-v4.1-flash-free').source, 'free');
+  assert.equal(resolveModelUnitPrice('openrouter', 'qwen/qwen3-coder:free').source, 'free');
+
+  // Reprice existing cost_source='unknown' rows on Store.recover()
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-usage-reprice-'));
+  try {
+    const store1 = new Store(home);
+    store1.recover();
+    store1.close();
+
+    const rawDb = new DatabaseSync(join(home, 'state.sqlite'));
+    const now = Date.now();
+    rawDb.prepare(`
+      INSERT INTO model_usage(
+        id, at, actor, provider, model,
+        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens,
+        cost_usd, unit_input_usd, unit_output_usd, cost_source, status
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    `).run(
+      'legacy-unknown-1',
+      now,
+      'worker',
+      'google',
+      'gemini-3.8-flash',
+      1_000_000,
+      200_000,
+      10_000_000,
+      0,
+      50_000,
+      11_200_000,
+      0,
+      0,
+      0,
+      'unknown',
+      'completed',
+    );
+    rawDb.prepare(`
+      INSERT INTO model_usage(
+        id, at, actor, provider, model,
+        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens,
+        cost_usd, unit_input_usd, unit_output_usd, cost_source, status
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    `).run(
+      'legacy-unknown-2',
+      now,
+      'router',
+      'opencode-go',
+      'deepseek-v4.1-flash',
+      1_000_000,
+      100_000,
+      1_000_000,
+      0,
+      0,
+      2_100_000,
+      0,
+      0,
+      0,
+      'unknown',
+      'completed',
+    );
+    rawDb.prepare("DELETE FROM metadata WHERE key='usage_reprice_version'").run();
+    rawDb.close();
+
+    const store2 = new Store(home);
+    store2.recover();
+    try {
+      const report = store2.queryUsage({ granularity: 'day' });
+      // gemini-3.8-flash: 1M*0.75 + 0.2M*3.75 + 10M*0.075 = 0.75 + 0.75 + 0.75 = 2.25
+      const gRow = report.byModel.find(m => m.spec === 'google/gemini-3.8-flash');
+      assert.ok(gRow);
+      assert.equal(gRow.costSource, 'estimated');
+      approxEqual(gRow.costUsd, 2.25, 1e-6);
+      // deepseek-v4.1-flash: 1M*0.15 + 0.1M*0.6 + 1M*0.003 = 0.15 + 0.06 + 0.003 = 0.213
+      const dRow = report.byModel.find(m => m.spec === 'opencode-go/deepseek-v4.1-flash');
+      assert.ok(dRow);
+      assert.equal(dRow.costSource, 'estimated');
+      approxEqual(dRow.costUsd, 0.213, 1e-6);
+    } finally {
+      store2.close();
+    }
+  } finally {
     await rm(home, { recursive: true, force: true });
   }
 });

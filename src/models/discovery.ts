@@ -2,6 +2,24 @@ import { randomUUID } from 'node:crypto';
 import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import type { ModelCatalogEntry } from '../view.js';
 import { DEFAULT_PROVIDER_ENDPOINTS, getPristineSdkModel, isOpenCodeProvider } from './catalog.js';
+import { resolveModelUnitPrice } from './pricing.js';
+
+function resolveDiscoveryCost(
+  providerId: string,
+  modelId: string,
+  baseModel?: { cost?: { input?: number; output?: number } },
+): { costInput: number; costOutput: number } {
+  const sdkIn = baseModel?.cost?.input ?? 0;
+  const sdkOut = baseModel?.cost?.output ?? 0;
+  if (sdkIn > 0 || sdkOut > 0) {
+    return { costInput: sdkIn, costOutput: sdkOut };
+  }
+  const fallback = resolveModelUnitPrice(providerId, modelId);
+  if (fallback.source !== 'unknown') {
+    return { costInput: fallback.inputUsdPer1M, costOutput: fallback.outputUsdPer1M };
+  }
+  return { costInput: 0, costOutput: 0 };
+}
 
 /** Fetches available chat models from a provider's remote /models HTTP endpoint. */
 export async function fetchRemoteModelsFromEndpoint(
@@ -47,6 +65,7 @@ export async function fetchRemoteModelsFromEndpoint(
       const id = item.name.replace(/^models\//, '');
       if (/(?:tts|image-generation|embedding|aqa|imagen|veo|robotics|computer-use|audio)/i.test(id)) continue;
       const baseModel = baseById.get(id) ?? getPristineSdkModel(providerId, id);
+      const { costInput, costOutput } = resolveDiscoveryCost(providerId, id, baseModel);
       entries.push({
         id,
         name: item.displayName || baseModel?.name || id,
@@ -58,8 +77,8 @@ export async function fetchRemoteModelsFromEndpoint(
         maxTokens: typeof item.outputTokenLimit === 'number' && item.outputTokenLimit > 0
           ? item.outputTokenLimit
           : (baseModel?.maxTokens ?? 65_536),
-        costInput: baseModel?.cost?.input ?? 0,
-        costOutput: baseModel?.cost?.output ?? 0,
+        costInput,
+        costOutput,
       });
     }
     if (!entries.length) {
@@ -92,6 +111,7 @@ export async function fetchRemoteModelsFromEndpoint(
     for (const item of rawList) {
       if (!item.id) continue;
       const baseModel = baseById.get(item.id) ?? getPristineSdkModel(providerId, item.id);
+      const { costInput, costOutput } = resolveDiscoveryCost(providerId, item.id, baseModel);
       entries.push({
         id: item.id,
         name: item.display_name || baseModel?.name || item.id,
@@ -99,8 +119,8 @@ export async function fetchRemoteModelsFromEndpoint(
         reasoning: Boolean(baseModel?.reasoning ?? true),
         contextWindow: baseModel?.contextWindow ?? 200_000,
         maxTokens: baseModel?.maxTokens ?? 16_384,
-        costInput: baseModel?.cost?.input ?? 0,
-        costOutput: baseModel?.cost?.output ?? 0,
+        costInput,
+        costOutput,
       });
     }
     if (!entries.length) {
@@ -173,6 +193,7 @@ export async function fetchRemoteModelsFromEndpoint(
       : typeof item.max_context_window === 'number' && item.max_context_window > 0
         ? item.max_context_window
         : (baseModel?.contextWindow ?? 128_000);
+    const { costInput, costOutput } = resolveDiscoveryCost(providerId, id, baseModel);
     entries.push({
       id,
       name: item.name || item.display_name || item.title || baseModel?.name || id,
@@ -182,8 +203,8 @@ export async function fetchRemoteModelsFromEndpoint(
       maxTokens: typeof item.max_output_tokens === 'number' && item.max_output_tokens > 0
         ? item.max_output_tokens
         : (baseModel?.maxTokens ?? 16_384),
-      costInput: baseModel?.cost?.input ?? 0,
-      costOutput: baseModel?.cost?.output ?? 0,
+      costInput,
+      costOutput,
     });
   }
   if (!entries.length) {

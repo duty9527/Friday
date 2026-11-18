@@ -4,6 +4,7 @@ import { splitModelAndLevel } from '../models/catalog.js';
 import {
   calculateModelCallCost,
   DEFAULT_USD_TO_CNY_RATE,
+  FALLBACK_PRICES_VERSION,
   normalizeSdkUsage,
   roundUsd,
   type CatalogCostRateInput,
@@ -175,6 +176,7 @@ interface MutableTotals {
 
 const PREFS_META_KEY = 'usage_prefs_v1';
 const BACKFILL_META_KEY = 'usage_backfill_v1';
+const REPRICE_META_KEY = 'usage_reprice_version';
 const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
 const WEEKDAY_ZH = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'] as const;
@@ -461,6 +463,7 @@ export class UsageStore {
 
     const providerReportedTotalUsd = input.providerReportedTotalUsd ?? parsedFromUsage?.providerReportedTotalUsd;
     const totalFromProvider = input.totalFromProvider ?? parsedFromUsage?.totalFromProvider;
+    const sdkCatalogTotalUsd = parsedFromUsage?.sdkCatalogTotalUsd;
 
     const { provider, model } = splitProviderAndModel(input.provider, input.model);
     const cost = calculateModelCallCost({
@@ -473,6 +476,7 @@ export class UsageStore {
       reasoningTokens,
       providerReportedTotalUsd,
       totalFromProvider,
+      sdkCatalogTotalUsd,
       catalogRate: input.catalogRate,
     });
 
@@ -521,6 +525,7 @@ export class UsageStore {
 
     const meta = this.readMeta<UsageBackfillMeta>(BACKFILL_META_KEY);
     if (meta && (!cleanDefaultProvider || Boolean(meta.defaultProvider))) {
+      this.repriceUnknownUsageIfNeeded();
       return 0;
     }
 
@@ -683,6 +688,7 @@ export class UsageStore {
               reasoningTokens: Number(existing.reasoning_tokens ?? 0),
               providerReportedTotalUsd: usage.providerReportedTotalUsd,
               totalFromProvider: usage.totalFromProvider,
+              sdkCatalogTotalUsd: usage.sdkCatalogTotalUsd,
             });
             const res = updateUnknownStmt.run(
               nextProvider,
@@ -708,6 +714,7 @@ export class UsageStore {
           reasoningTokens: usage.reasoningTokens,
           providerReportedTotalUsd: usage.providerReportedTotalUsd,
           totalFromProvider: usage.totalFromProvider,
+          sdkCatalogTotalUsd: usage.sdkCatalogTotalUsd,
         });
         const at = typeof event.at === 'number' && Number.isFinite(event.at) ? Math.round(event.at) : Date.now();
         const res = insertStmt.run(
@@ -742,7 +749,98 @@ export class UsageStore {
         updatedAt: Date.now(),
       };
       this.writeMeta(BACKFILL_META_KEY, nextMeta);
+      this.repriceUnknownUsageIfNeeded();
       return changed;
+    });
+  }
+
+  /**
+   * Reprices historical `model_usage` rows whose `cost_source = 'unknown'` whenever
+   * the built-in fallback pricing snapshot updates (`FALLBACK_PRICES_VERSION`).
+   */
+  repriceUnknownUsageIfNeeded(force = false): number {
+    if (!force && this.readMeta<string>(REPRICE_META_KEY) === FALLBACK_PRICES_VERSION) {
+      return 0;
+    }
+    return this.atomic(() => {
+      if (!force && this.readMeta<string>(REPRICE_META_KEY) === FALLBACK_PRICES_VERSION) {
+        return 0;
+      }
+      const rows = this.db.prepare(`
+        SELECT id, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens
+        FROM model_usage
+        WHERE cost_source = 'unknown'
+      `).all() as Array<{
+        id: string;
+        provider: string;
+        model: string;
+        input_tokens: number;
+        output_tokens: number;
+        cache_read_tokens: number;
+        cache_write_tokens: number;
+        reasoning_tokens: number;
+      }>;
+
+      const updateStmt = this.db.prepare(`
+        UPDATE model_usage
+        SET cost_usd=?, unit_input_usd=?, unit_output_usd=?, cost_source=?
+        WHERE id=?
+      `);
+      const journalStmt = this.db.prepare('SELECT body FROM journal WHERE seq=?');
+
+      let updated = 0;
+      for (const row of rows) {
+        let sdkCatalogTotalUsd: number | undefined;
+        let cost = calculateModelCallCost({
+          provider: row.provider,
+          model: row.model,
+          inputTokens: Number(row.input_tokens ?? 0),
+          outputTokens: Number(row.output_tokens ?? 0),
+          cacheReadTokens: Number(row.cache_read_tokens ?? 0),
+          cacheWriteTokens: Number(row.cache_write_tokens ?? 0),
+          reasoningTokens: Number(row.reasoning_tokens ?? 0),
+        });
+        if (cost.costSource === 'unknown' && row.id.startsWith('backfill:')) {
+          const seq = Number(row.id.slice('backfill:'.length));
+          if (Number.isSafeInteger(seq) && seq > 0) {
+            const jRow = journalStmt.get(seq) as { body?: string } | undefined;
+            if (jRow?.body) {
+              try {
+                const ev = JSON.parse(String(jRow.body)) as { data?: unknown };
+                const data = asRecord(ev.data);
+                const detail = asRecord(data?.detail) ?? data;
+                const parsed = normalizeSdkUsage(detail?.usage ?? data?.usage);
+                sdkCatalogTotalUsd = parsed?.sdkCatalogTotalUsd;
+                if (sdkCatalogTotalUsd && sdkCatalogTotalUsd > 0) {
+                  cost = calculateModelCallCost({
+                    provider: row.provider,
+                    model: row.model,
+                    inputTokens: Number(row.input_tokens ?? 0),
+                    outputTokens: Number(row.output_tokens ?? 0),
+                    cacheReadTokens: Number(row.cache_read_tokens ?? 0),
+                    cacheWriteTokens: Number(row.cache_write_tokens ?? 0),
+                    reasoningTokens: Number(row.reasoning_tokens ?? 0),
+                    sdkCatalogTotalUsd,
+                  });
+                }
+              } catch { /* ignore malformed journal body */ }
+            }
+          }
+        }
+        if (cost.costSource !== 'unknown') {
+          const res = updateStmt.run(
+            cost.costUsd,
+            cost.unitInputUsdPer1M,
+            cost.unitOutputUsdPer1M,
+            cost.costSource,
+            row.id,
+          );
+          if (res.changes > 0) updated += 1;
+        }
+      }
+
+      this.writeMeta(REPRICE_META_KEY, FALLBACK_PRICES_VERSION);
+      return updated;
     });
   }
 

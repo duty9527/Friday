@@ -17,7 +17,8 @@
     "test": "npm run build && tsx --test --test-concurrency=1 test/*.test.ts",
     "start": "node dist/cli.js",
     "check": "npm run typecheck && npm test",
-    "check:browser": "node scripts/browser-check.mjs"
+    "check:browser": "node scripts/browser-check.mjs",
+    "sync:prices": "node scripts/sync-model-prices.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "1.5.0",
