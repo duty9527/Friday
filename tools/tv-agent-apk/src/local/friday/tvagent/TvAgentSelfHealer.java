@@ -387,6 +387,13 @@ public final class TvAgentSelfHealer {
             PackageManager pm = context.getPackageManager();
             Map<String, String> appMap = new LinkedHashMap<>();
 
+            Set<String> extraPackages = getPrefPackageSet(context, PREF_EXTRA_PACKAGES);
+            Set<String> excludedPackages = getPrefPackageSet(context, PREF_EXCLUDED_PACKAGES);
+            String guardedPkg = getGuardedLauncherPackage(context);
+            if (!guardedPkg.isEmpty()) {
+                extraPackages.add(guardedPkg);
+            }
+
             Intent leanbackIntent = new Intent(Intent.ACTION_MAIN)
                     .addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER);
             List<ResolveInfo> leanbackList = pm.queryIntentActivities(leanbackIntent, 0);
@@ -394,7 +401,7 @@ public final class TvAgentSelfHealer {
                 for (ResolveInfo ri : leanbackList) {
                     if (ri.activityInfo == null) continue;
                     String pkg = ri.activityInfo.packageName;
-                    if (shouldIncludePackage(pm, pkg)) {
+                    if (shouldIncludePackage(pm, pkg, extraPackages, excludedPackages)) {
                         CharSequence labelCs = ri.loadLabel(pm);
                         appMap.put(pkg, labelCs != null ? labelCs.toString().trim() : pkg);
                     }
@@ -408,18 +415,11 @@ public final class TvAgentSelfHealer {
                 for (ResolveInfo ri : launcherList) {
                     if (ri.activityInfo == null) continue;
                     String pkg = ri.activityInfo.packageName;
-                    if (!appMap.containsKey(pkg) && shouldIncludePackage(pm, pkg)) {
+                    if (!appMap.containsKey(pkg) && shouldIncludePackage(pm, pkg, extraPackages, excludedPackages)) {
                         CharSequence labelCs = ri.loadLabel(pm);
                         appMap.put(pkg, labelCs != null ? labelCs.toString().trim() : pkg);
                     }
                 }
-            }
-
-            Set<String> extraPackages = getPrefPackageSet(context, PREF_EXTRA_PACKAGES);
-            Set<String> excludedPackages = getPrefPackageSet(context, PREF_EXCLUDED_PACKAGES);
-            String guardedPkg = getGuardedLauncherPackage(context);
-            if (!guardedPkg.isEmpty()) {
-                extraPackages.add(guardedPkg);
             }
 
             List<ApplicationInfo> installed = pm.getInstalledApplications(0);

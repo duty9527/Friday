@@ -365,10 +365,18 @@ test('tv-agent volume falls back to tv-ir vol_up/vol_down only when DLNA fails',
   assert.deepEqual(soapFail.irCalls, [{ action: 'press', args: { key: 'vol_down', count: 2 } }]);
   assert.equal(down.data.via, 'ir');
 
-  // level fallback computes the delta from the agent volume (7)
+  // level fallback converts DLNA 0-100 percentage against maxVolume (15): 67% -> 10 steps (10 - 7 = +3)
   const lvl = createMockTv({ dlnaUp: false });
-  await executeTvAgentAction('volume', { level: 10 }, lvl.deps);
+  await executeTvAgentAction('volume', { level: 67 }, lvl.deps);
   assert.deepEqual(lvl.irCalls, [{ action: 'press', args: { key: 'vol_up', count: 3 } }]);
+
+  // 20% of 15 = 3 steps -> 3 - 7 = -4 (vol_down x4), and simultaneous mute is explicitly flagged as unapplied
+  const lvlDown = createMockTv({ dlnaUp: false });
+  const downRes = await executeTvAgentAction('volume', { level: 20, mute: true }, lvlDown.deps);
+  assert.equal(downRes.ok, true);
+  assert.deepEqual(lvlDown.irCalls, [{ action: 'press', args: { key: 'vol_down', count: 4 } }]);
+  assert.equal(downRes.data.muteIgnored, true);
+  assert.match(downRes.message, /静音/);
 
   const none = createMockTv({ dlnaUp: false });
   await executeTvAgentAction('volume', {}, none.deps);

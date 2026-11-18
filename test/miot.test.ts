@@ -303,6 +303,7 @@ async function withTmp<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 interface MockHarnessOptions {
   dir: string;
   nowMs?: number;
+  protectedDevices?: string[];
   bleProps?: Record<string, boolean | number | undefined>;
   bleWriteCode?: number;
   fryerReadQueue?: Array<Record<string, unknown>>;
@@ -337,7 +338,7 @@ function createMockHarness(opts: MockHarnessOptions) {
       JSON.stringify({
         routerSsh: 'root@192.0.2.1',
         speakerSsh: 'lx06=root@192.0.2.104',
-        protectedDevices: ['水草补光灯'],
+        protectedDevices: opts.protectedDevices ?? [],
         customAliases: {
           水草补光灯: ['水草灯'],
           阳台夜灯: ['夜灯'],

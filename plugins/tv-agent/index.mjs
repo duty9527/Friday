@@ -1,14 +1,19 @@
+import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { closeSync, constants, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, writeSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import {
   errMsg,
   readConfig as readSharedConfig,
   resolvePluginPaths,
   writeConfig as writeSharedConfig,
 } from '../_shared/config-store.mjs';
+import { execSshText, parseSshSpec, shellQuote } from '../_shared/ssh.mjs';
+
+const execFileAsync = promisify(execFile);
 
 export const DEFAULT_CONFIG = Object.freeze({
   tvHost: '',
@@ -144,14 +149,22 @@ function sanitizePort(value) {
   return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : undefined;
 }
 
+function sanitizeAdbTarget(value) {
+  const s = String(value ?? '').trim();
+  if (!s || s.startsWith('-')) return '';
+  return /^[A-Za-z0-9._:-]{1,128}$/.test(s) ? s : '';
+}
+
 function loadConfig(paths) {
-  const raw = readSharedConfig(paths.configPath, DEFAULT_CONFIG);
+  const raw = /** @type {Record<string, any>} */ (readSharedConfig(paths.configPath, DEFAULT_CONFIG));
+  const adbTarget = sanitizeAdbTarget(raw.adbTarget);
   return {
     tvHost: sanitizeHost(raw.tvHost) ?? DEFAULT_CONFIG.tvHost,
     tvToken: typeof raw.tvToken === 'string' ? raw.tvToken.trim() : DEFAULT_CONFIG.tvToken,
     agentPort: sanitizePort(raw.agentPort) ?? DEFAULT_CONFIG.agentPort,
     dlnaPort: sanitizePort(raw.dlnaPort) ?? DEFAULT_CONFIG.dlnaPort,
     sshTarget: typeof raw.sshTarget === 'string' ? raw.sshTarget.trim() : DEFAULT_CONFIG.sshTarget,
+    ...(adbTarget ? { adbTarget } : {}),
     appAliases: normalizeCustomAliases(raw.appAliases),
   };
 }
@@ -163,6 +176,7 @@ function saveConfig(paths, cfg) {
 /** Per-call effective config: stored config with optional per-call overrides. */
 function effectiveConfig(args, paths) {
   const cfg = loadConfig(paths);
+  const adbTarget = args.adbTarget !== undefined ? sanitizeAdbTarget(args.adbTarget) : (cfg.adbTarget ?? '');
   return {
     ...cfg,
     tvHost: sanitizeHost(args.tvHost) ?? cfg.tvHost,
@@ -170,6 +184,7 @@ function effectiveConfig(args, paths) {
     agentPort: sanitizePort(args.agentPort) ?? cfg.agentPort,
     dlnaPort: sanitizePort(args.dlnaPort) ?? cfg.dlnaPort,
     sshTarget: typeof args.sshTarget === 'string' ? args.sshTarget.trim() : cfg.sshTarget,
+    ...(adbTarget ? { adbTarget } : {}),
     appAliases: args.appAliases !== undefined
       ? { ...cfg.appAliases, ...normalizeCustomAliases(args.appAliases) }
       : cfg.appAliases,
@@ -257,7 +272,13 @@ function buildRequestSignal(timeoutMs, externalSignal) {
   return timerSignal;
 }
 
+/**
+ * @param {any} ctx
+ * @param {string} url
+ * @param {{ method?: string; body?: unknown; headers?: Record<string, string>; timeoutMs?: number }} [opts]
+ */
 async function httpRequest(ctx, url, { method = 'GET', body, headers = {}, timeoutMs = AGENT_TIMEOUT_MS } = {}) {
+  /** @type {RequestInit & { headers: Record<string, string> }} */
   const init = {
     method,
     headers: { ...headers },
@@ -292,26 +313,130 @@ function agentHeaders(ctx, extra = {}) {
   return { ...extra, 'X-TV-Token': ctx.cfg.tvToken };
 }
 
+const TV_TOKEN_HEX_RE = /^[0-9a-f]{32,128}$/i;
+
+function parsePairedTokenOutput(rawText) {
+  const text = String(rawText ?? '');
+  const dataMatch = text.match(/data="([0-9a-f]{32,128})"/i);
+  if (dataMatch?.[1] && TV_TOKEN_HEX_RE.test(dataMatch[1])) {
+    return dataMatch[1];
+  }
+  const plain = text.trim();
+  if (TV_TOKEN_HEX_RE.test(plain)) {
+    return plain;
+  }
+  return '';
+}
+
+async function defaultAdbRunner(adbArgs, timeoutMs = 4000, signal) {
+  try {
+    const { stdout, stderr } = await execFileAsync('adb', adbArgs, {
+      encoding: 'utf8',
+      timeout: timeoutMs,
+      ...(signal ? { signal } : {}),
+    });
+    return { code: 0, stdout: String(stdout ?? ''), stderr: String(stderr ?? '') };
+  } catch (err) {
+    const e = /** @type {{ code?: unknown; stdout?: unknown; stderr?: unknown; message?: string }} */ (err);
+    return {
+      code: typeof e?.code === 'number' ? e.code : 1,
+      stdout: String(e?.stdout ?? ''),
+      stderr: String(e?.stderr ?? e?.message ?? ''),
+    };
+  }
+}
+
+async function pairTvTokenViaAdbOrSsh(ctx) {
+  if (ctx._tokenPairAttempted) return '';
+  ctx._tokenPairAttempted = true;
+  if (ctx.cfg.tvToken) return '';
+
+  const adbTarget = sanitizeAdbTarget(ctx.cfg.adbTarget) || (ctx.cfg.tvHost ? `${ctx.cfg.tvHost}:5555` : '');
+  const adbRunner = ctx.deps?.adbRunner ?? ((args, timeoutMs) => defaultAdbRunner(args, timeoutMs, ctx.deps?.signal));
+  let token = '';
+
+  if (adbTarget && (ctx.cfg.adbTarget || ctx.deps?.adbRunner || ctx.cfg.tvHost)) {
+    if (adbTarget.includes(':')) {
+      await adbRunner(['connect', adbTarget], 3000).catch(() => {});
+    }
+    const res = await adbRunner(
+      ['-s', adbTarget, 'shell', 'am', 'broadcast', '-n', 'local.friday.tvagent/.TvAgentBootReceiver', '-a', 'local.friday.tvagent.GET_TOKEN'],
+      4000,
+    ).catch(() => null);
+    token = parsePairedTokenOutput(res?.stdout);
+  }
+
+  if (!token && ctx.cfg.sshTarget) {
+    const sshSpec = parseSshSpec(ctx.cfg.sshTarget, 'tv');
+    if (sshSpec) {
+      const targetArg = adbTarget || '127.0.0.1:5555';
+      const cmd = `adb -s ${shellQuote(targetArg)} shell am broadcast -n local.friday.tvagent/.TvAgentBootReceiver -a local.friday.tvagent.GET_TOKEN`;
+      const sshExec = ctx.deps?.sshTextExec ?? ((t, c, ms) => execSshText(t, c, {
+        timeoutMs: ms,
+        homeDir: ctx.paths?.homeDir,
+        signal: ctx.deps?.signal,
+      }));
+      const sshRes = await sshExec(sshSpec, cmd, 5000).catch(() => null);
+      token = parsePairedTokenOutput(sshRes?.stdout);
+    }
+  }
+
+  if (!token) return '';
+  ctx.cfg.tvToken = token;
+  try {
+    if (ctx.paths?.configPath) {
+      const persisted = loadConfig(ctx.paths);
+      if (!persisted.tvToken) {
+        saveConfig(ctx.paths, { ...persisted, tvToken: token });
+      }
+    }
+  } catch {
+    // Best-effort cache; token remains valid for current call even if config dir isn't writable.
+  }
+  return token;
+}
+
 async function agentGet(ctx, path, timeoutMs = AGENT_TIMEOUT_MS) {
   if (!ctx.agentBase) {
     return { ok: false, status: 0, text: '', json: undefined, error: '未配置 tvHost' };
   }
-  return tryRequest(ctx, `${ctx.agentBase}${path}`, {
+  let res = await tryRequest(ctx, `${ctx.agentBase}${path}`, {
     timeoutMs,
     headers: agentHeaders(ctx),
   });
+  if (res.status === 401 && !ctx.cfg.tvToken) {
+    const paired = await pairTvTokenViaAdbOrSsh(ctx);
+    if (paired) {
+      res = await tryRequest(ctx, `${ctx.agentBase}${path}`, {
+        timeoutMs,
+        headers: agentHeaders(ctx),
+      });
+    }
+  }
+  return res;
 }
 
 async function agentAct(ctx, body, timeoutMs = AGENT_TIMEOUT_MS) {
   if (!ctx.agentBase) {
     return { ok: false, status: 0, detail: '未配置 tvHost', json: undefined };
   }
-  const res = await tryRequest(ctx, `${ctx.agentBase}/act`, {
+  let res = await tryRequest(ctx, `${ctx.agentBase}/act`, {
     method: 'POST',
     body,
     timeoutMs,
     headers: agentHeaders(ctx),
   });
+  if (res.status === 401 && !ctx.cfg.tvToken) {
+    const paired = await pairTvTokenViaAdbOrSsh(ctx);
+    if (paired) {
+      res = await tryRequest(ctx, `${ctx.agentBase}/act`, {
+        method: 'POST',
+        body,
+        timeoutMs,
+        headers: agentHeaders(ctx),
+      });
+    }
+  }
   const ok = res.ok && res.json?.ok !== false;
   return { ok, status: res.status, detail: res.json?.detail ?? res.error ?? res.text.slice(0, 160), json: res.json };
 }
@@ -609,6 +734,7 @@ async function volumeFallback(ctx, { hasLevel, hasDelta, hasMute, level, delta }
   if (hasMute && !hasLevel && !hasDelta) {
     return failure('电视音量', `DLNA 静音控制失败（${dlnaError}），红外无独立静音键。`);
   }
+  const muteNotice = hasMute ? '；注意：DLNA 不可用，静音状态未变更' : '';
   if (!hasLevel && !hasDelta) {
     const st = await agentGet(ctx, '/status', PROBE_TIMEOUT_MS);
     if (st.ok && Number.isFinite(Number(st.json?.volume))) {
@@ -625,16 +751,30 @@ async function volumeFallback(ctx, { hasLevel, hasDelta, hasMute, level, delta }
     if (!st.ok || !Number.isFinite(cur)) {
       return failure('电视音量', `DLNA 失败（${dlnaError}）且无法从 Agent 读取当前音量，无法用红外定位到 ${level}。`);
     }
-    steps = Math.round(level - cur);
+    const maxVolRaw = Number(st.json?.maxVolume);
+    const maxVol = Number.isFinite(maxVolRaw) && maxVolRaw > 0 ? maxVolRaw : 15;
+    const targetStep = Math.round((clampVolume(level) / 100) * maxVol);
+    steps = targetStep - cur;
   }
-  if (steps === 0) return success('电视音量', '音量已在目标位置', { via: 'ir', steps: 0 });
+  if (steps === 0) {
+    return success('电视音量', `音量已在目标位置${muteNotice}`, {
+      via: 'ir',
+      steps: 0,
+      ...(hasMute ? { muteIgnored: true } : {}),
+    });
+  }
   const key = steps > 0 ? 'vol_up' : 'vol_down';
   const count = Math.min(30, Math.abs(steps));
   const ir = await runIr(ctx, 'press', { key, count });
   if (!ir || ir.ok === false) {
     return failure('电视音量', `DLNA 失败（${dlnaError}），红外回退也失败：${ir?.message ?? '未知错误'}`);
   }
-  return success('电视音量', `已通过红外 ${key} ×${count}（DLNA 不可用：${dlnaError}）`, { via: 'ir', key, count });
+  return success('电视音量', `已通过红外 ${key} ×${count}（DLNA 不可用：${dlnaError}${muteNotice}）`, {
+    via: 'ir',
+    key,
+    count,
+    ...(hasMute ? { muteIgnored: true } : {}),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -833,8 +973,31 @@ function resolveSafeScreenshotPath(screenshotsDir, rawSavePath) {
   if (parentRel.startsWith('..') || isAbsolute(parentRel)) {
     return { error: 'savePath 目标目录越界，已拒绝。' };
   }
-  const safePath = join(resolve(screenshotsDir), parentRel, candidate.slice(dirname(candidate).length + 1));
+  const safePath = join(realRoot, parentRel, basename(candidate));
+  try {
+    const leafStat = lstatSync(safePath);
+    if (leafStat.isSymbolicLink()) {
+      return { error: 'savePath 目标文件为符号链接，已拒绝。' };
+    }
+    if (leafStat.isDirectory()) {
+      return { error: 'savePath 目标为目录，不能覆盖写入。' };
+    }
+  } catch (err) {
+    if (/** @type {NodeJS.ErrnoException} */ (err)?.code !== 'ENOENT') {
+      return { error: `校验 savePath 失败：${errMsg(err)}` };
+    }
+  }
   return { path: safePath };
+}
+
+function writeFileNoFollow(filePath, dataBuffer, mode = 0o600) {
+  const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | (constants.O_NOFOLLOW ?? 0);
+  const fd = openSync(filePath, flags, mode);
+  try {
+    writeSync(fd, dataBuffer);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 async function handleScreenshot(ctx) {
@@ -850,7 +1013,7 @@ async function handleScreenshot(ctx) {
   const { base64, ...meta } = res.json;
   const data = { ...meta, bytes: Buffer.byteLength(base64, 'base64') };
   if (safeSave?.path) {
-    writeFileSync(safeSave.path, Buffer.from(base64, 'base64'), { mode: 0o600 });
+    writeFileNoFollow(safeSave.path, Buffer.from(base64, 'base64'), 0o600);
     data.savedTo = safeSave.path;
   }
   if (ctx.args.includeBase64 === true) data.base64 = base64;
@@ -858,7 +1021,7 @@ async function handleScreenshot(ctx) {
 }
 
 async function handleAct(ctx) {
-  const { apiKey: _k, tvHost: _h, tvToken: _t, agentPort: _p, dlnaPort: _d, sshTarget: _s, appAliases: _a, ...rest } = ctx.args;
+  const { apiKey: _k, tvHost: _h, tvToken: _t, agentPort: _p, dlnaPort: _d, sshTarget: _s, adbTarget: _adb, appAliases: _a, ...rest } = ctx.args;
   const body = rest.body && typeof rest.body === 'object' ? rest.body : rest;
   if (!body.action || typeof body.action !== 'string') {
     return failure('电视操作', 'act 需要 action（wake/global/click/focus/set_text/scroll/launch_app/open_uri）。');
@@ -876,11 +1039,12 @@ function redactConfigView(cfg) {
     agentPort: cfg.agentPort,
     dlnaPort: cfg.dlnaPort,
     sshTarget: cfg.sshTarget,
+    ...(cfg.adbTarget ? { adbTarget: cfg.adbTarget } : {}),
     appAliases: cfg.appAliases,
   };
 }
 
-function handleConfig(ctx) {
+async function handleConfig(ctx) {
   const { args, paths } = ctx;
   const current = loadConfig(paths);
   const next = { ...current };
@@ -913,6 +1077,18 @@ function handleConfig(ctx) {
     next.sshTarget = String(args.sshTarget ?? '').trim();
     changed.push('sshTarget');
   }
+  if (args.adbTarget !== undefined) {
+    const rawAdb = String(args.adbTarget ?? '').trim();
+    if (!rawAdb) {
+      delete next.adbTarget;
+      changed.push('adbTarget');
+    } else {
+      const cleanAdb = sanitizeAdbTarget(rawAdb);
+      if (!cleanAdb) return failure('电视配置', 'adbTarget 无效（示例 192.168.1.50:5555）。');
+      next.adbTarget = cleanAdb;
+      changed.push('adbTarget');
+    }
+  }
   if (args.appAliases !== undefined) {
     if (!args.appAliases || typeof args.appAliases !== 'object' || Array.isArray(args.appAliases)) {
       return failure('电视配置', 'appAliases 必须是 JSON 对象（包名 -> 别名数组，或 别名 -> 包名）。');
@@ -921,6 +1097,15 @@ function handleConfig(ctx) {
     changed.push('appAliases');
   }
   if (changed.length) saveConfig(paths, next);
+  if (args.pair === true && !next.tvToken && (next.adbTarget || next.sshTarget || next.tvHost)) {
+    const pairCtx = { ...ctx, cfg: { ...next }, _tokenPairAttempted: false };
+    const paired = await pairTvTokenViaAdbOrSsh(pairCtx);
+    if (paired) {
+      next.tvToken = paired;
+      changed.push('tvToken');
+      saveConfig(paths, next);
+    }
+  }
   return success('电视配置', changed.length ? `已更新：${changed.join('、')}` : '当前电视配置', redactConfigView(next));
 }
 

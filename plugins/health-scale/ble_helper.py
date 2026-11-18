@@ -44,6 +44,24 @@ DEVICE_INFO_UUIDS = {
 }
 
 
+def atomic_write_json(path: str, payload: dict[str, Any]) -> None:
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.{time.monotonic_ns()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -336,12 +354,7 @@ class MeasureSession:
         if self.profile_id and not self.state.get("profileId"):
             self.state["profileId"] = self.profile_id
         self.state["updatedAt"] = now_ms()
-        parent = os.path.dirname(os.path.abspath(self.state_file))
-        os.makedirs(parent, exist_ok=True)
-        tmp = f"{self.state_file}.{os.getpid()}.tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(self.state, fh, ensure_ascii=False)
-        os.replace(tmp, self.state_file)
+        atomic_write_json(self.state_file, self.state)
 
     def cancel_timer(self, attr: str) -> None:
         timer_id = getattr(self, attr)
@@ -502,6 +515,8 @@ class MeasureSession:
                         self.finish("completed", "秤端测量锁定并自动断开，数据已同步")
                     elif self.state.get("phase") == "measuring":
                         self.finish("error", "体重秤在锁定前意外断开连接", "体重秤意外断开")
+                    elif self.state.get("phase") == "connecting":
+                        self._schedule_retry("蓝牙连接尚未完成即断开，正在重新等待唤醒…")
             elif not self.connecting and not self.device_path:
                 try:
                     prop_iface = dbus.Interface(self.bus.get_object(BLUEZ_SERVICE, path), PROPERTIES_IFACE)
@@ -688,13 +703,21 @@ class MeasureSession:
                         # Wait up to 8.5s for BIA impedance (user might be wearing socks)
                         self.grace_timer_id = GLib.timeout_add(8500, self._on_weight_only_grace)
                 elif pkt_type == 214:  # PACKET_ADC
-                    self.seen_adc = True
-                    self.state["message"] = "已采集双频生物电阻抗与稳定体重，正在收尾同步…"
-                    self.cancel_timer("grace_timer_id")
-                    self.grace_timer_id = GLib.timeout_add(
-                        550,
-                        lambda: (self.finish("completed", "测量完成，已获取完整体重与生物电阻抗数据"), False)[1],
-                    )
+                    adc_count = pkt[2]
+                    adcs: list[int] = []
+                    if adc_count <= 6:
+                        for idx in range(adc_count):
+                            pos = 4 + idx * 2
+                            if pos + 2 <= 18:
+                                adcs.append(int.from_bytes(pkt[pos:pos + 2], "big"))
+                    if any(0 < val < 65535 for val in adcs):
+                        self.seen_adc = True
+                        self.state["message"] = "已采集双频生物电阻抗与稳定体重，正在收尾同步…"
+                        self.cancel_timer("grace_timer_id")
+                        self.grace_timer_id = GLib.timeout_add(
+                            550,
+                            lambda: (self.finish("completed", "测量完成，已获取完整体重与生物电阻抗数据"), False)[1],
+                        )
         self.flush()
 
     def _on_weight_only_grace(self) -> bool:
@@ -758,12 +781,7 @@ def main() -> int:
                     "notifications": [],
                     "error": str(exc),
                 }
-                parent = os.path.dirname(os.path.abspath(args.state_file))
-                os.makedirs(parent, exist_ok=True)
-                tmp = f"{args.state_file}.{os.getpid()}.tmp"
-                with open(tmp, "w", encoding="utf-8") as fh:
-                    json.dump(err_state, fh, ensure_ascii=False)
-                os.replace(tmp, args.state_file)
+                atomic_write_json(args.state_file, err_state)
             except Exception:
                 pass
             return 1

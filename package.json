@@ -12,11 +12,14 @@
     "friday": "dist/cli.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && node scripts/copy-web.mjs",
-    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "clean": "node -e \"import('node:fs').then(m => m.rmSync('dist', { recursive: true, force: true }))\"",
+    "build": "npm run clean && tsc -p tsconfig.json && node scripts/copy-web.mjs",
+    "check:plugins": "tsc -p tsconfig.plugins.json --noEmit && python3 -m py_compile plugins/health-scale/ble_helper.py && bash -n tools/tv-agent-apk/build.sh",
+    "check:apk": "bash -c 'if command -v javac >/dev/null 2>&1 || [ -x \"$HOME/.local/jdk17/bin/javac\" ]; then if [ -d \"${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Android/Sdk}}/platforms\" ]; then bash tools/tv-agent-apk/build.sh >/dev/null; fi; fi'",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit && tsc -p tsconfig.plugins.json --noEmit",
     "test": "npm run build && tsx --test --test-concurrency=1 test/*.test.ts",
     "start": "node dist/cli.js",
-    "check": "npm run typecheck && npm test",
+    "check": "npm run typecheck && npm run check:plugins && npm run check:apk && npm test",
     "check:browser": "node scripts/browser-check.mjs",
     "sync:prices": "node scripts/sync-model-prices.mjs"
   },

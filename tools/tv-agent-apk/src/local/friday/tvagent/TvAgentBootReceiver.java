@@ -10,6 +10,8 @@ import android.util.Log;
 public final class TvAgentBootReceiver extends BroadcastReceiver {
     public static final String ACTION_STR_BOOT = "mitv.action.STR_BOOT_COMPLETED";
     public static final String ACTION_ENSURE_READY = "local.friday.tvagent.ENSURE_READY";
+    public static final String ACTION_GET_TOKEN = "local.friday.tvagent.GET_TOKEN";
+    public static final String ACTION_SYNC_TOKEN = "local.friday.tvagent.SYNC_TOKEN";
 
     @Override
     public void onReceive(Context context, Intent intent) {
@@ -18,6 +20,18 @@ public final class TvAgentBootReceiver extends BroadcastReceiver {
                 : context;
         String action = intent != null ? intent.getAction() : "";
         Log.i(TvAgentSelfHealer.TAG, "TvAgentBootReceiver onReceive: " + action);
+
+        if (ACTION_GET_TOKEN.equals(action)) {
+            String token = TvAgentHttpServer.ensureTokenInitialized(appCtx);
+            setResult(-1, token, null);
+            return;
+        }
+        if (ACTION_SYNC_TOKEN.equals(action)) {
+            String provided = intent != null ? intent.getStringExtra("token") : null;
+            String active = TvAgentHttpServer.syncTokenIfValid(appCtx, provided);
+            setResult(-1, active, null);
+            return;
+        }
 
         TvAgentSelfHealer.ensureAllReady(appCtx);
 

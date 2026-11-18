@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, lstatSync, mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -9,7 +9,64 @@ const execFileAsync = promisify(execFile);
 
 const SSH_USER_HOST_RE = /^[A-Za-z0-9._-]+@(?:\[[A-Za-z0-9:]+\]|[A-Za-z0-9._-]+)$/;
 const SSH_ID_RE = /^[A-Za-z0-9._-]+$/;
-const MAX_UNIX_SOCKET_PATH_BYTES = 104;
+// Keep expanded Unix domain socket path strictly < 100 bytes for Linux/BSD sun_path safety.
+const MAX_UNIX_SOCKET_PATH_BYTES = 100;
+const SSH_MUX_ERROR_RE = /(?:Control socket|mux_client_|muxserver_|mux master|ControlPath)/i;
+
+/** @type {Map<string, { controlPath: string; userHost: string; port?: number }>} */
+const ACTIVE_CONTROL_MASTERS = new Map();
+let exitCleanupRegistered = false;
+
+/**
+ * Best-effort cleanup for tracked OpenSSH ControlPersist mux masters/sockets before exit.
+ */
+export function cleanupSshControlMasters() {
+  for (const entry of ACTIVE_CONTROL_MASTERS.values()) {
+    try {
+      const args = [
+        '-O', 'exit',
+        '-o', `ControlPath=${entry.controlPath}`,
+      ];
+      if (entry.port) args.push('-p', String(entry.port));
+      args.push('--', entry.userHost);
+      execFileSync('ssh', args, { stdio: 'ignore', timeout: 800 });
+    } catch {
+      // best-effort socket teardown
+    }
+  }
+  ACTIVE_CONTROL_MASTERS.clear();
+}
+
+/**
+ * @param {string | undefined} controlPath
+ * @param {import('./types.d.ts').SshTarget} target
+ */
+function trackControlMaster(controlPath, target) {
+  if (!controlPath || !target?.userHost) return;
+  const key = `${controlPath}\0${target.userHost}\0${target.port ?? ''}`;
+  ACTIVE_CONTROL_MASTERS.set(key, {
+    controlPath,
+    userHost: target.userHost,
+    ...(target.port ? { port: target.port } : {}),
+  });
+  if (!exitCleanupRegistered) {
+    exitCleanupRegistered = true;
+    process.once('exit', cleanupSshControlMasters);
+  }
+}
+
+/**
+ * @param {string | undefined} controlPath
+ * @returns {boolean}
+ */
+function isSafeControlPathLength(controlPath) {
+  if (!controlPath || !controlPath.trim()) return false;
+  // OpenSSH expands %C to 40 hex chars; also account conservatively for %h/%p/%r/%n/%L tokens.
+  const expanded = controlPath
+    .replace(/%C/g, '0'.repeat(40))
+    .replace(/%[hnlpr]/g, '0'.repeat(16));
+  return Buffer.byteLength(expanded, 'utf8') < MAX_UNIX_SOCKET_PATH_BYTES;
+}
 
 /**
  * POSIX single-quote shell escaping.
@@ -128,9 +185,7 @@ export function resolvePrivateControlPath(homeDir) {
   if (!homeDir || !homeDir.trim()) return undefined;
   const runDir = resolvePrivateRunDir(homeDir);
   const template = join(runDir, 'ssh-ctl-%C');
-  // OpenSSH expands %C to 40 hex chars; Linux sun_path max is 108 bytes.
-  const estimatedExpandedBytes = Buffer.byteLength(template, 'utf8') - 2 + 40;
-  if (estimatedExpandedBytes > MAX_UNIX_SOCKET_PATH_BYTES) {
+  if (!isSafeControlPathLength(template)) {
     return undefined;
   }
   return template;
@@ -152,6 +207,16 @@ export function resolvePrivateControlPath(homeDir) {
  * @returns {string[]}
  */
 export function buildSshArgs(target, options = {}) {
+  if (!isValidSshUserHost(target?.userHost)) {
+    throw new Error(`Invalid SSH userHost "${target?.userHost ?? ''}"`);
+  }
+  if (target?.port !== undefined) {
+    const portNum = Number(target.port);
+    if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+      throw new Error(`Invalid SSH port "${String(target.port)}"`);
+    }
+  }
+
   const {
     connectTimeoutSec = 5,
     serverAliveInterval = 5,
@@ -177,8 +242,11 @@ export function buildSshArgs(target, options = {}) {
     );
   }
 
-  const resolvedControlPath = useControlMaster
+  const candidateControlPath = useControlMaster
     ? (controlPath ?? resolvePrivateControlPath(homeDir))
+    : undefined;
+  const resolvedControlPath = candidateControlPath && isSafeControlPathLength(candidateControlPath)
+    ? candidateControlPath
     : undefined;
 
   if (resolvedControlPath) {
@@ -199,7 +267,8 @@ export function buildSshArgs(target, options = {}) {
 
 /**
  * Run a remote command over SSH returning UTF-8 text.
- * Supports AbortSignal and ControlMaster=255 fallback retry without ControlMaster.
+ * Supports AbortSignal and ControlMaster mux failure fallback retry without ControlMaster.
+ * Never blindly retries on remote command `exit 255` to avoid replaying non-idempotent commands.
  * @param {import('./types.d.ts').SshTarget} target
  * @param {string} remoteCmd
  * @param {{
@@ -211,6 +280,7 @@ export function buildSshArgs(target, options = {}) {
  *   controlPersistSec?: number;
  *   useControlMaster?: boolean;
  *   allowLegacyRsa?: boolean;
+ *   idempotent?: boolean;
  * }} [options]
  * @returns {Promise<import('./types.d.ts').SshExecResult>}
  */
@@ -239,7 +309,13 @@ export async function execSshText(target, remoteCmd, options = {}) {
       useControlMaster: withMaster,
       allowLegacyRsa,
     });
-    sshArgs.push(target.userHost, remoteCmd);
+    if (withMaster) {
+      const ctlArg = sshArgs.find(a => a.startsWith('ControlPath=') && a !== 'ControlPath=none');
+      if (ctlArg) {
+        trackControlMaster(ctlArg.slice('ControlPath='.length), target);
+      }
+    }
+    sshArgs.push('--', target.userHost, remoteCmd);
     try {
       const { stdout, stderr } = await execFileAsync('ssh', sshArgs, {
         encoding: 'utf8',
@@ -261,7 +337,7 @@ export async function execSshText(target, remoteCmd, options = {}) {
   };
 
   const first = await runOnce(useControlMaster);
-  if (first.code === 255 && useControlMaster) {
+  if (first.code === 255 && useControlMaster && SSH_MUX_ERROR_RE.test(first.stderr)) {
     return await runOnce(false);
   }
   return first;
@@ -303,7 +379,13 @@ export async function execSshBinary(target, remoteCmd, options = {}) {
     useControlMaster,
     allowLegacyRsa,
   });
-  sshArgs.push(target.userHost, remoteCmd);
+  if (useControlMaster) {
+    const ctlArg = sshArgs.find(a => a.startsWith('ControlPath=') && a !== 'ControlPath=none');
+    if (ctlArg) {
+      trackControlMaster(ctlArg.slice('ControlPath='.length), target);
+    }
+  }
+  sshArgs.push('--', target.userHost, remoteCmd);
 
   try {
     const { stdout, stderr } = await execFileAsync('ssh', sshArgs, {
@@ -328,13 +410,53 @@ export async function execSshBinary(target, remoteCmd, options = {}) {
 }
 
 /**
- * Gracefully inspect `<homeDir>/state.sqlite` (read-only) for an enabled XiaoAI channel
- * SSH target when plugin-local `config.json` does not explicitly specify `speakerSsh` / `sshTarget`.
- * @param {{ homeDir?: string; env?: Record<string, string | undefined> }} [contextOrDeps]
+ * Select preferred target from an ordered SSH target list.
+ * @param {import('./types.d.ts').SshTarget[]} targets
+ * @param {string} preferredId
+ * @param {string} [defaultTarget]
+ * @returns {import('./types.d.ts').SshTarget | undefined}
+ */
+function pickPreferredTarget(targets, preferredId, defaultTarget = '') {
+  return (
+    targets.find(
+      t =>
+        t.id.toLowerCase() === preferredId.toLowerCase() ||
+        t.userHost.toLowerCase() === preferredId.toLowerCase(),
+    ) ||
+    targets.find(t => /lx06/i.test(t.id)) ||
+    (defaultTarget ? targets.find(t => t.id === defaultTarget) : undefined) ||
+    targets[0]
+  );
+}
+
+/**
+ * Resolve optional XiaoAI speaker SSH target from explicit args/env first, falling
+ * back read-only to `<homeDir>/state.sqlite` only when no explicit/env target exists.
+ * @param {{ homeDir?: string; ssh?: string; speakerSsh?: string; env?: Record<string, string | undefined>; sqliteFallback?: boolean }} [contextOrDeps]
  * @param {string} [preferredId]
  * @returns {{ target: import('./types.d.ts').SshTarget; channelId: string } | null}
  */
 export function discoverOptionalXiaoaiSshFromSqlite(contextOrDeps = {}, preferredId = 'lx06') {
+  const env = contextOrDeps?.env ?? process.env;
+  const envSpec = [
+    contextOrDeps?.speakerSsh,
+    contextOrDeps?.ssh,
+    env?.FRIDAY_XIAOAI_SSH,
+    env?.XIAOAI_SSH,
+  ].find(v => typeof v === 'string' && v.trim());
+
+  if (envSpec) {
+    const envTargets = parseSshTargets(envSpec, preferredId || 'xiaoai');
+    const envPreferred = pickPreferredTarget(envTargets, preferredId);
+    if (envPreferred) {
+      return { target: envPreferred, channelId: 'env' };
+    }
+  }
+
+  if (contextOrDeps?.sqliteFallback === false) {
+    return null;
+  }
+
   const homeDir = resolveHomeDir(contextOrDeps);
   const dbPath = join(homeDir, 'state.sqlite');
   if (!existsSync(dbPath)) return null;
@@ -370,15 +492,7 @@ export function discoverOptionalXiaoaiSshFromSqlite(contextOrDeps = {}, preferre
 
     candidates.sort((a, b) => Number(b.enabled) - Number(a.enabled));
     for (const cand of candidates) {
-      const preferred =
-        cand.targets.find(
-          t =>
-            t.id.toLowerCase() === preferredId.toLowerCase() ||
-            t.userHost.toLowerCase() === preferredId.toLowerCase(),
-        ) ||
-        cand.targets.find(t => /lx06/i.test(t.id)) ||
-        (cand.defaultTarget ? cand.targets.find(t => t.id === cand.defaultTarget) : undefined) ||
-        cand.targets[0];
+      const preferred = pickPreferredTarget(cand.targets, preferredId, cand.defaultTarget);
       if (preferred) {
         return { target: preferred, channelId: cand.channelId };
       }

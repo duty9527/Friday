@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { closeSync, constants, existsSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
@@ -12,6 +12,7 @@ import {
   readConfig,
   readJsonSafe,
   resolvePluginPaths,
+  withFileLock,
   writeConfig,
   writeJsonAtomic,
 } from '../_shared/config-store.mjs';
@@ -479,10 +480,11 @@ export function parseScaleAdvertisement(rawDevice) {
   };
 }
 
+/** @param {{ deviceType?: number; protocolVer?: number; user?: Record<string, any>; nowMs?: number }} [opts] */
 export function encodeTimeAndUserInfo27({
   deviceType = 0x27,
   protocolVer = 1,
-  user = {},
+  user = /** @type {Record<string, any>} */ ({}),
   nowMs = Date.now(),
 } = {}) {
   const nowSec = Math.floor(nowMs / 1000);
@@ -541,6 +543,26 @@ export class Scale27Protocol {
       : input instanceof Uint8Array
         ? Buffer.from(input)
         : Buffer.from(String(input || '').replace(/\s+/g, ''), 'hex');
+    if (pkt.length === 0) {
+      return { status: 'error', frame: null, events: [] };
+    }
+
+    // If waiting for continuation fragments of a multi-packet PACKET_SETTING, verify fragment validity;
+    // on mismatch or runt packet, reset stale fragments and re-sync on the incoming packet if >= 20B.
+    if (this._packets.length > 0) {
+      const idx = this._packets.length;
+      const validCont =
+        idx < 5 &&
+        pkt.length >= 18 &&
+        ((pkt[3] & 0x0f) === idx);
+      if (!validCont) {
+        this._packets = [];
+        if (pkt.length < 20) {
+          return { status: 'error', frame: null, events: [] };
+        }
+      }
+    }
+
     this._packets.push(pkt);
     const { status, frame } = this._assemble(this._packets);
     if (status === 'perfect' || status === 'error' || status === 'verify_error') {
@@ -559,7 +581,8 @@ export class Scale27Protocol {
   _assemble(packets) {
     if (!packets.length) return { status: 'imperfect', frame: null };
     const first = packets[0];
-    if (first.length < 20) return { status: 'imperfect', frame: null };
+    // Never leave a malformed <20B leading packet stuck in _packets.
+    if (first.length < 20) return { status: 'error', frame: null };
     const seqOrFlags = first[1] & 0xff;
     if (getBit(seqOrFlags, 7)) return { status: 'error', frame: null };
 
@@ -573,12 +596,13 @@ export class Scale27Protocol {
     const groupIndex = (checksumByte & 0xe0) >> 5;
 
     if (packetType === PACKET_SETTING && body18[0] === 6) {
+      if (packets.length > 5) return { status: 'error', frame: null };
       if (packets.length !== 5) return { status: 'imperfect', frame: null };
       const combined = Buffer.alloc(128, 0);
       let lastGroup = groupIndex;
       for (let idx = 0; idx < packets.length; idx++) {
         const packet = packets[idx];
-        if (packet.length < 18) return { status: 'imperfect', frame: null };
+        if (packet.length < 18) return { status: 'error', frame: null };
         const marker = packet[3];
         lastGroup = (marker & 0xf0) >> 4;
         if ((marker & 0x0f) !== idx) return { status: 'error', frame: null };
@@ -797,14 +821,15 @@ function deurenbergBodyFatPercent(weightKg, heightCm, age, male) {
   return 1.20 * bmi + 0.23 * age - 10.8 * sexVal - 5.4;
 }
 
+/** @param {number} value @param {number} min @param {number} max @param {{ highLabel?: string; criticalHigh?: number; criticalLabel?: string; lowLabel?: string; excellentMin?: number; excellentMax?: number }} [opts] */
 function rateRange(value, min, max, {
   highLabel = '偏高',
   criticalHigh = max + (max - min) * 0.6,
   criticalLabel = '超标',
   lowLabel = '偏低',
-  excellentMin,
-  excellentMax,
-} = {}) {
+  excellentMin = undefined,
+  excellentMax = undefined,
+} = /** @type {{ highLabel?: string; criticalHigh?: number; criticalLabel?: string; lowLabel?: string; excellentMin?: number; excellentMax?: number }} */ ({})) {
   if (value < min) return { status: 'low', statusLabel: lowLabel };
   if (excellentMin !== undefined && excellentMax !== undefined && value >= excellentMin && value <= excellentMax) {
     return { status: 'excellent', statusLabel: '优秀' };
@@ -834,17 +859,18 @@ function classifyBodyType(bmi, bodyFatPct, male) {
   return matrix[bmiBucket][fatBucket];
 }
 
+/** @param {{ weightKg?: any; heightCm?: any; age?: any; sex?: any; targetWeightKg?: any; impedances?: any[]; adcs?: any[]; algType?: any; heartRate?: any }} [opts] */
 export function computeFullHealthReport({
-  weightKg,
-  heightCm,
-  age,
-  sex,
+  weightKg = undefined,
+  heightCm = undefined,
+  age = undefined,
+  sex = undefined,
   targetWeightKg = null,
   impedances = [],
   adcs = [],
   algType = null,
   heartRate = null,
-} = {}) {
+} = /** @type {{ weightKg?: any; heightCm?: any; age?: any; sex?: any; targetWeightKg?: any; impedances?: any[]; adcs?: any[]; algType?: any; heartRate?: any }} */ ({})) {
   const weight = Number(weightKg);
   const rawHeight = Number(heightCm);
   const rawAge = Number(age);
@@ -1475,7 +1501,8 @@ function computeDeltas(records, activeProfile, nowMs) {
   };
 }
 
-function buildDashboardData(db, dataDir, { profileId, limit = 120, nowMs, config = DEFAULT_CONFIG }) {
+/** @param {any} db @param {string} dataDir @param {{ profileId?: string | null; limit?: number; nowMs: number; config?: Record<string, any> }} opts */
+function buildDashboardData(db, dataDir, { profileId = null, limit = 120, nowMs, config = DEFAULT_CONFIG }) {
   const { profiles, activeProfile } = resolveProfilesAndActive(db, profileId);
   const devRow = db.prepare('SELECT * FROM devices ORDER BY last_seen_at DESC LIMIT 1').get();
   const device = mapDeviceRow(devRow);
@@ -1546,8 +1573,10 @@ function sessionFilePath(dataDir) {
 
 function decodeNotifications(notifications) {
   const protocol = new Scale27Protocol();
-  let latestWeight = null;
-  let latestAdc = null;
+  let latestWeight = /** @type {Record<string, any> | null} */ (null);
+  let latestStableWeight = /** @type {Record<string, any> | null} */ (null);
+  let latestDynamicWeight = /** @type {Record<string, any> | null} */ (null);
+  let latestAdc = /** @type {Record<string, any> | null} */ (null);
   const historyEvents = [];
   const settingEvents = [];
 
@@ -1558,8 +1587,17 @@ function decodeNotifications(notifications) {
     for (const ev of res.events) {
       if (ev.kind === 'weight') {
         latestWeight = { ...(latestWeight || {}), ...ev };
+        if (ev.stable && ev.weightKg > 0) {
+          latestStableWeight = { ...latestWeight };
+        } else if (ev.weightKg > 0) {
+          latestDynamicWeight = { ...latestWeight };
+        }
       } else if (ev.kind === 'adc') {
-        latestAdc = ev;
+        const hasValidImp = firstValidResistance(ev.impedances) !== undefined;
+        const prevValidImp = latestAdc ? firstValidResistance(latestAdc.impedances) !== undefined : false;
+        if (!latestAdc || hasValidImp || (!prevValidImp && (ev.weightKg ?? 0) > 0)) {
+          latestAdc = ev;
+        }
       } else if (ev.kind === 'history') {
         historyEvents.push(ev);
       } else if (ev.kind === 'setting') {
@@ -1567,7 +1605,20 @@ function decodeNotifications(notifications) {
       }
     }
   }
-  return { latestWeight, latestAdc, historyEvents, settingEvents };
+  const effectiveWeight = latestStableWeight ?? latestDynamicWeight ?? latestWeight;
+  return {
+    latestWeight: /** @type {Record<string, any> | null} */ (effectiveWeight
+      ? {
+          ...(latestWeight || {}),
+          ...effectiveWeight,
+          stable: Boolean(latestStableWeight),
+        }
+      : null),
+    latestStableWeight,
+    latestAdc,
+    historyEvents,
+    settingEvents,
+  };
 }
 
 function readLiveSessionSnapshot(dataDir, db, activeProfileId, nowMs, ingestCompleted = true) {
@@ -1649,7 +1700,13 @@ function readLiveSessionSnapshot(dataDir, db, activeProfileId, nowMs, ingestComp
     }
 
     if (phase === 'completed') {
-      const weightKg = decoded.latestAdc?.weightKg ?? decoded.latestWeight?.weightKg;
+      const adcWeight = decoded.latestAdc?.weightKg && decoded.latestAdc.weightKg > 0 ? decoded.latestAdc : null;
+      const lockedWeight = decoded.latestStableWeight ?? null;
+      const primaryWeight = lockedWeight ?? adcWeight ?? decoded.latestWeight;
+      const weightKg = primaryWeight?.weightKg;
+      const isStable = Boolean(
+        lockedWeight || (decoded.latestAdc && firstValidResistance(decoded.latestAdc.impedances) !== undefined),
+      );
       if (weightKg && weightKg > 0) {
         const adcs = decoded.latestAdc?.adcs || [];
         const impedances = decoded.latestAdc?.impedances || normalizeImpedances(adcs, weightKg);
@@ -1661,21 +1718,21 @@ function readLiveSessionSnapshot(dataDir, db, activeProfileId, nowMs, ingestComp
           source: 'live',
           deviceMac: devMac,
           weightKg,
-          weightJin: decoded.latestAdc?.weightJin ?? decoded.latestWeight?.weightJin ?? roundTo(weightKg * 2, 2),
-          weightLb: decoded.latestAdc?.weightLb ?? decoded.latestWeight?.weightLb ?? roundTo(weightKg * 2.20462, 2),
-          weightG: decoded.latestAdc?.weightG ?? decoded.latestWeight?.weightG ?? Math.round(weightKg * 1000),
-          stable: true,
+          weightJin: primaryWeight?.weightJin ?? roundTo(weightKg * 2, 2),
+          weightLb: primaryWeight?.weightLb ?? roundTo(weightKg * 2.20462, 2),
+          weightG: primaryWeight?.weightG ?? Math.round(weightKg * 1000),
+          stable: isStable,
           adcs,
           impedances,
-          algType: decoded.latestAdc?.algType ?? decoded.latestWeight?.algType ?? null,
+          algType: decoded.latestAdc?.algType ?? primaryWeight?.algType ?? null,
           battery: decoded.latestWeight?.battery ?? null,
           charging: decoded.latestWeight?.charging ?? null,
           rssi: raw.device?.rssi ?? null,
           calibrationMode: decoded.latestWeight?.calibrationMode ?? null,
           overWeight: decoded.latestWeight?.overWeight ?? null,
-          dianji: decoded.latestAdc?.dianji ?? decoded.latestWeight?.dianji ?? null,
+          dianji: decoded.latestAdc?.dianji ?? primaryWeight?.dianji ?? null,
           rawMeta: {
-            unit: decoded.latestAdc?.unit ?? decoded.latestWeight?.unit,
+            unit: decoded.latestAdc?.unit ?? primaryWeight?.unit,
             supportFuns: decoded.latestWeight?.supportFuns ?? [],
             supportHr: decoded.latestWeight?.supportHr,
             supportPh: decoded.latestWeight?.supportPh,
@@ -1690,12 +1747,16 @@ function readLiveSessionSnapshot(dataDir, db, activeProfileId, nowMs, ingestComp
     }
   }
 
+  const readoutWeight = decoded.latestStableWeight
+    ?? (decoded.latestAdc?.weightKg && decoded.latestAdc.weightKg > 0 ? decoded.latestAdc : null)
+    ?? decoded.latestWeight;
+  const hasValidImpedance = Boolean(decoded.latestAdc && firstValidResistance(decoded.latestAdc.impedances) !== undefined);
   const liveReadout = decoded.latestAdc || decoded.latestWeight
     ? {
-        weightKg: decoded.latestAdc?.weightKg ?? decoded.latestWeight?.weightKg ?? null,
-        weightJin: decoded.latestAdc?.weightJin ?? decoded.latestWeight?.weightJin ?? null,
-        stable: Boolean(decoded.latestAdc || decoded.latestWeight?.stable),
-        impedanceMeasured: Boolean(decoded.latestAdc && firstValidResistance(decoded.latestAdc.impedances) !== undefined),
+        weightKg: readoutWeight?.weightKg ?? null,
+        weightJin: readoutWeight?.weightJin ?? (readoutWeight?.weightKg ? roundTo(readoutWeight.weightKg * 2, 2) : null),
+        stable: Boolean(hasValidImpedance || decoded.latestStableWeight),
+        impedanceMeasured: hasValidImpedance,
         adcs: decoded.latestAdc?.adcs || [],
         impedances: decoded.latestAdc?.impedances || [],
         battery: decoded.latestWeight?.battery ?? null,
@@ -1813,6 +1874,43 @@ async function handleScan(ctx) {
   };
 }
 
+function acquireSessionLockFile(dataDir) {
+  ensurePrivateDir(dataDir);
+  const lockPath = join(dataDir, 'live-session.lock');
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = openSync(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+      try {
+        writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }));
+      } finally {
+        closeSync(fd);
+      }
+      return () => {
+        try {
+          unlinkSync(lockPath);
+        } catch {
+          // ignore cleanup failure
+        }
+      };
+    } catch (err) {
+      if (/** @type {NodeJS.ErrnoException} */ (err)?.code !== 'EEXIST') throw err;
+      const meta = readJsonSafe(lockPath, null);
+      const holderPid = Number(meta?.pid);
+      const stale = !holderPid || !isPidAlive(holderPid) || (Date.now() - Number(meta?.at || 0) > 15_000);
+      if (stale && attempt === 0) {
+        try {
+          unlinkSync(lockPath);
+        } catch {
+          // ignore race
+        }
+        continue;
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
 async function handleMeasureStart(ctx) {
   if (process.platform !== 'linux' && !ctx.hasInjectedBleRunner && !ctx.hasInjectedSpawnMeasure) {
     return disabledBleResult();
@@ -1832,75 +1930,96 @@ async function handleMeasureStart(ctx) {
   const namePrefix = String(ctx.args.namePrefix ?? ctx.config.namePrefix ?? DEFAULT_NAME_PREFIX).trim() || DEFAULT_NAME_PREFIX;
   const sPath = sessionFilePath(ctx.dataDir);
 
-  if (existsSync(sPath)) {
-    const existing = readJsonSafe(sPath, null);
-    if (existing?.pid) {
-      await terminateBleHelperPid(Number(existing.pid));
+  return withFileLock(sPath, async () => {
+    const releaseLock = acquireSessionLockFile(ctx.dataDir);
+    if (!releaseLock) {
+      return {
+        ok: false,
+        notify: false,
+        title: '蓝牙测量启动繁忙',
+        message: '已有另一路蓝牙测量会话正在初始化，请稍后重试或先执行 measure-stop。',
+      };
     }
-  }
 
-  const devRow = ctx.db.prepare('SELECT * FROM devices ORDER BY last_seen_at DESC LIMIT 1').get();
-  const txPacket = encodeTimeAndUserInfo27({
-    deviceType: 0x27,
-    protocolVer: devRow?.protocol_ver ?? 1,
-    user: {
-      age: activeProfile.age,
-      heightCm: activeProfile.heightCm,
-      sex: activeProfile.sex,
-      unit: activeProfile.unit,
-    },
-    nowMs: ctx.nowMs,
+    try {
+      if (existsSync(sPath)) {
+        const existing = readJsonSafe(sPath, null);
+        if (existing?.pid) {
+          await terminateBleHelperPid(Number(existing.pid));
+        }
+      }
+
+      const devRow = ctx.db.prepare('SELECT * FROM devices ORDER BY last_seen_at DESC LIMIT 1').get();
+      const txPacket = encodeTimeAndUserInfo27({
+        deviceType: 0x27,
+        protocolVer: devRow?.protocol_ver ?? 1,
+        user: {
+          age: activeProfile.age,
+          heightCm: activeProfile.heightCm,
+          sex: activeProfile.sex,
+          unit: activeProfile.unit,
+        },
+        nowMs: ctx.nowMs,
+      });
+
+      const sessionId = `meas-${ctx.nowMs}-${randomUUID().slice(0, 6)}`;
+      const initialSession = {
+        sessionId,
+        profileId: activeProfile.id,
+        pid: null,
+        phase: 'scanning',
+        startedAt: ctx.nowMs,
+        updatedAt: ctx.nowMs,
+        timeoutSec,
+        message: '正在启动蓝牙测量会话，请赤脚上秤…',
+        device: null,
+        deviceInfo: {},
+        notifications: [],
+        error: null,
+      };
+      writeJsonAtomic(sPath, initialSession);
+
+      const pid = ctx.spawnMeasure([
+        'measure',
+        '--state-file', sPath,
+        '--session-id', sessionId,
+        '--profile-id', activeProfile.id,
+        '--timeout', String(timeoutSec),
+        '--target-mac', targetMac,
+        '--name-prefix', namePrefix,
+        '--tx-packet-hex', txPacket.toString('hex').toUpperCase(),
+      ]);
+
+      // Brief read-only wait (up to 250ms) for Python helper to flush initial state without overwriting sPath
+      for (let i = 0; i < 5; i++) {
+        await new Promise(r => setTimeout(r, 50));
+        const cur = readJsonSafe(sPath, null);
+        if (cur && cur.sessionId === sessionId && cur.pid) {
+          break;
+        }
+      }
+
+      const postCur = readJsonSafe(sPath, null);
+      if (postCur && postCur.sessionId === sessionId && !postCur.pid && typeof pid === 'number' && pid > 0) {
+        writeJsonAtomic(sPath, { ...postCur, pid });
+      }
+
+      const session = readLiveSessionSnapshot(ctx.dataDir, ctx.db, activeProfile.id, ctx.nowMs, false)
+        || { ...initialSession, pid };
+      session.profileId = session.profileId || activeProfile.id;
+
+      const targetDesc = targetMac ? `${namePrefix} (${targetMac})` : `${namePrefix} (自动扫描匹配)`;
+      return {
+        ok: true,
+        notify: false,
+        title: '已启动实时称重测量',
+        message: `已开始监听沃莱 A1 ${targetDesc}，请赤脚站上体脂秤（限时 ${timeoutSec} 秒）。`,
+        data: { session },
+      };
+    } finally {
+      releaseLock();
+    }
   });
-
-  const sessionId = `meas-${ctx.nowMs}-${randomUUID().slice(0, 6)}`;
-  const initialSession = {
-    sessionId,
-    profileId: activeProfile.id,
-    pid: null,
-    phase: 'scanning',
-    startedAt: ctx.nowMs,
-    updatedAt: ctx.nowMs,
-    timeoutSec,
-    message: '正在启动蓝牙测量会话，请赤脚上秤…',
-    device: null,
-    deviceInfo: {},
-    notifications: [],
-    error: null,
-  };
-  writeJsonAtomic(sPath, initialSession);
-
-  const pid = ctx.spawnMeasure([
-    'measure',
-    '--state-file', sPath,
-    '--session-id', sessionId,
-    '--profile-id', activeProfile.id,
-    '--timeout', String(timeoutSec),
-    '--target-mac', targetMac,
-    '--name-prefix', namePrefix,
-    '--tx-packet-hex', txPacket.toString('hex').toUpperCase(),
-  ]);
-
-  // Brief read-only wait (up to 250ms) for Python helper to flush initial state without overwriting sPath
-  for (let i = 0; i < 5; i++) {
-    await new Promise(r => setTimeout(r, 50));
-    const cur = readJsonSafe(sPath, null);
-    if (cur && cur.sessionId === sessionId && cur.pid) {
-      break;
-    }
-  }
-
-  const session = readLiveSessionSnapshot(ctx.dataDir, ctx.db, activeProfile.id, ctx.nowMs, false)
-    || { ...initialSession, pid };
-  session.profileId = session.profileId || activeProfile.id;
-
-  const targetDesc = targetMac ? `${namePrefix} (${targetMac})` : `${namePrefix} (自动扫描匹配)`;
-  return {
-    ok: true,
-    notify: false,
-    title: '已启动实时称重测量',
-    message: `已开始监听沃莱 A1 ${targetDesc}，请赤脚站上体脂秤（限时 ${timeoutSec} 秒）。`,
-    data: { session },
-  };
 }
 
 async function handleMeasureStatus(ctx) {
@@ -1935,29 +2054,55 @@ async function handleMeasureStatus(ctx) {
   };
 }
 
+function mergeSessionNotifications(a, b) {
+  const out = [];
+  const seen = new Set();
+  for (const list of [a, b]) {
+    if (!Array.isArray(list)) continue;
+    for (const item of list) {
+      const hex = typeof item === 'string' ? item : item?.hex;
+      const at = typeof item === 'object' && item ? item.at : '';
+      const key = `${at}:${hex ?? ''}`;
+      if (!hex || seen.has(key)) continue;
+      seen.add(key);
+      out.push(item);
+    }
+  }
+  return out;
+}
+
 async function handleMeasureStop(ctx) {
   const sPath = sessionFilePath(ctx.dataDir);
   const hadSession = existsSync(sPath);
   if (hadSession) {
-    const raw = readJsonSafe(sPath, null);
-    if (raw) {
-      if (raw.pid) {
-        await terminateBleHelperPid(Number(raw.pid));
+    await withFileLock(sPath, async () => {
+      const before = readJsonSafe(sPath, null);
+      if (before?.pid) {
+        await terminateBleHelperPid(Number(before.pid));
       }
-      const next = {
-        ...raw,
-        phase: raw.phase === 'completed' ? 'completed' : 'stopped',
-        message: raw.phase === 'completed' ? raw.message : '已手动停止本次蓝牙测量',
-        updatedAt: ctx.nowMs,
-      };
-      writeJsonAtomic(sPath, next);
-    }
+      // Re-read after terminating helper so final flushed notifications & offline history frames are preserved.
+      const latest = readJsonSafe(sPath, before) || before;
+      if (latest) {
+        const sameSession = !before?.sessionId || !latest?.sessionId || before.sessionId === latest.sessionId;
+        const mergedNotifications = sameSession
+          ? mergeSessionNotifications(before?.notifications, latest.notifications)
+          : (Array.isArray(latest.notifications) ? latest.notifications : []);
+        const next = {
+          ...latest,
+          notifications: mergedNotifications,
+          phase: latest.phase === 'completed' ? 'completed' : 'stopped',
+          message: latest.phase === 'completed' ? latest.message : '已手动停止本次蓝牙测量',
+          updatedAt: ctx.nowMs,
+        };
+        writeJsonAtomic(sPath, next);
+      }
+    });
   }
   if (process.platform !== 'linux' && !ctx.hasInjectedBleRunner && !ctx.hasInjectedSpawnMeasure && !hadSession) {
     return disabledBleResult();
   }
   const { activeProfile } = resolveProfilesAndActive(ctx.db, ctx.args.profileId);
-  const session = readLiveSessionSnapshot(ctx.dataDir, ctx.db, activeProfile?.id ?? null, ctx.nowMs, false);
+  const session = readLiveSessionSnapshot(ctx.dataDir, ctx.db, activeProfile?.id ?? null, ctx.nowMs, true);
   return {
     ok: true,
     notify: false,
@@ -2507,7 +2652,7 @@ export async function handleVoiceFastpath(request, context = {}) {
 
 async function main() {
   const action = process.argv[2] || 'status';
-  let args = {};
+  let args = /** @type {Record<string, unknown>} */ ({});
   try {
     args = process.argv[3] ? JSON.parse(process.argv[3]) : {};
   } catch {

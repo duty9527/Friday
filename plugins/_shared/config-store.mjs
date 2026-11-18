@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import {
   chmodSync,
   existsSync,
@@ -96,21 +97,61 @@ export function resolvePluginPaths(pluginName, contextOrDeps = {}, extraFiles = 
   return out;
 }
 
+/** @type {Map<string, Promise<unknown>>} */
+const FILE_LOCK_CHAINS = new Map();
+
 /**
- * Ensure a directory exists with private 0o700 permissions (rejecting symlinked leaf if checked).
+ * Serialize async read-modify-write operations on the same canonical file path
+ * within the current process so concurrent actions do not clobber each other.
+ * @template T
+ * @param {string} filePath
+ * @param {() => Promise<T> | T} fn
+ * @returns {Promise<T>}
+ */
+export function withFileLock(filePath, fn) {
+  const key = resolve(filePath);
+  const prev = FILE_LOCK_CHAINS.get(key) ?? Promise.resolve();
+  const next = prev.then(() => fn(), () => fn());
+  const tail = next.then(
+    () => {
+      if (FILE_LOCK_CHAINS.get(key) === tail) FILE_LOCK_CHAINS.delete(key);
+    },
+    () => {
+      if (FILE_LOCK_CHAINS.get(key) === tail) FILE_LOCK_CHAINS.delete(key);
+    },
+  );
+  FILE_LOCK_CHAINS.set(key, tail);
+  return next;
+}
+
+/**
+ * Ensure a directory exists with private 0o700 permissions (strictly rejecting symlinks).
  * @param {string} dirPath
  * @returns {string}
  */
 export function ensurePrivateDir(dirPath) {
-  mkdirSync(dirPath, { recursive: true, mode: 0o700 });
+  let st;
   try {
-    const st = lstatSync(dirPath);
-    if (!st.isSymbolicLink() && st.isDirectory()) {
-      chmodSync(dirPath, 0o700);
-    }
-  } catch {
-    // best-effort permission tightening
+    st = lstatSync(dirPath);
+  } catch (err) {
+    if (/** @type {NodeJS.ErrnoException} */ (err)?.code !== 'ENOENT') throw err;
   }
+  if (st) {
+    if (st.isSymbolicLink()) {
+      throw new Error(`Refusing symlink private directory: ${dirPath}`);
+    }
+    if (!st.isDirectory()) {
+      throw new Error(`Expected directory path, got non-directory: ${dirPath}`);
+    }
+    chmodSync(dirPath, 0o700);
+    return dirPath;
+  }
+  mkdirSync(dirPath, { recursive: true, mode: 0o700 });
+  const created = lstatSync(dirPath);
+  if (created.isSymbolicLink() || !created.isDirectory()) {
+    throw new Error(`Refusing insecure private directory: ${dirPath}`);
+  }
+  chmodSync(dirPath, 0o700);
   return dirPath;
 }
 
@@ -131,7 +172,7 @@ export function readJsonSafe(filePath, fallback) {
 }
 
 /**
- * Atomically write JSON via temp file + rename and apply restrictive 0o600 permissions.
+ * Atomically write JSON via exclusive temp file + rename and apply restrictive 0o600 permissions.
  * @param {string} filePath
  * @param {unknown} value
  * @param {{ mode?: number }} [options]
@@ -140,9 +181,18 @@ export function writeJsonAtomic(filePath, value, options = {}) {
   const mode = options.mode ?? 0o600;
   const parent = dirname(filePath);
   ensurePrivateDir(parent);
-  const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2, 8)}`;
   try {
-    writeFileSync(tmpPath, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode });
+    const existing = lstatSync(filePath);
+    if (existing.isSymbolicLink()) {
+      throw new Error(`Refusing to overwrite symlink file: ${filePath}`);
+    }
+  } catch (err) {
+    if (/** @type {NodeJS.ErrnoException} */ (err)?.code !== 'ENOENT') throw err;
+  }
+  const suffix = randomBytes(6).toString('hex');
+  const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${suffix}`;
+  try {
+    writeFileSync(tmpPath, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode, flag: 'wx' });
     renameSync(tmpPath, filePath);
     try {
       chmodSync(filePath, mode);
@@ -185,12 +235,16 @@ export function writeConfig(configPath, config) {
 
 /**
  * Parse and clamp an integer within `[min, max]`, returning `undefined` when invalid.
+ * Rejects `null`, booleans, objects, and blank strings rather than coercing to `0`.
  * @param {unknown} raw
  * @param {number} min
  * @param {number} max
  * @returns {number | undefined}
  */
 export function clampInt(raw, min, max) {
+  if (raw === null || raw === undefined || typeof raw === 'boolean') return undefined;
+  if (typeof raw === 'string' && !raw.trim()) return undefined;
+  if (typeof raw !== 'number' && typeof raw !== 'string') return undefined;
   const n = Number(raw);
   if (!Number.isFinite(n)) return undefined;
   return Math.max(min, Math.min(max, Math.round(n)));
