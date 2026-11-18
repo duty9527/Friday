@@ -20,7 +20,7 @@ import {
 } from '../shared/bot-expressions.js';
 import { button, element, node } from '../shared/dom.js';
 import { errorText, statusText, timestamp } from '../shared/format.js';
-import { api, appState, hooks } from '../state.js';
+import { api, appState, fetchMessagesBatch, hooks } from '../state.js';
 
 export interface ChatPanelController {
   updateComposer: () => void;
@@ -150,10 +150,8 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       ),
     ];
     if (!missing.length) return;
-    const parents = await Promise.all(
-      missing.slice(0, 40).map(id => api<ChatMessage>(`/api/message?${new URLSearchParams({ messageId: id })}`).catch(() => undefined)),
-    );
-    mergeMessages(parents.filter((message): message is ChatMessage => Boolean(message)));
+    const parents = await fetchMessagesBatch(missing.slice(0, 40)).catch(() => []);
+    mergeMessages(parents);
   }
 
   function actionRow(action: RouteAction): HTMLElement {
@@ -386,7 +384,10 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       speaker.append(node('span', message.role === 'user' && message.status === 'completed' ? 'F.R.I.D.A.Y. 已处理' : statusText(message.status), active(message.status) ? 'running' : ''));
       if (message.mode === 'offline') speaker.append(node('span', '离线模拟'));
       const time = node('time', timestamp(message.at));
-      time.dateTime = new Date(message.at).toISOString();
+      if (Number.isFinite(message.at)) {
+        const parsedTime = new Date(message.at);
+        if (!Number.isNaN(parsedTime.getTime())) time.dateTime = parsedTime.toISOString();
+      }
       speaker.append(time);
       const full = message.text || (active(message.status) ? '等待公开回复…' : '没有公开文本。');
       const visible = full.slice(0, 4000);

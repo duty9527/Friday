@@ -359,6 +359,9 @@ export function initImVoiceHub(): ImVoiceHubController {
     editingImChannelId = ch.id;
     imPlatformInput.value = ch.platform;
     imNameInput.value = ch.name;
+    imWebhookInput.value = '';
+    imTokenInput.value = '';
+    imSecretInput.value = '';
     imTargetInput.value = ch.defaultTarget ?? '';
     imAccountInput.value = ch.accountId ?? '';
     imApibaseInput.value = ch.apiBase ?? '';
@@ -371,14 +374,18 @@ export function initImVoiceHub(): ImVoiceHubController {
   }
 
   async function saveImChannelFromUi() {
+    const isEditing = Boolean(editingImChannelId);
     const platform = imPlatformInput.value as 'dingtalk' | 'wechat' | 'telegram' | 'xiaoai';
     const name = imNameInput.value.trim() || `${imPlatformLabels[platform] ?? platform}助手`;
     const webhookUrl = imWebhookInput.value.trim() || undefined;
     const botToken = imTokenInput.value.trim() || undefined;
     const secret = imSecretInput.value.trim() || undefined;
-    const defaultTarget = imTargetInput.value.trim() || undefined;
-    const accountId = imAccountInput.value.trim() || undefined;
-    const apiBase = imApibaseInput.value.trim() || undefined;
+    const rawTarget = imTargetInput.value.trim();
+    const rawAccount = imAccountInput.value.trim();
+    const rawApiBase = imApibaseInput.value.trim();
+    const defaultTarget = isEditing ? rawTarget : (rawTarget || undefined);
+    const accountId = isEditing ? rawAccount : (rawAccount || undefined);
+    const apiBase = isEditing ? rawApiBase : (rawApiBase || undefined);
     const allowedSenders = imAllowInput.value.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean);
     imSaveBtn.disabled = true;
     try {
@@ -427,6 +434,10 @@ export function initImVoiceHub(): ImVoiceHubController {
   async function removeImChannelFromUi(id: string) {
     try {
       await api<unknown>('/api/im-remove', { id });
+      if (editingImChannelId === id) {
+        resetImChannelForm();
+        imAddDetails.open = false;
+      }
       await hooks.refreshView();
     } catch (error) {
       hooks.connection(`删除 IM 通道失败：${errorText(error)}`, true);
@@ -496,10 +507,8 @@ export function initImVoiceHub(): ImVoiceHubController {
     imTopBadge.textContent = channels.length ? `${activeCount}/${channels.length}` : '0';
 
     if (imHubBackdrop.hidden && !force) {
-      appState.dirtyModals.add('im');
       return;
     }
-    appState.dirtyModals.delete('im');
 
     const controlsDisabled = appState.authExpired || !appState.ready;
     imTgTokenInput.disabled = controlsDisabled || tgQuickBusy;

@@ -2,7 +2,6 @@ import type { ChatMessage, MainView, TraceEvent, VoiceprintStatusView } from '..
 import { createHttpClient, resolveBootstrapToken } from './shared/auth-http.js';
 
 export type Selection = { type: 'all' } | { type: 'task' | 'message'; id: string; label: string };
-export type ModalKey = 'memory' | 'timer' | 'plugin' | 'im' | 'model' | 'usage' | 'health';
 
 export interface Submission {
   requestId: string;
@@ -48,7 +47,6 @@ export const appState = {
   stopRequests: new Set<string>(),
   cursor: 0,
   connectionGeneration: 0,
-  streamController: undefined as AbortController | undefined,
   reconnectTimer: undefined as ReturnType<typeof setTimeout> | undefined,
   retryDelay: 500,
   refreshTimer: undefined as ReturnType<typeof setTimeout> | undefined,
@@ -63,14 +61,13 @@ export const appState = {
   traceHasMore: false,
   traceHasEarlier: false,
   traceBusy: false,
-  traceAgain: false,
+  traceQueuedDirection: undefined as 'live' | 'earlier' | 'recent' | undefined,
   traceMode: 'steps' as 'steps' | 'graph' | 'events',
   selectedEvent: undefined as number | undefined,
   selectedSpan: undefined as string | undefined,
   workData: undefined as unknown,
   workRequest: 0,
   voiceprintState: undefined as VoiceprintStatusView | undefined,
-  dirtyModals: new Set<ModalKey>(),
 };
 
 export const hooks: AppHooks = {
@@ -101,3 +98,15 @@ export const http = createHttpClient({
 
 export const api = http.api;
 export const request = http.request;
+
+export async function fetchMessagesBatch(ids: readonly string[]): Promise<ChatMessage[]> {
+  const unique = [...new Set(ids.filter(Boolean))];
+  if (!unique.length) return [];
+  const items: ChatMessage[] = [];
+  for (let offset = 0; offset < unique.length; offset += 50) {
+    const params = new URLSearchParams({ ids: unique.slice(offset, offset + 50).join(',') });
+    const res = await api<{ items?: ChatMessage[] }>(`/api/messages?${params}`);
+    if (Array.isArray(res.items)) items.push(...res.items);
+  }
+  return items;
+}

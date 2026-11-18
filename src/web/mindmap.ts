@@ -4,6 +4,7 @@ import {
   formatDuration,
   formatTimeShort,
   getEffectiveSessions,
+  mergeSessionLists,
   resolveSessionTurns,
   shortText,
   sourceIcon,
@@ -22,7 +23,8 @@ import {
   type MindmapWorkerPhase,
   type MindmapWorkerStep,
 } from './mindmap-data.js';
-import { ApiError, consumeSseStream, createHttpClient, resolveBootstrapToken } from './shared/auth-http.js';
+import { ApiError, createHttpClient, resolveBootstrapToken } from './shared/auth-http.js';
+import { createSharedSseHub, type SseUpdateBatch } from './shared/sse-hub.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -55,7 +57,6 @@ function domEl<K extends keyof HTMLElementTagNameMap>(
 
 const accessToken = resolveBootstrapToken().token;
 let authExpired = false;
-let sseRetryDelay = 1000;
 let snapshot: MindmapSnapshot | null = null;
 let loadedFlows: MindmapTaskFlow[] = [];
 let viewMode: ViewMode = 'session';
@@ -65,9 +66,19 @@ let searchTerm = '';
 let selectedSessionId = '';
 let selectedFlowId = '';
 let selectedNodeId = '';
-let sseAbort: AbortController | null = null;
 let sseCursor = 0;
+let sseStarted = false;
 let refreshTimer: number | undefined;
+let refreshSeq = 0;
+const expandedTextCache = new Map<string, string>();
+
+function rememberExpandedText(key: string, value: string): void {
+  if (expandedTextCache.size >= 200) {
+    const oldest = expandedTextCache.keys().next().value;
+    if (oldest !== undefined) expandedTextCache.delete(oldest);
+  }
+  expandedTextCache.set(key, value);
+}
 
 const collapseOverride = new Map<string, boolean>();
 let currentGraph: FlowchartGraph | null = null;
@@ -132,8 +143,7 @@ const inspectorBodyEl = el<HTMLElement>('mm-inspector-body');
 
 function markAuthExpired() {
   authExpired = true;
-  sseAbort?.abort();
-  sseAbort = null;
+  sseHub.stop();
   if (refreshTimer) {
     clearTimeout(refreshTimer);
     refreshTimer = undefined;
@@ -698,12 +708,17 @@ function rebuildAndRenderCanvas(shouldFit: boolean) {
     currentGraph = buildSessionFlowchart(activeSession, flowsById, snapshot, collapseOverride, searchTerm);
   }
 
+  const prevSelected = selectedNodeId;
+  const prevScrollTop = inspectorBodyEl.scrollTop;
   const activeNode = (selectedNodeId && currentGraph.nodes.find(n => n.id === selectedNodeId)) ?? currentGraph.nodes[0];
   if (activeNode) selectedNodeId = activeNode.id;
 
   renderFlowchartCanvas();
   if (shouldFit) fitWidthTop();
-  if (activeNode) renderInspectorForNode(activeNode);
+  if (activeNode) {
+    renderInspectorForNode(activeNode);
+    if (activeNode.id === prevSelected) inspectorBodyEl.scrollTop = prevScrollTop;
+  }
 }
 
 function renderListMatrix() {
@@ -892,10 +907,12 @@ function appendIngressSection(container: HTMLElement, flow: MindmapTaskFlow) {
     sec.appendChild(list);
   }
 
-  const pre = domEl('pre', 'mm-pre', flow.ingress.text);
+  const ingressCacheKey = flow.ingress.messageId ? `ingress:${flow.ingress.messageId}` : '';
+  const cachedIngressText = ingressCacheKey ? expandedTextCache.get(ingressCacheKey) : undefined;
+  const pre = domEl('pre', 'mm-pre', cachedIngressText ?? flow.ingress.text);
   sec.appendChild(pre);
 
-  if (flow.ingress.textTruncated && flow.ingress.messageId) {
+  if (flow.ingress.textTruncated && flow.ingress.messageId && cachedIngressText === undefined) {
     const loadFullBtn = domEl('button', 'mm-mini-btn', '查看未截断原始消息全文');
     loadFullBtn.type = 'button';
     loadFullBtn.addEventListener('click', async () => {
@@ -903,10 +920,12 @@ function appendIngressSection(container: HTMLElement, flow: MindmapTaskFlow) {
       loadFullBtn.textContent = '正在加载全文…';
       try {
         const full = await apiGet<{ text: string }>(`/api/message?messageId=${encodeURIComponent(flow.ingress.messageId!)}`);
+        rememberExpandedText(ingressCacheKey, full.text);
         pre.textContent = full.text;
         loadFullBtn.remove();
       } catch {
-        loadFullBtn.textContent = '加载失败';
+        loadFullBtn.disabled = false;
+        loadFullBtn.textContent = '加载失败，重试';
       }
     });
     sec.appendChild(loadFullBtn);
@@ -964,12 +983,14 @@ function appendWorkerStepSection(container: HTMLElement, task: MindmapTaskDetail
     sec.appendChild(domEl('strong', 'mm-kv-k', '调用入参 / 命令：'));
     sec.appendChild(domEl('pre', 'mm-pre', step.inputPreview));
   }
-  const outPre = domEl('pre', 'mm-pre', step.outputPreview ?? '（无文本输出）');
-  if (step.outputPreview) {
+  const opCacheKey = step.operationId ? `op:${task.id}:${step.operationId}` : '';
+  const cachedOpOut = opCacheKey ? expandedTextCache.get(opCacheKey) : undefined;
+  const outPre = domEl('pre', 'mm-pre', cachedOpOut ?? step.outputPreview ?? '（无文本输出）');
+  if (cachedOpOut !== undefined || step.outputPreview) {
     sec.appendChild(domEl('strong', 'mm-kv-k', '执行结果输出：'));
     sec.appendChild(outPre);
   }
-  if (step.operationId && step.hasFullOperation) {
+  if (step.operationId && step.hasFullOperation && cachedOpOut === undefined) {
     const btn = domEl('button', 'mm-mini-btn', '从后台拉取完整工具原始输出');
     btn.type = 'button';
     btn.addEventListener('click', async () => {
@@ -977,11 +998,17 @@ function appendWorkerStepSection(container: HTMLElement, task: MindmapTaskDetail
       btn.textContent = '拉取中…';
       try {
         const op = await apiGet<{ result?: string; error?: string }>(`/api/operation?taskId=${encodeURIComponent(task.id)}&operationId=${encodeURIComponent(step.operationId!)}`);
-        outPre.textContent = op.result ?? op.error ?? '（空）';
-        if (!step.outputPreview) sec.appendChild(outPre);
+        const text = op.result ?? op.error ?? '（空）';
+        rememberExpandedText(opCacheKey, text);
+        outPre.textContent = text;
+        if (!step.outputPreview) {
+          sec.appendChild(domEl('strong', 'mm-kv-k', '执行结果输出：'));
+          sec.appendChild(outPre);
+        }
         btn.remove();
       } catch {
-        btn.textContent = '拉取失败';
+        btn.disabled = false;
+        btn.textContent = '拉取失败，重试';
       }
     });
     sec.appendChild(btn);
@@ -1008,18 +1035,24 @@ function appendDeliverySection(container: HTMLElement, flow: MindmapTaskFlow, fo
       const head = domEl('div', 'mm-sub-card-head');
       head.append(domEl('span', undefined, `${del.roleLabel} · #${del.seq}`), domEl('span', 'mm-badge', `${formatTimeShort(del.at)} · ${statusLabel(del.status)}`));
       card.appendChild(head);
-      const pre = domEl('pre', 'mm-pre', del.text || del.reason || '（空）');
+      const delCacheKey = `del:${del.messageId}`;
+      const cachedDel = expandedTextCache.get(delCacheKey);
+      const pre = domEl('pre', 'mm-pre', cachedDel ?? (del.text || del.reason || '（空）'));
       card.appendChild(pre);
-      if (del.textTruncated) {
+      if (del.textTruncated && cachedDel === undefined) {
         const btn = domEl('button', 'mm-mini-btn', '查看完整回复正文');
         btn.type = 'button';
         btn.addEventListener('click', async () => {
           btn.disabled = true;
           try {
             const full = await apiGet<{ text: string }>(`/api/message?messageId=${encodeURIComponent(del.messageId)}`);
+            rememberExpandedText(delCacheKey, full.text);
             pre.textContent = full.text;
             btn.remove();
-          } catch { btn.textContent = '加载失败'; }
+          } catch {
+            btn.disabled = false;
+            btn.textContent = '加载失败，重试';
+          }
         });
         card.appendChild(btn);
       }
@@ -1043,18 +1076,26 @@ function appendTaskOverviewSection(container: HTMLElement, task: MindmapTaskDeta
   sec.appendChild(domEl('pre', 'mm-pre', task.prompt));
   if (task.reportPreview) {
     sec.appendChild(domEl('strong', 'mm-kv-k', 'Worker 提交的成果报告：'));
-    const repPre = domEl('pre', 'mm-pre', task.reportPreview);
+    const workCacheKey = `work:${task.id}`;
+    const cachedReport = expandedTextCache.get(workCacheKey);
+    const repPre = domEl('pre', 'mm-pre', cachedReport ?? task.reportPreview);
     sec.appendChild(repPre);
-    if (task.reportTruncated) {
+    if (task.reportTruncated && cachedReport === undefined) {
       const btn = domEl('button', 'mm-mini-btn', '查看未截断 Worker 完整报告');
       btn.type = 'button';
       btn.addEventListener('click', async () => {
         btn.disabled = true;
         try {
           const full = await apiGet<{ report?: string }>(`/api/work?taskId=${encodeURIComponent(task.id)}`);
-          if (full.report) repPre.textContent = full.report;
+          if (full.report) {
+            rememberExpandedText(workCacheKey, full.report);
+            repPre.textContent = full.report;
+          }
           btn.remove();
-        } catch { btn.textContent = '加载失败'; }
+        } catch {
+          btn.disabled = false;
+          btn.textContent = '加载失败，重试';
+        }
       });
       sec.appendChild(btn);
     }
@@ -1348,25 +1389,87 @@ function switchViewMode(next: ViewMode) {
   }
 }
 
+const sseHub = createSharedSseHub({
+  token: accessToken,
+  request: http.request,
+  isStopped: () => authExpired,
+  onConnected: viaLeader => {
+    if (!snapshot) return;
+    const sessCount = snapshot.summary.totalSessions ?? getEffectiveSessions(snapshot, loadedFlows).length;
+    setConnState('live', `已连接实时库${viaLeader ? '（共享流）' : ''} (${sessCount} 会话 · ${snapshot.summary.totalFlows} 句)`);
+  },
+  onError: err => {
+    if (authExpired) return;
+    if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+      markAuthExpired();
+      return;
+    }
+    setConnState('error', '实时流重连中…');
+  },
+  onUpdates: (batch: SseUpdateBatch) => {
+    if (authExpired) return;
+    const cursorReset = Boolean(batch.reset) || batch.cursor < sseCursor;
+    if (cursorReset) {
+      sseCursor = batch.cursor;
+      if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = undefined; }
+      void refreshMindmap(false);
+      return;
+    }
+    if (typeof batch.cursor === 'number') {
+      sseCursor = Math.max(sseCursor, batch.cursor);
+    }
+    if (refreshTimer) clearTimeout(refreshTimer);
+    refreshTimer = window.setTimeout(() => {
+      refreshTimer = undefined;
+      void refreshMindmap(false);
+    }, 450);
+  },
+});
+
+window.addEventListener('pagehide', () => {
+  if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = undefined; }
+  sseHub.stop();
+});
+
 async function refreshMindmap(fitOnFirst = false) {
   if (authExpired) return;
+  const seq = ++refreshSeq;
   try {
     setConnState('loading', '同步中…');
     const data = await apiGet<MindmapSnapshot>('/api/mindmap?limit=120');
+    if (seq !== refreshSeq || authExpired) return;
     authBannerEl.hidden = true;
+    const dbReset = Boolean(snapshot && data.cursor < snapshot.cursor);
+    const prevIds = new Set(loadedFlows.map(flow => flow.id));
     const latestIds = new Set(data.flows.map(flow => flow.id));
-    const olderPreserved = loadedFlows.filter(flow => !latestIds.has(flow.id));
-    loadedFlows = [...data.flows, ...olderPreserved];
-    const hasOlderPreserved = olderPreserved.length > 0;
-    snapshot = hasOlderPreserved && snapshot
-      ? {
-          ...data,
-          flows: loadedFlows,
-          hasMore: snapshot.hasMore,
-          beforeSeq: snapshot.beforeSeq,
-        }
-      : data;
-    const sessCount = data.summary.totalSessions ?? getEffectiveSessions(data, loadedFlows).length;
+    const olderPreserved = dbReset ? [] : loadedFlows.filter(flow => !latestIds.has(flow.id));
+    const hasOverlapWithLoaded = data.flows.some(flow => prevIds.has(flow.id));
+    const hasPaginationGap = !dbReset && olderPreserved.length > 0 && data.hasMore && !hasOverlapWithLoaded;
+
+    if (dbReset) {
+      collapseOverride.clear();
+      expandedTextCache.clear();
+      sseCursor = data.cursor;
+      sseHub.setCursor(data.cursor);
+    }
+
+    if (dbReset || hasPaginationGap || olderPreserved.length === 0) {
+      loadedFlows = data.flows;
+      snapshot = data;
+    } else {
+      loadedFlows = [...data.flows, ...olderPreserved];
+      snapshot = snapshot
+        ? {
+            ...data,
+            flows: loadedFlows,
+            sessions: mergeSessionLists(data.sessions, snapshot.sessions),
+            hasMore: snapshot.hasMore,
+            beforeSeq: snapshot.beforeSeq,
+          }
+        : data;
+    }
+
+    const sessCount = data.summary.totalSessions ?? getEffectiveSessions(snapshot, loadedFlows).length;
     setConnState('live', `已连接实时库 (${sessCount} 会话 · ${data.summary.totalFlows} 句)`);
     renderKpis();
     renderSidebar();
@@ -1374,6 +1477,7 @@ async function refreshMindmap(fitOnFirst = false) {
     else rebuildAndRenderCanvas(fitOnFirst);
     ensureSseConnected(data.cursor);
   } catch (err) {
+    if (seq !== refreshSeq) return;
     if (!(err instanceof ApiError && err.status === 401)) {
       setConnState('error', '读取失败');
     }
@@ -1381,23 +1485,30 @@ async function refreshMindmap(fitOnFirst = false) {
 }
 
 async function loadMoreFlows() {
-  if (!snapshot?.hasMore || !snapshot.beforeSeq || authExpired) return;
+  if (!snapshot?.hasMore || snapshot.beforeSeq === undefined || authExpired || loadMoreBtn.disabled) return;
   loadMoreBtn.disabled = true;
   loadMoreBtn.textContent = '加载中…';
   try {
     const older = await apiGet<MindmapSnapshot>(`/api/mindmap?limit=100&before=${snapshot.beforeSeq}`);
+    if (authExpired) return;
     const seen = new Set(loadedFlows.map(f => f.id));
     for (const f of older.flows) {
       if (!seen.has(f.id)) loadedFlows.push(f);
     }
     snapshot = {
       ...snapshot,
+      flows: loadedFlows,
+      sessions: mergeSessionLists(snapshot.sessions, older.sessions),
       hasMore: older.hasMore,
       beforeSeq: older.beforeSeq,
     };
     renderSidebar();
     if (viewMode === 'list') renderListMatrix();
     else rebuildAndRenderCanvas(false);
+  } catch (err) {
+    if (!(err instanceof ApiError && err.status === 401)) {
+      setConnState('error', '加载历史失败');
+    }
   } finally {
     loadMoreBtn.disabled = false;
     loadMoreBtn.textContent = '加载更早的历史会话消息…';
@@ -1405,45 +1516,14 @@ async function loadMoreFlows() {
 }
 
 function ensureSseConnected(initialCursor: number) {
-  sseCursor = Math.max(sseCursor, initialCursor);
-  if (sseAbort || !accessToken || authExpired) return;
-  const startStream = async () => {
-    const controller = new AbortController();
-    sseAbort = controller;
-    try {
-      const response = await http.request(`/api/stream?after=${sseCursor}`, {
-        signal: controller.signal,
-        headers: { Accept: 'text/event-stream' },
-      });
-      sseRetryDelay = 1000;
-      await consumeSseStream(response, {
-        shouldContinue: () => !controller.signal.aborted && !authExpired,
-        onEvent: (kind, raw) => {
-          if (kind === 'updates' && raw) {
-            sseRetryDelay = 1000;
-            try {
-              const batch = JSON.parse(raw) as { cursor?: number };
-              if (typeof batch.cursor === 'number') sseCursor = Math.max(sseCursor, batch.cursor);
-            } catch { /* ignore */ }
-            if (refreshTimer) clearTimeout(refreshTimer);
-            refreshTimer = window.setTimeout(() => { void refreshMindmap(false); }, 450);
-          }
-        },
-      });
-    } catch (err) {
-      if (sseAbort === controller) sseAbort = null;
-      if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
-        markAuthExpired();
-        return;
-      }
-      if (!controller.signal.aborted && accessToken && !authExpired) {
-        const waitMs = sseRetryDelay;
-        sseRetryDelay = Math.min(sseRetryDelay * 2, 10_000);
-        window.setTimeout(() => ensureSseConnected(sseCursor), waitMs);
-      }
-    }
-  };
-  void startStream();
+  sseCursor = sseStarted ? Math.max(sseCursor, initialCursor) : initialCursor;
+  if (!accessToken || authExpired) return;
+  if (!sseStarted) {
+    sseStarted = true;
+    sseHub.start(sseCursor);
+  } else {
+    sseHub.setCursor(sseCursor);
+  }
 }
 
 /* ==================== 交互事件绑定 ==================== */
@@ -1513,6 +1593,9 @@ expandAllBtn.addEventListener('click', () => {
 
 collapseAllBtn.addEventListener('click', () => {
   if (!currentGraph) return;
+  for (const frame of currentGraph.frames) {
+    if (frame.toggleKey) collapseOverride.set(frame.toggleKey, true);
+  }
   for (const node of currentGraph.nodes) {
     if (node.toggleKey && node.kind !== 'worker_more') collapseOverride.set(node.toggleKey, true);
   }

@@ -4,7 +4,7 @@ import {
   createLiveBotAvatar,
   deriveFridayBotState,
 } from './shared/bot-avatar.js';
-import { consumeSseStream } from './shared/auth-http.js';
+import { createSharedSseHub, type SseUpdateBatch } from './shared/sse-hub.js';
 import { element, node } from './shared/dom.js';
 import { errorText } from './shared/format.js';
 import { initChatPanel } from './panels/chat.js';
@@ -15,13 +15,7 @@ import { initImVoiceHub } from './hubs/im-voice-hub.js';
 import { initModelHub } from './hubs/model-hub.js';
 import { initUsageHub } from './hubs/usage-hub.js';
 import type { HealthScaleUiController } from './plugins/health-scale-ui.js';
-import { api, appState, hooks, request } from './state.js';
-
-interface StreamBatch {
-  events: TraceEvent[];
-  cursor: number;
-  head: number;
-}
+import { api, appState, fetchMessagesBatch, hooks, request } from './state.js';
 
 const connectionEl = element('connection');
 const reconnectBtn = element<HTMLButtonElement>('reconnect');
@@ -180,9 +174,9 @@ function closeAllHubModals(): void {
 function expireAuthentication(): void {
   appState.authExpired = true;
   appState.ready = false;
-  appState.streamController?.abort();
-  if (appState.reconnectTimer) clearTimeout(appState.reconnectTimer);
-  if (appState.refreshTimer) clearTimeout(appState.refreshTimer);
+  sseHub.stop();
+  if (appState.reconnectTimer) { clearTimeout(appState.reconnectTimer); appState.reconnectTimer = undefined; }
+  if (appState.refreshTimer) { clearTimeout(appState.refreshTimer); appState.refreshTimer = undefined; }
   imVoiceHub.stopWechatQrPoll();
   healthScaleUi?.closeModal();
   connection('访问链接已失效。请从当前服务的本地启动链接重新进入（服务重启后需使用新链接）。', true);
@@ -219,68 +213,94 @@ function scheduleRefresh(): void {
   }, 150);
 }
 
+let activeRefresh: Promise<void> | undefined;
+let refreshRunSeq = 0;
+
 async function refreshView(initial = false): Promise<void> {
-  if (appState.refreshBusy) {
+  if (activeRefresh) {
     appState.refreshAgain = true;
-    return;
+    await activeRefresh;
+    if (!initial || appState.view || appState.authExpired) return;
   }
+  const runSeq = ++refreshRunSeq;
   appState.refreshBusy = true;
-  try {
-    const result = await api<MainView>('/api/view');
-    const selectedTaskId = appState.selection.type === 'task' ? appState.selection.id : undefined;
-    const previousWorkStatus = appState.view?.works.find(work => work.id === selectedTaskId)?.status;
-    appState.view = result;
-    appState.voiceprintState = result.voiceprint;
-    for (const work of result.works) {
-      if (['completed', 'failed', 'cancelled'].includes(work.status)) {
-        appState.stopRequests.delete(`task:${work.id}`);
+  const run = (async () => {
+    try {
+      const result = await api<MainView>('/api/view');
+      const selectedTaskId = appState.selection.type === 'task' ? appState.selection.id : undefined;
+      const previousWorkStatus = appState.view?.works.find(work => work.id === selectedTaskId)?.status;
+      const cursorReset = !initial && result.cursor < appState.cursor;
+      appState.view = result;
+      appState.voiceprintState = result.voiceprint;
+      if (cursorReset) {
+        appState.messages.clear();
+        appState.followedMessage = undefined;
+        appState.traceAfter = 0;
+        appState.traceEvents = [];
+        appState.traceHasMore = false;
+        appState.traceHasEarlier = false;
+        appState.historyBefore = result.messages.before;
+        appState.historyHasMore = result.messages.hasMore;
+        appState.cursor = result.cursor;
+        sseHub.setCursor(result.cursor);
+      }
+      for (const work of result.works) {
+        if (['completed', 'failed', 'cancelled'].includes(work.status)) {
+          appState.stopRequests.delete(`task:${work.id}`);
+        }
+      }
+      for (const message of result.messages.items) {
+        if (!active(message.status)) appState.stopRequests.delete(`message:${message.id}`);
+      }
+      appState.ready = true;
+      chatPanel.mergeMessages(result.messages.items);
+      await chatPanel.hydrateParents();
+      if (initial || appState.historyBefore === undefined) {
+        appState.historyBefore = result.messages.before;
+        appState.historyHasMore = result.messages.hasMore;
+      }
+      if (initial) {
+        appState.cursor = result.cursor;
+        sseHub.setCursor(result.cursor);
+      }
+      modeEl.textContent = result.mode === 'offline' ? '离线模拟' : '真实模式';
+      modeEl.classList.toggle('offline', result.mode === 'offline');
+      chatPanel.renderMessages();
+      tracePanel.renderWorks();
+      memoryHub.render();
+      timerPluginHub.renderTimers();
+      timerPluginHub.renderPlugins();
+      imVoiceHub.render();
+      modelHub.render();
+      usageHub.render();
+      const healthPlugin = appState.view?.plugins?.find(p => p.name === 'health-scale');
+      const healthEnabled = healthPlugin ? healthPlugin.enabled !== false : false;
+      openHealthHubTop.hidden = !healthEnabled;
+      if (!healthEnabled && !healthHubBackdrop.hidden) {
+        healthScaleUi?.closeModal();
+        healthHubBackdrop.hidden = true;
+      }
+      chatPanel.updateComposer();
+      followLatestMessage();
+      trackCompanionTransitions(initial);
+      if (
+        !initial
+        && appState.selection.type === 'task'
+        && result.works.find(work => work.id === selectedTaskId)?.status !== previousWorkStatus
+      ) {
+        void tracePanel.loadWork(appState.selection.id, appState.selectionGeneration, true);
+      }
+    } finally {
+      appState.refreshBusy = false;
+      if (refreshRunSeq === runSeq) activeRefresh = undefined;
+      if (appState.refreshAgain && !appState.authExpired) {
+        appState.refreshAgain = false;
+        scheduleRefresh();
       }
     }
-    for (const message of result.messages.items) {
-      if (!active(message.status)) appState.stopRequests.delete(`message:${message.id}`);
-    }
-    appState.ready = true;
-    chatPanel.mergeMessages(result.messages.items);
-    await chatPanel.hydrateParents();
-    if (initial || appState.historyBefore === undefined) {
-      appState.historyBefore = result.messages.before;
-      appState.historyHasMore = result.messages.hasMore;
-    }
-    if (initial) appState.cursor = result.cursor;
-    modeEl.textContent = result.mode === 'offline' ? '离线模拟' : '真实模式';
-    modeEl.classList.toggle('offline', result.mode === 'offline');
-    chatPanel.renderMessages();
-    tracePanel.renderWorks();
-    memoryHub.render();
-    timerPluginHub.renderTimers();
-    timerPluginHub.renderPlugins();
-    imVoiceHub.render();
-    modelHub.render();
-    usageHub.render();
-    const healthPlugin = appState.view?.plugins?.find(p => p.name === 'health-scale');
-    const healthEnabled = healthPlugin ? healthPlugin.enabled !== false : false;
-    openHealthHubTop.hidden = !healthEnabled;
-    if (!healthEnabled && !healthHubBackdrop.hidden) {
-      healthScaleUi?.closeModal();
-      healthHubBackdrop.hidden = true;
-    }
-    chatPanel.updateComposer();
-    followLatestMessage();
-    trackCompanionTransitions(initial);
-    if (
-      !initial
-      && appState.selection.type === 'task'
-      && result.works.find(work => work.id === selectedTaskId)?.status !== previousWorkStatus
-    ) {
-      void tracePanel.loadWork(appState.selection.id, appState.selectionGeneration, true);
-    }
-  } finally {
-    appState.refreshBusy = false;
-    if (appState.refreshAgain && !appState.authExpired) {
-      appState.refreshAgain = false;
-      scheduleRefresh();
-    }
-  }
+  })();
+  activeRefresh = run;
+  return run;
 }
 
 Object.assign(hooks, {
@@ -303,13 +323,61 @@ Object.assign(hooks, {
   closeAllHubModals,
 });
 
-async function connect(): Promise<void> {
+const sseHub = createSharedSseHub({
+  token: appState.token,
+  request,
+  isStopped: () => appState.authExpired,
+  onConnected: viaLeader => {
+    reconnectBtn.disabled = false;
+    const runtimeStatus = appState.view?.health.executorAvailable === false ? '执行器不可用，服务降级' : '后台服务持续运行';
+    const prefix = viaLeader ? '本机已连接（共享流）' : '本机已连接';
+    connection(`${prefix} · ${runtimeStatus}${appState.storageUnavailable ? ' · 当前标签页无法保存访问链接' : ''}`);
+  },
+  onError: error => {
+    if (appState.authExpired) return;
+    connection(`连接已断开 / 数据可能过时：${errorText(error)}。后台工作继续；消息不会自动重发。`, true);
+    reconnectBtn.disabled = false;
+  },
+  onUpdates: async (batch: SseUpdateBatch) => {
+    if (appState.authExpired) return;
+    const cursorReset = Boolean(batch.reset) || batch.cursor < appState.cursor;
+    if (cursorReset) {
+      appState.messages.clear();
+      appState.followedMessage = undefined;
+      appState.traceAfter = 0;
+      appState.traceEvents = [];
+      appState.cursor = batch.cursor;
+      scheduleRefresh();
+      return;
+    }
+    const fresh = batch.events.filter(event => event.seq > appState.cursor);
+    const ids = [...new Set(
+      fresh
+        .filter(event => event.type === 'message' || event.kind === 'work_linked')
+        .map(event => event.messageId)
+        .filter((id): id is string => Boolean(id)),
+    )];
+    const changed = ids.length ? await fetchMessagesBatch(ids) : [];
+    if (appState.authExpired) return;
+    chatPanel.mergeMessages(changed);
+    await chatPanel.hydrateParents();
+    if (changed.length) {
+      chatPanel.renderMessages();
+      trackCompanionTransitions(false);
+    }
+    appState.cursor = Math.max(appState.cursor, batch.cursor);
+    if (fresh.length) scheduleRefresh();
+  },
+});
+
+window.addEventListener('pagehide', () => { sseHub.stop(); });
+
+let sseStarted = false;
+
+async function connect(forceReconnect = false): Promise<void> {
   if (!appState.token || appState.authExpired) return;
   const generation = ++appState.connectionGeneration;
-  appState.streamController?.abort();
-  if (appState.reconnectTimer) clearTimeout(appState.reconnectTimer);
-  appState.streamController = new AbortController();
-  const controller = appState.streamController;
+  if (appState.reconnectTimer) { clearTimeout(appState.reconnectTimer); appState.reconnectTimer = undefined; }
   reconnectBtn.disabled = true;
   connection(appState.ready ? '正在恢复连接，保留上次数据…' : '正在连接本机服务…', appState.ready);
   try {
@@ -327,50 +395,24 @@ async function connect(): Promise<void> {
     } else if (!appState.traceHasMore) {
       void tracePanel.loadTrace('live');
     }
-    const response = await request(`/api/stream?after=${appState.cursor}`, {
-      signal: controller.signal,
-      headers: { Accept: 'text/event-stream' },
-    });
-    if (generation !== appState.connectionGeneration) return;
+    appState.retryDelay = 500;
     reconnectBtn.disabled = false;
-    connection('本机已连接 · 后台服务持续运行');
-    await consumeSseStream(response, {
-      shouldContinue: () => generation === appState.connectionGeneration,
-      onEvent: async (eventName, rawData) => {
-        if (eventName !== 'updates' || generation !== appState.connectionGeneration) return;
-        const batch = JSON.parse(rawData) as StreamBatch;
-        const fresh = batch.events.filter(event => event.seq > appState.cursor);
-        const ids = [...new Set(
-          fresh
-            .filter(event => event.type === 'message' || event.kind === 'work_linked')
-            .map(event => event.messageId)
-            .filter((id): id is string => Boolean(id)),
-        )];
-        const changed = await Promise.all(ids.map(id => api<ChatMessage>(`/api/message?${new URLSearchParams({ messageId: id })}`)));
-        if (generation !== appState.connectionGeneration) return;
-        chatPanel.mergeMessages(changed);
-        await chatPanel.hydrateParents();
-        if (changed.length) {
-          chatPanel.renderMessages();
-          trackCompanionTransitions(false);
-        }
-        appState.cursor = Math.max(appState.cursor, batch.cursor);
-        appState.retryDelay = 500;
-        const runtimeStatus = appState.view?.health.executorAvailable === false ? '执行器不可用，服务降级' : '后台服务持续运行';
-        connection(`本机已连接 · ${runtimeStatus}${appState.storageUnavailable ? ' · 当前标签页无法保存访问链接' : ''}`);
-        if (fresh.length) scheduleRefresh();
-      },
-    });
+    if (forceReconnect && sseStarted) {
+      sseHub.reconnect(appState.cursor);
+    } else {
+      sseStarted = true;
+      sseHub.start(appState.cursor);
+    }
   } catch (error) {
-    if (generation !== appState.connectionGeneration || appState.authExpired || controller.signal.aborted) return;
+    if (generation !== appState.connectionGeneration || appState.authExpired) return;
     connection(`连接已断开 / 数据可能过时：${errorText(error)}。后台工作继续；消息不会自动重发。`, true);
     reconnectBtn.disabled = false;
-    appState.reconnectTimer = setTimeout(() => { void connect(); }, appState.retryDelay);
+    appState.reconnectTimer = setTimeout(() => { void connect(forceReconnect); }, appState.retryDelay);
     appState.retryDelay = Math.min(appState.retryDelay * 2, 5000);
   }
 }
 
-reconnectBtn.addEventListener('click', () => { appState.retryDelay = 500; void connect(); });
+reconnectBtn.addEventListener('click', () => { appState.retryDelay = 500; void connect(true); });
 
 openHealthHubTop.addEventListener('click', () => {
   openHealthHubTop.disabled = true;

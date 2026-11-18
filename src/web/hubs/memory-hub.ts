@@ -1,4 +1,4 @@
-import type { ContextSearchHit, MemoryCard } from '../../view.js';
+import type { ContextSearchHit, MainView, MemoryCard } from '../../view.js';
 import { GoldenBrainStage, type BrainMemoryItem } from '../brain.js';
 import { button, element, kpiCard, node } from '../shared/dom.js';
 import { errorText, synapseRelationNames, timestamp } from '../shared/format.js';
@@ -42,10 +42,21 @@ export function initMemoryHub(): MemoryHubController {
   const memoriesList = element<HTMLElement>('memories-list');
 
   let fullMemoriesCache: MemoryCard[] | undefined;
+  let fullMemoriesSig: string | undefined;
+  let fullMemoriesBusy = false;
   let memoryFilterMode: 'all' | 'pinned' | 'synapse' = 'all';
   let editingMemoryId: string | undefined;
   let searchMatchedMemoryIds: Set<string> | undefined;
   let enteredNativeFullscreen = false;
+
+  function directorySignature(dir: MainView['memoryDirectory'] | undefined): string {
+    if (!dir) return '';
+    const latestAt = dir.items.reduce((max, item) => Math.max(max, item.updatedAt ?? 0), 0);
+    const itemsSig = dir.items
+      .map(item => `${item.id}:${item.updatedAt ?? 0}:${item.pinned ? 1 : 0}:${item.accessCount ?? 0}`)
+      .join('|');
+    return `${dir.totalActive}:${latestAt}:${itemsSig}`;
+  }
 
   function syncBrainCardSelectionClass(selectedId?: string) {
     for (const el of memoriesList.querySelectorAll<HTMLElement>('.memory-card')) {
@@ -90,15 +101,20 @@ export function initMemoryHub(): MemoryHubController {
   }
 
   async function fetchFullMemories() {
-    if (!appState.ready || appState.authExpired) return;
+    if (!appState.ready || appState.authExpired || fullMemoriesBusy) return;
+    const sig = directorySignature(appState.view?.memoryDirectory);
+    fullMemoriesBusy = true;
     try {
       const list = await api<MemoryCard[]>('/api/memories');
       if (Array.isArray(list)) {
         fullMemoriesCache = list;
+        fullMemoriesSig = sig;
         render();
       }
     } catch {
       /* fallback to view.memoryDirectory */
+    } finally {
+      fullMemoriesBusy = false;
     }
   }
 
@@ -141,6 +157,10 @@ export function initMemoryHub(): MemoryHubController {
   async function removeMemoryFromUi(id: string) {
     try {
       await api<unknown>('/api/memory-remove', { id });
+      if (editingMemoryId === id) {
+        resetMemoryForm();
+        memoryAddDetails.open = false;
+      }
       await hooks.refreshView();
       await fetchFullMemories();
     } catch (error) {
@@ -254,15 +274,21 @@ export function initMemoryHub(): MemoryHubController {
 
   function render(force = false) {
     const directory = appState.view?.memoryDirectory;
+    const dirSig = directorySignature(directory);
+    if (fullMemoriesCache && dirSig !== fullMemoriesSig) {
+      fullMemoriesCache = undefined;
+      fullMemoriesSig = undefined;
+    }
     const baseItems = fullMemoriesCache ?? directory?.items ?? [];
     const total = directory?.totalActive ?? baseItems.length;
     memoryTopBadge.textContent = String(total);
 
     if (memoryHubBackdrop.hidden && !force) {
-      appState.dirtyModals.add('memory');
       return;
     }
-    appState.dirtyModals.delete('memory');
+    if (!fullMemoriesCache && !fullMemoriesBusy && appState.ready && !appState.authExpired) {
+      void fetchFullMemories();
+    }
 
     const pinnedCount = baseItems.filter(i => i.pinned).length;
     const synapseCount = baseItems.reduce((sum, i) => sum + (i.synapses?.length ?? 0), 0);

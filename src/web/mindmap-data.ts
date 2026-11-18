@@ -137,50 +137,145 @@ export function resolveSessionTurns(session: MindmapSession, flowsById: Map<stri
   return turns;
 }
 
+function cloneSession(session: MindmapSession): MindmapSession {
+  return {
+    ...session,
+    channels: [...session.channels],
+    turnFlowIds: [...session.turnFlowIds],
+    turnSummaries: session.turnSummaries.map(summary => ({ ...summary, taskIds: [...summary.taskIds] })),
+  };
+}
+
+function summarizeFlowTurn(flow: MindmapTaskFlow): MindmapSessionTurnSummary {
+  return {
+    flowId: flow.id,
+    seq: flow.seq,
+    at: flow.createdAt,
+    sourceKind: flow.ingress.sourceKind,
+    channelLabel: flow.ingress.channelLabel,
+    textPreview: shortText(flow.ingress.text, 120),
+    status: flow.status,
+    taskIds: flow.tasks.map(t => t.id),
+  };
+}
+
+function mergeSessionInto(target: MindmapSession, incoming: MindmapSession): void {
+  const existingIds = new Set(target.turnFlowIds);
+  for (const summary of incoming.turnSummaries) {
+    if (!existingIds.has(summary.flowId)) {
+      existingIds.add(summary.flowId);
+      target.turnSummaries.push({ ...summary, taskIds: [...summary.taskIds] });
+    }
+  }
+  target.turnSummaries.sort((a, b) => (a.seq - b.seq) || (a.at - b.at));
+  const summaryById = new Set(target.turnSummaries.map(s => s.flowId));
+  for (const fid of incoming.turnFlowIds) {
+    if (!summaryById.has(fid) && !target.turnFlowIds.includes(fid)) {
+      target.turnFlowIds.push(fid);
+    }
+  }
+  const orderedIds = target.turnSummaries.map(s => s.flowId);
+  for (const fid of target.turnFlowIds) {
+    if (!summaryById.has(fid)) orderedIds.push(fid);
+  }
+  target.turnFlowIds = orderedIds;
+  target.turnCount = Math.max(target.turnCount, target.turnFlowIds.length, incoming.turnCount);
+  target.taskCount = Math.max(target.taskCount, incoming.taskCount);
+  target.jevCallCount = Math.max(target.jevCallCount, incoming.jevCallCount);
+  target.recalledMemoryCount = Math.max(target.recalledMemoryCount, incoming.recalledMemoryCount);
+  target.consolidatedMemoryCount = Math.max(target.consolidatedMemoryCount, incoming.consolidatedMemoryCount);
+  target.aiManagedContext = target.aiManagedContext || incoming.aiManagedContext;
+  for (const channel of incoming.channels) {
+    if (!target.channels.includes(channel)) target.channels.push(channel);
+  }
+  target.startedAt = Math.min(target.startedAt, incoming.startedAt);
+  if (incoming.updatedAt >= target.updatedAt) {
+    target.updatedAt = incoming.updatedAt;
+    target.status = incoming.status;
+    target.primaryChannelLabel = incoming.primaryChannelLabel;
+  }
+}
+
+export function mergeSessionLists(
+  primary: readonly MindmapSession[] | undefined,
+  secondary: readonly MindmapSession[] | undefined,
+): MindmapSession[] {
+  const byId = new Map<string, MindmapSession>();
+  for (const session of primary ?? []) {
+    const existing = byId.get(session.id);
+    if (existing) mergeSessionInto(existing, session);
+    else byId.set(session.id, cloneSession(session));
+  }
+  for (const session of secondary ?? []) {
+    const existing = byId.get(session.id);
+    if (existing) mergeSessionInto(existing, session);
+    else byId.set(session.id, cloneSession(session));
+  }
+  return [...byId.values()].sort((a, b) => (b.updatedAt - a.updatedAt) || (b.startedAt - a.startedAt));
+}
+
 export function getEffectiveSessions(snapshot: MindmapSnapshot | null, loadedFlows: MindmapTaskFlow[]): MindmapSession[] {
   const flowsById = new Map(loadedFlows.map(f => [f.id, f]));
-  const base = snapshot?.sessions ? [...snapshot.sessions] : [];
+  const byId = new Map<string, MindmapSession>();
   const coveredFlowIds = new Set<string>();
-  for (const s of base) {
-    for (const fid of s.turnFlowIds) {
+
+  for (const raw of snapshot?.sessions ?? []) {
+    const cloned = cloneSession(raw);
+    const existing = byId.get(cloned.id);
+    if (existing) mergeSessionInto(existing, cloned);
+    else byId.set(cloned.id, cloned);
+    for (const fid of cloned.turnFlowIds) {
       if (flowsById.has(fid)) coveredFlowIds.add(fid);
     }
   }
-  // Fallback for older flows loaded via "Load More" pagination that were not part of initial snapshot.sessions
+
+  // Group older flows uncovered by initial snapshot.sessions by session ID so we never emit duplicate session IDs.
+  const uncoveredGroups = new Map<string, MindmapTaskFlow[]>();
   for (const flow of loadedFlows) {
     if (coveredFlowIds.has(flow.id)) continue;
     coveredFlowIds.add(flow.id);
-    const jevCount = flow.tasks.reduce((sum, t) => sum + (t.jevRoute?.called ? 1 : 0) + t.jevQualityGates.length, 0);
-    base.push({
-      id: flow.sessionId ?? `session:${flow.id}`,
-      title: shortText(flow.ingress.text, 34),
-      kind: flow.ingress.sourceKind === 'timer' ? 'timer' : flow.ingress.sourceKind === 'standalone' ? 'standalone' : 'human',
-      status: flow.status,
-      startedAt: flow.createdAt,
-      updatedAt: Math.max(flow.createdAt, flow.completedAt ?? 0, ...(flow.deliveries.map(d => d.at))),
-      channels: [flow.ingress.sourceKind],
-      primaryChannelLabel: flow.ingress.channelLabel,
-      turnCount: 1,
-      taskCount: flow.tasks.length,
-      jevCallCount: jevCount,
-      recalledMemoryCount: flow.memoryRecall.recalledItems.length,
-      consolidatedMemoryCount: flow.consolidatedMemories.length,
-      aiManagedContext: flow.memoryRecall.recalledItems.length > 0 || flow.tasks.some(t => Boolean(t.contextBrief)),
-      turnFlowIds: [flow.id],
-      turnSummaries: [{
-        flowId: flow.id,
-        seq: flow.seq,
-        at: flow.createdAt,
-        sourceKind: flow.ingress.sourceKind,
-        channelLabel: flow.ingress.channelLabel,
-        textPreview: shortText(flow.ingress.text, 120),
-        status: flow.status,
-        taskIds: flow.tasks.map(t => t.id),
-      }],
-    });
+    const key = flow.sessionId ?? `session:${flow.id}`;
+    const group = uncoveredGroups.get(key);
+    if (group) group.push(flow);
+    else uncoveredGroups.set(key, [flow]);
   }
-  base.sort((a, b) => (b.updatedAt - a.updatedAt) || (b.startedAt - a.startedAt));
-  return base;
+
+  for (const [sessionId, flows] of uncoveredGroups) {
+    const ordered = [...flows].sort((a, b) => (a.seq - b.seq) || (a.createdAt - b.createdAt));
+    const first = ordered[0]!;
+    const last = ordered[ordered.length - 1]!;
+    const channels: MindmapSession['channels'] = [];
+    for (const f of ordered) {
+      if (!channels.includes(f.ingress.sourceKind)) channels.push(f.ingress.sourceKind);
+    }
+    const aggregated: MindmapSession = {
+      id: sessionId,
+      title: shortText(first.ingress.text, 34),
+      kind: first.ingress.sourceKind === 'timer' ? 'timer' : first.ingress.sourceKind === 'standalone' ? 'standalone' : 'human',
+      status: last.status,
+      startedAt: first.createdAt,
+      updatedAt: Math.max(...ordered.map(f => Math.max(f.createdAt, f.completedAt ?? 0, ...(f.deliveries.map(d => d.at))))),
+      channels,
+      primaryChannelLabel: last.ingress.channelLabel,
+      turnCount: ordered.length,
+      taskCount: ordered.reduce((sum, f) => sum + f.tasks.length, 0),
+      jevCallCount: ordered.reduce((sum, f) => sum + f.tasks.reduce((s, t) => s + (t.jevRoute?.called ? 1 : 0) + t.jevQualityGates.length, 0), 0),
+      recalledMemoryCount: ordered.reduce((sum, f) => sum + f.memoryRecall.recalledItems.length, 0),
+      consolidatedMemoryCount: ordered.reduce((sum, f) => sum + f.consolidatedMemories.length, 0),
+      aiManagedContext: ordered.some(f => f.memoryRecall.recalledItems.length > 0 || f.tasks.some(t => Boolean(t.contextBrief))),
+      turnFlowIds: ordered.map(f => f.id),
+      turnSummaries: ordered.map(summarizeFlowTurn),
+    };
+    const existing = byId.get(sessionId);
+    if (existing) {
+      mergeSessionInto(existing, aggregated);
+      existing.taskCount = existing.turnFlowIds.reduce((sum, fid) => sum + (flowsById.get(fid)?.tasks.length ?? 0), 0);
+    } else {
+      byId.set(sessionId, aggregated);
+    }
+  }
+
+  return [...byId.values()].sort((a, b) => (b.updatedAt - a.updatedAt) || (b.startedAt - a.startedAt));
 }
 
 const FC_FRAME_X = 24;

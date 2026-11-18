@@ -56,6 +56,8 @@ export function initModelHub(): ModelHubController {
   const modelPoolMatrix = element<HTMLElement>('model-pool-matrix');
 
   let activeAuthProviderTab = 'deepseek';
+  let lastModalAuthProvId = '';
+  let lastSyncedModalBaseUrl = '';
 
   function providerStatusText(prov: ModelProviderView): string {
     const prefix = prov.enabled === false ? '🚫 已禁用 · ' : '';
@@ -191,7 +193,15 @@ export function initModelHub(): ModelHubController {
     modalAuthToggleBtn.disabled = appState.authExpired || !appState.ready;
     modalAuthFetchBtn.disabled = isDisabled || appState.authExpired || !appState.ready;
     modalAuthTestBtn.disabled = isDisabled || appState.authExpired || !appState.ready;
-    modalAuthBaseurlInput.value = currentProv.baseUrl ?? '';
+    const nextBaseUrl = currentProv.baseUrl ?? '';
+    if (
+      currentProv.id !== lastModalAuthProvId
+      || (document.activeElement !== modalAuthBaseurlInput && modalAuthBaseurlInput.value === lastSyncedModalBaseUrl)
+    ) {
+      modalAuthBaseurlInput.value = nextBaseUrl;
+    }
+    lastModalAuthProvId = currentProv.id;
+    lastSyncedModalBaseUrl = nextBaseUrl;
     if (currentProv.modelSource === 'remote_api') {
       modalAuthModelSource.textContent = `🌐 远端同步 (${currentProv.models.length} 款)`;
     } else {
@@ -472,10 +482,8 @@ export function initModelHub(): ModelHubController {
     modelTopBadge.textContent = `${configuredCount}方·${pool.length}模`;
 
     if (modelHubBackdrop.hidden && !force) {
-      appState.dirtyModals.add('model');
       return;
     }
-    appState.dirtyModals.delete('model');
 
     const disabledCount = hub?.providers.filter(p => p.enabled === false).length ?? 0;
     const totalProviders = hub?.providers.length ?? 0;

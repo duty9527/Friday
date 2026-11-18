@@ -111,10 +111,10 @@ try {
     await page.eval(() => [...document.querySelectorAll('#messages .user-message')].at(-1).querySelector('.routing-summary .route-target').click());
     await until(() => page.eval("document.querySelector('#trace-content').innerText.includes('读取文件副本')"), 'worker tool step');
     await until(() => page.eval("document.querySelector('#trace-content').innerText.includes('Worker 接收任务')"), 'process start');
-    await until(() => page.eval("document.querySelector('#trace-content').innerText.includes('Router 处理新输入')"), 'routing decision that created the work');
+    await until(() => page.eval("document.querySelector('#trace-content').innerText.includes('F.R.I.D.A.Y. 处理新输入')"), 'routing decision that created the work');
     assert.equal(await page.eval("document.querySelector('#step-mode').getAttribute('aria-pressed')"), 'true', 'the readable process is the default');
     const steps = await page.eval("document.querySelector('#trace-content').innerText");
-    assert.match(steps, /Router 处理新输入/);
+    assert.match(steps, /F\.R\.I\.D\.A\.Y\. 处理新输入/);
     assert.match(steps, /新建工作/);
     assert.match(steps, /Worker 接收任务/);
     assert.match(steps, /文件: /, 'a file read names the file instead of its internal id');
@@ -123,7 +123,7 @@ try {
       .find(detail => detail.innerText.includes('已记录的'))?.setAttribute('open', ''));
     assert.match(await page.eval("document.querySelector('#trace-content').innerText"), /已记录的 \d+ 条记录/);
     assert.match(await page.eval("document.querySelector('#messages').innerText"), /新建工作/);
-    checks.push('readable steps: Router input, routing decision, Worker task and file read, with recorded details on demand');
+    checks.push('readable steps: F.R.I.D.A.Y. input, routing decision, Worker task and file read, with recorded details on demand');
   } else checks.push('skipped path analysis (no --sample given)');
 
   await page.eval(() => document.querySelector('#graph-mode').click());
@@ -167,7 +167,7 @@ try {
   }
   assert.equal(await page.eval(`[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('${burstTag}')).length`), beforeReload);
   checks.push('refresh keeps the same main history and load-older restores it');
-  await until(() => page.eval(`[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('${burstTag}')).every(x => x.querySelector('.speaker').innerText.includes('Router 已处理'))`), 'burst replies settled');
+  await until(() => page.eval(`[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('${burstTag}')).every(x => x.querySelector('.speaker').innerText.includes('F.R.I.D.A.Y. 已处理'))`), 'burst replies settled');
   const order = await page.eval(() => [...document.querySelectorAll('#messages article')].map(item => Number(item.dataset.seq)));
   assert.ok(order.every((seq, index) => index === 0 || order[index - 1] < seq), 'persisted insertion order survives hydration, refresh and paging');
   assert.equal(await page.eval("document.querySelectorAll('#messages .router-message .source-reference').length > 0"), true, 'replies carry clickable source references');
