@@ -72,6 +72,34 @@ export interface TaskListOptions {
   offset?: number;
 }
 
+export interface TaskPatchOptions {
+  expectedRevision?: number;
+}
+
+/**
+ * Thrown by `TaskStore.patch` when the stored `task.revision` does not match
+ * the caller's `expectedRevision` under SQLite CAS.
+ */
+export class TaskConflictError extends Error {
+  constructor(
+    readonly taskId: string,
+    readonly expectedRevision: number,
+    readonly actualRevision?: number,
+  ) {
+    super(`Task ${taskId} revision conflict (expected ${expectedRevision}, actual ${actualRevision ?? 'missing'})`);
+    this.name = 'TaskConflictError';
+  }
+}
+
+function parseJsonSafe<T>(raw: unknown): T | undefined {
+  if (raw === null || raw === undefined) return undefined;
+  try {
+    return JSON.parse(String(raw)) as T;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Persistence and recovery for background worker tasks, follow-up events,
  * tool/file operations, and task state notices.
@@ -92,12 +120,20 @@ export class TaskStore {
 
   get(id: string): Task {
     const exact = this.db.prepare('SELECT body FROM tasks WHERE id=?').get(id);
-    if (exact) return JSON.parse(String(exact.body)) as Task;
+    if (exact) {
+      const parsed = parseJsonSafe<Task>(exact.body);
+      if (!parsed) throw new Error('Corrupt task record');
+      return parsed;
+    }
 
     const prefix = id.trim();
     if (prefix.length >= 6) {
       const matches = this.db.prepare('SELECT id, body FROM tasks WHERE substr(id, 1, ?) = ? LIMIT 5').all(prefix.length, prefix);
-      if (matches.length === 1) return JSON.parse(String(matches[0]!.body)) as Task;
+      if (matches.length === 1) {
+        const parsed = parseJsonSafe<Task>(matches[0]!.body);
+        if (!parsed) throw new Error('Corrupt task record');
+        return parsed;
+      }
       if (matches.length > 1) {
         const candidates = matches.map(m => String(m.id).slice(0, 8)).join(', ');
         throw new Error(`Ambiguous task ID prefix "${prefix}" matches multiple tasks (${candidates})`);
@@ -108,7 +144,7 @@ export class TaskStore {
 
   byRequest(requestId: string): Task | undefined {
     const row = this.db.prepare('SELECT body FROM tasks WHERE request_id=?').get(requestId);
-    return row ? JSON.parse(String(row.body)) as Task : undefined;
+    return row ? parseJsonSafe<Task>(row.body) : undefined;
   }
 
   list(limitOrOptions?: number | TaskListOptions): Task[] {
@@ -122,7 +158,12 @@ export class TaskStore {
           ? this.db.prepare('SELECT body FROM tasks ORDER BY rowid DESC LIMIT -1 OFFSET ?').all(offset).reverse()
           : this.db.prepare('SELECT body FROM tasks ORDER BY rowid').all())
       : this.db.prepare('SELECT body FROM tasks ORDER BY rowid DESC LIMIT ? OFFSET ?').all(Math.max(0, Math.floor(limit)), offset).reverse();
-    return rows.map(row => JSON.parse(String(row.body)) as Task);
+    const tasks: Task[] = [];
+    for (const row of rows) {
+      const parsed = parseJsonSafe<Task>(row.body);
+      if (parsed) tasks.push(parsed);
+    }
+    return tasks;
   }
 
   countTasks(): number {
@@ -131,16 +172,21 @@ export class TaskStore {
 
   countOrphanTasks(): number {
     return Number(
-      this.db.prepare("SELECT count(*) AS cnt FROM tasks WHERE json_extract(body, '$.originMessageId') IS NULL").get()?.cnt ?? 0,
+      this.db.prepare("SELECT count(*) AS cnt FROM tasks WHERE json_valid(body)=1 AND (CASE WHEN json_valid(body) THEN json_extract(body, '$.originMessageId') END) IS NULL").get()?.cnt ?? 0,
     );
   }
 
   listOrphanTasks(limit = 200): Task[] {
     const safeLimit = Math.max(1, Math.floor(limit));
     const rows = this.db.prepare(
-      "SELECT body FROM tasks WHERE json_extract(body, '$.originMessageId') IS NULL ORDER BY rowid DESC LIMIT ?",
+      "SELECT body FROM tasks WHERE json_valid(body)=1 AND (CASE WHEN json_valid(body) THEN json_extract(body, '$.originMessageId') END) IS NULL ORDER BY rowid DESC LIMIT ?",
     ).all(safeLimit);
-    return rows.map(row => JSON.parse(String(row.body)) as Task);
+    const tasks: Task[] = [];
+    for (const row of rows) {
+      const parsed = parseJsonSafe<Task>(row.body);
+      if (parsed) tasks.push(parsed);
+    }
+    return tasks;
   }
 
   /**
@@ -151,8 +197,8 @@ export class TaskStore {
     const byId = new Map<string, Task>();
     const pushRows = (rows: Array<Record<string, unknown>>) => {
       for (const row of rows) {
-        const task = JSON.parse(String(row.body)) as Task;
-        if (!byId.has(task.id)) byId.set(task.id, task);
+        const task = parseJsonSafe<Task>(row.body);
+        if (task && !byId.has(task.id)) byId.set(task.id, task);
       }
     };
 
@@ -161,7 +207,7 @@ export class TaskStore {
       const chunk = uniqueOriginIds.slice(i, i + 200);
       const placeholders = chunk.map(() => '?').join(',');
       pushRows(
-        this.db.prepare(`SELECT body FROM tasks WHERE json_extract(body, '$.originMessageId') IN (${placeholders})`).all(...chunk) as Array<Record<string, unknown>>,
+        this.db.prepare(`SELECT body FROM tasks WHERE (CASE WHEN json_valid(body) THEN json_extract(body, '$.originMessageId') END) IN (${placeholders})`).all(...chunk) as Array<Record<string, unknown>>,
       );
     }
 
@@ -180,6 +226,36 @@ export class TaskStore {
     this.db.prepare('UPDATE tasks SET body=? WHERE id=?').run(JSON.stringify(task), task.id);
   }
 
+  /**
+   * Atomically updates a task using optimistic-lock revision CAS validation.
+   * Throws `TaskConflictError` if `expectedRevision` does not match the stored revision.
+   */
+  patch(id: string, updater: (current: Task) => Task | void, options?: TaskPatchOptions): Task {
+    return this.atomic(() => {
+      const row = this.db.prepare('SELECT body FROM tasks WHERE id=?').get(id);
+      if (!row) throw new Error('Task not found');
+      const current = parseJsonSafe<Task>(row.body);
+      if (!current) throw new Error('Corrupt task record');
+      const expectedRevision = options?.expectedRevision ?? current.revision;
+      if (current.revision !== expectedRevision) {
+        throw new TaskConflictError(id, expectedRevision, current.revision);
+      }
+      const draft = structuredClone(current);
+      const updated = updater(draft) ?? draft;
+      updated.id = current.id;
+      updated.revision = expectedRevision + 1;
+      const result = this.db.prepare(
+        "UPDATE tasks SET body=? WHERE id=? AND CAST(CASE WHEN json_valid(body) THEN json_extract(body, '$.revision') END AS INTEGER)=?",
+      ).run(JSON.stringify(updated), id, expectedRevision);
+      if (result.changes !== 1) {
+        const latestRow = this.db.prepare('SELECT body FROM tasks WHERE id=?').get(id);
+        const actualRevision = latestRow ? parseJsonSafe<Task>(latestRow.body)?.revision : undefined;
+        throw new TaskConflictError(id, expectedRevision, actualRevision);
+      }
+      return updated;
+    });
+  }
+
   transition(id: string, status: TaskStatus, reason?: string, report?: string): Task {
     return this.atomic(() => {
       const task = this.get(id);
@@ -195,16 +271,16 @@ export class TaskStore {
   }
 
   addEvent(id: string, taskId: string, text: string): boolean {
-    const row = this.db.prepare('SELECT task_id, text FROM events WHERE id=?').get(id);
-    if (row) {
-      if (row.task_id !== taskId || row.text !== text) throw new Error('Request ID already used for a different follow-up');
-      return false;
-    }
-    this.atomic(() => {
+    return this.atomic(() => {
+      const row = this.db.prepare('SELECT task_id, text FROM events WHERE id=?').get(id);
+      if (row) {
+        if (row.task_id !== taskId || row.text !== text) throw new Error('Request ID already used for a different follow-up');
+        return false;
+      }
       this.db.prepare('INSERT INTO events VALUES(?,?,?,?)').run(id, taskId, text, 'pending');
       this.notice(taskId, 'followup', 'Follow-up accepted');
+      return true;
     });
-    return true;
   }
 
   takeEvents(taskId: string): TaskEvent[] {
@@ -290,12 +366,16 @@ export class TaskStore {
     const row = taskId === undefined
       ? this.db.prepare('SELECT body FROM operations WHERE id=?').get(id)
       : this.db.prepare('SELECT body FROM operations WHERE id=? AND task_id=?').get(id, taskId);
-    return row ? JSON.parse(String(row.body)) as Operation : undefined;
+    return row ? parseJsonSafe<Operation>(row.body) : undefined;
   }
 
   operations(taskId: string): Operation[] {
-    return this.db.prepare('SELECT body FROM operations WHERE task_id=? ORDER BY rowid').all(taskId)
-      .map(row => JSON.parse(String(row.body)) as Operation);
+    const out: Operation[] = [];
+    for (const row of this.db.prepare('SELECT body FROM operations WHERE task_id=? ORDER BY rowid').all(taskId)) {
+      const op = parseJsonSafe<Operation>(row.body);
+      if (op) out.push(op);
+    }
+    return out;
   }
 
   acknowledgeUnsettledOperations(taskId: string): void {
@@ -311,27 +391,38 @@ export class TaskStore {
   }
 
   notice(taskId: string, kind: string, text: string): void {
-    this.db.prepare('INSERT INTO notices(task_id,kind,text,at) VALUES(?,?,?,?)').run(
-      taskId,
-      kind,
-      text.length > 4096 ? text.slice(0, 4096) + '\n[notice truncated; use get for the full task report]' : text,
-      Date.now(),
-    );
-    const row = this.db.prepare('SELECT body FROM tasks WHERE id=?').get(taskId);
-    if (!row) return;
-    const task = JSON.parse(String(row.body)) as Task;
-    this.conversation.emit({
-      type: 'trace',
-      kind: 'task_state',
-      rootId: task.originMessageId ?? taskId,
-      messageId: task.originMessageId,
-      taskId,
-      spanId: taskId,
-      parentSpanId: task.parentSpanId,
-      actor: 'system',
-      label: task.prompt.slice(0, 100),
-      status: kind,
-      data: { reason: task.reason, mode: task.mode },
+    const clippedText = text.length > 4096
+      ? text.slice(0, 4096) + '\n[notice truncated; use get for the full task report]'
+      : text;
+    this.atomic(() => {
+      this.db.prepare('INSERT INTO notices(task_id,kind,text,at) VALUES(?,?,?,?)').run(
+        taskId,
+        kind,
+        clippedText,
+        Date.now(),
+      );
+      const row = this.db.prepare('SELECT body FROM tasks WHERE id=?').get(taskId);
+      if (!row) return;
+      const task = parseJsonSafe<Task>(row.body);
+      if (!task) return;
+      const includeText = kind === 'followup' || kind === 'followup_failed';
+      this.conversation.emit({
+        type: 'trace',
+        kind: 'task_state',
+        rootId: task.originMessageId ?? taskId,
+        messageId: task.originMessageId,
+        taskId,
+        spanId: taskId,
+        parentSpanId: task.parentSpanId,
+        actor: 'system',
+        label: task.prompt.slice(0, 100),
+        status: kind,
+        data: {
+          ...(includeText ? { text: clippedText } : {}),
+          reason: task.reason,
+          mode: task.mode,
+        },
+      });
     });
   }
 
@@ -346,28 +437,32 @@ export class TaskStore {
   }
 
   recoverTasks(): void {
-    // Follow-ups taken by a worker whose progress cannot be proven are never silently dropped.
-    for (const row of this.db.prepare("SELECT id, task_id FROM events WHERE state='processing'").all()) {
-      this.db.prepare("UPDATE events SET state='failed' WHERE id=?").run(String(row.id));
-      this.conversation.followupState(String(row.id), 'failed');
-      this.notice(String(row.task_id), 'followup_failed', '服务重启时该补充要求仍在处理中，无法证明已送达；不会自动重发。');
-    }
-    for (const row of this.db.prepare("SELECT body FROM operations WHERE json_extract(body,'$.status') IN ('requested','started','cancel_requested') ORDER BY rowid").all()) {
-      const op = JSON.parse(String(row.body)) as Operation;
-      op.status = 'unknown';
-      this.operation(op);
-    }
-    for (const row of this.db.prepare("SELECT body FROM tasks WHERE json_extract(body,'$.status') IN ('running','queued') ORDER BY rowid").all()) {
-      const task = JSON.parse(String(row.body)) as Task;
-      const priorQuestion = task.pendingQuestion?.question;
-      delete task.pendingQuestion;
-      task.revision++;
-      task.status = 'paused';
-      task.reason = priorQuestion
-        ? `服务已重启：中断前正在等待老板拍板（「${priorQuestion.slice(0, 120)}」），先前进度无法自动重放。`
-        : '服务已重启：先前模型/交付进度与已用时间无法证明，不会自动重放。';
-      this.save(task);
-      this.notice(task.id, 'paused', task.reason);
-    }
+    this.atomic(() => {
+      // Follow-ups taken by a worker whose progress cannot be proven are never silently dropped.
+      for (const row of this.db.prepare("SELECT id, task_id FROM events WHERE state='processing'").all()) {
+        this.db.prepare("UPDATE events SET state='failed' WHERE id=?").run(String(row.id));
+        this.conversation.followupState(String(row.id), 'failed');
+        this.notice(String(row.task_id), 'followup_failed', '服务重启时该补充要求仍在处理中，无法证明已送达；不会自动重发。');
+      }
+      for (const row of this.db.prepare("SELECT body FROM operations WHERE (CASE WHEN json_valid(body) THEN json_extract(body,'$.status') END) IN ('requested','started','cancel_requested') ORDER BY rowid").all()) {
+        const op = parseJsonSafe<Operation>(row.body);
+        if (!op) continue;
+        op.status = 'unknown';
+        this.operation(op);
+      }
+      for (const row of this.db.prepare("SELECT body FROM tasks WHERE (CASE WHEN json_valid(body) THEN json_extract(body,'$.status') END) IN ('running','queued') ORDER BY rowid").all()) {
+        const task = parseJsonSafe<Task>(row.body);
+        if (!task) continue;
+        const priorQuestion = task.pendingQuestion?.question;
+        delete task.pendingQuestion;
+        task.revision++;
+        task.status = 'paused';
+        task.reason = priorQuestion
+          ? `服务已重启：中断前正在等待老板拍板（「${priorQuestion.slice(0, 120)}」），先前进度无法自动重放。`
+          : '服务已重启：先前模型/交付进度与已用时间无法证明，不会自动重放。';
+        this.save(task);
+        this.notice(task.id, 'paused', task.reason);
+      }
+    });
   }
 }

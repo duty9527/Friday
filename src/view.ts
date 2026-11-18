@@ -169,7 +169,7 @@ export interface MemoryCard {
   cwd?: string; sourceMessageId?: string; sourceTaskId?: string;
   supersededBy?: string; supersedes?: string;
   pinned?: boolean; accessCount?: number; lastAccessedAt?: number;
-  lastReinforcedAt?: number; importance?: number;
+  lastReinforcedAt?: number; importance?: number; prePinImportance?: number; lastDecayedAt?: number;
   synapses?: MemorySynapse[];
   createdAt: number; updatedAt: number;
 }

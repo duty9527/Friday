@@ -2,6 +2,17 @@ import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import type { ChatMessage, MessagePage, TraceContext, TraceEvent, RouteAction, RoutingRecord, SessionTurnLink } from './view.js';
 
+const MAX_MESSAGE_TEXT_LENGTH = 65_536;
+
+function parseJsonSafe<T>(raw: unknown): T | undefined {
+  if (raw === null || raw === undefined) return undefined;
+  try {
+    return JSON.parse(String(raw)) as T;
+  } catch {
+    return undefined;
+  }
+}
+
 export function publicData(value: unknown, depth = 0): unknown {
   if (depth > 6) return '[nested value omitted]';
   if (typeof value === 'string') return (value.slice(0, 8192) + (value.length > 8192 ? '\n[truncated]' : ''))
@@ -27,7 +38,7 @@ export class Conversation {
   }
   meta<T>(key: string): T | undefined {
     const row = this.db.prepare('SELECT value FROM metadata WHERE key=?').get(key);
-    return row ? JSON.parse(String(row.value)) as T : undefined;
+    return row ? parseJsonSafe<T>(row.value) : undefined;
   }
   setMeta(key: string, value: unknown) {
     this.db.prepare('INSERT INTO metadata VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, JSON.stringify(value));
@@ -43,11 +54,14 @@ export class Conversation {
   }
   private decodeBatch(rows: Array<Record<string, unknown>>): ChatMessage[] {
     if (!rows.length) return [];
-    const messages = rows.map(row => {
-      const message = JSON.parse(String(row.body)) as ChatMessage;
+    const messages: ChatMessage[] = [];
+    for (const row of rows) {
+      const message = parseJsonSafe<ChatMessage>(row.body);
+      if (!message) continue;
       message.seq = Number(row.seq);
-      return message;
-    });
+      messages.push(message);
+    }
+    if (!messages.length) return [];
     const versionMap = new Map<string, number>();
     const taskIdsMap = new Map<string, string[]>();
     const ids = messages.map(m => m.id);
@@ -80,7 +94,9 @@ export class Conversation {
     return messages;
   }
   private decode(row: Record<string, unknown>): ChatMessage {
-    return this.decodeBatch([row])[0]!;
+    const decoded = this.decodeBatch([row])[0];
+    if (!decoded) throw new Error('Corrupt message record');
+    return decoded;
   }
   get(id: string): ChatMessage {
     const row = this.db.prepare('SELECT seq,body FROM messages WHERE id=?').get(id);
@@ -89,9 +105,12 @@ export class Conversation {
   }
   byRequest(requestId: string): ChatMessage | undefined {
     const row = this.db.prepare('SELECT seq,body FROM messages WHERE request_id=?').get(requestId);
-    return row ? this.decode(row) : undefined;
+    return row ? this.decodeBatch([row])[0] : undefined;
   }
   create(message: Omit<ChatMessage, 'seq' | 'version' | 'at' | 'taskIds'> & { at?: number }): ChatMessage {
+    if (message.text.length > MAX_MESSAGE_TEXT_LENGTH) {
+      throw new Error('Message exceeds 65536 character limit');
+    }
     return this.atomic(() => {
       const parent = message.replyTo ? this.get(message.replyTo) : undefined;
       const origin = message.origin ?? parent?.origin;
@@ -106,9 +125,11 @@ export class Conversation {
   }
   update(id: string, patch: Partial<Pick<ChatMessage, 'text' | 'status' | 'reason' | 'routing' | 'origin' | 'paths' | 'attachments' | 'sessionId' | 'sessionLink'>>) {
     return this.atomic(() => {
+      if ('text' in patch && patch.text !== undefined && patch.text.length > MAX_MESSAGE_TEXT_LENGTH) {
+        throw new Error('Message exceeds 65536 character limit');
+      }
       const message = { ...this.get(id), ...patch };
       if ('sessionLink' in patch && patch.sessionLink === undefined) delete message.sessionLink;
-      if (message.text.length > 65_536) throw new Error('Message exceeds 65536 character limit');
       this.db.prepare('UPDATE messages SET body=? WHERE id=?').run(JSON.stringify(message), id);
       this.emit({ type: 'message', kind: 'message_updated', rootId: message.replyTo ?? id, messageId: id,
         spanId: message.role === 'user' ? id : undefined,
@@ -145,15 +166,15 @@ export class Conversation {
   recentHumanUserMessages(beforeSeq: number, limit = 8): ChatMessage[] {
     const safeLimit = Math.max(1, Math.min(limit, 50));
     const rows = this.db.prepare(
-      `SELECT seq,body FROM messages WHERE seq<? AND json_extract(body,'$.role')='user' AND coalesce(json_extract(body,'$.source'),'')!='system' ORDER BY seq DESC LIMIT ?`,
+      `SELECT seq,body FROM messages WHERE seq<? AND json_valid(body)=1 AND (CASE WHEN json_valid(body) THEN json_extract(body,'$.role') END)='user' AND coalesce(CASE WHEN json_valid(body) THEN json_extract(body,'$.source') END,'')!='system' ORDER BY seq DESC LIMIT ?`,
     ).all(beforeSeq, safeLimit);
     return this.decodeBatch(rows).reverse();
   }
   hasUnassignedUserMessages(): boolean {
-    return Boolean(this.db.prepare(`SELECT 1 FROM messages WHERE json_extract(body,'$.role')='user' AND json_extract(body,'$.sessionId') IS NULL LIMIT 1`).get());
+    return Boolean(this.db.prepare(`SELECT 1 FROM messages WHERE json_valid(body)=1 AND (CASE WHEN json_valid(body) THEN json_extract(body,'$.role') END)='user' AND (CASE WHEN json_valid(body) THEN json_extract(body,'$.sessionId') END) IS NULL LIMIT 1`).get());
   }
   allUserMessagesChronological(): ChatMessage[] {
-    const rows = this.db.prepare(`SELECT seq,body FROM messages WHERE json_extract(body,'$.role')='user' ORDER BY seq ASC`).all();
+    const rows = this.db.prepare(`SELECT seq,body FROM messages WHERE json_valid(body)=1 AND (CASE WHEN json_valid(body) THEN json_extract(body,'$.role') END)='user' ORDER BY seq ASC`).all();
     return this.decodeBatch(rows);
   }
   delete(id: string) {
@@ -182,8 +203,8 @@ export class Conversation {
       actions: message.routing.actions.map(action => action.status === 'pending' && (status === 'failed' || status === 'interrupted') ? { ...action, status: 'interrupted' } : action) } });
   }
   followupState(id: string, state: string) {
-    const rows = this.db.prepare(`SELECT id FROM messages WHERE EXISTS (
-      SELECT 1 FROM json_each(messages.body, '$.routing.actions') WHERE json_extract(value, '$.followupId')=?)`).all(id);
+    const rows = this.db.prepare(`SELECT id FROM messages WHERE json_valid(messages.body)=1 AND EXISTS (
+      SELECT 1 FROM json_each(CASE WHEN json_valid(messages.body) THEN messages.body ELSE '{}' END, '$.routing.actions') WHERE json_extract(value, '$.followupId')=?)`).all(id);
     for (const row of rows) {
       const message = this.get(String(row.id));
       if (message.routing) this.update(message.id, { routing: { ...message.routing,
@@ -218,10 +239,13 @@ export class Conversation {
   neighbors(seq: number, radius = 1): Array<{ id: string; seq: number; role: 'user' | 'assistant'; preview: string }> {
     const prev = this.db.prepare('SELECT seq,body FROM messages WHERE seq<? ORDER BY seq DESC LIMIT ?').all(seq, radius).reverse();
     const next = this.db.prepare('SELECT seq,body FROM messages WHERE seq>? ORDER BY seq ASC LIMIT ?').all(seq, radius);
-    return [...prev, ...next].map(row => {
-      const msg = JSON.parse(String(row.body)) as ChatMessage;
-      return { id: msg.id, seq: Number(row.seq), role: msg.role, preview: String(publicData(msg.text.slice(0, 240))) };
-    });
+    const out: Array<{ id: string; seq: number; role: 'user' | 'assistant'; preview: string }> = [];
+    for (const row of [...prev, ...next]) {
+      const msg = parseJsonSafe<ChatMessage>(row.body);
+      if (!msg) continue;
+      out.push({ id: msg.id, seq: Number(row.seq), role: msg.role, preview: String(publicData(msg.text.slice(0, 240))) });
+    }
+    return out;
   }
   neighborsBatch(
     seqs: number[],
@@ -235,10 +259,12 @@ export class Conversation {
     // Narrow range query handles dense sequences in 1 SQL roundtrip; fall back per sparse seq if gaps exist.
     const rangeRows = this.db.prepare('SELECT seq,body FROM messages WHERE seq>=? AND seq<=? ORDER BY seq ASC').all(minSeq, maxSeq);
     if (rangeRows.length <= 1000) {
-      const parsed = rangeRows.map(row => {
-        const msg = JSON.parse(String(row.body)) as ChatMessage;
-        return { id: msg.id, seq: Number(row.seq), role: msg.role, preview: String(publicData(msg.text.slice(0, 240))) };
-      });
+      const parsed: Array<{ id: string; seq: number; role: 'user' | 'assistant'; preview: string }> = [];
+      for (const row of rangeRows) {
+        const msg = parseJsonSafe<ChatMessage>(row.body);
+        if (!msg) continue;
+        parsed.push({ id: msg.id, seq: Number(row.seq), role: msg.role, preview: String(publicData(msg.text.slice(0, 240))) });
+      }
       for (const targetSeq of uniqueSeqs) {
         const before = parsed.filter(item => item.seq < targetSeq).slice(-radius);
         const after = parsed.filter(item => item.seq > targetSeq).slice(0, radius);
@@ -271,11 +297,14 @@ export class Conversation {
     // routing decision cannot appear inside an earlier round.
     const own = filter.messageId ? [filter.messageId, ...this.replyIds(filter.messageId)] : [];
     const listed = own.map(() => '?').join(',');
-    const scope = filter.taskId ? (origin ? '(task_id=? OR (message_id=? AND task_id IS NULL))' : 'task_id=?')
+    const replyMatch = `(task_id IS NULL AND (CASE WHEN json_valid(body) THEN json_extract(body,'$.type') END)='message' AND message_id IN (SELECT mt.message_id FROM message_tasks mt JOIN messages m ON m.id = mt.message_id WHERE mt.task_id=? AND (CASE WHEN json_valid(m.body) THEN json_extract(m.body,'$.role') END)='assistant'))`;
+    const scope = filter.taskId
+      ? (origin ? `(task_id=? OR (message_id=? AND task_id IS NULL) OR ${replyMatch})` : `(task_id=? OR ${replyMatch})`)
       : filter.messageId
         ? `(root_id=? OR message_id IN (${listed}) OR task_id IN (SELECT task_id FROM message_tasks WHERE message_id=?))
           AND (message_id IS NULL OR message_id IN (${listed}))` : '';
-    const args = filter.taskId ? origin ? [filter.taskId, origin] : [filter.taskId]
+    const args = filter.taskId
+      ? (origin ? [filter.taskId, origin, filter.taskId] : [filter.taskId, filter.taskId])
       : filter.messageId ? [filter.messageId, ...own, filter.messageId, ...own] : [];
     const where = [scope, after !== undefined ? 'seq>?' : 'seq<?']
       .filter(Boolean).join(' AND ');
@@ -284,24 +313,29 @@ export class Conversation {
     const sql = `SELECT seq,body FROM journal${where ? ` WHERE ${where}` : ''} ORDER BY seq ${descending ? 'DESC' : 'ASC'} LIMIT ${limit}`;
     const rows = this.db.prepare(sql).all(...args, anchor) as Array<Record<string, unknown>>;
     if (descending) rows.reverse();
-    return rows.map(row => ({ ...JSON.parse(String(row.body)), seq: Number(row.seq) } as TraceEvent));
+    const events: TraceEvent[] = [];
+    for (const row of rows) {
+      const parsed = parseJsonSafe<TraceEvent>(row.body);
+      if (parsed) events.push({ ...parsed, seq: Number(row.seq) });
+    }
+    return events;
   }
   private replyIds(messageId: string): string[] {
-    return this.db.prepare("SELECT id FROM messages WHERE json_extract(body,'$.replyTo')=?").all(messageId).map(row => String(row.id));
+    return this.db.prepare("SELECT id FROM messages WHERE (CASE WHEN json_valid(body) THEN json_extract(body,'$.replyTo') END)=?").all(messageId).map(row => String(row.id));
   }
   private originMessage(taskId: string): string | undefined {
     const row = this.db.prepare('SELECT body FROM tasks WHERE id=?').get(taskId);
     if (!row) return undefined;
-    const origin = (JSON.parse(String(row.body)) as { originMessageId?: string }).originMessageId;
-    return typeof origin === 'string' ? origin : undefined;
+    const parsed = parseJsonSafe<{ originMessageId?: string }>(row.body);
+    return typeof parsed?.originMessageId === 'string' ? parsed.originMessageId : undefined;
   }
   latestSeq(): number { return Number(this.db.prepare('SELECT coalesce(max(seq),0) AS seq FROM journal').get()!.seq); }
   userTurnsPage(beforeSeq?: number, limit = 120): { items: ChatMessage[]; hasMore: boolean; before?: number; totalUsers: number } {
     const safeLimit = Math.max(1, Math.min(limit, 200));
-    const totalUsers = Number(this.db.prepare("SELECT count(*) AS cnt FROM messages WHERE json_extract(body,'$.role')='user'").get()!.cnt);
+    const totalUsers = Number(this.db.prepare("SELECT count(*) AS cnt FROM messages WHERE (CASE WHEN json_valid(body) THEN json_extract(body,'$.role') END)='user'").get()!.cnt);
     const rows = beforeSeq === undefined
-      ? this.db.prepare("SELECT seq,body FROM messages WHERE json_extract(body,'$.role')='user' ORDER BY seq DESC LIMIT ?").all(safeLimit + 1)
-      : this.db.prepare("SELECT seq,body FROM messages WHERE json_extract(body,'$.role')='user' AND seq<? ORDER BY seq DESC LIMIT ?").all(beforeSeq, safeLimit + 1);
+      ? this.db.prepare("SELECT seq,body FROM messages WHERE (CASE WHEN json_valid(body) THEN json_extract(body,'$.role') END)='user' ORDER BY seq DESC LIMIT ?").all(safeLimit + 1)
+      : this.db.prepare("SELECT seq,body FROM messages WHERE (CASE WHEN json_valid(body) THEN json_extract(body,'$.role') END)='user' AND seq<? ORDER BY seq DESC LIMIT ?").all(beforeSeq, safeLimit + 1);
     const items = this.decodeBatch(rows.slice(0, safeLimit));
     return { items, hasMore: rows.length > safeLimit, before: items.at(-1)?.seq, totalUsers };
   }
@@ -311,44 +345,55 @@ export class Conversation {
     for (let i = 0; i < messageIds.length; i += 200) {
       const chunk = messageIds.slice(i, i + 200);
       const placeholders = chunk.map(() => '?').join(',');
-      const rows = this.db.prepare(`SELECT seq,body FROM messages WHERE json_extract(body,'$.replyTo') IN (${placeholders}) ORDER BY seq ASC`).all(...chunk);
+      const rows = this.db.prepare(`SELECT seq,body FROM messages WHERE (CASE WHEN json_valid(body) THEN json_extract(body,'$.replyTo') END) IN (${placeholders}) ORDER BY seq ASC`).all(...chunk);
       results.push(...this.decodeBatch(rows));
     }
     return results.sort((a, b) => a.seq - b.seq);
   }
-  structuredJournalForScopes(messageIds: string[], taskIds: string[]): TraceEvent[] {
+  structuredJournalForScopes(messageIds: string[], taskIds: string[], limit = 8000): TraceEvent[] {
     const uniqueMsgIds = [...new Set(messageIds.filter(Boolean))];
     const uniqueTaskIds = [...new Set(taskIds.filter(Boolean))];
     if (!uniqueMsgIds.length && !uniqueTaskIds.length) return [];
-    const conditions: string[] = [];
-    const args: string[] = [];
+    const safeLimit = Math.max(100, Math.min(Math.floor(limit), 50_000));
+    const bySeq = new Map<number, TraceEvent>();
+    const collectColumn = (column: 'root_id' | 'message_id' | 'task_id', ids: string[]) => {
+      for (let i = 0; i < ids.length; i += 100) {
+        const chunk = ids.slice(i, i + 100);
+        const placeholders = chunk.map(() => '?').join(',');
+        const rows = this.db.prepare(
+          `SELECT seq,body FROM journal WHERE ${column} IN (${placeholders}) AND coalesce(CASE WHEN json_valid(body) THEN json_extract(body,'$.kind') END,'') NOT IN ('visible_text','message_updated') ORDER BY seq DESC LIMIT ?`,
+        ).all(...chunk, safeLimit) as Array<Record<string, unknown>>;
+        for (const row of rows) {
+          const seq = Number(row.seq);
+          if (bySeq.has(seq)) continue;
+          const parsed = parseJsonSafe<TraceEvent>(row.body);
+          if (parsed) bySeq.set(seq, { ...parsed, seq });
+        }
+      }
+    };
     if (uniqueMsgIds.length) {
-      const p1 = uniqueMsgIds.map(() => '?').join(',');
-      conditions.push(`root_id IN (${p1})`, `message_id IN (${p1})`);
-      args.push(...uniqueMsgIds, ...uniqueMsgIds);
+      collectColumn('root_id', uniqueMsgIds);
+      collectColumn('message_id', uniqueMsgIds);
     }
     if (uniqueTaskIds.length) {
-      const p2 = uniqueTaskIds.map(() => '?').join(',');
-      conditions.push(`root_id IN (${p2})`, `task_id IN (${p2})`);
-      args.push(...uniqueTaskIds, ...uniqueTaskIds);
+      collectColumn('root_id', uniqueTaskIds);
+      collectColumn('task_id', uniqueTaskIds);
     }
-    const sql = `SELECT seq,body FROM journal WHERE (${conditions.join(' OR ')}) AND json_extract(body,'$.kind') NOT IN ('visible_text','message_updated') ORDER BY seq ASC`;
-    const rows = this.db.prepare(sql).all(...args) as Array<Record<string, unknown>>;
-    return rows.map(row => ({ ...JSON.parse(String(row.body)), seq: Number(row.seq) } as TraceEvent));
+    const sorted = [...bySeq.values()].sort((a, b) => a.seq - b.seq);
+    return sorted.length > safeLimit ? sorted.slice(-safeLimit) : sorted;
   }
   recover() {
     this.atomic(() => {
-      const rows = this.db.prepare("SELECT seq,body FROM messages WHERE json_extract(body,'$.status') IN ('queued','processing','streaming')").all();
-      for (const row of rows) {
-        const message = this.decode(row);
+      const rows = this.db.prepare("SELECT seq,body FROM messages WHERE (CASE WHEN json_valid(body) THEN json_extract(body,'$.status') END) IN ('queued','processing','streaming')").all() as Array<Record<string, unknown>>;
+      for (const message of this.decodeBatch(rows)) {
         this.update(message.id, { status: 'interrupted', reason: '服务中断，处理进度未确认；已保留内容，不自动重发或重放。',
           routing: message.routing ? { ...message.routing, status: 'interrupted', actions: message.routing.actions.map(action => action.status === 'pending' ? { ...action, status: 'interrupted' } : action) } : undefined });
       }
       const latestSpans = this.db.prepare(`SELECT body FROM journal WHERE seq IN (
-        SELECT max(seq) FROM journal WHERE json_extract(body,'$.spanId') IS NOT NULL GROUP BY json_extract(body,'$.spanId'))`).all();
+        SELECT max(seq) FROM journal WHERE (CASE WHEN json_valid(body) THEN json_extract(body,'$.spanId') END) IS NOT NULL GROUP BY CASE WHEN json_valid(body) THEN json_extract(body,'$.spanId') END)`).all() as Array<Record<string, unknown>>;
       for (const row of latestSpans) {
-        const event = JSON.parse(String(row.body)) as TraceEvent;
-        if (event.type === 'trace' && ['started', 'running', 'requested', 'streaming'].includes(event.status)) {
+        const event = parseJsonSafe<TraceEvent>(row.body);
+        if (event && event.type === 'trace' && ['started', 'running', 'requested', 'streaming'].includes(event.status)) {
           const { seq: _seq, id: _id, at: _at, ...previous } = event;
           this.emit({ ...previous, status: 'interrupted', data: { reason: '服务重启，未确认完成，不自动重放。' } });
         }

@@ -1,7 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import type { ModelCatalogEntry } from '../view.js';
-import { DEFAULT_PROVIDER_ENDPOINTS, getPristineSdkModel, isOpenCodeProvider } from './catalog.js';
+import {
+  assertSafeBaseUrlForCredentials,
+  DEFAULT_PROVIDER_ENDPOINTS,
+  getPristineSdkModel,
+  isOpenCodeProvider,
+  sanitizeCredentialLeakText,
+} from './catalog.js';
 import { resolveModelUnitPrice } from './pricing.js';
 
 function resolveDiscoveryCost(
@@ -33,17 +39,21 @@ export async function fetchRemoteModelsFromEndpoint(
   if (!cleanBase) {
     throw new Error(`提供方 "${providerId}" 未配置可用的模型列表接口地址 (Base URL)`);
   }
+  assertSafeBaseUrlForCredentials(cleanBase, Boolean(apiKey?.trim()));
 
   if (providerId === 'google' && !baseUrl?.trim()) {
     if (!apiKey) throw new Error('拉取 Google Gemini 模型列表需要先提供 API Key');
-    const url = `${cleanBase}/models?pageSize=100&key=${encodeURIComponent(apiKey)}`;
+    const url = `${cleanBase}/models?pageSize=100`;
     const res = await fetch(url, {
       method: 'GET',
-      headers: { Accept: 'application/json' },
+      headers: {
+        'x-goog-api-key': apiKey,
+        Accept: 'application/json',
+      },
       signal: AbortSignal.timeout(12_000),
     });
     if (!res.ok) {
-      const errBody = await res.text().catch(() => '');
+      const errBody = sanitizeCredentialLeakText(await res.text().catch(() => ''), [apiKey]) ?? '';
       throw new Error(`Google /models 接口返回 HTTP ${res.status}: ${errBody.slice(0, 200)}`);
     }
     const data = await res.json() as {
@@ -100,7 +110,7 @@ export async function fetchRemoteModelsFromEndpoint(
       signal: AbortSignal.timeout(12_000),
     });
     if (!res.ok) {
-      const errBody = await res.text().catch(() => '');
+      const errBody = sanitizeCredentialLeakText(await res.text().catch(() => ''), [apiKey]) ?? '';
       throw new Error(`Anthropic /v1/models 接口返回 HTTP ${res.status}: ${errBody.slice(0, 200)}`);
     }
     const data = await res.json() as {
@@ -143,7 +153,7 @@ export async function fetchRemoteModelsFromEndpoint(
     signal: AbortSignal.timeout(12_000),
   });
   if (!res.ok) {
-    const errBody = await res.text().catch(() => '');
+    const errBody = sanitizeCredentialLeakText(await res.text().catch(() => ''), [apiKey]) ?? '';
     throw new Error(`${providerId} /models 接口 (${url}) 返回 HTTP ${res.status}: ${errBody.slice(0, 200)}`);
   }
   const data = await res.json() as {

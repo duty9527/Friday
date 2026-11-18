@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import { splitModelAndLevel } from '../models/catalog.js';
+import { normalizeProviderId, parseModelSpec as parseCatalogModelSpec, splitModelAndLevel } from '../models/catalog.js';
 import {
   calculateModelCallCost,
   DEFAULT_USD_TO_CNY_RATE,
@@ -136,6 +136,7 @@ export interface UsagePrefsPatch {
 interface UsageBackfillMeta {
   version: number;
   lastSeq: number;
+  cutoffSeq?: number;
   defaultProvider?: string;
   defaultRouterModel?: string;
   insertedCount: number;
@@ -257,10 +258,57 @@ function finalizeTotals(acc: MutableTotals, usdToCnyRate: number): UsageTotalsVi
   };
 }
 
-function resolveTzOffsetMin(tzOffsetMin?: number): number {
+function createLocalFormatter(): Intl.DateTimeFormat {
+  const tz = process.env.TZ?.trim() || undefined;
+  return new Intl.DateTimeFormat('en-US', {
+    ...(tz ? { timeZone: tz } : {}),
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  });
+}
+
+function getZonedParts(epochMs: number, dtf: Intl.DateTimeFormat): {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+} {
+  const parts = dtf.formatToParts(new Date(epochMs));
+  let year = 1970;
+  let month = 1;
+  let day = 1;
+  let hour = 0;
+  let minute = 0;
+  let second = 0;
+  for (const part of parts) {
+    if (part.type === 'year') year = Number(part.value);
+    else if (part.type === 'month') month = Number(part.value);
+    else if (part.type === 'day') day = Number(part.value);
+    else if (part.type === 'hour') hour = Number(part.value) % 24;
+    else if (part.type === 'minute') minute = Number(part.value);
+    else if (part.type === 'second') second = Number(part.value);
+  }
+  return { year, month, day, hour, minute, second };
+}
+
+function getZonedOffsetMinAt(epochMs: number, dtf: Intl.DateTimeFormat): number {
+  const secMs = Math.floor(epochMs / 1000) * 1000;
+  const p = getZonedParts(secMs, dtf);
+  const asUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
+  const offsetMin = Math.round((secMs - asUtc) / 60_000);
+  return offsetMin === 0 ? 0 : offsetMin;
+}
+
+function resolveTzOffsetMin(tzOffsetMin?: number, atMs = Date.now(), dtf?: Intl.DateTimeFormat): number {
   if (tzOffsetMin === undefined) {
-    const local = new Date().getTimezoneOffset();
-    return local === 0 ? 0 : local;
+    return getZonedOffsetMinAt(atMs, dtf ?? createLocalFormatter());
   }
   if (
     typeof tzOffsetMin !== 'number'
@@ -278,8 +326,12 @@ function formatUtcYmd(date: Date): string {
   return `${date.getUTCFullYear()}-${pad2(date.getUTCMonth() + 1)}-${pad2(date.getUTCDate())}`;
 }
 
-function epochToShiftedYmd(at: number, tzOffsetMin: number): string {
-  return formatUtcYmd(new Date(at - tzOffsetMin * 60_000));
+function epochToShiftedYmd(at: number, explicitTzOffsetMin: number | undefined, dtf?: Intl.DateTimeFormat): string {
+  if (explicitTzOffsetMin !== undefined) {
+    return formatUtcYmd(new Date(at - explicitTzOffsetMin * 60_000));
+  }
+  const p = getZonedParts(at, dtf ?? createLocalFormatter());
+  return `${p.year}-${pad2(p.month)}-${pad2(p.day)}`;
 }
 
 function parseYmd(ymd: string): { year: number; month: number; day: number; utcMidnightMs: number } {
@@ -317,8 +369,22 @@ function addDaysUtc(
   };
 }
 
-function shiftedMidnightToEpoch(year: number, monthIndex0: number, day: number, tzOffsetMin: number): number {
-  return Date.UTC(year, monthIndex0, day, 0, 0, 0, 0) + tzOffsetMin * 60_000;
+function shiftedMidnightToEpoch(
+  year: number,
+  monthIndex0: number,
+  day: number,
+  explicitTzOffsetMin: number | undefined,
+  dtf?: Intl.DateTimeFormat,
+): number {
+  const utcWall = Date.UTC(year, monthIndex0, day, 0, 0, 0, 0);
+  if (explicitTzOffsetMin !== undefined) {
+    return utcWall + explicitTzOffsetMin * 60_000;
+  }
+  const formatter = dtf ?? createLocalFormatter();
+  const off1 = getZonedOffsetMinAt(utcWall, formatter);
+  const pass1 = utcWall + off1 * 60_000;
+  const off2 = getZonedOffsetMinAt(pass1, formatter);
+  return utcWall + off2 * 60_000;
 }
 
 function isoWeekInfo(utcMidnightMs: number): { year: number; week: number } {
@@ -334,20 +400,19 @@ function splitProviderAndModel(
   rawProvider: string,
   rawModel: string,
 ): { provider: string; model: string } {
-  let provider = rawProvider.trim();
-  let model = splitModelAndLevel(rawModel.trim()).model;
-
-  if (!provider && model.includes('/')) {
-    const slash = model.indexOf('/');
-    provider = model.slice(0, slash).trim();
-    model = model.slice(slash + 1).trim();
-  } else if (provider && model.startsWith(`${provider}/`)) {
-    model = model.slice(provider.length + 1).trim();
+  const normProv = normalizeProviderId(rawProvider.trim()) ?? rawProvider.trim();
+  const cleanedModel = splitModelAndLevel(rawModel.trim()).model;
+  if (!normProv) {
+    const parsed = parseCatalogModelSpec(cleanedModel);
+    return { provider: parsed.providerId, model: parsed.modelId };
   }
-
+  const parsed = parseCatalogModelSpec(cleanedModel, {
+    fallbackProvider: normProv,
+    preferFallbackProvider: true,
+  });
   return {
-    provider: provider || 'unknown',
-    model: model || 'unknown',
+    provider: parsed.providerId || 'unknown',
+    model: parsed.modelId || 'unknown',
   };
 }
 
@@ -356,18 +421,10 @@ function parseModelSpec(
   fallbackProvider?: string,
 ): { provider: string; model: string } | undefined {
   if (!rawSpec || !rawSpec.trim()) return undefined;
-  const cleaned = splitModelAndLevel(rawSpec.trim()).model;
-  if (!cleaned) return undefined;
-  const slash = cleaned.indexOf('/');
-  if (slash > 0) {
-    return {
-      provider: cleaned.slice(0, slash).trim() || fallbackProvider || 'unknown',
-      model: cleaned.slice(slash + 1).trim() || 'unknown',
-    };
-  }
+  const parsed = parseCatalogModelSpec(rawSpec, { fallbackProvider });
   return {
-    provider: fallbackProvider?.trim() || 'unknown',
-    model: cleaned,
+    provider: parsed.providerId,
+    model: parsed.modelId,
   };
 }
 
@@ -561,13 +618,20 @@ export class UsageStore {
         }
       };
 
-      const rows = this.db.prepare(`
-        SELECT seq, task_id, message_id, body
+      const cutoffRow = this.db.prepare('SELECT coalesce(max(seq), 0) AS max_seq FROM journal').get() as { max_seq?: number } | undefined;
+      const cutoffSeq = meta?.cutoffSeq ?? Number(cutoffRow?.max_seq ?? 0);
+
+      const pageStmt = this.db.prepare(`
+        SELECT seq, root_id, task_id, message_id, body
         FROM journal
-        WHERE json_extract(body, '$.label') IN ('模型推理调用', '上下文压缩（SDK）')
-           OR json_extract(body, '$.label') LIKE 'Gemini Decision 1%'
+        WHERE seq > ? AND seq <= ?
+          AND (
+            (CASE WHEN json_valid(body) THEN json_extract(body, '$.label') END) IN ('模型推理调用', '上下文压缩（SDK）')
+            OR (CASE WHEN json_valid(body) THEN json_extract(body, '$.label') END) LIKE 'Gemini Decision 1%'
+          )
         ORDER BY seq ASC
-      `).all() as Array<{ seq: number; task_id: string | null; message_id: string | null; body: string }>;
+        LIMIT ?
+      `);
 
       const existingBackfillStmt = this.db.prepare(
         'SELECT provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens FROM model_usage WHERE id=?',
@@ -587,162 +651,199 @@ export class UsageStore {
 
       let changed = 0;
       let maxSeq = meta?.lastSeq ?? 0;
+      let afterSeq = 0;
+      const pageSize = 500;
 
-      for (const row of rows) {
-        if (row.seq > maxSeq) maxSeq = row.seq;
-        let event: {
-          actor?: string;
-          label?: string;
-          status?: string;
-          at?: number;
-          taskId?: string;
-          messageId?: string;
-          data?: unknown;
-        };
-        try {
-          event = JSON.parse(String(row.body)) as typeof event;
-        } catch {
-          continue;
-        }
-        if (event.status === 'started') continue;
+      while (true) {
+        const rows = pageStmt.all(afterSeq, cutoffSeq, pageSize) as Array<{
+          seq: number;
+          root_id: string | null;
+          task_id: string | null;
+          message_id: string | null;
+          body: string;
+        }>;
+        if (!rows.length) break;
 
-        const label = typeof event.label === 'string' ? event.label : '';
-        const data = asRecord(event.data);
-        const detail = asRecord(data?.detail) ?? data;
-        const taskId = typeof event.taskId === 'string' && event.taskId ? event.taskId : (row.task_id ?? undefined);
-        const messageId = typeof event.messageId === 'string' && event.messageId ? event.messageId : (row.message_id ?? undefined);
-
-        let actor: UsageActor;
-        let rawUsage: unknown;
-        let resolvedSpec: { provider: string; model: string } | undefined;
-        let status: UsageStatus;
-
-        if (label === '模型推理调用') {
-          rawUsage = detail?.usage ?? data?.usage;
-          actor = event.actor === 'router' ? 'router' : 'worker';
-          if (typeof detail?.provider === 'string' && detail.provider.trim() && typeof detail?.model === 'string' && detail.model.trim()) {
-            resolvedSpec = splitProviderAndModel(detail.provider, detail.model);
-          } else if (actor === 'worker') {
-            resolvedSpec = parseModelSpec(getTaskWorkerModel(taskId), cleanDefaultProvider);
-          } else {
-            resolvedSpec = cleanRouterSpec;
+        for (const row of rows) {
+          afterSeq = row.seq;
+          if (row.seq > maxSeq) maxSeq = row.seq;
+          let event: {
+            actor?: string;
+            label?: string;
+            status?: string;
+            at?: number;
+            rootId?: string;
+            spanId?: string;
+            taskId?: string;
+            messageId?: string;
+            data?: unknown;
+          };
+          try {
+            event = JSON.parse(String(row.body)) as typeof event;
+          } catch {
+            continue;
           }
-          status = event.status === 'failed' ? 'failed' : event.status === 'interrupted' ? 'interrupted' : 'completed';
-        } else if (label === '上下文压缩（SDK）') {
-          rawUsage = detail?.usage ?? data?.usage;
-          actor = 'compaction';
-          if (typeof detail?.provider === 'string' && detail.provider.trim() && typeof detail?.model === 'string' && detail.model.trim()) {
-            resolvedSpec = splitProviderAndModel(detail.provider, detail.model);
-          } else {
-            resolvedSpec = parseModelSpec(getTaskWorkerModel(taskId), cleanDefaultProvider) ?? cleanRouterSpec;
-          }
-          status = event.status === 'failed' ? 'failed' : event.status === 'interrupted' ? 'interrupted' : 'completed';
-        } else if (label.startsWith('Gemini Decision 1')) {
-          rawUsage = data?.usage ?? detail?.usage;
-          actor = 'decision';
-          const req = asRecord(data?.request);
-          const decisionModel = typeof req?.decisionModel === 'string' && req.decisionModel.trim()
-            ? req.decisionModel.trim()
-            : 'gemini-decision-1';
-          resolvedSpec = { provider: 'google', model: decisionModel };
-          status = event.status === 'failed' ? 'failed' : 'completed';
-        } else {
-          continue;
-        }
+          if (event.status === 'started') continue;
 
-        const usage = normalizeSdkUsage(rawUsage);
-        if (!usage) continue;
+          const label = typeof event.label === 'string' ? event.label : '';
+          const data = asRecord(event.data);
+          const detail = asRecord(data?.detail) ?? data;
+          const taskId = typeof event.taskId === 'string' && event.taskId ? event.taskId : (row.task_id ?? undefined);
+          const messageId = typeof event.messageId === 'string' && event.messageId ? event.messageId : (row.message_id ?? undefined);
+          const sessionId = typeof detail?.sessionId === 'string'
+            ? detail.sessionId
+            : typeof data?.sessionId === 'string'
+              ? data.sessionId
+              : undefined;
+          const isDreamSpan = Boolean(
+            event.actor === 'dreamer'
+            || sessionId?.startsWith('dream-')
+            || event.spanId?.startsWith('dream-')
+            || event.rootId?.startsWith('dream-')
+            || row.root_id?.startsWith('dream-')
+            || taskId?.startsWith('dream-'),
+          );
 
-        const { provider, model } = splitProviderAndModel(
-          resolvedSpec?.provider ?? cleanDefaultProvider ?? 'unknown',
-          resolvedSpec?.model ?? 'unknown',
-        );
-        const backfillId = `backfill:${row.seq}`;
+          let actor: UsageActor;
+          let rawUsage: unknown;
+          let resolvedSpec: { provider: string; model: string } | undefined;
+          let status: UsageStatus;
 
-        const existing = existingBackfillStmt.get(backfillId) as
-          | {
-              provider: string;
-              model: string;
-              input_tokens: number;
-              output_tokens: number;
-              cache_read_tokens: number;
-              cache_write_tokens: number;
-              reasoning_tokens: number;
+          if (label === '模型推理调用') {
+            rawUsage = detail?.usage ?? data?.usage;
+            actor = event.actor === 'router'
+              ? 'router'
+              : (event.actor === 'dreamer' || isDreamSpan)
+                ? 'dreamer'
+                : event.actor === 'distiller'
+                  ? 'distiller'
+                  : 'worker';
+            if (typeof detail?.provider === 'string' && detail.provider.trim() && typeof detail?.model === 'string' && detail.model.trim()) {
+              resolvedSpec = splitProviderAndModel(detail.provider, detail.model);
+            } else if (actor === 'worker') {
+              resolvedSpec = parseModelSpec(getTaskWorkerModel(taskId), cleanDefaultProvider);
+            } else {
+              resolvedSpec = cleanRouterSpec;
             }
-          | undefined;
-
-        if (existing) {
-          if (
-            (existing.provider === 'unknown' || existing.model === 'unknown')
-            && (provider !== 'unknown' || model !== 'unknown')
-          ) {
-            const nextProvider = existing.provider === 'unknown' ? provider : existing.provider;
-            const nextModel = existing.model === 'unknown' ? model : existing.model;
-            const cost = calculateModelCallCost({
-              provider: nextProvider,
-              model: nextModel,
-              inputTokens: Number(existing.input_tokens ?? 0),
-              outputTokens: Number(existing.output_tokens ?? 0),
-              cacheReadTokens: Number(existing.cache_read_tokens ?? 0),
-              cacheWriteTokens: Number(existing.cache_write_tokens ?? 0),
-              reasoningTokens: Number(existing.reasoning_tokens ?? 0),
-              providerReportedTotalUsd: usage.providerReportedTotalUsd,
-              totalFromProvider: usage.totalFromProvider,
-              sdkCatalogTotalUsd: usage.sdkCatalogTotalUsd,
-            });
-            const res = updateUnknownStmt.run(
-              nextProvider,
-              nextModel,
-              cost.costUsd,
-              cost.unitInputUsdPer1M,
-              cost.unitOutputUsdPer1M,
-              cost.costSource,
-              backfillId,
-            );
-            if (res.changes > 0) changed += 1;
+            status = event.status === 'failed' ? 'failed' : event.status === 'interrupted' ? 'interrupted' : 'completed';
+          } else if (label === '上下文压缩（SDK）') {
+            rawUsage = detail?.usage ?? data?.usage;
+            actor = isDreamSpan ? 'dreamer' : 'compaction';
+            if (typeof detail?.provider === 'string' && detail.provider.trim() && typeof detail?.model === 'string' && detail.model.trim()) {
+              resolvedSpec = splitProviderAndModel(detail.provider, detail.model);
+            } else {
+              resolvedSpec = (isDreamSpan ? undefined : parseModelSpec(getTaskWorkerModel(taskId), cleanDefaultProvider)) ?? cleanRouterSpec;
+            }
+            status = event.status === 'failed' ? 'failed' : event.status === 'interrupted' ? 'interrupted' : 'completed';
+          } else if (label.startsWith('Gemini Decision 1')) {
+            rawUsage = data?.usage ?? detail?.usage;
+            actor = 'decision';
+            const req = asRecord(data?.request);
+            const decisionModel = typeof req?.decisionModel === 'string' && req.decisionModel.trim()
+              ? req.decisionModel.trim()
+              : 'gemini-decision-1';
+            resolvedSpec = { provider: 'google', model: decisionModel };
+            status = event.status === 'failed' ? 'failed' : 'completed';
+          } else {
+            continue;
           }
-          continue;
-        }
 
-        const cost = calculateModelCallCost({
-          provider,
-          model,
-          inputTokens: usage.inputTokens,
-          outputTokens: usage.outputTokens,
-          cacheReadTokens: usage.cacheReadTokens,
-          cacheWriteTokens: usage.cacheWriteTokens,
-          reasoningTokens: usage.reasoningTokens,
-          providerReportedTotalUsd: usage.providerReportedTotalUsd,
-          totalFromProvider: usage.totalFromProvider,
-          sdkCatalogTotalUsd: usage.sdkCatalogTotalUsd,
-        });
-        const at = typeof event.at === 'number' && Number.isFinite(event.at) ? Math.round(event.at) : Date.now();
-        const res = insertStmt.run(
-          backfillId,
-          at,
-          actor,
-          provider,
-          model,
-          usage.inputTokens,
-          usage.outputTokens,
-          usage.cacheReadTokens,
-          usage.cacheWriteTokens,
-          usage.reasoningTokens,
-          usage.totalTokens,
-          cost.costUsd,
-          cost.unitInputUsdPer1M,
-          cost.unitOutputUsdPer1M,
-          cost.costSource,
-          status,
-          taskId ?? null,
-          messageId ?? null,
-        );
-        if (res.changes > 0) changed += 1;
+          const usage = normalizeSdkUsage(rawUsage);
+          if (!usage) continue;
+
+          const { provider, model } = splitProviderAndModel(
+            resolvedSpec?.provider ?? cleanDefaultProvider ?? 'unknown',
+            resolvedSpec?.model ?? 'unknown',
+          );
+          const backfillId = `backfill:${row.seq}`;
+
+          const existing = existingBackfillStmt.get(backfillId) as
+            | {
+                provider: string;
+                model: string;
+                input_tokens: number;
+                output_tokens: number;
+                cache_read_tokens: number;
+                cache_write_tokens: number;
+                reasoning_tokens: number;
+              }
+            | undefined;
+
+          if (existing) {
+            if (
+              (existing.provider === 'unknown' || existing.model === 'unknown')
+              && (provider !== 'unknown' || model !== 'unknown')
+            ) {
+              const nextProvider = existing.provider === 'unknown' ? provider : existing.provider;
+              const nextModel = existing.model === 'unknown' ? model : existing.model;
+              const cost = calculateModelCallCost({
+                provider: nextProvider,
+                model: nextModel,
+                inputTokens: Number(existing.input_tokens ?? 0),
+                outputTokens: Number(existing.output_tokens ?? 0),
+                cacheReadTokens: Number(existing.cache_read_tokens ?? 0),
+                cacheWriteTokens: Number(existing.cache_write_tokens ?? 0),
+                reasoningTokens: Number(existing.reasoning_tokens ?? 0),
+                providerReportedTotalUsd: usage.providerReportedTotalUsd,
+                totalFromProvider: usage.totalFromProvider,
+                sdkCatalogTotalUsd: usage.sdkCatalogTotalUsd,
+              });
+              const res = updateUnknownStmt.run(
+                nextProvider,
+                nextModel,
+                cost.costUsd,
+                cost.unitInputUsdPer1M,
+                cost.unitOutputUsdPer1M,
+                cost.costSource,
+                backfillId,
+              );
+              if (res.changes > 0) changed += 1;
+            }
+            continue;
+          }
+
+          const cost = calculateModelCallCost({
+            provider,
+            model,
+            inputTokens: usage.inputTokens,
+            outputTokens: usage.outputTokens,
+            cacheReadTokens: usage.cacheReadTokens,
+            cacheWriteTokens: usage.cacheWriteTokens,
+            reasoningTokens: usage.reasoningTokens,
+            providerReportedTotalUsd: usage.providerReportedTotalUsd,
+            totalFromProvider: usage.totalFromProvider,
+            sdkCatalogTotalUsd: usage.sdkCatalogTotalUsd,
+          });
+          const at = typeof event.at === 'number' && Number.isFinite(event.at) ? Math.round(event.at) : Date.now();
+          const res = insertStmt.run(
+            backfillId,
+            at,
+            actor,
+            provider,
+            model,
+            usage.inputTokens,
+            usage.outputTokens,
+            usage.cacheReadTokens,
+            usage.cacheWriteTokens,
+            usage.reasoningTokens,
+            usage.totalTokens,
+            cost.costUsd,
+            cost.unitInputUsdPer1M,
+            cost.unitOutputUsdPer1M,
+            cost.costSource,
+            status,
+            taskId ?? null,
+            messageId ?? null,
+          );
+          if (res.changes > 0) changed += 1;
+        }
+        if (rows.length < pageSize) break;
       }
 
       const nextMeta: UsageBackfillMeta = {
         version: 1,
         lastSeq: maxSeq,
+        cutoffSeq,
         ...(cleanDefaultProvider ? { defaultProvider: cleanDefaultProvider } : {}),
         ...(cleanDefaultRouterModel ? { defaultRouterModel: cleanDefaultRouterModel } : {}),
         insertedCount: (meta?.insertedCount ?? 0) + changed,
@@ -845,11 +946,14 @@ export class UsageStore {
   }
 
   todayUsageSummary(tzOffsetMin?: number): UsageTodaySummary {
-    const tz = resolveTzOffsetMin(tzOffsetMin);
-    const todayDate = epochToShiftedYmd(Date.now(), tz);
+    const explicitTz = tzOffsetMin !== undefined ? resolveTzOffsetMin(tzOffsetMin) : undefined;
+    const dtf = explicitTz === undefined ? createLocalFormatter() : undefined;
+    const nowMs = Date.now();
+    const todayDate = epochToShiftedYmd(nowMs, explicitTz, dtf);
     const parsed = parseYmd(todayDate);
-    const startAt = shiftedMidnightToEpoch(parsed.year, parsed.month - 1, parsed.day, tz);
-    const endAt = startAt + DAY_MS;
+    const tomorrow = addDaysUtc(parsed.year, parsed.month, parsed.day, 1);
+    const startAt = shiftedMidnightToEpoch(parsed.year, parsed.month - 1, parsed.day, explicitTz, dtf);
+    const endAt = shiftedMidnightToEpoch(tomorrow.year, tomorrow.month - 1, tomorrow.day, explicitTz, dtf);
 
     const row = this.db.prepare(`
       SELECT
@@ -878,11 +982,18 @@ export class UsageStore {
     if (granularity !== 'day' && granularity !== 'week' && granularity !== 'month') {
       throw new Error(`无效的统计粒度 "${String(granularity)}"，请使用 day / week / month`);
     }
-    const tzOffsetMin = resolveTzOffsetMin(options?.tzOffsetMin);
-    const todayDate = epochToShiftedYmd(Date.now(), tzOffsetMin);
+    const explicitTz = options?.tzOffsetMin !== undefined ? resolveTzOffsetMin(options?.tzOffsetMin) : undefined;
+    const dtf = explicitTz === undefined ? createLocalFormatter() : undefined;
+    const nowMs = Date.now();
+    const todayDate = epochToShiftedYmd(nowMs, explicitTz, dtf);
     const anchorDate = options?.anchorDate?.trim() || todayDate;
     const anchorParts = parseYmd(anchorDate);
     const todayParts = parseYmd(todayDate);
+    const tzOffsetMin = resolveTzOffsetMin(
+      explicitTz,
+      shiftedMidnightToEpoch(anchorParts.year, anchorParts.month - 1, anchorParts.day, explicitTz, dtf),
+      dtf,
+    );
     const prefs = this.getUsagePrefs();
     const rate = prefs.usdToCnyRate;
 
@@ -907,27 +1018,48 @@ export class UsageStore {
     const recentWindows: PeriodWindow[] = [];
 
     if (granularity === 'day') {
-      startAt = shiftedMidnightToEpoch(anchorParts.year, anchorParts.month - 1, anchorParts.day, tzOffsetMin);
-      endAt = startAt + DAY_MS;
+      const nextDay = addDaysUtc(anchorParts.year, anchorParts.month, anchorParts.day, 1);
+      startAt = shiftedMidnightToEpoch(anchorParts.year, anchorParts.month - 1, anchorParts.day, explicitTz, dtf);
+      endAt = shiftedMidnightToEpoch(nextDay.year, nextDay.month - 1, nextDay.day, explicitTz, dtf);
       prevAnchorDate = addDaysUtc(anchorParts.year, anchorParts.month, anchorParts.day, -1).ymd;
-      nextAnchorDate = addDaysUtc(anchorParts.year, anchorParts.month, anchorParts.day, 1).ymd;
+      nextAnchorDate = nextDay.ymd;
       periodLabel = anchorDate === todayDate ? `${anchorDate} (今天)` : anchorDate;
       currentPeriodKey = anchorDate;
 
-      for (let h = 0; h < 24; h++) {
-        const key = pad2(h);
-        buckets.push({
-          key,
-          label: `${key}:00`,
-          startAt: startAt + h * HOUR_MS,
-          endAt: startAt + (h + 1) * HOUR_MS,
-          calls: 0,
-          inputTokens: 0,
-          outputTokens: 0,
-          totalTokens: 0,
-          costUsd: 0,
-          costCny: 0,
-        });
+      if (explicitTz !== undefined) {
+        for (let h = 0; h < 24; h++) {
+          const key = pad2(h);
+          buckets.push({
+            key,
+            label: `${key}:00`,
+            startAt: startAt + h * HOUR_MS,
+            endAt: startAt + (h + 1) * HOUR_MS,
+            calls: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            totalTokens: 0,
+            costUsd: 0,
+            costCny: 0,
+          });
+        }
+      } else {
+        for (let bStart = startAt; bStart < endAt; bStart += HOUR_MS) {
+          const bEnd = Math.min(endAt, bStart + HOUR_MS);
+          const localHour = getZonedParts(bStart, dtf!).hour;
+          const key = pad2(localHour);
+          buckets.push({
+            key,
+            label: `${key}:00`,
+            startAt: bStart,
+            endAt: bEnd,
+            calls: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            totalTokens: 0,
+            costUsd: 0,
+            costCny: 0,
+          });
+        }
       }
 
       const todayStartUtc = todayParts.utcMidnightMs;
@@ -937,13 +1069,15 @@ export class UsageStore {
         : anchorParts;
       for (let offset = -6; offset <= 0; offset++) {
         const d = addDaysUtc(windowEnd.year, windowEnd.month, windowEnd.day, offset);
-        const pStart = shiftedMidnightToEpoch(d.year, d.month - 1, d.day, tzOffsetMin);
+        const nd = addDaysUtc(d.year, d.month, d.day, 1);
+        const pStart = shiftedMidnightToEpoch(d.year, d.month - 1, d.day, explicitTz, dtf);
+        const pEnd = shiftedMidnightToEpoch(nd.year, nd.month - 1, nd.day, explicitTz, dtf);
         recentWindows.push({
           key: d.ymd,
           anchorDate: d.ymd,
           label: `${pad2(d.month)}/${pad2(d.day)}`,
           startAt: pStart,
-          endAt: pStart + DAY_MS,
+          endAt: pEnd,
           calls: 0,
           totalTokens: 0,
           costUsd: 0,
@@ -956,8 +1090,8 @@ export class UsageStore {
       const nextMon = addDaysUtc(anchorMon.year, anchorMon.month, anchorMon.day, 7);
       const prevMon = addDaysUtc(anchorMon.year, anchorMon.month, anchorMon.day, -7);
 
-      startAt = shiftedMidnightToEpoch(anchorMon.year, anchorMon.month - 1, anchorMon.day, tzOffsetMin);
-      endAt = shiftedMidnightToEpoch(nextMon.year, nextMon.month - 1, nextMon.day, tzOffsetMin);
+      startAt = shiftedMidnightToEpoch(anchorMon.year, anchorMon.month - 1, anchorMon.day, explicitTz, dtf);
+      endAt = shiftedMidnightToEpoch(nextMon.year, nextMon.month - 1, nextMon.day, explicitTz, dtf);
       prevAnchorDate = prevMon.ymd;
       nextAnchorDate = nextMon.ymd;
       const iso = isoWeekInfo(anchorMon.utcMidnightMs);
@@ -966,12 +1100,14 @@ export class UsageStore {
 
       for (let i = 0; i < 7; i++) {
         const d = addDaysUtc(anchorMon.year, anchorMon.month, anchorMon.day, i);
-        const bStart = startAt + i * DAY_MS;
+        const nd = addDaysUtc(d.year, d.month, d.day, 1);
+        const bStart = shiftedMidnightToEpoch(d.year, d.month - 1, d.day, explicitTz, dtf);
+        const bEnd = shiftedMidnightToEpoch(nd.year, nd.month - 1, nd.day, explicitTz, dtf);
         buckets.push({
           key: d.ymd,
           label: `${WEEKDAY_ZH[i]!} ${pad2(d.month)}/${pad2(d.day)}`,
           startAt: bStart,
-          endAt: bStart + DAY_MS,
+          endAt: bEnd,
           calls: 0,
           inputTokens: 0,
           outputTokens: 0,
@@ -992,14 +1128,16 @@ export class UsageStore {
       for (let w = -7; w <= 0; w++) {
         const mon = addDaysUtc(windowEndMon.year, windowEndMon.month, windowEndMon.day, w * 7);
         const sun = addDaysUtc(mon.year, mon.month, mon.day, 6);
+        const nextWMon = addDaysUtc(mon.year, mon.month, mon.day, 7);
         const wIso = isoWeekInfo(mon.utcMidnightMs);
-        const pStart = shiftedMidnightToEpoch(mon.year, mon.month - 1, mon.day, tzOffsetMin);
+        const pStart = shiftedMidnightToEpoch(mon.year, mon.month - 1, mon.day, explicitTz, dtf);
+        const pEnd = shiftedMidnightToEpoch(nextWMon.year, nextWMon.month - 1, nextWMon.day, explicitTz, dtf);
         recentWindows.push({
           key: `${wIso.year}-W${pad2(wIso.week)}`,
           anchorDate: mon.ymd,
           label: `第${wIso.week}周 (${pad2(mon.month)}/${pad2(mon.day)}~${pad2(sun.month)}/${pad2(sun.day)})`,
           startAt: pStart,
-          endAt: pStart + 7 * DAY_MS,
+          endAt: pEnd,
           calls: 0,
           totalTokens: 0,
           costUsd: 0,
@@ -1007,20 +1145,21 @@ export class UsageStore {
       }
     } else {
       const daysInMonth = new Date(Date.UTC(anchorParts.year, anchorParts.month, 0)).getUTCDate();
-      startAt = shiftedMidnightToEpoch(anchorParts.year, anchorParts.month - 1, 1, tzOffsetMin);
-      endAt = shiftedMidnightToEpoch(anchorParts.year, anchorParts.month, 1, tzOffsetMin);
+      startAt = shiftedMidnightToEpoch(anchorParts.year, anchorParts.month - 1, 1, explicitTz, dtf);
+      endAt = shiftedMidnightToEpoch(anchorParts.year, anchorParts.month, 1, explicitTz, dtf);
       prevAnchorDate = formatUtcYmd(new Date(Date.UTC(anchorParts.year, anchorParts.month - 2, 1)));
       nextAnchorDate = formatUtcYmd(new Date(Date.UTC(anchorParts.year, anchorParts.month, 1)));
       periodLabel = `${anchorParts.year}年${anchorParts.month}月`;
       currentPeriodKey = `${anchorParts.year}-${pad2(anchorParts.month)}`;
 
       for (let day = 1; day <= daysInMonth; day++) {
-        const bStart = startAt + (day - 1) * DAY_MS;
+        const bStart = shiftedMidnightToEpoch(anchorParts.year, anchorParts.month - 1, day, explicitTz, dtf);
+        const bEnd = shiftedMidnightToEpoch(anchorParts.year, anchorParts.month - 1, day + 1, explicitTz, dtf);
         buckets.push({
           key: `${anchorParts.year}-${pad2(anchorParts.month)}-${pad2(day)}`,
           label: `${day}日`,
           startAt: bStart,
-          endAt: bStart + DAY_MS,
+          endAt: bEnd,
           calls: 0,
           inputTokens: 0,
           outputTokens: 0,
@@ -1039,8 +1178,8 @@ export class UsageStore {
         const idx = windowEndIdx + mOff;
         const yr = Math.floor(idx / 12);
         const mo = (idx % 12) + 1;
-        const pStart = shiftedMidnightToEpoch(yr, mo - 1, 1, tzOffsetMin);
-        const pEnd = shiftedMidnightToEpoch(yr, mo, 1, tzOffsetMin);
+        const pStart = shiftedMidnightToEpoch(yr, mo - 1, 1, explicitTz, dtf);
+        const pEnd = shiftedMidnightToEpoch(yr, mo, 1, explicitTz, dtf);
         recentWindows.push({
           key: `${yr}-${pad2(mo)}`,
           anchorDate: `${yr}-${pad2(mo)}-01`,
@@ -1119,9 +1258,11 @@ export class UsageStore {
         modelAcc.costSource = rowCostSource;
       }
 
-      const bIdx = Math.floor((row.at - startAt) / bucketStepMs);
+      let bIdx = Math.min(buckets.length - 1, Math.max(0, Math.floor((row.at - startAt) / bucketStepMs)));
+      while (bIdx > 0 && row.at < buckets[bIdx]!.startAt) bIdx--;
+      while (bIdx + 1 < buckets.length && row.at >= buckets[bIdx]!.endAt) bIdx++;
       const bucket = buckets[bIdx];
-      if (bucket) {
+      if (bucket && row.at >= bucket.startAt && row.at < bucket.endAt) {
         bucket.calls += 1;
         bucket.inputTokens += Number(row.input_tokens ?? 0);
         bucket.outputTokens += Number(row.output_tokens ?? 0);

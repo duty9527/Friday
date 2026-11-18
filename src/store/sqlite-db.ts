@@ -21,6 +21,13 @@ export class SqliteDb {
       CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), body TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS operations_task ON operations(task_id);
       CREATE TABLE IF NOT EXISTS timers(id TEXT PRIMARY KEY, body TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS messages(seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, request_id TEXT UNIQUE, body TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS message_tasks(message_id TEXT NOT NULL REFERENCES messages(id), task_id TEXT NOT NULL REFERENCES tasks(id), PRIMARY KEY(message_id,task_id));
+      CREATE TABLE IF NOT EXISTS journal(seq INTEGER PRIMARY KEY AUTOINCREMENT, root_id TEXT NOT NULL, task_id TEXT, message_id TEXT, body TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS journal_root ON journal(root_id,seq);
+      CREATE INDEX IF NOT EXISTS journal_task ON journal(task_id,seq);
+      CREATE INDEX IF NOT EXISTS journal_message ON journal(message_id,seq);
+      CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS memories(
         id TEXT PRIMARY KEY,
         topic TEXT NOT NULL,
@@ -31,6 +38,7 @@ export class SqliteDb {
         last_accessed_at INTEGER,
         last_reinforced_at INTEGER,
         importance INTEGER,
+        pinned INTEGER NOT NULL DEFAULT 0,
         body TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS memories_active ON memories(superseded_by, updated_at DESC);
@@ -68,8 +76,26 @@ export class SqliteDb {
       CREATE INDEX IF NOT EXISTS model_usage_at ON model_usage(at);
       CREATE INDEX IF NOT EXISTS model_usage_model ON model_usage(provider, model, at);
     `);
-    this.migrateMemoriesColumns();
-    this.migrateMemoryEmbeddingsFk();
+    this.runSchemaMigrations();
+  }
+
+  private getUserVersion(): number {
+    const row = this.db.prepare('PRAGMA user_version').get() as Record<string, unknown> | undefined;
+    return Number(row?.user_version ?? 0) || 0;
+  }
+
+  private runSchemaMigrations(): void {
+    const version = this.getUserVersion();
+    if (version < 1) {
+      this.migrateMemoriesColumns();
+      this.migrateMemoryEmbeddingsFk();
+      this.db.exec('PRAGMA user_version = 1;');
+    }
+    if (version < 2) {
+      this.migrateMemoriesPinnedColumn();
+      this.db.exec('CREATE INDEX IF NOT EXISTS memories_active_pinned ON memories(superseded_by, pinned DESC, updated_at DESC);');
+      this.db.exec('PRAGMA user_version = 2;');
+    }
   }
 
   private migrateMemoriesColumns(): void {
@@ -108,6 +134,25 @@ export class SqliteDb {
     });
   }
 
+  private migrateMemoriesPinnedColumn(): void {
+    const cols = new Set(
+      (this.db.prepare('PRAGMA table_info(memories)').all() as Array<Record<string, unknown>>)
+        .map(row => String(row.name ?? '')),
+    );
+    this.transaction(() => {
+      if (!cols.has('pinned')) {
+        this.db.exec('ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;');
+        this.db.exec(`
+          UPDATE memories
+          SET pinned = CASE
+            WHEN json_extract(body, '$.pinned') IN (1, '1', 'true') THEN 1
+            ELSE 0
+          END
+        `);
+      }
+    });
+  }
+
   private migrateMemoryEmbeddingsFk(): void {
     const fkRows = this.db.prepare('PRAGMA foreign_key_list(memory_embeddings)').all() as Array<Record<string, unknown>>;
     const hasCascadeFk = fkRows.some(row =>
@@ -138,19 +183,28 @@ export class SqliteDb {
   }
 
   transaction<T>(run: () => T): T {
-    const level = this.depth++;
+    const level = this.depth;
     const savepoint = `nested_${level}`;
     this.db.exec(level === 0 ? 'BEGIN IMMEDIATE' : `SAVEPOINT ${savepoint}`);
+    this.depth = level + 1;
     try {
       const result = run();
       this.db.exec(level === 0 ? 'COMMIT' : `RELEASE SAVEPOINT ${savepoint}`);
       return result;
     } catch (error) {
-      this.db.exec(level === 0 ? 'ROLLBACK' : `ROLLBACK TO SAVEPOINT ${savepoint}`);
-      if (level !== 0) this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
+      try {
+        if (level === 0) {
+          this.db.exec('ROLLBACK');
+        } else {
+          this.db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+          this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
+        }
+      } catch {
+        // Preserve original error if rollback fails (e.g., connection closed or busy).
+      }
       throw error;
     } finally {
-      this.depth--;
+      this.depth = level;
     }
   }
 

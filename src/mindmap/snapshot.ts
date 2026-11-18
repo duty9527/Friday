@@ -9,7 +9,7 @@ import type {
   MindmapTaskFlow,
 } from '../mindmap-types.js';
 import type { Task } from '../store.js';
-import type { ChatMessage, MemoryCard, MessageOrigin } from '../view.js';
+import type { ChatMessage, MemoryCard, MessageOrigin, TraceEvent } from '../view.js';
 import {
   asRecord,
   buildRouterTurns,
@@ -76,18 +76,22 @@ export function groupFlowsIntoSessions(flowsNewestFirst: MindmapTaskFlow[]): Min
     let recalledMemoryCount = 0;
     let consolidatedMemoryCount = 0;
     let aiManagedContext = turns.some((t, idx) => idx > 0 && Boolean(t.sessionLink));
+    const seenTaskIds = new Set<string>();
 
     const turnSummaries: MindmapSessionTurnSummary[] = turns.map((t, idx) => {
       t.sessionId = sessionId;
       t.turnIndex = idx + 1;
       t.turnCount = turns.length;
-      taskCount += t.tasks.length;
       recalledMemoryCount += t.memoryRecall.recalledItems.length;
       consolidatedMemoryCount += t.consolidatedMemories.length;
       if (t.sessionLink?.source === 'gemini-decision-1') jevCallCount += 1;
       for (const task of t.tasks) {
-        if (task.jevRoute?.called) jevCallCount += 1;
-        jevCallCount += task.jevQualityGates.length;
+        if (!seenTaskIds.has(task.id)) {
+          seenTaskIds.add(task.id);
+          taskCount += 1;
+          if (task.jevRoute?.called) jevCallCount += 1;
+          jevCallCount += task.jevQualityGates.length;
+        }
         if (task.contextBrief || task.compiledMemories.length > 0) aiManagedContext = true;
       }
       if (t.memoryRecall.recalledItems.length > 0 || t.consolidatedMemories.length > 0) aiManagedContext = true;
@@ -183,7 +187,10 @@ export async function buildMindmapSnapshot(
     for (const t of tasksByOriginMsg.get(msg.id) ?? []) combined.set(t.id, t);
     for (const tid of msg.taskIds) {
       const found = tasksById.get(tid);
-      if (found) combined.set(found.id, found);
+      // Do not duplicate tasks owned by another user message onto follow-up turns.
+      if (found && (!found.originMessageId || found.originMessageId === msg.id)) {
+        combined.set(found.id, found);
+      }
     }
     const sorted = [...combined.values()].sort((a, b) => a.createdAt - b.createdAt);
     flowTaskMap.set(msg.id, sorted);
@@ -194,27 +201,67 @@ export async function buildMindmapSnapshot(
   }
 
   const journalEvents = store.conversation.structuredJournalForScopes([...scopeMsgIds], [...scopeTaskIds]);
+  const eventsByRoot = new Map<string, TraceEvent[]>();
+  const eventsByMessage = new Map<string, TraceEvent[]>();
+  const eventsByTask = new Map<string, TraceEvent[]>();
+  const pushEvent = (map: Map<string, TraceEvent[]>, key: string | undefined, ev: TraceEvent) => {
+    if (!key) return;
+    let bucket = map.get(key);
+    if (!bucket) {
+      bucket = [];
+      map.set(key, bucket);
+    }
+    bucket.push(ev);
+  };
+  for (const ev of journalEvents) {
+    pushEvent(eventsByRoot, ev.rootId, ev);
+    pushEvent(eventsByMessage, ev.messageId, ev);
+    pushEvent(eventsByTask, ev.taskId, ev);
+  }
+  const collectFlowEvents = (msgId: string, replyIds: string[], taskIds: string[]): TraceEvent[] => {
+    const seen = new Map<number, TraceEvent>();
+    for (const ev of eventsByRoot.get(msgId) ?? []) seen.set(ev.seq, ev);
+    for (const ev of eventsByMessage.get(msgId) ?? []) seen.set(ev.seq, ev);
+    for (const rid of replyIds) {
+      for (const ev of eventsByMessage.get(rid) ?? []) seen.set(ev.seq, ev);
+    }
+    for (const tid of taskIds) {
+      for (const ev of eventsByTask.get(tid) ?? []) seen.set(ev.seq, ev);
+    }
+    return [...seen.values()].sort((a, b) => a.seq - b.seq);
+  };
+
   const allMemories = store.listMemories({ includeSuperseded: true, limit: 500 });
   const memoryById = new Map<string, MemoryCard>(allMemories.map(c => [c.id, c]));
-  const activeMemoriesCount = allMemories.filter(c => !c.supersededBy).length;
+  const memoriesBySourceMsg = new Map<string, MemoryCard[]>();
+  const memoriesBySourceTask = new Map<string, MemoryCard[]>();
+  for (const card of allMemories) {
+    if (card.sourceMessageId) {
+      const bucket = memoriesBySourceMsg.get(card.sourceMessageId) ?? [];
+      bucket.push(card);
+      memoriesBySourceMsg.set(card.sourceMessageId, bucket);
+    }
+    if (card.sourceTaskId) {
+      const bucket = memoriesBySourceTask.get(card.sourceTaskId) ?? [];
+      bucket.push(card);
+      memoriesBySourceTask.set(card.sourceTaskId, bucket);
+    }
+  }
+  const activeMemoriesCount = store.memoryDirectory(1).totalActive;
   const imChannels = store.listImChannelViews();
   const channelById = new Map(imChannels.map(ch => [ch.id, ch]));
   const timers = store.listTimers();
   const modelHubView = await coordinator.modelHub.getView();
 
-  const flows: MindmapTaskFlow[] = [];
+  const messageFlows: MindmapTaskFlow[] = [];
 
   for (const userMsg of page.items) {
     const flowTasks = flowTaskMap.get(userMsg.id) ?? [];
-    const flowTaskIdSet = new Set(flowTasks.map(t => t.id));
     const flowReplies = repliesByParent.get(userMsg.id) ?? [];
-    const flowReplyIdSet = new Set(flowReplies.map(r => r.id));
-
-    const flowEvents = journalEvents.filter(ev =>
-      ev.rootId === userMsg.id
-      || ev.messageId === userMsg.id
-      || (ev.messageId && flowReplyIdSet.has(ev.messageId))
-      || (ev.taskId && flowTaskIdSet.has(ev.taskId)),
+    const flowEvents = collectFlowEvents(
+      userMsg.id,
+      flowReplies.map(r => r.id),
+      flowTasks.map(t => t.id),
     );
 
     const timerName = userMsg.source === 'system' ? parseTimerTriggerName(userMsg.text) : undefined;
@@ -254,23 +301,29 @@ export async function buildMindmapSnapshot(
 
     const claimedReportSpans = new Set<string>();
     const taskDetails = flowTasks.map(task => {
-      const taskSpecificEvents = flowEvents.filter(ev => ev.taskId === task.id);
+      const taskSpecificEvents = eventsByTask.get(task.id) ?? [];
       return buildTaskDetail(store, task, taskSpecificEvents, routerTurns, claimedReportSpans, memoryById);
     });
 
     // Memories created/saved in this flow (via save_memory or distiller)
-    const savedMemoryIdsFromActions = new Set<string>();
-    for (const act of routeActions) {
-      if (act.kind === 'save_memory') {
-        for (const mid of act.memoryIds ?? []) savedMemoryIdsFromActions.add(mid);
+    const consolidatedById = new Map<string, MemoryCard>();
+    for (const card of memoriesBySourceMsg.get(userMsg.id) ?? []) {
+      consolidatedById.set(card.id, card);
+    }
+    for (const t of flowTasks) {
+      for (const card of memoriesBySourceTask.get(t.id) ?? []) {
+        consolidatedById.set(card.id, card);
       }
     }
-    const consolidatedMemories: MindmapConsolidatedMemory[] = allMemories
-      .filter(card =>
-        card.sourceMessageId === userMsg.id
-        || (card.sourceTaskId && flowTaskIdSet.has(card.sourceTaskId))
-        || savedMemoryIdsFromActions.has(card.id),
-      )
+    for (const act of routeActions) {
+      if (act.kind === 'save_memory') {
+        for (const mid of act.memoryIds ?? []) {
+          const card = memoryById.get(mid);
+          if (card) consolidatedById.set(card.id, card);
+        }
+      }
+    }
+    const consolidatedMemories: MindmapConsolidatedMemory[] = [...consolidatedById.values()]
       .map(card => ({
         id: card.id,
         topic: card.topic,
@@ -352,7 +405,7 @@ export async function buildMindmapSnapshot(
     const clippedMsg = clipText(userMsg.text, 1600);
     const completedAt = flowReplies.at(-1)?.at ?? taskDetails.at(-1)?.createdAt;
 
-    flows.push({
+    messageFlows.push({
       id: `flow:msg:${userMsg.id}`,
       seq: userMsg.seq,
       createdAt: userMsg.at,
@@ -415,14 +468,18 @@ export async function buildMindmapSnapshot(
   }
 
   // Append any standalone tasks submitted directly without a user message (e.g. CLI submit)
+  const orphanFlows: MindmapTaskFlow[] = [];
   if (includeOrphans) {
     for (const task of [...orphanTasks].sort((a, b) => b.createdAt - a.createdAt)) {
-      const taskEvents = journalEvents.filter(ev => ev.taskId === task.id || ev.rootId === task.id);
+      const seenTaskEv = new Map<number, TraceEvent>();
+      for (const ev of eventsByTask.get(task.id) ?? []) seenTaskEv.set(ev.seq, ev);
+      for (const ev of eventsByRoot.get(task.id) ?? []) seenTaskEv.set(ev.seq, ev);
+      const taskEvents = [...seenTaskEv.values()].sort((a, b) => a.seq - b.seq);
       const orphanRouterTurns = buildRouterTurns(taskEvents);
       const detail = buildTaskDetail(store, task, taskEvents, orphanRouterTurns, new Set<string>(), memoryById);
       const imChannel = task.origin?.channel ?? 'local';
       const imBound = task.origin?.channelId ? channelById.get(task.origin.channelId) : undefined;
-      flows.push({
+      orphanFlows.push({
         id: `flow:task:${task.id}`,
         seq: 0,
         createdAt: task.createdAt,
@@ -445,8 +502,7 @@ export async function buildMindmapSnapshot(
         routerTurns: orphanRouterTurns,
         routeActions: [],
         tasks: [detail],
-        consolidatedMemories: allMemories
-          .filter(c => c.sourceTaskId === task.id)
+        consolidatedMemories: (memoriesBySourceTask.get(task.id) ?? [])
           .map(card => ({
             id: card.id,
             topic: card.topic,
@@ -470,34 +526,61 @@ export async function buildMindmapSnapshot(
     }
   }
 
-  // Enforce safe Unix socket payload limit (< 2.4 MB) by trimming trailing flows if needed
+  // Enforce safe Unix socket payload limit (< 2.4 MB) while preserving orphanTasks
+  // and ensuring `hasMore` never emits an infinite-pagination cursor (`beforeSeq: undefined`).
+  const boundedOrphans: Array<{ flow: MindmapTaskFlow; size: number }> = [];
+  const orphanCapBytes = messageFlows.length > 0 ? Math.floor(SAFE_PAYLOAD_BYTES * 0.5) : SAFE_PAYLOAD_BYTES;
+  let orphanReservedBytes = 0;
+  for (const oFlow of orphanFlows) {
+    const oSize = Buffer.byteLength(JSON.stringify(oFlow), 'utf8');
+    if (boundedOrphans.length > 0 && orphanReservedBytes + oSize > orphanCapBytes) break;
+    boundedOrphans.push({ flow: oFlow, size: oSize });
+    orphanReservedBytes += oSize;
+  }
+
+  let runningBytes = 2048;
+  const boundedFlows: MindmapTaskFlow[] = [];
+  let truncatedMessageFlows = false;
+  let lastMessageSeq: number | undefined;
+  for (const flow of messageFlows) {
+    const chunkSize = Buffer.byteLength(JSON.stringify(flow), 'utf8');
+    if (boundedFlows.length > 0 && runningBytes + orphanReservedBytes + chunkSize > SAFE_PAYLOAD_BYTES) {
+      truncatedMessageFlows = true;
+      break;
+    }
+    boundedFlows.push(flow);
+    runningBytes += chunkSize;
+    if (flow.seq > 0) lastMessageSeq = flow.seq;
+  }
+  for (const { flow: oFlow, size: oSize } of boundedOrphans) {
+    if (boundedFlows.length > 0 && runningBytes + oSize > SAFE_PAYLOAD_BYTES) {
+      break;
+    }
+    boundedFlows.push(oFlow);
+    runningBytes += oSize;
+  }
+
   let wechatFlows = 0;
   let localFlows = 0;
   let timerFlows = 0;
   let jevCalls = 0;
-  let hasMore = page.hasMore;
-  let beforeSeq = page.before;
-
-  const boundedFlows: MindmapTaskFlow[] = [];
-  let runningSize = 2048;
-  for (const flow of flows) {
-    const chunkSize = Buffer.byteLength(JSON.stringify(flow), 'utf8');
-    if (boundedFlows.length > 0 && runningSize + chunkSize > SAFE_PAYLOAD_BYTES) {
-      hasMore = true;
-      beforeSeq = boundedFlows.at(-1)?.seq || beforeSeq;
-      break;
-    }
-    boundedFlows.push(flow);
-    runningSize += chunkSize;
+  const seenJevTaskIds = new Set<string>();
+  for (const flow of boundedFlows) {
     if (flow.ingress.sourceKind === 'timer') timerFlows += 1;
     else if (flow.ingress.sourceKind === 'wechat') wechatFlows += 1;
-    else localFlows += 1;
+    else if (flow.ingress.sourceKind === 'local') localFlows += 1;
     if (flow.sessionLink?.source === 'gemini-decision-1') jevCalls += 1;
     for (const t of flow.tasks) {
+      if (seenJevTaskIds.has(t.id)) continue;
+      seenJevTaskIds.add(t.id);
       if (t.jevRoute?.called) jevCalls += 1;
       jevCalls += t.jevQualityGates.length;
     }
   }
+
+  const candidateBeforeSeq = lastMessageSeq ?? (page.before && page.before > 0 ? page.before : undefined);
+  const hasMore = Boolean((page.hasMore || truncatedMessageFlows) && candidateBeforeSeq !== undefined && candidateBeforeSeq > 0);
+  const beforeSeq = hasMore ? candidateBeforeSeq : undefined;
 
   const sessions = groupFlowsIntoSessions(boundedFlows);
   const multiTurnSessions = sessions.filter(s => s.turnCount >= 2).length;

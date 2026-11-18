@@ -550,3 +550,140 @@ export function isOfficialOpenCodeUrl(providerId: string, baseUrl?: string): boo
     return false;
   }
 }
+
+const KNOWN_PROVIDER_IDS = new Set([
+  ...FEATURED_PROVIDERS.map(p => p.id),
+  ...Object.keys(DEFAULT_PROVIDER_ENDPOINTS),
+  'gemini',
+]);
+
+export function getKnownProviderIds(extraProviders?: Iterable<string>): Set<string> {
+  const set = new Set(KNOWN_PROVIDER_IDS);
+  if (extraProviders) {
+    for (const provider of extraProviders) {
+      const norm = normalizeProviderId(provider);
+      if (norm) set.add(norm);
+    }
+  }
+  return set;
+}
+
+export interface ParsedModelSpec {
+  providerId: string;
+  modelId: string;
+  spec: string;
+  explicitLevel?: ThinkingLevel;
+}
+
+/**
+ * Parses a model spec using known provider prefixes so multi-slash model IDs
+ * (e.g. `openrouter/anthropic/claude-sonnet-4` or `deepseek-ai/DeepSeek-R1`)
+ * split cleanly into `{ providerId, modelId }`.
+ */
+export function parseModelSpec(
+  rawSpec: string,
+  options?: {
+    fallbackProvider?: string;
+    preferFallbackProvider?: boolean;
+    knownProviders?: Iterable<string>;
+  },
+): ParsedModelSpec {
+  const { model: cleaned, explicitLevel } = splitModelAndLevel(rawSpec.trim());
+  const fallback = normalizeProviderId(options?.fallbackProvider);
+  const rawFallback = options?.fallbackProvider?.trim();
+  const safeFallback = fallback || 'unknown';
+
+  if (!cleaned) {
+    return {
+      providerId: safeFallback,
+      modelId: 'unknown',
+      spec: `${safeFallback}/unknown`,
+      explicitLevel,
+    };
+  }
+
+  if (options?.preferFallbackProvider && fallback && fallback !== 'unknown') {
+    if (cleaned.startsWith(`${fallback}/`)) {
+      const rest = cleaned.slice(fallback.length + 1).trim() || 'unknown';
+      return { providerId: fallback, modelId: rest, spec: `${fallback}/${rest}`, explicitLevel };
+    }
+    if (rawFallback && rawFallback !== fallback && cleaned.startsWith(`${rawFallback}/`)) {
+      const rest = cleaned.slice(rawFallback.length + 1).trim() || 'unknown';
+      return { providerId: fallback, modelId: rest, spec: `${fallback}/${rest}`, explicitLevel };
+    }
+    return { providerId: fallback, modelId: cleaned, spec: `${fallback}/${cleaned}`, explicitLevel };
+  }
+
+  const slash = cleaned.indexOf('/');
+  if (slash <= 0) {
+    return { providerId: safeFallback, modelId: cleaned, spec: `${safeFallback}/${cleaned}`, explicitLevel };
+  }
+
+  const headRaw = cleaned.slice(0, slash).trim();
+  const headNorm = normalizeProviderId(headRaw);
+  const rest = cleaned.slice(slash + 1).trim() || 'unknown';
+  const known = getKnownProviderIds(options?.knownProviders);
+
+  if (headNorm && known.has(headNorm)) {
+    return { providerId: headNorm, modelId: rest, spec: `${headNorm}/${rest}`, explicitLevel };
+  }
+  if (fallback && fallback !== 'unknown') {
+    return { providerId: fallback, modelId: cleaned, spec: `${fallback}/${cleaned}`, explicitLevel };
+  }
+  const providerId = headNorm || 'unknown';
+  return { providerId, modelId: rest, spec: `${providerId}/${rest}`, explicitLevel };
+}
+
+export function isLoopbackHostname(hostname: string): boolean {
+  const cleaned = hostname.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  return cleaned === 'localhost' || cleaned === '127.0.0.1' || cleaned === '::1';
+}
+
+export function assertSafeBaseUrlForCredentials(rawUrl: string | undefined, hasCredentials: boolean): void {
+  if (!rawUrl?.trim()) return;
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl.trim());
+  } catch {
+    throw new Error(`无效的 Base URL: ${rawUrl}`);
+  }
+  if (parsed.protocol === 'https:') return;
+  if (parsed.protocol === 'http:') {
+    if (hasCredentials && !isLoopbackHostname(parsed.hostname)) {
+      throw new Error(`安全限制：禁止通过明文 HTTP 向非本地地址 (${parsed.hostname}) 发送凭据，请改用 HTTPS`);
+    }
+    return;
+  }
+  throw new Error('Base URL 必须使用 http 或 https');
+}
+
+export function sanitizeCredentialLeakText(text: string | undefined, secrets?: Array<string | undefined>): string | undefined {
+  if (!text) return text;
+  let cleaned = text
+    .replace(/([?&](?:key|api_key|token|access_token)=)[^&\s]+/gi, '$1[redacted]')
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, '$1[redacted]')
+    .replace(/\b(?:sk-[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{12,})\b/g, '[redacted]');
+  if (secrets) {
+    for (const secret of secrets) {
+      const trimmed = secret?.trim();
+      if (trimmed && trimmed.length >= 6) {
+        cleaned = cleaned.split(trimmed).join('[redacted]');
+      }
+    }
+  }
+  return cleaned;
+}
+
+export function computeEffectiveFailCount(
+  stats: Pick<ModelEffectStats, 'failCount' | 'updatedAt'> | undefined,
+  now = Date.now(),
+): number {
+  const raw = Math.max(0, stats?.failCount ?? 0);
+  if (raw === 0) return 0;
+  const elapsed = Math.max(0, now - (stats?.updatedAt ?? now));
+  const graceMs = 3_600_000;
+  if (elapsed <= graceMs) return raw;
+  const halfLifeMs = 6 * 3_600_000;
+  const decayed = raw * Math.pow(0.5, (elapsed - graceMs) / halfLifeMs);
+  return decayed < 0.25 ? 0 : Number(decayed.toFixed(2));
+}

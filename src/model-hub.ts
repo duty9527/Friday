@@ -32,13 +32,16 @@ import type {
   PooledModelEntry,
 } from './view.js';
 import {
+  assertSafeBaseUrlForCredentials,
   buildModelTiers,
   classifyModelEntry,
+  computeEffectiveFailCount,
   DECISION_STATS_EPOCH,
   DEFAULT_PROVIDER_ENDPOINTS,
   ensureRealProviderCatalog,
   FALLBACK_PROVIDER_MODELS,
   FEATURED_PROVIDERS,
+  getKnownProviderIds,
   getPristineSdkModel,
   isOfficialOpenCodeUrl,
   isOpenCodeProvider,
@@ -46,7 +49,9 @@ import {
   MODEL_TIER_VALUES,
   normalizeProviderId,
   normalizeSelectedModels,
+  parseModelSpec,
   resolveWorkerModelFromTiers,
+  sanitizeCredentialLeakText,
   splitModelAndLevel,
   thinkingLevelToTier,
   tierToPreferredThinkingLevel,
@@ -105,6 +110,9 @@ export class ModelHub {
   private saveQueue: Promise<void> = Promise.resolve();
   private runtimePromise?: Promise<ModelRuntime>;
   private closed = false;
+  private readonly envProviderKeys = new Map<string, string>();
+  private readonly explicitSessionKeys = new Set<string>();
+  private readonly overriddenProviders = new Set<string>();
 
   constructor(
     private readonly home: string,
@@ -146,14 +154,15 @@ export class ModelHub {
     provider: string,
     model: string,
   ): { costInput: number; costOutput: number; costCacheRead?: number; costCacheWrite?: number } | undefined {
+    const knownProviders = this.getKnownProviders();
+    const parsed = parseModelSpec(model, {
+      fallbackProvider: provider,
+      preferFallbackProvider: Boolean(provider.trim()),
+      knownProviders,
+    });
     const rawProvider = provider.trim();
-    const normProvider = normalizeProviderId(rawProvider) ?? rawProvider;
-    const rawModel = splitModelAndLevel(model.trim()).model;
-    const cleanModel = rawModel.startsWith(`${normProvider}/`)
-      ? rawModel.slice(normProvider.length + 1)
-      : rawProvider && rawModel.startsWith(`${rawProvider}/`)
-        ? rawModel.slice(rawProvider.length + 1)
-        : rawModel;
+    const normProvider = parsed.providerId;
+    const cleanModel = parsed.modelId;
 
     const cached = this.cachedCosts.get(`${normProvider}/${cleanModel}`)
       ?? (rawProvider && rawProvider !== normProvider ? this.cachedCosts.get(`${rawProvider}/${cleanModel}`) : undefined);
@@ -238,11 +247,12 @@ export class ModelHub {
         this.state = { providers: {}, modelStats: {} };
       }
     }
+    this.envProviderKeys.clear();
     if (initialProviderKeys) {
       for (const [prov, key] of Object.entries(initialProviderKeys)) {
         const norm = normalizeProviderId(prov);
-        if (norm && key?.trim() && !this.state.providers[norm]?.apiKey) {
-          this.state.providers[norm] = { ...this.state.providers[norm], apiKey: key.trim() };
+        if (norm && key?.trim()) {
+          this.envProviderKeys.set(norm, key.trim());
         }
       }
     }
@@ -252,13 +262,14 @@ export class ModelHub {
       const candidateIds = new Set<string>([
         ...FEATURED_PROVIDERS.map(p => p.id),
         ...Object.keys(this.state.providers),
+        ...this.envProviderKeys.keys(),
       ]);
       const syncTasks: Array<Promise<void>> = [];
       for (const provId of candidateIds) {
         const cfg = this.state.providers[provId];
         if (cfg?.enabled === false) continue;
         const hasCred = Boolean(
-          cfg?.apiKey
+          this.getEffectiveProviderKey(provId).key
           || cfg?.baseUrl
           || creds.some(c => c.providerId === provId)
           || runtime.getProviderAuthStatus(provId).configured,
@@ -275,6 +286,42 @@ export class ModelHub {
       }
     }
     await this.applyStateToRuntime(runtime);
+  }
+
+  private getKnownProviders(): Set<string> {
+    return getKnownProviderIds([
+      ...FEATURED_PROVIDERS.map(p => p.id),
+      ...Object.keys(this.state.providers),
+      ...this.envProviderKeys.keys(),
+      this.currentTiers.provider,
+      this.currentRouterProvider,
+    ]);
+  }
+
+  private getEffectiveProviderKey(providerId: string): { key?: string; source: 'persisted' | 'environment' | 'none' } {
+    const persisted = this.state.providers[providerId]?.apiKey?.trim() || undefined;
+    const envKey = this.envProviderKeys.get(providerId)?.trim() || undefined;
+    if (this.explicitSessionKeys.has(providerId)) {
+      return persisted ? { key: persisted, source: 'persisted' } : { source: 'none' };
+    }
+    if (envKey) return { key: envKey, source: 'environment' };
+    if (persisted) return { key: persisted, source: 'persisted' };
+    return { source: 'none' };
+  }
+
+  private isSameOriginInlineBaseUrl(runtime: ModelRuntime, providerId: string, inlineBaseUrl: string | undefined): boolean {
+    const cleanInline = inlineBaseUrl?.trim();
+    if (!cleanInline) return true;
+    const baseModels = this.getBaseModels(runtime, providerId);
+    const baseline = this.state.providers[providerId]?.baseUrl?.trim()
+      || baseModels[0]?.baseUrl?.trim()
+      || DEFAULT_PROVIDER_ENDPOINTS[providerId];
+    if (!baseline) return false;
+    try {
+      return new URL(cleanInline).origin === new URL(baseline).origin;
+    } catch {
+      return false;
+    }
   }
 
   private async ensureRuntime(): Promise<ModelRuntime> {
@@ -318,8 +365,9 @@ export class ModelHub {
 
   private async resolveProviderApiKey(runtime: ModelRuntime, providerId: string, inlineApiKey?: string): Promise<string | undefined> {
     if (inlineApiKey?.trim()) return inlineApiKey.trim();
-    const persistedKey = this.state.providers[providerId]?.apiKey?.trim();
-    if (persistedKey) return persistedKey;
+    const effective = this.getEffectiveProviderKey(providerId);
+    if (effective.key) return effective.key;
+    if (this.explicitSessionKeys.has(providerId)) return undefined;
     try {
       const auth = await runtime.getAuth(providerId) as { auth?: { apiKey?: string }; apiKey?: string } | undefined;
       const key = auth?.auth?.apiKey ?? auth?.apiKey;
@@ -337,7 +385,9 @@ export class ModelHub {
   ): Promise<ModelCatalogEntry[]> {
     const baseModels = this.getBaseModels(runtime, providerId);
     const persisted = this.state.providers[providerId] ?? {};
-    const apiKey = await this.resolveProviderApiKey(runtime, providerId, inline?.apiKey);
+    const allowStoredKey = !inline?.baseUrl?.trim() || this.isSameOriginInlineBaseUrl(runtime, providerId, inline.baseUrl);
+    const apiKey = inline?.apiKey?.trim()
+      || (allowStoredKey ? await this.resolveProviderApiKey(runtime, providerId) : undefined);
     const baseUrl = inline?.baseUrl !== undefined
       ? (inline.baseUrl.trim() || undefined)
       : persisted.baseUrl;
@@ -351,10 +401,15 @@ export class ModelHub {
       };
       return fetched;
     } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
+      const rawMsg = error instanceof Error ? error.message : String(error);
+      const safeMsg = sanitizeCredentialLeakText(rawMsg, [
+        apiKey,
+        persisted.apiKey,
+        this.envProviderKeys.get(providerId),
+      ]) ?? rawMsg;
       this.state.providers[providerId] = {
         ...this.state.providers[providerId],
-        fetchError: msg,
+        fetchError: safeMsg,
       };
       throw error;
     }
@@ -380,9 +435,11 @@ export class ModelHub {
     const allProviderIds = new Set<string>([
       ...FEATURED_PROVIDERS.map(p => p.id),
       ...Object.keys(this.state.providers),
+      ...this.envProviderKeys.keys(),
     ]);
     for (const providerId of allProviderIds) {
       const cfg = this.state.providers[providerId] ?? {};
+      const effectiveKey = this.getEffectiveProviderKey(providerId).key;
       const baseModels = this.getBaseModels(runtime, providerId);
       const baseById = new Map(baseModels.map(m => [m.id, m]));
       const defaultSample = baseModels[0];
@@ -430,11 +487,12 @@ export class ModelHub {
         const effectiveApi = cfg.baseUrl ? 'openai-completions' : (defaultSample?.api ?? 'openai-completions');
 
         if (catalogMap.size > 0) {
+          this.overriddenProviders.add(providerId);
           const officialOpenCode = isOfficialOpenCodeUrl(providerId, cfg.baseUrl);
           runtime.registerProvider(providerId, {
             baseUrl: effectiveBaseUrl,
             api: effectiveApi,
-            ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}),
+            ...(effectiveKey ? { apiKey: effectiveKey } : {}),
             models: [...catalogMap.values()].map(entry => {
               const bm = baseById.get(entry.id) ?? getPristineSdkModel(providerId, entry.id);
               const preserveBuiltinProtocol = Boolean(bm && officialOpenCode);
@@ -479,9 +537,18 @@ export class ModelHub {
             }),
           });
         }
+      } else if (this.overriddenProviders.has(providerId) && baseModels.length > 0 && defaultSample) {
+        runtime.registerProvider(providerId, {
+          baseUrl: defaultSample.baseUrl,
+          api: defaultSample.api,
+          models: baseModels.map(m => ({ ...m })),
+        });
+        this.overriddenProviders.delete(providerId);
       }
-      if (cfg.apiKey) {
-        await runtime.setRuntimeApiKey(providerId, cfg.apiKey);
+      if (effectiveKey) {
+        await runtime.setRuntimeApiKey(providerId, effectiveKey);
+      } else if (this.explicitSessionKeys.has(providerId)) {
+        await runtime.removeRuntimeApiKey(providerId).catch(() => {});
       }
     }
     await this.rebuildPoolCache(runtime);
@@ -546,7 +613,6 @@ export class ModelHub {
     const enabled = this.state.decision?.enabled !== false;
     const baseUrl = this.state.decision?.baseUrl?.trim()
       || resolveEnv('FRIDAY_DECISION_BASE_URL', 'SUPER_AGENT_DECISION_BASE_URL')
-      || this.state.providers.google?.baseUrl?.trim()
       || DEFAULT_GEMINI_DECISION_BASE_URL;
     if (!enabled) {
       return {
@@ -584,7 +650,13 @@ export class ModelHub {
 
     // 离线模式下默认不发外网请求；仅当显式配置了独立 decisionApiKey / decisionBaseUrl（如测试桩）时才启用远端决策请求
     const allowInCurrentMode = this.mode === 'real' || Boolean(explicitKey || this.state.decision?.baseUrl?.trim());
-    const configured = Boolean(apiKey && allowInCurrentMode);
+    let safeDecisionUrl = true;
+    try {
+      assertSafeBaseUrlForCredentials(baseUrl, Boolean(apiKey));
+    } catch {
+      safeDecisionUrl = false;
+    }
+    const configured = Boolean(apiKey && allowInCurrentMode && safeDecisionUrl);
 
     return {
       credentials: configured && apiKey ? { apiKey, baseUrl } : undefined,
@@ -606,7 +678,7 @@ export class ModelHub {
     return Boolean(
       resolveEnv('FRIDAY_DECISION_API_KEY', 'SUPER_AGENT_DECISION_API_KEY')
       || (this.isProviderEnabled('google') && (
-        this.state.providers.google?.apiKey?.trim()
+        this.getEffectiveProviderKey('google').key
         || resolveEnv('GEMINI_API_KEY', 'GOOGLE_API_KEY')
         || this.runtime?.getProviderAuthStatus('google').configured
       )),
@@ -679,6 +751,7 @@ export class ModelHub {
     const oauthSet = new Set(creds.filter(c => c.type === 'oauth').map(c => c.providerId));
     const providerIds = new Set<string>(FEATURED_PROVIDERS.map(p => p.id));
     for (const id of Object.keys(this.state.providers)) providerIds.add(id);
+    for (const id of this.envProviderKeys.keys()) providerIds.add(id);
     if (this.currentTiers.provider && this.currentTiers.provider !== 'offline') providerIds.add(this.currentTiers.provider);
     if (this.currentRouterProvider && this.currentRouterProvider !== 'offline') providerIds.add(this.currentRouterProvider);
 
@@ -692,7 +765,8 @@ export class ModelHub {
       if (persisted?.enabled === false) continue;
       const authStatus = runtime.getProviderAuthStatus(id);
       const hasOAuth = oauthSet.has(id);
-      const hasApiKey = Boolean(persisted?.apiKey || authStatus.source === 'runtime' || authStatus.source === 'stored');
+      const hasEffectiveKey = Boolean(this.getEffectiveProviderKey(id).key);
+      const hasApiKey = Boolean(hasEffectiveKey || authStatus.source === 'runtime' || authStatus.source === 'stored');
       const configured = hasOAuth || hasApiKey || authStatus.configured || Boolean(persisted?.baseUrl);
       if (!configured) continue;
 
@@ -733,7 +807,7 @@ export class ModelHub {
           contextWindow: m.contextWindow,
           latencyMs: stats?.lastLatencyMs,
           successCount: stats?.successCount,
-          failCount: stats?.failCount,
+          failCount: stats ? computeEffectiveFailCount(stats) : undefined,
           avgQualityScore: stats?.avgQualityScore,
         };
       };
@@ -786,14 +860,19 @@ export class ModelHub {
 
   recordTaskOutcome(workerModel: string | undefined, ok: boolean, durationMs?: number, qualityScore?: number): void {
     if (!workerModel) return;
-    let spec = splitModelAndLevel(workerModel).model;
-    if (!spec) return;
-    if (!spec.includes('/')) {
-      const matched = this.cachedPool.find(item => item.modelId === spec);
-      spec = matched ? matched.spec : `${this.currentTiers.provider}/${spec}`;
-    }
+    const rawSpec = splitModelAndLevel(workerModel).model;
+    if (!rawSpec) return;
+    const poolHit = this.cachedPool.find(item => item.spec === rawSpec || item.modelId === rawSpec);
+    const spec = poolHit
+      ? poolHit.spec
+      : parseModelSpec(rawSpec, {
+          fallbackProvider: this.currentTiers.provider,
+          knownProviders: this.getKnownProviders(),
+        }).spec;
+    const now = Date.now();
     const stats = this.state.modelStats ?? (this.state.modelStats = {});
-    const prev = stats[spec] ?? { successCount: 0, failCount: 0, updatedAt: Date.now() };
+    const prev = stats[spec] ?? { successCount: 0, failCount: 0, updatedAt: now };
+    const decayedPrevFail = computeEffectiveFailCount(prev, now);
     let qualityScoreSum = prev.qualityScoreSum ?? 0;
     let qualityCount = prev.qualityCount ?? 0;
     if (typeof qualityScore === 'number' && Number.isFinite(qualityScore)) {
@@ -806,10 +885,10 @@ export class ModelHub {
     const updated: ModelEffectStats = {
       ...prev,
       successCount: prev.successCount + (ok ? 1 : 0),
-      failCount: prev.failCount + (ok ? 0 : 1),
+      failCount: ok ? decayedPrevFail : decayedPrevFail + 1,
       ...(durationMs && durationMs > 0 ? { lastLatencyMs: Math.round(durationMs) } : {}),
       ...(qualityCount > 0 ? { qualityScoreSum: Number(qualityScoreSum.toFixed(2)), qualityCount, avgQualityScore } : {}),
-      updatedAt: Date.now(),
+      updatedAt: now,
     };
     stats[spec] = updated;
     const poolEntry = this.cachedPool.find(item => item.spec === spec);
@@ -830,7 +909,7 @@ export class ModelHub {
     for (const entry of [...this.cachedPool, ...this.cachedCatalog]) {
       const st = nextStats[entry.spec];
       entry.successCount = st?.successCount;
-      entry.failCount = st?.failCount;
+      entry.failCount = st ? computeEffectiveFailCount(st) : undefined;
       entry.latencyMs = st?.lastLatencyMs;
       entry.avgQualityScore = st?.avgQualityScore;
     }
@@ -843,16 +922,30 @@ export class ModelHub {
     explicitLevel?: ThinkingLevel;
   } {
     const { model: rawModel, explicitLevel } = splitModelAndLevel(rawModelInput);
+    const directPoolHit = this.cachedPool.find(p => p.spec === rawModel || p.modelId === rawModel);
+    if (directPoolHit) {
+      const readyProviders = new Set(this.cachedPool.map(p => p.providerId));
+      const useQualifiedSpec = readyProviders.size > 1
+        || directPoolHit.providerId !== this.currentTiers.provider
+        || directPoolHit.modelId.includes('/');
+      return {
+        poolEntry: directPoolHit,
+        spec: useQualifiedSpec ? directPoolHit.spec : directPoolHit.modelId,
+        explicitLevel,
+      };
+    }
     if (rawModel.includes('/')) {
-      const slash = rawModel.indexOf('/');
-      const explicitProv = normalizeProviderId(rawModel.slice(0, slash));
+      const parsed = parseModelSpec(rawModel, {
+        fallbackProvider: this.currentTiers.provider,
+        knownProviders: this.getKnownProviders(),
+      });
+      const explicitProv = parsed.providerId !== 'unknown' ? parsed.providerId : undefined;
       if (explicitProv && !this.isProviderEnabled(explicitProv)) {
         throw new Error(`提供方 "${explicitProv}" 已禁用，无法调用模型 "${rawModel}"`);
       }
-      const normalizedSpec = `${explicitProv}/${rawModel.slice(slash + 1)}`;
-      const entry = this.cachedPool.find(p => p.spec === rawModel || p.spec === normalizedSpec);
+      const entry = this.cachedPool.find(p => p.spec === rawModel || p.spec === parsed.spec);
       if (!entry && this.cachedPool.length > 0) throw formatModelNotInPoolError(rawModel, this.cachedPool);
-      return { poolEntry: entry, spec: rawModel, explicitLevel };
+      return { poolEntry: entry, spec: parsed.spec, explicitLevel };
     }
     const poolHit = this.cachedPool.find(p => p.modelId === rawModel);
     if (poolHit) {
@@ -936,7 +1029,9 @@ export class ModelHub {
       excludedProviders: input.excludedProviders,
     });
     const readyProviders = new Set(this.cachedPool.map(p => p.providerId));
-    const useQualifiedSpec = readyProviders.size > 1 || heuristic.candidate.providerId !== this.currentTiers.provider;
+    const useQualifiedSpec = readyProviders.size > 1
+      || heuristic.candidate.providerId !== this.currentTiers.provider
+      || heuristic.candidate.modelId.includes('/');
     return {
       model: useQualifiedSpec ? heuristic.candidate.spec : heuristic.candidate.modelId,
       tier: thinkingLevelToTier(heuristic.thinkingLevel),
@@ -1047,7 +1142,9 @@ export class ModelHub {
     );
     this.emitDecisionUsage(picked.usage);
     const readyProviders = new Set(this.cachedPool.map(p => p.providerId));
-    const useQualifiedSpec = readyProviders.size > 1 || picked.providerId !== this.currentTiers.provider;
+    const useQualifiedSpec = readyProviders.size > 1
+      || picked.providerId !== this.currentTiers.provider
+      || picked.modelId.includes('/');
     return {
       model: useQualifiedSpec ? picked.spec : picked.modelId,
       thinkingLevel: picked.thinkingLevel,
@@ -1119,6 +1216,7 @@ export class ModelHub {
 
     const providerIds = new Set<string>(FEATURED_PROVIDERS.map(p => p.id));
     for (const id of Object.keys(this.state.providers)) providerIds.add(id);
+    for (const id of this.envProviderKeys.keys()) providerIds.add(id);
     if (this.currentTiers.provider && this.currentTiers.provider !== 'offline') providerIds.add(this.currentTiers.provider);
     if (this.currentRouterProvider && this.currentRouterProvider !== 'offline') providerIds.add(this.currentRouterProvider);
 
@@ -1129,14 +1227,21 @@ export class ModelHub {
       const persisted = this.state.providers[id];
       const authStatus = runtime.getProviderAuthStatus(id);
       const hasOAuth = oauthSet.has(id);
-      const hasApiKey = Boolean(persisted?.apiKey || authStatus.source === 'runtime' || authStatus.source === 'stored');
+      const effectiveKeyInfo = this.getEffectiveProviderKey(id);
+      const hasPersistedOrRuntimeKey = effectiveKeyInfo.source === 'persisted'
+        || authStatus.source === 'stored'
+        || (!effectiveKeyInfo.key && authStatus.source === 'runtime');
       const authType: ModelProviderView['authType'] = hasOAuth
         ? 'oauth'
-        : hasApiKey
+        : effectiveKeyInfo.source === 'persisted'
           ? 'api_key'
-          : authStatus.configured
+          : effectiveKeyInfo.source === 'environment'
             ? 'environment'
-            : 'none';
+            : hasPersistedOrRuntimeKey
+              ? 'api_key'
+              : authStatus.configured
+                ? 'environment'
+                : 'none';
       const configured = authType !== 'none' || Boolean(persisted?.baseUrl);
       const hasRemoteModels = Boolean(persisted?.fetchedModels?.length);
       const models = this.buildProviderCatalogModels(runtime, id, persisted);
@@ -1155,12 +1260,12 @@ export class ModelHub {
         enabled: persisted?.enabled !== false,
         configured,
         authType,
-        keyHint: maskKey(persisted?.apiKey),
+        keyHint: maskKey(effectiveKeyInfo.key),
         baseUrl: persisted?.baseUrl,
         supportsOAuth: Boolean(catalogProvider?.auth?.oauth),
         modelSource: hasRemoteModels ? 'remote_api' : 'sdk_catalog',
         modelsFetchedAt: persisted?.modelsFetchedAt,
-        fetchError: persisted?.fetchError,
+        fetchError: sanitizeCredentialLeakText(persisted?.fetchError, [effectiveKeyInfo.key]),
         defaultFast: sampleTiers.fast,
         defaultBalanced: sampleTiers.balanced,
         defaultStrong: sampleTiers.strong,
@@ -1188,13 +1293,16 @@ export class ModelHub {
 
   async configure(input: ModelHubConfigureInput): Promise<ModelHubView> {
     const runtime = await this.ensureRuntime();
+    let nextDecision: PersistedDecisionConfig | undefined = this.state.decision
+      ? { ...this.state.decision }
+      : undefined;
     if (
       input.decisionEnabled !== undefined
       || input.decisionApiKey !== undefined
       || input.clearDecisionApiKey
       || input.decisionBaseUrl !== undefined
     ) {
-      const nextDecision: PersistedDecisionConfig = { ...(this.state.decision ?? {}) };
+      nextDecision = { ...(this.state.decision ?? {}) };
       if (input.decisionEnabled !== undefined) {
         nextDecision.enabled = Boolean(input.decisionEnabled);
       }
@@ -1206,17 +1314,25 @@ export class ModelHub {
       if (input.decisionBaseUrl !== undefined) {
         const trimmedUrl = input.decisionBaseUrl.trim();
         if (trimmedUrl) {
-          let parsed: URL;
-          try { parsed = new URL(trimmedUrl); } catch { throw new Error(`无效的决策引擎 Base URL: ${trimmedUrl}`); }
-          if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('决策引擎 Base URL 必须使用 http 或 https');
+          assertSafeBaseUrlForCredentials(
+            trimmedUrl,
+            Boolean(nextDecision.apiKey || resolveEnv('FRIDAY_DECISION_API_KEY', 'SUPER_AGENT_DECISION_API_KEY') || this.getEffectiveProviderKey('google').key),
+          );
           nextDecision.baseUrl = trimmedUrl;
         } else {
           delete nextDecision.baseUrl;
         }
+      } else if (nextDecision.baseUrl && nextDecision.apiKey) {
+        assertSafeBaseUrlForCredentials(nextDecision.baseUrl, true);
       }
-      this.state.decision = nextDecision;
     }
+
+    const nextProviders: Record<string, PersistedProviderConfig> = { ...this.state.providers };
     const targetProvider = normalizeProviderId(input.providerId);
+    let nextProviderEntry: PersistedProviderConfig | undefined;
+    let shouldClearRuntimeKey = false;
+    let baseUrlModified = false;
+
     if (targetProvider) {
       const prev = this.state.providers[targetProvider] ?? {};
       const next: PersistedProviderConfig = { ...prev };
@@ -1231,20 +1347,29 @@ export class ModelHub {
         delete next.fetchedModels;
         delete next.modelsFetchedAt;
         delete next.fetchError;
-        await runtime.removeRuntimeApiKey(targetProvider).catch(() => {});
+        shouldClearRuntimeKey = true;
       } else if (input.apiKey !== undefined && input.apiKey.trim()) {
         next.apiKey = input.apiKey.trim();
       }
       if (input.baseUrl !== undefined) {
         const trimmedUrl = input.baseUrl.trim();
+        const effectiveNextKey = input.clearApiKey
+          ? undefined
+          : (next.apiKey || this.envProviderKeys.get(targetProvider));
         if (trimmedUrl) {
-          let parsed: URL;
-          try { parsed = new URL(trimmedUrl); } catch { throw new Error(`无效的 Base URL: ${trimmedUrl}`); }
-          if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('Base URL 必须使用 http 或 https');
+          assertSafeBaseUrlForCredentials(trimmedUrl, Boolean(effectiveNextKey));
           next.baseUrl = trimmedUrl;
         } else {
           delete next.baseUrl;
         }
+        if ((next.baseUrl ?? '') !== (prev.baseUrl ?? '')) {
+          baseUrlModified = true;
+          delete next.fetchedModels;
+          delete next.modelsFetchedAt;
+          delete next.fetchError;
+        }
+      } else if (next.baseUrl && next.apiKey) {
+        assertSafeBaseUrlForCredentials(next.baseUrl, true);
       }
       if (Array.isArray(input.customModels)) {
         next.customModels = input.customModels.map(m => m.trim()).filter(Boolean);
@@ -1254,47 +1379,103 @@ export class ModelHub {
         if (selected.length) next.selectedModels = selected;
         else delete next.selectedModels;
       }
-      this.state.providers[targetProvider] = next;
-      if (this.mode === 'real' && next.enabled !== false && !input.clearApiKey && (next.apiKey || next.baseUrl)) {
-        await this.syncProviderModelsFromApi(runtime, targetProvider).catch(() => {});
+      nextProviders[targetProvider] = next;
+      nextProviderEntry = next;
+    }
+
+    const isPendingProviderEnabled = (providerId: string): boolean => nextProviders[providerId]?.enabled !== false;
+
+    let nextWorkerProvider = this.state.workerProvider;
+    let nextCurrentWorkerProvider = this.currentTiers.provider;
+    let clearWorkerTierModels = false;
+    if (input.workerProvider !== undefined && input.workerProvider.trim()) {
+      const candidateWorkerProv = normalizeProviderId(input.workerProvider)!;
+      if (!isPendingProviderEnabled(candidateWorkerProv)) {
+        throw new Error(`提供方 "${candidateWorkerProv}" 已禁用，无法设为 Worker 提供方；请先启用该提供方`);
+      }
+      const switchedProvider = candidateWorkerProv !== this.currentTiers.provider;
+      nextWorkerProvider = candidateWorkerProv;
+      nextCurrentWorkerProvider = candidateWorkerProv;
+      if (switchedProvider && input.fastModel === undefined && input.balancedModel === undefined && input.strongModel === undefined) {
+        clearWorkerTierModels = true;
       }
     }
 
-    if (input.workerProvider !== undefined && input.workerProvider.trim()) {
-      const nextWorkerProv = normalizeProviderId(input.workerProvider)!;
-      if (!this.isProviderEnabled(nextWorkerProv)) {
-        throw new Error(`提供方 "${nextWorkerProv}" 已禁用，无法设为 Worker 提供方；请先启用该提供方`);
-      }
-      const switchedProvider = nextWorkerProv !== this.currentTiers.provider;
-      this.state.workerProvider = nextWorkerProv;
-      this.currentTiers.provider = nextWorkerProv;
-      if (switchedProvider && input.fastModel === undefined && input.balancedModel === undefined && input.strongModel === undefined) {
-        delete this.state.fastModel;
-        delete this.state.balancedModel;
-        delete this.state.strongModel;
-      }
-    }
+    let nextRouterProvider = normalizeProviderId(this.state.routerProvider) ?? this.currentRouterProvider;
+    let explicitRouterProvider = false;
     if (input.routerProvider !== undefined && input.routerProvider.trim()) {
-      const nextRouterProv = normalizeProviderId(input.routerProvider)!;
-      if (!this.isProviderEnabled(nextRouterProv)) {
-        throw new Error(`提供方 "${nextRouterProv}" 已禁用，无法设为 F.R.I.D.A.Y. 主控提供方；请先启用该提供方`);
+      const candidateRouterProv = normalizeProviderId(input.routerProvider)!;
+      if (!isPendingProviderEnabled(candidateRouterProv)) {
+        throw new Error(`提供方 "${candidateRouterProv}" 已禁用，无法设为 F.R.I.D.A.Y. 主控提供方；请先启用该提供方`);
       }
-      this.state.routerProvider = nextRouterProv;
-      this.currentRouterProvider = this.state.routerProvider;
+      nextRouterProvider = candidateRouterProv;
+      explicitRouterProvider = true;
     }
+
+    let nextRouterModel = this.state.routerModel;
     if (input.routerModel !== undefined && input.routerModel.trim()) {
       const rawRouter = input.routerModel.trim();
-      if (rawRouter.includes('/')) {
-        const slash = rawRouter.indexOf('/');
-        const nextRouterProv = normalizeProviderId(rawRouter.slice(0, slash));
-        if (nextRouterProv && !this.isProviderEnabled(nextRouterProv)) {
-          throw new Error(`提供方 "${nextRouterProv}" 已禁用，无法设为 F.R.I.D.A.Y. 主控模型；请先启用该提供方`);
-        }
-        this.state.routerProvider = nextRouterProv;
-        this.state.routerModel = rawRouter.slice(slash + 1);
-      } else {
-        this.state.routerModel = rawRouter;
+      const parsedRouter = parseModelSpec(rawRouter, {
+        fallbackProvider: nextRouterProvider,
+        preferFallbackProvider: explicitRouterProvider,
+        knownProviders: getKnownProviderIds([
+          ...this.getKnownProviders(),
+          ...Object.keys(nextProviders),
+        ]),
+      });
+      const resolvedProv = parsedRouter.providerId !== 'unknown' ? parsedRouter.providerId : nextRouterProvider;
+      if (resolvedProv && !isPendingProviderEnabled(resolvedProv)) {
+        throw new Error(`提供方 "${resolvedProv}" 已禁用，无法设为 F.R.I.D.A.Y. 主控模型；请先启用该提供方`);
       }
+      if (resolvedProv && resolvedProv !== 'offline') {
+        const pendingCfg = nextProviders[resolvedProv];
+        const catalog = this.buildProviderCatalogModels(runtime, resolvedProv, pendingCfg);
+        const inCustom = Boolean(pendingCfg?.customModels?.includes(parsedRouter.modelId));
+        const inCatalog = catalog.some(m => m.id === parsedRouter.modelId)
+          || Boolean(runtime.getModel(resolvedProv, parsedRouter.modelId))
+          || Boolean(getPristineSdkModel(resolvedProv, parsedRouter.modelId));
+        if (catalog.length > 0 && !inCatalog && !inCustom) {
+          throw new Error(`在提供方 "${resolvedProv}" 目录中未找到主控模型 "${parsedRouter.modelId}"`);
+        }
+      }
+      nextRouterProvider = resolvedProv;
+      nextRouterModel = parsedRouter.modelId;
+    }
+
+    // Commit validated changes atomically to memory before syncing / persisting.
+    this.state.decision = nextDecision;
+    this.state.providers = nextProviders;
+    if (targetProvider) {
+      if (input.clearApiKey || (input.apiKey !== undefined && input.apiKey.trim())) {
+        this.explicitSessionKeys.add(targetProvider);
+      }
+      if (shouldClearRuntimeKey) {
+        await runtime.removeRuntimeApiKey(targetProvider).catch(() => {});
+      }
+      if (baseUrlModified && shouldClearRuntimeKey === false) {
+        // Ensure stale runtime override is cleared if baseUrl changed without sync
+        this.overriddenProviders.add(targetProvider);
+      }
+      if (this.mode === 'real' && nextProviderEntry?.enabled !== false && !input.clearApiKey) {
+        const effKey = this.getEffectiveProviderKey(targetProvider).key;
+        if (effKey || nextProviderEntry?.baseUrl) {
+          await this.syncProviderModelsFromApi(runtime, targetProvider).catch(() => {});
+        }
+      }
+    }
+    this.state.workerProvider = nextWorkerProvider;
+    this.currentTiers.provider = nextCurrentWorkerProvider;
+    if (clearWorkerTierModels) {
+      delete this.state.fastModel;
+      delete this.state.balancedModel;
+      delete this.state.strongModel;
+    }
+    if (input.routerProvider !== undefined && input.routerProvider.trim() || input.routerModel !== undefined && input.routerModel.trim()) {
+      this.state.routerProvider = nextRouterProvider;
+      this.currentRouterProvider = nextRouterProvider;
+    }
+    if (input.routerModel !== undefined && input.routerModel.trim()) {
+      this.state.routerModel = nextRouterModel;
     }
     if (input.fastModel !== undefined) {
       this.state.fastModel = input.fastModel.trim() || undefined;
@@ -1313,13 +1494,15 @@ export class ModelHub {
 
   async probe(input: ModelHubProbeInput): Promise<ModelProbeResult> {
     const runtime = await this.ensureRuntime();
-    let provider = normalizeProviderId(input.provider) ?? this.currentTiers.provider;
-    let modelId = input.model.trim();
-    if (modelId.includes('/')) {
-      const slash = modelId.indexOf('/');
-      provider = normalizeProviderId(modelId.slice(0, slash)) ?? provider;
-      modelId = modelId.slice(slash + 1);
-    } else if (provider === 'offline' || (!runtime.getModel(provider, modelId) && runtime.getModel('deepseek', modelId))) {
+    const hasExplicitProvider = Boolean(input.provider?.trim());
+    const parsedProbe = parseModelSpec(input.model, {
+      fallbackProvider: hasExplicitProvider ? input.provider : this.currentTiers.provider,
+      preferFallbackProvider: hasExplicitProvider,
+      knownProviders: this.getKnownProviders(),
+    });
+    let provider = parsedProbe.providerId;
+    const modelId = parsedProbe.modelId;
+    if (!hasExplicitProvider && !input.model.includes('/') && (provider === 'offline' || (!runtime.getModel(provider, modelId) && runtime.getModel('deepseek', modelId)))) {
       if (runtime.getModel('deepseek', modelId)) provider = 'deepseek';
       else if (runtime.getModel('openai', modelId)) provider = 'openai';
       else if (runtime.getModel('google', modelId)) provider = 'google';
@@ -1406,7 +1589,7 @@ export class ModelHub {
     const creds = await runtime.listCredentials();
     const hasOAuth = creds.some(c => c.type === 'oauth' && c.providerId === provider);
     const authStatus = runtime.getProviderAuthStatus(provider);
-    const hasPersistedKey = Boolean(this.state.providers[provider]?.apiKey);
+    const hasPersistedKey = Boolean(this.getEffectiveProviderKey(provider).key);
     const hasBaseUrl = Boolean(inlineBaseUrl || this.state.providers[provider]?.baseUrl);
     const hasRealAuth = Boolean(inlineApiKey || hasOAuth || authStatus.configured || hasPersistedKey || hasBaseUrl);
 
@@ -1460,16 +1643,19 @@ export class ModelHub {
       return result;
     }
 
+    let resolvedKey: string | undefined;
     try {
       const promptText = input.prompt?.trim() || '请用简短一句话回复：确认你的模型名称并报告连接正常。';
       const probeSessionId = randomUUID();
       const openCodeHeaders = isOpenCodeProvider(provider, probeModel.baseUrl)
         ? { 'x-opencode-session': probeSessionId, 'x-opencode-client': 'pi' }
         : undefined;
-      const resolvedKey = inlineApiKey ?? await this.resolveProviderApiKey(runtime, provider);
+      const allowStoredKey = !inlineBaseUrl || this.isSameOriginInlineBaseUrl(runtime, provider, inlineBaseUrl);
+      resolvedKey = inlineApiKey ?? (allowStoredKey ? await this.resolveProviderApiKey(runtime, provider) : undefined);
+      assertSafeBaseUrlForCredentials(inlineBaseUrl ?? probeModel.baseUrl, Boolean(resolvedKey));
       // Use an isolated runtime if this provider isn't registered on the live runtime yet.
       let callRuntime = runtime;
-      if (!runtime.getProvider(provider)) {
+      if (!runtime.getProvider(provider) || inlineBaseUrl) {
         callRuntime = await ModelRuntime.create({
           authPath: join(this.sdkDir, 'auth.json'),
           modelsPath: null,
@@ -1533,6 +1719,8 @@ export class ModelHub {
         });
       }
       if (res.stopReason === 'error' || res.stopReason === 'aborted') {
+        const rawErr = res.errorMessage?.trim() || `模型请求返回状态: ${res.stopReason}`;
+        const safeErr = sanitizeCredentialLeakText(rawErr, [resolvedKey, inlineApiKey]) ?? rawErr;
         const result: ModelProbeResult = {
           ok: false,
           provider,
@@ -1541,9 +1729,12 @@ export class ModelHub {
           latencyMs,
           supportsImages,
           contextWindow,
-          error: res.errorMessage?.trim() || `模型请求返回状态: ${res.stopReason}`,
+          error: safeErr,
           testedAt: Date.now(),
         };
+        if (res.stopReason === 'error') {
+          this.recordProbeStats(`${provider}/${modelId}`, false, latencyMs);
+        }
         this.state.lastProbe = result;
         await this.saveState();
         return result;
@@ -1570,6 +1761,8 @@ export class ModelHub {
       return result;
     } catch (error) {
       const latencyMs = Math.max(1, Date.now() - start);
+      const rawErr = error instanceof Error ? error.message : String(error);
+      const safeErr = sanitizeCredentialLeakText(rawErr, [resolvedKey, inlineApiKey]) ?? rawErr;
       const result: ModelProbeResult = {
         ok: false,
         provider,
@@ -1578,7 +1771,7 @@ export class ModelHub {
         latencyMs,
         supportsImages,
         contextWindow,
-        error: error instanceof Error ? error.message : String(error),
+        error: safeErr,
         testedAt: Date.now(),
       };
       this.recordProbeStats(`${provider}/${modelId}`, false, latencyMs);
@@ -1593,6 +1786,7 @@ export class ModelHub {
     const prev = stats[spec] ?? { successCount: 0, failCount: 0, updatedAt: Date.now() };
     stats[spec] = {
       ...prev,
+      ...(ok ? { failCount: 0 } : {}),
       lastLatencyMs: latencyMs,
       lastProbeOk: ok,
       updatedAt: Date.now(),
@@ -1600,6 +1794,7 @@ export class ModelHub {
     const poolEntry = this.cachedPool.find(item => item.spec === spec);
     if (poolEntry) {
       poolEntry.latencyMs = latencyMs;
+      if (ok) poolEntry.failCount = 0;
     }
   }
 }

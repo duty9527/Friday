@@ -467,20 +467,50 @@ export function classifyModelSpecialties(
   return { tier, specialties };
 }
 
+function filterEligibleCandidates(
+  candidates: readonly DecisionRouteCandidate[],
+  task: DecisionRouteTaskInput,
+): DecisionRouteCandidate[] {
+  if (!candidates.length) {
+    throw new Error('当前模型池为空，无法执行路由决策');
+  }
+  const excludedExact = new Set<string>();
+  const excludedBare = new Set<string>();
+  for (const raw of task.excludedSpecs ?? []) {
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    const stripped = trimmed.replace(/@(?:off|minimal|low|medium|high|xhigh|max)$/i, '').trim();
+    excludedExact.add(trimmed);
+    excludedExact.add(stripped);
+    if (!stripped.includes('/')) {
+      excludedBare.add(stripped);
+    }
+  }
+  const excludedProvSet = new Set((task.excludedProviders ?? []).map(p => p.trim()).filter(Boolean));
+  const filtered = candidates.filter(c => {
+    if (excludedProvSet.has(c.providerId)) return false;
+    if (excludedExact.has(c.spec) || excludedBare.has(c.modelId)) return false;
+    return true;
+  });
+  if (!filtered.length) {
+    throw new Error('当前模型池中所有可用模型均已被排除，无可用候选模型');
+  }
+  if (task.hasImages) {
+    const visionOnly = filtered.filter(c => c.supportsImages);
+    if (visionOnly.length > 0) return visionOnly;
+  }
+  return filtered;
+}
+
 export function selectHeuristicRoute(
   candidates: readonly DecisionRouteCandidate[],
   task: DecisionRouteTaskInput,
 ): { candidate: DecisionRouteCandidate; thinkingLevel: ThinkingLevel } {
-  const excludedSpecSet = new Set(task.excludedSpecs ?? []);
-  const excludedProvSet = new Set(task.excludedProviders ?? []);
-  const filtered = candidates.filter(
-    c => !excludedSpecSet.has(c.spec) && !excludedProvSet.has(c.providerId),
-  );
-  const active = filtered.length ? filtered : candidates;
+  const active = filterEligibleCandidates(candidates, task);
   const text = task.instruction.trim();
 
-  const needsVision = Boolean(task.hasImages)
-    || /图片|截图|看图|视觉|二维码|照片|设计稿|OCR|image|screenshot|vision|photo|diagram/i.test(text);
+  const needsVision = task.hasImages === true
+    || (task.hasImages !== false && /(?:图片|截图|看图|识图|视觉|二维码|照片|设计稿|OCR)/.test(text));
   const inferredTier = inferTaskComplexityTier({
     instruction: text,
     profile: task.profile,
@@ -561,15 +591,7 @@ export async function decideWorkerRoute(
   task: DecisionRouteTaskInput,
   credentials?: DecisionCredentials,
 ): Promise<DecisionRouteResult> {
-  if (!candidates.length) {
-    throw new Error('当前模型池为空，无法执行路由决策');
-  }
-  const excludedSpecSet = new Set(task.excludedSpecs ?? []);
-  const excludedProvSet = new Set(task.excludedProviders ?? []);
-  const eligible = candidates.filter(
-    c => !excludedSpecSet.has(c.spec) && !excludedProvSet.has(c.providerId),
-  );
-  const pool = eligible.length ? eligible : [...candidates];
+  const pool = filterEligibleCandidates(candidates, task);
   const expanded = buildExpandedOptions(pool);
   const heuristicPick = selectHeuristicRoute(pool, task);
 

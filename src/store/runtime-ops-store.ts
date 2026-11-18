@@ -50,48 +50,81 @@ export interface ImChannelConfig {
   updatedAt: number;
 }
 
+function parseJsonSafe<T>(raw: unknown): T | undefined {
+  if (raw === null || raw === undefined) return undefined;
+  try {
+    return JSON.parse(String(raw)) as T;
+  } catch {
+    return undefined;
+  }
+}
+
+function maskUrlCredentials(raw?: string): string | undefined {
+  if (!raw) return raw;
+  return raw.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/:@\s,;]+):[^@\s,;]+@/g, '$1:***@');
+}
+
 /**
  * Persistence for scheduled timers and external IM channel configurations.
  */
 export class RuntimeOpsStore {
-  constructor(private readonly db: DatabaseSync) {}
+  constructor(
+    private readonly db: DatabaseSync,
+    private readonly atomic: <T>(run: () => T) => T = run => run(),
+  ) {}
 
   saveTimer(timer: Timer): void {
-    this.db.prepare('INSERT INTO timers VALUES(?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body')
-      .run(timer.id, JSON.stringify(timer));
+    this.atomic(() => {
+      this.db.prepare('INSERT INTO timers VALUES(?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body')
+        .run(timer.id, JSON.stringify(timer));
+    });
   }
 
   getTimer(id: string): Timer {
     const row = this.db.prepare('SELECT body FROM timers WHERE id=?').get(id);
     if (!row) throw new Error('Timer not found');
-    return JSON.parse(String(row.body)) as Timer;
+    const parsed = parseJsonSafe<Timer>(row.body);
+    if (!parsed) throw new Error('Corrupt timer record');
+    return parsed;
   }
 
   listTimers(): Timer[] {
-    return this.db.prepare('SELECT body FROM timers ORDER BY rowid').all()
-      .map(row => JSON.parse(String(row.body)) as Timer);
+    const out: Timer[] = [];
+    for (const row of this.db.prepare('SELECT body FROM timers ORDER BY rowid').all()) {
+      const parsed = parseJsonSafe<Timer>(row.body);
+      if (parsed) out.push(parsed);
+    }
+    return out;
   }
 
   deleteTimer(id: string): boolean {
-    return this.db.prepare('DELETE FROM timers WHERE id=?').run(id).changes > 0;
+    return this.atomic(() => this.db.prepare('DELETE FROM timers WHERE id=?').run(id).changes > 0);
   }
 
   saveImChannel(channel: ImChannelConfig): ImChannelConfig {
-    this.db.prepare(
-      'INSERT INTO im_channels(id,platform,updated_at,body) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET platform=excluded.platform,updated_at=excluded.updated_at,body=excluded.body',
-    ).run(channel.id, channel.platform, channel.updatedAt, JSON.stringify(channel));
+    this.atomic(() => {
+      this.db.prepare(
+        'INSERT INTO im_channels(id,platform,updated_at,body) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET platform=excluded.platform,updated_at=excluded.updated_at,body=excluded.body',
+      ).run(channel.id, channel.platform, channel.updatedAt, JSON.stringify(channel));
+    });
     return channel;
   }
 
   getImChannel(id: string): ImChannelConfig {
     const row = this.db.prepare('SELECT body FROM im_channels WHERE id=?').get(id);
     if (!row) throw new Error('IM channel not found');
-    return JSON.parse(String(row.body)) as ImChannelConfig;
+    const parsed = parseJsonSafe<ImChannelConfig>(row.body);
+    if (!parsed) throw new Error('Corrupt IM channel record');
+    return parsed;
   }
 
   listImChannels(): ImChannelConfig[] {
-    return this.db.prepare('SELECT body FROM im_channels ORDER BY rowid').all()
-      .map(row => JSON.parse(String(row.body)) as ImChannelConfig);
+    const out: ImChannelConfig[] = [];
+    for (const row of this.db.prepare('SELECT body FROM im_channels ORDER BY rowid').all()) {
+      const parsed = parseJsonSafe<ImChannelConfig>(row.body);
+      if (parsed) out.push(parsed);
+    }
+    return out;
   }
 
   toImChannelView(channel: ImChannelConfig): ImChannelView {
@@ -101,7 +134,8 @@ export class RuntimeOpsStore {
         const u = new URL(channel.webhookUrl);
         webhookUrlMasked = `${u.origin}${u.pathname.slice(0, 24)}${u.pathname.length > 24 || u.search ? '…' : ''}`;
       } catch {
-        webhookUrlMasked = channel.webhookUrl.slice(0, 24) + '…';
+        const masked = maskUrlCredentials(channel.webhookUrl) ?? channel.webhookUrl;
+        webhookUrlMasked = masked.slice(0, 24) + '…';
       }
     }
     return {
@@ -123,7 +157,7 @@ export class RuntimeOpsStore {
       webhookUrlMasked,
       defaultTarget: channel.defaultTarget,
       allowedSenders: channel.allowedSenders,
-      apiBase: channel.apiBase,
+      apiBase: maskUrlCredentials(channel.apiBase),
       pollIntervalMs: channel.pollIntervalMs,
       inboundCount: channel.inboundCount,
       outboundCount: channel.outboundCount,

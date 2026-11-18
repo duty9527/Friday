@@ -53,9 +53,11 @@ export interface HomeostaticPassOptions {
   minWeight?: number;
   stubMaxAgeMs?: number;
   coldMaxAgeMs?: number;
+  coldDecayIntervalMs?: number;
   coldImportanceThreshold?: number;
   coldDecayStep?: number;
   coldPruneThreshold?: number;
+  force?: boolean;
 }
 
 export interface HomeostaticPassResult {
@@ -114,7 +116,7 @@ export class ConsolidationStore {
       const distiller = this.conversation.meta<DistillerState>('memory_distiller_state');
       if (distiller && Number(distiller.lastRunAt ?? 0) > lastWakeAt) {
         const seqRow = this.db.prepare(
-          `SELECT coalesce(max(seq), 0) AS seq FROM messages WHERE coalesce(CAST(json_extract(body, '$.at') AS INTEGER), 0) <= ?`,
+          `SELECT coalesce(max(seq), 0) AS seq FROM messages WHERE coalesce(CAST(CASE WHEN json_valid(body) THEN json_extract(body, '$.at') END AS INTEGER), 0) <= ?`,
         ).get(lastWakeAt);
         lastMessageSeq = Math.min(lastMessageSeq, Number(seqRow?.seq ?? 0));
         const distilledSet = new Set(Array.isArray(distiller.distilledTaskIds) ? distiller.distilledTaskIds : []);
@@ -227,76 +229,132 @@ export class ConsolidationStore {
     const minWeight = options?.minWeight ?? 0.30;
     const stubMaxAgeMs = options?.stubMaxAgeMs ?? 7 * 24 * 3600_000;
     const coldMaxAgeMs = options?.coldMaxAgeMs ?? 45 * 24 * 3600_000;
+    const coldDecayIntervalMs = options?.coldDecayIntervalMs ?? 15 * 24 * 3600_000;
     const coldImportanceThreshold = options?.coldImportanceThreshold ?? 55;
     const coldPruneThreshold = options?.coldPruneThreshold ?? 20;
+    const dayKey = new Date(now).toISOString().slice(0, 10);
     let scaledSynapses = 0;
     let prunedSynapses = 0;
     let forgottenStubs = 0;
     let decayedCards = 0;
     let prunedColdCards = 0;
     return this.atomic(() => {
-      const active = this.memories.listMemories({ includeSuperseded: false, limit: 500 });
-      for (const card of active) {
-        const imp = card.importance ?? defaultImportanceFor(card);
-        const recentlyReinforced = Boolean(card.lastReinforcedAt && now - card.lastReinforcedAt < stubMaxAgeMs);
-        if (
-          isAutoStubCard(card)
-          && !card.pinned
-          && imp < 85
-          && (card.accessCount ?? 0) < 3
-          && !recentlyReinforced
-          && now - card.updatedAt >= stubMaxAgeMs
-        ) {
-          if (this.memories.deleteMemory(card.id)) forgottenStubs++;
-          continue;
-        }
-        let cardMutated = false;
-        const lastActiveAt = Math.max(card.lastAccessedAt ?? 0, card.lastReinforcedAt ?? 0, card.updatedAt);
-        const coldAgeMs = now - lastActiveAt;
-        if (!card.pinned && imp < 75 && imp < coldImportanceThreshold && coldAgeMs >= coldMaxAgeMs) {
-          const overdueBuckets = Math.floor((coldAgeMs - coldMaxAgeMs) / (15 * 24 * 3600_000));
-          const decayStep = options?.coldDecayStep ?? Math.min(35, 15 + overdueBuckets * 10);
-          const nextImp = Math.max(0, imp - decayStep);
-          if (nextImp <= coldPruneThreshold) {
-            if (this.memories.deleteMemory(card.id)) prunedColdCards++;
-            continue;
-          }
-          if (nextImp !== imp) {
-            card.importance = nextImp;
-            decayedCards++;
-            cardMutated = true;
-          }
-        }
-        if (card.synapses?.length) {
-          let synMutated = false;
-          const nextSynapses: MemorySynapse[] = [];
-          for (const syn of card.synapses) {
-            if (syn.relation === 'explicit' || now - syn.updatedAt < decayAfterMs) {
-              nextSynapses.push(syn);
-              continue;
-            }
-            const decayed = Number((syn.weight * decayFactor).toFixed(2));
-            if (decayed < minWeight) {
-              prunedSynapses++;
-              synMutated = true;
-            } else {
-              if (decayed !== syn.weight) {
-                scaledSynapses++;
-                synMutated = true;
-              }
-              nextSynapses.push({ ...syn, weight: decayed });
-            }
-          }
-          if (synMutated) {
-            const trimmed = this.memories.trimSynapses(nextSynapses);
-            card.synapses = trimmed.length ? trimmed : undefined;
-            cardMutated = true;
-          }
-        }
-        if (cardMutated) {
-          this.memories.updateCardFields(card.id, card);
+      if (!options?.force) {
+        const lastRun = this.conversation.meta<{ dayKey?: string; ranAt?: number }>('homeostatic_sleep_pass_v1');
+        if (lastRun?.dayKey === dayKey) {
+          return { scaledSynapses, prunedSynapses, forgottenStubs, decayedCards, prunedColdCards };
         }
       }
+
+      const prunedPairs: Array<{ fromId: string; toId: string }> = [];
+      let cursorUpdatedAt = -1;
+      let cursorRowId = -1;
+      const pageSize = 500;
+
+      while (true) {
+        const rows = this.db.prepare(
+          `SELECT rowid AS _rowid, body, access_count, last_accessed_at, last_reinforced_at, importance
+           FROM memories
+           WHERE superseded_by IS NULL
+             AND (updated_at > ? OR (updated_at = ? AND rowid > ?))
+           ORDER BY updated_at ASC, rowid ASC
+           LIMIT ?`,
+        ).all(cursorUpdatedAt, cursorUpdatedAt, cursorRowId, pageSize) as Array<Record<string, unknown>>;
+        if (!rows.length) break;
+
+        for (const row of rows) {
+          cursorRowId = Number(row._rowid);
+          let card: MemoryCard;
+          try {
+            card = JSON.parse(String(row.body)) as MemoryCard;
+          } catch {
+            continue;
+          }
+          if (row.access_count !== undefined && row.access_count !== null) card.accessCount = Number(row.access_count);
+          if (row.last_accessed_at !== undefined && row.last_accessed_at !== null) card.lastAccessedAt = Number(row.last_accessed_at);
+          if (row.last_reinforced_at !== undefined && row.last_reinforced_at !== null) card.lastReinforcedAt = Number(row.last_reinforced_at);
+          if (row.importance !== undefined && row.importance !== null) card.importance = Number(row.importance);
+          cursorUpdatedAt = card.updatedAt;
+
+          const imp = card.importance ?? defaultImportanceFor(card);
+          const recentlyReinforced = Boolean(card.lastReinforcedAt && now - card.lastReinforcedAt < stubMaxAgeMs);
+          if (
+            isAutoStubCard(card)
+            && !card.pinned
+            && imp < 85
+            && (card.accessCount ?? 0) < 3
+            && !recentlyReinforced
+            && now - card.updatedAt >= stubMaxAgeMs
+          ) {
+            if (this.memories.deleteMemory(card.id)) forgottenStubs++;
+            continue;
+          }
+          let cardMutated = false;
+          const lastActiveAt = Math.max(card.lastAccessedAt ?? 0, card.lastReinforcedAt ?? 0, card.updatedAt);
+          const coldAgeMs = now - lastActiveAt;
+          const coldCooldownOk = !card.lastDecayedAt || now - card.lastDecayedAt >= coldDecayIntervalMs;
+          if (!card.pinned && imp < 75 && imp < coldImportanceThreshold && coldAgeMs >= coldMaxAgeMs && coldCooldownOk) {
+            const overdueBuckets = Math.floor((coldAgeMs - coldMaxAgeMs) / (15 * 24 * 3600_000));
+            const decayStep = options?.coldDecayStep ?? Math.min(35, 15 + overdueBuckets * 10);
+            const nextImp = Math.max(0, imp - decayStep);
+            if (nextImp <= coldPruneThreshold) {
+              if (this.memories.deleteMemory(card.id)) prunedColdCards++;
+              continue;
+            }
+            if (nextImp !== imp) {
+              card.importance = nextImp;
+              card.lastDecayedAt = now;
+              decayedCards++;
+              cardMutated = true;
+            }
+          }
+          if (card.synapses?.length) {
+            let synMutated = false;
+            const nextSynapses: MemorySynapse[] = [];
+            for (const syn of card.synapses) {
+              if (syn.relation === 'explicit' || now - syn.updatedAt < decayAfterMs) {
+                nextSynapses.push(syn);
+                continue;
+              }
+              const decayed = Number((syn.weight * decayFactor).toFixed(2));
+              if (decayed < minWeight) {
+                prunedSynapses++;
+                prunedPairs.push({ fromId: card.id, toId: syn.targetId });
+                synMutated = true;
+              } else {
+                if (decayed !== syn.weight) {
+                  scaledSynapses++;
+                  synMutated = true;
+                }
+                nextSynapses.push({ ...syn, weight: decayed });
+              }
+            }
+            if (synMutated) {
+              const trimmed = this.memories.trimSynapses(nextSynapses);
+              card.synapses = trimmed.length ? trimmed : undefined;
+              cardMutated = true;
+            }
+          }
+          if (cardMutated) {
+            this.memories.updateCardFields(card.id, card);
+          }
+        }
+        if (rows.length < pageSize) break;
+      }
+
+      // Clean any asymmetric reverse non-explicit synapse leftovers on surviving targets.
+      for (const pair of prunedPairs) {
+        try {
+          const target = this.memories.getMemory(pair.toId);
+          if (target.synapses?.some(s => s.targetId === pair.fromId && s.relation !== 'explicit')) {
+            const remaining = target.synapses.filter(s => !(s.targetId === pair.fromId && s.relation !== 'explicit'));
+            target.synapses = remaining.length ? remaining : undefined;
+            this.memories.updateCardFields(target.id, target);
+          }
+        } catch { /* ignore deleted/missing target */ }
+      }
+
+      this.conversation.setMeta('homeostatic_sleep_pass_v1', { dayKey, ranAt: now });
       return { scaledSynapses, prunedSynapses, forgottenStubs, decayedCards, prunedColdCards };
     });
   }
@@ -304,17 +362,23 @@ export class ConsolidationStore {
   sampleDreamMaterial(random: () => number = Math.random): DreamMaterial {
     const state = this.subconsciousState();
     const recentMsgs = this.conversation.allMessages(60).reverse();
-    const latestMessageSeq = recentMsgs.at(-1)?.seq ?? state.lastMessageSeq;
-    const undigestedMessages = recentMsgs
-      .filter(m => m.seq > state.lastMessageSeq && m.status === 'completed' && m.source !== 'system' && m.text.trim().length > 0)
-      .slice(-24)
+    const afterCursor = recentMsgs.filter(m => m.seq > state.lastMessageSeq);
+    const firstIncompleteIdx = afterCursor.findIndex(m => ['queued', 'processing', 'streaming'].includes(m.status));
+    const settledAfterCursor = firstIncompleteIdx >= 0 ? afterCursor.slice(0, firstIncompleteIdx) : afterCursor;
+    const eligibleMsgs = settledAfterCursor
+      .filter(m => m.status === 'completed' && m.source !== 'system' && m.origin?.speakerRole !== 'member' && m.text.trim().length > 0);
+    const sampledMsgs = eligibleMsgs.slice(0, 24);
+    const latestMessageSeq = sampledMsgs.length > 0
+      ? sampledMsgs.at(-1)!.seq
+      : (settledAfterCursor.at(-1)?.seq ?? state.lastMessageSeq);
+    const undigestedMessages = sampledMsgs
       .map(m => ({ id: m.id, seq: m.seq, role: m.role, text: String(publicData(m.text.slice(0, 800))), at: m.at }));
 
     const digestedSet = new Set(state.digestedTaskIds);
     const completedTasks = this.tasks.list(60).filter(t => t.status === 'completed' && Boolean(t.report));
     const undigestedTasks = completedTasks
       .filter(t => !digestedSet.has(t.id))
-      .slice(-8)
+      .slice(0, 8)
       .map(t => ({
         id: t.id,
         prompt: String(publicData(t.prompt.slice(0, 240))),
@@ -371,7 +435,7 @@ export class ConsolidationStore {
       distantMemories,
       candidateCwds,
       latestMessageSeq,
-      completedTaskIds: completedTasks.map(t => t.id),
+      completedTaskIds: undigestedTasks.map(t => t.id),
     };
   }
 

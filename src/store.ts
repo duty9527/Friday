@@ -21,12 +21,14 @@ import {
 import { RuntimeOpsStore, type ImChannelConfig, type Timer } from './store/runtime-ops-store.js';
 import { SqliteDb } from './store/sqlite-db.js';
 import {
+  TaskConflictError,
   TaskStore,
   type Notice,
   type Operation,
   type Task,
   type TaskEvent,
   type TaskListOptions,
+  type TaskPatchOptions,
   type TaskStatus,
 } from './store/task-store.js';
 import {
@@ -67,6 +69,7 @@ export type {
   Task,
   TaskEvent,
   TaskListOptions,
+  TaskPatchOptions,
   TaskStatus,
   Timer,
   UsageActor,
@@ -85,7 +88,7 @@ export type {
   UsageTodaySummary,
   UsageTotalsView,
 };
-export { memoryDocumentText };
+export { memoryDocumentText, TaskConflictError };
 
 /**
  * Unified persistence facade delegating to specialized SQLite sub-stores while
@@ -105,7 +108,7 @@ export class Store {
     const atomic = <T>(run: () => T): T => this.sqlite.transaction(run);
     this.conversation = new Conversation(this.sqlite.db, atomic);
     this.tasks = new TaskStore(this.sqlite.db, atomic, this.conversation);
-    this.runtimeOps = new RuntimeOpsStore(this.sqlite.db);
+    this.runtimeOps = new RuntimeOpsStore(this.sqlite.db, atomic);
     this.memories = new MemoryStore(this.sqlite.db, atomic, this.tasks, this.conversation);
     this.consolidation = new ConsolidationStore(
       this.sqlite.db,
@@ -164,6 +167,10 @@ export class Store {
 
   save(task: Task): void {
     this.tasks.save(task);
+  }
+
+  patchTask(id: string, updater: (current: Task) => Task | void, options?: TaskPatchOptions): Task {
+    return this.tasks.patch(id, updater, options);
   }
 
   transition(id: string, status: TaskStatus, reason?: string, report?: string): Task {

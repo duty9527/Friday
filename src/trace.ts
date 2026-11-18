@@ -11,13 +11,13 @@ export class PromptTrace {
   private timer?: NodeJS.Timeout;
   private active = false;
   private currentTurn?: string;
-  private readonly spans = new Map<string, string>();
+  private readonly spans = new Map<string, { label: string; parentSpanId: string }>();
   constructor(private readonly chat: Conversation, private readonly context: TraceContext,
     private readonly actor: 'router' | 'worker', private readonly mode: 'real' | 'offline',
     private readonly replyId?: string) {}
   toolSpan(callId?: string) { return callId ? `${this.id}:${callId}` : this.id; }
   private span(id: string, parentSpanId: string, label: string, status: string, data?: unknown, summary?: unknown) {
-    if (status === 'started') this.spans.set(id, label); else this.spans.delete(id);
+    if (status === 'started') this.spans.set(id, { label, parentSpanId }); else this.spans.delete(id);
     const payload = { mode: this.mode, detail: boundedTraceData(data), summary };
     if (JSON.stringify(payload).length > 7500) payload.detail = { truncated: true };
     this.chat.span({ ...this.context, spanId: id, parentSpanId }, this.actor, label, status, payload);
@@ -59,17 +59,21 @@ export class PromptTrace {
   private trigger(input: string) {
     const value = JSON.parse(input) as Record<string, unknown>;
     const message = value.message && typeof value.message === 'object' ? value.message as Record<string, unknown> : {};
-    return { kind: value.kind, messageId: message.id, preview: String(message.text ?? value.report ?? value.prompt ?? '').slice(0, 800),
+    return { kind: value.kind, messageId: message.id,
+      ...(typeof value.taskId === 'string' && value.taskId ? { taskId: value.taskId } : {}),
+      preview: String(message.text ?? value.report ?? value.prompt ?? '').slice(0, 800),
       followupCount: Array.isArray(value.followups) ? value.followups.length : 0 };
   }
   async run(agent: AgentPort, input: string, signal: AbortSignal): Promise<string> {
-    this.active = true;
-    const rawInput = JSON.parse(input);
-    const publicInput = rawInput && typeof rawInput === 'object' && !Array.isArray(rawInput) && 'subconscious' in rawInput
-      ? (({ subconscious: _subconscious, ...rest }) => rest)(rawInput as Record<string, unknown>)
-      : rawInput;
-    this.chat.span({ ...this.context, spanId: this.id }, this.actor, 'Agent 请求', 'started', { mode: this.mode, input: boundedTraceData(publicInput), trigger: this.trigger(input) });
+    let spanStarted = false;
     try {
+      this.active = true;
+      const rawInput = JSON.parse(input);
+      const publicInput = rawInput && typeof rawInput === 'object' && !Array.isArray(rawInput) && 'subconscious' in rawInput
+        ? (({ subconscious: _subconscious, ...rest }) => rest)(rawInput as Record<string, unknown>)
+        : rawInput;
+      this.chat.span({ ...this.context, spanId: this.id }, this.actor, 'Agent 请求', 'started', { mode: this.mode, input: boundedTraceData(publicInput), trigger: this.trigger(input) });
+      spanStarted = true;
       const result = await agent.prompt(input, signal);
       if (signal.aborted) throw signal.reason;
       if (result.length > 65_536) throw new Error('Agent reply exceeds delivery limit');
@@ -79,9 +83,11 @@ export class PromptTrace {
     } catch (error) {
       this.flush();
       const status = signal.aborted ? 'interrupted' : 'failed';
-      for (const [id, label] of [...this.spans]) this.span(id, this.id, label, status, { reason: '请求未确认正常结束' });
-      this.chat.span({ ...this.context, spanId: this.id }, this.actor, 'Agent 请求', status,
-        { mode: this.mode, error: error instanceof Error ? error.message : 'Agent request failed' });
+      for (const [id, info] of [...this.spans]) this.span(id, info.parentSpanId, info.label, status, { reason: '请求未确认正常结束' });
+      if (spanStarted) {
+        this.chat.span({ ...this.context, spanId: this.id }, this.actor, 'Agent 请求', status,
+          { mode: this.mode, error: error instanceof Error ? error.message : 'Agent request failed' });
+      }
       throw error;
     } finally {
       this.active = false;

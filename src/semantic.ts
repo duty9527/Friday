@@ -76,7 +76,13 @@ export interface SemanticEngineOptions {
 
 type OrtModule = typeof import('onnxruntime-node');
 
-const inFlightFileDownloads = new Map<string, Promise<string>>();
+interface InFlightDownloadEntry {
+  controller: AbortController;
+  waiters: number;
+  promise: Promise<string>;
+}
+
+const inFlightFileDownloads = new Map<string, InFlightDownloadEntry>();
 
 export const EN_STOPWORDS = new Set([
   'about', 'after', 'all', 'also', 'am', 'an', 'and', 'any', 'are', 'as', 'at',
@@ -216,56 +222,105 @@ async function downloadFileWithMirrors(params: {
 }): Promise<string> {
   const { urls, destPath, fetchImpl, validateJson, signal } = params;
   if (existsSync(destPath)) return destPath;
+  if (signal?.aborted) {
+    throw new Error('Download aborted');
+  }
 
-  const existing = inFlightFileDownloads.get(destPath);
-  if (existing) return existing;
+  let entry = inFlightFileDownloads.get(destPath);
+  if (!entry) {
+    const controller = new AbortController();
+    const created: InFlightDownloadEntry = {
+      controller,
+      waiters: 0,
+      promise: (async () => {
+        if (existsSync(destPath)) return destPath;
+        await mkdir(dirname(destPath), { recursive: true });
 
-  const task = (async () => {
-    if (existsSync(destPath)) return destPath;
-    await mkdir(dirname(destPath), { recursive: true });
-
-    let lastError: unknown;
-    for (const url of urls) {
-      if (signal?.aborted) {
-        throw new Error('Download aborted');
-      }
-      const tmpPath = `${destPath}.tmp.${process.pid}.${randomUUID()}`;
-      try {
-        const timeoutSignal = AbortSignal.timeout(120_000);
-        const reqSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-        const res = await fetchImpl(url, {
-          method: 'GET',
-          redirect: 'follow',
-          signal: reqSignal,
-        });
-        if (!res.ok) {
-          throw new Error(`HTTP ${res.status}`);
-        }
-        const bytes = await readResponseBytes(res);
-        if (bytes.byteLength === 0) {
-          throw new Error('Empty response body');
-        }
-        if (validateJson) {
-          const parsed = JSON.parse(new TextDecoder().decode(bytes)) as unknown;
-          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-            throw new Error('Invalid JSON object');
+        let lastError: unknown;
+        for (const url of urls) {
+          if (controller.signal.aborted) {
+            throw new Error('Download aborted');
+          }
+          const tmpPath = `${destPath}.tmp.${process.pid}.${randomUUID()}`;
+          try {
+            const timeoutSignal = AbortSignal.timeout(120_000);
+            const reqSignal = AbortSignal.any([controller.signal, timeoutSignal]);
+            const res = await fetchImpl(url, {
+              method: 'GET',
+              redirect: 'follow',
+              signal: reqSignal,
+            });
+            if (!res.ok) {
+              throw new Error(`HTTP ${res.status}`);
+            }
+            const bytes = await readResponseBytes(res);
+            if (bytes.byteLength === 0) {
+              throw new Error('Empty response body');
+            }
+            if (validateJson) {
+              const parsed = JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+              if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                throw new Error('Invalid JSON object');
+              }
+            }
+            await writeFile(tmpPath, bytes);
+            await rename(tmpPath, destPath);
+            return destPath;
+          } catch (err) {
+            lastError = err;
+            await rm(tmpPath, { force: true }).catch(() => {});
           }
         }
-        await writeFile(tmpPath, bytes);
-        await rename(tmpPath, destPath);
-        return destPath;
-      } catch (err) {
-        lastError = err;
-        await rm(tmpPath, { force: true }).catch(() => {});
-      }
-    }
-    throw lastError instanceof Error ? lastError : new Error(String(lastError ?? 'Download failed'));
-  })().finally(() => {
-    inFlightFileDownloads.delete(destPath);
-  });
+        throw lastError instanceof Error ? lastError : new Error(String(lastError ?? 'Download failed'));
+      })().finally(() => {
+        if (inFlightFileDownloads.get(destPath) === created) {
+          inFlightFileDownloads.delete(destPath);
+        }
+      }),
+    };
+    inFlightFileDownloads.set(destPath, created);
+    entry = created;
+  }
 
-  inFlightFileDownloads.set(destPath, task);
-  return task;
+  entry.waiters++;
+  let released = false;
+  const releaseWaiter = (abortIfIdle: boolean) => {
+    if (released) return;
+    released = true;
+    entry.waiters = Math.max(0, entry.waiters - 1);
+    if (abortIfIdle && entry.waiters === 0 && !entry.controller.signal.aborted) {
+      entry.controller.abort();
+    }
+  };
+
+  if (!signal) {
+    try {
+      return await entry.promise;
+    } finally {
+      releaseWaiter(false);
+    }
+  }
+
+  return new Promise<string>((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener('abort', onAbort);
+      releaseWaiter(true);
+      reject(new Error('Download aborted'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    entry.promise.then(
+      path => {
+        signal.removeEventListener('abort', onAbort);
+        releaseWaiter(false);
+        resolve(path);
+      },
+      err => {
+        signal.removeEventListener('abort', onAbort);
+        releaseWaiter(false);
+        reject(err);
+      },
+    );
+  });
 }
 
 async function defaultTokenizerFactory(paths: {
@@ -414,7 +469,8 @@ function poolOutputToVectors(params: {
 
 class SemanticEngine implements SemanticEmbedder {
   readonly modelId: string;
-  readonly dim: number;
+  private _dim: number;
+  get dim(): number { return this._dim; }
   private readonly options: SemanticEngineOptions;
   private readonly modelDir: string;
   private readonly tokenizerPath: string;
@@ -436,7 +492,7 @@ class SemanticEngine implements SemanticEmbedder {
   constructor(options: SemanticEngineOptions) {
     this.options = options;
     this.modelId = options.modelRepo?.trim() || process.env.FRIDAY_SEMANTIC_MODEL?.trim() || DEFAULT_SEMANTIC_MODEL_REPO;
-    this.dim = inferModelDim(this.modelId, options.dim);
+    this._dim = inferModelDim(this.modelId, options.dim);
     this.maxLength = Math.max(1, Math.min(DEFAULT_SEMANTIC_MAX_LENGTH, options.maxLength ?? DEFAULT_SEMANTIC_MAX_LENGTH));
     this.maxCacheEntries = Math.max(0, options.maxCacheEntries ?? DEFAULT_SEMANTIC_CACHE_ENTRIES);
     this.bgeModel = isBgeModel(this.modelId);
@@ -618,8 +674,13 @@ class SemanticEngine implements SemanticEmbedder {
     const tokenizer = this.tokenizer;
     if (!tokenizer) return undefined;
 
-    const encoded = tokenizer.encode(text, { return_token_type_ids: true });
-    if (!encoded.ids || encoded.ids.length === 0) return undefined;
+    let encoded: ReturnType<SemanticTokenizerLike['encode']>;
+    try {
+      encoded = tokenizer.encode(text, { return_token_type_ids: true });
+    } catch {
+      return undefined;
+    }
+    if (!encoded?.ids || encoded.ids.length === 0) return undefined;
 
     const maxLen = this.maxLength;
     const rawIds = encoded.ids;
@@ -815,7 +876,11 @@ class SemanticEngine implements SemanticEmbedder {
         preferMeanPooling: false,
       });
       for (let b = 0; b < batchSize; b++) {
-        results[validPositions[b]!] = pooled[b];
+        const vec = pooled[b];
+        if (vec && vec.length > 0 && this.options.dim === undefined && this._dim !== vec.length) {
+          this._dim = vec.length;
+        }
+        results[validPositions[b]!] = vec;
       }
       return results;
     }
@@ -837,7 +902,11 @@ class SemanticEngine implements SemanticEmbedder {
       preferMeanPooling: !this.bgeModel,
     });
     for (let b = 0; b < batchSize; b++) {
-      results[validPositions[b]!] = pooled[b];
+      const vec = pooled[b];
+      if (vec && vec.length > 0 && this.options.dim === undefined && this._dim !== vec.length) {
+        this._dim = vec.length;
+      }
+      results[validPositions[b]!] = vec;
     }
     return results;
   }

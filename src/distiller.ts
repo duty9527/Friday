@@ -63,6 +63,57 @@ function sanitizeIdArray(raw: unknown, max = 16): string[] | undefined {
   return ids.length ? ids : undefined;
 }
 
+function extractBalancedJsonObjects(raw: string): unknown[] {
+  const results: unknown[] = [];
+  let i = 0;
+  while (i < raw.length) {
+    if (raw[i] !== '{') {
+      i++;
+      continue;
+    }
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    let foundEnd = -1;
+    for (let j = i; j < raw.length; j++) {
+      const ch = raw[j]!;
+      if (inString) {
+        if (escape) {
+          escape = false;
+        } else if (ch === '\\') {
+          escape = true;
+        } else if (ch === '"') {
+          inString = false;
+        }
+        continue;
+      }
+      if (ch === '"') {
+        inString = true;
+      } else if (ch === '{') {
+        depth++;
+      } else if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          foundEnd = j;
+          break;
+        }
+      }
+    }
+    if (foundEnd > i) {
+      const candidate = raw.slice(i, foundEnd + 1);
+      try {
+        results.push(JSON.parse(candidate) as unknown);
+      } catch {
+        // Keep scanning for another valid JSON object.
+      }
+      i = foundEnd + 1;
+    } else {
+      i++;
+    }
+  }
+  return results;
+}
+
 export function parseDistillerOutput(
   raw: string,
   options?: { maxOps?: number },
@@ -71,19 +122,26 @@ export function parseDistillerOutput(
   const trimmed = raw.trim();
   if (!trimmed) return [];
 
-  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(trimmed)?.[1]?.trim();
-  const candidate = fenced ?? (() => {
-    const start = trimmed.indexOf('{');
-    const end = trimmed.lastIndexOf('}');
-    return start >= 0 && end > start ? trimmed.slice(start, end + 1) : undefined;
-  })();
-  if (!candidate) return [];
-
   let parsed: unknown;
-  try {
-    parsed = JSON.parse(candidate);
-  } catch {
-    return [];
+  const fenceStart = /```(?:json)?\s*\r?\n?/i.exec(trimmed);
+  if (fenceStart) {
+    const afterStart = fenceStart.index + fenceStart[0].length;
+    const lastFence = trimmed.lastIndexOf('```');
+    const fencedBody = (lastFence >= afterStart ? trimmed.slice(afterStart, lastFence) : trimmed.slice(afterStart)).trim();
+    try {
+      const direct = JSON.parse(fencedBody) as unknown;
+      if (direct && typeof direct === 'object' && !Array.isArray(direct) && Array.isArray((direct as { operations?: unknown }).operations)) {
+        parsed = direct;
+      }
+    } catch {
+      // Fall back to balanced JSON extraction (handles prose or embedded code fences).
+    }
+  }
+  if (!parsed) {
+    const candidates = extractBalancedJsonObjects(trimmed);
+    parsed = candidates.find(
+      item => Boolean(item) && typeof item === 'object' && !Array.isArray(item) && Array.isArray((item as { operations?: unknown }).operations),
+    );
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
   const rawOps = (parsed as { operations?: unknown }).operations;
@@ -340,15 +398,21 @@ export async function distillIdleConversation(params: {
   const { store, factory, modelHub, messages, signal } = params;
   signal?.throwIfAborted();
 
-  const eligible = messages
-    .filter(m => m.status === 'completed' && m.source !== 'system' && m.text.trim().length > 0)
-    .sort((a, b) => a.seq - b.seq)
-    .slice(-20);
+  const sortedAll = [...messages].sort((a, b) => a.seq - b.seq);
+  const firstIncompleteIdx = sortedAll.findIndex(m => ['queued', 'processing', 'streaming'].includes(m.status));
+  const settledPrefix = firstIncompleteIdx >= 0 ? sortedAll.slice(0, firstIncompleteIdx) : sortedAll;
+  const eligible = settledPrefix
+    .filter(m => m.status === 'completed' && m.source !== 'system' && m.origin?.speakerRole !== 'member' && m.text.trim().length > 0)
+    .slice(0, 20);
   if (!eligible.length) {
+    const skippedCursor = settledPrefix.at(-1)?.seq;
+    if (skippedCursor !== undefined) {
+      store.markDistilled({ latestMessageSeq: skippedCursor });
+    }
     return { skipped: true, saved: [] };
   }
 
-  const maxSeq = Math.max(...eligible.map(m => m.seq));
+  const maxSeq = eligible.at(-1)!.seq;
   if (shouldSkipTrivialChatBatch(eligible)) {
     store.markDistilled({ latestMessageSeq: maxSeq });
     return { skipped: true, saved: [] };

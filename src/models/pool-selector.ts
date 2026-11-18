@@ -1,6 +1,6 @@
 import type { DecisionRouteCandidate, DecisionSource } from '../decision.js';
 import type { PooledModelEntry } from '../view.js';
-import { splitModelAndLevel, type ModelEffectStats } from './catalog.js';
+import { parseModelSpec, splitModelAndLevel, type ModelEffectStats } from './catalog.js';
 
 export interface DecisionEraTaskRecord {
   id: string;
@@ -26,14 +26,15 @@ export function accumulateDecisionEraStats(
     .filter(t => Boolean(t.decisionSource) && (t.status === 'completed' || t.status === 'failed') && Boolean(t.workerModel))
     .sort((a, b) => a.createdAt - b.createdAt);
 
+  const knownProviders = cachedPool.map(item => item.providerId);
   const nextStats: Record<string, ModelEffectStats> = {};
   for (const task of jevTasks) {
-    let spec = splitModelAndLevel(task.workerModel!).model;
-    if (!spec) continue;
-    if (!spec.includes('/')) {
-      const matched = cachedPool.find(item => item.modelId === spec);
-      spec = matched ? matched.spec : `${defaultProvider}/${spec}`;
-    }
+    const rawModel = splitModelAndLevel(task.workerModel!).model;
+    if (!rawModel) continue;
+    const poolHit = cachedPool.find(item => item.spec === rawModel || item.modelId === rawModel);
+    const spec = poolHit
+      ? poolHit.spec
+      : parseModelSpec(rawModel, { fallbackProvider: defaultProvider, knownProviders }).spec;
     const ok = task.status === 'completed';
     const prev = nextStats[spec] ?? { successCount: 0, failCount: 0, updatedAt: task.createdAt || Date.now() };
     let qualityScoreSum = prev.qualityScoreSum ?? 0;

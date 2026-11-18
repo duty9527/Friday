@@ -87,8 +87,9 @@ function readUsageNumbers(
   const input = Number(u.input ?? u.inputTokens ?? 0) || 0;
   const output = Number(u.output ?? u.outputTokens ?? 0) || 0;
   const cacheRead = Number(u.cacheRead ?? 0) || 0;
+  const cacheWrite = Number(u.cacheWrite ?? 0) || 0;
   const reasoning = Number(u.reasoning ?? 0) || 0;
-  const totalTokens = Number(u.totalTokens ?? input + output + cacheRead + reasoning) || 0;
+  const totalTokens = Number(u.totalTokens ?? input + output + cacheRead + cacheWrite) || 0;
   if (!totalTokens && !input && !output) return undefined;
   return { input, output, cacheRead, reasoning, totalTokens };
 }
@@ -101,6 +102,9 @@ export function sanitizeOrigin(origin?: MessageOrigin): Omit<MessageOrigin, 'con
     ...(origin.accountId ? { accountId: origin.accountId } : {}),
     ...(origin.conversationId ? { conversationId: origin.conversationId } : {}),
     ...(origin.senderId ? { senderId: origin.senderId } : {}),
+    ...(origin.speakerId ? { speakerId: origin.speakerId } : {}),
+    ...(origin.speakerName ? { speakerName: origin.speakerName } : {}),
+    ...(origin.speakerRole ? { speakerRole: origin.speakerRole } : {}),
     ...(origin.replyToMessageId ? { replyToMessageId: origin.replyToMessageId } : {}),
   };
 }
@@ -157,9 +161,13 @@ export function buildRouterTurns(events: TraceEvent[]): MindmapRouterTurn[] {
     const endData = asRecord(pair.end?.data);
     const startedAt = pair.start?.at ?? pair.end?.at ?? 0;
     const endedAt = pair.end?.at;
+    const triggerTaskId = typeof trigger?.taskId === 'string' && trigger.taskId
+      ? trigger.taskId
+      : (pair.start?.taskId ?? pair.end?.taskId);
     turnsById.set(reqId, {
       spanId: reqId,
       triggerKind: typeof trigger?.kind === 'string' ? trigger.kind : 'CHAT',
+      ...(triggerTaskId ? { triggerTaskId } : {}),
       startedAt,
       endedAt,
       durationMs: endedAt && startedAt ? Math.max(0, endedAt - startedAt) : undefined,
@@ -407,7 +415,11 @@ export function buildTaskDetail(
         at: ev.at,
         status: ev.status,
         title: ev.status === 'waiting_decision' ? 'ASK_BOSS 挂起请示老板' : '收到老板拍板继续推进',
-        outputPreview: typeof d?.reason === 'string' ? clipText(d.reason, 400).text : undefined,
+        outputPreview: typeof d?.reason === 'string'
+          ? clipText(d.reason, 400).text
+          : typeof d?.text === 'string'
+            ? clipText(d.text, 400).text
+            : undefined,
       });
     }
   }
@@ -516,10 +528,10 @@ export function buildTaskDetail(
       }
       const matchedQg = jevQualityGates.find(qg => qg.at >= (pIdx === 0 ? rp.startedAt : winStart) - 500 && qg.at < nextPhaseStart);
       const phaseEndBoundary = rp.endedAt ?? matchedQg?.at ?? rp.startedAt;
-      const matchedReportTurn = routerTurns.find((rt, rtIdx) => {
+      const matchedReportTurn = routerTurns.find(rt => {
         if (claimedReportSpans.has(rt.spanId)) return false;
-        const isCandidateTurn = rt.triggerKind === 'WORKER_REPORT' || rtIdx > 0;
-        if (!isCandidateTurn) return false;
+        if (rt.triggerTaskId) return rt.triggerTaskId === task.id;
+        if (rt.triggerKind !== 'WORKER_REPORT') return false;
         return rt.startedAt >= phaseEndBoundary - 1500 && rt.startedAt <= nextPhaseStart + 2500;
       });
       if (matchedReportTurn) claimedReportSpans.add(matchedReportTurn.spanId);
@@ -548,7 +560,11 @@ export function buildTaskDetail(
       else if (step.kind === 'tool_call') toolCount += 1;
     }
     const fallbackEnd = allSteps.at(-1)?.at ?? (task.createdAt + Math.round(task.activeMs));
-    const matchedReportTurn = routerTurns.find((rt, rtIdx) => !claimedReportSpans.has(rt.spanId) && (rt.triggerKind === 'WORKER_REPORT' || rtIdx > 0));
+    const matchedReportTurn = routerTurns.find(rt => {
+      if (claimedReportSpans.has(rt.spanId)) return false;
+      if (rt.triggerTaskId) return rt.triggerTaskId === task.id;
+      return rt.triggerKind === 'WORKER_REPORT';
+    });
     if (matchedReportTurn) claimedReportSpans.add(matchedReportTurn.spanId);
     executionPhases.push({
       index: 1,

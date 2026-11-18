@@ -62,6 +62,7 @@ export interface MindmapRouterToolCall {
 export interface MindmapRouterTurn {
   spanId: string;
   triggerKind: string;
+  triggerTaskId?: string;
   startedAt: number;
   endedAt?: number;
   durationMs?: number;

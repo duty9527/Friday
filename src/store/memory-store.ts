@@ -69,7 +69,8 @@ const AUTO_SYNAPSE_STOP_TAGS = new Set([
 ]);
 const MAX_AUTO_SYNAPSES_PER_CARD = 8;
 const MAX_AUTO_PEERS_PER_SAVE = 4;
-const MEMORY_SELECT_COLS = 'body, access_count, last_accessed_at, last_reinforced_at, importance';
+const MAX_EMBEDDING_CACHE_SIZE = 4096;
+const MEMORY_SELECT_COLS = 'body, access_count, last_accessed_at, last_reinforced_at, importance, pinned';
 
 export function hasCwdConflict(cwdA?: string, cwdB?: string): boolean {
   const a = normalizeCwd(cwdA);
@@ -110,7 +111,19 @@ function decodeMemoryRow(row: Record<string, unknown>): MemoryCard {
   if (row.importance !== undefined && row.importance !== null) {
     card.importance = Number(row.importance);
   }
+  if (row.pinned !== undefined && row.pinned !== null) {
+    if (Number(row.pinned) === 1) card.pinned = true;
+    else delete card.pinned;
+  }
   return card;
+}
+
+function parseMemoryRowSafe(row: Record<string, unknown>): MemoryCard | undefined {
+  try {
+    return decodeMemoryRow(row);
+  } catch {
+    return undefined;
+  }
 }
 
 function escapeLikePattern(value: string): string {
@@ -180,8 +193,10 @@ export class MemoryStore {
       `SELECT e.memory_id, e.model_id, e.dim, e.content_hash, e.vector, e.updated_at
        FROM memory_embeddings e
        JOIN memories m ON m.id = e.memory_id
-       WHERE m.superseded_by IS NULL`,
-    ).all();
+       WHERE m.superseded_by IS NULL
+       ORDER BY m.updated_at DESC, m.rowid DESC
+       LIMIT ?`,
+    ).all(MAX_EMBEDDING_CACHE_SIZE);
     for (const row of rows) {
       if (!(row.vector instanceof Uint8Array)) continue;
       const vec = deserializeEmbedding(row.vector, Number(row.dim));
@@ -195,6 +210,18 @@ export class MemoryStore {
         updatedAt: Number(row.updated_at),
       });
     }
+  }
+
+  private setCacheEntry(memoryId: string, entry: CachedMemoryEmbedding): void {
+    if (this.embeddingCache.has(memoryId)) {
+      this.embeddingCache.delete(memoryId);
+    }
+    while (this.embeddingCache.size >= MAX_EMBEDDING_CACHE_SIZE) {
+      const oldest = this.embeddingCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.embeddingCache.delete(oldest);
+    }
+    this.embeddingCache.set(memoryId, entry);
   }
 
   private upsertEmbeddingRecord(
@@ -217,7 +244,7 @@ export class MemoryStore {
          vector=excluded.vector,
          updated_at=excluded.updated_at`,
     ).run(memoryId, modelId, normalized.length, contentHash, blob, updatedAt);
-    this.embeddingCache.set(memoryId, {
+    this.setCacheEntry(memoryId, {
       memoryId,
       modelId,
       dim: normalized.length,
@@ -347,48 +374,63 @@ export class MemoryStore {
       if (input.id) {
         const existingRow = this.db.prepare(`SELECT ${MEMORY_SELECT_COLS} FROM memories WHERE id=?`).get(input.id);
         if (existingRow) {
-          const prev = decodeMemoryRow(existingRow);
-          const nextTags = tags.length ? tags : prev.tags;
-          const nextPinned = input.pinned ?? prev.pinned;
-          const nextImportance = input.importance !== undefined
-            ? clampImp(input.importance)
-            : (input.pinned === true && !prev.pinned)
-              ? Math.max(90, prev.importance ?? 90)
-              : (prev.importance ?? defaultImportanceFor({ pinned: nextPinned, topic, tags: nextTags }));
-          card = {
-            ...prev,
-            topic,
-            content,
-            tags: nextTags,
-            cwd: cwd ?? prev.cwd,
-            sourceMessageId: input.sourceMessageId ?? prev.sourceMessageId,
-            sourceTaskId: input.sourceTaskId ?? prev.sourceTaskId,
-            pinned: nextPinned || undefined,
-            importance: nextImportance,
-            updatedAt: now,
-          };
-          this.db.prepare(
-            `UPDATE memories
-             SET topic=?,cwd=?,superseded_by=?,updated_at=?,access_count=?,last_accessed_at=?,last_reinforced_at=?,importance=?,body=?
-             WHERE id=?`,
-          ).run(
-            card.topic,
-            card.cwd ?? null,
-            card.supersededBy ?? null,
-            card.updatedAt,
-            card.accessCount ?? 0,
-            card.lastAccessedAt ?? null,
-            card.lastReinforcedAt ?? null,
-            card.importance ?? null,
-            JSON.stringify(card),
-            card.id,
-          );
-          const updatedHash = computeSemanticContentHash(memoryDocumentText(card));
-          if (normalizedInputVec) {
-            this.upsertEmbeddingRecord(card.id, modelId, updatedHash, normalizedInputVec, now);
-          } else {
-            const cached = this.embeddingCache.get(card.id);
-            if (cached && cached.contentHash !== updatedHash) this.deleteEmbeddingRecord(card.id);
+          const prev = parseMemoryRowSafe(existingRow);
+          if (prev) {
+            const nextTags = input.tags !== undefined ? tags : prev.tags;
+            const nextPinned = input.pinned ?? prev.pinned;
+            let nextPrePinImportance = prev.prePinImportance;
+            let nextImportance: number;
+            if (input.importance !== undefined) {
+              nextImportance = clampImp(input.importance);
+              if (input.pinned === false) nextPrePinImportance = undefined;
+            } else if (input.pinned === true && !prev.pinned) {
+              nextPrePinImportance = prev.importance ?? defaultImportanceFor({ pinned: false, topic: prev.topic, tags: prev.tags });
+              nextImportance = Math.max(90, prev.importance ?? 90);
+            } else if (input.pinned === false && prev.pinned) {
+              nextImportance = prev.prePinImportance ?? defaultImportanceFor({ pinned: false, topic, tags: nextTags });
+              nextPrePinImportance = undefined;
+            } else {
+              nextImportance = prev.importance ?? defaultImportanceFor({ pinned: nextPinned, topic, tags: nextTags });
+            }
+            card = {
+              ...prev,
+              topic,
+              content,
+              tags: nextTags,
+              cwd: cwd ?? prev.cwd,
+              sourceMessageId: input.sourceMessageId ?? prev.sourceMessageId,
+              sourceTaskId: input.sourceTaskId ?? prev.sourceTaskId,
+              pinned: nextPinned || undefined,
+              importance: nextImportance,
+              prePinImportance: nextPrePinImportance,
+              updatedAt: now,
+            };
+            if (!nextPinned) delete card.pinned;
+            if (card.prePinImportance === undefined) delete card.prePinImportance;
+            this.db.prepare(
+              `UPDATE memories
+               SET topic=?,cwd=?,superseded_by=?,updated_at=?,access_count=?,last_accessed_at=?,last_reinforced_at=?,importance=?,pinned=?,body=?
+               WHERE id=?`,
+            ).run(
+              card.topic,
+              card.cwd ?? null,
+              card.supersededBy ?? null,
+              card.updatedAt,
+              card.accessCount ?? 0,
+              card.lastAccessedAt ?? null,
+              card.lastReinforcedAt ?? null,
+              card.importance ?? null,
+              card.pinned ? 1 : 0,
+              JSON.stringify(card),
+              card.id,
+            );
+            const updatedHash = computeSemanticContentHash(memoryDocumentText(card));
+            if (normalizedInputVec) {
+              this.upsertEmbeddingRecord(card.id, modelId, updatedHash, normalizedInputVec, now);
+            } else {
+              const cached = this.embeddingCache.get(card.id);
+              if (cached && cached.contentHash !== updatedHash) this.deleteEmbeddingRecord(card.id);
+            }
           }
         }
       }
@@ -403,15 +445,15 @@ export class MemoryStore {
           const priorRows = this.db.prepare(
             `SELECT ${MEMORY_SELECT_COLS} FROM memories WHERE id IN (${explicitSupersedeIds.map(() => '?').join(',')}) AND superseded_by IS NULL`,
           ).all(...explicitSupersedeIds);
-          priors = priorRows.map(row => decodeMemoryRow(row)).filter(prior => prior.id !== id);
+          priors = priorRows
+            .map(row => parseMemoryRowSafe(row))
+            .filter((prior): prior is MemoryCard => Boolean(prior && prior.id !== id));
         } else {
           const canonicalTopicKey = (value: string): string =>
             normalizeTopicForDedup(value).replace(/(?<=[\u4e00-\u9fff\u3400-\u4dbf])\s+|\s+(?=[\u4e00-\u9fff\u3400-\u4dbf])/g, '');
           const normDedupTopic = canonicalTopicKey(topic);
           const isNewStub = isAutoStubCard({ topic, tags });
-          const sameCwdActive = this.listMemories({ includeSuperseded: false, limit: 500 })
-            .filter(prior => prior.id !== id && normalizeCwd(prior.cwd) === normCwd);
-          priors = sameCwdActive.filter(prior => {
+          const isDedupCandidate = (prior: MemoryCard): boolean => {
             if (prior.topic === topic) return true;
             if (normDedupTopic.length > 0 && canonicalTopicKey(prior.topic) === normDedupTopic) return true;
             if (prior.pinned) return false;
@@ -428,13 +470,33 @@ export class MemoryStore {
             if (isAutoStubCard(prior) !== isNewStub) return false;
             const overlap = computeLexicalConceptOverlap(docText, memoryDocumentText(prior));
             return overlap.jaccard >= 0.68 && overlap.sharedTerms >= 4;
-          });
+          };
+          priors = [];
+          const pageSize = 500;
+          for (let offset = 0; ; offset += pageSize) {
+            const rows = this.db.prepare(
+              `SELECT ${MEMORY_SELECT_COLS} FROM memories WHERE superseded_by IS NULL ORDER BY updated_at DESC, rowid DESC LIMIT ? OFFSET ?`,
+            ).all(pageSize, offset) as Array<Record<string, unknown>>;
+            if (!rows.length) break;
+            for (const row of rows) {
+              const prior = parseMemoryRowSafe(row);
+              if (!prior || prior.id === id || normalizeCwd(prior.cwd) !== normCwd) continue;
+              if (isDedupCandidate(prior)) priors.push(prior);
+            }
+            if (rows.length < pageSize) break;
+          }
         }
         const inheritedPin = input.pinned ?? priors.some(p => p.pinned);
         const baseImp = defaultImportanceFor({ pinned: Boolean(inheritedPin), topic, tags });
         const inheritedImp = input.importance !== undefined
           ? clampImp(input.importance)
           : Math.max(baseImp, ...priors.map(p => p.importance ?? baseImp));
+        const inheritedPrePinImp = inheritedPin
+          ? priors.find(p => p.prePinImportance !== undefined)?.prePinImportance
+            ?? (input.pinned === true && priors.length && priors.every(p => !p.pinned)
+              ? Math.max(...priors.map(p => p.importance ?? defaultImportanceFor({ pinned: false, topic: p.topic, tags: p.tags })))
+              : undefined)
+          : undefined;
         card = {
           id,
           topic,
@@ -446,27 +508,29 @@ export class MemoryStore {
           supersedes: priors[0]?.id,
           pinned: inheritedPin || undefined,
           importance: inheritedImp,
+          ...(inheritedPrePinImp !== undefined ? { prePinImportance: inheritedPrePinImp } : {}),
           accessCount: 0,
           createdAt: now,
           updatedAt: now,
         };
         // Inherit synapses from superseded prior neurons and redirect neighbor pointers.
+        const supersededIdSet = new Set([card.id, ...priors.map(p => p.id)]);
         for (const prior of priors) {
           for (const syn of prior.synapses ?? []) {
-            if (syn.targetId !== card.id) {
-              this.upsertSynapseOnCard(card, syn.targetId, syn.targetTopic, syn.relation, syn.weight, now, 'at_least');
-              try {
-                const neighbor = this.getMemory(syn.targetId);
-                neighbor.synapses = (neighbor.synapses ?? []).filter(s => s.targetId !== prior.id);
-                this.upsertSynapseOnCard(neighbor, card.id, card.topic, syn.relation, syn.weight, now, 'at_least');
-                this.db.prepare('UPDATE memories SET body=? WHERE id=?').run(JSON.stringify(neighbor), neighbor.id);
-              } catch { /* ignore missing neighbor */ }
-            }
+            if (supersededIdSet.has(syn.targetId)) continue;
+            try {
+              const neighbor = this.getMemory(syn.targetId);
+              if (neighbor.supersededBy) continue;
+              this.upsertSynapseOnCard(card, syn.targetId, neighbor.topic ?? syn.targetTopic, syn.relation, syn.weight, now, 'at_least');
+              neighbor.synapses = (neighbor.synapses ?? []).filter(s => !supersededIdSet.has(s.targetId));
+              this.upsertSynapseOnCard(neighbor, card.id, card.topic, syn.relation, syn.weight, now, 'at_least');
+              this.db.prepare('UPDATE memories SET body=? WHERE id=?').run(JSON.stringify(neighbor), neighbor.id);
+            } catch { /* ignore missing or corrupt neighbor */ }
           }
         }
         this.db.prepare(
-          `INSERT INTO memories(id,topic,cwd,superseded_by,updated_at,access_count,last_accessed_at,last_reinforced_at,importance,body)
-           VALUES(?,?,?,?,?,?,?,?,?,?)`,
+          `INSERT INTO memories(id,topic,cwd,superseded_by,updated_at,access_count,last_accessed_at,last_reinforced_at,importance,pinned,body)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
         ).run(
           card.id,
           card.topic,
@@ -477,6 +541,7 @@ export class MemoryStore {
           null,
           null,
           card.importance ?? null,
+          card.pinned ? 1 : 0,
           JSON.stringify(card),
         );
         if (normalizedInputVec) {
@@ -594,11 +659,20 @@ export class MemoryStore {
   pinMemory(id: string, pinned = true): MemoryCard {
     return this.atomic(() => {
       const card = this.getMemory(id);
-      card.pinned = pinned || undefined;
-      card.importance = pinned ? Math.max(90, card.importance ?? 90) : (card.importance ?? 50);
+      if (pinned) {
+        if (!card.pinned) {
+          card.prePinImportance = card.importance ?? defaultImportanceFor({ pinned: false, topic: card.topic, tags: card.tags });
+        }
+        card.pinned = true;
+        card.importance = Math.max(90, card.importance ?? 90);
+      } else {
+        delete card.pinned;
+        card.importance = card.prePinImportance ?? defaultImportanceFor({ pinned: false, topic: card.topic, tags: card.tags });
+        delete card.prePinImportance;
+      }
       card.updatedAt = Date.now();
-      this.db.prepare('UPDATE memories SET updated_at=?,importance=?,body=? WHERE id=?')
-        .run(card.updatedAt, card.importance, JSON.stringify(card), card.id);
+      this.db.prepare('UPDATE memories SET updated_at=?,importance=?,pinned=?,body=? WHERE id=?')
+        .run(card.updatedAt, card.importance, card.pinned ? 1 : 0, JSON.stringify(card), card.id);
       return card;
     });
   }
@@ -655,28 +729,49 @@ export class MemoryStore {
     if (options?.cwd) { clauses.push('(cwd=? OR cwd IS NULL)'); args.push(options.cwd); }
     if (options?.topic) { clauses.push('topic=?'); args.push(options.topic); }
     const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : '';
-    const limit = options?.limit ?? 100;
+    const limit = Math.max(0, Math.floor(options?.limit ?? 100));
     const rows = this.db.prepare(
-      `SELECT ${MEMORY_SELECT_COLS} FROM memories${where} ORDER BY updated_at DESC, rowid DESC LIMIT ?`,
-    ).all(...args, limit);
-    return rows
-      .map(row => decodeMemoryRow(row))
-      .sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) || b.updatedAt - a.updatedAt);
+      `SELECT ${MEMORY_SELECT_COLS} FROM memories${where} ORDER BY pinned DESC, updated_at DESC, rowid DESC LIMIT ?`,
+    ).all(...args, limit) as Array<Record<string, unknown>>;
+    const cards: MemoryCard[] = [];
+    for (const row of rows) {
+      const card = parseMemoryRowSafe(row);
+      if (card) cards.push(card);
+    }
+    return cards.sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) || b.updatedAt - a.updatedAt);
   }
 
   deleteMemory(id: string): boolean {
     return this.atomic(() => {
       let existing: MemoryCard | undefined;
       try { existing = this.getMemory(id); } catch { /* ignore */ }
+      const incomingRows = this.db.prepare(
+        `SELECT ${MEMORY_SELECT_COLS} FROM memories WHERE id != ? AND json_valid(body)=1 AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(body) THEN body ELSE '{}' END, '$.synapses') WHERE json_extract(value, '$.targetId') = ?)`,
+      ).all(id, id) as Array<Record<string, unknown>>;
       // memory_embeddings uses ON DELETE CASCADE, so deleting the parent cleans embeddings automatically.
       const deleted = this.db.prepare('DELETE FROM memories WHERE id=?').run(id).changes > 0;
       this.embeddingCache.delete(id);
-      if (deleted && existing?.synapses?.length) {
-        for (const syn of existing.synapses) {
+      if (deleted) {
+        const remainingOutgoingTargets = new Set<string>();
+        for (const syn of existing?.synapses ?? []) {
+          if (syn.targetId && syn.targetId !== id) remainingOutgoingTargets.add(syn.targetId);
+        }
+        for (const row of incomingRows) {
+          const neighbor = parseMemoryRowSafe(row);
+          if (!neighbor) continue;
+          remainingOutgoingTargets.delete(neighbor.id);
+          if (neighbor.synapses?.some(s => s.targetId === id)) {
+            const nextSynapses = neighbor.synapses.filter(s => s.targetId !== id);
+            neighbor.synapses = nextSynapses.length ? nextSynapses : undefined;
+            this.db.prepare('UPDATE memories SET body=? WHERE id=?').run(JSON.stringify(neighbor), neighbor.id);
+          }
+        }
+        for (const targetId of remainingOutgoingTargets) {
           try {
-            const neighbor = this.getMemory(syn.targetId);
+            const neighbor = this.getMemory(targetId);
             if (neighbor.synapses?.some(s => s.targetId === id)) {
-              neighbor.synapses = neighbor.synapses.filter(s => s.targetId !== id);
+              const nextSynapses = neighbor.synapses.filter(s => s.targetId !== id);
+              neighbor.synapses = nextSynapses.length ? nextSynapses : undefined;
               this.db.prepare('UPDATE memories SET body=? WHERE id=?').run(JSON.stringify(neighbor), neighbor.id);
             }
           } catch { /* ignore */ }
@@ -742,7 +837,8 @@ export class MemoryStore {
             `SELECT ${MEMORY_SELECT_COLS} FROM memories WHERE id IN (${placeholders})${supersededFilter}`,
           ).all(...chunk);
           for (const row of rows) {
-            const card = decodeMemoryRow(row);
+            const card = parseMemoryRowSafe(row);
+            if (!card) continue;
             if (options.excludeCwdConflict && hasCwdConflict(options.cwd, card.cwd)) {
               skippedIds.add(card.id);
               continue;
@@ -780,8 +876,8 @@ export class MemoryStore {
           `SELECT ${MEMORY_SELECT_COLS} FROM memories${where} ORDER BY updated_at DESC, rowid DESC LIMIT ?`,
         ).all(...args, 100);
         for (const row of rows) {
-          const card = decodeMemoryRow(row);
-          if (byId.has(card.id)) continue;
+          const card = parseMemoryRowSafe(row);
+          if (!card || byId.has(card.id)) continue;
           if (options.excludeCwdConflict && hasCwdConflict(options.cwd, card.cwd)) continue;
           byId.set(card.id, card);
         }
@@ -1188,16 +1284,33 @@ export class MemoryStore {
         return 0;
       }
     }
-    const maxCount = Math.max(1, Math.min(limit, 500));
-    const active = this.listMemories({ includeSuperseded: false, limit: 500 });
+    const maxCount = Math.max(1, Math.floor(limit));
     const pending: Array<{ card: MemoryCard; docText: string; docHash: string }> = [];
-    for (const card of active) {
-      if (pending.length >= maxCount) break;
-      const docText = memoryDocumentText(card);
-      const docHash = computeSemanticContentHash(docText);
-      const cached = this.embeddingCache.get(card.id);
-      if (cached && cached.modelId === engine.modelId && cached.contentHash === docHash) continue;
-      pending.push({ card, docText, docHash });
+    const pageSize = 200;
+    for (let offset = 0; pending.length < maxCount; offset += pageSize) {
+      if (signal?.aborted) break;
+      const rows = this.db.prepare(
+        `SELECT m.body, m.access_count, m.last_accessed_at, m.last_reinforced_at, m.importance, m.pinned,
+                e.model_id AS emb_model_id, e.content_hash AS emb_hash
+         FROM memories m
+         LEFT JOIN memory_embeddings e ON e.memory_id = m.id
+         WHERE m.superseded_by IS NULL
+         ORDER BY m.pinned DESC, m.updated_at DESC, m.rowid DESC
+         LIMIT ? OFFSET ?`,
+      ).all(pageSize, offset) as Array<Record<string, unknown>>;
+      if (!rows.length) break;
+      for (const row of rows) {
+        if (pending.length >= maxCount) break;
+        const card = parseMemoryRowSafe(row);
+        if (!card) continue;
+        const docText = memoryDocumentText(card);
+        const docHash = computeSemanticContentHash(docText);
+        if (row.emb_model_id === engine.modelId && row.emb_hash === docHash) continue;
+        const cached = this.embeddingCache.get(card.id);
+        if (cached && cached.modelId === engine.modelId && cached.contentHash === docHash) continue;
+        pending.push({ card, docText, docHash });
+      }
+      if (rows.length < pageSize) break;
     }
     if (!pending.length) return 0;
 
