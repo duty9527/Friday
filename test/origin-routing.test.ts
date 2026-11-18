@@ -70,11 +70,17 @@ test('explicit switch_channel routes a local Web message reply directly to bound
 
     const updatedUser = coordinator.store.conversation.get(msg.id);
     assert.equal(updatedUser.status, 'completed');
-    assert.equal(updatedUser.origin?.channel, 'wechat');
-    assert.equal(updatedUser.origin?.channelId, 'wechat-clawbot');
-    assert.equal(updatedUser.origin?.conversationId, 'boss@im.wechat');
+    assert.equal(updatedUser.origin?.channel, 'local');
+    assert.equal(updatedUser.origin?.channelId, undefined);
+    assert.equal(updatedUser.origin?.conversationId, undefined);
     assert.equal(updatedUser.routing?.actions[0]?.kind, 'switch_channel');
     assert.equal(updatedUser.routing?.actions[0]?.status, 'accepted');
+    const switchedReplies = coordinator.store.conversation.history(undefined, 20).items
+      .filter(item => item.role === 'assistant' && item.replyTo === msg.id);
+    assert.equal(switchedReplies.length, 1);
+    assert.equal(switchedReplies[0]?.origin?.channel, 'wechat');
+    assert.equal(switchedReplies[0]?.origin?.channelId, 'wechat-clawbot');
+    assert.equal(switchedReplies[0]?.origin?.conversationId, 'boss@im.wechat');
     assert.equal(sent.length, 1);
     assert.equal(sent[0][0], 'wechat-clawbot');
     assert.match(sent[0][1], /已经切到 wechat 这边了/);

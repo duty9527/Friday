@@ -526,7 +526,7 @@ export async function handleTvIrVoiceFastpath(request, context = {}, actionExecu
     return { handled: false };
   }
 
-  const inRemoteMode = Boolean(sessionState?.tvRemoteActive || sessionState?.continuous);
+  const inRemoteMode = Boolean(sessionState?.tvRemoteActive);
   const cleaned = stripWakeAndPunct(request?.text);
 
   // 2. Exit remote mode (supports "好了", "退出", "不用了", etc.).

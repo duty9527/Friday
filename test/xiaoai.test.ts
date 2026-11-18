@@ -69,6 +69,7 @@ import { Coordinator } from '../src/coordinator.js';
 import { compactHostEventText, offlineFactory, prepareRouterSessionModel, type AgentFactory } from '../src/agent.js';
 import { Store, type ImChannelConfig } from '../src/store.js';
 import { ImGateway } from '../src/im.js';
+import { tryPluginVoiceFastpath } from '../src/plugin.js';
 
 async function until(predicate: () => boolean | Promise<boolean>, attempts = 300) {
   for (let i = 0; i < attempts; i++) {
@@ -760,11 +761,27 @@ test('XiaoAI Webhook Bridge secret auth and switch_channel cross-device routing'
       origin?: { channel?: string; channelId?: string; conversationId?: string };
       routing?: { actions?: Array<{ kind?: string; status?: string }> };
     };
-    assert.equal(storedUser.origin?.channel, 'xiaoai');
-    assert.equal(storedUser.origin?.channelId, 'xiaoai-bridge');
-    assert.equal(storedUser.origin?.conversationId, 'oh2p');
+    assert.equal(storedUser.origin?.channel, 'local');
+    assert.equal(storedUser.origin?.channelId, undefined);
+    assert.equal(storedUser.origin?.conversationId, undefined);
     assert.equal(storedUser.routing?.actions?.[0]?.kind, 'switch_channel');
     assert.equal(storedUser.routing?.actions?.[0]?.status, 'accepted');
+
+    const historyPage = await request(home, { command: 'history' }) as {
+      items?: Array<{
+        id: string;
+        role?: string;
+        replyTo?: string;
+        origin?: { channel?: string; channelId?: string; conversationId?: string };
+      }>;
+    };
+    const switchedReplies = (historyPage.items ?? []).filter(
+      item => item.role === 'assistant' && item.replyTo === localMsg.id,
+    );
+    assert.equal(switchedReplies.length, 1);
+    assert.equal(switchedReplies[0]?.origin?.channel, 'xiaoai');
+    assert.equal(switchedReplies[0]?.origin?.channelId, 'xiaoai-bridge');
+    assert.equal(switchedReplies[0]?.origin?.conversationId, 'oh2p');
   } finally {
     await web.close();
     await daemon.close();
@@ -1778,6 +1795,8 @@ test('XiaoAI TV Remote Mode: zero-LLM deterministic keys, empty/timeout/noise ca
     };
     const uninstallTvPlugin = await installTestTvFastpathPlugin(home, 'root@192.0.2.104', sshRunner, tvCfg);
     try {
+      (coordinator.im as any).ctx.runVoiceFastpath = (req: Parameters<typeof tryPluginVoiceFastpath>[1]) =>
+        tryPluginVoiceFastpath(home, req, { allowedPlugins: ['test-tv-ir'] });
       coordinator.im.xiaoaiDeps = {
         sshRunner,
         kwsCooldownMs: 20,
@@ -2387,6 +2406,8 @@ test('XiaoAI E2E voiceprint enrollment, multi-speaker recognition, TV rejection,
     );
     try {
       const downCode = TEST_TV_IR_CODES.down;
+      (coordinator.im as any).ctx.runVoiceFastpath = (req: Parameters<typeof tryPluginVoiceFastpath>[1]) =>
+        tryPluginVoiceFastpath(home, req, { allowedPlugins: ['test-tv-ir'] });
 
       coordinator.im.xiaoaiDeps = {
         sshRunner,

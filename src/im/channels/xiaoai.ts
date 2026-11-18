@@ -762,7 +762,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     const wasContinuous = Boolean(prevEntry?.state.continuous || prevEntry?.state.tvRemoteActive);
     const sshTarget = resolveSshTarget(channel, targetId);
 
-    const request = {
+    const request: VoiceFastpathRequest = {
       text: inbound.text,
       channelId: channel.id,
       platform: channel.platform,
@@ -777,7 +777,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
         : {}),
       explicitWake: inbound.explicitWake,
       ...(prevEntry ? { sessionState: prevEntry.state } : {}),
-    } as VoiceFastpathRequest;
+    };
 
     const startedAt = Date.now();
     let result: VoiceFastpathResult | undefined;
