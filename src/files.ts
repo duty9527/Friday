@@ -1,6 +1,6 @@
 import { constants } from 'node:fs';
 import { lstat, mkdir, open, opendir, realpath, writeFile, chmod, rm } from 'node:fs/promises';
-import { basename, dirname, join, parse, resolve, relative } from 'node:path';
+import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 
 export const FILE_LIMIT = 256 * 1024;
@@ -19,8 +19,28 @@ export async function privateHome(path: string): Promise<string> {
 }
 
 async function noSymlinkAncestors(path: string, stopAt?: string): Promise<void> {
-  const fsRoot = parse(path).root;
+  // Check raw path segments left-to-right BEFORE lexical resolution collapses "symlink/..".
+  const absRaw = isAbsolute(path) ? path : `${process.cwd()}${sep}${path}`;
+  const rawRoot = parse(absRaw).root;
   const bound = stopAt ? resolve(stopAt) : undefined;
+  const rawParts = absRaw.slice(rawRoot.length).split(/[\\/]+/).filter(Boolean);
+  let rawCursor = rawRoot;
+  let hitStopBound = !bound;
+  for (const part of rawParts) {
+    if (part === '.') continue;
+    if (part === '..') {
+      rawCursor = dirname(rawCursor);
+      continue;
+    }
+    rawCursor = rawCursor.endsWith(sep) ? `${rawCursor}${part}` : `${rawCursor}${sep}${part}`;
+    if (!hitStopBound && bound && (rawCursor === bound || rawCursor.startsWith(`${bound}${sep}`))) {
+      hitStopBound = true;
+    }
+    if (hitStopBound && (await lstat(rawCursor)).isSymbolicLink()) {
+      throw new Error('Symbolic links are not accepted as inputs');
+    }
+  }
+  const fsRoot = parse(path).root;
   let current = resolve(path);
   while (current !== fsRoot) {
     if ((await lstat(current)).isSymbolicLink()) throw new Error('Symbolic links are not accepted as inputs');
@@ -87,8 +107,33 @@ async function expandInputs(paths: string[]): Promise<Array<{ path: string; name
       throw new Error(`Directory changed while creating snapshot; submit again: ${path}`);
     }
   }
-  for (const input of paths) { const path = resolve(input); await visit(path, path, 0); }
+  for (const input of paths) {
+    await noSymlinkAncestors(input);
+    const path = resolve(input);
+    await visit(path, path, 0);
+  }
   if (!files.length) throw new Error('No regular files found in the authorized input paths');
+  // Disambiguate colliding snapshot display names across distinct top-level inputs.
+  const counts = new Map<string, number>();
+  for (const file of files) counts.set(file.name, (counts.get(file.name) ?? 0) + 1);
+  if ([...counts.values()].some(c => c > 1)) {
+    const used = new Set<string>();
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i]!;
+      if ((counts.get(file.name) ?? 0) <= 1 && !used.has(file.name)) {
+        used.add(file.name);
+        continue;
+      }
+      let candidate = join(basename(dirname(file.root)), file.name);
+      if (used.has(candidate)) {
+        let seq = 2;
+        while (used.has(`${seq}-${candidate}`)) seq++;
+        candidate = `${seq}-${candidate}`;
+      }
+      file.name = candidate;
+      used.add(candidate);
+    }
+  }
   return files;
 }
 

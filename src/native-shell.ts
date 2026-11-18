@@ -4,10 +4,14 @@ import type { BashOperations } from '@earendil-works/pi-coding-agent';
 export class NativeCommandInterrupted extends Error {}
 export class NativeCommandTimeoutError extends Error {}
 
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
 export function nativeShellOperations(): BashOperations {
   return { exec: async (command, cwd, { onData, signal, timeout, env }) => {
     signal?.throwIfAborted();
-    if (timeout !== undefined && (!Number.isFinite(timeout) || timeout < 0)) throw new Error('Invalid command timeout');
+    if (timeout !== undefined && (!Number.isFinite(timeout) || timeout < 0 || timeout * 1000 > MAX_TIMEOUT_MS)) {
+      throw new Error('Invalid command timeout');
+    }
     return new Promise((resolve, reject) => {
       const child = spawn('/bin/bash', ['-c', command], { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
       let interrupted = false;

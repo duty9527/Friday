@@ -46,12 +46,26 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
     onCompromised: () => { compromised = true; void shutdown?.(); },
   });
   const connections = new Set<Socket>();
+  const handledSockets = new WeakSet<Socket>();
+  const inFlightRequests = new Set<Promise<void>>();
+  let shuttingDown = false;
   const server = createServer(socket => {
-    connections.add(socket); socket.on('close', () => connections.delete(socket));
+    if (shuttingDown || compromised) {
+      socket.destroy();
+      return;
+    }
+    connections.add(socket);
     let buffer = Buffer.alloc(0);
     let handled = false;
-    socket.setTimeout(5_000, () => {
-      if (!handled) socket.destroy();
+    const readDeadline = setTimeout(() => {
+      if (!handled && !socket.destroyed) socket.destroy();
+    }, 5_000);
+    socket.on('close', () => {
+      clearTimeout(readDeadline);
+      connections.delete(socket);
+    });
+    socket.on('end', () => {
+      if (!handled && !socket.destroyed) socket.destroy();
     });
     socket.on('error', () => {});
     const reply = (response: Response) => {
@@ -61,19 +75,22 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
     };
     socket.on('data', chunk => {
       if (handled) return;
-      buffer = Buffer.concat([buffer, chunk]);
-      if (buffer.length > REQUEST_LIMIT) {
+      if (buffer.length + chunk.length > REQUEST_LIMIT) {
         handled = true;
-        socket.setTimeout(0);
+        handledSockets.add(socket);
+        clearTimeout(readDeadline);
         reply({ ok: false, error: 'Request exceeds limit' });
         return;
       }
+      buffer = Buffer.concat([buffer, chunk]);
       const newline = buffer.indexOf(10);
       if (newline === -1) return;
       handled = true;
-      socket.setTimeout(0);
-      void (async () => {
+      handledSockets.add(socket);
+      clearTimeout(readDeadline);
+      const pending = (async () => {
         if (compromised || !coordinator) throw new Error('Service does not own its instance lock');
+        if (shuttingDown) throw new Error('Service is shutting down');
         const message: unknown = JSON.parse(buffer.subarray(0, newline).toString('utf8'));
         if (!message || typeof message !== 'object' || !('command' in message)) throw new Error('Invalid command');
         const command = message as Record<string, unknown>;
@@ -177,6 +194,21 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
           }
           case 'chat-stop': return coordinator.stopReply(text(command.messageId, 'messageId', 128));
           case 'message': return store.conversation.get(text(command.messageId, 'messageId', 128));
+          case 'messages': {
+            const rawIds = command.ids ?? command.messageIds;
+            if (!Array.isArray(rawIds)) throw new Error('ids must be an array');
+            if (rawIds.length > 200) throw new Error('ids must contain at most 200 items');
+            const seen = new Set<string>();
+            const items: Array<ReturnType<typeof store.conversation.get>> = [];
+            for (const rawId of rawIds) {
+              const id = text(rawId, 'messageId', 128);
+              if (seen.has(id)) continue;
+              seen.add(id);
+              try { items.push(store.conversation.get(id)); }
+              catch { /* Skip missing or removed messages in batch lookup */ }
+            }
+            return items;
+          }
           case 'history': return store.conversation.history(command.before === undefined ? undefined : integer(command.before, 0, 1, Number.MAX_SAFE_INTEGER));
           case 'trace': return store.conversation.trace({
             messageId: command.messageId === undefined ? undefined : text(command.messageId, 'messageId', 128),
@@ -397,12 +429,31 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
           }
           default: throw new Error('Unknown command');
         }
-      })().then(result => reply({ ok: true, result }), error => reply({ ok: false, error: error instanceof Error ? error.message : 'Request failed' }));
+      })().then(
+        result => {
+          if (compromised) reply({ ok: false, error: 'Service does not own its instance lock' });
+          else reply({ ok: true, result });
+        },
+        error => reply({ ok: false, error: error instanceof Error ? error.message : 'Request failed' }),
+      );
+      inFlightRequests.add(pending);
+      void pending.finally(() => inFlightRequests.delete(pending));
     });
   });
+  server.maxConnections = 64;
   let closing: Promise<void> | undefined;
   const close = () => closing ??= (async () => {
+    shuttingDown = true;
     server.close();
+    for (const socket of connections) {
+      if (!handledSockets.has(socket)) socket.destroy();
+    }
+    if (inFlightRequests.size > 0) {
+      await Promise.race([
+        Promise.allSettled([...inFlightRequests]),
+        new Promise<void>(resolve => setTimeout(resolve, 5_000)),
+      ]);
+    }
     for (const socket of connections) socket.destroy();
     await coordinator?.close();
     if (!compromised) await rm(path, { force: true });
@@ -417,11 +468,14 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
     await coordinator.ready();
     if (compromised) throw new Error('Instance lock was lost during startup');
     await rm(path, { force: true });
+    if (compromised) throw new Error('Instance lock was lost during startup');
     await new Promise<void>((resolve, reject) => {
       server.once('error', reject);
       server.listen(path, () => { server.removeListener('error', reject); resolve(); });
     });
+    if (compromised) throw new Error('Instance lock was lost during startup');
     await chmod(path, 0o600);
+    if (compromised) throw new Error('Instance lock was lost during startup');
     return { home, close };
   } catch (error) { await close(); throw error; }
 }

@@ -40,6 +40,14 @@ export function formatTaskSessionId(taskId: string): string {
   return `session:task:${taskId}`;
 }
 
+export function formatMemberSessionId(firstMessageId: string): string {
+  return `session:member:${firstMessageId}`;
+}
+
+export function isMemberOrigin(origin?: ChatMessage['origin']): boolean {
+  return origin?.speakerRole === 'member';
+}
+
 export function isTimerOrSystemMessage(msg: Pick<ChatMessage, 'source' | 'text'>): boolean {
   return msg.source === 'system' || /^\[定时触发\s*·/.test(msg.text.trim());
 }
@@ -203,7 +211,10 @@ function loadRecentSessionContext(
   knownWorks: Task[],
 ): RecentSessionContext | undefined {
   const beforeSeq = current.seq ?? Number.MAX_SAFE_INTEGER;
-  const recentHumans = store.conversation.recentHumanUserMessages(beforeSeq, 10);
+  const recentHumans = store.conversation
+    .recentHumanUserMessages(beforeSeq, 20)
+    .filter(m => !isMemberOrigin(m.origin))
+    .slice(-10);
   if (!recentHumans.length) return undefined;
   const prevUser = recentHumans[recentHumans.length - 1]!;
   const prevSessionId = prevUser.sessionId ?? formatFlowSessionId(prevUser.id);
@@ -370,6 +381,9 @@ export function assignInitialMessageSessionSync(
   draft: { id: string; text: string; origin?: ChatMessage['origin']; source?: 'router' | 'system'; at: number },
   knownWorks: Task[],
 ): { sessionId: string; sessionLink?: SessionTurnLink } {
+  if (isMemberOrigin(draft.origin)) {
+    return { sessionId: formatMemberSessionId(draft.id) };
+  }
   if (isTimerOrSystemMessage(draft)) {
     return { sessionId: formatFlowSessionId(draft.id) };
   }
@@ -419,6 +433,9 @@ export async function resolveRuntimeMessageSession(
   semantic?: SemanticEmbedder,
   options?: { skipAiContinuity?: boolean },
 ): Promise<{ sessionId: string; sessionLink?: SessionTurnLink }> {
+  if (isMemberOrigin(currentMessage.origin)) {
+    return { sessionId: formatMemberSessionId(currentMessage.id) };
+  }
   if (isTimerOrSystemMessage(currentMessage)) {
     return { sessionId: formatFlowSessionId(currentMessage.id) };
   }
@@ -582,7 +599,7 @@ function resolveHumanTaskSession(store: Store, task: Task): string | undefined {
   if (task.originMessageId) {
     try {
       const originMsg = store.conversation.get(task.originMessageId);
-      if (isTimerOrSystemMessage(originMsg)) return undefined;
+      if (isTimerOrSystemMessage(originMsg) || isMemberOrigin(originMsg.origin)) return undefined;
       return originMsg.sessionId ?? formatFlowSessionId(originMsg.id);
     } catch { /* fall through to task.sessionId */ }
   }
@@ -603,7 +620,7 @@ export function reconcileRuntimeSessionAfterTool(
 ): { updated: boolean; sessionId: string } {
   const msg = store.conversation.get(messageId);
   const currentSessionId = msg.sessionId ?? formatFlowSessionId(msg.id);
-  if (isTimerOrSystemMessage(msg)) return { updated: false, sessionId: currentSessionId };
+  if (isTimerOrSystemMessage(msg) || isMemberOrigin(msg.origin)) return { updated: false, sessionId: currentSessionId };
 
   const createdTask = action.taskId
     ? (() => { try { return store.get(action.taskId); } catch { return undefined; } })()
@@ -676,9 +693,9 @@ export function reconcileRuntimeSessionAfterTool(
     for (const mid of action.messageIds) {
       try {
         const hit = store.conversation.get(mid);
-        if (hit.seq >= msg.seq || isTimerOrSystemMessage(hit)) continue;
+        if (hit.seq >= msg.seq || isTimerOrSystemMessage(hit) || isMemberOrigin(hit.origin)) continue;
         const rootHit = hit.role === 'assistant' && hit.replyTo ? store.conversation.get(hit.replyTo) : hit;
-        if (isTimerOrSystemMessage(rootHit)) continue;
+        if (isTimerOrSystemMessage(rootHit) || isMemberOrigin(rootHit.origin)) continue;
         if (msg.at - rootHit.at <= 3600_000 && (!bestTarget || rootHit.seq > bestTarget.seq)) {
           bestTarget = rootHit;
         }
@@ -743,6 +760,13 @@ export function backfillPersistedSessions(store: Store): number {
   for (const user of users) {
     const replies = repliesByParent.get(user.id) ?? [];
     const userTasks = user.taskIds.map(id => tasksById.get(id)).filter((t): t is Task => Boolean(t));
+
+    if (isMemberOrigin(user.origin)) {
+      const sid = user.sessionId?.startsWith('session:member:') ? user.sessionId : formatMemberSessionId(user.id);
+      userSessionMap.set(user.id, sid);
+      if (user.sessionId !== sid) updates.push({ msg: user, sessionId: sid });
+      continue;
+    }
 
     if (isTimerOrSystemMessage(user)) {
       const sid = user.sessionId ?? formatFlowSessionId(user.id);

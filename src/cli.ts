@@ -59,9 +59,12 @@ function attachGracefulShutdown(closeTarget: () => Promise<void>): void {
     process.removeListener('SIGTERM', close);
     const forceExit = setTimeout(() => {
       process.exit(typeof process.exitCode === 'number' && process.exitCode !== 0 ? process.exitCode : 1);
-    }, 5_000);
+    }, 15_000);
     forceExit.unref();
-    void closeTarget().catch(() => { process.exitCode = 1; });
+    void closeTarget().then(
+      () => { clearTimeout(forceExit); },
+      () => { clearTimeout(forceExit); process.exitCode = 1; },
+    );
   };
   process.on('SIGINT', close);
   process.on('SIGTERM', close);
@@ -186,19 +189,23 @@ async function main() {
       systemdUnit,
       serveArgs,
     });
+    const watchdog = new Watchdog({
+      home,
+      intervalMs: number(values['interval-ms']),
+      maxRetries: number(values['max-retries']),
+      restartService: restarter.restartService,
+    });
     try {
-      const watchdog = new Watchdog({
-        home,
-        intervalMs: number(values['interval-ms']),
-        maxRetries: number(values['max-retries']),
-        restartService: restarter.restartService,
-      });
       await watchdog.loop(controller.signal);
       process.stdout.write(JSON.stringify(watchdog.state(), null, 2) + '\n');
     } finally {
       process.removeListener('SIGINT', stop);
       process.removeListener('SIGTERM', stop);
-      await restarter.stop();
+      if (watchdog.state().status === 'healthy') {
+        restarter.detach?.();
+      } else {
+        await restarter.stop();
+      }
     }
     return;
   }
@@ -412,6 +419,14 @@ async function main() {
   process.stdout.write(JSON.stringify(result, null, 2) + '\n');
 }
 
+async function ensureHomeUnlockedForLocalFallback(verifiedHome: string): Promise<void> {
+  const { default: lockfile } = await import('proper-lockfile');
+  const locked = await lockfile.check(verifiedHome, { stale: 10_000 }).catch(() => false);
+  if (locked) {
+    throw new Error('Coordination service holds the instance lock; cannot fall back to direct local write');
+  }
+}
+
 async function requestPluginOrLocal(
   home: string,
   payload: Record<string, unknown>,
@@ -428,6 +443,7 @@ async function requestPluginOrLocal(
   }
   const { privateHome } = await import('./files.js');
   const verifiedHome = await privateHome(home);
+  await ensureHomeUnlockedForLocalFallback(verifiedHome);
   return localFallback(verifiedHome);
 }
 
@@ -447,6 +463,7 @@ async function requestVoiceOrLocal(
   }
   const { privateHome } = await import('./files.js');
   const verifiedHome = await privateHome(home);
+  await ensureHomeUnlockedForLocalFallback(verifiedHome);
   const { XiaoaiSpeakerManager } = await import('./xiaoai-speaker.js');
   const manager = new XiaoaiSpeakerManager({ homeDir: verifiedHome });
   try {

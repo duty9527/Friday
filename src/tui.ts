@@ -115,7 +115,6 @@ export async function startTui(home: string): Promise<void> {
     try {
       const batch = await request(home, { command: 'updates', after: cursor }) as { events: TraceEvent[]; cursor: number };
       if (!batch.events.length) return;
-      cursor = batch.cursor;
       const ids = [...new Set(batch.events.filter(e => e.type === 'message').map(e => e.messageId).filter((id): id is string => Boolean(id)))];
       for (const id of ids) {
         if (closed) return;
@@ -127,6 +126,7 @@ export async function startTui(home: string): Promise<void> {
         process.stdout.write(`\r\x1b[K[${label}] ${formatMessageText(msg)}\n`);
         if (!closed) rl.prompt(true);
       }
+      cursor = batch.cursor;
     } catch {
       /* Transient poll error */
     } finally {

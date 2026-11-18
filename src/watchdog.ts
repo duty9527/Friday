@@ -45,6 +45,7 @@ export interface ManagedServeOptions {
 export interface ManagedServeRestarter {
   restartService: () => Promise<void>;
   stop: () => Promise<void>;
+  detach?: () => void;
 }
 
 const MAX_WATCHDOG_NOTICES = 50;
@@ -65,10 +66,12 @@ async function stopChildProcess(child: ChildProcess | undefined, timeoutMs: numb
   if (!child || child.exitCode !== null || child.signalCode !== null) return;
   await new Promise<void>(resolve => {
     let finished = false;
+    let killWait: NodeJS.Timeout | undefined;
     const finish = () => {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
+      if (killWait) clearTimeout(killWait);
       resolve();
     };
     child.once('exit', finish);
@@ -80,7 +83,8 @@ async function stopChildProcess(child: ChildProcess | undefined, timeoutMs: numb
     }
     const timer = setTimeout(() => {
       try { child.kill('SIGKILL'); } catch {}
-      finish();
+      killWait = setTimeout(finish, 1_500);
+      killWait.unref();
     }, timeoutMs);
     timer.unref();
   });
@@ -146,10 +150,11 @@ export function createManagedServeRestarter(options: ManagedServeOptions): Manag
     managedChild = child;
 
     let stderr = '';
-    child.stderr?.on('data', (chunk: Buffer | string) => {
+    const onStderr = (chunk: Buffer | string) => {
       stderr += String(chunk);
       if (stderr.length > 4096) stderr = stderr.slice(-4096);
-    });
+    };
+    child.stderr?.on('data', onStderr);
 
     await new Promise<void>((resolve, reject) => {
       let settled = false;
@@ -160,6 +165,7 @@ export function createManagedServeRestarter(options: ManagedServeOptions): Manag
         child.off('exit', onExit);
         child.off('error', onError);
         child.stdout?.off('data', onStdout);
+        child.stderr?.off('data', onStderr);
       };
       const done = (error?: Error) => {
         if (settled) return;
@@ -201,8 +207,14 @@ export function createManagedServeRestarter(options: ManagedServeOptions): Manag
       const pollTimer = setInterval(() => {
         void request(options.home, { command: 'health' }, { timeoutMs: 1_500 })
           .then(res => {
-            const health = res as { status?: string; executorAvailable?: boolean };
-            if (health.status === 'ready' && health.executorAvailable !== false) done();
+            const health = res as { status?: string; executorAvailable?: boolean; pid?: number };
+            if (
+              health.status === 'ready'
+              && health.executorAvailable !== false
+              && (health.pid === undefined || (child.pid !== undefined && health.pid === child.pid))
+            ) {
+              done();
+            }
           })
           .catch(() => {});
       }, 200);
@@ -217,7 +229,18 @@ export function createManagedServeRestarter(options: ManagedServeOptions): Manag
     });
   };
 
-  return { restartService, stop };
+  const detach = () => {
+    const child = managedChild;
+    managedChild = undefined;
+    if (!child) return;
+    child.stdout?.pause();
+    child.stderr?.pause();
+    (child.stdout as { unref?: () => void } | null)?.unref?.();
+    (child.stderr as { unref?: () => void } | null)?.unref?.();
+    child.unref();
+  };
+
+  return { restartService, stop, detach };
 }
 
 export class Watchdog {
@@ -231,7 +254,7 @@ export class Watchdog {
 
   constructor(private readonly options: WatchdogOptions) {
     this.maxRetries = options.maxRetries ?? 3;
-    this.backoffMs = options.backoffMs ?? 200;
+    this.backoffMs = options.backoffMs ?? 2_000;
   }
 
   state(): WatchdogState {

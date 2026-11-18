@@ -1,5 +1,6 @@
 import { performance } from 'node:perf_hooks';
 import type { AgentPort } from '../agent.js';
+import { FALLBACK_PROVIDER_MODELS, normalizeProviderId, REAL_PROVIDER_DEFAULTS } from '../models/catalog.js';
 import type { Operation, Store, Task, TaskStatus } from '../store.js';
 import type { PromptTrace } from '../trace.js';
 import type { AttachmentView, ChatMessage, MessageOrigin, ModelTier, PooledModelEntry, ThinkingLevel, WorkerProfile } from '../view.js';
@@ -26,6 +27,10 @@ export interface Run {
   /** The Router already spoke about this failure (WORKER_FAILED turn); no system notice is needed. */
   failureRouted?: boolean;
   acceptedByRouter?: boolean;
+  resumed?: boolean;
+  userStopped?: boolean;
+  deliveryOrigin?: MessageOrigin;
+  replyController?: AbortController;
   attachments?: AttachmentView[];
   pendingFollowupAttachments?: AttachmentView[];
 }
@@ -135,6 +140,47 @@ export function accrueTaskRun(store: Store, run: Run, flush = true): boolean {
   return !run.clockUncertain;
 }
 
+const KNOWN_SPEC_PROVIDERS = new Set<string>([
+  ...Object.keys(FALLBACK_PROVIDER_MODELS),
+  ...Object.keys(REAL_PROVIDER_DEFAULTS),
+  'google-vertex',
+  'gemini',
+  'groq',
+  'mistral',
+  'bedrock',
+  'azure',
+  'opencode',
+]);
+
+export function extractModelProvider(spec: string | undefined, pool?: PooledModelEntry[]): string | undefined {
+  if (!spec) return undefined;
+  const trimmed = spec.trim();
+  if (!trimmed) return undefined;
+  if (pool?.length) {
+    const exact = pool.find(entry => entry.spec === trimmed) ?? pool.find(entry => entry.modelId === trimmed);
+    if (exact) return exact.providerId;
+  }
+  const slash = trimmed.indexOf('/');
+  if (slash <= 0) return undefined;
+  const head = trimmed.slice(0, slash);
+  const norm = normalizeProviderId(head) ?? head;
+  return KNOWN_SPEC_PROVIDERS.has(head) || KNOWN_SPEC_PROVIDERS.has(norm) ? norm : undefined;
+}
+
+function extractStandaloneOuterJson(trimmed: string): string | undefined {
+  let inner = trimmed;
+  if (inner.startsWith('```')) {
+    const openMatch = /^```(?:json)?[ \t]*\r?\n/.exec(inner);
+    const closeMatch = /\r?\n```[ \t]*$/.exec(inner);
+    if (!openMatch || !closeMatch || closeMatch.index < openMatch[0].length) {
+      return undefined;
+    }
+    inner = inner.slice(openMatch[0].length, closeMatch.index).trim();
+  }
+  if (!inner.startsWith('{') || !inner.endsWith('}')) return undefined;
+  return inner;
+}
+
 export function parseWorkerQuestion(raw: string): { question: string; options?: string[] } | undefined {
   const trimmed = raw.trim();
   if (!trimmed) return undefined;
@@ -143,12 +189,7 @@ export function parseWorkerQuestion(raw: string): { question: string; options?: 
     return { question: tagMatch[1].trim().slice(0, 1200) };
   }
   if (!/ASK_BOSS/.test(trimmed)) return undefined;
-  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(trimmed)?.[1]?.trim();
-  const candidate = fenced ?? (() => {
-    const start = trimmed.indexOf('{');
-    const end = trimmed.lastIndexOf('}');
-    return start >= 0 && end > start ? trimmed.slice(start, end + 1) : undefined;
-  })();
+  const candidate = extractStandaloneOuterJson(trimmed);
   if (!candidate) return undefined;
   try {
     const parsed = JSON.parse(candidate) as Record<string, unknown>;
@@ -169,10 +210,10 @@ export function parseWorkerQuestion(raw: string): { question: string; options?: 
  * error, another dispatch to that provider is a retry of a known environment fault, not new work.
  */
 export function detectProviderFailureBreaker(store: Store, workerModel: string | undefined): string | undefined {
-  const provider = workerModel?.includes('/') ? workerModel.slice(0, workerModel.indexOf('/')) : undefined;
+  const provider = extractModelProvider(workerModel);
   const sameProvider = (model?: string) => provider
-    ? model?.startsWith(`${provider}/`) === true
-    : !model?.includes('/');
+    ? extractModelProvider(model) === provider
+    : !extractModelProvider(model);
   const since = Date.now() - 30 * 60_000;
   const counts = new Map<string, number>();
   for (const task of store.list()) {
@@ -206,8 +247,9 @@ export function resolveExcludedFailures(
   };
 
   const recordProviderFailure = (spec: string | undefined, reason: string | undefined) => {
-    if (!reason || !spec?.includes('/')) return;
-    const provider = spec.slice(0, spec.indexOf('/'));
+    if (!reason || !spec) return;
+    const provider = extractModelProvider(spec, pool);
+    if (!provider) return;
     const key = `${provider}\u0000${reason}`;
     const count = (providerFailureCounts.get(key) ?? 0) + 1;
     providerFailureCounts.set(key, count);

@@ -1,4 +1,6 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { rm, stat, realpath } from 'node:fs/promises';
 import { isAbsolute, join, dirname } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -33,6 +35,8 @@ import {
   compactRouterChatWorks,
   createRouterTools,
   createRouterTurnScope,
+  isOriginAccessible,
+  resolveReportChainKey,
   type RouterToolsHost,
   type RouterTurnScope,
 } from './orchestrator/router-tools.js';
@@ -126,6 +130,17 @@ function isFastpathMessage(msg: ChatMessage): boolean {
   );
 }
 
+const INBOUND_HOLD_TTL_MS = 25_000;
+
+function resolveMaxConcurrentWorkers(): number {
+  const raw = resolveEnv('FRIDAY_MAX_CONCURRENT_WORKERS', 'SUPER_AGENT_MAX_CONCURRENT_WORKERS');
+  if (raw !== undefined) {
+    const parsed = Number(raw);
+    if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 64) return parsed;
+  }
+  return 8;
+}
+
 export class Coordinator {
   readonly store: Store;
   readonly semantic: SemanticEmbedder;
@@ -133,6 +148,8 @@ export class Coordinator {
   readonly modelHub: ModelHub;
   private executor?: Executor;
   private readonly runs = new Map<string, Run>();
+  private readonly activeWorkerSlots = new Set<string>();
+  private readonly queuedWorkers: Array<{ run: Run; isChatWork: boolean; launchWork: () => Promise<void> }> = [];
   private readonly jobs = new Set<Promise<void>>();
   private readonly submissions = new Set<Promise<Task>>();
   private readonly closingAbort = new AbortController();
@@ -140,22 +157,29 @@ export class Coordinator {
   private semanticWarmup?: Promise<void>;
   private router?: AgentPort;
   private activeRouterSpec?: string;
+  private routerSwapPromise: Promise<void> = Promise.resolve();
   private readonly interactiveRouterQueue: Array<{ run: () => void; reject: (reason?: unknown) => void }> = [];
   private readonly backgroundRouterQueue: Array<{ run: () => void; reject: (reason?: unknown) => void }> = [];
   private routerActive = false;
   private lastRouterChatSeq = 0;
-  private currentTurn?: RouterTurnScope;
+  private readonly turnStorage = new AsyncLocalStorage<RouterTurnScope>();
+  private activeChatContext?: ChatRun;
   private readonly reportAutoDispatches = new BoundedCounterMap(500, 3_600_000);
   private readonly chatRuns = new Map<string, ChatRun>();
   private readonly chatJobs = new Set<Promise<void>>();
-  private readonly inboundHolds = new Map<string, number>();
+  private readonly inboundHolds = new Map<string, number[]>();
   private readonly requestFingerprints = new BoundedFingerprintMap<{ messageId: string; text: string; pathsJson: string }>(2000);
   private readonly outboundListeners = new Set<() => void>();
   private readonly timers: TimerScheduler;
   private readonly subconscious: SubconsciousController;
-  private readonly timer: NodeJS.Timeout;
+  private timer?: NodeJS.Timeout;
   private closing = false;
+  private closingPromise?: Promise<void>;
   private storeClosed = false;
+
+  private get currentTurn(): RouterTurnScope | undefined {
+    return this.turnStorage.getStore();
+  }
 
   constructor(
     private readonly home: string,
@@ -230,8 +254,6 @@ export class Coordinator {
       hasRouter: () => Boolean(this.router),
       hasActiveWork: () => this.chatRuns.size > 0 || this.runs.size > 0 || this.submissions.size > 0,
     });
-
-    this.timer = setInterval(() => this.tick(), 200);
   }
 
   get homeDir(): string {
@@ -420,6 +442,9 @@ export class Coordinator {
     this.router = await this.createRouter(true);
     this.im.start();
     this.startSemanticWarmup();
+    if (!this.closing && !this.timer) {
+      this.timer = setInterval(() => this.tick(), 200);
+    }
   }
 
   private startSemanticWarmup() {
@@ -470,13 +495,18 @@ export class Coordinator {
       (messageId, callId, kind) => buildToolRequestId(this.currentTurn, messageId, callId, kind),
     );
     const checkpoint = restoreCheckpoint
-      ? this.store.conversation.meta<{ sessionFile: string; leafId: string }>('router_checkpoint')
+      ? this.store.conversation.meta<{ sessionFile: string; leafId: string; lastChatSeq?: number } | null>('router_checkpoint')
+      : undefined;
+    const validRestore = checkpoint && typeof checkpoint.sessionFile === 'string' && typeof checkpoint.leafId === 'string'
+      ? { sessionFile: checkpoint.sessionFile, leafId: checkpoint.leafId }
       : undefined;
     const router = await this.factory.create('router', 'router', tools, {
-      restore: checkpoint,
+      restore: validRestore,
       onEvent: event => this.currentTurn?.routerTrace?.observe(event),
     });
-    this.lastRouterChatSeq = checkpoint ? (this.store.conversation.allMessages(1)[0]?.seq ?? 0) : 0;
+    this.lastRouterChatSeq = checkpoint
+      ? (typeof checkpoint.lastChatSeq === 'number' ? checkpoint.lastChatSeq : (this.store.conversation.allMessages(1)[0]?.seq ?? 0))
+      : (this.store.conversation.allMessages(1)[0]?.seq ?? 0);
     return router;
   }
 
@@ -534,21 +564,46 @@ export class Coordinator {
     return this.im.getVoiceprintStatus().profiles.find(p => p.id === origin.speakerId)?.role;
   }
 
+  private async syncRouterModelIfNeeded(): Promise<void> {
+    if (this.closing || !this.router) return;
+    const latestSpec = `${this.factory.routerProvider ?? ''}/${this.factory.modelTiers?.router ?? ''}`;
+    if (!latestSpec || latestSpec === '/' || latestSpec === this.activeRouterSpec) return;
+    const nextAgent = await this.createRouter(false);
+    if (this.closing) {
+      nextAgent.close();
+      return;
+    }
+    this.router?.close();
+    this.router = nextAgent;
+    this.activeRouterSpec = latestSpec;
+    this.store.conversation.setMeta('router_checkpoint', null);
+    if (nextAgent.checkpoint) this.checkpoint();
+  }
+
+  private listEnabledPluginSummaries(allowedPlugins?: ReadonlySet<string>) {
+    return listPluginViews(this.home)
+      .filter(p => p.enabled !== false && (!allowedPlugins || allowedPlugins.has(p.name)))
+      .map(p => ({
+        name: p.name,
+        actions: p.actions.slice(0, 8),
+        ...(p.promptHint ? { hint: p.promptHint.slice(0, 120) } : p.description ? { hint: p.description.slice(0, 120) } : {}),
+      }));
+  }
+
   async configureModels(input: ModelHubConfigureInput) {
     const view = await this.modelHub.configure(input);
     const targetSpec = `${view.routerProvider}/${view.routerModel}`;
     const swap = this.enqueueRouter('background', async () => {
-      if (this.closing || !this.router) return;
       const latestSpec = `${this.factory.routerProvider ?? ''}/${this.factory.modelTiers?.router ?? ''}`;
       if (latestSpec === this.activeRouterSpec && targetSpec === this.activeRouterSpec) return;
-      const nextAgent = await this.createRouter(false).catch(() => undefined);
-      if (nextAgent) {
-        this.router?.close();
-        this.router = nextAgent;
-        this.activeRouterSpec = latestSpec;
-      }
+      await this.syncRouterModelIfNeeded();
+    }).catch(error => {
+      if (this.closing) return;
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error('[friday] Router hot-swap failed after model configuration:', detail);
+      this.store.notice('system', 'router_swap_failed', `切换 Router 模型 (${targetSpec}) 失败，已保留原会话模型：${detail}`);
     });
-    await swap;
+    this.routerSwapPromise = this.routerSwapPromise.then(() => swap, () => swap);
     return view;
   }
 
@@ -578,7 +633,7 @@ export class Coordinator {
       600_000,
       {
         originMessageId,
-        origin: context.message.origin,
+        origin: context.deliveryOrigin ?? context.message.origin,
         parentTaskId: source?.id,
         parentSpanId: turn?.routerTrace?.toolSpan(callId),
         source,
@@ -671,33 +726,49 @@ export class Coordinator {
     return undefined;
   }
 
+  private pruneInboundHolds(key: string, now = Date.now()): number[] {
+    const holds = this.inboundHolds.get(key);
+    if (!holds?.length) return [];
+    const active = holds.filter(expiresAt => expiresAt > now);
+    if (!active.length) {
+      this.inboundHolds.delete(key);
+      return [];
+    }
+    if (active.length !== holds.length) this.inboundHolds.set(key, active);
+    return active;
+  }
+
   hasInboundHold(origin?: MessageOrigin): boolean {
     const key = imSessionKey(origin);
-    return Boolean(key && (this.inboundHolds.get(key) ?? 0) > 0);
+    return Boolean(key && this.pruneInboundHolds(key).length > 0);
   }
 
   beginInboundHold(origin?: MessageOrigin) {
     const key = imSessionKey(origin);
     if (!key) return;
-    this.inboundHolds.set(key, (this.inboundHolds.get(key) ?? 0) + 1);
-    const active = this.findMergeableChatRun(origin);
-    if (active) {
-      active.mergeVersion++;
+    const now = Date.now();
+    const active = this.pruneInboundHolds(key, now);
+    active.push(now + INBOUND_HOLD_TTL_MS);
+    this.inboundHolds.set(key, active);
+    const activeRun = this.findMergeableChatRun(origin);
+    if (activeRun) {
+      activeRun.mergeVersion++;
       const coalesceCfg = { mode: this.factory.mode, env: process.env };
-      active.coalesceUntil = Math.min(active.firstAt + resolveMaxCoalesceMs(this.factory.mode), Date.now() + resolveTextCoalesceMs(coalesceCfg));
-      active.wakeCoalesce?.();
-      active.attemptController?.abort(new Error('Superseded by incoming media in same IM session'));
+      activeRun.coalesceUntil = Math.min(activeRun.firstAt + resolveMaxCoalesceMs(this.factory.mode), now + resolveTextCoalesceMs(coalesceCfg));
+      activeRun.wakeCoalesce?.();
+      activeRun.attemptController?.abort(new Error('Superseded by incoming media in same IM session'));
     }
   }
 
   endInboundHold(origin?: MessageOrigin) {
     const key = imSessionKey(origin);
     if (!key) return;
-    const next = (this.inboundHolds.get(key) ?? 1) - 1;
-    if (next <= 0) this.inboundHolds.delete(key);
-    else this.inboundHolds.set(key, next);
-    const active = this.findMergeableChatRun(origin);
-    if (active) active.wakeCoalesce?.();
+    const active = this.pruneInboundHolds(key);
+    active.shift();
+    if (!active.length) this.inboundHolds.delete(key);
+    else this.inboundHolds.set(key, active);
+    const activeRun = this.findMergeableChatRun(origin);
+    if (activeRun) activeRun.wakeCoalesce?.();
   }
 
   chat(requestId: string, content: string, paths: string[] = [], origin: MessageOrigin = { channel: 'local' }, attachments?: AttachmentView[]): ChatMessage {
@@ -785,10 +856,11 @@ export class Coordinator {
     };
     this.chatRuns.set(message.id, context);
 
-    const pending = this.enqueueRouter('interactive', async () => {
+    const pending = (async () => {
       for (;;) {
         await waitForChatCoalesceLoop(context, o => this.hasInboundHold(o), () => this.closing);
         if (context.controller.signal.aborted || this.closing) {
+          context.settled = true;
           chat.update(message.id, { status: 'interrupted', reason: 'F.R.I.D.A.Y. 处理前已停止；不会自动重发。' });
           if (context.replyId) {
             chat.update(context.replyId, { status: 'interrupted', reason: 'F.R.I.D.A.Y. 回复未完成；已保留公开输出和真实错误轨迹，不自动重放。' });
@@ -796,246 +868,299 @@ export class Coordinator {
           this.notifyOutbound();
           return;
         }
-        const attemptVersion = context.mergeVersion;
-        context.activeAttemptVersion = attemptVersion;
-        let currentMessage = chat.get(message.id);
-        const isMemberSpeaker = this.resolveOriginSpeakerRole(currentMessage.origin) === 'member';
-        const knownWorks = isMemberSpeaker ? [] : this.store.list();
-        const skipAiContinuity = isMemberSpeaker || currentMessage.origin?.channel === 'xiaoai';
-        const resolvedSession = await resolveRuntimeMessageSession(
-          this.store,
-          this.modelHub,
-          currentMessage,
-          knownWorks,
-          this.semantic,
-          { skipAiContinuity },
-        );
-        if (attemptVersion === 0
-          || currentMessage.sessionId !== resolvedSession.sessionId
-          || JSON.stringify(currentMessage.sessionLink ?? null) !== JSON.stringify(resolvedSession.sessionLink ?? null)) {
-          currentMessage = chat.assignSession(message.id, resolvedSession.sessionId, resolvedSession.sessionLink, attemptVersion === 0);
-        }
-        context.message = currentMessage;
-        const memoryDirectory = isMemberSpeaker
-          ? { totalActive: 0, truncated: false, items: [] }
-          : this.store.memoryDirectory(24);
-        const bareQuery = currentMessage.text.replace(/[。，,！!？?、；;：\s]+/g, '');
-        const skipTrivialRecall = bareQuery.length === 0
-          || /^(?:好|好的|好嘞|行|可以|不用了?|不需要|不要了?|算了|对|对啊|是的|没错|嗯|发吧|再来一次|再试一次|试一次吧|继续|开始吧)$/.test(bareQuery)
-          || (currentMessage.origin?.channel === 'xiaoai' && bareQuery.length <= 4);
-        const autoRecalled = !isMemberSpeaker && !skipTrivialRecall
-          ? (await this.store.searchContextAsync({ query: currentMessage.text, limit: 3, touch: false }))
-              .hits
-              .filter(hit => hit.score >= 46 && !(hit.kind === 'message' && hit.messageId === message.id))
-          : [];
-        const subconscious = isMemberSpeaker ? undefined : this.store.peekSubconsciousForChat(this.subconscious.now());
-        context.revisions = new Map(knownWorks.map(task => [task.id, task.revision]));
+        let retryCoalesce = false;
+        await this.enqueueRouter('interactive', async () => {
+          for (;;) {
+            if (context.controller.signal.aborted || this.closing) {
+              context.settled = true;
+              chat.update(message.id, { status: 'interrupted', reason: 'F.R.I.D.A.Y. 处理前已停止；不会自动重发。' });
+              if (context.replyId) {
+                chat.update(context.replyId, { status: 'interrupted', reason: 'F.R.I.D.A.Y. 回复未完成；已保留公开输出和真实错误轨迹，不自动重放。' });
+              }
+              this.notifyOutbound();
+              return;
+            }
+            if (!context.hasSideEffectTool && (Date.now() < context.coalesceUntil || this.hasInboundHold(context.message.origin))) {
+              retryCoalesce = true;
+              return;
+            }
+            const attemptVersion = context.mergeVersion;
+            context.activeAttemptVersion = attemptVersion;
+            let currentMessage = chat.get(message.id);
+            const callerOrigin = currentMessage.origin;
+            const isNonLocalCaller = Boolean(callerOrigin?.channel && callerOrigin.channel !== 'local');
+            const isMemberSpeaker = this.resolveOriginSpeakerRole(callerOrigin) === 'member';
+            const knownWorks = isMemberSpeaker
+              ? []
+              : this.store.list().filter(task => isOriginAccessible(callerOrigin, task.origin));
+            const skipAiContinuity = isMemberSpeaker || callerOrigin?.channel === 'xiaoai';
+            const resolvedSession = await resolveRuntimeMessageSession(
+              this.store,
+              this.modelHub,
+              currentMessage,
+              knownWorks,
+              this.semantic,
+              { skipAiContinuity },
+            );
+            if (attemptVersion === 0
+              || currentMessage.sessionId !== resolvedSession.sessionId
+              || JSON.stringify(currentMessage.sessionLink ?? null) !== JSON.stringify(resolvedSession.sessionLink ?? null)) {
+              currentMessage = chat.assignSession(message.id, resolvedSession.sessionId, resolvedSession.sessionLink, attemptVersion === 0);
+            }
+            context.message = currentMessage;
+            const memoryDirectory = isMemberSpeaker
+              ? { totalActive: 0, truncated: false, items: [] }
+              : this.store.memoryDirectory(24);
+            const bareQuery = currentMessage.text.replace(/[。，,！!？?、；;：\s]+/g, '');
+            const skipTrivialRecall = bareQuery.length === 0
+              || /^(?:好|好的|好嘞|行|可以|不用了?|不需要|不要了?|算了|对|对啊|是的|没错|嗯|发吧|再来一次|再试一次|试一次吧|继续|开始吧)$/.test(bareQuery)
+              || (callerOrigin?.channel === 'xiaoai' && bareQuery.length <= 4);
+            const autoRecalled = !isMemberSpeaker && !skipTrivialRecall
+              ? (await this.store.searchContextAsync({ query: currentMessage.text, limit: 3, touch: false }))
+                  .hits
+                  .filter(hit => hit.score >= 46 && !(hit.kind === 'message' && hit.messageId === message.id))
+              : [];
+            const subconscious = isMemberSpeaker ? undefined : this.store.peekSubconsciousForChat(this.subconscious.now());
+            context.revisions = new Map(knownWorks.map(task => [task.id, task.revision]));
 
-        // Always reset heartbeat clock right before attaching active turn state after async coalesce/lookup work.
-        resetChatContextClock(context);
-        const recentContext = isMemberSpeaker ? undefined : chat.recentContext();
-        chat.update(message.id, {
-          status: 'processing',
-          routing: {
-            at: Date.now(),
-            status: 'processing',
-            actions: [],
-            context: {
-              execution: this.factory.nativeTools ? 'native' : 'snapshot',
-              cwd: process.cwd(),
-              totalWorks: knownWorks.length,
-              truncated: knownWorks.length > 40,
-              works: knownWorks.slice(-40).map(({ id, prompt, status, revision }) => ({
-                id,
-                prompt: String(publicData(prompt.slice(0, 240))),
-                status,
-                revision,
-              })),
-              messages: isMemberSpeaker
-                ? []
-                : chat.history(undefined, 12).items.map(item => ({
+            // Always reset heartbeat clock right before attaching active turn state after async coalesce/lookup work.
+            resetChatContextClock(context);
+            const accessibleHistory = isMemberSpeaker
+              ? []
+              : isNonLocalCaller
+                ? chat.history(undefined, 24).items.filter(item => isOriginAccessible(callerOrigin, item.origin)).slice(-12)
+                : chat.history(undefined, 12).items;
+            const recentContext = isMemberSpeaker
+              ? undefined
+              : isNonLocalCaller
+                ? accessibleHistory.map(({ id, role, text, mode, status, taskIds, paths: itemPaths }) => ({
+                    id,
+                    role,
+                    mode,
+                    text: text.slice(-4096),
+                    truncated: text.length > 4096,
+                    status,
+                    taskIds,
+                    fileCount: itemPaths.length,
+                  }))
+                : chat.recentContext();
+            const replyOrigin = context.deliveryOrigin ?? currentMessage.origin;
+            chat.update(message.id, {
+              status: 'processing',
+              routing: {
+                at: Date.now(),
+                status: 'processing',
+                actions: [],
+                context: {
+                  execution: this.factory.nativeTools ? 'native' : 'snapshot',
+                  cwd: process.cwd(),
+                  totalWorks: knownWorks.length,
+                  truncated: knownWorks.length > 40,
+                  works: knownWorks.slice(-40).map(({ id, prompt, status, revision }) => ({
+                    id,
+                    prompt: String(publicData(prompt.slice(0, 240))),
+                    status,
+                    revision,
+                  })),
+                  messages: accessibleHistory.map(item => ({
                     id: item.id,
                     role: item.role,
                     preview: String(publicData(item.text.slice(-160))),
                   })),
-              memoryDirectory,
-              ...(autoRecalled.length ? { autoRecalled } : {}),
-            },
-          },
-        });
-        const reply = context.replyId
-          ? chat.update(context.replyId, { text: '', status: 'streaming', reason: undefined, origin: currentMessage.origin, sessionId: currentMessage.sessionId })
-          : chat.create({
-              id: randomUUID(),
-              replyTo: message.id,
-              role: 'assistant',
-              text: '',
-              status: 'streaming',
-              mode: this.factory.mode,
-              paths: [],
-              sessionId: currentMessage.sessionId,
+                  memoryDirectory,
+                  ...(autoRecalled.length ? { autoRecalled } : {}),
+                },
+              },
             });
-        context.replyId = reply.id;
-        this.notifyOutbound();
+            const reply = context.replyId
+              ? chat.update(context.replyId, { text: '', status: 'streaming', reason: undefined, origin: replyOrigin, sessionId: currentMessage.sessionId })
+              : chat.create({
+                  id: randomUUID(),
+                  replyTo: message.id,
+                  role: 'assistant',
+                  origin: replyOrigin,
+                  text: '',
+                  status: 'streaming',
+                  mode: this.factory.mode,
+                  paths: [],
+                  sessionId: currentMessage.sessionId,
+                });
+            context.replyId = reply.id;
+            this.notifyOutbound();
 
-        const trace = new PromptTrace(chat, { rootId: message.id, messageId: message.id, parentSpanId: message.id }, 'router', this.factory.mode, reply.id);
-        const turn = createRouterTurnScope({ chatContext: context, routerTrace: trace });
-        this.currentTurn = turn;
-        const attemptController = new AbortController();
-        context.attemptController = attemptController;
-        const onUserAbort = () => attemptController.abort(context.controller.signal.reason);
-        context.controller.signal.addEventListener('abort', onUserAbort, { once: true });
-        const preTurnLeafId = isMemberSpeaker ? undefined : this.router?.leafId;
-        let memberRouter: AgentPort | undefined;
+            const trace = new PromptTrace(chat, { rootId: message.id, messageId: message.id, parentSpanId: message.id }, 'router', this.factory.mode, reply.id);
+            const turn = createRouterTurnScope({ chatContext: context, routerTrace: trace });
+            const attemptController = new AbortController();
+            context.attemptController = attemptController;
+            const onUserAbort = () => attemptController.abort(context.controller.signal.reason);
+            context.controller.signal.addEventListener('abort', onUserAbort, { once: true });
+            const preTurnLeafId = isMemberSpeaker ? undefined : this.router?.leafId;
+            let memberRouter: AgentPort | undefined;
 
-        try {
-          const deliveryChannel = currentMessage.origin?.channel ?? 'local';
-          const carriedImages = resolveRecentSessionImages(this.store, currentMessage);
-          const { routing: _omittedRouting, ...cleanCurrentMessage } = currentMessage;
-          const promptMessage = carriedImages.length
-            ? { ...cleanCurrentMessage, attachments: [...(cleanCurrentMessage.attachments ?? []), ...carriedImages] }
-            : cleanCurrentMessage;
+            try {
+              const deliveryChannel = (context.deliveryOrigin ?? currentMessage.origin)?.channel ?? 'local';
+              const carriedImages = resolveRecentSessionImages(this.store, currentMessage);
+              const { routing: _omittedRouting, ...cleanCurrentMessage } = currentMessage;
+              const promptMessage = carriedImages.length
+                ? { ...cleanCurrentMessage, attachments: [...(cleanCurrentMessage.attachments ?? []), ...carriedImages] }
+                : cleanCurrentMessage;
 
-          let activeRouter: AgentPort;
-          let payload: string;
-          if (isMemberSpeaker) {
-            const memberTools = createRouterTools(
-              this.createRouterToolHost(),
-              (messageId, callId, kind) => buildToolRequestId(this.currentTurn, messageId, callId, kind),
-              { allowedPlugins: MEMBER_ALLOWED_PLUGINS, toolNames: new Set(['run_plugin']) },
-            );
-            memberRouter = await this.factory.create('router', `member-${message.id}`, memberTools, {
-              onEvent: event => this.currentTurn?.routerTrace?.observe(event),
-            });
-            activeRouter = memberRouter;
-            payload = JSON.stringify({
-              kind: 'CHAT',
-              message: promptMessage,
-              deliveryChannel,
-              ...buildVoiceTurnHint(this.home, deliveryChannel, MEMBER_ALLOWED_PLUGINS),
-              execution: this.factory.nativeTools ? 'native' : 'snapshot',
-              cwd: process.cwd(),
-              memoryDirectory: { total: 0, pinnedCount: 0, items: [] },
-              memberPrivacyNotice: '当前为家庭成员语音对话：仅可操作客厅/全屋公开智能家居，严禁透露或查询机主私人记忆、持仓与后台工作。',
-            });
-          } else {
-            activeRouter = this.router!;
-            const imChannels = this.store.listImChannelViews()
-              .filter(c => c.enabled)
-              .map(({ id, platform, name, loginStatus, defaultTarget }) => ({ id, platform, name, loginStatus, defaultTarget }));
-            const promptMemoryDirectory = compactRouterChatMemoryDirectory(
-              this.store.memoryDirectory(deliveryChannel === 'xiaoai' ? 10 : 12),
-            );
-            const promptAutoRecalled = autoRecalled.map(({ synapses: _synapses, neighbors, ...hit }) => ({
-              ...hit,
-              snippet: hit.snippet.length > 200 ? `${hit.snippet.slice(0, 200)}…` : hit.snippet,
-              ...(neighbors?.length
-                ? {
-                    neighbors: neighbors.slice(0, 2).map(n => ({
-                      ...n,
-                      preview: n.preview.length > 100 ? `${n.preview.slice(0, 100)}…` : n.preview,
-                    })),
-                  }
-                : {}),
-            }));
-            const includeRecentContext = !this.router?.leafId;
-            let promptContext = includeRecentContext
-              ? (this.factory.mode === 'real' ? compactRouterChatRecentContext(recentContext) : recentContext)
-              : undefined;
-            if (!includeRecentContext) {
-              // Fastpath turns (e.g. MiOT/TV-IR) are recorded in SQLite without entering Router's SDK session;
-              // bridge only unseen turns after lastRouterChatSeq whenever an unseen fastpath turn exists.
-              const unseenItems = chat.history(currentMessage.seq, 8).items
-                .filter(m => m.seq > this.lastRouterChatSeq);
-              if (unseenItems.some(isFastpathMessage)) {
-                const formattedPrior = unseenItems.map(({ id, role, text, mode, status, taskIds, paths }) => ({
-                  id,
-                  role,
-                  mode,
-                  text: text.slice(-4096),
-                  truncated: text.length > 4096,
-                  status,
-                  taskIds,
-                  fileCount: paths.length,
+              let activeRouter: AgentPort;
+              let payload: string;
+              if (isMemberSpeaker) {
+                const memberTools = createRouterTools(
+                  this.createRouterToolHost(),
+                  (messageId, callId, kind) => buildToolRequestId(this.currentTurn, messageId, callId, kind),
+                  { allowedPlugins: MEMBER_ALLOWED_PLUGINS, toolNames: new Set(['run_plugin']) },
+                );
+                memberRouter = await this.factory.create('router', `member-${message.id}`, memberTools, {
+                  onEvent: event => this.currentTurn?.routerTrace?.observe(event),
+                });
+                activeRouter = memberRouter;
+                payload = JSON.stringify({
+                  kind: 'CHAT',
+                  message: promptMessage,
+                  deliveryChannel,
+                  ...buildVoiceTurnHint(this.home, deliveryChannel, MEMBER_ALLOWED_PLUGINS),
+                  availablePlugins: this.listEnabledPluginSummaries(MEMBER_ALLOWED_PLUGINS),
+                  execution: this.factory.nativeTools ? 'native' : 'snapshot',
+                  cwd: process.cwd(),
+                  memoryDirectory: { total: 0, pinnedCount: 0, items: [] },
+                  memberPrivacyNotice: '当前为家庭成员语音对话：仅可操作客厅/全屋公开智能家居，严禁透露或查询机主私人记忆、持仓与后台工作。',
+                });
+              } else {
+                await this.syncRouterModelIfNeeded();
+                activeRouter = this.router!;
+                const imChannels = this.store.listImChannelViews()
+                  .filter(c => c.enabled)
+                  .map(({ id, platform, name, loginStatus, defaultTarget }) => ({ id, platform, name, loginStatus, defaultTarget }));
+                const promptMemoryDirectory = compactRouterChatMemoryDirectory(
+                  this.store.memoryDirectory(deliveryChannel === 'xiaoai' ? 10 : 12),
+                );
+                const promptAutoRecalled = autoRecalled.map(({ synapses: _synapses, neighbors, ...hit }) => ({
+                  ...hit,
+                  snippet: hit.snippet.length > 200 ? `${hit.snippet.slice(0, 200)}…` : hit.snippet,
+                  ...(neighbors?.length
+                    ? {
+                        neighbors: neighbors.slice(0, 2).map(n => ({
+                          ...n,
+                          preview: n.preview.length > 100 ? `${n.preview.slice(0, 100)}…` : n.preview,
+                        })),
+                      }
+                    : {}),
                 }));
-                promptContext = compactRouterChatRecentContext(formattedPrior, 6);
+                const includeRecentContext = !this.router?.leafId;
+                let promptContext = includeRecentContext
+                  ? (this.factory.mode === 'real' ? compactRouterChatRecentContext(recentContext) : recentContext)
+                  : undefined;
+                if (!includeRecentContext) {
+                  // Fastpath turns (e.g. MiOT/TV-IR) are recorded in SQLite without entering Router's SDK session;
+                  // bridge only unseen turns after lastRouterChatSeq whenever an unseen fastpath turn exists.
+                  const unseenItems = chat.history(currentMessage.seq, 8).items
+                    .filter(m => m.seq > this.lastRouterChatSeq && (!isNonLocalCaller || isOriginAccessible(callerOrigin, m.origin)));
+                  if (unseenItems.some(isFastpathMessage)) {
+                    const formattedPrior = unseenItems.map(({ id, role, text, mode, status, taskIds, paths: itemPaths }) => ({
+                      id,
+                      role,
+                      mode,
+                      text: text.slice(-4096),
+                      truncated: text.length > 4096,
+                      status,
+                      taskIds,
+                      fileCount: itemPaths.length,
+                    }));
+                    promptContext = compactRouterChatRecentContext(formattedPrior, 6);
+                  }
+                }
+                const promptWorks = compactRouterChatWorks(knownWorks, deliveryChannel === 'xiaoai' ? 2 : 3);
+                payload = JSON.stringify({
+                  kind: 'CHAT',
+                  message: promptMessage,
+                  deliveryChannel,
+                  ...buildVoiceTurnHint(this.home, deliveryChannel),
+                  availablePlugins: this.listEnabledPluginSummaries(),
+                  ...(promptContext !== undefined ? { context: promptContext } : {}),
+                  execution: this.factory.nativeTools ? 'native' : 'snapshot',
+                  cwd: process.cwd(),
+                  memoryDirectory: promptMemoryDirectory,
+                  ...(imChannels.length ? { imChannels } : {}),
+                  ...(promptAutoRecalled.length ? { autoRecalled: promptAutoRecalled } : {}),
+                  ...(subconscious ? { subconscious } : {}),
+                  works: promptWorks,
+                });
+              }
+
+              resetChatContextClock(context);
+              this.activeChatContext = context;
+              const result = await this.turnStorage.run(turn, () => trace.run(activeRouter, payload, attemptController.signal));
+              accrueChatRun(context);
+              if (context.controller.signal.aborted) throw context.controller.signal.reason;
+              if ((context.mergeVersion !== attemptVersion || this.hasInboundHold(currentMessage.origin)) && !context.hasSideEffectTool && !this.closing) {
+                if (!isMemberSpeaker && preTurnLeafId !== undefined) this.router?.rewind?.(preTurnLeafId);
+                retryCoalesce = true;
+                return;
+              }
+              context.settled = true;
+              this.store.transaction(() => {
+                chat.update(reply.id, {
+                  text: this.publicText(result),
+                  status: 'completed',
+                  ...(context.deliveryOrigin ? { origin: context.deliveryOrigin } : {}),
+                });
+                if (!chat.get(message.id).routing?.actions.length) {
+                  chat.routeAction(message.id, { id: randomUUID(), kind: 'reply', status: 'accepted', at: Date.now() });
+                }
+                chat.routeState(message.id, 'completed');
+                chat.update(message.id, { status: 'completed' });
+                for (const id of chat.get(message.id).taskIds) chat.link(reply.id, id);
+                if (!isMemberSpeaker) {
+                  if (subconscious) this.store.advanceSubconsciousTurn(subconscious.pendingInsight?.id, this.subconscious.now());
+                  this.lastRouterChatSeq = Math.max(this.lastRouterChatSeq, currentMessage.seq, reply.seq);
+                  this.checkpoint();
+                }
+              });
+              this.notifyOutbound();
+              return;
+            } catch (error) {
+              if ((context.mergeVersion !== attemptVersion || this.hasInboundHold(currentMessage.origin)) && !context.hasSideEffectTool && !context.controller.signal.aborted && !this.closing) {
+                if (!isMemberSpeaker && preTurnLeafId !== undefined) this.router?.rewind?.(preTurnLeafId);
+                retryCoalesce = true;
+                return;
+              }
+              if (!isMemberSpeaker && preTurnLeafId !== undefined && !context.hasSideEffectTool) {
+                this.router?.rewind?.(preTurnLeafId);
+              }
+              context.settled = true;
+              const status = context.controller.signal.aborted ? 'interrupted' : 'failed';
+              const detail = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').trim();
+              const failReason = status === 'interrupted'
+                ? 'F.R.I.D.A.Y. 回复未完成；已保留公开输出和真实错误轨迹，不自动重放。'
+                : isRetryableModelError(error)
+                  ? `这条我没答上：模型那边暂时过载或限流（${detail.slice(0, 120)}），备用模型也没接住。过一会儿再发我一次。`
+                  : `这条我没答上：${detail.slice(0, 200) || '未知错误'}`;
+              chat.update(reply.id, { status, reason: failReason });
+              chat.routeState(message.id, status);
+              chat.update(message.id, { status, reason: error instanceof Error ? '处理未完成，可查看执行轨迹。' : '处理失败。' });
+              this.notifyOutbound();
+              return;
+            } finally {
+              this.activeChatContext = undefined;
+              try {
+                memberRouter?.close();
+                memberRouter = undefined;
+                if (isMemberSpeaker) {
+                  await rm(join(this.home, 'sdk', `member-${message.id}`), { recursive: true, force: true }).catch(() => {});
+                }
+              } finally {
+                context.controller.signal.removeEventListener('abort', onUserAbort);
+                context.attemptController = undefined;
               }
             }
-            const promptWorks = compactRouterChatWorks(knownWorks, deliveryChannel === 'xiaoai' ? 2 : 3);
-            payload = JSON.stringify({
-              kind: 'CHAT',
-              message: promptMessage,
-              deliveryChannel,
-              ...buildVoiceTurnHint(this.home, deliveryChannel),
-              ...(promptContext !== undefined ? { context: promptContext } : {}),
-              execution: this.factory.nativeTools ? 'native' : 'snapshot',
-              cwd: process.cwd(),
-              memoryDirectory: promptMemoryDirectory,
-              ...(imChannels.length ? { imChannels } : {}),
-              ...(promptAutoRecalled.length ? { autoRecalled: promptAutoRecalled } : {}),
-              ...(subconscious ? { subconscious } : {}),
-              works: promptWorks,
-            });
           }
-
-          resetChatContextClock(context);
-          const result = await trace.run(activeRouter, payload, attemptController.signal);
-          accrueChatRun(context);
-          if (context.controller.signal.aborted) throw context.controller.signal.reason;
-          if ((context.mergeVersion !== attemptVersion || this.hasInboundHold(currentMessage.origin)) && !context.hasSideEffectTool && !this.closing) {
-            if (!isMemberSpeaker && preTurnLeafId !== undefined) this.router?.rewind?.(preTurnLeafId);
-            continue;
-          }
-          context.settled = true;
-          this.store.transaction(() => {
-            chat.update(reply.id, { text: this.publicText(result), status: 'completed' });
-            if (!chat.get(message.id).routing?.actions.length) {
-              chat.routeAction(message.id, { id: randomUUID(), kind: 'reply', status: 'accepted', at: Date.now() });
-            }
-            chat.routeState(message.id, 'completed');
-            chat.update(message.id, { status: 'completed' });
-            for (const id of chat.get(message.id).taskIds) chat.link(reply.id, id);
-            if (!isMemberSpeaker) {
-              if (subconscious) this.store.advanceSubconsciousTurn(subconscious.pendingInsight?.id, this.subconscious.now());
-              this.lastRouterChatSeq = Math.max(this.lastRouterChatSeq, currentMessage.seq, reply.seq);
-              this.checkpoint();
-            }
-          });
-          this.notifyOutbound();
-          break;
-        } catch (error) {
-          if ((context.mergeVersion !== attemptVersion || this.hasInboundHold(currentMessage.origin)) && !context.hasSideEffectTool && !context.controller.signal.aborted && !this.closing) {
-            if (!isMemberSpeaker && preTurnLeafId !== undefined) this.router?.rewind?.(preTurnLeafId);
-            continue;
-          }
-          context.settled = true;
-          const status = context.controller.signal.aborted ? 'interrupted' : 'failed';
-          const detail = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').trim();
-          const failReason = status === 'interrupted'
-            ? 'F.R.I.D.A.Y. 回复未完成；已保留公开输出和真实错误轨迹，不自动重放。'
-            : isRetryableModelError(error)
-              ? `这条我没答上：模型那边暂时过载或限流（${detail.slice(0, 120)}），备用模型也没接住。过一会儿再发我一次。`
-              : `这条我没答上：${detail.slice(0, 200) || '未知错误'}`;
-          chat.update(reply.id, { status, reason: failReason });
-          chat.routeState(message.id, status);
-          chat.update(message.id, { status, reason: error instanceof Error ? '处理未完成，可查看执行轨迹。' : '处理失败。' });
-          this.notifyOutbound();
-          break;
-        } finally {
-          try {
-            memberRouter?.close();
-            memberRouter = undefined;
-            if (isMemberSpeaker) {
-              await rm(join(this.home, 'sdk', `member-${message.id}`), { recursive: true, force: true }).catch(() => {});
-            }
-          } finally {
-            context.controller.signal.removeEventListener('abort', onUserAbort);
-            context.attemptController = undefined;
-            if (this.currentTurn === turn) this.currentTurn = undefined;
-          }
-        }
+        });
+        if (!retryCoalesce || context.settled) break;
       }
-    }).catch((error: unknown) => {
+    })().catch((error: unknown) => {
       if (!context.settled) {
         context.settled = true;
         try {
@@ -1080,13 +1205,25 @@ export class Coordinator {
   stopReply(id: string) {
     const message = this.store.conversation.get(id);
     const run = this.chatRuns.get(message.role === 'assistant' ? message.replyTo ?? id : id);
-    run?.controller.abort(new Error('User stopped the Router reply; independent background works are unchanged'));
-    run?.wakeCoalesce?.();
-    if (run && !run.replyId) {
-      this.store.conversation.update(run.message.id, { status: 'interrupted', reason: '已停止排队中的回复；后台工作不受影响。' });
-      this.notifyOutbound();
+    if (run) {
+      run.controller.abort(new Error('User stopped the Router reply; independent background works are unchanged'));
+      run.wakeCoalesce?.();
+      if (!run.replyId) {
+        this.store.conversation.update(run.message.id, { status: 'interrupted', reason: '已停止排队中的回复；后台工作不受影响。' });
+        this.notifyOutbound();
+      }
+      return { messageId: id, state: 'stop_requested' };
     }
-    return { messageId: id, state: run ? 'stop_requested' : message.status };
+    let stoppedBackgroundReply = false;
+    for (const workerRun of this.runs.values()) {
+      if (workerRun.replyId === id || message.taskIds.includes(workerRun.id)) {
+        if (workerRun.replyController && !workerRun.replyController.signal.aborted) {
+          workerRun.replyController.abort(new Error('User stopped background Router delivery'));
+          stoppedBackgroundReply = true;
+        }
+      }
+    }
+    return { messageId: id, state: stoppedBackgroundReply ? 'stop_requested' : message.status };
   }
 
   stopImSessionReplies(origin?: MessageOrigin): number {
@@ -1107,7 +1244,29 @@ export class Coordinator {
   }
 
   private checkpoint() {
-    if (this.router?.checkpoint) this.store.conversation.setMeta('router_checkpoint', this.router.checkpoint);
+    if (this.router?.checkpoint) {
+      this.store.conversation.setMeta('router_checkpoint', {
+        ...this.router.checkpoint,
+        lastChatSeq: this.lastRouterChatSeq,
+      });
+    }
+  }
+
+  private pumpWorkerQueue(): void {
+    const limit = resolveMaxConcurrentWorkers();
+    while (this.activeWorkerSlots.size < limit && this.queuedWorkers.length > 0 && !this.closing) {
+      const next = this.queuedWorkers.shift()!;
+      if (!this.runs.has(next.run.id) || next.run.stopping || next.run.controller.signal.aborted) continue;
+      const current = this.store.get(next.run.id);
+      if (current.status !== 'queued' || current.revision !== next.run.revision) continue;
+      this.activeWorkerSlots.add(next.run.id);
+      if (next.isChatWork) {
+        this.store.transition(next.run.id, 'running');
+      }
+      next.run.lastTick = performance.now();
+      next.run.lastWall = Date.now();
+      this.launch(next.run, next.launchWork);
+    }
   }
 
   private launch(run: Run, work: () => Promise<void>) {
@@ -1115,6 +1274,17 @@ export class Coordinator {
     const job = work().catch(async (error: unknown) => {
       if (run.controller.signal.aborted) return;
       const detail = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').trim().slice(0, 600) || '未知错误';
+      for (const op of this.store.operations(run.id)) {
+        if (['requested', 'started'].includes(op.status)) {
+          op.status = 'cancel_requested';
+          this.store.operation(op);
+          if (!op.fileId.startsWith('native:')) this.executor?.stop(op.id);
+        }
+      }
+      if (run.reads.size > 0 || this.store.operations(run.id).some(unsettled)) {
+        this.stop(run.id, `模型或执行器请求失败：${detail}`, 'failed');
+        return;
+      }
       if (await this.routeWorkerFailure(run, detail)) return;
       if (!run.controller.signal.aborted) this.stop(run.id, `模型或执行器请求失败：${detail}`, 'failed');
     }).finally(async () => {
@@ -1140,7 +1310,7 @@ export class Coordinator {
   }
 
   private publicText(text: string): string {
-    return sanitizePublicReply(text, this.store.list().map(task => task.id));
+    return sanitizePublicReply(text, this.store.list().map(task => task.id), this.home);
   }
 
   private valid(run: Run): boolean {
@@ -1149,11 +1319,14 @@ export class Coordinator {
   }
 
   private async routeWorkerFailure(run: Run, detail: string): Promise<boolean> {
+    if (run.reads.size > 0 || this.store.operations(run.id).some(unsettled)) return false;
     const task = this.store.get(run.id);
     if (!this.router || !task.originMessageId || !this.valid(run)) return false;
+    const deliveryOrigin = run.deliveryOrigin ?? task.origin;
     try {
       const handled = await this.serialRouter(run, async () => {
-        const chainKey = task.originMessageId ?? task.id;
+        if (run.reads.size > 0 || this.store.operations(run.id).some(unsettled)) return false;
+        const chainKey = resolveReportChainKey(this.store, task);
         const turnInit: Partial<RouterTurnScope> = {
           activeFailureTask: {
             id: task.id,
@@ -1171,8 +1344,8 @@ export class Coordinator {
           cwd: task.cwd,
           ...(task.workerModel ? { workerModel: task.workerModel } : {}),
           error: detail,
-          deliveryChannel: task.origin?.channel ?? 'local',
-          ...buildVoiceTurnHint(this.home, task.origin?.channel ?? 'local'),
+          deliveryChannel: deliveryOrigin?.channel ?? 'local',
+          ...buildVoiceTurnHint(this.home, deliveryOrigin?.channel ?? 'local'),
           autoDispatchesRemaining: Math.max(0, 2 - this.reportAutoDispatches.get(chainKey)),
         }), turnInit, scope => {
           turnDispatched = scope.reportTurnDispatched;
@@ -1184,7 +1357,11 @@ export class Coordinator {
           if (turnDispatched && !turnSentFile && isHandoffText) {
             this.store.conversation.delete(run.replyId);
           } else {
-            this.store.conversation.update(run.replyId, { text, status: 'completed' });
+            this.store.conversation.update(run.replyId, {
+              text,
+              status: 'completed',
+              ...(run.deliveryOrigin ? { origin: run.deliveryOrigin } : {}),
+            });
           }
           run.replyId = undefined;
           this.notifyOutbound();
@@ -1192,8 +1369,19 @@ export class Coordinator {
         return true;
       });
       if (!handled) return false;
-    } catch {
+    } catch (routerError) {
+      if (run.replyId && run.replyController?.signal.aborted && !run.controller.signal.aborted) {
+        this.store.conversation.update(run.replyId, { status: 'interrupted', reason: '已停止播报失败说明。' });
+        run.replyId = undefined;
+        this.notifyOutbound();
+      } else {
+        console.warn(`[friday] WORKER_FAILED router turn failed for task ${task.id}:`, routerError instanceof Error ? routerError.message : String(routerError));
+      }
       return false;
+    }
+    if (run.reads.size > 0 || this.store.operations(run.id).some(unsettled)) {
+      this.finish(run, 'paused', '失败结算前发现未决操作；工作保持暂停，不会自动重放');
+      return true;
     }
     run.failureRouted = true;
     this.finish(run, 'failed', `模型或执行器请求失败：${detail}`);
@@ -1207,6 +1395,7 @@ export class Coordinator {
   ): Promise<T> {
     return this.enqueueRouter(priority, async () => {
       if (!this.valid(run)) throw new Error('Task no longer active');
+      await this.syncRouterModelIfNeeded();
       return work();
     });
   }
@@ -1244,7 +1433,7 @@ export class Coordinator {
     const native = this.factory.nativeTools === true;
     let cwd: string | undefined;
     if (native) {
-      let candidate = chatWork?.cwd ?? paths[0] ?? source?.cwd ?? process.cwd();
+      let candidate = chatWork?.cwd ?? (source ? source.cwd : undefined) ?? paths[0] ?? process.cwd();
       if (!isAbsolute(candidate)) throw new Error('Native working directory must be an absolute path');
       const info = await stat(candidate);
       if (chatWork?.cwd && !info.isDirectory()) throw new Error('cwd must be a directory');
@@ -1469,16 +1658,22 @@ export class Coordinator {
     };
     this.runs.set(id, run);
 
+    const limit = resolveMaxConcurrentWorkers();
     if (chatWork) {
-      this.store.transition(id, 'running');
-      this.launch(run, () => this.work(run));
+      if (this.activeWorkerSlots.size < limit) {
+        this.activeWorkerSlots.add(id);
+        this.store.transition(id, 'running');
+        this.launch(run, () => this.work(run));
+        return this.store.get(id);
+      }
+      this.queuedWorkers.push({ run, isChatWork: true, launchWork: () => this.work(run) });
       return this.store.get(id);
     }
 
-    this.launch(run, async () => {
+    const launchNonChat = async () => {
       await this.serialRouter(run, async () => {
         if (!this.valid(run)) return;
-        this.store.transition(id, 'running');
+        if (this.store.get(id).status === 'queued') this.store.transition(id, 'running');
         run.lastTick = performance.now();
         run.lastWall = Date.now();
         let dispatched = false;
@@ -1493,12 +1688,34 @@ export class Coordinator {
         await this.prompt(run, this.router!, JSON.stringify({ kind: 'NEW_TASK', taskId: id, prompt, files }), { dispatch });
         if (!dispatched && this.valid(run)) throw new Error('Router did not dispatch the task');
       });
-    });
+    };
+    if (this.activeWorkerSlots.size < limit) {
+      this.activeWorkerSlots.add(id);
+      this.launch(run, launchNonChat);
+    } else {
+      this.queuedWorkers.push({
+        run,
+        isChatWork: false,
+        launchWork: launchNonChat,
+      });
+    }
     return task;
   }
 
   private async work(run: Run) {
     const task = this.store.get(run.id);
+    const savedCheckpoint = run.resumed
+      ? this.store.conversation.meta<{ sessionFile?: string; leafId?: string } | null>(`worker_checkpoint:${task.id}`)
+      : undefined;
+    const canRestore = Boolean(
+      run.resumed
+      && savedCheckpoint?.sessionFile
+      && savedCheckpoint.leafId
+      && existsSync(savedCheckpoint.sessionFile),
+    );
+    const restoreCheckpoint = canRestore
+      ? { sessionFile: savedCheckpoint!.sessionFile!, leafId: savedCheckpoint!.leafId! }
+      : undefined;
     const worker = await this.factory.create(
       'worker',
       run.id,
@@ -1543,6 +1760,7 @@ export class Coordinator {
         tier: task.modelTier,
         thinkingLevel: task.thinkingLevel,
         model: task.workerModel,
+        ...(restoreCheckpoint ? { restore: restoreCheckpoint } : {}),
         nativeTool: event => {
           const id = `${task.id}:${event.id}`;
           if (event.phase === 'start') {
@@ -1597,6 +1815,14 @@ export class Coordinator {
         }
       : undefined;
 
+    const priorFollowups = run.resumed
+      ? this.store.events(task.id)
+          .filter(ev => ev.state === 'done')
+          .map(ev => ({ id: ev.id, text: ev.text }))
+      : [];
+    const priorOperations = run.resumed
+      ? this.store.operations(task.id).map(op => ({ id: op.id, fileId: op.fileId, status: op.status, error: op.error }))
+      : [];
     const taskAttachments = resolveTaskAttachments(this.store, task, run.attachments);
     let input: Record<string, unknown> = {
       kind: 'TASK',
@@ -1612,6 +1838,14 @@ export class Coordinator {
       ...(task.thinkingLevel ? { thinkingLevel: task.thinkingLevel } : {}),
       ...(task.workerModel ? { workerModel: task.workerModel } : {}),
       ...(compiledContext ? { compiledContext } : {}),
+      ...(run.resumed
+        ? {
+            resumed: true,
+            ...(priorFollowups.length ? { priorFollowups } : {}),
+            ...(priorOperations.length ? { priorOperations } : {}),
+            ...(task.report ? { priorReport: task.report } : {}),
+          }
+        : {}),
       priorWork: prior
         ? {
             taskId: prior.id,
@@ -1624,7 +1858,7 @@ export class Coordinator {
         : undefined,
     };
 
-    const followupTexts: string[] = [];
+    const followupTexts: string[] = priorFollowups.map(ev => ev.text.trim()).filter(Boolean);
     try {
       while (this.valid(run)) {
         const events = this.store.takeEvents(task.id);
@@ -1641,8 +1875,14 @@ export class Coordinator {
             ...input,
           }));
         } catch (error) {
+          if (worker.checkpoint) {
+            this.store.conversation.setMeta(`worker_checkpoint:${task.id}`, worker.checkpoint);
+          }
           this.store.abandonEvents(events, 'Worker 请求失败或中断，未确认送达');
           throw error;
+        }
+        if (worker.checkpoint) {
+          this.store.conversation.setMeta(`worker_checkpoint:${task.id}`, worker.checkpoint);
         }
         if (!this.valid(run)) {
           this.store.abandonEvents(events, '工作已停止，未确认送达');
@@ -1652,65 +1892,102 @@ export class Coordinator {
           this.store.abandonEvents(events, 'Worker 报告超过交付上限，未确认送达');
           throw new Error('Worker report exceeds delivery limit');
         }
-        this.store.finishEvents(events);
         if (run.reads.size) await Promise.all([...run.reads.values()]);
-        if (!this.valid(run)) return;
+        if (!this.valid(run)) {
+          this.store.abandonEvents(events, '工作已停止，未确认送达');
+          return;
+        }
         if (run.completions.length) {
           const results = run.completions.splice(0);
           if (results.some(result => result.status !== 'succeeded')) {
+            this.store.abandonEvents(events, '文件读取操作失败或结果未知；任务已暂停');
             this.finish(run, 'paused', '文件读取操作失败或结果未知；不会自动重放');
             return;
           }
+          this.store.finishEvents(events);
           input = { kind: 'READ_COMPLETIONS', results };
           continue;
         }
-        if (this.store.hasPending(task.id)) {
-          const pendingAttachments = run.pendingFollowupAttachments?.splice(0) ?? [];
-          input = { kind: 'FOLLOWUP', ...(pendingAttachments.length ? { attachments: pendingAttachments } : {}) };
-          continue;
-        }
         if (this.store.operations(task.id).some(unsettled)) {
+          this.store.abandonEvents(events, '存在结果不明的工具调用；任务已暂停');
           this.finish(run, 'paused', '存在结果不明的工具调用；不会自动重放');
           return;
         }
         const successfulReads = new Set(this.store.operations(task.id).filter(op => op.status === 'succeeded').map(op => op.fileId));
         if (task.files.some(file => !successfulReads.has(file.id))) {
+          this.store.abandonEvents(events, 'Worker 未读取全部输入；任务已暂停');
           this.finish(run, 'paused', 'Worker 未读取全部明确提供的输入；拒绝交付无依据的成功报告');
           return;
+        }
+        this.store.finishEvents(events);
+        if (this.store.hasPending(task.id)) {
+          const pendingAttachments = run.pendingFollowupAttachments?.splice(0) ?? [];
+          input = { kind: 'FOLLOWUP', ...(pendingAttachments.length ? { attachments: pendingAttachments } : {}) };
+          continue;
         }
 
         const asked = parseWorkerQuestion(report);
         if (asked) {
-          const waitingTask = this.store.get(task.id);
-          waitingTask.pendingQuestion = {
-            question: asked.question,
-            ...(asked.options?.length ? { options: asked.options } : {}),
-            askedAt: Date.now(),
-          };
-          waitingTask.reason = `等待老板拍板：${asked.question.slice(0, 160)}`;
-          this.store.save(waitingTask);
-          this.store.notice(task.id, 'waiting_decision', waitingTask.reason);
-          await this.serialRouter(run, async () => {
-            const questionText = await this.prompt(run, this.router!, JSON.stringify({
-              kind: 'WORKER_QUESTION',
-              taskId: task.id,
-              prompt: task.prompt,
-              question: asked.question,
-              ...(asked.options?.length ? { options: asked.options } : {}),
-              deliveryChannel: task.origin?.channel ?? 'local',
-              ...buildVoiceTurnHint(this.home, task.origin?.channel ?? 'local'),
-            }));
-            if (run.replyId) {
+          let yieldedToPendingFollowup = false;
+          let preQuestionIds = new Set<string>();
+          try {
+            yieldedToPendingFollowup = await this.serialRouter(run, async () => {
+              if (this.store.hasPending(task.id)) {
+                return true;
+              }
+              const waitingTask = this.store.get(task.id);
+              waitingTask.pendingQuestion = {
+                question: asked.question,
+                ...(asked.options?.length ? { options: asked.options } : {}),
+                askedAt: Date.now(),
+              };
+              waitingTask.reason = `等待老板拍板：${asked.question.slice(0, 160)}`;
+              this.store.save(waitingTask);
+              this.store.notice(task.id, 'waiting_decision', waitingTask.reason);
+              const qDeliveryOrigin = run.deliveryOrigin ?? waitingTask.origin;
+              preQuestionIds = new Set(this.store.events(task.id).map(ev => ev.id));
+              const questionText = await this.prompt(run, this.router!, JSON.stringify({
+                kind: 'WORKER_QUESTION',
+                taskId: task.id,
+                prompt: task.prompt,
+                question: asked.question,
+                ...(asked.options?.length ? { options: asked.options } : {}),
+                deliveryChannel: qDeliveryOrigin?.channel ?? 'local',
+                ...buildVoiceTurnHint(this.home, qDeliveryOrigin?.channel ?? 'local'),
+              }));
+              if (run.replyId) {
+                this.store.conversation.update(run.replyId, {
+                  text: questionText,
+                  status: 'completed',
+                  ...(run.deliveryOrigin ? { origin: run.deliveryOrigin } : {}),
+                  reason: '等待老板拍板：后台工作已原地挂起（不消耗时限预算），回复后将在同一会话继续推进。',
+                });
+                run.replyId = undefined;
+                this.notifyOutbound();
+              }
+              return false;
+            }, 'interactive');
+          } catch (qErr) {
+            if (run.replyId && run.replyController?.signal.aborted && !run.controller.signal.aborted) {
               this.store.conversation.update(run.replyId, {
-                text: questionText,
-                status: 'completed',
-                reason: '等待老板拍板：后台工作已原地挂起（不消耗时限预算），回复后将在同一会话继续推进。',
+                status: 'interrupted',
+                reason: '已停止请示播报；后台工作已暂停等待您的指令。',
               });
               run.replyId = undefined;
               this.notifyOutbound();
+            } else if (!this.valid(run)) {
+              return;
+            } else {
+              console.warn(`[friday] WORKER_QUESTION delivery warning for ${task.id}:`, qErr instanceof Error ? qErr.message : String(qErr));
             }
-          }, 'interactive');
-          await this.waitForFollowupOrStop(run);
+          }
+          if (!this.valid(run)) return;
+          if (yieldedToPendingFollowup) {
+            const pendingAttachments = run.pendingFollowupAttachments?.splice(0) ?? [];
+            input = { kind: 'FOLLOWUP', ...(pendingAttachments.length ? { attachments: pendingAttachments } : {}) };
+            continue;
+          }
+          await this.waitForFollowupOrStop(run, preQuestionIds);
           if (!this.valid(run)) return;
           const resumedTask = this.store.get(task.id);
           delete resumedTask.pendingQuestion;
@@ -1777,83 +2054,121 @@ export class Coordinator {
         let silentHandoff = false;
         let acceptedByRouter = false;
         let savedMemoryInReportTurn = false;
-        const delivered = await this.serialRouter(run, async () => {
-          const preReport = this.store.get(task.id);
-          preReport.report = report;
-          preReport.qualityGate = qualityEval.assessment;
-          this.store.save(preReport);
-          const chainKey = task.originMessageId ?? task.id;
-          const autoDispatchesRemaining = Math.max(0, 2 - this.reportAutoDispatches.get(chainKey));
-          const imChannels = this.store.listImChannelViews()
-            .filter(c => c.enabled)
-            .map(({ id, platform, name, loginStatus, defaultTarget }) => ({ id, platform, name, loginStatus, defaultTarget }));
-          const reportTruncSuffix = `\n…[已截断，完整共${report.length}字，详情调 inspect_work]`;
-          const reportForRouter = report.length > 800
-            ? `${report.slice(0, Math.max(0, 800 - reportTruncSuffix.length))}${reportTruncSuffix}`
-            : report;
-          const turnState: { dispatched: boolean; sentFile: boolean; savedMemory: boolean } = {
-            dispatched: false,
-            sentFile: false,
-            savedMemory: false,
-          };
-          const text = await this.prompt(
-            run,
-            this.router!,
-            JSON.stringify({
-              kind: 'WORKER_REPORT',
-              taskId: task.id,
-              prompt: task.prompt,
-              cwd: task.cwd,
-              report: reportForRouter,
-              qualityGate: qualityEval.assessment,
-              deliveryChannel: task.origin?.channel ?? 'local',
-              ...buildVoiceTurnHint(this.home, task.origin?.channel ?? 'local'),
-              ...(imChannels.length ? { imChannels } : {}),
-              autoDispatchesRemaining,
-              memoryDirectory: compactRouterChatMemoryDirectory(this.store.memoryDirectory(10)),
-            }),
-            undefined,
-            scope => {
-              turnState.dispatched = scope.reportTurnDispatched;
-              turnState.sentFile = scope.reportTurnSentFile;
-              turnState.savedMemory = scope.reportTurnSavedMemory;
-            },
-          );
-          savedMemoryInReportTurn = turnState.savedMemory;
-          const isHandoffText = /^(?:\[OFFLINE SIMULATION\]\s*)?(?:好的老板[，,、\s]*)?任务已下发[。！!.\s]*$/i.test(text.trim());
-          if (this.store.hasPending(task.id)) {
-            if (run.replyId) {
-              if (!turnState.sentFile && isHandoffText) {
-                this.store.conversation.delete(run.replyId);
-              } else {
-                this.store.conversation.update(run.replyId, { text, status: 'completed', reason: '阶段回复：工作仍在继续，将处理新补充要求。' });
+        let reportDeliveryFailed = false;
+        let reportDeliveryStopped = false;
+        let delivered: string | undefined;
+        try {
+          delivered = await this.serialRouter(run, async () => {
+            const preReport = this.store.get(task.id);
+            preReport.report = report;
+            preReport.qualityGate = qualityEval.assessment;
+            this.store.save(preReport);
+            const chainKey = resolveReportChainKey(this.store, preReport);
+            const autoDispatchesRemaining = Math.max(0, 2 - this.reportAutoDispatches.get(chainKey));
+            const imChannels = this.store.listImChannelViews()
+              .filter(c => c.enabled)
+              .map(({ id, platform, name, loginStatus, defaultTarget }) => ({ id, platform, name, loginStatus, defaultTarget }));
+            const reportTruncSuffix = `\n…[已截断，完整共${report.length}字，详情调 inspect_work]`;
+            const reportForRouter = report.length > 800
+              ? `${report.slice(0, Math.max(0, 800 - reportTruncSuffix.length))}${reportTruncSuffix}`
+              : report;
+            const rDeliveryOrigin = run.deliveryOrigin ?? preReport.origin;
+            const turnState: { dispatched: boolean; sentFile: boolean; savedMemory: boolean } = {
+              dispatched: false,
+              sentFile: false,
+              savedMemory: false,
+            };
+            const text = await this.prompt(
+              run,
+              this.router!,
+              JSON.stringify({
+                kind: 'WORKER_REPORT',
+                taskId: task.id,
+                prompt: task.prompt,
+                cwd: task.cwd,
+                report: reportForRouter,
+                qualityGate: qualityEval.assessment,
+                deliveryChannel: rDeliveryOrigin?.channel ?? 'local',
+                ...buildVoiceTurnHint(this.home, rDeliveryOrigin?.channel ?? 'local'),
+                ...(imChannels.length ? { imChannels } : {}),
+                autoDispatchesRemaining,
+                memoryDirectory: compactRouterChatMemoryDirectory(this.store.memoryDirectory(10)),
+              }),
+              undefined,
+              scope => {
+                turnState.dispatched = scope.reportTurnDispatched;
+                turnState.sentFile = scope.reportTurnSentFile;
+                turnState.savedMemory = scope.reportTurnSavedMemory;
+              },
+            );
+            savedMemoryInReportTurn = turnState.savedMemory;
+            const isHandoffText = /^(?:\[OFFLINE SIMULATION\]\s*)?(?:好的老板[，,、\s]*)?任务已下发[。！!.\s]*$/i.test(text.trim());
+            if (this.store.hasPending(task.id)) {
+              if (run.replyId) {
+                if (!turnState.sentFile && isHandoffText) {
+                  this.store.conversation.delete(run.replyId);
+                } else {
+                  this.store.conversation.update(run.replyId, {
+                    text,
+                    status: 'completed',
+                    ...(run.deliveryOrigin ? { origin: run.deliveryOrigin } : {}),
+                    reason: '阶段回复：工作仍在继续，将处理新补充要求。',
+                  });
+                }
+                this.notifyOutbound();
               }
-              this.notifyOutbound();
+              run.replyId = undefined;
+              return undefined;
             }
-            run.replyId = undefined;
-            return undefined;
-          }
-          if (turnState.dispatched && !turnState.sentFile && isHandoffText) {
+            if (turnState.dispatched && !turnState.sentFile && isHandoffText) {
+              if (run.replyId) {
+                this.store.conversation.delete(run.replyId);
+                run.replyId = undefined;
+                this.notifyOutbound();
+              }
+              silentHandoff = true;
+            }
+            acceptedByRouter = !turnState.dispatched;
+            run.acceptedByRouter = acceptedByRouter;
+            if (text.length > 65_536) throw new Error('Router report exceeds delivery limit');
+            return text;
+          });
+        } catch (reportErr) {
+          if (!this.valid(run)) return;
+          if (run.replyController?.signal.aborted) {
+            reportDeliveryStopped = true;
             if (run.replyId) {
-              this.store.conversation.delete(run.replyId);
+              this.store.conversation.update(run.replyId, { status: 'interrupted', reason: '已停止汇总播报；后台任务完整报告已保留。' });
               run.replyId = undefined;
               this.notifyOutbound();
             }
-            silentHandoff = true;
+          } else {
+            reportDeliveryFailed = true;
+            const errMsg = reportErr instanceof Error ? reportErr.message : String(reportErr);
+            this.store.notice(task.id, 'router_report_fallback', `Router 汇总播报失败，已保留完整报告直接交付：${errMsg.slice(0, 200)}`);
           }
-          acceptedByRouter = !turnState.dispatched;
-          run.acceptedByRouter = acceptedByRouter;
-          if (text.length > 65_536) throw new Error('Router report exceeds delivery limit');
-          return text;
-        });
+        }
 
         if (!this.valid(run)) return;
+        if (reportDeliveryStopped) {
+          this.finish(run, 'completed', '汇报播报已停止；完整报告已保留', report);
+          return;
+        }
+        if (reportDeliveryFailed) {
+          const fallbackText = report.length > 65_536 ? `${report.slice(0, 65_400)}\n…[完整报告已保存至任务记录]` : report;
+          this.finish(run, 'completed', undefined, report, fallbackText);
+          const settledTask = this.store.get(task.id);
+          if (this.subconscious.isDistillerEnabled() && task.originMessageId && !savedMemoryInReportTurn && settledTask.status === 'completed') {
+            this.subconscious.enqueueTaskDistillation(settledTask.id);
+          }
+          return;
+        }
         if (delivered === undefined) {
           const pendingAttachments = run.pendingFollowupAttachments?.splice(0) ?? [];
           input = { kind: 'FOLLOWUP', ...(pendingAttachments.length ? { attachments: pendingAttachments } : {}) };
           continue;
         }
-        this.finish(run, 'completed', undefined, silentHandoff ? report : delivered);
+        this.finish(run, 'completed', undefined, report, silentHandoff ? report : delivered);
         const settledTask = this.store.get(task.id);
         if (this.subconscious.isDistillerEnabled() && acceptedByRouter && task.originMessageId && !savedMemoryInReportTurn && settledTask.status === 'completed') {
           this.subconscious.enqueueTaskDistillation(settledTask.id);
@@ -1861,14 +2176,21 @@ export class Coordinator {
         return;
       }
     } finally {
+      if (!this.storeClosed && worker.checkpoint && this.store.get(task.id).status === 'paused') {
+        this.store.conversation.setMeta(`worker_checkpoint:${task.id}`, worker.checkpoint);
+      }
       worker.close();
     }
   }
 
-  private waitForFollowupOrStop(run: Run): Promise<void> {
-    if (!this.valid(run) || this.store.hasPending(run.id)) return Promise.resolve();
+  private waitForFollowupOrStop(run: Run, preQuestionIds?: Set<string>): Promise<void> {
+    const hasPostQuestionPending = () => this.store.events(run.id).some(ev =>
+      ev.state === 'pending' && (!preQuestionIds || !preQuestionIds.has(ev.id)),
+    );
+    if (!this.valid(run) || hasPostQuestionPending()) return Promise.resolve();
     return new Promise<void>(resolve => {
       const done = () => {
+        if (preQuestionIds && this.valid(run) && !hasPostQuestionPending()) return;
         if (run.wakeFollowup === done) run.wakeFollowup = undefined;
         run.controller.signal.removeEventListener('abort', done);
         resolve();
@@ -1909,6 +2231,9 @@ export class Coordinator {
     this.store.notice(id, 'stop_requested', reason);
     run.stopping = status;
     run.controller.abort(new Error(reason));
+    for (let i = this.queuedWorkers.length - 1; i >= 0; i--) {
+      if (this.queuedWorkers[i]!.run.id === id) this.queuedWorkers.splice(i, 1);
+    }
     for (const op of this.store.operations(id)) {
       if (['requested', 'started'].includes(op.status)) {
         op.status = 'cancel_requested';
@@ -1925,14 +2250,15 @@ export class Coordinator {
     this.subconscious.arouse('Resume activity');
     const task = this.store.get(id);
     if (task.status !== 'paused' || this.runs.has(id)) throw new Error('Only a settled paused task can be resumed');
+    const hasSlot = this.activeWorkerSlots.size < resolveMaxConcurrentWorkers();
     this.store.transaction(() => {
       this.store.acknowledgeUnsettledOperations(id);
       task.revision++;
       task.limitMs = Math.max(task.limitMs, Math.ceil(task.activeMs) + extendMs);
-      task.status = 'running';
-      task.reason = '用户已确认恢复运行';
+      task.status = hasSlot ? 'running' : 'queued';
+      task.reason = hasSlot ? '用户已确认恢复运行' : '用户已确认恢复运行，等待并发槽位';
       this.store.save(task);
-      this.store.notice(id, 'running', task.reason);
+      this.store.notice(id, task.status, task.reason);
     });
     const attachments = resolveTaskAttachments(this.store, task);
     const run: Run = {
@@ -1944,12 +2270,18 @@ export class Coordinator {
       clockUncertain: false,
       reads: new Map(),
       completions: [],
+      resumed: true,
       lastTick: performance.now(),
       lastWall: Date.now(),
       ...(attachments.length ? { attachments } : {}),
     };
     this.runs.set(id, run);
-    this.launch(run, () => this.work(run));
+    if (hasSlot) {
+      this.activeWorkerSlots.add(id);
+      this.launch(run, () => this.work(run));
+    } else {
+      this.queuedWorkers.push({ run, isChatWork: true, launchWork: () => this.work(run) });
+    }
     return this.store.get(id);
   }
 
@@ -1972,24 +2304,36 @@ export class Coordinator {
     return this.timers.removeTimer(id);
   }
 
-  private finish(run: Run, status: TaskStatus, reason?: string, report?: string) {
+  private finish(run: Run, status: TaskStatus, reason?: string, report?: string, replyText?: string) {
     if (!accrueTaskRun(this.store, run) && status === 'completed') {
       status = 'paused';
       reason = '交付时检测到时钟或心跳缺口，无法证明活跃用时';
       report = undefined;
+      replyText = undefined;
     }
     const current = this.store.get(run.id);
     if (status === 'completed' && current.activeMs >= current.limitMs) {
       status = 'paused';
       reason = '交付前已达到活跃执行时限；工作暂停';
       report = undefined;
+      replyText = undefined;
     }
-    if (['completed', 'failed', 'cancelled'].includes(current.status)) return;
-    if (run.controller.signal.aborted && !run.stopping) return;
+    if (['completed', 'failed', 'cancelled'].includes(current.status)) {
+      this.activeWorkerSlots.delete(run.id);
+      this.pumpWorkerQueue();
+      return;
+    }
+    if (run.controller.signal.aborted && !run.stopping) {
+      this.activeWorkerSlots.delete(run.id);
+      this.pumpWorkerQueue();
+      return;
+    }
+    const effectiveReplyOrigin = run.deliveryOrigin ?? current.origin;
     this.store.transaction(() => {
       this.store.transition(run.id, status, reason, report);
       if (['completed', 'failed', 'cancelled'].includes(status)) {
         this.store.failPendingEvents(run.id, status === 'cancelled' ? '工作已取消' : '工作已结束');
+        this.store.conversation.setMeta(`worker_checkpoint:${run.id}`, null);
       }
       if (status === 'completed' || status === 'failed') {
         const calibratedScore = current.qualityGate?.source === 'gemini-decision-1'
@@ -2008,6 +2352,7 @@ export class Coordinator {
           id: randomUUID(),
           role: 'assistant',
           source: 'system',
+          origin: effectiveReplyOrigin,
           replyTo: current.originMessageId,
           text: '',
           status: status === 'failed' ? 'failed' : 'interrupted',
@@ -2022,10 +2367,15 @@ export class Coordinator {
         this.store.conversation.update(
           run.replyId,
           status === 'completed'
-            ? { text: report ?? '', status: 'completed' }
+            ? {
+                text: replyText ?? report ?? '',
+                status: 'completed',
+                ...(run.deliveryOrigin ? { origin: run.deliveryOrigin } : {}),
+              }
             : {
                 text: reply.text,
                 status: status === 'failed' ? 'failed' : 'interrupted',
+                ...(run.deliveryOrigin ? { origin: run.deliveryOrigin } : {}),
                 reason: reason ? `${reason}；已显示的内容未核实，不视为最终交付。` : '工作未确认完成；已显示的内容未核实。',
               },
         );
@@ -2035,6 +2385,8 @@ export class Coordinator {
     if (!run.controller.signal.aborted) run.controller.abort(new Error('Task settled'));
     for (const id of run.reads.keys()) this.executor?.stop(id);
     this.runs.delete(run.id);
+    this.activeWorkerSlots.delete(run.id);
+    this.pumpWorkerQueue();
   }
 
   private async prompt(
@@ -2044,17 +2396,21 @@ export class Coordinator {
     turnInit?: Partial<RouterTurnScope>,
     onRouterComplete?: (scope: RouterTurnScope) => void,
   ): Promise<string> {
-    accrueTaskRun(this.store, run);
-    run.activeCalls++;
     const task = this.store.get(run.id);
     const router = agent === this.router;
+    if (!router) {
+      accrueTaskRun(this.store, run);
+      run.activeCalls++;
+    }
     const event = JSON.parse(input) as { kind?: string; report?: string };
     const routerTaskReply = event.kind === 'WORKER_REPORT' || event.kind === 'WORKER_QUESTION' || event.kind === 'WORKER_FAILED';
+    const replyOrigin = run.deliveryOrigin ?? task.origin;
     if (router && task.originMessageId && routerTaskReply && !run.replyId) {
       const reply = this.store.conversation.create({
         id: randomUUID(),
         replyTo: task.originMessageId,
         role: 'assistant',
+        ...(replyOrigin ? { origin: replyOrigin } : {}),
         text: '',
         status: 'streaming',
         mode: this.factory.mode,
@@ -2074,10 +2430,13 @@ export class Coordinator {
     );
 
     let turn: RouterTurnScope | undefined;
+    let replyController: AbortController | undefined;
     if (router) {
       turn = createRouterTurnScope({ ...turnInit, routerTrace: trace });
       if (routerTaskReply) {
-        turn.activeReportTask = typeof event.report === 'string' ? { ...task, report: event.report } : task;
+        replyController = new AbortController();
+        run.replyController = replyController;
+        turn.activeReportTask = task;
         const originMessage = task.originMessageId
           ? (() => { try { return this.store.conversation.get(task.originMessageId); } catch { return undefined; } })()
           : undefined;
@@ -2096,6 +2455,7 @@ export class Coordinator {
         };
         turn.reportChatContext = {
           message: syntheticMessage,
+          ...(run.deliveryOrigin ? { deliveryOrigin: run.deliveryOrigin } : {}),
           controller: run.controller,
           revisions: new Map(this.store.list().map(item => [item.id, item.revision])),
           replyId: run.replyId,
@@ -2104,31 +2464,39 @@ export class Coordinator {
           mergeVersion: 0,
         };
       }
-      this.currentTurn = turn;
     } else {
       run.trace = trace;
     }
 
+    const runSignal = replyController ? AbortSignal.any([run.controller.signal, replyController.signal]) : run.controller.signal;
     try {
-      const result = await trace.run(agent, input, run.controller.signal);
+      const result = router && turn
+        ? await this.turnStorage.run(turn, () => trace.run(agent, input, runSignal))
+        : await trace.run(agent, input, runSignal);
       if (router && turn) {
+        if (run.replyId) {
+          try {
+            const replyMsg = this.store.conversation.get(run.replyId);
+            this.lastRouterChatSeq = Math.max(this.lastRouterChatSeq, replyMsg.seq);
+          } catch { /* ignore if deleted */ }
+        }
         this.checkpoint();
         onRouterComplete?.(turn);
       }
       return router ? this.publicText(result) : result;
     } finally {
       if (router) {
-        if (this.currentTurn === turn) this.currentTurn = undefined;
+        if (run.replyController === replyController) run.replyController = undefined;
       } else {
         run.trace = undefined;
+        accrueTaskRun(this.store, run);
+        run.activeCalls--;
       }
-      accrueTaskRun(this.store, run);
-      run.activeCalls--;
     }
   }
 
   private tick() {
-    if (this.currentTurn?.chatContext) accrueChatRun(this.currentTurn.chatContext);
+    if (this.activeChatContext) accrueChatRun(this.activeChatContext);
     for (const run of this.runs.values()) {
       if (run.stopping) continue;
       if (!accrueTaskRun(this.store, run, false)) {
@@ -2147,31 +2515,39 @@ export class Coordinator {
   }
 
   async close() {
-    if (this.closing) return;
-    this.closing = true;
-    clearInterval(this.timer);
-    this.closingAbort.abort(new Error('Service shutdown'));
-    this.semanticAbort.abort(new Error('Service shutdown'));
-    this.subconscious.abortAll('Service shutdown');
-    await this.im.close();
-    for (const context of this.chatRuns.values()) {
-      context.controller.abort(new Error('Service shutdown; reply interrupted without replay'));
-    }
-    for (const run of this.runs.values()) {
-      this.stop(run.id, '服务关闭；工作暂停，不会自动重放', 'paused');
-    }
-    this.drainRouterQueues(new Error('Service is shutting down'));
-    await Promise.allSettled([...this.submissions]);
-    await this.subconscious.awaitSettled();
-    if (this.executor) await this.executor.close();
-    await Promise.all([...this.jobs]);
-    await Promise.allSettled([...this.chatJobs]);
-    await this.modelHub.close();
-    await this.semanticWarmup?.catch(() => {});
-    this.outboundListeners.clear();
-    this.router?.close();
-    this.storeClosed = true;
-    this.store.close();
-    await Promise.resolve(this.semantic.close?.()).catch(() => {});
+    if (this.closingPromise) return this.closingPromise;
+    this.closingPromise = (async () => {
+      this.closing = true;
+      if (this.timer) {
+        clearInterval(this.timer);
+        this.timer = undefined;
+      }
+      this.closingAbort.abort(new Error('Service shutdown'));
+      this.semanticAbort.abort(new Error('Service shutdown'));
+      this.subconscious.abortAll('Service shutdown');
+      await this.im.close();
+      for (const context of this.chatRuns.values()) {
+        context.controller.abort(new Error('Service shutdown; reply interrupted without replay'));
+      }
+      for (const run of this.runs.values()) {
+        this.stop(run.id, '服务关闭；工作暂停，不会自动重放', 'paused');
+      }
+      this.queuedWorkers.length = 0;
+      this.drainRouterQueues(new Error('Service is shutting down'));
+      await this.routerSwapPromise.catch(() => {});
+      await Promise.allSettled([...this.submissions]);
+      await this.subconscious.awaitSettled();
+      if (this.executor) await this.executor.close();
+      await Promise.allSettled([...this.jobs]);
+      await Promise.allSettled([...this.chatJobs]);
+      await this.modelHub.close();
+      await this.semanticWarmup?.catch(() => {});
+      this.outboundListeners.clear();
+      this.router?.close();
+      this.storeClosed = true;
+      this.store.close();
+      await Promise.resolve(this.semantic.close?.()).catch(() => {});
+    })();
+    return this.closingPromise;
   }
 }

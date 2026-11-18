@@ -405,7 +405,7 @@ test('4. speakerRole: member isolates temp Router, strips owner memory/works/aut
     entry: 'index.mjs',
     runtime: 'in-process',
     enabled: true,
-    actions: ['set'],
+    actions: ['config', 'set'],
   }));
   await writeFile(join(home, 'plugins', 'miot', 'index.mjs'), `
     export async function runAction() {
@@ -460,8 +460,8 @@ test('4. speakerRole: member isolates temp Router, strips owner memory/works/aut
               () => runPluginTool.execute(JSON.stringify({ action: 'run', plugin: 'fund-tracker', pluginAction: 'status' })),
               /无权|公共智能家居/,
             );
-            // Verify allowed smart home plugin succeeds
-            const miotRes = JSON.parse(await runPluginTool.execute(JSON.stringify({ action: 'run', plugin: 'miot', pluginAction: 'set' }))) as {
+            // Verify allowed smart home plugin succeeds (use local config action for both custom and built-in miot)
+            const miotRes = JSON.parse(await runPluginTool.execute(JSON.stringify({ action: 'run', plugin: 'miot', pluginAction: 'config' }))) as {
               ok: boolean;
               message: string;
             };
@@ -497,8 +497,10 @@ test('4. speakerRole: member isolates temp Router, strips owner memory/works/aut
     // Establish owner checkpoint via owner chat
     const ownerMsg = coordinator.chat(randomUUID(), '先记录我的检查点');
     await until(() => coordinator.store.conversation.get(ownerMsg.id).status === 'completed');
-    const ownerCheckpointBefore = coordinator.store.conversation.meta('router_checkpoint');
-    assert.deepEqual(ownerCheckpointBefore, { sessionFile: 'owner.jsonl', leafId: 'owner-leaf-1' });
+    const ownerCheckpointBefore = coordinator.store.conversation.meta<{ sessionFile?: string; leafId?: string; lastChatSeq?: number }>('router_checkpoint');
+    assert.equal(ownerCheckpointBefore?.sessionFile, 'owner.jsonl');
+    assert.equal(ownerCheckpointBefore?.leafId, 'owner-leaf-1');
+    assert.ok(typeof ownerCheckpointBefore?.lastChatSeq === 'number');
     const ownerPromptsBefore = ownerPrompts;
 
     // Test ImGateway inboundOrigin propagates speakerRole

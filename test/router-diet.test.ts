@@ -654,6 +654,9 @@ test('Coordinator CHAT payload with 40 completed works + 24 memories shrinks cle
         cwd: home,
         profile: 'coding',
         modelTier: 'balanced',
+        origin: i >= 38
+          ? { channel: 'xiaoai', channelId: 'xa-1', senderId: 'lx06' }
+          : { channel: 'wechat', conversationId: 'boss-1', senderId: 'boss-1' },
       });
     }
 
@@ -718,11 +721,9 @@ test('Coordinator CHAT payload with 40 completed works + 24 memories shrinks cle
       });
     }
 
-    // 1. Fresh Router turn (leafId undefined): includes compact context, L0 memoryDirectory<=12, settled works<=3 without reportPreview
+    // 1. Fresh Router turn (leafId undefined): local admin sees all 40 works, compacts settled<=3 without reportPreview
     const msg1 = coordinator.chat('diet-req-1', '现在整体情况怎么样？', [], {
-      channel: 'wechat',
-      conversationId: 'boss-1',
-      senderId: 'boss-1',
+      channel: 'local',
     });
     await until(() => coordinator.store.conversation.get(msg1.id).status === 'completed');
 
@@ -772,6 +773,7 @@ test('Coordinator CHAT payload with 40 completed works + 24 memories shrinks cle
       report: 'P'.repeat(700),
       execution: 'native' as const,
       cwd: home,
+      origin: { channel: 'xiaoai' as const, channelId: 'xa-1', senderId: 'lx06' },
     };
     coordinator.store.create(activeRunning);
     const activeQuestion = {
@@ -789,6 +791,7 @@ test('Coordinator CHAT payload with 40 completed works + 24 memories shrinks cle
       pendingQuestion: { question: '是否覆盖旧配置？', options: ['覆盖', '保留'], askedAt: Date.now() },
       execution: 'native' as const,
       cwd: home,
+      origin: { channel: 'xiaoai' as const, channelId: 'xa-1', senderId: 'lx06' },
     };
     coordinator.store.create(activeQuestion);
 

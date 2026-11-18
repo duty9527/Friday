@@ -5,14 +5,20 @@ export const REQUEST_LIMIT = 64 * 1024;
 export const RESPONSE_LIMIT = 4 * 1024 * 1024;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 export const LONG_REQUEST_TIMEOUT_MS = 90_000;
+export const PLUGIN_REQUEST_TIMEOUT_MS = 305_000;
 
 const LONG_COMMANDS = new Set([
-  'plugin-run',
   'voice-enroll-start',
   'memory-search',
   'memory-save',
   'im-telegram-quick',
   'im-telegram-sync-commands',
+  'model-configure',
+  'model-probe',
+  'model-fetch',
+  'submit',
+  'im-test',
+  'im-webhook',
 ]);
 
 export const socketPath = (home: string) => join(home, 'service.sock');
@@ -41,6 +47,7 @@ export function resolveRequestTimeoutMs(message: unknown, options?: RequestOptio
     && typeof (message as { command?: unknown }).command === 'string'
     ? (message as { command: string }).command
     : undefined;
+  if (command === 'plugin-run') return PLUGIN_REQUEST_TIMEOUT_MS;
   return command && LONG_COMMANDS.has(command) ? LONG_REQUEST_TIMEOUT_MS : DEFAULT_REQUEST_TIMEOUT_MS;
 }
 
@@ -74,6 +81,7 @@ export async function request(home: string, message: unknown, options?: RequestO
         else resolve(response.result);
       } catch { fail(new Error('Invalid service response')); }
     });
-    socket.on('end', () => { if (!buffer.includes(10)) fail(new Error('Service closed without a response')); });
+    socket.on('end', () => { if (!settled && !buffer.includes(10)) fail(new Error('Service closed without a response')); });
+    socket.on('close', () => { if (!settled) fail(new Error('Service closed without a response')); });
   });
 }

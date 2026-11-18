@@ -297,7 +297,13 @@ test('CLI model set does not overwrite workerProvider unless --worker-provider i
 
 test('protocol resolves per-command timeouts, honors custom timeoutMs, and Watchdog persists watchdog.json with >= circuit breaker', { timeout: 20_000 }, async () => {
   assert.equal(resolveRequestTimeoutMs({ command: 'health' }), 15_000);
-  assert.equal(resolveRequestTimeoutMs({ command: 'plugin-run' }), 90_000);
+  assert.equal(resolveRequestTimeoutMs({ command: 'plugin-run' }), 305_000);
+  assert.equal(resolveRequestTimeoutMs({ command: 'model-configure' }), 90_000);
+  assert.equal(resolveRequestTimeoutMs({ command: 'model-probe' }), 90_000);
+  assert.equal(resolveRequestTimeoutMs({ command: 'model-fetch' }), 90_000);
+  assert.equal(resolveRequestTimeoutMs({ command: 'submit' }), 90_000);
+  assert.equal(resolveRequestTimeoutMs({ command: 'im-test' }), 90_000);
+  assert.equal(resolveRequestTimeoutMs({ command: 'im-webhook' }), 90_000);
   assert.equal(resolveRequestTimeoutMs({ command: 'voice-enroll-start' }), 90_000);
   assert.equal(resolveRequestTimeoutMs({ command: 'memory-search' }), 90_000);
   assert.equal(resolveRequestTimeoutMs({ command: 'memory-save' }), 90_000);

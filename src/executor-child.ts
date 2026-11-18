@@ -18,7 +18,7 @@ async function start(op: Operation, file: InputFile) {
   const previous = db.prepare('SELECT * FROM operations WHERE id=?').get(op.id);
   if (previous) {
     if (previous.fingerprint !== fingerprint) {
-      send({ ...op, status: 'failed', error: 'Operation ID parameter mismatch' });
+      send({ ...op, status: 'failed', error: 'Operation ID parameter mismatch', mismatch: true } as Operation & { mismatch: true });
       return;
     }
     if (!running.has(op.id)) {
@@ -38,9 +38,10 @@ async function start(op: Operation, file: InputFile) {
     const result = await readSnapshot(home!, op.taskId, file);
     op.status = state.cancelled ? 'cancelled' : 'succeeded';
     if (!state.cancelled) op.result = result;
-  } catch {
+  } catch (error) {
+    const detail = error instanceof Error && error.message ? error.message : 'Snapshot read or integrity check failed';
     op.status = state.cancelled ? 'cancelled' : 'failed';
-    op.error = state.cancelled ? 'Read cancelled' : 'Snapshot read or integrity check failed';
+    op.error = state.cancelled ? 'Read cancelled' : detail;
   } finally {
     try { persist(op, fingerprint); } catch { /* best-effort persistence */ }
     send(op);
