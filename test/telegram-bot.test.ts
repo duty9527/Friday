@@ -601,9 +601,9 @@ test('Telegram slash commands, inline keyboards, callback_query, chunking, stick
       assert.equal(mock.getFileCalls.length, beforeUnauthorizedGetFile);
       assert.equal(mock.callbackAnswers.length, beforeUnauthorizedCb);
 
-      // 7. Inbound photo download + sendChatAction typing indicator (and silent 500 handling)
+      // 7. Inbound photo download + sendChatAction typing indicator (and silent 500 handling) via authenticated poll()
       mock.failChatAction = true;
-      const photoRes = await coordinator.im.ingestMessage(parseTelegramUpdate(channelId, {
+      mock.queuedUpdates.push({
         update_id: 1013,
         message: {
           message_id: 88,
@@ -615,11 +615,18 @@ test('Telegram slash commands, inline keyboards, callback_query, chunking, stick
             { file_id: 'tg-photo-big', width: 800, height: 600, file_size: PNG_1X1.length },
           ],
         },
-      })!);
-      assert.equal(photoRes.action, 'routed_to_chat');
-      assert.ok(mock.getFileCalls.includes('tg-photo-big'));
+      });
+      await (coordinator.im as any).pollChannel(channelId);
+      await until(() =>
+        mock.getFileCalls.includes('tg-photo-big')
+        && coordinator.store.conversation.history(undefined, 20).items.some(
+          m => m.role === 'user' && m.attachments?.length === 1,
+        ),
+      );
       assert.ok(mock.chatActions.some(a => a.chat_id === '9001' && a.action === 'typing'));
-      const storedPhotoMsg = coordinator.store.conversation.get(photoRes.messageId!);
+      const storedPhotoMsg = coordinator.store.conversation.history(undefined, 20).items.find(
+        m => m.role === 'user' && m.attachments?.length === 1,
+      )!;
       assert.equal(storedPhotoMsg.attachments?.length, 1);
       const savedImg = storedPhotoMsg.attachments![0]!;
       assert.equal(savedImg.kind, 'image');
@@ -629,14 +636,14 @@ test('Telegram slash commands, inline keyboards, callback_query, chunking, stick
       assert.deepEqual(await readFile(savedImg.path!), PNG_1X1);
       const imgMode = (await stat(savedImg.path!)).mode & 0o777;
       assert.equal(imgMode, 0o600);
-      await until(() => coordinator.store.conversation.get(photoRes.messageId!).status === 'completed');
+      await until(() => coordinator.store.conversation.get(storedPhotoMsg.id).status === 'completed');
       await until(() => coordinator.store.list().every(w => !['queued', 'running'].includes(w.status)));
 
-      // 8. /file <filename> sends staged document via sendDocument
+      // 8. /file <filename> sends staged document via sendDocument when received from authenticated poll()
       const outboxDir = join(home, 'wechat-files');
       await mkdir(outboxDir, { recursive: true, mode: 0o700 });
       await writeFile(join(outboxDir, 'staged-note.txt'), 'Telegram staged attachment body', { mode: 0o600 });
-      const fileCmdRes = await coordinator.im.ingestMessage(parseTelegramUpdate(channelId, {
+      mock.queuedUpdates.push({
         update_id: 1014,
         message: {
           message_id: 89,
@@ -644,9 +651,9 @@ test('Telegram slash commands, inline keyboards, callback_query, chunking, stick
           chat: { id: 9001 },
           text: '/file staged-note.txt',
         },
-      })!);
-      assert.equal(fileCmdRes.action, 'attachment_sent');
-      assert.equal(mock.sentDocuments.length, 1);
+      });
+      await (coordinator.im as any).pollChannel(channelId);
+      await until(() => mock.sentDocuments.length >= 1);
       assert.ok(mock.sentDocuments[0]!.raw.toString('utf8').includes('Telegram staged attachment body'));
 
       // 9. Router send_file tool works on Telegram origin and local fallback to Telegram

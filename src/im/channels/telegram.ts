@@ -701,7 +701,11 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
     if (!parsed.ok) {
       return jsonWebhookResponse(400, { error: 'Invalid JSON payload' });
     }
-    return finalizeWebhookInbound(this.ctx, parseTelegramUpdate(channel.id, parsed.data));
+    const inbound = parseTelegramUpdate(channel.id, parsed.data);
+    if (inbound) {
+      this.ctx.markTrustedTelegramInbound?.(inbound);
+    }
+    return finalizeWebhookInbound(this.ctx, inbound);
   }
 
   private async postSendMessage(

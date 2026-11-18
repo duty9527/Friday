@@ -605,12 +605,13 @@ export class ImGateway {
       if (xiaoaiHandled) return xiaoaiHandled;
     }
 
+    const trustedTelegram = this.trustedTelegramRequests.delete(inbound);
     const parsedCmd = parseImSlashCommand(rawText);
     if (parsedCmd?.command === '/file') {
       if (channel.platform === 'telegram') {
         const tgAllowed = channel.allowedSenders.length > 0 && channel.allowedSenders.includes(inbound.senderId);
         const tgPrivate = Boolean(inbound.senderId && inbound.target === inbound.senderId);
-        if (!channel.enabled || !channel.botToken || !replyOpts.target || !tgAllowed || !tgPrivate) {
+        if (!trustedTelegram || !channel.enabled || !channel.botToken || !replyOpts.target || !tgAllowed || !tgPrivate) {
           return { ok: false, action: 'rejected', reason: 'attachment_not_authorized' };
         }
         if (!parsedCmd.arg) {
@@ -653,7 +654,6 @@ export class ImGateway {
 
     const attachments: ReceivedAttachment[] = [];
     const authenticatedMedia = this.trustedMediaRequests.delete(inbound);
-    this.trustedTelegramRequests.delete(inbound);
     const hasMedia = Boolean(inbound.mediaItems?.length || inbound.telegramMedia?.length);
     const isInstantCommand = isInstantImCommand(rawText, hasMedia);
     const ingestTypingRef = `ingest:${requestId}`;
@@ -692,14 +692,15 @@ export class ImGateway {
         }
       } else if (channel.platform === 'telegram' && inbound.telegramMedia?.length) {
         const tgMediaAuthorized = Boolean(
-          channel.botToken
+          trustedTelegram
+          && channel.botToken
           && channel.allowedSenders.length > 0
           && channel.allowedSenders.includes(inbound.senderId),
         );
         for (const item of inbound.telegramMedia.slice(0, 4)) {
           attachments.push(tgMediaAuthorized
             ? await this.telegramAdapter.downloadMedia(channel, item, join(this.homeDir, 'inbound-media'))
-            : { kind: item.kind, name: item.fileName || 'attachment', status: 'failed', error: '附件未下载：Telegram 发送人未获精确 ID 授权或缺少 botToken。' });
+            : { kind: item.kind, name: item.fileName || 'attachment', status: 'failed', error: '附件未下载：来源未经 Telegram 轮询/验签认证或发送人未获精确 ID 授权。' });
         }
         if (inbound.telegramMedia.length > 4) {
           attachments.push({ kind: 'file', name: 'remaining attachments', status: 'failed', error: '单条消息最多接收4个附件。' });

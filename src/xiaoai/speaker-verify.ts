@@ -538,7 +538,33 @@ function isFullAndTailConsistentMatch(
   fullRes: XiaoaiSpeakerMatchResult,
   tailRes: XiaoaiSpeakerMatchResult,
 ): boolean {
-  return Boolean(fullRes.matched && tailRes.matched);
+  return Boolean(
+    fullRes.matched
+    && tailRes.matched
+    && (!fullRes.speaker || !tailRes.speaker || fullRes.speaker.role === tailRes.speaker.role),
+  );
+}
+
+function enforceLeastPrivilegeOnMixedRoles(
+  fullRes: XiaoaiSpeakerMatchResult,
+  tailRes: XiaoaiSpeakerMatchResult,
+  result: XiaoaiSpeakerUtteranceCheck,
+): XiaoaiSpeakerUtteranceCheck {
+  if (
+    result.matched
+    && !result.trimmed
+    && fullRes.matched
+    && tailRes.matched
+    && fullRes.speaker
+    && tailRes.speaker
+    && fullRes.speaker.role !== tailRes.speaker.role
+  ) {
+    const memberSpeaker = fullRes.speaker.role === 'member' ? fullRes.speaker : tailRes.speaker;
+    if (memberSpeaker.role === 'member' && result.speaker?.role !== 'member') {
+      return { ...result, speaker: memberSpeaker };
+    }
+  }
+  return result;
 }
 
 function finalizeTrimmedUtterance(params: {
@@ -1150,6 +1176,7 @@ export class XiaoaiSpeakerManager {
     if (!anchorProfile || anchorStartIdx < 0) {
       return {
         ...fullRes,
+        speaker: undefined,
         matched: false,
         samples,
         trimmed: false,
@@ -1176,17 +1203,21 @@ export class XiaoaiSpeakerManager {
       }
     }
 
-    return finalizeTrimmedUtterance({
-      samples,
-      sampleRate,
-      threshold,
-      starts,
-      winLen,
-      anchorProfile,
-      anchorStartIdx,
-      bestAnchorScore,
-      windowScores,
-    });
+    return enforceLeastPrivilegeOnMixedRoles(
+      fullRes,
+      tailRes,
+      finalizeTrimmedUtterance({
+        samples,
+        sampleRate,
+        threshold,
+        starts,
+        winLen,
+        anchorProfile,
+        anchorStartIdx,
+        bestAnchorScore,
+        windowScores,
+      }),
+    );
   }
 
   async verifyAndTrimUtteranceAsync(
@@ -1242,6 +1273,7 @@ export class XiaoaiSpeakerManager {
       await yieldEventLoop();
       return {
         ...fullRes,
+        speaker: undefined,
         matched: false,
         samples,
         trimmed: false,
@@ -1270,17 +1302,21 @@ export class XiaoaiSpeakerManager {
     }
 
     await yieldEventLoop();
-    return finalizeTrimmedUtterance({
-      samples,
-      sampleRate,
-      threshold,
-      starts,
-      winLen,
-      anchorProfile,
-      anchorStartIdx,
-      bestAnchorScore,
-      windowScores,
-    });
+    return enforceLeastPrivilegeOnMixedRoles(
+      fullRes,
+      tailRes,
+      finalizeTrimmedUtterance({
+        samples,
+        sampleRate,
+        threshold,
+        starts,
+        winLen,
+        anchorProfile,
+        anchorStartIdx,
+        bestAnchorScore,
+        windowScores,
+      }),
+    );
   }
 
   close(): void {

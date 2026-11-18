@@ -348,11 +348,13 @@ test('Allowlist blocks spoofed senderName/unprefixed username, blocks group /sta
   const chatMessages: string[] = [];
   let tgSendCalls = 0;
   let tgDocCalls = 0;
+  let tgGetFileCalls = 0;
 
   const mockTg = createServer((req: IncomingMessage, res: ServerResponse) => {
     const url = req.url ?? '/';
     if (url.includes('/sendMessage')) tgSendCalls++;
     if (url.includes('/sendDocument')) tgDocCalls++;
+    if (url.includes('/getFile')) tgGetFileCalls++;
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true, result: { message_id: 1 } }));
   });
@@ -474,29 +476,64 @@ test('Allowlist blocks spoofed senderName/unprefixed username, blocks group /sta
       name: 'TG Strict',
       botToken: '111:TOKEN_A',
       webhookUrl: `${tgApiBase}/custom-webhook`,
+      secret: 'tg-wh-secret',
       apiBase: tgApiBase,
       allowedSenders: ['9001', '@realuser'],
       pollIntervalMs: 60_000,
     });
-    const missingFileRes = await gateway.ingestMessage({
+
+    // Direct ingestMessage (without poll/webhook provenance) must REJECT Telegram /file and media download even for allowlisted senderId!
+    const untrustedDirectFile = await gateway.ingestMessage({
       channelId: 'tg-strict',
-      externalId: 'priv-missing',
+      externalId: 'direct-forged-file',
       senderId: '9001',
       target: '9001',
-      text: '/file does-not-exist.txt',
+      text: '/file note.txt',
     });
+    assert.equal(untrustedDirectFile.ok, false);
+    assert.equal(untrustedDirectFile.reason, 'attachment_not_authorized');
+
+    await gateway.ingestMessage({
+      channelId: 'tg-strict',
+      externalId: 'direct-forged-media',
+      senderId: '9001',
+      target: '9001',
+      text: '看图',
+      telegramMedia: [{ kind: 'image', fileId: 'forged-img-1', fileName: 'pic.jpg' }],
+    });
+    assert.equal(tgGetFileCalls, 0, 'Unauthenticated direct ingestMessage must not invoke Telegram getFile');
+    assert.match(chatMessages.at(-1) ?? '', /附件未下载/);
+
+    // Secret-verified Telegram webhook marks provenance -> missing-file diagnostics & valid /file succeed cleanly
+    const missingWhRes = await gateway.handleWebhook(
+      'tg-strict',
+      'POST',
+      new URLSearchParams(),
+      { 'x-telegram-bot-api-secret-token': 'tg-wh-secret' },
+      JSON.stringify({
+        update_id: 2001,
+        message: { message_id: 201, from: { id: 9001 }, chat: { id: 9001 }, text: '/file does-not-exist.txt' },
+      }),
+    );
+    assert.equal(missingWhRes.status, 200);
+    const missingFileRes = JSON.parse(missingWhRes.body) as { ok: boolean; action: string; reason?: string };
     assert.equal(missingFileRes.ok, false);
     assert.equal(missingFileRes.action, 'attachment_failed');
     assert.equal(missingFileRes.reason, 'delivery_failed');
     assert.ok(!(store.getImChannel('tg-strict').lastError ?? '').includes(home));
 
-    const validFileRes = await gateway.ingestMessage({
-      channelId: 'tg-strict',
-      externalId: 'priv-ok',
-      senderId: '9001',
-      target: '9001',
-      text: '/file note.txt',
-    });
+    const validWhRes = await gateway.handleWebhook(
+      'tg-strict',
+      'POST',
+      new URLSearchParams(),
+      { 'x-telegram-bot-api-secret-token': 'tg-wh-secret' },
+      JSON.stringify({
+        update_id: 2002,
+        message: { message_id: 202, from: { id: 9001 }, chat: { id: 9001 }, text: '/file note.txt' },
+      }),
+    );
+    assert.equal(validWhRes.status, 200);
+    const validFileRes = JSON.parse(validWhRes.body) as { ok: boolean; action: string };
     assert.equal(validFileRes.ok, true);
     assert.equal(validFileRes.action, 'attachment_sent');
     assert.equal(tgDocCalls, 1);
@@ -780,6 +817,29 @@ test('XiaoAI voiceprint management fails closed, speaker-verify handles corrupt 
       const dipRes = hystMgr.verifyAndTrimUtterance(dipAudio, 16_000);
       assert.equal(dipRes.matched, true);
       assert.equal(dipRes.trimmed, false, 'Single mid-sentence brief dip must recover instead of truncating utterance');
+
+      // Mixed owner (200Hz) + member (800Hz) tail in one utterance must NOT grant untrimmed owner role!
+      const memberEmb = hystMgr.extractEmbedding(synthToneSamples(800, 1200))!;
+      hystMgr.enrollEmbeddings({ name: '家庭成员', role: 'member', embeddings: [memberEmb] });
+      const ownerHead = synthToneSamples(200, 1600, 0.28);
+      const memberTail = synthToneSamples(800, 1400, 0.22);
+      const mixedRoleAudio = new Float32Array(ownerHead.length + memberTail.length);
+      mixedRoleAudio.set(ownerHead, 0);
+      mixedRoleAudio.set(memberTail, ownerHead.length);
+      const syncMixedRole = hystMgr.verifyAndTrimUtterance(mixedRoleAudio, 16_000);
+      const asyncMixedRole = await hystMgr.verifyAndTrimUtteranceAsync(mixedRoleAudio, 16_000);
+      for (const r of [syncMixedRole, asyncMixedRole]) {
+        assert.equal(r.matched, true);
+        assert.ok(
+          r.trimmed || r.speaker?.role !== 'owner',
+          'Mixed owner+member utterance must trim differing-role tail or downgrade role (never untrimmed owner)',
+        );
+        if (r.trimmed) {
+          assert.ok(r.samples.length < mixedRoleAudio.length);
+        }
+      }
+      assert.equal(asyncMixedRole.trimmed, syncMixedRole.trimmed);
+      assert.equal(asyncMixedRole.speaker?.role, syncMixedRole.speaker?.role);
       hystMgr.close();
     } finally {
       await rm(hystHome, { recursive: true, force: true });
