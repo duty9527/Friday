@@ -11,6 +11,8 @@ const LONG_COMMANDS = new Set([
   'voice-enroll-start',
   'memory-search',
   'memory-save',
+  'im-telegram-quick',
+  'im-telegram-sync-commands',
 ]);
 
 export const socketPath = (home: string) => join(home, 'service.sock');

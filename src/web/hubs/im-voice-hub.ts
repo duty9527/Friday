@@ -1,4 +1,10 @@
-import type { ImChannelView, VoiceprintStatusView, WechatQrLoginSession } from '../../view.js';
+import type {
+  ImChannelView,
+  TelegramQuickConnectView,
+  TelegramSyncCommandsView,
+  VoiceprintStatusView,
+  WechatQrLoginSession,
+} from '../../view.js';
 import { button, element, kpiCard, node } from '../shared/dom.js';
 import { errorText, timestamp } from '../shared/format.js';
 import { api, appState, hooks } from '../state.js';
@@ -35,6 +41,10 @@ export function initImVoiceHub(): ImVoiceHubController {
   const imWechatQrStatus = element<HTMLElement>('im-wechat-qr-status');
   const imWechatQrRefresh = element<HTMLButtonElement>('im-wechat-qr-refresh');
   const imWechatQrClose = element<HTMLButtonElement>('im-wechat-qr-close');
+  const imTgTokenInput = element<HTMLInputElement>('im-tg-token-input');
+  const imTgAllowInput = element<HTMLInputElement>('im-tg-allow-input');
+  const imTgQuickBtn = element<HTMLButtonElement>('im-tg-quick-btn');
+  const imTgQuickStatus = element<HTMLElement>('im-tg-quick-status');
   const imVoiceStatusBadge = element<HTMLElement>('im-voice-status-badge');
   const imVoiceRefreshBtn = element<HTMLButtonElement>('im-voice-refresh-btn');
   const imVoiceToggleBtn = element<HTMLButtonElement>('im-voice-toggle-btn');
@@ -61,6 +71,8 @@ export function initImVoiceHub(): ImVoiceHubController {
   let wechatAutoHideTimer: ReturnType<typeof setTimeout> | undefined;
   let activeWechatQrChannelId: string | undefined;
   let editingImChannelId: string | undefined;
+  let tgQuickBusy = false;
+  const syncingTgChannels = new Set<string>();
   let voiceBusy = false;
   let armedVoiceDeleteKey: string | undefined;
   let armedVoiceDeleteTimer: ReturnType<typeof setTimeout> | undefined;
@@ -421,6 +433,63 @@ export function initImVoiceHub(): ImVoiceHubController {
     }
   }
 
+  async function quickConnectTelegramFromUi() {
+    if (tgQuickBusy) return;
+    const botToken = imTgTokenInput.value.trim();
+    if (!botToken) {
+      imTgQuickStatus.hidden = false;
+      imTgQuickStatus.className = 'telegram-quick-status is-error';
+      imTgQuickStatus.textContent = '⚠️ 请先输入从 @BotFather 获取的 Bot Token。';
+      imTgTokenInput.focus();
+      return;
+    }
+    const allowedSenders = imTgAllowInput.value.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean);
+    tgQuickBusy = true;
+    render(true);
+    imTgQuickStatus.hidden = false;
+    imTgQuickStatus.className = 'telegram-quick-status is-pending';
+    imTgQuickStatus.textContent = '⏳ 正在校验 Bot Token、清理冲突 Webhook 并同步常见命令菜单…';
+    try {
+      const res = await api<TelegramQuickConnectView>('/api/im-telegram-quick', {
+        botToken,
+        ...(allowedSenders.length ? { allowedSenders } : {}),
+      });
+      imTgTokenInput.value = '';
+      imTgAllowInput.value = '';
+      const botLabel = res.bot.username ? `@${res.bot.username}` : `${res.bot.firstName} (#${res.bot.id})`;
+      const cmdStatus = res.commandsRegistered
+        ? '常见命令菜单已配置完成'
+        : `命令菜单同步异常（${res.commandsError ?? '可稍后在下方通道点击「🔄 同步命令」重试'}）`;
+      imTgQuickStatus.className = 'telegram-quick-status is-ok';
+      imTgQuickStatus.textContent = `✅ 已接入 ${botLabel}（${res.bot.firstName}） · ${cmdStatus}。现在就可以在 Telegram 中打开 ${botLabel} 发送 /start 开始对话！`;
+      hooks.connection(`Telegram Bot ${botLabel} 已一键接入并启动长轮询。`);
+      await hooks.refreshView();
+    } catch (error) {
+      imTgQuickStatus.className = 'telegram-quick-status is-error';
+      imTgQuickStatus.textContent = `❌ Telegram 接入失败：${errorText(error)}`;
+      hooks.connection(`Telegram 快速接入失败：${errorText(error)}`, true);
+    } finally {
+      tgQuickBusy = false;
+      render(true);
+    }
+  }
+
+  async function syncTelegramCommandsFromUi(id: string, name: string) {
+    if (syncingTgChannels.has(id)) return;
+    syncingTgChannels.add(id);
+    render(true);
+    try {
+      const res = await api<TelegramSyncCommandsView>('/api/im-telegram-sync', { id });
+      hooks.connection(`已为「${name}」同步 ${res.count} 项 Telegram 常见命令菜单。`);
+      await hooks.refreshView();
+    } catch (error) {
+      hooks.connection(`同步 Telegram 命令菜单失败：${errorText(error)}`, true);
+    } finally {
+      syncingTgChannels.delete(id);
+      render(true);
+    }
+  }
+
   function render(force = false) {
     const channels = appState.view?.imChannels ?? [];
     const activeCount = channels.filter(c => c.enabled).length;
@@ -432,15 +501,31 @@ export function initImVoiceHub(): ImVoiceHubController {
     }
     appState.dirtyModals.delete('im');
 
+    const controlsDisabled = appState.authExpired || !appState.ready;
+    imTgTokenInput.disabled = controlsDisabled || tgQuickBusy;
+    imTgAllowInput.disabled = controlsDisabled || tgQuickBusy;
+    imTgQuickBtn.disabled = controlsDisabled || tgQuickBusy;
+
     const wechatBound = channels.some(c => c.platform === 'wechat' && c.hasBotToken);
+    const telegramBound = channels.some(c => c.platform === 'telegram' && c.hasBotToken);
+    const boundCount = channels.filter(c =>
+      c.hasBotToken
+      || Boolean(c.webhookUrlMasked)
+      || (c.platform === 'xiaoai' && (Boolean(c.accountId) || Boolean(c.apiBase))),
+    ).length;
     const totalIn = channels.reduce((sum, c) => sum + (c.inboundCount ?? 0), 0);
     const totalOut = channels.reduce((sum, c) => sum + (c.outboundCount ?? 0), 0);
     const vp = appState.voiceprintState ?? appState.view?.voiceprint;
 
     const kpiFrag = document.createDocumentFragment();
     kpiFrag.append(
-      kpiCard('启用通道', `${activeCount} / ${channels.length}`, '', activeCount > 0 ? 'positive' : 'default'),
-      kpiCard('微信绑定', wechatBound ? '✅ 已直连' : '⚪ 未绑定', '', wechatBound ? 'positive' : 'default'),
+      kpiCard('启用通道', `${activeCount} / ${channels.length}`, channels.length ? `已绑定 ${boundCount} 个` : '暂无配置', activeCount > 0 ? 'positive' : 'default'),
+      kpiCard(
+        '直连绑定',
+        wechatBound && telegramBound ? '✅ 微信 + TG' : wechatBound ? '✅ 微信已连' : telegramBound ? '✅ TG 已连' : '⚪ 未绑定',
+        `微信 ${wechatBound ? '✓' : '—'} · Telegram ${telegramBound ? '✓' : '—'}`,
+        wechatBound || telegramBound ? 'positive' : 'default',
+      ),
       kpiCard(
         '声纹门控',
         vp?.active ? `🛡️ 已生效 (${vp.profiles.length}人)` : vp?.profiles.length ? `⏸ 已暂停 (${vp.profiles.length}人)` : '⚪ 待录入',
@@ -468,17 +553,27 @@ export function initImVoiceHub(): ImVoiceHubController {
       const actions = node('div', '', 'timer-actions');
       if (ch.platform === 'wechat') {
         const qrBtn = button(ch.hasBotToken ? '📱 换绑扫码' : '📱 扫码绑定', () => { void startWechatQrFromUi(ch.id, ch.name); }, 'mini-button');
-        qrBtn.disabled = appState.authExpired || !appState.ready;
+        qrBtn.disabled = controlsDisabled;
         actions.append(qrBtn);
+      }
+      if (ch.platform === 'telegram' && ch.hasBotToken) {
+        const syncing = syncingTgChannels.has(ch.id);
+        const syncBtn = button(
+          syncing ? '⏳ 同步中…' : '🔄 同步命令',
+          () => { void syncTelegramCommandsFromUi(ch.id, ch.name); },
+          'mini-button',
+        );
+        syncBtn.disabled = controlsDisabled || syncing;
+        actions.append(syncBtn);
       }
       const testBtn = button('⚡ 自检', () => { void testImChannelFromUi(ch.id); }, 'mini-button');
       const editBtn = button('✏️ 编辑', () => { editImChannelFromUi(ch); }, 'mini-button');
       const toggleBtn = button(ch.enabled ? '⏸ 暂停' : '▶️ 启用', () => { void toggleImChannelFromUi(ch.id, !ch.enabled); }, 'mini-button');
       const delBtn = button('🗑️ 删除', () => { void removeImChannelFromUi(ch.id); }, 'mini-button danger-btn');
-      editBtn.disabled = appState.authExpired || !appState.ready;
-      testBtn.disabled = appState.authExpired || !appState.ready;
-      toggleBtn.disabled = appState.authExpired || !appState.ready;
-      delBtn.disabled = appState.authExpired || !appState.ready;
+      editBtn.disabled = controlsDisabled;
+      testBtn.disabled = controlsDisabled;
+      toggleBtn.disabled = controlsDisabled;
+      delBtn.disabled = controlsDisabled;
       actions.append(testBtn, editBtn, toggleBtn, delBtn);
       head.append(actions);
       card.append(head);
@@ -492,6 +587,15 @@ export function initImVoiceHub(): ImVoiceHubController {
             ? `🔗 企微/网桥 Webhook: ${ch.webhookUrlMasked}`
             : '⚠️ 尚未完成微信扫码授权，请点击右上角「📱 扫码绑定」获取登录二维码';
         endpointBox.append(node('span', bindText, ch.hasBotToken ? 'hub-endpoint-text ok' : 'hub-endpoint-text warn'));
+      } else if (ch.platform === 'telegram') {
+        if (!ch.webhookUrlMasked) {
+          const tgText = ch.hasBotToken
+            ? `✅ Telegram 本机长轮询已就绪${ch.accountId ? ` · 机器人: ${ch.accountId}` : ''} · 常见命令菜单已配置`
+            : '⚠️ 尚未配置 Telegram Bot Token，请使用上方「✈️ Telegram Bot 一键快速接入」或手动填写 Token';
+          endpointBox.append(node('span', tgText, ch.hasBotToken ? 'hub-endpoint-text ok' : 'hub-endpoint-text warn'));
+        } else {
+          endpointBox.append(node('span', `🔗 Telegram Webhook 已配置: ${ch.webhookUrlMasked}`, 'hub-endpoint-text ok'));
+        }
       } else if (ch.platform === 'xiaoai') {
         if (ch.apiBase?.startsWith('ssh://')) {
           endpointBox.append(node('span', `⚡ 局域网 SSH 直连: ${ch.apiBase}`, 'hub-endpoint-text ok'));
@@ -565,6 +669,15 @@ export function initImVoiceHub(): ImVoiceHubController {
     imAddDetails.open = false;
   });
   imSaveBtn.addEventListener('click', () => { void saveImChannelFromUi(); });
+  imTgQuickBtn.addEventListener('click', () => { void quickConnectTelegramFromUi(); });
+  const onTgQuickKeyDown = (event: KeyboardEvent) => {
+    if (event.key === 'Enter' && !event.isComposing) {
+      event.preventDefault();
+      void quickConnectTelegramFromUi();
+    }
+  };
+  imTgTokenInput.addEventListener('keydown', onTgQuickKeyDown);
+  imTgAllowInput.addEventListener('keydown', onTgQuickKeyDown);
   imWechatQrBtn.addEventListener('click', () => { void startWechatQrFromUi(); });
   imWechatQrRefresh.addEventListener('click', () => { void startWechatQrFromUi(activeWechatQrChannelId); });
   imWechatQrClose.addEventListener('click', closeWechatQrFromUi);

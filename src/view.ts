@@ -297,6 +297,23 @@ export interface WechatQrLoginSession {
   error?: string;
   channel?: ImChannelView;
 }
+export interface TelegramQuickConnectView {
+  ok: boolean;
+  bot: {
+    id: number;
+    username?: string;
+    firstName: string;
+  };
+  commandsRegistered: boolean;
+  commandsError?: string;
+  webhookCleared: boolean;
+  channel: ImChannelView;
+}
+export interface TelegramSyncCommandsView {
+  ok: boolean;
+  count: number;
+  channel: ImChannelView;
+}
 export type PluginRuntimeMode = 'subprocess' | 'in-process';
 
 export interface PluginActionSpec {
@@ -343,6 +360,95 @@ export interface VoiceprintStatusView {
   modelReady: boolean;
   profiles: VoiceprintProfileView[];
 }
+export type UsageGranularity = 'day' | 'week' | 'month';
+export type UsageCurrency = 'CNY' | 'USD';
+export type UsageActor = 'router' | 'worker' | 'decision' | 'distiller' | 'dreamer' | 'probe' | 'compaction';
+export type UsageCostSource = 'provider' | 'catalog' | 'estimated' | 'free' | 'unknown';
+
+export interface UsagePreferences {
+  currency: UsageCurrency; // default 'CNY'
+  usdToCnyRate: number;    // default 7.25
+}
+
+export interface UsageTotalsView {
+  calls: number;
+  successCalls: number;
+  failedCalls: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  reasoningTokens: number;
+  totalTokens: number;
+  costUsd: number;
+  costCny: number;
+}
+
+export interface UsageTodaySummary {
+  date: string; // YYYY-MM-DD
+  calls: number;
+  totalTokens: number;
+  costUsd: number;
+  costCny: number;
+  currency: UsageCurrency;
+  usdToCnyRate: number;
+}
+
+export interface UsageModelBreakdownView extends UsageTotalsView {
+  spec: string;
+  provider: string;
+  model: string;
+  tokenShare: number;
+  costShare: number;
+  unitInputUsdPer1M: number;
+  unitOutputUsdPer1M: number;
+  costSource: UsageCostSource;
+  actors: Partial<Record<UsageActor, number>>;
+  lastUsedAt: number;
+}
+
+export interface UsageBucketView {
+  key: string;
+  label: string;
+  startAt: number;
+  endAt: number;
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  costUsd: number;
+  costCny: number;
+}
+
+export interface UsagePeriodSummaryView {
+  key: string;
+  anchorDate: string;
+  label: string;
+  isCurrent: boolean;
+  calls: number;
+  totalTokens: number;
+  costUsd: number;
+  costCny: number;
+}
+
+export interface UsageReportView {
+  granularity: UsageGranularity;
+  anchorDate: string;
+  periodLabel: string;
+  prevAnchorDate: string;
+  nextAnchorDate: string;
+  todayDate: string;
+  startAt: number;
+  endAt: number;
+  tzOffsetMin: number;
+  prefs: UsagePreferences;
+  totals: UsageTotalsView;
+  byModel: UsageModelBreakdownView[];
+  byActor: Partial<Record<UsageActor, UsageTotalsView>>;
+  buckets: UsageBucketView[];
+  recentPeriods: UsagePeriodSummaryView[];
+}
+
 export interface MainView {
   mode: 'real' | 'offline'; health: { status: string; executorAvailable: boolean };
   messages: MessagePage; works: WorkView[]; cursor: number;
@@ -353,4 +459,5 @@ export interface MainView {
   plugins?: PluginView[];
   imChannels?: ImChannelView[];
   voiceprint?: VoiceprintStatusView;
+  usageToday?: UsageTodaySummary;
 }

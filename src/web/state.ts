@@ -2,7 +2,7 @@ import type { ChatMessage, MainView, TraceEvent, VoiceprintStatusView } from '..
 import { createHttpClient, resolveBootstrapToken } from './shared/auth-http.js';
 
 export type Selection = { type: 'all' } | { type: 'task' | 'message'; id: string; label: string };
-export type ModalKey = 'memory' | 'timer' | 'plugin' | 'im' | 'model' | 'health';
+export type ModalKey = 'memory' | 'timer' | 'plugin' | 'im' | 'model' | 'usage' | 'health';
 
 export interface Submission {
   requestId: string;

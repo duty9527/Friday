@@ -869,7 +869,7 @@ export function createRouterTools(
     },
   }, {
     name: 'send_file',
-    description: 'Send a file attachment via an authenticated IM attachment channel (e.g. WeChat). Input JSON {name, content?}. Pass UTF-8 text/Markdown in content to stage and send directly without a Worker; omit content to send an existing staged file (1B..16MiB) from FRIDAY_WECHAT_ATTACHMENT_DIR or <home>/wechat-files.',
+    description: 'Send a file attachment via an authenticated IM attachment channel (WeChat or Telegram). Input JSON {name, content?}. Pass UTF-8 text/Markdown in content to stage and send directly without a Worker; omit content to send an existing staged file (1B..16MiB) from FRIDAY_WECHAT_ATTACHMENT_DIR or <home>/wechat-files.',
     execute: async input => {
       if (host.isClosing()) throw new Error('Service is shutting down');
       const turn = host.getTurn();
@@ -879,13 +879,16 @@ export function createRouterTools(
         throw new Error('Invalid attachment name');
       }
       const currentOrigin = turn?.chatContext?.message.origin ?? turn?.activeReportTask?.origin;
-      const origin = currentOrigin?.channel === 'wechat'
+      const origin = (currentOrigin?.channel === 'wechat' || currentOrigin?.channel === 'telegram')
         ? currentOrigin
         : (!currentOrigin?.channel || currentOrigin.channel === 'local' || currentOrigin.channel === 'xiaoai')
-          ? host.resolveChannelOrigin('wechat')
+          ? (host.resolveChannelOrigin('wechat') ?? host.resolveChannelOrigin('telegram'))
           : undefined;
-      if (!origin || origin.channel !== 'wechat' || !origin.channelId || !origin.senderId) {
-        throw new Error('当前未找到已认证的微信会话或绑定通道，无法发送微信附件');
+      const target = origin?.channel === 'telegram'
+        ? (origin.conversationId ?? origin.senderId)
+        : origin?.senderId;
+      if (!origin || (origin.channel !== 'wechat' && origin.channel !== 'telegram') || !origin.channelId || !target) {
+        throw new Error('当前未找到可用的微信或 Telegram 会话/绑定通道，无法发送附件');
       }
       if (args.content !== undefined) {
         const contentText = text(args.content, 'content', 65_536);
@@ -893,12 +896,19 @@ export function createRouterTools(
         await mkdir(outboxRoot, { recursive: true, mode: 0o700 });
         await writeFile(join(outboxRoot, fileName), contentText, { encoding: 'utf8', mode: 0o600 });
       }
-      await host.im.sendWechatAttachment(origin.channelId, fileName, {
-        target: origin.senderId,
-        contextToken: origin.contextToken,
-      });
+      if (origin.channel === 'telegram') {
+        await host.im.sendTelegramAttachment(origin.channelId, fileName, {
+          target,
+          ...(origin.replyToMessageId ? { replyToMessageId: origin.replyToMessageId } : {}),
+        });
+      } else {
+        await host.im.sendWechatAttachment(origin.channelId, fileName, {
+          target,
+          contextToken: origin.contextToken,
+        });
+      }
       if (turn && !turn.chatContext && turn.activeReportTask) turn.reportTurnSentFile = true;
-      return JSON.stringify({ sent: true, name: fileName, target: origin.senderId });
+      return JSON.stringify({ sent: true, name: fileName, channel: origin.channel, target });
     },
   }, {
     name: 'switch_channel',

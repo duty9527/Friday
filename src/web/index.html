@@ -39,6 +39,11 @@
         <span>模型与提供方</span>
         <span id="model-top-badge" class="hub-pill-badge">—</span>
       </button>
+      <button id="open-usage-hub-top" class="hub-pill-btn" type="button">
+        <span class="hub-pill-icon" aria-hidden="true">📊</span>
+        <span>模型用量</span>
+        <span id="usage-top-badge" class="hub-pill-badge">0</span>
+      </button>
       <button id="open-health-hub-top" class="hub-pill-btn health-pill-btn" type="button">
         <span class="hub-pill-icon" aria-hidden="true">❤️</span>
         <span>健康管理</span>
@@ -308,6 +313,32 @@
                 <button id="im-wechat-qr-close" class="mini-button" type="button">关闭</button>
               </div>
             </div>
+          </div>
+        </section>
+
+        <section class="model-modal-section">
+          <div class="telegram-hero-card">
+            <div class="modal-row-head">
+              <div class="hub-card-title-group">
+                <h3>✈️ Telegram Bot 一键快速接入</h3>
+                <span class="hub-badge badge-blue">本机长轮询 · 无需公网 Webhook</span>
+              </div>
+            </div>
+            <p class="telegram-guide-tip">💡 粘贴从 @BotFather 获取的 Bot Token 即可自动验活、清理冲突 Webhook 并注册常见斜杠命令菜单。</p>
+            <div class="telegram-quick-form">
+              <label class="telegram-field-token">
+                <span class="meta">Bot Token</span>
+                <input id="im-tg-token-input" type="password" maxlength="512" autocomplete="off" placeholder="123456789:AAH..." aria-label="Telegram Bot Token">
+              </label>
+              <label class="telegram-field-allow">
+                <span class="meta">发送方白名单（可选，逗号或空格分隔）</span>
+                <input id="im-tg-allow-input" type="text" maxlength="512" placeholder="如：@myname, 123456789" aria-label="Telegram 发送方白名单">
+              </label>
+              <div class="telegram-quick-action">
+                <button id="im-tg-quick-btn" class="primary telegram-quick-trigger" type="button">🚀 一键接入</button>
+              </div>
+            </div>
+            <p id="im-tg-quick-status" class="telegram-quick-status" hidden></p>
           </div>
         </section>
 
@@ -765,6 +796,91 @@
             </div>
           </div>
           <div id="health-records-list" class="health-records-list"><p class="empty">尚无测量记录。</p></div>
+        </section>
+      </div>
+    </div>
+  </div>
+  <!-- 7. 模型用量统计弹窗 -->
+  <div id="usage-hub-backdrop" class="modal-backdrop" hidden>
+    <div id="usage-hub-modal" class="model-modal hub-modal usage-modal" role="dialog" aria-modal="true" aria-labelledby="usage-modal-title">
+      <div class="model-modal-header usage-modal-header">
+        <div>
+          <h2 id="usage-modal-title">📊 模型调用用量与费用账本</h2>
+          <p class="usage-header-sub">按日 / 周 / 月统计全链路模型调用次数、Token 消耗与汇率折算金额</p>
+        </div>
+        <div class="modal-btn-group">
+          <button id="usage-refresh-btn" class="mini-button" type="button">🔄 刷新</button>
+          <button id="usage-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
+        </div>
+      </div>
+      <div class="model-modal-body">
+        <section class="usage-toolbar" aria-label="用量统计维度与汇率控制">
+          <div class="usage-toolbar-row">
+            <div class="hub-filter-pills" role="tablist" aria-label="统计维度">
+              <button id="usage-gran-day" class="hub-filter-pill active" type="button" data-granularity="day" aria-selected="true">按日查看</button>
+              <button id="usage-gran-week" class="hub-filter-pill" type="button" data-granularity="week" aria-selected="false">按周汇总</button>
+              <button id="usage-gran-month" class="hub-filter-pill" type="button" data-granularity="month" aria-selected="false">按月汇总</button>
+            </div>
+            <div class="usage-date-nav">
+              <button id="usage-prev-btn" class="mini-button" type="button">◀ 上一周期</button>
+              <input id="usage-date-input" class="usage-date-input" type="date" aria-label="选择统计日期">
+              <button id="usage-next-btn" class="mini-button" type="button">下一周期 ▶</button>
+              <button id="usage-today-btn" class="mini-button" type="button">回到今天</button>
+            </div>
+          </div>
+          <div class="usage-toolbar-row usage-prefs-row">
+            <div class="usage-period-banner">
+              <strong id="usage-period-label" class="usage-period-label">—</strong>
+              <span id="usage-tz-chip" class="hub-meta-chip">本地时区</span>
+            </div>
+            <div class="usage-currency-controls">
+              <div class="hub-filter-pills" role="group" aria-label="展示币种">
+                <button id="usage-curr-cny" class="hub-filter-pill active" type="button" data-currency="CNY">¥ 人民币</button>
+                <button id="usage-curr-usd" class="hub-filter-pill" type="button" data-currency="USD">$ 美元</button>
+              </div>
+              <label class="usage-rate-label">
+                <span class="meta">1 USD =</span>
+                <input id="usage-rate-input" class="usage-rate-input" type="number" min="0.1" max="100" step="0.01" value="7.25" aria-label="美元兑人民币汇率">
+                <span class="meta">CNY</span>
+              </label>
+              <button id="usage-rate-save-btn" class="mini-button" type="button">保存汇率</button>
+            </div>
+          </div>
+          <p id="usage-status-banner" class="error" role="status" hidden></p>
+        </section>
+
+        <div id="usage-kpi-grid" class="hub-kpi-grid"></div>
+
+        <section class="model-modal-section" aria-label="分时段趋势柱状图">
+          <div class="modal-row-head">
+            <h3 id="usage-chart-title">分时趋势</h3>
+            <span id="usage-chart-subtitle" class="meta">柱高按消耗金额或 Token 占比绘制 · 悬停查看详情</span>
+          </div>
+          <div id="usage-chart-shell" class="usage-chart-shell"></div>
+        </section>
+
+        <section class="model-modal-section" aria-label="近期多周期对比">
+          <div class="modal-row-head">
+            <h3 id="usage-recent-title">近 7 日对比</h3>
+            <span class="meta">点击任意一期即可切换查看</span>
+          </div>
+          <div id="usage-recent-grid" class="usage-recent-grid"></div>
+        </section>
+
+        <section class="model-modal-section" aria-label="按模型用量明细">
+          <div class="modal-row-head">
+            <h3>按模型用量明细</h3>
+            <span id="usage-models-subtitle" class="meta"></span>
+          </div>
+          <div id="usage-models-list" class="hub-cards-grid"><p class="empty">当前周期暂无模型调用记录。</p></div>
+        </section>
+
+        <section class="model-modal-section" aria-label="按角色分摊概览">
+          <div class="modal-row-head">
+            <h3>按角色分摊概览</h3>
+            <span class="meta">覆盖主控、Worker、决策引擎、记忆提炼、做梦与探针</span>
+          </div>
+          <div id="usage-actors-grid" class="usage-actors-grid"></div>
         </section>
       </div>
     </div>

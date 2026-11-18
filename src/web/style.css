@@ -2545,3 +2545,325 @@ pre {
     align-items:flex-start;
   }
 }
+
+/* Telegram Quick Connect Hero Card */
+.telegram-hero-card {
+  background:linear-gradient(135deg,#eff6ff 0%,#ffffff 68%);
+  border:1px solid #bfdbfe;
+  border-radius:12px;
+  padding:16px 20px;
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+}
+.telegram-hero-card h3 {
+  margin:0;
+  font-size:15px;
+}
+.telegram-guide-tip {
+  margin:0;
+  font-size:12px;
+  line-height:1.5;
+  color:#1e40af;
+  background:#e8f1ff;
+  border:1px solid #c7dfff;
+  border-radius:8px;
+  padding:8px 12px;
+}
+.telegram-quick-form {
+  display:grid;
+  grid-template-columns:minmax(220px,1.25fr) minmax(200px,1fr) auto;
+  gap:10px;
+  align-items:end;
+}
+.telegram-quick-form label {
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+  margin-bottom:0;
+}
+.telegram-quick-action {
+  display:flex;
+  align-items:center;
+}
+.telegram-quick-trigger {
+  min-height:34px;
+  padding:5px 16px;
+  font-size:13px;
+  font-weight:600;
+  background:#1d4ed8;
+  border-color:#1d4ed8;
+  color:#ffffff;
+  white-space:nowrap;
+}
+.telegram-quick-trigger:hover:not(:disabled) {
+  background:#1e40af;
+  border-color:#1e40af;
+}
+.telegram-quick-status {
+  margin:0;
+  padding:9px 12px;
+  border-radius:8px;
+  font-size:12.5px;
+  font-weight:600;
+  line-height:1.5;
+  border:1px solid var(--border);
+  background:var(--surface);
+}
+.telegram-quick-status.is-pending {
+  border-color:#bfdbfe;
+  background:#eff6ff;
+  color:#1e40af;
+}
+.telegram-quick-status.is-ok {
+  border-color:#9bd3ae;
+  background:#f0fdf4;
+  color:#166534;
+}
+.telegram-quick-status.is-error {
+  border-color:#f5c2c7;
+  background:#fff5f5;
+  color:var(--negative);
+}
+
+/* Model Usage Dashboard Modal & SVG Chart */
+.usage-modal {
+  width:min(1060px,100%);
+}
+.usage-modal-header {
+  align-items:center;
+}
+.usage-header-sub {
+  margin:2px 0 0;
+  font-size:12px;
+  color:var(--muted);
+}
+.usage-toolbar {
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:10px;
+  padding:12px 14px;
+}
+.usage-toolbar-row {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  flex-wrap:wrap;
+}
+.usage-prefs-row {
+  padding-top:8px;
+  border-top:1px dashed var(--border);
+}
+.usage-date-nav {
+  display:flex;
+  align-items:center;
+  gap:6px;
+  flex-wrap:wrap;
+}
+.usage-date-input {
+  width:auto;
+  min-width:142px;
+  min-height:28px;
+  padding:2px 8px;
+  font-size:12px;
+  font-family:"IBM Plex Mono",monospace;
+}
+.usage-period-banner {
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-wrap:wrap;
+}
+.usage-period-label {
+  font-size:14px;
+  font-weight:600;
+  color:var(--text);
+}
+.usage-currency-controls {
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-wrap:wrap;
+}
+.usage-rate-label {
+  display:inline-flex;
+  align-items:center;
+  gap:5px;
+  margin:0;
+}
+.usage-rate-input {
+  width:76px;
+  min-height:26px;
+  padding:2px 6px;
+  font-size:12px;
+  font-family:"IBM Plex Mono",monospace;
+  text-align:right;
+}
+.usage-chart-shell {
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:10px;
+  padding:12px 14px;
+}
+.usage-chart-svg {
+  display:block;
+  width:100%;
+  height:auto;
+  max-height:236px;
+}
+.usage-chart-grid {
+  stroke:var(--border);
+  stroke-width:1;
+  stroke-dasharray:3 3;
+}
+.usage-chart-baseline {
+  stroke:var(--control);
+  stroke-width:1;
+}
+.usage-chart-axis,
+.usage-chart-xaxis {
+  fill:var(--muted);
+  font-size:10.5px;
+  font-family:"IBM Plex Mono",monospace;
+}
+.usage-chart-hit {
+  fill:transparent;
+}
+.usage-chart-bar.has-value {
+  fill:var(--accent);
+  transition:fill .12s ease;
+}
+.usage-chart-bar.is-zero {
+  fill:var(--border);
+}
+.usage-chart-bar-group:hover .usage-chart-hit {
+  fill:rgba(27,108,128,0.06);
+}
+.usage-chart-bar-group:hover .usage-chart-bar.has-value {
+  fill:#134e5e;
+}
+.usage-recent-grid {
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(132px,1fr));
+  gap:8px;
+}
+.usage-period-card {
+  display:flex;
+  flex-direction:column;
+  align-items:flex-start;
+  gap:4px;
+  padding:10px 12px;
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:9px;
+  text-align:left;
+  min-height:0;
+}
+.usage-period-card:hover:not(:disabled) {
+  border-color:var(--accent);
+  background:#f8fbfc;
+}
+.usage-period-card.is-selected {
+  border-color:var(--accent);
+  background:#edf6f8;
+  box-shadow:0 0 0 1px rgba(27,108,128,0.25);
+}
+.usage-period-card-head {
+  width:100%;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:6px;
+}
+.usage-period-card-label {
+  font-size:12px;
+  font-weight:600;
+  color:var(--text);
+}
+.usage-period-card-money {
+  font-size:15px;
+  font-weight:600;
+  color:var(--text);
+  font-variant-numeric:tabular-nums;
+}
+.usage-model-cost-group {
+  display:flex;
+  align-items:baseline;
+  gap:6px;
+  flex-shrink:0;
+}
+.usage-model-cost-primary {
+  font-size:15px;
+  font-weight:600;
+  color:var(--accent);
+}
+.usage-progress-row {
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+}
+.usage-progress-label {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:8px;
+  flex-wrap:wrap;
+}
+.usage-share-progress {
+  width:100%;
+  height:8px;
+  border-radius:999px;
+  overflow:hidden;
+  border:1px solid var(--border);
+  background:var(--raised);
+}
+.usage-share-progress::-webkit-progress-bar {
+  background:var(--raised);
+}
+.usage-share-progress::-webkit-progress-value {
+  background:var(--accent);
+  border-radius:999px;
+}
+.usage-share-progress::-moz-progress-bar {
+  background:var(--accent);
+  border-radius:999px;
+}
+.usage-actors-grid {
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(160px,1fr));
+  gap:10px;
+}
+.usage-actor-card {
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:9px;
+  padding:10px 12px;
+  display:flex;
+  flex-direction:column;
+  gap:3px;
+}
+.usage-actor-card.has-calls {
+  border-left:3px solid var(--accent);
+}
+.usage-actor-name {
+  font-size:12px;
+  font-weight:600;
+  color:var(--muted);
+}
+.usage-actor-calls {
+  font-size:16px;
+  font-weight:600;
+  color:var(--text);
+}
+@media(max-width:730px) {
+  .telegram-quick-form {
+    grid-template-columns:1fr;
+  }
+  .usage-recent-grid {
+    grid-template-columns:repeat(auto-fill,minmax(120px,1fr));
+  }
+}

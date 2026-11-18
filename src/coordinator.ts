@@ -74,7 +74,7 @@ import {
   formatTaskSessionId,
   resolveRuntimeMessageSession,
 } from './session.js';
-import { Store, type Operation, type Task, type TaskStatus, type Timer } from './store.js';
+import { Store, type Operation, type Task, type TaskStatus, type Timer, type UsageActor } from './store.js';
 import { PromptTrace } from './trace.js';
 import type {
   AttachmentView,
@@ -155,6 +155,7 @@ export class Coordinator {
   private readonly subconscious: SubconsciousController;
   private readonly timer: NodeJS.Timeout;
   private closing = false;
+  private storeClosed = false;
 
   constructor(
     private readonly home: string,
@@ -201,6 +202,12 @@ export class Coordinator {
         this.factory.updateModelConfig?.(tiers, routerProvider, routerModel, disabledProviders);
       },
     );
+    this.factory.onModelUsage = entry => {
+      this.recordLiveModelUsage(entry);
+    };
+    this.modelHub.setUsageListener(entry => {
+      this.recordLiveModelUsage(entry);
+    });
 
     this.timers = new TimerScheduler({
       home: this.home,
@@ -351,6 +358,48 @@ export class Coordinator {
     return this.executorStatus();
   }
 
+  private recordLiveModelUsage(entry: {
+    actor: UsageActor;
+    sessionId?: string;
+    provider: string;
+    model: string;
+    status: 'completed' | 'failed' | 'interrupted';
+    usage: unknown;
+  }): void {
+    if (this.storeClosed) return;
+    try {
+      let taskId: string | undefined;
+      let messageId: string | undefined;
+      if ((entry.actor === 'worker' || entry.actor === 'compaction') && entry.sessionId && this.runs.has(entry.sessionId)) {
+        taskId = entry.sessionId;
+        try {
+          messageId = this.store.get(taskId).originMessageId;
+        } catch {
+          // ignore missing task
+        }
+      } else if (entry.actor === 'router') {
+        messageId = this.currentTurn?.chatContext?.message.id
+          ?? this.currentTurn?.activeReportTask?.originMessageId
+          ?? this.currentTurn?.activeFailureTask?.originMessageId;
+        taskId = this.currentTurn?.activeReportTask?.id
+          ?? this.currentTurn?.activeFailureTask?.id;
+      }
+      const catalogRate = this.modelHub.getModelCostRates(entry.provider, entry.model);
+      this.store.recordUsage({
+        actor: entry.actor,
+        provider: entry.provider,
+        model: entry.model,
+        status: entry.status,
+        usage: entry.usage,
+        ...(catalogRate ? { catalogRate } : {}),
+        ...(taskId ? { taskId } : {}),
+        ...(messageId ? { messageId } : {}),
+      });
+    } catch {
+      // Never allow usage ledger recording to interrupt live agent execution.
+    }
+  }
+
   async ready() {
     if (this.executor) {
       await this.executor.ready;
@@ -359,6 +408,10 @@ export class Coordinator {
       this.factory.initialApiKey && this.factory.modelTiers?.provider
         ? { [this.factory.modelTiers.provider]: this.factory.initialApiKey }
         : undefined,
+    );
+    this.store.backfillUsage(
+      this.factory.routerProvider ?? this.factory.modelTiers?.provider,
+      this.factory.modelTiers?.router,
     );
     await this.modelHub.syncDecisionEraStats(this.store.list());
     backfillPersistedSessions(this.store);
@@ -1267,7 +1320,7 @@ export class Coordinator {
       needsQualityGateProb?: number;
       source?: DecisionSource;
       attempted?: boolean;
-      usage?: { inputTokens: number; totalTokens: number };
+      usage?: { inputTokens: number; outputTokens?: number; totalTokens: number };
       fallbackReason?: string;
     };
     try {
@@ -2117,6 +2170,7 @@ export class Coordinator {
     await this.semanticWarmup?.catch(() => {});
     this.outboundListeners.clear();
     this.router?.close();
+    this.storeClosed = true;
     this.store.close();
     await Promise.resolve(this.semantic.close?.()).catch(() => {});
   }

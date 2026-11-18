@@ -2,7 +2,7 @@ import { timingSafeEqual } from 'node:crypto';
 import type { Coordinator } from '../coordinator.js';
 import type { VoiceFastpathRequest, VoiceFastpathResult } from '../plugin.js';
 import type { ImChannelConfig } from '../store.js';
-import type { ChatMessage, ImPlatform, MessageOrigin } from '../view.js';
+import type { ChatMessage, ImChannelView, ImPlatform, MessageOrigin } from '../view.js';
 import type { ReceivedAttachment } from '../wechat-inbound.js';
 import type { XiaoaiSshRunner } from '../xiaoai/ssh.js';
 import type { XiaoaiKwsMonitorOptions } from '../xiaoai/kws-monitor.js';
@@ -16,6 +16,33 @@ export interface XiaoaiMatchedSpeaker {
   name: string;
   role: 'owner' | 'member';
   score: number;
+}
+
+export interface TelegramMediaItem {
+  kind: 'image' | 'file';
+  fileId: string;
+  fileName: string;
+  mimeType?: string;
+  fileSize?: number;
+}
+
+export interface TelegramQuickConnectView {
+  ok: boolean;
+  bot: {
+    id: number;
+    username?: string;
+    firstName: string;
+  };
+  commandsRegistered: boolean;
+  commandsError?: string;
+  webhookCleared: boolean;
+  channel: ImChannelView;
+}
+
+export interface TelegramSyncCommandsView {
+  ok: boolean;
+  count: number;
+  channel: ImChannelView;
 }
 
 export interface ImInboundMessage {
@@ -33,6 +60,8 @@ export interface ImInboundMessage {
   replyWebhook?: string;
   contextToken?: string;
   mediaItems?: Record<string, unknown>[];
+  telegramMedia?: TelegramMediaItem[];
+  callbackQueryId?: string;
 }
 
 export interface ImWebhookResponse {
@@ -47,6 +76,7 @@ export interface ImSendOptions {
   replyWebhook?: string;
   contextToken?: string;
   waitForCompletion?: boolean;
+  replyMarkup?: Record<string, unknown>;
 }
 
 export interface FastpathTurnInput {

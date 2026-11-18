@@ -29,6 +29,24 @@ import {
   type TaskListOptions,
   type TaskStatus,
 } from './store/task-store.js';
+import {
+  UsageStore,
+  type UsageActor,
+  type UsageBucketView,
+  type UsageCostSource,
+  type UsageCurrency,
+  type UsageGranularity,
+  type UsageModelBreakdownView,
+  type UsagePeriodSummaryView,
+  type UsagePreferences,
+  type UsagePrefsPatch,
+  type UsageQueryOptions,
+  type UsageRecordInput,
+  type UsageReportView,
+  type UsageStatus,
+  type UsageTodaySummary,
+  type UsageTotalsView,
+} from './store/usage-store.js';
 import type { ImChannelView, MemoryCard, MemoryDirectory, SynapseRelation } from './view.js';
 
 export type {
@@ -51,6 +69,21 @@ export type {
   TaskListOptions,
   TaskStatus,
   Timer,
+  UsageActor,
+  UsageBucketView,
+  UsageCostSource,
+  UsageCurrency,
+  UsageGranularity,
+  UsageModelBreakdownView,
+  UsagePeriodSummaryView,
+  UsagePreferences,
+  UsagePrefsPatch,
+  UsageQueryOptions,
+  UsageRecordInput,
+  UsageReportView,
+  UsageStatus,
+  UsageTodaySummary,
+  UsageTotalsView,
 };
 export { memoryDocumentText };
 
@@ -64,6 +97,7 @@ export class Store {
   private readonly runtimeOps: RuntimeOpsStore;
   private readonly memories: MemoryStore;
   private readonly consolidation: ConsolidationStore;
+  private readonly usage: UsageStore;
   readonly conversation: Conversation;
 
   constructor(readonly home: string) {
@@ -80,6 +114,7 @@ export class Store {
       this.memories,
       this.conversation,
     );
+    this.usage = new UsageStore(this.sqlite.db, atomic);
   }
 
   attachSemanticEngine(engine?: SemanticEmbedder): void {
@@ -350,11 +385,37 @@ export class Store {
     this.consolidation.advanceSubconsciousTurn(surfacedInsightId, now);
   }
 
+  // --- Model Usage Ledger & Reporting ---
+  recordUsage(input: UsageRecordInput): void {
+    this.usage.recordUsage(input);
+  }
+
+  queryUsage(options?: { granularity?: UsageGranularity; anchorDate?: string; tzOffsetMin?: number }): UsageReportView {
+    return this.usage.queryUsage(options);
+  }
+
+  todayUsageSummary(tzOffsetMin?: number): UsageTodaySummary {
+    return this.usage.todayUsageSummary(tzOffsetMin);
+  }
+
+  getUsagePrefs(): UsagePreferences {
+    return this.usage.getUsagePrefs();
+  }
+
+  setUsagePrefs(patch: { currency?: UsageCurrency; usdToCnyRate?: number }): UsagePreferences {
+    return this.usage.setUsagePrefs(patch);
+  }
+
+  backfillUsage(defaultProvider?: string, defaultRouterModel?: string): number {
+    return this.usage.backfillFromJournalIfNeeded(defaultProvider, defaultRouterModel);
+  }
+
   // --- Recovery & Lifecycle ---
   recover(): void {
     this.transaction(() => {
       this.tasks.recoverTasks();
       this.conversation.recover();
+      this.usage.backfillFromJournalIfNeeded();
     });
   }
 

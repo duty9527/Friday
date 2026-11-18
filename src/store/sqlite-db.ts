@@ -45,6 +45,28 @@ export class SqliteDb {
       );
       CREATE TABLE IF NOT EXISTS im_channels(id TEXT PRIMARY KEY, platform TEXT NOT NULL, updated_at INTEGER NOT NULL, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS notices(seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS model_usage(
+        id TEXT PRIMARY KEY,
+        at INTEGER NOT NULL,
+        actor TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+        reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+        total_tokens INTEGER NOT NULL DEFAULT 0,
+        cost_usd REAL NOT NULL DEFAULT 0,
+        unit_input_usd REAL NOT NULL DEFAULT 0,
+        unit_output_usd REAL NOT NULL DEFAULT 0,
+        cost_source TEXT NOT NULL DEFAULT 'unknown',
+        status TEXT NOT NULL DEFAULT 'completed',
+        task_id TEXT,
+        message_id TEXT
+      );
+      CREATE INDEX IF NOT EXISTS model_usage_at ON model_usage(at);
+      CREATE INDEX IF NOT EXISTS model_usage_model ON model_usage(provider, model, at);
     `);
     this.migrateMemoriesColumns();
     this.migrateMemoryEmbeddingsFk();

@@ -72,7 +72,7 @@ export interface DecisionRouteResult {
   needsQualityGateProb?: number;
   source: DecisionSource;
   attempted: boolean;
-  usage?: { inputTokens: number; totalTokens: number };
+  usage?: { inputTokens: number; outputTokens?: number; totalTokens: number };
   fallbackReason?: string;
 }
 
@@ -90,7 +90,7 @@ export interface CompletionEvaluationInput {
 export interface CompletionEvaluationResult {
   assessment: QualityGateAssessment;
   attempted: boolean;
-  usage?: { inputTokens: number; totalTokens: number };
+  usage?: { inputTokens: number; outputTokens?: number; totalTokens: number };
   fallbackReason?: string;
 }
 
@@ -120,7 +120,7 @@ export interface SessionContinuityResult {
   relation: 'answer_clarification' | 'post_task_discussion' | 'topic_continuity' | 'dialogue_followup' | 'new_topic';
   source: DecisionSource;
   attempted: boolean;
-  usage?: { inputTokens: number; totalTokens: number };
+  usage?: { inputTokens: number; outputTokens?: number; totalTokens: number };
   fallbackReason?: string;
 }
 
@@ -200,6 +200,18 @@ export function resolveDecisionEndpoint(baseUrl?: string): string {
   return `${clean}/v1beta/decisions`;
 }
 
+function mergeDecisionUsage(res: {
+  usage?: { inputTokens: number; totalTokens: number };
+  outputTokens?: number;
+}): { inputTokens: number; outputTokens?: number; totalTokens: number } | undefined {
+  if (!res.usage) return undefined;
+  return {
+    inputTokens: res.usage.inputTokens,
+    ...(res.outputTokens !== undefined ? { outputTokens: res.outputTokens } : {}),
+    totalTokens: res.usage.totalTokens,
+  };
+}
+
 export async function requestGeminiDecisions(
   credentials: DecisionCredentials,
   input: DecisionInput,
@@ -207,6 +219,7 @@ export async function requestGeminiDecisions(
 ): Promise<{
   answers: Record<string, DecisionResponseAnswer>;
   usage?: { inputTokens: number; totalTokens: number };
+  outputTokens?: number;
 }> {
   const endpoint = resolveDecisionEndpoint(credentials.baseUrl);
   const res = await fetch(endpoint, {
@@ -231,13 +244,20 @@ export async function requestGeminiDecisions(
   if (!payload || typeof payload !== 'object' || !payload.answers || typeof payload.answers !== 'object') {
     throw new Error(payload?.error?.message || 'Gemini Decision API response missing answers');
   }
-  const usage = payload.usage
-    ? {
-        inputTokens: Number(payload.usage.total_input_tokens ?? 0),
-        totalTokens: Number(payload.usage.total_tokens ?? 0),
-      }
-    : undefined;
-  return { answers: payload.answers, usage };
+  if (!payload.usage) {
+    return { answers: payload.answers };
+  }
+  const inputTokens = Number(payload.usage.total_input_tokens ?? 0);
+  const rawTotal = Number(payload.usage.total_tokens ?? 0);
+  const rawOut = payload.usage.total_output_tokens;
+  const outputTokens = typeof rawOut === 'number' && Number.isFinite(rawOut)
+    ? Math.max(0, rawOut)
+    : Math.max(0, rawTotal - inputTokens);
+  const usage = {
+    inputTokens,
+    totalTokens: rawTotal > 0 ? rawTotal : inputTokens + outputTokens,
+  };
+  return { answers: payload.answers, usage, outputTokens };
 }
 
 function resolveChoiceAnswer(answer: DecisionResponseAnswer | undefined, validKeys: Set<string>): { key?: string; confidence?: number } {
@@ -625,7 +645,7 @@ export async function decideWorkerRoute(
         ...gateFields,
         source: 'gemini-decision-1',
         attempted: true,
-        usage: res.usage,
+        usage: mergeDecisionUsage(res),
       };
     }
     return {
@@ -636,7 +656,7 @@ export async function decideWorkerRoute(
       ...gateFields,
       source: 'heuristic',
       attempted: true,
-      usage: res.usage,
+      usage: mergeDecisionUsage(res),
       fallbackReason: 'Gemini Decision API returned no valid candidate key',
     };
   } catch (error) {
@@ -777,7 +797,7 @@ export async function evaluateWorkCompletion(
       return {
         assessment: fallback,
         attempted: true,
-        usage: res.usage,
+        usage: mergeDecisionUsage(res),
         fallbackReason: 'Gemini Decision API returned non-numeric completion score or noul',
       };
     }
@@ -814,7 +834,7 @@ export async function evaluateWorkCompletion(
         evaluatedAt: Date.now(),
       },
       attempted: true,
-      usage: res.usage,
+      usage: mergeDecisionUsage(res),
     };
   } catch (error) {
     return {
@@ -904,7 +924,7 @@ export async function evaluateSessionContinuity(
       return {
         ...fallback,
         attempted: true,
-        usage: res.usage,
+        usage: mergeDecisionUsage(res),
         fallbackReason: 'Gemini Decision API returned non-numeric same_session probability',
       };
     }
@@ -931,7 +951,7 @@ export async function evaluateSessionContinuity(
       relation,
       source: 'gemini-decision-1',
       attempted: true,
-      usage: res.usage,
+      usage: mergeDecisionUsage(res),
     };
   } catch (error) {
     return {

@@ -7,7 +7,26 @@ import { Coordinator } from './coordinator.js';
 import { buildMindmapSnapshot } from './mindmap-flow.js';
 import { listPluginViews, runPlugin } from './plugin.js';
 import { integer, REQUEST_LIMIT, RESPONSE_LIMIT, socketPath, text, type Response } from './protocol.js';
-import type { ThinkingLevel } from './view.js';
+import type { ThinkingLevel, UsageCurrency, UsageGranularity } from './view.js';
+
+function parseUsageGranularity(raw: unknown): UsageGranularity {
+  if (raw === undefined) return 'day';
+  if (raw === 'day' || raw === 'week' || raw === 'month') return raw;
+  throw new Error('granularity must be day, week, or month');
+}
+
+function parseUsageAnchorDate(raw: unknown): string | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    throw new Error('anchorDate must be in YYYY-MM-DD format');
+  }
+  const [y, m, d] = raw.split('-').map(Number);
+  const dt = new Date(Date.UTC(y!, m! - 1, d!));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() + 1 !== m || dt.getUTCDate() !== d) {
+    throw new Error('anchorDate must be a valid calendar date');
+  }
+  return raw;
+}
 
 export interface ServiceOptions {
   home: string; mode: 'real' | 'offline'; offlineDelayMs?: number;
@@ -64,7 +83,44 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
             const health = coordinator.health();
             return { mode: options.mode, pid: process.pid, status: health.executorAvailable ? 'ready' : 'degraded', ...health };
           }
-          case 'view': return { ...coordinator.view(), modelHub: await coordinator.modelHub.getView() };
+          case 'view': return {
+            ...coordinator.view(),
+            modelHub: await coordinator.modelHub.getView(),
+            usageToday: store.todayUsageSummary(),
+          };
+          case 'model-usage': {
+            const granularity = parseUsageGranularity(command.granularity);
+            const anchorDate = parseUsageAnchorDate(command.anchorDate);
+            const tzOffsetMin = command.tzOffsetMin === undefined
+              ? undefined
+              : integer(command.tzOffsetMin, 0, -840, 840);
+            return store.queryUsage({
+              granularity,
+              ...(anchorDate ? { anchorDate } : {}),
+              ...(tzOffsetMin !== undefined ? { tzOffsetMin } : {}),
+            });
+          }
+          case 'model-usage-prefs': {
+            const patch: { currency?: UsageCurrency; usdToCnyRate?: number } = {};
+            if (command.currency !== undefined) {
+              if (command.currency !== 'CNY' && command.currency !== 'USD') {
+                throw new Error('currency must be CNY or USD');
+              }
+              patch.currency = command.currency;
+            }
+            if (command.usdToCnyRate !== undefined) {
+              if (
+                typeof command.usdToCnyRate !== 'number'
+                || !Number.isFinite(command.usdToCnyRate)
+                || command.usdToCnyRate < 0.1
+                || command.usdToCnyRate > 100
+              ) {
+                throw new Error('usdToCnyRate must be a finite number between 0.1 and 100');
+              }
+              patch.usdToCnyRate = command.usdToCnyRate;
+            }
+            return store.setUsagePrefs(patch);
+          }
           case 'mindmap': return await buildMindmapSnapshot(coordinator, {
             home,
             beforeSeq: command.before === undefined ? undefined : integer(command.before, 0, 1, Number.MAX_SAFE_INTEGER),
@@ -251,6 +307,35 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
           case 'im-wechat-qr-status': return await coordinator.im.pollWechatQrLogin(
             text(command.sessionId, 'sessionId', 256),
           );
+          case 'im-telegram-quick': {
+            const botToken = text(command.botToken, 'botToken', 512).trim();
+            const optionalText = (val: unknown, name: string, max: number): string | undefined => {
+              if (val === undefined) return undefined;
+              if (typeof val !== 'string' || val.length > max) {
+                throw new Error(`${name} must be a string of at most ${max} characters`);
+              }
+              const trimmed = val.trim();
+              return trimmed || undefined;
+            };
+            let allowedSenders: string[] | undefined;
+            if (command.allowedSenders !== undefined) {
+              if (!Array.isArray(command.allowedSenders) || !command.allowedSenders.every(s => typeof s === 'string')) {
+                throw new Error('allowedSenders must be a string array');
+              }
+              allowedSenders = command.allowedSenders.map(s => s.trim()).filter(Boolean);
+            }
+            return await coordinator.im.quickConnectTelegram({
+              botToken,
+              id: optionalText(command.id, 'id', 128),
+              name: optionalText(command.name, 'name', 120),
+              defaultTarget: optionalText(command.defaultTarget, 'defaultTarget', 256),
+              apiBase: optionalText(command.apiBase, 'apiBase', 1024),
+              notifyAll: command.notifyAll === undefined ? undefined : Boolean(command.notifyAll),
+              ...(allowedSenders !== undefined ? { allowedSenders } : {}),
+            });
+          }
+          case 'im-telegram-sync-commands':
+            return await coordinator.im.syncTelegramCommands(text(command.id, 'id', 128));
           case 'im-webhook': return await coordinator.im.handleWebhook(
             text(command.channelId, 'channelId', 128),
             text(command.method ?? 'POST', 'method', 16),

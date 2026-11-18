@@ -376,6 +376,24 @@ export async function startWeb(options: { home: string; port?: number }): Promis
           case '/api/plugins': command = { command: 'plugin-list' }; break;
           case '/api/im-channels': command = { command: 'im-list' }; break;
           case '/api/models': command = { command: 'model-hub' }; break;
+          case '/api/usage': {
+            let tzOffsetMin: number | undefined;
+            if (search.has('tzOffsetMin')) {
+              const rawTz = search.get('tzOffsetMin') ?? '';
+              if (!rawTz.trim()) throw new HttpFailure(400, 'Invalid tzOffsetMin');
+              try { tzOffsetMin = integer(Number(rawTz), 0, -840, 840); }
+              catch { throw new HttpFailure(400, 'Invalid tzOffsetMin'); }
+            }
+            const granularity = search.get('granularity') || undefined;
+            const anchorDate = search.get('anchorDate') || undefined;
+            command = {
+              command: 'model-usage',
+              ...(granularity !== undefined ? { granularity } : {}),
+              ...(anchorDate !== undefined ? { anchorDate } : {}),
+              ...(tzOffsetMin !== undefined ? { tzOffsetMin } : {}),
+            };
+            break;
+          }
           case '/api/memories':
             command = search.get('query')
               ? { command: 'memory-search', query: search.get('query'), scope: search.get('scope') ?? undefined, cwd: search.get('cwd') ?? undefined, limit: numeric('limit') }
@@ -393,8 +411,10 @@ export async function startWeb(options: { home: string; port?: number }): Promis
           '/api/plugin-run': 'plugin-run',
           '/api/im-save': 'im-save', '/api/im-toggle': 'im-toggle', '/api/im-remove': 'im-remove', '/api/im-test': 'im-test',
           '/api/im-wechat-qr-start': 'im-wechat-qr-start', '/api/im-wechat-qr-status': 'im-wechat-qr-status',
+          '/api/im-telegram-quick': 'im-telegram-quick', '/api/im-telegram-sync': 'im-telegram-sync-commands',
           '/api/voice-remove': 'voice-remove', '/api/voice-clear': 'voice-clear', '/api/voice-config': 'voice-config',
           '/api/model-configure': 'model-configure', '/api/model-probe': 'model-probe', '/api/model-fetch': 'model-fetch',
+          '/api/usage-prefs': 'model-usage-prefs',
         };
         const command = Object.hasOwn(commands, url.pathname) ? commands[url.pathname] : undefined;
         if (!command) throw new HttpFailure(404, 'Unknown API endpoint');

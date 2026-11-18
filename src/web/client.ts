@@ -13,6 +13,7 @@ import { initMemoryHub } from './hubs/memory-hub.js';
 import { initTimerPluginHub } from './hubs/timer-plugin-hub.js';
 import { initImVoiceHub } from './hubs/im-voice-hub.js';
 import { initModelHub } from './hubs/model-hub.js';
+import { initUsageHub } from './hubs/usage-hub.js';
 import type { HealthScaleUiController } from './plugins/health-scale-ui.js';
 import { api, appState, hooks, request } from './state.js';
 
@@ -31,6 +32,7 @@ const timerHubBackdrop = element<HTMLElement>('timer-hub-backdrop');
 const pluginHubBackdrop = element<HTMLElement>('plugin-hub-backdrop');
 const imHubBackdrop = element<HTMLElement>('im-hub-backdrop');
 const modelHubBackdrop = element<HTMLElement>('model-hub-backdrop');
+const usageHubBackdrop = element<HTMLElement>('usage-hub-backdrop');
 const healthHubBackdrop = element<HTMLElement>('health-hub-backdrop');
 const messagesEl = element('messages');
 const worksEl = element('works');
@@ -132,6 +134,7 @@ const memoryHub = initMemoryHub();
 const timerPluginHub = initTimerPluginHub();
 const imVoiceHub = initImVoiceHub();
 const modelHub = initModelHub();
+const usageHub = initUsageHub();
 
 let healthScaleUi: HealthScaleUiController | undefined;
 let healthScaleLoadPromise: Promise<HealthScaleUiController> | undefined;
@@ -169,6 +172,7 @@ function closeAllHubModals(): void {
   timerPluginHub.closePluginModal();
   imVoiceHub.closeModal();
   modelHub.closeModal();
+  usageHub.closeModal();
   healthScaleUi?.closeModal();
   healthHubBackdrop.hidden = true;
 }
@@ -190,6 +194,7 @@ function expireAuthentication(): void {
   timerPluginHub.renderPlugins();
   imVoiceHub.render();
   modelHub.render();
+  usageHub.render();
   chatPanel.renderMessages();
   syncCompanionState();
 }
@@ -251,6 +256,7 @@ async function refreshView(initial = false): Promise<void> {
     timerPluginHub.renderPlugins();
     imVoiceHub.render();
     modelHub.render();
+    usageHub.render();
     const healthPlugin = appState.view?.plugins?.find(p => p.name === 'health-scale');
     const healthEnabled = healthPlugin ? healthPlugin.enabled !== false : false;
     openHealthHubTop.hidden = !healthEnabled;
@@ -374,7 +380,7 @@ openHealthHubTop.addEventListener('click', () => {
     .finally(() => { openHealthHubTop.disabled = false; });
 });
 
-const modalBackdrops = [memoryHubBackdrop, timerHubBackdrop, pluginHubBackdrop, imHubBackdrop, modelHubBackdrop, healthHubBackdrop];
+const modalBackdrops = [memoryHubBackdrop, timerHubBackdrop, pluginHubBackdrop, imHubBackdrop, modelHubBackdrop, usageHubBackdrop, healthHubBackdrop];
 document.addEventListener('keydown', event => {
   if (event.key !== 'Escape') return;
   if (memoryHub.isImmersive()) {

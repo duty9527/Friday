@@ -82,6 +82,14 @@ export type {
   WorkerModelResolutionInput,
 };
 
+export interface ModelUsageEvent {
+  actor: 'decision' | 'probe';
+  provider: string;
+  model: string;
+  status: 'completed' | 'failed' | 'interrupted';
+  usage: unknown;
+}
+
 export class ModelHub {
   private readonly sdkDir: string;
   private readonly statePath: string;
@@ -92,6 +100,7 @@ export class ModelHub {
   /** 所有已配置且启用的 provider 的完整模型目录（仅用于禁用 provider 时的回退选择，不作为 Worker 模型池） */
   private cachedCatalog: PooledModelEntry[] = [];
   private cachedCosts = new Map<string, { costInput: number; costOutput: number }>();
+  private usageListener?: (entry: ModelUsageEvent) => void;
   private saveQueue: Promise<void> = Promise.resolve();
   private runtimePromise?: Promise<ModelRuntime>;
   private closed = false;
@@ -106,6 +115,83 @@ export class ModelHub {
   ) {
     this.sdkDir = join(home, 'sdk');
     this.statePath = join(this.sdkDir, 'model-hub.json');
+  }
+
+  setUsageListener(listener?: (entry: ModelUsageEvent) => void): void {
+    this.usageListener = listener;
+  }
+
+  private emitUsage(entry: ModelUsageEvent): void {
+    if (!this.usageListener) return;
+    try {
+      this.usageListener(entry);
+    } catch {
+      // Never allow usage telemetry errors to affect model hub operations.
+    }
+  }
+
+  private emitDecisionUsage(usage: { inputTokens: number; outputTokens?: number; totalTokens: number } | undefined): void {
+    if (!usage) return;
+    this.emitUsage({
+      actor: 'decision',
+      provider: 'google',
+      model: GEMINI_DECISION_MODEL,
+      status: 'completed',
+      usage,
+    });
+  }
+
+  getModelCostRates(
+    provider: string,
+    model: string,
+  ): { costInput: number; costOutput: number; costCacheRead?: number; costCacheWrite?: number } | undefined {
+    const rawProvider = provider.trim();
+    const normProvider = normalizeProviderId(rawProvider) ?? rawProvider;
+    const rawModel = splitModelAndLevel(model.trim()).model;
+    const cleanModel = rawModel.startsWith(`${normProvider}/`)
+      ? rawModel.slice(normProvider.length + 1)
+      : rawProvider && rawModel.startsWith(`${rawProvider}/`)
+        ? rawModel.slice(rawProvider.length + 1)
+        : rawModel;
+
+    const cached = this.cachedCosts.get(`${normProvider}/${cleanModel}`)
+      ?? (rawProvider && rawProvider !== normProvider ? this.cachedCosts.get(`${rawProvider}/${cleanModel}`) : undefined);
+    const runtimeModel = this.runtime?.getModel(normProvider, cleanModel)
+      ?? (rawProvider && rawProvider !== normProvider ? this.runtime?.getModel(rawProvider, cleanModel) : undefined);
+    const pristine = getPristineSdkModel(normProvider, cleanModel)
+      ?? (rawProvider && rawProvider !== normProvider ? getPristineSdkModel(rawProvider, cleanModel) : undefined);
+
+    const hasPositive = (r?: { costInput?: number; costOutput?: number }) =>
+      Boolean(r && ((r.costInput ?? 0) > 0 || (r.costOutput ?? 0) > 0));
+    const hasSdkPositive = (m?: { cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number } }) =>
+      Boolean(m?.cost && ((m.cost.input ?? 0) > 0 || (m.cost.output ?? 0) > 0));
+
+    if (hasPositive(cached)) {
+      const sdkRef = hasSdkPositive(runtimeModel) ? runtimeModel : hasSdkPositive(pristine) ? pristine : undefined;
+      return {
+        costInput: cached!.costInput,
+        costOutput: cached!.costOutput,
+        ...(sdkRef?.cost?.cacheRead !== undefined ? { costCacheRead: sdkRef.cost.cacheRead } : {}),
+        ...(sdkRef?.cost?.cacheWrite !== undefined ? { costCacheWrite: sdkRef.cost.cacheWrite } : {}),
+      };
+    }
+    if (hasSdkPositive(runtimeModel)) {
+      return {
+        costInput: runtimeModel!.cost.input,
+        costOutput: runtimeModel!.cost.output,
+        costCacheRead: runtimeModel!.cost.cacheRead,
+        costCacheWrite: runtimeModel!.cost.cacheWrite,
+      };
+    }
+    if (hasSdkPositive(pristine)) {
+      return {
+        costInput: pristine!.cost.input,
+        costOutput: pristine!.cost.output,
+        costCacheRead: pristine!.cost.cacheRead,
+        costCacheWrite: pristine!.cost.cacheWrite,
+      };
+    }
+    return undefined;
   }
 
   isProviderEnabled(providerId: string | undefined): boolean {
@@ -823,7 +909,7 @@ export class ModelHub {
     needsQualityGateProb?: number;
     source: DecisionSource;
     attempted: boolean;
-    usage?: { inputTokens: number; totalTokens: number };
+    usage?: { inputTokens: number; outputTokens?: number; totalTokens: number };
     fallbackReason?: string;
   }> {
     const runtime = await this.ensureRuntime();
@@ -859,6 +945,7 @@ export class ModelHub {
           },
           credentials,
         );
+        this.emitDecisionUsage(picked.usage);
         return {
           model: spec,
           thinkingLevel: picked.thinkingLevel,
@@ -914,6 +1001,7 @@ export class ModelHub {
       },
       credentials,
     );
+    this.emitDecisionUsage(picked.usage);
     const readyProviders = new Set(this.cachedPool.map(p => p.providerId));
     const useQualifiedSpec = readyProviders.size > 1 || picked.providerId !== this.currentTiers.provider;
     return {
@@ -933,13 +1021,17 @@ export class ModelHub {
   async evaluateCompletion(input: CompletionEvaluationInput): Promise<CompletionEvaluationResult> {
     const runtime = await this.ensureRuntime();
     const { credentials } = await this.resolveDecisionInfo(runtime);
-    return evaluateWorkCompletion(input, credentials);
+    const res = await evaluateWorkCompletion(input, credentials);
+    this.emitDecisionUsage(res.usage);
+    return res;
   }
 
   async decideSessionContinuity(input: SessionContinuityInput): Promise<SessionContinuityResult> {
     const runtime = await this.ensureRuntime();
     const { credentials } = await this.resolveDecisionInfo(runtime);
-    return evaluateSessionContinuity(input, credentials);
+    const res = await evaluateSessionContinuity(input, credentials);
+    this.emitDecisionUsage(res.usage);
+    return res;
   }
 
   private saveState(): Promise<void> {
@@ -1375,9 +1467,27 @@ export class ModelHub {
         && probeReasoning !== 'low'
         && /reasoning\.effort|unsupported_value.*'none'/i.test(res.errorMessage ?? '')
       ) {
+        if (res.usage && res.usage.totalTokens > 0) {
+          this.emitUsage({
+            actor: 'probe',
+            provider,
+            model: modelId,
+            status: 'failed',
+            usage: res.usage,
+          });
+        }
         res = await runProbe('low');
       }
       const latencyMs = Math.max(1, Date.now() - start);
+      if (res.usage) {
+        this.emitUsage({
+          actor: 'probe',
+          provider,
+          model: modelId,
+          status: res.stopReason === 'error' ? 'failed' : res.stopReason === 'aborted' ? 'interrupted' : 'completed',
+          usage: res.usage,
+        });
+      }
       if (res.stopReason === 'error' || res.stopReason === 'aborted') {
         const result: ModelProbeResult = {
           ok: false,

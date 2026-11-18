@@ -115,9 +115,11 @@ export class RuntimeOpsStore {
       accountId: channel.accountId,
       loginStatus: channel.platform === 'wechat'
         ? (channel.botToken ? 'bound' : 'unbound')
-        : channel.platform === 'xiaoai'
-          ? (Boolean(channel.botToken || channel.webhookUrl || channel.apiBase?.startsWith('ssh://')) ? 'bound' : 'unbound')
-          : undefined,
+        : channel.platform === 'telegram'
+          ? ((channel.botToken || channel.webhookUrl) ? 'bound' : 'unbound')
+          : channel.platform === 'xiaoai'
+            ? (Boolean(channel.botToken || channel.webhookUrl || channel.apiBase?.startsWith('ssh://')) ? 'bound' : 'unbound')
+            : undefined,
       webhookUrlMasked,
       defaultTarget: channel.defaultTarget,
       allowedSenders: channel.allowedSenders,

@@ -74,6 +74,14 @@ export interface AgentFactory {
   runtime?: ModelRuntime;
   resolveWorkerModel?: (input: WorkerModelResolutionInput) => { model: string; tier: ModelTier };
   updateModelConfig?: (tiers: ModelTierConfig, nextRouterProvider: string, nextRouterModelId: string, disabledProviders?: string[]) => void;
+  onModelUsage?: (entry: {
+    actor: Role | 'compaction';
+    sessionId: string;
+    provider: string;
+    model: string;
+    status: 'completed' | 'failed' | 'interrupted';
+    usage: unknown;
+  }) => void;
   create(role: Role, id: string, tools: AgentTool[], options?: AgentOptions): Promise<AgentPort>;
 }
 
@@ -346,6 +354,13 @@ export class SdkAgent implements AgentPort {
     private readonly fallbackModel?: () => NonNullable<AgentSession['model']> | undefined,
     private readonly role: Role = 'worker',
     private readonly primaryModel?: () => NonNullable<AgentSession['model']> | undefined,
+    private readonly onModelUsage?: (entry: {
+      actor: Role | 'compaction';
+      provider: string;
+      model: string;
+      status: 'completed' | 'failed' | 'interrupted';
+      usage: unknown;
+    }) => void,
   ) {
     this.configuredModel = session.model;
     let turn: string | undefined;
@@ -359,6 +374,37 @@ export class SdkAgent implements AgentPort {
     this.unsubscribe = session.subscribe(event => {
       if (event.type === 'turn_end' && event.message.role === 'assistant') {
         this.activeTurnAssistants?.push(event.message);
+        if (event.message.usage) {
+          const usageStatus = event.message.stopReason === 'error'
+            ? 'failed'
+            : event.message.stopReason === 'aborted'
+              ? 'interrupted'
+              : 'completed';
+          try {
+            this.onModelUsage?.({
+              actor: this.role,
+              provider: event.message.provider || this.session.model?.provider || this.configuredModel?.provider || 'unknown',
+              model: event.message.model || this.session.model?.id || this.configuredModel?.id || 'unknown',
+              status: usageStatus,
+              usage: event.message.usage,
+            });
+          } catch {
+            // Never allow usage collection errors to disrupt live agent turns.
+          }
+        }
+      } else if (event.type === 'compaction_end' && event.result?.usage) {
+        const compStatus = event.aborted ? 'interrupted' : event.errorMessage ? 'failed' : 'completed';
+        try {
+          this.onModelUsage?.({
+            actor: 'compaction',
+            provider: this.session.model?.provider || this.configuredModel?.provider || 'unknown',
+            model: this.session.model?.id || this.configuredModel?.id || 'unknown',
+            status: compStatus,
+            usage: event.result.usage,
+          });
+        } catch {
+          // Never allow usage collection errors to disrupt SDK compaction.
+        }
       }
       if (!onEvent) return;
       if (event.type === 'turn_start') { turn = randomUUID(); onEvent({ kind: 'turn_start', id: turn }); }
@@ -375,6 +421,8 @@ export class SdkAgent implements AgentPort {
             ? {
                 stopReason: message.stopReason,
                 ...(errorMessage ? { errorMessage } : {}),
+                ...(message.provider ? { provider: message.provider } : {}),
+                ...(message.model ? { model: message.model } : {}),
                 usage: message.usage,
                 publicText: publicText.slice(0, 1600),
                 publicTextTruncated: publicText.length > 1600,
@@ -744,6 +792,12 @@ export async function realFactory(home: string, config: {
           : undefined,
         role,
         role === 'router' ? () => prepareRouterSessionModel(activeRouterModel) : undefined,
+        entry => {
+          factoryObj.onModelUsage?.({
+            ...entry,
+            sessionId: id,
+          });
+        },
       );
     },
   };
