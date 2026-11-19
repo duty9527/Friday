@@ -3,7 +3,7 @@ import type { AgentPort } from '../agent.js';
 import { FALLBACK_PROVIDER_MODELS, normalizeProviderId, REAL_PROVIDER_DEFAULTS } from '../models/catalog.js';
 import type { Operation, Store, Task, TaskStatus } from '../store.js';
 import type { PromptTrace } from '../trace.js';
-import type { AttachmentView, ChatMessage, MessageOrigin, ModelTier, PooledModelEntry, ThinkingLevel, WorkerProfile } from '../view.js';
+import type { AttachmentView, ChatMessage, MessageOrigin, ModelTier, PooledModelEntry, RunInitiator, ThinkingLevel, WorkerProfile } from '../view.js';
 import { resolveRecentSessionImages } from './chat-coalescer.js';
 
 export interface Run {
@@ -50,6 +50,8 @@ export interface ChatWork {
   modelTier?: ModelTier;
   thinkingLevel?: ThinkingLevel;
   attachments?: AttachmentView[];
+  initiator?: RunInitiator;
+  timerId?: string;
 }
 
 export class SourceChangedError extends Error {}

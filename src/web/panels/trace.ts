@@ -2,7 +2,7 @@ import type { ChatMessage, TraceEvent, WorkView } from '../../view.js';
 import { activeStatus as active, mergeTraceWindow, record } from '../model.js';
 import { button, element, node } from '../shared/dom.js';
 import { errorText, profileBadges, statusText, tierBadges, timestamp } from '../shared/format.js';
-import { ensureRightDrawerOpen } from '../shared/theme.js';
+import { collapseRightDrawer, ensureRightDrawerOpen } from '../shared/theme.js';
 import { api, appState, hooks, type Selection } from '../state.js';
 import {
   buildExecutionChain,
@@ -92,18 +92,30 @@ function isNarrowViewport(): boolean {
 }
 
 function createCopyButton(label: string, textToCopy: string): HTMLButtonElement {
+  let resetTimer: ReturnType<typeof setTimeout> | undefined;
   const btn = button(label, () => {
+    const scheduleReset = () => {
+      if (resetTimer) clearTimeout(resetTimer);
+      resetTimer = setTimeout(() => {
+        resetTimer = undefined;
+        btn.classList.remove('is-copied');
+        btn.textContent = label;
+      }, 1500);
+    };
     if (typeof navigator === 'undefined' || !navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
+      btn.classList.remove('is-copied');
       btn.textContent = '当前环境不支持复制';
-      setTimeout(() => { btn.textContent = label; }, 1500);
+      scheduleReset();
       return;
     }
     void navigator.clipboard.writeText(textToCopy).then(() => {
+      btn.classList.add('is-copied');
       btn.textContent = '✓ 已复制';
-      setTimeout(() => { btn.textContent = label; }, 1500);
+      scheduleReset();
     }).catch(() => {
+      btn.classList.remove('is-copied');
       btn.textContent = '复制失败';
-      setTimeout(() => { btn.textContent = label; }, 1500);
+      scheduleReset();
     });
   }, 'copy-mini-btn mini-button');
   return btn;
@@ -197,6 +209,7 @@ export function initTracePanel(): TracePanelController {
   const clearFilterBtn = element('clear-filter');
 
   const traceWideToggleBtn = document.getElementById('trace-wide-toggle') as HTMLButtonElement | null;
+  const traceCloseBtn = document.getElementById('trace-close-btn') as HTMLButtonElement | null;
   const filterMsgBtn = document.getElementById('filter-msg-mode') as HTMLButtonElement | null;
   const filterRouteBtn = document.getElementById('filter-route-mode') as HTMLButtonElement | null;
 
@@ -218,6 +231,8 @@ export function initTracePanel(): TracePanelController {
   let autoSelectedSource: 'none' | 'fallback' | 'bundle' = 'none';
   let lastChainView: ExecutionChainView | undefined;
   let lastInspectorNodeId: string | undefined;
+  const seenChainNodeIds = new Set<string>();
+  let lastChainScopeKey = '';
 
   function showPanel(trace: boolean): void {
     panelsEl.classList.toggle('trace-visible', trace);
@@ -367,11 +382,14 @@ export function initTracePanel(): TracePanelController {
       const modelLabel = work.workerModel
         ? `${work.workerModel}${work.thinkingLevel ? `@${work.thinkingLevel}` : ''}`
         : (work.modelTier ? (tierBadges[work.modelTier] ?? work.modelTier) : undefined);
+      const initiatorPrefix = work.initiator?.kind === 'timer'
+        ? `⏱ 定时${work.initiator.label ? `(${work.initiator.label})` : ''} · `
+        : '';
       const profilePrefix = (work.profile || modelLabel)
         ? `${profileBadges[work.profile ?? 'general'] ?? (work.profile || '子 AI')}${modelLabel ? ` (${modelLabel})` : ''} · `
         : '';
       const statusLabel = work.pendingQuestion ? '⏳ 等待拍板' : statusText(work.status);
-      mainBtn.append(node('span', `${profilePrefix}${statusLabel} · ${timestamp(work.createdAt)}`, `meta${active(work.status) ? ' running' : ''}`));
+      mainBtn.append(node('span', `${initiatorPrefix}${profilePrefix}${statusLabel} · ${timestamp(work.createdAt)}`, `meta${active(work.status) ? ' running' : ''}`));
       entry.append(mainBtn);
 
       if (active(work.status)) {
@@ -1042,7 +1060,7 @@ export function initTracePanel(): TracePanelController {
     navGroup.append(prevBtn, nextBtn, closeBtn);
     toolbar.append(titleGroup, navGroup);
 
-    const body = node('div', '', 'inspector-body');
+    const body = node('div', '', `inspector-body${sameNode ? '' : ' is-switching'}`);
     const metaGrid = node('div', '', 'inspector-meta-grid');
     appendMetaCell(metaGrid, '精确时间', timestamp(selectedNode.at));
     appendMetaCell(metaGrid, '相对起点偏移', formatOffset(selectedNode.offsetMs));
@@ -1100,6 +1118,14 @@ export function initTracePanel(): TracePanelController {
       appState.selectedNodeId = undefined;
     }
 
+    const scopeKey = `${appState.selection.type}:${appState.selection.type === 'all' ? '' : appState.selection.id}:${appState.traceCategory}`;
+    const scopeSwitched = scopeKey !== lastChainScopeKey;
+    if (scopeSwitched) {
+      lastChainScopeKey = scopeKey;
+      seenChainNodeIds.clear();
+    }
+    const isInitialBatchForScope = seenChainNodeIds.size === 0;
+
     const contents = document.createDocumentFragment();
     if (!visibleNodes.length) {
       const emptyMsg = !chainView.nodes.length
@@ -1107,11 +1133,13 @@ export function initTracePanel(): TracePanelController {
         : '当前筛选分类下暂无动作记录，可切换「全部链路」查看完整过程。';
       contents.append(node('p', emptyMsg, 'empty'));
     } else {
-      const list = node('ul', '', 'chain-list');
+      const list = node('ul', '', `chain-list${isInitialBatchForScope ? ' is-fresh-list' : ''}`);
       for (const item of visibleNodes) {
+        const isEntering = !isInitialBatchForScope && !seenChainNodeIds.has(item.id);
+        seenChainNodeIds.add(item.id);
         const isSelected = item.id === appState.selectedNodeId;
         const isLive = item.tone === 'run' || active(item.status);
-        const li = node('li', '', 'chain-item');
+        const li = node('li', '', `chain-item${isEntering ? ' is-entering' : ''}`);
         const card = node(
           'button',
           '',
@@ -1368,6 +1396,17 @@ export function initTracePanel(): TracePanelController {
   traceWideToggleBtn?.addEventListener('click', () => {
     appState.traceWide = !appState.traceWide;
     syncWideToggle();
+  });
+
+  traceCloseBtn?.addEventListener('click', () => {
+    const mobileViewport = typeof window !== 'undefined'
+      && typeof window.matchMedia === 'function'
+      && window.matchMedia('(max-width: 730px)').matches;
+    if (mobileViewport) {
+      showPanel(false);
+    } else {
+      collapseRightDrawer();
+    }
   });
 
   showChatBtn.addEventListener('click', () => showPanel(false));

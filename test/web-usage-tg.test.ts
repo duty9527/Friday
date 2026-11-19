@@ -52,14 +52,26 @@ test('Web usage and Telegram UI files strictly adhere to CSP and zero inline sty
   const webRoot = fileURLToPath(new URL('../src/web/', import.meta.url));
   const indexHtml = await readFile(join(webRoot, 'index.html'), 'utf8');
   const usageHubTs = await readFile(join(webRoot, 'hubs', 'usage-hub.ts'), 'utf8');
+  const systemHubTs = await readFile(join(webRoot, 'hubs', 'system-hub.ts'), 'utf8');
+  const timerPluginHubTs = await readFile(join(webRoot, 'hubs', 'timer-plugin-hub.ts'), 'utf8');
   const imVoiceHubTs = await readFile(join(webRoot, 'hubs', 'im-voice-hub.ts'), 'utf8');
   const clientTs = await readFile(join(webRoot, 'client.ts'), 'utf8');
   const styleCss = await readFile(join(webRoot, 'style.css'), 'utf8');
 
-  assert.match(indexHtml, /id="open-usage-hub-top"/);
+  assert.match(indexHtml, /id="open-system-hub-top"/);
+  assert.match(indexHtml, /id="system-top-badge"/);
+  assert.match(indexHtml, /id="system-hub-backdrop"/);
+  assert.match(indexHtml, /id="system-hub-modal"/);
+  assert.match(indexHtml, /id="system-tab-models"/);
+  assert.match(indexHtml, /id="system-tab-usage"/);
+  assert.match(indexHtml, /id="system-panel-models"/);
+  assert.match(indexHtml, /id="system-panel-usage"/);
+  assert.match(indexHtml, /id="model-top-badge"/);
   assert.match(indexHtml, /id="usage-top-badge"/);
-  assert.match(indexHtml, /id="usage-hub-backdrop"/);
-  assert.match(indexHtml, /id="usage-hub-modal"/);
+  assert.match(indexHtml, /id="open-mindmap-trace"/);
+  assert.doesNotMatch(indexHtml, /id="open-model-hub-top"/, 'model hub must live under SYS system base');
+  assert.doesNotMatch(indexHtml, /id="open-usage-hub-top"/, 'usage hub must live under SYS system base');
+  assert.doesNotMatch(indexHtml, /id="open-mindmap-top"/, 'mindmap link must live inside trace heading');
   assert.match(indexHtml, /id="im-tg-token-input"/);
   assert.match(indexHtml, /id="im-tg-allow-input"/);
   assert.match(indexHtml, /id="im-tg-quick-btn"/);
@@ -71,6 +83,8 @@ test('Web usage and Telegram UI files strictly adhere to CSP and zero inline sty
 
   for (const [name, src] of [
     ['usage-hub.ts', usageHubTs],
+    ['system-hub.ts', systemHubTs],
+    ['timer-plugin-hub.ts', timerPluginHubTs],
     ['im-voice-hub.ts', imVoiceHubTs],
     ['client.ts', clientTs],
   ] as const) {

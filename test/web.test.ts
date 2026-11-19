@@ -498,12 +498,17 @@ test('Web console lazy-loads health-scale UI, serves redacted PluginView metadat
   const f = await fixture();
   try {
     const html = await (await fetch(f.base)).text();
-    assert.match(html, /id="open-health-hub-top"/);
-    assert.match(html, /id="health-hub-modal"/);
+    assert.match(html, /id="open-plugin-hub-top"/);
+    assert.match(html, /id="plugin-hub-modal"/);
+    assert.match(html, /id="plugin-tab-catalog"/);
+    assert.match(html, /id="plugin-tab-health-scale"/);
+    assert.match(html, /id="plugin-panel-health-scale"/);
     assert.match(html, /id="health-trend-canvas"/);
-    assert.match(html, /id="open-fund-hub-top"/);
-    assert.match(html, /id="fund-hub-modal"/);
+    assert.match(html, /id="plugin-tab-fund-tracker"/);
+    assert.match(html, /id="plugin-panel-fund-tracker"/);
     assert.match(html, /id="fund-trend-canvas"/);
+    assert.doesNotMatch(html, /id="open-health-hub-top"/, 'health surface must live inside M3 plugin hub');
+    assert.doesNotMatch(html, /id="open-fund-hub-top"/, 'fund surface must live inside M3 plugin hub');
     assert.doesNotMatch(html, /\sstyle="/i);
     assert.doesNotMatch(html, /<input[^>]+type=["']file["']/i);
     assert.doesNotMatch(html, /018168|192\.168\./, 'index.html must not contain hardcoded personal samples');

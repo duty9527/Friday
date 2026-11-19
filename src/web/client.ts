@@ -11,27 +11,21 @@ import { bindThemeButtons, initDesktopDrawers } from './shared/theme.js';
 import { initChatPanel } from './panels/chat.js';
 import { initTracePanel } from './panels/trace.js';
 import { initMemoryHub } from './hubs/memory-hub.js';
-import { initTimerPluginHub } from './hubs/timer-plugin-hub.js';
+import { initTimerPluginHub, type PluginSurfaceRegistration } from './hubs/timer-plugin-hub.js';
 import { initImVoiceHub } from './hubs/im-voice-hub.js';
-import { initModelHub } from './hubs/model-hub.js';
-import { initUsageHub } from './hubs/usage-hub.js';
-import type { FundTrackerUiController } from './plugins/fund-tracker-ui.js';
-import type { HealthScaleUiController } from './plugins/health-scale-ui.js';
+import { initSystemHub } from './hubs/system-hub.js';
 import { api, appState, fetchMessagesBatch, hooks, request } from './state.js';
 
 const connectionBannerEl = element('connection-banner');
 const connectionEl = element('connection');
 const reconnectBtn = element<HTMLButtonElement>('reconnect');
-const openHealthHubTop = element<HTMLButtonElement>('open-health-hub-top');
-const openFundHubTop = element<HTMLButtonElement>('open-fund-hub-top');
 const memoryHubBackdrop = element<HTMLElement>('memory-hub-backdrop');
 const timerHubBackdrop = element<HTMLElement>('timer-hub-backdrop');
 const pluginHubBackdrop = element<HTMLElement>('plugin-hub-backdrop');
 const imHubBackdrop = element<HTMLElement>('im-hub-backdrop');
-const modelHubBackdrop = element<HTMLElement>('model-hub-backdrop');
-const usageHubBackdrop = element<HTMLElement>('usage-hub-backdrop');
-const healthHubBackdrop = element<HTMLElement>('health-hub-backdrop');
-const fundHubBackdrop = element<HTMLElement>('fund-hub-backdrop');
+const systemHubBackdrop = element<HTMLElement>('system-hub-backdrop');
+const healthSurfacePanel = element<HTMLElement>('plugin-panel-health-scale');
+const fundSurfacePanel = element<HTMLElement>('plugin-panel-fund-tracker');
 const messagesEl = element('messages');
 const worksEl = element('works');
 const companionEl = element('companion-avatar');
@@ -78,6 +72,7 @@ const trackedActiveWorks = new Set<string>();
 function syncCompanionState(): void {
   if (transientCompanionState && appState.ready && !appState.authExpired) {
     companionAvatar.setState(transientCompanionState);
+    chatPanel.updateCompanionStatus(transientCompanionState);
     return;
   }
   const next = deriveFridayBotState({
@@ -90,12 +85,14 @@ function syncCompanionState(): void {
     works: appState.view?.works ?? [],
   });
   companionAvatar.setState(next);
+  chatPanel.updateCompanionStatus(next);
 }
 
 function triggerTransientCompanion(state: 'finished' | 'failed', durationMs: number): void {
   if (transientCompanionTimer) clearTimeout(transientCompanionTimer);
   transientCompanionState = state;
   companionAvatar.setState(state);
+  chatPanel.updateCompanionStatus(state);
   transientCompanionTimer = setTimeout(() => {
     transientCompanionTimer = undefined;
     transientCompanionState = undefined;
@@ -136,55 +133,39 @@ function trackCompanionTransitions(initial = false): void {
   else syncCompanionState();
 }
 
+const pluginSurfaces: PluginSurfaceRegistration[] = [
+  {
+    pluginName: 'health-scale',
+    tabId: 'plugin-tab-health-scale',
+    panelId: 'plugin-panel-health-scale',
+    label: '健康管理',
+    messageTrigger: /体重|体脂|上秤|称重|health-scale/,
+    load: () => import('./plugins/health-scale-ui.js').then(mod =>
+      mod.initHealthScaleUi({
+        isVisible: () => !pluginHubBackdrop.hidden && !healthSurfacePanel.hidden,
+      })),
+  },
+  {
+    pluginName: 'fund-tracker',
+    tabId: 'plugin-tab-fund-tracker',
+    panelId: 'plugin-panel-fund-tracker',
+    label: '投资管理',
+    messageTrigger: /持仓晚间结算|持仓午间估值|持仓总览|fund-tracker/,
+    load: () => import('./plugins/fund-tracker-ui.js').then(mod =>
+      mod.initFundTrackerUi({
+        isVisible: () => !pluginHubBackdrop.hidden && !fundSurfacePanel.hidden,
+      })),
+  },
+];
+
 const chatPanel = initChatPanel({ onDraftActivity: syncCompanionState });
 const tracePanel = initTracePanel();
 const memoryHub = initMemoryHub();
-const timerPluginHub = initTimerPluginHub();
+const timerPluginHub = initTimerPluginHub({ pluginSurfaces });
 const imVoiceHub = initImVoiceHub();
-const modelHub = initModelHub();
-const usageHub = initUsageHub();
+const systemHub = initSystemHub();
 
-let healthScaleUi: HealthScaleUiController | undefined;
-let healthScaleLoadPromise: Promise<HealthScaleUiController> | undefined;
-let healthBadgeSynced = false;
-let lastHealthCheckSeq = 0;
-
-let fundTrackerUi: FundTrackerUiController | undefined;
-let fundTrackerLoadPromise: Promise<FundTrackerUiController> | undefined;
-let fundBadgeSynced = false;
-let lastFundCheckSeq = 0;
-
-async function loadHealthScaleUi(): Promise<HealthScaleUiController> {
-  if (healthScaleUi) return healthScaleUi;
-  if (!healthScaleLoadPromise) {
-    healthScaleLoadPromise = import('./plugins/health-scale-ui.js')
-      .then(mod => {
-        healthScaleUi = mod.initHealthScaleUi();
-        return healthScaleUi;
-      })
-      .catch(error => {
-        healthScaleLoadPromise = undefined;
-        throw error;
-      });
-  }
-  return healthScaleLoadPromise;
-}
-
-async function loadFundTrackerUi(): Promise<FundTrackerUiController> {
-  if (fundTrackerUi) return fundTrackerUi;
-  if (!fundTrackerLoadPromise) {
-    fundTrackerLoadPromise = import('./plugins/fund-tracker-ui.js')
-      .then(mod => {
-        fundTrackerUi = mod.initFundTrackerUi();
-        return fundTrackerUi;
-      })
-      .catch(error => {
-        fundTrackerLoadPromise = undefined;
-        throw error;
-      });
-  }
-  return fundTrackerLoadPromise;
-}
+let lastPluginCheckSeq = 0;
 
 function connection(text: string, stale = false): void {
   if (appState.authExpired) {
@@ -203,12 +184,7 @@ function closeAllHubModals(): void {
   timerPluginHub.closeTimerModal();
   timerPluginHub.closePluginModal();
   imVoiceHub.closeModal();
-  modelHub.closeModal();
-  usageHub.closeModal();
-  healthScaleUi?.closeModal();
-  healthHubBackdrop.hidden = true;
-  fundTrackerUi?.closeModal();
-  fundHubBackdrop.hidden = true;
+  systemHub.closeModal();
 }
 
 function expireAuthentication(): void {
@@ -218,8 +194,7 @@ function expireAuthentication(): void {
   if (appState.reconnectTimer) { clearTimeout(appState.reconnectTimer); appState.reconnectTimer = undefined; }
   if (appState.refreshTimer) { clearTimeout(appState.refreshTimer); appState.refreshTimer = undefined; }
   imVoiceHub.stopWechatQrPoll();
-  healthScaleUi?.closeModal();
-  fundTrackerUi?.closeModal();
+  timerPluginHub.deactivateActiveSurface();
   connection('访问链接已失效。请从当前服务的本地启动链接重新进入（服务重启后需使用新链接）。', true);
   reconnectBtn.disabled = true;
   chatPanel.updateComposer();
@@ -228,8 +203,7 @@ function expireAuthentication(): void {
   timerPluginHub.renderTimers();
   timerPluginHub.renderPlugins();
   imVoiceHub.render();
-  modelHub.render();
-  usageHub.render();
+  systemHub.render();
   chatPanel.renderMessages();
   syncCompanionState();
 }
@@ -283,10 +257,7 @@ async function refreshView(initial = false): Promise<void> {
         appState.historyBefore = result.messages.before;
         appState.historyHasMore = result.messages.hasMore;
         appState.cursor = result.cursor;
-        healthBadgeSynced = false;
-        lastHealthCheckSeq = 0;
-        fundBadgeSynced = false;
-        lastFundCheckSeq = 0;
+        lastPluginCheckSeq = 0;
         sseHub.setCursor(result.cursor);
       }
       for (const work of result.works) {
@@ -314,53 +285,16 @@ async function refreshView(initial = false): Promise<void> {
       timerPluginHub.renderTimers();
       timerPluginHub.renderPlugins();
       imVoiceHub.render();
-      modelHub.render();
-      usageHub.render();
-      const healthPlugin = appState.view?.plugins?.find(p => p.name === 'health-scale');
-      const healthEnabled = healthPlugin ? healthPlugin.enabled !== false : false;
-      openHealthHubTop.hidden = !healthEnabled;
-      if (!healthEnabled) {
-        healthBadgeSynced = false;
-        if (!healthHubBackdrop.hidden) {
-          healthScaleUi?.closeModal();
-          healthHubBackdrop.hidden = true;
-        }
-      } else {
-        const maxSeq = result.messages.items.reduce((acc, m) => Math.max(acc, m.seq), lastHealthCheckSeq);
-        const hasHealthMsg = maxSeq > lastHealthCheckSeq && result.messages.items.some(
-          m => m.seq > lastHealthCheckSeq && /体重|体脂|上秤|称重|health-scale/.test(m.text),
-        );
-        lastHealthCheckSeq = maxSeq;
-        if ((initial || cursorReset || !healthBadgeSynced || hasHealthMsg) && !appState.authExpired) {
-          healthBadgeSynced = true;
-          void loadHealthScaleUi()
-            .then(ctrl => ctrl.refreshTopBadge())
-            .catch(() => { healthBadgeSynced = false; });
-        }
-      }
-      const fundPlugin = appState.view?.plugins?.find(p => p.name === 'fund-tracker');
-      const fundEnabled = fundPlugin ? fundPlugin.enabled !== false : false;
-      openFundHubTop.hidden = !fundEnabled;
-      if (!fundEnabled) {
-        fundBadgeSynced = false;
-        if (!fundHubBackdrop.hidden) {
-          fundTrackerUi?.closeModal();
-          fundHubBackdrop.hidden = true;
-        }
-      } else {
-        const maxFundSeq = result.messages.items.reduce((acc, m) => Math.max(acc, m.seq), lastFundCheckSeq);
-        const hasFundMsg = maxFundSeq > lastFundCheckSeq && result.messages.items.some(
-          m => m.seq > lastFundCheckSeq && /持仓晚间结算|持仓午间估值|持仓总览|fund-tracker/.test(m.text),
-        );
-        lastFundCheckSeq = maxFundSeq;
-        if ((initial || cursorReset || !fundBadgeSynced || hasFundMsg) && !appState.authExpired) {
-          fundBadgeSynced = true;
-          void loadFundTrackerUi()
-            .then(ctrl => ctrl.refreshTopBadge())
-            .catch(() => { fundBadgeSynced = false; });
-        }
-      }
+      systemHub.render();
+      const newMessages = result.messages.items.filter(m => m.seq > lastPluginCheckSeq);
+      lastPluginCheckSeq = result.messages.items.reduce((acc, m) => Math.max(acc, m.seq), lastPluginCheckSeq);
+      timerPluginHub.syncPluginSurfaces({
+        initial,
+        cursorReset,
+        newMessages,
+      });
       chatPanel.updateComposer();
+      chatPanel.renderBossDecisionDock();
       followLatestMessage();
       trackCompanionTransitions(initial);
       if (
@@ -496,31 +430,12 @@ async function connect(forceReconnect = false): Promise<void> {
 
 reconnectBtn.addEventListener('click', () => { appState.retryDelay = 500; void connect(true); });
 
-openHealthHubTop.addEventListener('click', () => {
-  openHealthHubTop.disabled = true;
-  void loadHealthScaleUi()
-    .then(ctrl => ctrl.openModal())
-    .catch(error => connection(`加载健康体脂看板模块失败：${errorText(error)}`, true))
-    .finally(() => { openHealthHubTop.disabled = false; });
-});
-
-openFundHubTop.addEventListener('click', () => {
-  openFundHubTop.disabled = true;
-  void loadFundTrackerUi()
-    .then(ctrl => ctrl.openModal())
-    .catch(error => connection(`加载投资管理看板模块失败：${errorText(error)}`, true))
-    .finally(() => { openFundHubTop.disabled = false; });
-});
-
 const modalBackdrops = [
   memoryHubBackdrop,
   timerHubBackdrop,
   pluginHubBackdrop,
   imHubBackdrop,
-  modelHubBackdrop,
-  usageHubBackdrop,
-  healthHubBackdrop,
-  fundHubBackdrop,
+  systemHubBackdrop,
 ];
 document.addEventListener('keydown', event => {
   if (event.key !== 'Escape') return;

@@ -50,7 +50,9 @@ import {
 } from './orchestrator/subconscious-loop.js';
 import {
   TimerScheduler,
+  extractGoalMetMarker,
   nextDailyRunAt,
+  parseTimerIdFromRequestId,
   resolveStoreChannelOrigin,
   type AddTimerOptions,
 } from './orchestrator/timer-scheduler.js';
@@ -88,6 +90,7 @@ import type {
   MessageOrigin,
   ModelTier,
   ModelTierConfig,
+  RunInitiator,
   ThinkingLevel,
   WorkerProfile,
 } from './view.js';
@@ -483,6 +486,7 @@ export class Coordinator {
       addTimer: (name, instruction, intervalMs, cwd, origin, options) =>
         this.addTimer(name, instruction, intervalMs, cwd, origin, options),
       toggleTimer: (id, enabled) => this.toggleTimer(id, enabled),
+      completeTimer: (id, summary) => this.completeTimer(id, summary),
       removeTimer: id => this.removeTimer(id),
       resolveChannelOrigin: (channelSpec, deliverTarget) =>
         resolveStoreChannelOrigin(this.store, channelSpec, deliverTarget),
@@ -687,7 +691,7 @@ export class Coordinator {
         modelReady: vp.modelReady,
         profiles: vp.profiles,
       },
-      works: recent.map(({ id, prompt, status, mode, createdAt, activeMs, limitMs, reason, sessionId, originMessageId, parentTaskId, cwd, execution, profile, workerModel, modelTier, thinkingLevel, decisionSource, skipQualityGate, qualityGate, pendingQuestion }) => {
+      works: recent.map(({ id, prompt, status, mode, createdAt, activeMs, limitMs, reason, sessionId, originMessageId, parentTaskId, cwd, execution, profile, workerModel, modelTier, thinkingLevel, decisionSource, skipQualityGate, qualityGate, pendingQuestion, initiator, timerId }) => {
         const concurrentTaskIds = execution === 'native' && ['queued', 'running'].includes(status) ? this.concurrentTasksInCwd(cwd, id) : undefined;
         return {
           id,
@@ -711,6 +715,8 @@ export class Coordinator {
           ...(workerModel ? { workerModel } : {}),
           ...(pendingQuestion ? { pendingQuestion } : {}),
           ...(concurrentTaskIds?.length ? { concurrentTaskIds } : {}),
+          ...(initiator ? { initiator } : {}),
+          ...(timerId ? { timerId } : {}),
         };
       }),
     };
@@ -1321,6 +1327,7 @@ export class Coordinator {
   private async routeWorkerFailure(run: Run, detail: string): Promise<boolean> {
     if (run.reads.size > 0 || this.store.operations(run.id).some(unsettled)) return false;
     const task = this.store.get(run.id);
+    if (this.timers.willNextFailureBeSilent(task)) return false;
     if (!this.router || !task.originMessageId || !this.valid(run)) return false;
     const deliveryOrigin = run.deliveryOrigin ?? task.origin;
     try {
@@ -1554,6 +1561,13 @@ export class Coordinator {
         ? (() => { try { return this.store.conversation.get(chatWork.source.originMessageId!).sessionId; } catch { return undefined; } })()
         : undefined);
     const taskSessionId = originMessage?.sessionId ?? sourceOriginSession ?? formatTaskSessionId(id);
+    const resolvedTimerId = chatWork?.timerId ?? parseTimerIdFromRequestId(requestId);
+    const resolvedTaskOrigin = chatWork
+      ? (chatWork.origin ?? (chatWork.originMessageId ? this.store.conversation.get(chatWork.originMessageId).origin : chatWork.source?.origin))
+      : undefined;
+    const resolvedInitiator: RunInitiator | undefined = chatWork?.initiator
+      ?? (resolvedTimerId ? { kind: 'timer', id: resolvedTimerId } : undefined)
+      ?? (resolvedTaskOrigin?.channel === 'xiaoai' ? { kind: 'voice' } : chatWork ? { kind: 'person' } : { kind: 'system' });
 
     const task: Task = {
       id,
@@ -1571,9 +1585,7 @@ export class Coordinator {
       execution: native ? 'native' : 'snapshot',
       cwd,
       paths: native ? (paths.length ? paths : source?.paths ?? []) : undefined,
-      origin: chatWork
-        ? (chatWork.origin ?? (chatWork.originMessageId ? this.store.conversation.get(chatWork.originMessageId).origin : chatWork.source?.origin))
-        : undefined,
+      origin: resolvedTaskOrigin,
       originMessageId: chatWork?.originMessageId,
       parentTaskId: chatWork?.parentTaskId,
       parentSpanId: chatWork?.parentSpanId,
@@ -1586,6 +1598,8 @@ export class Coordinator {
       decisionSource: resolvedModel.source,
       decisionConfidence: resolvedModel.confidence,
       ...(resolvedModel.needsQualityGate === false ? { skipQualityGate: true } : {}),
+      ...(resolvedInitiator ? { initiator: resolvedInitiator } : {}),
+      ...(resolvedTimerId ? { timerId: resolvedTimerId } : {}),
     };
 
     try {
@@ -2078,6 +2092,8 @@ export class Coordinator {
               sentFile: false,
               savedMemory: false,
             };
+            const timerId = task.timerId ?? parseTimerIdFromRequestId(task.requestId);
+            const linkedTimer = timerId ? this.store.listTimers().find(t => t.id === timerId) : undefined;
             const text = await this.prompt(
               run,
               this.router!,
@@ -2091,6 +2107,16 @@ export class Coordinator {
                 deliveryChannel: rDeliveryOrigin?.channel ?? 'local',
                 ...buildVoiceTurnHint(this.home, rDeliveryOrigin?.channel ?? 'local'),
                 ...(imChannels.length ? { imChannels } : {}),
+                ...(linkedTimer?.goalCondition && linkedTimer.enabled
+                  ? {
+                      timerGoal: {
+                        timerId: linkedTimer.id,
+                        timerName: linkedTimer.name,
+                        goalCondition: linkedTimer.goalCondition,
+                        hint: '若确认该终态目标已达成，可在总结末尾附加 [[GOAL_MET: 一句话说明达成情况]] 或调用 manage_timer{action:"complete"}。',
+                      },
+                    }
+                  : {}),
                 autoDispatchesRemaining,
                 memoryDirectory: compactRouterChatMemoryDirectory(this.store.memoryDirectory(10)),
               }),
@@ -2300,6 +2326,10 @@ export class Coordinator {
     return this.timers.toggleTimer(id, enabled);
   }
 
+  completeTimer(id: string, summary?: string): Timer {
+    return this.timers.completeTimer(id, summary);
+  }
+
   removeTimer(id: string): boolean {
     return this.timers.removeTimer(id);
   }
@@ -2329,8 +2359,23 @@ export class Coordinator {
       return;
     }
     const effectiveReplyOrigin = run.deliveryOrigin ?? current.origin;
+    const isCompleted = status === 'completed';
+    const reportMarker = isCompleted ? extractGoalMetMarker(report) : { met: false, cleanedText: report ?? '' };
+    const replyMarker = isCompleted ? extractGoalMetMarker(replyText) : { met: false, cleanedText: replyText ?? '' };
+    const effectiveReport = isCompleted && report !== undefined
+      ? (reportMarker.cleanedText || (reportMarker.met ? (reportMarker.summary ?? '目标已达成') : ''))
+      : report;
+    const effectiveReplyText = isCompleted && replyText !== undefined
+      ? (replyMarker.cleanedText || (replyMarker.met ? ((replyMarker.summary ?? reportMarker.cleanedText) || '目标已达成') : ''))
+      : replyText;
+    const goalMetSignal = isCompleted && (reportMarker.met || replyMarker.met);
+    const goalMetSummary = replyMarker.summary ?? reportMarker.summary;
+    const silentTimerFailure = status === 'failed' && this.timers.willNextFailureBeSilent(current);
+    const failureNotifiedInConversation = status === 'failed'
+      && !silentTimerFailure
+      && Boolean(run.replyId || run.failureRouted || (taskStatusNeedsNotice(status) && current.originMessageId));
     this.store.transaction(() => {
-      this.store.transition(run.id, status, reason, report);
+      this.store.transition(run.id, status, reason, effectiveReport);
       if (['completed', 'failed', 'cancelled'].includes(status)) {
         this.store.failPendingEvents(run.id, status === 'cancelled' ? '工作已取消' : '工作已结束');
         this.store.conversation.setMeta(`worker_checkpoint:${run.id}`, null);
@@ -2347,7 +2392,7 @@ export class Coordinator {
           : undefined;
         this.modelHub.recordTaskOutcome(current.workerModel, status === 'completed', current.activeMs, effectiveQualityScore);
       }
-      if (!run.replyId && !run.failureRouted && taskStatusNeedsNotice(status) && current.originMessageId) {
+      if (!silentTimerFailure && !run.replyId && !run.failureRouted && taskStatusNeedsNotice(status) && current.originMessageId) {
         const message = this.store.conversation.create({
           id: randomUUID(),
           role: 'assistant',
@@ -2363,24 +2408,38 @@ export class Coordinator {
         this.store.conversation.link(message.id, run.id);
       }
       if (run.replyId) {
-        const reply = this.store.conversation.get(run.replyId);
-        this.store.conversation.update(
-          run.replyId,
-          status === 'completed'
-            ? {
-                text: replyText ?? report ?? '',
-                status: 'completed',
-                ...(run.deliveryOrigin ? { origin: run.deliveryOrigin } : {}),
-              }
-            : {
-                text: reply.text,
-                status: status === 'failed' ? 'failed' : 'interrupted',
-                ...(run.deliveryOrigin ? { origin: run.deliveryOrigin } : {}),
-                reason: reason ? `${reason}；已显示的内容未核实，不视为最终交付。` : '工作未确认完成；已显示的内容未核实。',
-              },
-        );
+        if (silentTimerFailure) {
+          this.store.conversation.delete(run.replyId);
+          run.replyId = undefined;
+        } else {
+          const reply = this.store.conversation.get(run.replyId);
+          this.store.conversation.update(
+            run.replyId,
+            status === 'completed'
+              ? {
+                  text: effectiveReplyText ?? effectiveReport ?? '',
+                  status: 'completed',
+                  ...(run.deliveryOrigin ? { origin: run.deliveryOrigin } : {}),
+                }
+              : {
+                  text: reply.text,
+                  status: status === 'failed' ? 'failed' : 'interrupted',
+                  ...(run.deliveryOrigin ? { origin: run.deliveryOrigin } : {}),
+                  reason: reason ? `${reason}；已显示的内容未核实，不视为最终交付。` : '工作未确认完成；已显示的内容未核实。',
+                },
+          );
+        }
       }
     });
+    this.timers.onTimerTaskSettled(
+      { ...current, reason },
+      status,
+      {
+        goalMet: goalMetSignal,
+        goalSummary: goalMetSummary,
+        notifyFirstFailure: !failureNotifiedInConversation,
+      },
+    );
     this.notifyOutbound();
     if (!run.controller.signal.aborted) run.controller.abort(new Error('Task settled'));
     for (const id of run.reads.keys()) this.executor?.stop(id);

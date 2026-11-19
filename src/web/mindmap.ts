@@ -86,12 +86,17 @@ let currentGraph: FlowchartGraph | null = null;
 let panX = 24;
 let panY = 18;
 let zoom = 1;
+let viewportAnimRaf = 0;
+let viewportTargetPanX = panX;
+let viewportTargetPanY = panY;
+let viewportTargetZoom = zoom;
 let isDragging = false;
 let dragMoved = false;
 let dragStartX = 0;
 let dragStartY = 0;
 let dragPanStartX = 0;
 let dragPanStartY = 0;
+let lastRenderedInspectorKey = '';
 
 const workspaceEl = el<HTMLElement>('mm-canvas-panel').parentElement!;
 const toggleSidebarBtn = el<HTMLButtonElement>('mm-toggle-sidebar');
@@ -233,27 +238,84 @@ function applyViewportTransform() {
   zoomLabelEl.textContent = `${Math.round(zoom * 100)}%`;
 }
 
-function fitWidthTop() {
+function prefersReducedMotion(): boolean {
+  return typeof window !== 'undefined'
+    && typeof window.matchMedia === 'function'
+    && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+
+function cancelViewportAnimation(): void {
+  if (viewportAnimRaf && typeof cancelAnimationFrame === 'function') {
+    cancelAnimationFrame(viewportAnimRaf);
+  }
+  viewportAnimRaf = 0;
+}
+
+function springEase(t: number): number {
+  if (t <= 0) return 0;
+  if (t >= 1) return 1;
+  return 1 - Math.exp(-4.8 * t) * Math.cos(1.5 * Math.PI * t);
+}
+
+function animateViewportTo(targetPanX: number, targetPanY: number, targetZoom: number, durationMs = 440): void {
+  cancelViewportAnimation();
+  viewportTargetPanX = targetPanX;
+  viewportTargetPanY = targetPanY;
+  viewportTargetZoom = targetZoom;
+  if (
+    prefersReducedMotion()
+    || typeof requestAnimationFrame !== 'function'
+    || durationMs <= 0
+    || (Math.abs(targetPanX - panX) < 0.5 && Math.abs(targetPanY - panY) < 0.5 && Math.abs(targetZoom - zoom) < 0.002)
+  ) {
+    panX = targetPanX;
+    panY = targetPanY;
+    zoom = targetZoom;
+    applyViewportTransform();
+    return;
+  }
+  const startPanX = panX;
+  const startPanY = panY;
+  const startZoom = zoom;
+  const startAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  const step = (now: number) => {
+    const elapsed = now - startAt;
+    const t = Math.min(1, Math.max(0, elapsed / durationMs));
+    const eased = springEase(t);
+    panX = startPanX + (targetPanX - startPanX) * eased;
+    panY = startPanY + (targetPanY - startPanY) * eased;
+    zoom = Math.max(0.12, startZoom + (targetZoom - startZoom) * eased);
+    applyViewportTransform();
+    if (t < 1) {
+      viewportAnimRaf = requestAnimationFrame(step);
+    } else {
+      viewportAnimRaf = 0;
+    }
+  };
+  viewportAnimRaf = requestAnimationFrame(step);
+}
+
+function fitWidthTop(animate = false) {
   if (!currentGraph) return;
   const rect = svgElRoot.getBoundingClientRect();
   if (!rect.width || !rect.height) return;
   const availW = Math.max(300, rect.width - 40);
-  zoom = Math.max(0.45, Math.min(1.0, availW / Math.max(1, currentGraph.width)));
-  panX = Math.max(14, (rect.width - currentGraph.width * zoom) / 2);
-  panY = 18;
-  applyViewportTransform();
+  const nextZoom = Math.max(0.45, Math.min(1.0, availW / Math.max(1, currentGraph.width)));
+  const nextPanX = Math.max(14, (rect.width - currentGraph.width * nextZoom) / 2);
+  const nextPanY = 18;
+  animateViewportTo(nextPanX, nextPanY, nextZoom, animate ? 440 : 0);
 }
 
-function fitToCanvas() {
+function fitToCanvas(animate = false) {
   if (!currentGraph) return;
   const rect = svgElRoot.getBoundingClientRect();
   if (!rect.width || !rect.height) return;
   const availW = Math.max(300, rect.width - 44);
   const availH = Math.max(260, rect.height - 76);
-  zoom = Math.max(0.22, Math.min(1.05, Math.min(availW / Math.max(1, currentGraph.width), availH / Math.max(1, currentGraph.height))));
-  panX = Math.max(16, (rect.width - currentGraph.width * zoom) / 2);
-  panY = Math.max(18, (rect.height - 50 - currentGraph.height * zoom) / 2);
-  applyViewportTransform();
+  const nextZoom = Math.max(0.22, Math.min(1.05, Math.min(availW / Math.max(1, currentGraph.width), availH / Math.max(1, currentGraph.height))));
+  const nextPanX = Math.max(16, (rect.width - currentGraph.width * nextZoom) / 2);
+  const nextPanY = Math.max(18, (rect.height - 50 - currentGraph.height * nextZoom) / 2);
+  animateViewportTo(nextPanX, nextPanY, nextZoom, animate ? 480 : 0);
 }
 
 function scrollToFrame(frameId: string) {
@@ -262,10 +324,10 @@ function scrollToFrame(frameId: string) {
   if (!frame) return;
   const rect = svgElRoot.getBoundingClientRect();
   if (!rect.width || !rect.height) return;
-  zoom = Math.max(zoom, 0.78);
-  panX = Math.max(14, (rect.width - currentGraph.width * zoom) / 2);
-  panY = Math.min(28, 28 - frame.y * zoom);
-  applyViewportTransform();
+  const nextZoom = Math.max(zoom, 0.78);
+  const nextPanX = Math.max(14, (rect.width - currentGraph.width * nextZoom) / 2);
+  const nextPanY = Math.min(28, 28 - frame.y * nextZoom);
+  animateViewportTo(nextPanX, nextPanY, nextZoom, 500);
 }
 
 function renderKpis() {
@@ -1197,7 +1259,22 @@ function renderInspectorForPayload(payload: InspectorPayload, headerInfo?: { ico
 }
 
 function renderInspectorForNode(node: FlowchartNode) {
+  const inspKey = `${node.id}|${node.kind}|${node.flowId}|${node.sessionId ?? ''}`;
+  const switched = lastRenderedInspectorKey !== '' && lastRenderedInspectorKey !== inspKey;
+  lastRenderedInspectorKey = inspKey;
   inspectorBodyEl.replaceChildren();
+  try {
+    renderInspectorNodeContents(node);
+  } finally {
+    if (switched) {
+      for (const child of inspectorBodyEl.children) {
+        child.classList.add('mm-insp-enter');
+      }
+    }
+  }
+}
+
+function renderInspectorNodeContents(node: FlowchartNode) {
   const payload = node.inspector;
   const flow = payload.flow;
   const session = payload.session;
@@ -1532,7 +1609,7 @@ function ensureSseConnected(initialCursor: number) {
 
 toggleSidebarBtn.addEventListener('click', () => {
   workspaceEl.classList.toggle('sidebar-collapsed');
-  window.setTimeout(() => { if (viewMode !== 'list') fitWidthTop(); }, 80);
+  window.setTimeout(() => { if (viewMode !== 'list') fitWidthTop(true); }, 430);
 });
 
 sidebarModeSessionsBtn.addEventListener('click', () => {
@@ -1604,15 +1681,37 @@ collapseAllBtn.addEventListener('click', () => {
   rebuildAndRenderCanvas(true);
 });
 
-zoomOutBtn.addEventListener('click', () => { zoom = Math.max(0.25, zoom * 0.85); applyViewportTransform(); });
-zoomInBtn.addEventListener('click', () => { zoom = Math.min(2.2, zoom * 1.18); applyViewportTransform(); });
-fitWidthBtn.addEventListener('click', fitWidthTop);
-fitBtn.addEventListener('click', fitToCanvas);
+function zoomAroundCenter(factor: number) {
+  const baseZoom = viewportAnimRaf ? viewportTargetZoom : zoom;
+  const basePanX = viewportAnimRaf ? viewportTargetPanX : panX;
+  const basePanY = viewportAnimRaf ? viewportTargetPanY : panY;
+  const nextZoom = Math.max(0.25, Math.min(2.2, baseZoom * factor));
+  const rect = svgElRoot.getBoundingClientRect();
+  if (rect.width && rect.height) {
+    const cx = rect.width / 2;
+    const cy = rect.height / 2;
+    const scaleChange = nextZoom / baseZoom;
+    animateViewportTo(
+      cx - (cx - basePanX) * scaleChange,
+      cy - (cy - basePanY) * scaleChange,
+      nextZoom,
+      320,
+    );
+  } else {
+    animateViewportTo(basePanX, basePanY, nextZoom, 320);
+  }
+}
+
+zoomOutBtn.addEventListener('click', () => zoomAroundCenter(0.85));
+zoomInBtn.addEventListener('click', () => zoomAroundCenter(1.18));
+fitWidthBtn.addEventListener('click', () => fitWidthTop(true));
+fitBtn.addEventListener('click', () => fitToCanvas(true));
 refreshBtn.addEventListener('click', () => { void refreshMindmap(false); });
 loadMoreBtn.addEventListener('click', () => { void loadMoreFlows(); });
 
 svgElRoot.addEventListener('mousedown', ev => {
   if (ev.button !== 0) return;
+  cancelViewportAnimation();
   isDragging = true;
   dragMoved = false;
   dragStartX = ev.clientX;
@@ -1640,6 +1739,7 @@ window.addEventListener('mouseup', () => {
 
 svgElRoot.addEventListener('wheel', ev => {
   ev.preventDefault();
+  cancelViewportAnimation();
   if (ev.ctrlKey || ev.metaKey) {
     const rect = svgElRoot.getBoundingClientRect();
     const mx = ev.clientX - rect.left;

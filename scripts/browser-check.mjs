@@ -154,7 +154,19 @@ try {
   await until(() => page.eval("[...document.querySelectorAll('#messages .router-message .message-text')].some(x => x.innerText.includes('我们始终在同一个对话中'))"), 'ordinary reply');
   await until(() => page.eval("document.querySelector('#trace-scope').innerText.includes('我们始终在同一个对话中')"), 'the process follows the newest round');
   checks.push('ordinary conversation without files, IME Enter suppressed, process follows the newest round');
-  await until(() => page.eval("[...document.querySelectorAll('#messages .user-message')].at(-1)?.querySelector('.routing-summary')?.innerText.includes('仅回复')"), 'direct reply routing summary');
+
+  // Clean mode hides pure direct-reply routing clutter by default; audit detail mode reveals it on demand
+  assert.equal(
+    await page.eval("[...document.querySelectorAll('#messages .user-message')].at(-1)?.querySelector('.routing-summary') === null"),
+    true,
+    'clean mode hides routine direct-reply routing summary',
+  );
+  await page.eval(() => document.querySelector('#conv-detail-mode-btn')?.click());
+  await until(() => page.eval("document.querySelector('#conv-detail-mode-btn').getAttribute('aria-pressed') === 'true'"), 'audit detail mode enabled');
+  await until(() => page.eval("[...document.querySelectorAll('#messages .user-message')].at(-1)?.querySelector('.routing-summary')?.innerText.includes('仅回复')"), 'direct reply routing summary in detail mode');
+  await page.eval(() => document.querySelector('#conv-detail-mode-btn')?.click());
+  await until(() => page.eval("document.querySelector('#conv-detail-mode-btn').getAttribute('aria-pressed') === 'false'"), 'audit detail mode restored to clean default');
+
   await page.eval(() => {
     const user = [...document.querySelectorAll('#messages .user-message')].at(-1);
     [...user.querySelectorAll('.message-actions button')].find(button => button.innerText.includes('路由'))?.click();
@@ -335,14 +347,25 @@ try {
   }
   assert.equal(await page.eval(`[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('${burstTag}')).length`), beforeReload);
   checks.push('refresh keeps the same main history and load-older restores it');
-  await until(() => page.eval(`[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('${burstTag}')).every(x => x.querySelector('.speaker').innerText.includes('F.R.I.D.A.Y. 已处理'))`), 'burst replies settled');
+
+  // Toggle audit detail mode to verify settled markers and toggle channel/system filters cleanly
+  await page.eval(() => document.querySelector('#conv-detail-mode-btn')?.click());
+  await until(() => page.eval(`[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('${burstTag}')).every(x => x.querySelector('.speaker').innerText.includes('F.R.I.D.A.Y. 已处理'))`), 'burst replies settled in detail mode');
   const order = await page.eval(() => [...document.querySelectorAll('#messages article')].map(item => Number(item.dataset.seq)));
   assert.ok(order.every((seq, index) => index === 0 || order[index - 1] < seq), 'persisted insertion order survives hydration, refresh and paging');
   assert.equal(await page.eval("document.querySelectorAll('#messages .router-message .source-reference').length > 0"), true, 'replies carry clickable source references');
-  await page.eval(() => [...document.querySelectorAll('#messages .user-message .message-actions button')].at(-1).click());
+  await page.eval(() => {
+    const btns = [...document.querySelectorAll('#messages .user-message .message-actions button')].filter(b => b.innerText.includes('路由'));
+    btns.at(-1)?.click();
+  });
   await page.eval(() => { const facts = document.querySelector('#routing-detail details.routing-facts'); if (facts) facts.open = true; });
   assert.match(await page.eval("document.querySelector('#routing-detail').innerText"), /分配记录与当时上下文/);
-  checks.push('all message blocks remain in durable sequence order after reload; source references and routing context survive');
+  await page.eval(() => document.querySelector('#conv-hide-system-btn')?.click());
+  assert.equal(await page.eval("document.querySelector('#conv-hide-system-btn').getAttribute('aria-pressed')"), 'true');
+  await page.eval(() => document.querySelector('#conv-hide-system-btn')?.click());
+  await page.eval(() => document.querySelector('#conv-channel-filters button')?.click());
+  await page.eval(() => document.querySelector('#conv-detail-mode-btn')?.click());
+  checks.push('all message blocks remain in durable sequence order after reload; clean/audit toggles, channel/system filters, source references and routing context survive');
 
   // Re-select the completed work so responsive & dual-theme checks inspect a populated Execution Chain Studio
   await page.eval(() => document.querySelector('.work-row .work-row-main')?.click());

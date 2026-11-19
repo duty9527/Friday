@@ -814,6 +814,15 @@ test('src/web and dist/web uphold zero inline styles and light-theme WCAG contra
   assert.doesNotMatch(css, /\.health-status-banner\.tone-err\s*\{[^}]*#fca5a5/i);
   assert.doesNotMatch(css, /\.rating-badge-(?:excellent|normal|low|high|critical)[^}]*(?:#4ade80|#7dd3fc|#fcd34d|#fdba74|#fca5a5)/i);
 
+  for (const token of ['--ease-out', '--dur-modal', 'prefers-reduced-motion', '@keyframes modalFloatIn', '@keyframes messageEnter']) {
+    assert.ok(css.includes(token), `style.css must define ${token}`);
+  }
+
+  const mindmapCss = await readFile(join(srcWebDir, 'mindmap.css'), 'utf8');
+  for (const token of ['--mm-ease-out', '--mm-dur-panel', 'prefers-reduced-motion', '@keyframes mmInspEnter', '@keyframes mmStatusDotPulse']) {
+    assert.ok(mindmapCss.includes(token), `mindmap.css must define ${token}`);
+  }
+
   const srcScripts = (await walkFiles(srcWebDir)).filter(f => f.endsWith('.ts'));
   for (const file of srcScripts) {
     const content = await readFile(file, 'utf8');

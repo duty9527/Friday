@@ -559,7 +559,7 @@ export class SdkAgent implements AgentPort {
   get checkpoint() {
     const sessionFile = this.session.sessionFile;
     const leafId = this.session.sessionManager.getLeafId();
-    return sessionFile && leafId ? { sessionFile, leafId } : undefined;
+    return sessionFile && leafId && existsSync(sessionFile) ? { sessionFile, leafId } : undefined;
   }
 
   rewind(leafId: string | null) {
@@ -726,41 +726,86 @@ export async function realFactory(home: string, config: {
     return ['text'];
   };
 
+  const stripProviderPrefix = (raw: string | undefined, provId: string): string | undefined => {
+    const trimmed = raw?.trim();
+    if (!trimmed) return undefined;
+    if (!trimmed.includes('/')) return trimmed;
+    const slash = trimmed.indexOf('/');
+    const head = trimmed.slice(0, slash);
+    const tail = trimmed.slice(slash + 1);
+    const normProv = normalizeProviderId(provId) ?? provId;
+    if (head === provId || (normalizeProviderId(head) ?? head) === normProv) {
+      return tail || undefined;
+    }
+    return undefined;
+  };
+  const normRouterHubProv = normalizeProviderId(persistedHub?.routerProvider) ?? persistedHub?.routerProvider;
+  const normWorkerHubProv = normalizeProviderId(persistedHub?.workerProvider) ?? persistedHub?.workerProvider;
+
   // Pre-register persisted provider custom URLs / custom & fetched models so startup resolves
   // multi-slash and UI-configured providers cleanly even before Coordinator calls modelHub.init().
   for (const [provId, cfg] of Object.entries(persistedHub?.providers ?? {})) {
     if (!cfg || cfg.enabled === false) continue;
     const baseUrl = cfg.baseUrl?.trim();
+    const existingModels = runtime.getModels(provId);
+    const extraModelIds = [...new Set([
+      ...(cfg.customModels ?? []),
+      ...(cfg.fetchedModels ?? []).map(m => m.id),
+      ...extractSelectedModelIds(cfg.selectedModels),
+      ...(provId === persistedHub?.routerProvider || provId === normRouterHubProv
+        ? [stripProviderPrefix(persistedHub?.routerModel, provId)]
+        : []),
+      ...(provId === persistedHub?.workerProvider || provId === normWorkerHubProv
+        ? [
+            stripProviderPrefix(persistedHub?.fastModel, provId),
+            stripProviderPrefix(persistedHub?.balancedModel, provId),
+            stripProviderPrefix(persistedHub?.strongModel, provId),
+          ]
+        : []),
+    ].filter((id): id is string => Boolean(id && id.trim())))];
+    const toCustomModelEntry = (id: string, fallbackBaseUrl: string, fallbackApi: string) => {
+      const fetched = cfg.fetchedModels?.find(m => m.id === id);
+      return {
+        id,
+        name: fetched?.name ?? id,
+        api: fallbackApi,
+        baseUrl: fallbackBaseUrl,
+        reasoning: fetched?.reasoning ?? false,
+        input: fetched?.supportsImages ? (['text', 'image'] as Array<'text' | 'image'>) : inferModelInput(id, provId),
+        cost: { input: fetched?.costInput ?? 0, output: fetched?.costOutput ?? 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: fetched?.contextWindow ?? 128_000,
+        maxTokens: fetched?.maxTokens ?? 8192,
+      };
+    };
+
     if (baseUrl) {
       let parsedUrl: URL | undefined;
       try { parsedUrl = new URL(baseUrl); } catch { parsedUrl = undefined; }
       if (parsedUrl && (parsedUrl.protocol === 'http:' || parsedUrl.protocol === 'https:')) {
-        const modelIds = [...new Set([
-          ...runtime.getModels(provId).map(m => m.id),
-          ...(cfg.customModels ?? []),
-          ...(cfg.fetchedModels ?? []).map(m => m.id),
-          ...extractSelectedModelIds(cfg.selectedModels),
-          ...(provId === persistedHub?.routerProvider && persistedHub?.routerModel ? [persistedHub.routerModel] : []),
-        ].filter(Boolean))];
+        const modelIds = [...new Set([...existingModels.map(m => m.id), ...extraModelIds])];
         if (modelIds.length > 0) {
           runtime.registerProvider(provId, {
             baseUrl,
             api: 'openai-completions',
             ...(cfg.apiKey?.trim() ? { apiKey: cfg.apiKey.trim() } : {}),
-            models: modelIds.map(id => {
-              const fetched = cfg.fetchedModels?.find(m => m.id === id);
-              return {
-                id,
-                name: fetched?.name ?? id,
-                reasoning: fetched?.reasoning ?? false,
-                input: fetched?.supportsImages ? ['text', 'image'] : inferModelInput(id, provId),
-                cost: { input: fetched?.costInput ?? 0, output: fetched?.costOutput ?? 0, cacheRead: 0, cacheWrite: 0 },
-                contextWindow: fetched?.contextWindow ?? 128_000,
-                maxTokens: fetched?.maxTokens ?? 8192,
-              };
-            }),
+            models: modelIds.map(id => toCustomModelEntry(id, baseUrl, 'openai-completions')),
           });
         }
+      }
+    } else if (existingModels.length > 0) {
+      const existingIds = new Set(existingModels.map(m => m.id));
+      const missingIds = extraModelIds.filter(id => !existingIds.has(id));
+      const sample = existingModels[0]!;
+      if (missingIds.length > 0) {
+        runtime.registerProvider(provId, {
+          baseUrl: sample.baseUrl,
+          api: sample.api,
+          ...(cfg.apiKey?.trim() ? { apiKey: cfg.apiKey.trim() } : {}),
+          models: [
+            ...existingModels.map(m => ({ ...m })),
+            ...missingIds.map(id => toCustomModelEntry(id, sample.baseUrl, sample.api)),
+          ],
+        });
       }
     }
     if (cfg.apiKey?.trim()) {
@@ -810,7 +855,14 @@ export async function realFactory(home: string, config: {
   }
   let routerProvider = routerSpec.provider;
   let routerModelId = routerSpec.modelId;
-  const workerSpec = resolveProviderAndModelSpec(runtime, rawWorkerModel, provider, persistedHub?.providers, disabledProviderSet);
+  const workerFallbackProvider = !config.workerModel
+    && normWorkerHubProv
+    && normWorkerHubProv !== 'offline'
+    && !disabledProviderSet.has(normWorkerHubProv)
+    && persistedHub?.providers?.[normWorkerHubProv]
+    ? normWorkerHubProv
+    : provider;
+  const workerSpec = resolveProviderAndModelSpec(runtime, rawWorkerModel, workerFallbackProvider, persistedHub?.providers, disabledProviderSet);
   const workerProvider = workerSpec.provider;
   const workerModelId = workerSpec.modelId;
 
@@ -962,12 +1014,16 @@ export async function realFactory(home: string, config: {
       if (native) customTools.push(...nativeDefinitions(cwd, options));
       if (dreamerReadonly) customTools.push(...readonlyDefinitions(cwd));
       const { systemPrompt, promptSuffix } = buildAgentSystemPrompts({ home, role, native, profile: options?.profile });
+      const hasPersistedRestore = Boolean(options?.restore && existsSync(options.restore.sessionFile));
+      if (options?.restore && !hasPersistedRestore && role !== 'dreamer' && role !== 'distiller') {
+        console.warn('[sdk-runtime] ignoring unpersisted checkpoint session file; starting fresh session');
+      }
       const manager = (role === 'dreamer' || role === 'distiller')
         ? SessionManager.inMemory(cwd)
-        : options?.restore
+        : hasPersistedRestore && options?.restore
           ? SessionManager.open(options.restore.sessionFile, undefined, cwd)
           : SessionManager.create(cwd, join(sessionDir, 'sessions'));
-      if (options?.restore && role !== 'dreamer' && role !== 'distiller') {
+      if (hasPersistedRestore && options?.restore && role !== 'dreamer' && role !== 'distiller') {
         if (!manager.getEntry(options.restore.leafId)) throw new Error('Router checkpoint not found; refusing unsafe session replay');
         manager.branch(options.restore.leafId);
       }

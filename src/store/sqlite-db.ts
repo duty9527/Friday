@@ -52,6 +52,20 @@ export class SqliteDb {
         updated_at INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS im_channels(id TEXT PRIMARY KEY, platform TEXT NOT NULL, updated_at INTEGER NOT NULL, body TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS wechat_quote_cache(
+        channel_id TEXT NOT NULL,
+        account_id TEXT NOT NULL DEFAULT '',
+        conversation_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        body TEXT NOT NULL,
+        media_path TEXT,
+        media_mime TEXT,
+        media_name TEXT,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY(channel_id, account_id, conversation_id, message_id)
+      );
+      CREATE INDEX IF NOT EXISTS wechat_quote_cache_prune ON wechat_quote_cache(channel_id, account_id, created_at DESC);
       CREATE TABLE IF NOT EXISTS notices(seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS model_usage(
         id TEXT PRIMARY KEY,

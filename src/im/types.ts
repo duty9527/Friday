@@ -3,6 +3,7 @@ import type { Coordinator } from '../coordinator.js';
 import type { VoiceFastpathRequest, VoiceFastpathResult } from '../plugin.js';
 import type { ImChannelConfig } from '../store.js';
 import type { ChatMessage, ImChannelView, ImPlatform, MessageOrigin } from '../view.js';
+import type { WechatQuote } from '../wechat/protocol.js';
 import type { ReceivedAttachment } from '../wechat-inbound.js';
 import type { XiaoaiSshRunner } from '../xiaoai/ssh.js';
 import type { XiaoaiKwsMonitorOptions } from '../xiaoai/kws-monitor.js';
@@ -84,7 +85,9 @@ export interface ImInboundMessage {
   replyWebhook?: string;
   contextToken?: string;
   mediaItems?: Record<string, unknown>[];
+  itemMessageIds?: string[];
   telegramMedia?: TelegramMediaItem[];
+  quote?: WechatQuote;
   callbackQueryId?: string;
   messageThreadId?: number;
 }
@@ -313,7 +316,7 @@ export function isSuspiciousBrowserWebhookRequest(headers: Record<string, string
   return false;
 }
 
-function isPrivateOrLocalHostname(hostname: string): boolean {
+export function isPrivateOrLocalHostname(hostname: string): boolean {
   const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
   if (!host) return true;
   if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) {

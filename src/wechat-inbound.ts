@@ -3,10 +3,22 @@ import { constants } from 'node:fs';
 import { chmod, mkdir, open, lstat } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 import { buildRequestSignal, runBoundedMediaTask } from './im/types.js';
+import {
+  DEFAULT_WECHAT_CDN_ORIGIN,
+  validateWechatCdnOrigin,
+  validateWechatCdnUrl,
+} from './wechat/protocol.js';
 
 export interface ReceivedAttachment {
-  kind: 'image' | 'file'; name: string; status: 'ready' | 'failed';
-  path?: string; mimeType?: string; bytes?: number; error?: string;
+  kind: 'image' | 'file' | 'voice' | 'video';
+  name: string;
+  status: 'ready' | 'failed';
+  path?: string;
+  mimeType?: string;
+  bytes?: number;
+  error?: string;
+  transcript?: string;
+  durationSeconds?: number;
 }
 export const MEDIA_LIMIT = 16 * 1024 * 1024;
 export function decryptMedia(bytes: Buffer, encodedKey: string): Buffer {
@@ -32,32 +44,68 @@ const MIME_EXT: Record<string, string> = {
   'image/gif': '.gif',
   'image/webp': '.webp',
 };
-function safeExtension(kind: 'image' | 'file', rawName: string, mimeType?: string): string {
+function safeExtension(kind: ReceivedAttachment['kind'], rawName: string, mimeType?: string): string {
   if (kind === 'image' && mimeType && MIME_EXT[mimeType]) return MIME_EXT[mimeType];
   const ext = extname(rawName).toLowerCase();
-  return /^\.[a-z0-9]{1,10}$/.test(ext) ? ext : '';
+  if (/^\.[a-z0-9]{1,10}$/.test(ext)) return ext;
+  if (kind === 'voice') return '.silk';
+  if (kind === 'video') return '.mp4';
+  return '';
 }
-export function mediaUrl(media: Record<string, unknown>): URL {
-  const url = typeof media.full_url === 'string' ? new URL(media.full_url)
-    : new URL(`https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=${encodeURIComponent(String(media.encrypt_query_param ?? ''))}`);
-  if (url.protocol !== 'https:' || url.hostname !== 'novac2c.cdn.weixin.qq.com' || url.port || url.username || url.password || !url.pathname.startsWith('/c2c/')) throw new Error('Untrusted CDN');
-  return url;
+export function mediaUrl(media: Record<string, unknown>, cdnBaseUrl?: string): URL {
+  const origin = cdnBaseUrl?.trim() ? validateWechatCdnOrigin(cdnBaseUrl) : DEFAULT_WECHAT_CDN_ORIGIN;
+  const rawUrl = typeof media.full_url === 'string' && media.full_url.trim()
+    ? media.full_url.trim()
+    : `${origin}/c2c/download?encrypted_query_param=${encodeURIComponent(String(media.encrypt_query_param ?? ''))}`;
+  return validateWechatCdnUrl(rawUrl);
+}
+function resolveMediaDescriptor(item: Record<string, unknown>): {
+  kind: ReceivedAttachment['kind'];
+  detail: Record<string, unknown> | undefined;
+  defaultName: string;
+} {
+  const type = Number(item.type);
+  if (type === 2) {
+    return {
+      kind: 'image',
+      detail: item.image_item as Record<string, unknown> | undefined,
+      defaultName: 'image',
+    };
+  }
+  if (type === 3) {
+    return {
+      kind: 'voice',
+      detail: item.voice_item as Record<string, unknown> | undefined,
+      defaultName: 'voice.silk',
+    };
+  }
+  if (type === 5) {
+    return {
+      kind: 'video',
+      detail: item.video_item as Record<string, unknown> | undefined,
+      defaultName: 'video.mp4',
+    };
+  }
+  return {
+    kind: 'file',
+    detail: item.file_item as Record<string, unknown> | undefined,
+    defaultName: 'file',
+  };
 }
 export async function receiveMedia(
   root: string,
   item: Record<string, unknown>,
   fetcher: typeof fetch = fetch,
-  options?: { signal?: AbortSignal },
+  options?: { signal?: AbortSignal; cdnBaseUrl?: string },
 ): Promise<ReceivedAttachment> {
   return runBoundedMediaTask(async () => {
-    const kind = Number(item.type) === 2 ? 'image' : 'file';
-    const detail = (kind === 'image' ? item.image_item : item.file_item) as Record<string, unknown> | undefined;
-    const name = String(detail?.file_name ?? (kind === 'image' ? 'image' : 'file')).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 255);
+    const { kind, detail, defaultName } = resolveMediaDescriptor(item);
+    const name = String(detail?.file_name ?? defaultName).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 255) || defaultName;
     const result: ReceivedAttachment = { kind, name, status: 'failed' };
     try {
       const media = detail?.media as Record<string, unknown> | undefined;
       if (!media) throw new Error('Missing media');
-      const url = mediaUrl(media);
+      const url = mediaUrl(media, options?.cdnBaseUrl);
       const response = await fetcher(url, { redirect: 'error', signal: buildRequestSignal(20_000, options?.signal) });
       if (!response.ok || !response.body) throw new Error('Download failed');
       const reader = response.body.getReader();
@@ -74,7 +122,13 @@ export async function receiveMedia(
       const encodedKey = typeof hex === 'string' && /^[a-f\d]{32}$/i.test(hex) ? Buffer.from(hex, 'hex').toString('base64') : String(media.aes_key ?? '');
       const bytes = decryptMedia(Buffer.concat(chunks), encodedKey);
       if (bytes.length > MEDIA_LIMIT) throw new Error('Too large');
-      const mimeType = kind === 'image' ? imageMime(bytes) : undefined;
+      const mimeType = kind === 'image'
+        ? imageMime(bytes)
+        : kind === 'voice'
+          ? 'audio/silk'
+          : kind === 'video'
+            ? 'video/mp4'
+            : undefined;
       if (kind === 'image' && !mimeType) throw new Error('Unsupported image');
       await mkdir(root, { recursive: true, mode: 0o700 });
       let stat = await lstat(root);

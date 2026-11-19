@@ -19,7 +19,7 @@ const help = `F.R.I.D.A.Y. (friday) — Local persistent personal AI assistant &
   followup TASK_ID [--request-id ID] "additional instruction"
   stop TASK_ID
   resume TASK_ID [--limit-ms 600000]
-  timer list | add [--name NAME] [--every-ms 60000] [--delay-ms MS] [--daily-at HH:MM] [--once] [--plugin NAME] [--action ACTION] [--channel ID] [--target TARGET] [--cwd DIR] ["instruction"] | toggle ID [--enabled|--no-enabled] | remove ID
+  timer list | add [--name NAME] [--every-ms 60000] [--delay-ms MS] [--daily-at HH:MM] [--once] [--until CONDITION] [--max-failures 5] [--plugin NAME] [--action ACTION] [--channel ID] [--target TARGET] [--cwd DIR] ["instruction"] | toggle ID [--enabled|--no-enabled] | complete ID [--summary TEXT] | remove ID
   plugin list | run NAME [ACTION] [--args JSON]
   memory list | search [--scope all|memories|works|messages] [--cwd DIR] "query" | save --topic TOPIC [--tag TAG ...] [--link ID ...] [--pinned] [--cwd DIR] "content" | link ID TARGET_ID | pin ID [--unpin] | remove ID
   im list | login [CHANNEL_ID] [--name NAME] [--api-base URL] [--no-wait] | add --platform telegram|dingtalk|wechat|xiaoai --name NAME [--bot-token TOKEN] [--account-id ID] [--webhook-url URL] [--secret SECRET] [--target CHAT_ID] [--allow SENDER ...] [--api-base URL] [--every-ms MS] | toggle ID [--enabled|--no-enabled] | test ID ["message"] | remove ID | voice ...
@@ -81,6 +81,7 @@ async function main() {
       host: { type: 'string' }, 'allow-host': { type: 'string', multiple: true },
       auth: { type: 'boolean' }, token: { type: 'string' },
       name: { type: 'string' }, 'every-ms': { type: 'string' }, 'delay-ms': { type: 'string' }, 'daily-at': { type: 'string' }, once: { type: 'boolean' },
+      until: { type: 'string' }, 'max-failures': { type: 'string' }, summary: { type: 'string' },
       plugin: { type: 'string' }, action: { type: 'string' }, channel: { type: 'string' }, args: { type: 'string' },
       cwd: { type: 'string' },
       topic: { type: 'string' }, scope: { type: 'string' }, tag: { type: 'string', multiple: true },
@@ -261,6 +262,8 @@ async function main() {
         delayMs: number(values['delay-ms']),
         dailyAt: values['daily-at'],
         once: values.once,
+        goalCondition: values.until,
+        maxFailures: number(values['max-failures']),
         plugin: values.plugin,
         pluginAction: values.action,
         deliverChannelId: values.channel,
@@ -269,6 +272,7 @@ async function main() {
         instruction: args.slice(1).join(' ') || undefined,
       };
       else if (sub === 'toggle') message = { command: 'timer-toggle', id: args[1], enabled: values.enabled };
+      else if (sub === 'complete') message = { command: 'timer-complete', id: args[1], summary: values.summary ?? (args.slice(2).join(' ') || undefined) };
       else if (sub === 'remove') message = { command: 'timer-remove', id: args[1] };
       else throw new Error(`Unknown timer subcommand: ${sub}`);
       break;

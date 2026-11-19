@@ -1,7 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import type { Conversation } from '../conversation.js';
 import type { InputFile } from '../files.js';
-import type { DecisionSource, ModelTier, PendingQuestion, QualityGateAssessment, ThinkingLevel, MessageOrigin, WorkerProfile } from '../view.js';
+import type { DecisionSource, ModelTier, PendingQuestion, QualityGateAssessment, RunInitiator, ThinkingLevel, MessageOrigin, WorkerProfile } from '../view.js';
 
 export type TaskStatus = 'queued' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';
 
@@ -39,6 +39,8 @@ export interface Task {
   skipQualityGate?: boolean;
   qualityGate?: QualityGateAssessment;
   pendingQuestion?: PendingQuestion;
+  initiator?: RunInitiator;
+  timerId?: string;
 }
 
 export interface TaskEvent {

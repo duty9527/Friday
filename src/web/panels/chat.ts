@@ -1,4 +1,4 @@
-import type { ChatMessage, MessagePage, RouteAction } from '../../view.js';
+import type { AttachmentView, ChatMessage, MessagePage, RouteAction, WorkView } from '../../view.js';
 import {
   activeStatus as active,
   mergeMessages as mergeInto,
@@ -11,15 +11,35 @@ import {
   createLiveBotAvatar,
   createStaticBotSvg,
   type BotAvatarController,
+  type BotStateId,
 } from '../shared/bot-avatar.js';
 import {
   BOT_EXPRESSIONS,
   BOT_EXPRESSION_META,
   inferMessageBotExpression,
-  tokenizeBotMessageText,
 } from '../shared/bot-expressions.js';
+import {
+  channelMeta,
+  classifyRoutingDisplay,
+  collectAvailableChannels,
+  deriveCompanionStatus,
+  extractLeadingQuote,
+  filterConversationMessages,
+  formatActionShortLabel,
+  formatByteSize,
+  formatShortClock,
+  formatTimeDivider,
+  isGroupedWithPrevious,
+  resolveMessageChannel,
+  shouldShowReplyReference,
+  shouldShowTimeDivider,
+  stripLeadingQuoteForPreview,
+  summarizeSystemNotice,
+  type ChatChannelFilter,
+} from '../shared/chat-view.js';
 import { button, element, node } from '../shared/dom.js';
 import { errorText, makeRequestId, statusText, timestamp } from '../shared/format.js';
+import { renderMarkdownContent, renderUserMessageContent, type MarkdownRenderOptions } from '../shared/markdown.js';
 import { api, appState, fetchMessagesBatch, hooks } from '../state.js';
 
 export interface ChatPanelController {
@@ -30,10 +50,125 @@ export interface ChatPanelController {
   renderRoutingDetail: () => void;
   jumpMessage: (id: string) => Promise<void>;
   isDraftTyping: () => boolean;
+  updateCompanionStatus: (botState: BotStateId) => void;
+  renderBossDecisionDock: () => void;
+}
+
+const STORAGE_KEY_CHANNEL = 'friday.chat-channel-filter';
+const STORAGE_KEY_HIDE_SYSTEM = 'friday.chat-hide-system';
+const STORAGE_KEY_DETAIL_MODE = 'friday.chat-detail-mode';
+const LONG_MESSAGE_COLLAPSE_CHARS = 4800;
+
+function singleLine(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+function readStoredString(key: string): string | null {
+  try {
+    return typeof localStorage !== 'undefined' ? localStorage.getItem(key) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredString(key: string, value: string): void {
+  try {
+    if (typeof localStorage !== 'undefined') localStorage.setItem(key, value);
+  } catch {
+    // Ignore storage write errors in private or sandboxed tabs.
+  }
+}
+
+function normalizeStoredChannel(raw: string | null): ChatChannelFilter {
+  if (raw === 'local' || raw === 'wechat' || raw === 'telegram' || raw === 'xiaoai' || raw === 'dingtalk') {
+    return raw;
+  }
+  return 'all';
+}
+
+function createClipboardButton(label: string, getText: () => string, className = 'mini-button copy-msg-btn'): HTMLButtonElement {
+  let resetTimer: ReturnType<typeof setTimeout> | undefined;
+  const btn = button(label, () => {
+    const text = getText();
+    const resetLater = () => {
+      if (resetTimer) clearTimeout(resetTimer);
+      resetTimer = setTimeout(() => {
+        resetTimer = undefined;
+        btn.classList.remove('is-copied');
+        btn.textContent = label;
+      }, 1500);
+    };
+    if (typeof navigator === 'undefined' || !navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
+      btn.textContent = '不支持';
+      resetLater();
+      return;
+    }
+    void navigator.clipboard.writeText(text).then(() => {
+      btn.classList.add('is-copied');
+      btn.textContent = '✓ 已复制';
+      resetLater();
+    }).catch(() => {
+      btn.textContent = '失败';
+      resetLater();
+    });
+  }, className);
+  btn.title = '复制正文';
+  return btn;
+}
+
+function actionToneClass(action: RouteAction): string {
+  if (action.status === 'failed' || action.status === 'interrupted' || action.delivery === 'failed') {
+    return 'tone-err';
+  }
+  if (action.status === 'pending' || action.delivery === 'pending' || action.delivery === 'processing') {
+    return 'tone-run';
+  }
+  return 'tone-ok';
+}
+
+function findQuotedJumpTargetId(
+  current: ChatMessage,
+  label: string,
+  preview: string,
+): string | undefined {
+  const needle = singleLine(preview);
+  if (!needle || needle.length < 2) return undefined;
+  const preferredRole = label === '回复 F.R.I.D.A.Y.'
+    ? 'assistant'
+    : label === '回复你'
+      ? 'user'
+      : undefined;
+  const earlier = [...appState.messages.values()]
+    .filter(m => m.id !== current.id && m.source !== 'system' && m.seq < current.seq)
+    .sort((a, b) => b.seq - a.seq);
+  const candidates = preferredRole
+    ? [...earlier.filter(m => m.role === preferredRole), ...earlier.filter(m => m.role !== preferredRole)]
+    : earlier;
+  for (const cand of candidates) {
+    const clean = singleLine(stripLeadingQuoteForPreview(cand.text));
+    if (!clean) continue;
+    if (clean === needle) return cand.id;
+    if (needle.length >= 6 && (clean.includes(needle) || needle.startsWith(clean))) return cand.id;
+  }
+  return undefined;
+}
+
+function isMessageMatchedByTraceSelection(message: ChatMessage): boolean {
+  if (!appState.selectionPinned) return false;
+  const sel = appState.selection;
+  if (sel.type === 'message') {
+    return message.id === sel.id || message.replyTo === sel.id;
+  }
+  if (sel.type === 'task') {
+    if (message.taskIds.includes(sel.id)) return true;
+    return Boolean(message.routing?.actions.some(a => a.taskId === sel.id));
+  }
+  return false;
 }
 
 /**
- * Initializes the main conversation panel, message composer, and per-message routing inspector.
+ * Initializes the redesigned main conversation panel, channel filters, Markdown renderer,
+ * compact routing pills, boss decision dock, and keyed incremental DOM synchronization.
  */
 export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatPanelController {
   const messagesEl = element('messages');
@@ -48,10 +183,51 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
   const sendErrorEl = element('send-error');
   const routingDetailEl = element('routing-detail');
 
+  const statusPillEl = element('companion-status-pill');
+  const activeWorksBtn = element<HTMLButtonElement>('conv-active-works-btn');
+  const channelFiltersEl = element('conv-channel-filters');
+  const hideSystemBtn = element<HTMLButtonElement>('conv-hide-system-btn');
+  const detailModeBtn = element<HTMLButtonElement>('conv-detail-mode-btn');
+  const filterBannerEl = element('conv-filter-banner');
+  const scrollBottomBtn = element<HTMLButtonElement>('scroll-bottom-btn');
+  const bossDecisionDockEl = element('boss-decision-dock');
+
+  let channelFilter: ChatChannelFilter = normalizeStoredChannel(readStoredString(STORAGE_KEY_CHANNEL));
+  let hideSystem = readStoredString(STORAGE_KEY_HIDE_SYSTEM) === 'true';
+  let detailMode = readStoredString(STORAGE_KEY_DETAIL_MODE) === 'true';
+  let lastBotState: BotStateId = 'sleeping';
+
   let routingDetailRequest = 0;
   let draftTypingActive = false;
   let draftTypingTimer: ReturnType<typeof setTimeout> | undefined;
+  let unreadWhileScrolledUp = 0;
+  let resizeTimer: ReturnType<typeof setTimeout> | undefined;
+  let resizePinned = true;
+  let hasRenderedMessages = false;
+  let emptyStateNotice: HTMLElement | undefined;
+
   const liveMessageAvatars = new Map<string, BotAvatarController>();
+  const knownMessageIds = new Set<string>();
+  const renderedArticles = new Map<string, { el: HTMLElement; sig: string }>();
+  const renderedDividers = new Map<string, { el: HTMLElement; label: string }>();
+  const expandedRoutingIds = new Set<string>();
+  const expandedSystemIds = new Set<string>();
+  const expandedLongTextIds = new Set<string>();
+
+  const markdownOpts: MarkdownRenderOptions = {
+    createEmote: expr => {
+      const wrap = node('span', '', 'bot-inline-emote');
+      wrap.title = `F.R.I.D.A.Y. 小表情：${BOT_EXPRESSION_META[expr].label}`;
+      wrap.append(createStaticBotSvg({ size: 20, expr, interactivePoke: true }));
+      return wrap;
+    },
+    createSticker: expr => {
+      const wrap = node('span', '', 'bot-inline-sticker');
+      wrap.title = `F.R.I.D.A.Y. 动态表情：${BOT_EXPRESSION_META[expr].label}`;
+      wrap.append(createStaticBotSvg({ size: 46, expr, interactivePoke: true }));
+      return wrap;
+    },
+  };
 
   function setDraftTyping(activeFlag: boolean): void {
     if (draftTypingTimer) {
@@ -143,7 +319,136 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     sendBtn.title = sendLabel;
     sendBtn.classList.toggle('is-sending', appState.sending);
     sendBtn.classList.toggle('is-retry', appState.uncertain);
+    renderBossDecisionDock();
   }
+
+  function updateCompanionStatus(botState: BotStateId): void {
+    lastBotState = botState;
+    const works = appState.view?.works ?? [];
+    const activeWorks = works.filter(work => active(work.status));
+    const waitingWorks = works.filter(work => Boolean(work.pendingQuestion));
+    const derived = deriveCompanionStatus(botState, activeWorks.length, waitingWorks.length);
+    statusPillEl.textContent = derived.text;
+    statusPillEl.className = `conv-status-pill tone-${derived.tone}`;
+
+    if (waitingWorks.length > 0) {
+      activeWorksBtn.hidden = false;
+      activeWorksBtn.classList.add('is-waiting');
+      activeWorksBtn.textContent = `⏳ ${waitingWorks.length} 项待拍板`;
+      activeWorksBtn.title = '点击查看等待拍板的后台任务';
+    } else if (activeWorks.length > 0) {
+      activeWorksBtn.hidden = false;
+      activeWorksBtn.classList.remove('is-waiting');
+      activeWorksBtn.textContent = `⚡ ${activeWorks.length} 项进行中`;
+      activeWorksBtn.title = '点击查看正在运行的后台任务';
+    } else {
+      activeWorksBtn.hidden = true;
+      activeWorksBtn.classList.remove('is-waiting');
+    }
+  }
+
+  activeWorksBtn.addEventListener('click', () => {
+    const works = appState.view?.works ?? [];
+    const target = works.find(w => Boolean(w.pendingQuestion)) ?? works.find(w => active(w.status));
+    if (!target) return;
+    hooks.selectTrace({ type: 'task', id: target.id, label: target.prompt || '后台工作' });
+    hooks.showPanel(true);
+  });
+
+  function renderFilterControls(ordered: readonly ChatMessage[], hiddenSystemCount: number, hiddenChannelCount: number): void {
+    const configuredPlatforms = (appState.view?.imChannels ?? [])
+      .filter(ch => ch.enabled)
+      .map(ch => ch.platform);
+    const available = collectAvailableChannels(ordered, appState.messages, configuredPlatforms);
+    if (channelFilter !== 'all' && !available.includes(channelFilter)) {
+      available.push(channelFilter);
+    }
+
+    const frag = document.createDocumentFragment();
+    for (const ch of available) {
+      const meta = channelMeta(ch);
+      const btn = button(`${meta.icon} ${meta.shortLabel}`, () => {
+        if (channelFilter === ch) return;
+        channelFilter = ch;
+        writeStoredString(STORAGE_KEY_CHANNEL, ch);
+        unreadWhileScrolledUp = 0;
+        renderMessages();
+        scrollEl.scrollTop = scrollEl.scrollHeight;
+        syncScrollBottomButton();
+      }, `conv-channel-chip mini-button${channelFilter === ch ? ' active' : ''}`);
+      btn.setAttribute('aria-pressed', String(channelFilter === ch));
+      btn.title = meta.label;
+      frag.append(btn);
+    }
+    channelFiltersEl.replaceChildren(frag);
+
+    hideSystemBtn.classList.toggle('active', hideSystem);
+    hideSystemBtn.setAttribute('aria-pressed', String(hideSystem));
+    detailModeBtn.classList.toggle('active', detailMode);
+    detailModeBtn.setAttribute('aria-pressed', String(detailMode));
+
+    const hasActiveFilter = channelFilter !== 'all' || hideSystem;
+    if (!hasActiveFilter || (hiddenSystemCount === 0 && hiddenChannelCount === 0 && channelFilter === 'all')) {
+      filterBannerEl.hidden = true;
+      filterBannerEl.replaceChildren();
+      return;
+    }
+
+    const parts: string[] = [];
+    if (channelFilter !== 'all') {
+      const meta = channelMeta(channelFilter);
+      parts.push(`仅看「${meta.icon} ${meta.shortLabel}」渠道${hiddenChannelCount > 0 ? `（已滤除 ${hiddenChannelCount} 条其他渠道）` : ''}`);
+    }
+    if (hideSystem) {
+      parts.push(hiddenSystemCount > 0 ? `已静默 ${hiddenSystemCount} 条系统/定时通知` : '已开启系统通知静默');
+    }
+    filterBannerEl.hidden = false;
+    filterBannerEl.replaceChildren(
+      node('span', parts.join(' · '), 'conv-filter-banner-text'),
+      button('恢复全部', () => {
+        channelFilter = 'all';
+        hideSystem = false;
+        writeStoredString(STORAGE_KEY_CHANNEL, 'all');
+        writeStoredString(STORAGE_KEY_HIDE_SYSTEM, 'false');
+        unreadWhileScrolledUp = 0;
+        renderMessages();
+      }, 'mini-button'),
+    );
+  }
+
+  hideSystemBtn.addEventListener('click', () => {
+    hideSystem = !hideSystem;
+    writeStoredString(STORAGE_KEY_HIDE_SYSTEM, String(hideSystem));
+    unreadWhileScrolledUp = 0;
+    renderMessages();
+  });
+
+  detailModeBtn.addEventListener('click', () => {
+    detailMode = !detailMode;
+    writeStoredString(STORAGE_KEY_DETAIL_MODE, String(detailMode));
+    renderMessages();
+  });
+
+  function syncScrollBottomButton(): void {
+    const dist = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
+    const hasMessages = renderedArticles.size > 0;
+    const show = hasMessages && (dist > 140 || unreadWhileScrolledUp > 0);
+    scrollBottomBtn.hidden = !show;
+    scrollBottomBtn.classList.toggle('has-unread', unreadWhileScrolledUp > 0);
+    scrollBottomBtn.textContent = unreadWhileScrolledUp > 0
+      ? `↓ ${unreadWhileScrolledUp} 条新消息`
+      : '↓ 回到底部';
+  }
+
+  scrollBottomBtn.addEventListener('click', () => {
+    unreadWhileScrolledUp = 0;
+    if (typeof scrollEl.scrollTo === 'function') {
+      scrollEl.scrollTo({ top: scrollEl.scrollHeight, behavior: 'smooth' });
+    } else {
+      scrollEl.scrollTop = scrollEl.scrollHeight;
+    }
+    syncScrollBottomButton();
+  });
 
   function mergeMessages(items: ChatMessage[]): void {
     mergeInto(appState.messages, items);
@@ -210,29 +515,175 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     return row;
   }
 
-  function routingSummary(message: ChatMessage): HTMLElement {
-    const area = node('div', '', 'routing-summary');
-    if (!message.routing) {
-      area.append(node('p', active(message.status) ? '等待 F.R.I.D.A.Y. 处理并记录分配结果…' : '此历史消息未采集路由摘要；不从回复正文猜测。', 'meta'));
-      return area;
+  function buildRoutingSection(message: ChatMessage): HTMLElement | undefined {
+    const model = classifyRoutingDisplay(message, detailMode);
+    if (!model.visible) return undefined;
+
+    const area = node('div', '', `routing-summary is-${model.mode}`);
+    const row = node('div', '', 'route-pills-row');
+
+    if (model.pendingText) {
+      const pending = node('span', '', 'route-pill tone-run is-pending');
+      pending.append(node('span', '', 'route-pill-dot'), node('span', model.pendingText));
+      row.append(pending);
     }
-    for (const action of message.routing.actions) area.append(actionRow(action));
-    if (!message.routing.actions.length) {
-      area.append(node('p', message.routing.status === 'processing' ? 'F.R.I.D.A.Y. 正在处理，尚无已受理动作。' : '本次路由未确认完成，没有可确认的分配动作。', 'meta'));
+
+    const workMap = new Map<string, WorkView>();
+    for (const work of appState.view?.works ?? []) workMap.set(work.id, work);
+
+    for (const action of model.taskActions) {
+      const work = action.taskId ? workMap.get(action.taskId) : undefined;
+      const tone = work
+        ? (work.status === 'failed' || work.status === 'cancelled' ? 'tone-err'
+          : work.pendingQuestion ? 'tone-warn'
+          : active(work.status) ? 'tone-run' : 'tone-ok')
+        : actionToneClass(action);
+      const pill = node('div', '', `route-pill ${tone}`);
+      pill.append(node('span', '', 'route-pill-dot'));
+      const label = singleLine(formatActionShortLabel(action));
+      if (action.taskId) {
+        const targetBtn = button(label, () => {
+          hooks.selectTrace({ type: 'task', id: action.taskId!, label: action.taskLabel ?? '目标工作' });
+          hooks.showPanel(true);
+        }, 'route-target route-pill-btn');
+        targetBtn.title = `${label} · ${work ? statusText(work.status) : routeState(action)}`;
+        pill.append(targetBtn);
+      } else {
+        const textSpan = node('span', label, 'route-pill-text');
+        textSpan.title = label;
+        pill.append(textSpan);
+      }
+
+      const stateHint = work
+        ? (work.pendingQuestion ? '待拍板' : statusText(work.status))
+        : (action.kind === 'followup' || action.status !== 'accepted' ? routeState(action) : '');
+      if (stateHint) {
+        pill.append(node('span', stateHint, 'route-pill-state'));
+      }
+
+      if (work && active(work.status)) {
+        const requested = appState.stopRequests.has(`task:${work.id}`);
+        const stopPillBtn = button(requested ? '…' : '■', () => {
+          void hooks.stopWork(work.id);
+        }, 'route-pill-stop danger-btn mini-button');
+        stopPillBtn.disabled = requested || appState.authExpired;
+        stopPillBtn.title = requested ? '已请求停止' : '停止此后台任务';
+        pill.append(stopPillBtn);
+      }
+      row.append(pill);
     }
-    if (message.routing.omittedActions) area.append(node('p', '动作较多，摘要只展示最近 40 条；完整动作记录请在事件时间线查看。', 'meta'));
-    if (message.routing.status === 'failed' || message.routing.status === 'interrupted') {
-      area.append(node('p', 'F.R.I.D.A.Y. 处理未完成；已受理的动作保留，不代表已撤销。', 'meta'));
+
+    for (const action of model.metaActions) {
+      const pill = node('div', '', `route-pill is-meta ${actionToneClass(action)}`);
+      const metaLabel = singleLine(formatActionShortLabel(action));
+      const metaSpan = node('span', metaLabel, 'route-pill-text');
+      metaSpan.title = metaLabel;
+      pill.append(metaSpan);
+      if (model.mode === 'detail' || action.status !== 'accepted' || action.error) {
+        pill.append(node('span', routeState(action), 'route-pill-state'));
+      }
+      row.append(pill);
+    }
+
+    const isExpanded = expandedRoutingIds.has(message.id);
+    if (model.hasExpandableDetails || model.mode === 'detail') {
+      const expandBtn = button(isExpanded ? '▴ 收起' : '▾ 详情', () => {
+        if (expandedRoutingIds.has(message.id)) expandedRoutingIds.delete(message.id);
+        else expandedRoutingIds.add(message.id);
+        renderMessages();
+      }, 'route-expand-btn mini-button');
+      expandBtn.setAttribute('aria-expanded', String(isExpanded));
+      row.append(expandBtn);
+    }
+
+    if (row.childNodes.length) area.append(row);
+
+    if (model.warningText) {
+      area.append(node('p', model.warningText, 'route-warning-note'));
+    }
+
+    if (isExpanded && message.routing) {
+      const drawer = node('div', '', 'route-expanded-drawer');
+      for (const action of message.routing.actions) {
+        drawer.append(actionRow(action));
+      }
+      area.append(drawer);
     }
     return area;
   }
 
+  function renderAttachmentAndFooterChips(
+    message: ChatMessage,
+    options?: { skipRoutingCoveredTasks?: boolean },
+  ): HTMLElement | undefined {
+    const attachments: AttachmentView[] = message.attachments ?? [];
+    const paths = message.paths ?? [];
+    const routingTaskIds = new Set(
+      (message.routing?.actions ?? [])
+        .map(a => a.taskId)
+        .filter((id): id is string => Boolean(id)),
+    );
+    const rawTaskIds = message.role === 'assistant' || !message.routing ? message.taskIds : [];
+    const taskIds = options?.skipRoutingCoveredTasks
+      ? rawTaskIds.filter(id => !routingTaskIds.has(id))
+      : rawTaskIds;
+
+    if (!attachments.length && !paths.length && !taskIds.length) return undefined;
+
+    const wrap = node('div', '', 'message-footer-chips');
+
+    for (const att of attachments) {
+      const sizeStr = formatByteSize(att.bytes);
+      const icon = att.kind === 'image' ? '🖼️' : att.kind === 'voice' ? '🎤' : att.kind === 'video' ? '🎬' : '📎';
+      const statusSuffix = att.status === 'failed' ? ` · 失败${att.error ? `: ${att.error}` : ''}` : '';
+      const label = `${icon} ${att.name}${sizeStr ? ` (${sizeStr})` : ''}${statusSuffix}`;
+      const chip = node('span', label, `attachment-chip${att.status === 'failed' ? ' is-failed' : ''}`);
+      if (att.path) chip.title = att.path;
+      wrap.append(chip);
+    }
+
+    for (const p of paths) {
+      wrap.append(node('span', p, 'message-path attachment-chip'));
+    }
+
+    const workMap = new Map<string, WorkView>();
+    for (const work of appState.view?.works ?? []) workMap.set(work.id, work);
+    const seenTasks = new Set<string>();
+    for (const id of taskIds) {
+      if (seenTasks.has(id)) continue;
+      seenTasks.add(id);
+      const work = workMap.get(id);
+      const promptLine = work?.prompt ? singleLine(work.prompt) : '';
+      const fullLabel = promptLine ? `🔗 关联工作：${promptLine}` : '🔗 关联工作：查看详情';
+      const taskBtn = button('', () => {
+        hooks.selectTrace({ type: 'task', id, label: work?.prompt ?? '关联工作' });
+        hooks.showPanel(true);
+      }, 'task-link-chip source-reference');
+      taskBtn.title = fullLabel;
+      taskBtn.append(node('span', fullLabel, 'task-link-label'));
+      if (work) {
+        taskBtn.append(node('span', statusText(work.status), `task-link-state${active(work.status) ? ' running' : ''}`));
+      }
+      wrap.append(taskBtn);
+    }
+
+    return wrap;
+  }
+
+  function syncSelectionHighlight(): void {
+    for (const [id, entry] of renderedArticles) {
+      const msg = appState.messages.get(id);
+      const selected = msg ? isMessageMatchedByTraceSelection(msg) : false;
+      entry.el.classList.toggle('is-trace-selected', selected);
+    }
+  }
+
   function renderRoutingDetail(): void {
+    syncSelectionHighlight();
     routingDetailEl.hidden = appState.selection.type !== 'message';
     if (appState.selection.type !== 'message') return;
     const message = appState.messages.get(appState.selection.id);
     if (!message) {
-      // A message outside the loaded page still has a recorded routing decision; read it instead of claiming none.
       const requestSeq = ++routingDetailRequest;
       const generation = appState.selectionGeneration;
       const id = appState.selection.id;
@@ -255,7 +706,6 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       return;
     }
     const routing = message.routing;
-    // The readable process leads; the recorded routing context stays available without crowding it.
     const summary = routing.actions.length
       ? routing.actions.map(action => `${routeLabel(action)}${action.taskLabel ? ` · ${action.taskLabel}` : ''}`).join('；')
       : routing.status === 'processing' ? 'F.R.I.D.A.Y. 正在处理' : '没有已确认的分配动作';
@@ -331,12 +781,378 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     target.append(refs, node('p', `执行环境：${routing.context.execution} · ${routing.context.cwd}`, 'meta'));
   }
 
+  function buildMessageSignature(
+    message: ChatMessage,
+    opts: {
+      isLatestAssistant: boolean;
+      isGrouped: boolean;
+      showReplyRef: boolean;
+      replySourcePreview: string;
+    },
+  ): string {
+    const workStates = [
+      ...message.taskIds,
+      ...(message.routing?.actions.map(a => a.taskId).filter((id): id is string => Boolean(id)) ?? []),
+    ]
+      .map(id => {
+        const w = appState.view?.works.find(item => item.id === id);
+        return w ? `${id}:${w.status}:${w.pendingQuestion ? 1 : 0}:${appState.stopRequests.has(`task:${id}`) ? 1 : 0}` : id;
+      })
+      .join(',');
+
+    return [
+      message.version,
+      message.status,
+      message.text.length,
+      message.text.slice(-32),
+      message.mode,
+      message.reason ?? '',
+      message.paths.length,
+      message.attachments?.length ?? 0,
+      message.origin?.channel ?? '',
+      message.origin?.speakerName ?? '',
+      message.routing ? `${message.routing.status}:${message.routing.actions.length}:${message.routing.actions.map(a => `${a.kind}/${a.status}/${a.delivery ?? ''}`).join(';')}` : '-',
+      opts.isLatestAssistant ? 'L' : 'S',
+      opts.isGrouped ? 'G' : 'N',
+      opts.showReplyRef ? `R:${opts.replySourcePreview}` : 'R0',
+      detailMode ? 'D' : 'C',
+      expandedRoutingIds.has(message.id) ? 'ER' : '',
+      expandedSystemIds.has(message.id) ? 'ES' : '',
+      expandedLongTextIds.has(message.id) ? 'EL' : '',
+      appState.stopRequests.has(`message:${message.id}`) ? 'SM' : '',
+      appState.authExpired ? 'AX' : '',
+      workStates,
+    ].join('|');
+  }
+
+  function buildStopActionButton(message: ChatMessage): HTMLButtonElement | undefined {
+    if (!active(message.status)) return undefined;
+    const deliveryWork = message.role === 'assistant'
+      ? appState.view?.works.find(work => message.taskIds.includes(work.id) && active(work.status))
+      : undefined;
+    const requested = appState.stopRequests.has(deliveryWork ? `task:${deliveryWork.id}` : `message:${message.id}`);
+    const label = message.role === 'user' ? '取消' : deliveryWork ? '停止任务' : '停止回复';
+    const stop = button(requested ? '已请求停止' : label, () => {
+      if (deliveryWork) void hooks.stopWork(deliveryWork.id);
+      else void stopMessage(message.id);
+    }, 'mini-button danger-btn msg-stop-btn');
+    stop.disabled = requested || appState.authExpired;
+    stop.dataset.actionKey = `stop-${message.id}`;
+    return stop;
+  }
+
+  function populateUserArticle(
+    article: HTMLElement,
+    message: ChatMessage,
+    channel: ReturnType<typeof resolveMessageChannel>,
+    isGrouped: boolean,
+  ): void {
+    article.className = `message user-message${isGrouped ? ' is-grouped' : ''}${isMessageMatchedByTraceSelection(message) ? ' is-trace-selected' : ''}`;
+    const children: Node[] = [];
+    const parsedQuote = extractLeadingQuote(message.text);
+    const displayBody = parsedQuote ? parsedQuote.body : message.text;
+
+    const row = node('div', '', 'user-row');
+    const actions = node('div', '', `message-actions${active(message.status) ? ' has-active-stop' : ''}`);
+    actions.append(createClipboardButton('复制', () => displayBody || message.text));
+    const traceBtn = button('路由', () => {
+      hooks.selectTrace({ type: 'message', id: message.id, label: '本轮消息' });
+      hooks.showPanel(true);
+    }, 'mini-button');
+    traceBtn.title = '查看本次路由与上下文';
+    traceBtn.dataset.actionKey = `trace-${message.id}`;
+    actions.append(traceBtn);
+    const stopBtn = buildStopActionButton(message);
+    if (stopBtn) actions.append(stopBtn);
+
+    const bubble = node('div', '', 'user-bubble');
+    if (parsedQuote) {
+      const fullLine = `↩ ${parsedQuote.label}：${parsedQuote.preview}`;
+      const jumpId = !parsedQuote.uncached
+        ? findQuotedJumpTargetId(message, parsedQuote.label, parsedQuote.preview)
+        : undefined;
+      if (jumpId) {
+        const quoteBtn = button('', () => {
+          void jumpMessage(jumpId);
+        }, 'reply-quote-btn user-reply-quote source-reference');
+        quoteBtn.title = parsedQuote.fullText;
+        quoteBtn.append(node('span', fullLine, 'reply-quote-text'));
+        bubble.append(quoteBtn);
+      } else {
+        const quoteBox = node('div', '', 'reply-quote-btn user-reply-quote is-static');
+        quoteBox.title = parsedQuote.fullText;
+        quoteBox.append(node('span', fullLine, 'reply-quote-text'));
+        bubble.append(quoteBox);
+      }
+    }
+    const textEl = node('div', '', 'message-text');
+    textEl.append(renderUserMessageContent(displayBody || (parsedQuote ? '（仅引用）' : '（空消息）'), markdownOpts));
+    bubble.append(textEl);
+
+    const footerChips = renderAttachmentAndFooterChips(message, { skipRoutingCoveredTasks: true });
+    if (footerChips) bubble.append(footerChips);
+
+    row.append(actions, bubble);
+    children.push(row);
+
+    const speaker = node('div', '', 'speaker user-meta');
+    if (channel !== 'local') {
+      const chMeta = channelMeta(channel);
+      speaker.append(node('span', `${chMeta.icon} ${chMeta.shortLabel}`, `origin-channel-badge ch-${channel}`));
+    }
+    if (message.origin?.speakerName) {
+      speaker.append(node('span', `🎙️ ${channel === 'xiaoai' ? '小爱 · ' : ''}${message.origin.speakerName}`, 'origin-speaker-badge'));
+    }
+    if (message.mode === 'offline') speaker.append(node('span', '离线模拟', 'mode-chip'));
+
+    if (active(message.status)) {
+      speaker.append(node('span', statusText(message.status), 'status-chip running'));
+    } else if (message.status === 'failed' || message.status === 'interrupted') {
+      speaker.append(node('span', statusText(message.status), 'status-chip is-error'));
+    } else if (detailMode && message.status === 'completed') {
+      speaker.append(node('span', 'F.R.I.D.A.Y. 已处理', 'status-chip'));
+    }
+
+    const time = node('time', formatShortClock(message.at));
+    time.title = timestamp(message.at);
+    if (Number.isFinite(message.at)) {
+      const parsedTime = new Date(message.at);
+      if (!Number.isNaN(parsedTime.getTime())) time.dateTime = parsedTime.toISOString();
+    }
+    speaker.append(time);
+    children.push(speaker);
+
+    const routingSection = buildRoutingSection(message);
+    if (routingSection) children.push(routingSection);
+
+    article.replaceChildren(...children);
+  }
+
+  function populateSystemArticle(article: HTMLElement, message: ChatMessage): void {
+    article.className = `message router-message system-message${isMessageMatchedByTraceSelection(message) ? ' is-trace-selected' : ''}`;
+    const summary = summarizeSystemNotice(message);
+    const expanded = expandedSystemIds.has(message.id) || detailMode;
+
+    const card = node('div', '', `system-notice-card${expanded ? ' is-expanded' : ''}`);
+    const head = node('div', '', 'system-notice-head');
+    head.append(
+      node('span', summary.icon, 'system-notice-icon'),
+      node('span', summary.badge, 'system-notice-badge'),
+      node('span', summary.title, 'system-notice-title'),
+    );
+    const time = node('time', formatShortClock(message.at), 'system-notice-time meta');
+    time.title = timestamp(message.at);
+    head.append(time);
+
+    if (summary.expandable && !detailMode) {
+      const toggleBtn = button(expanded ? '收起' : '详情', () => {
+        if (expandedSystemIds.has(message.id)) expandedSystemIds.delete(message.id);
+        else expandedSystemIds.add(message.id);
+        renderMessages();
+      }, 'mini-button system-notice-toggle');
+      toggleBtn.setAttribute('aria-expanded', String(expanded));
+      head.append(toggleBtn);
+    }
+
+    const traceBtn = button('链路', () => {
+      hooks.selectTrace({ type: 'message', id: message.replyTo ?? message.id, label: '系统通知链路' });
+      hooks.showPanel(true);
+    }, 'mini-button system-notice-trace');
+    traceBtn.dataset.actionKey = `trace-${message.id}`;
+    head.append(traceBtn);
+
+    card.append(head);
+
+    if (expanded) {
+      const body = node('div', '', 'system-notice-body');
+      const md = node('div', '', 'message-text md-content');
+      md.append(renderMarkdownContent(message.text || '没有公开文本。', markdownOpts));
+      body.append(md);
+      const footerChips = renderAttachmentAndFooterChips(message);
+      if (footerChips) body.append(footerChips);
+      if (message.reason) body.append(node('p', message.reason, 'message-reason'));
+      card.append(body);
+    }
+
+    article.replaceChildren(card);
+  }
+
+  function populateAssistantArticle(
+    article: HTMLElement,
+    message: ChatMessage,
+    opts: {
+      isLatestAssistant: boolean;
+      isGrouped: boolean;
+      showReplyRef: boolean;
+      replySourceText?: string;
+      channel: ReturnType<typeof resolveMessageChannel>;
+    },
+  ): void {
+    article.className = `message router-message${opts.isGrouped ? ' is-grouped' : ''}${isMessageMatchedByTraceSelection(message) ? ' is-trace-selected' : ''}`;
+
+    const row = node('div', '', 'assistant-row');
+    const avatarCol = node('div', '', 'assistant-avatar-col');
+    avatarCol.setAttribute('aria-hidden', 'true');
+
+    if (!opts.isGrouped || active(message.status) || opts.isLatestAssistant) {
+      const avatar = node('span', '', 'speaker-avatar');
+      const inferredExpr = inferMessageBotExpression(message.text);
+      if (active(message.status) || opts.isLatestAssistant) {
+        let ctrl = liveMessageAvatars.get(message.id);
+        if (!ctrl) {
+          ctrl = createLiveBotAvatar({
+            size: 28,
+            compact: true,
+            interactive: true,
+            idPrefix: `friday-msg-${message.id.replace(/[^a-zA-Z0-9_-]/g, '')}`,
+          });
+          liveMessageAvatars.set(message.id, ctrl);
+        }
+        if (message.status === 'streaming') {
+          ctrl.setState('streaming');
+          ctrl.setExpression(inferredExpr ?? 'auto');
+        } else if (message.status === 'queued' || message.status === 'processing') {
+          ctrl.setState('thinking');
+          ctrl.setExpression('auto');
+        } else if (message.status === 'failed' || message.status === 'interrupted') {
+          ctrl.setState('idle');
+          ctrl.setExpression(inferredExpr ?? 'sad');
+        } else {
+          ctrl.setState('idle');
+          ctrl.setExpression(inferredExpr ?? 'auto');
+        }
+        avatar.append(ctrl.svg);
+      } else {
+        avatar.append(createStaticBotSvg({
+          size: 28,
+          expr: inferredExpr ?? 'neutral',
+          interactivePoke: true,
+        }));
+      }
+      avatarCol.append(avatar);
+    }
+
+    const bodyCol = node('div', '', 'assistant-body-col');
+
+    const headRow = node('div', '', 'assistant-head-row');
+    const speaker = node('div', '', 'speaker assistant-meta');
+    if (!opts.isGrouped || detailMode || active(message.status) || message.status === 'failed' || message.status === 'interrupted') {
+      speaker.append(node('span', 'F.R.I.D.A.Y.', 'speaker-name'));
+      if (opts.channel !== 'local' && detailMode) {
+        const chMeta = channelMeta(opts.channel);
+        speaker.append(node('span', `${chMeta.icon} ${chMeta.shortLabel}`, `origin-channel-badge ch-${opts.channel}`));
+      }
+      if (active(message.status)) {
+        speaker.append(node('span', statusText(message.status), 'status-chip running'));
+      } else if (message.status === 'failed' || message.status === 'interrupted') {
+        speaker.append(node('span', statusText(message.status), 'status-chip is-error'));
+      } else if (detailMode) {
+        speaker.append(node('span', statusText(message.status), 'status-chip'));
+      }
+      if (message.mode === 'offline') speaker.append(node('span', '离线模拟', 'mode-chip'));
+    }
+    const time = node('time', formatShortClock(message.at));
+    time.title = timestamp(message.at);
+    if (Number.isFinite(message.at)) {
+      const parsedTime = new Date(message.at);
+      if (!Number.isNaN(parsedTime.getTime())) time.dateTime = parsedTime.toISOString();
+    }
+    speaker.append(time);
+
+    const actions = node('div', '', `message-actions${active(message.status) ? ' has-active-stop' : ''}`);
+    actions.append(createClipboardButton('复制', () => message.text));
+    const traceBtn = button('链路', () => {
+      hooks.selectTrace({ type: 'message', id: message.replyTo ?? message.id, label: '本轮消息' });
+      hooks.showPanel(true);
+    }, 'mini-button');
+    traceBtn.title = '查看来源轨迹';
+    traceBtn.dataset.actionKey = `trace-${message.id}`;
+    actions.append(traceBtn);
+    const stopBtn = buildStopActionButton(message);
+    if (stopBtn) actions.append(stopBtn);
+
+    headRow.append(speaker, actions);
+    bodyCol.append(headRow);
+
+    if (opts.showReplyRef && message.replyTo) {
+      const quoteText = opts.replySourceText ? singleLine(opts.replySourceText) : '查看原消息';
+      const fullQuote = `↩ 回应：${quoteText || '查看原消息'}`;
+      const replyBtn = button('', () => {
+        void jumpMessage(message.replyTo!);
+      }, 'reply-quote-btn source-reference');
+      replyBtn.title = fullQuote;
+      replyBtn.append(node('span', fullQuote, 'reply-quote-text'));
+      bodyCol.append(replyBtn);
+    }
+
+    const fullText = message.text;
+    const isLong = !active(message.status) && fullText.length > LONG_MESSAGE_COLLAPSE_CHARS;
+    const isLongExpanded = expandedLongTextIds.has(message.id);
+    const visibleText = isLong && !isLongExpanded ? fullText.slice(0, LONG_MESSAGE_COLLAPSE_CHARS) : fullText;
+
+    const textBlock = node('div', '', `message-text md-content${isLong && !isLongExpanded ? ' is-long-truncated' : ''}`);
+    if (!visibleText && active(message.status)) {
+      const typing = node('div', '', 'typing-indicator');
+      typing.append(
+        node('span', '', 'typing-dot'),
+        node('span', '', 'typing-dot'),
+        node('span', '', 'typing-dot'),
+        node('span', 'F.R.I.D.A.Y. 正在处理…', 'typing-label meta'),
+      );
+      textBlock.append(typing);
+    } else if (!visibleText) {
+      textBlock.append(node('p', '没有公开文本。', 'md-p meta'));
+    } else {
+      textBlock.append(renderMarkdownContent(visibleText, markdownOpts));
+      if (message.status === 'streaming') {
+        const cursor = node('span', '', 'streaming-cursor');
+        cursor.setAttribute('aria-hidden', 'true');
+        textBlock.append(cursor);
+      }
+    }
+    bodyCol.append(textBlock);
+
+    if (isLong) {
+      const remaining = fullText.length - LONG_MESSAGE_COLLAPSE_CHARS;
+      const toggleLongBtn = button(
+        isLongExpanded ? '▴ 收起长文' : `▾ 展开全文（剩余 ${remaining.toLocaleString('en-US')} 字）`,
+        () => {
+          if (expandedLongTextIds.has(message.id)) expandedLongTextIds.delete(message.id);
+          else expandedLongTextIds.add(message.id);
+          renderMessages();
+        },
+        'long-text-toggle mini-button',
+      );
+      bodyCol.append(toggleLongBtn);
+    }
+
+    const footerChips = renderAttachmentAndFooterChips(message);
+    if (footerChips) bodyCol.append(footerChips);
+    if (message.reason) bodyCol.append(node('p', message.reason, 'message-reason'));
+
+    row.append(avatarCol, bodyCol);
+    article.replaceChildren(row);
+  }
+
   function renderMessages(): void {
-    const nearBottom = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 90;
+    const distFromBottom = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
+    const nearBottom = distFromBottom < 90;
     const previousTop = scrollEl.scrollTop;
     const focus = document.activeElement instanceof HTMLElement ? document.activeElement.dataset.actionKey : undefined;
-    const contents = document.createDocumentFragment();
+
     const ordered = orderConversation(appState.messages.values());
+    if (!ordered.length && appState.messages.size === 0) {
+      knownMessageIds.clear();
+      hasRenderedMessages = false;
+    }
+    const isInitialRender = !hasRenderedMessages;
+
+    const filtered = filterConversationMessages(ordered, appState.messages, {
+      channel: channelFilter,
+      hideSystem,
+    });
+    renderFilterControls(ordered, filtered.hiddenSystemCount, filtered.hiddenChannelCount);
+
     let latestAssistantId: string | undefined;
     for (let i = ordered.length - 1; i >= 0; i--) {
       const candidate = ordered[i];
@@ -345,136 +1161,117 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
         break;
       }
     }
-    const keptLiveIds = new Set<string>();
 
-    for (const message of ordered) {
+    const keptLiveIds = new Set<string>();
+    const usedArticleIds = new Set<string>();
+    const usedDividerKeys = new Set<string>();
+    const desiredNodes: HTMLElement[] = [];
+    let newlyAddedVisible = 0;
+
+    for (let i = 0; i < filtered.visible.length; i++) {
+      const message = filtered.visible[i]!;
+      const prevVisible = i > 0 ? filtered.visible[i - 1] : undefined;
       const systemNotice = message.source === 'system';
-      const article = node('article', '', `message ${message.role === 'user' ? 'user-message' : 'router-message'}`);
-      article.dataset.messageId = message.id;
-      article.dataset.seq = String(message.seq);
-      if (message.replyTo) article.dataset.replyTo = message.replyTo;
-      const speaker = node('div', '', 'speaker');
-      if (message.role === 'assistant' && !systemNotice) {
-        const avatar = node('span', '', 'speaker-avatar');
-        avatar.setAttribute('aria-hidden', 'true');
-        const inferredExpr = inferMessageBotExpression(message.text);
-        if (active(message.status) || message.id === latestAssistantId) {
-          keptLiveIds.add(message.id);
-          let ctrl = liveMessageAvatars.get(message.id);
-          if (!ctrl) {
-            ctrl = createLiveBotAvatar({
-              size: 26,
-              compact: true,
-              interactive: true,
-              idPrefix: `friday-msg-${message.id.replace(/[^a-zA-Z0-9_-]/g, '')}`,
-            });
-            liveMessageAvatars.set(message.id, ctrl);
-          }
-          if (message.status === 'streaming') {
-            ctrl.setState('streaming');
-            ctrl.setExpression(inferredExpr ?? 'auto');
-          } else if (message.status === 'queued' || message.status === 'processing') {
-            ctrl.setState('thinking');
-            ctrl.setExpression('auto');
-          } else if (message.status === 'failed' || message.status === 'interrupted') {
-            ctrl.setState('idle');
-            ctrl.setExpression(inferredExpr ?? 'sad');
-          } else {
-            ctrl.setState('idle');
-            ctrl.setExpression(inferredExpr ?? 'auto');
-          }
-          avatar.append(ctrl.svg);
-        } else {
-          avatar.append(createStaticBotSvg({
-            size: 26,
-            expr: inferredExpr ?? 'neutral',
-            interactivePoke: true,
-          }));
+
+      if (shouldShowTimeDivider(prevVisible, message)) {
+        const dividerKey = `div:${message.id}`;
+        const label = formatTimeDivider(message.at);
+        usedDividerKeys.add(dividerKey);
+        let divEntry = renderedDividers.get(dividerKey);
+        if (!divEntry) {
+          const el = node('div', '', 'time-divider');
+          el.append(node('span', label, 'time-divider-label'));
+          divEntry = { el, label };
+          renderedDividers.set(dividerKey, divEntry);
+        } else if (divEntry.label !== label) {
+          const labelSpan = divEntry.el.firstElementChild;
+          if (labelSpan) labelSpan.textContent = label;
+          divEntry.label = label;
         }
-        speaker.append(avatar);
+        desiredNodes.push(divEntry.el);
       }
-      speaker.append(node('span', message.role === 'user' ? '你' : systemNotice ? '系统 · 工作状态（非模型回复）' : 'F.R.I.D.A.Y.'));
-      if (message.role === 'user' && message.origin?.speakerName) {
-        speaker.append(node('span', `🎙️ ${message.origin.channel === 'xiaoai' ? '小爱 · ' : ''}${message.origin.speakerName}`, 'origin-speaker-badge'));
+
+      const isEntering = !isInitialRender && !knownMessageIds.has(message.id);
+      if (isEntering) newlyAddedVisible++;
+      knownMessageIds.add(message.id);
+
+      const isLatestAssistant = message.id === latestAssistantId;
+      if (message.role === 'assistant' && !systemNotice && (active(message.status) || isLatestAssistant)) {
+        keptLiveIds.add(message.id);
       }
-      speaker.append(node('span', message.role === 'user' && message.status === 'completed' ? 'F.R.I.D.A.Y. 已处理' : statusText(message.status), active(message.status) ? 'running' : ''));
-      if (message.mode === 'offline') speaker.append(node('span', '离线模拟'));
-      const time = node('time', timestamp(message.at));
-      if (Number.isFinite(message.at)) {
-        const parsedTime = new Date(message.at);
-        if (!Number.isNaN(parsedTime.getTime())) time.dateTime = parsedTime.toISOString();
-      }
-      speaker.append(time);
-      const full = message.text || (active(message.status) ? '等待公开回复…' : '没有公开文本。');
-      const visible = full.slice(0, 4000);
-      const textBlock = node('div', '', 'message-text');
-      const tokens = tokenizeBotMessageText(visible);
-      if (!tokens.length) {
-        textBlock.textContent = visible;
-      } else {
-        for (const token of tokens) {
-          if (token.kind === 'text') {
-            textBlock.append(document.createTextNode(token.value));
-          } else if (token.kind === 'emote') {
-            const wrap = node('span', '', 'bot-inline-emote');
-            wrap.title = `F.R.I.D.A.Y. 小表情：${BOT_EXPRESSION_META[token.expr].label}`;
-            wrap.append(createStaticBotSvg({ size: 20, expr: token.expr, interactivePoke: true }));
-            textBlock.append(wrap);
-          } else {
-            const wrap = node('span', '', 'bot-inline-sticker');
-            wrap.title = `F.R.I.D.A.Y. 动态表情：${BOT_EXPRESSION_META[token.expr].label}`;
-            wrap.append(createStaticBotSvg({ size: 46, expr: token.expr, interactivePoke: true }));
-            textBlock.append(wrap);
-          }
-        }
-      }
-      article.append(speaker);
-      if (message.replyTo) {
-        const source = appState.messages.get(message.replyTo);
-        article.append(button(`回应：${source?.text.slice(0, 80) ?? '查看原消息'}`, () => { void jumpMessage(message.replyTo!); }, 'source-reference'));
-      }
-      article.append(textBlock);
-      if (message.role === 'user') article.append(routingSummary(message));
-      for (const id of message.role === 'assistant' || !message.routing ? message.taskIds : []) {
-        const work = appState.view?.works.find(item => item.id === id);
-        article.append(button(`关联工作：${work?.prompt ?? '查看工作'}`, () => {
-          hooks.selectTrace({ type: 'task', id, label: work?.prompt ?? '关联工作' });
-          hooks.showPanel(true);
-        }, 'source-reference'));
-      }
-      if (full.length > visible.length) {
-        const more = node('details');
-        more.append(node('summary', `展开剩余 ${full.length - visible.length} 个字符`), node('pre', full.slice(visible.length)));
-        article.append(more);
-      }
-      for (const path of message.paths) article.append(node('span', path, 'message-path'));
-      if (message.reason) article.append(node('p', message.reason, 'message-reason'));
-      const actions = node('div', '', 'message-actions');
-      const trace = button(message.role === 'user' ? '查看本次路由与上下文' : '查看来源轨迹', () => {
-        hooks.selectTrace({ type: 'message', id: message.replyTo ?? message.id, label: '本轮消息' });
-        hooks.showPanel(true);
+
+      const isGrouped = isGroupedWithPrevious(prevVisible, message);
+      const showReplyRef = !systemNotice && shouldShowReplyReference(message, prevVisible, detailMode);
+      const replySource = message.replyTo ? appState.messages.get(message.replyTo) : undefined;
+      const replySourceClean = replySource ? stripLeadingQuoteForPreview(replySource.text) : '';
+      const replySourcePreview = replySourceClean.slice(0, 72);
+      const channel = resolveMessageChannel(message, appState.messages);
+
+      const sig = buildMessageSignature(message, {
+        isLatestAssistant,
+        isGrouped,
+        showReplyRef,
+        replySourcePreview,
       });
-      trace.dataset.actionKey = `trace-${message.id}`;
-      actions.append(trace);
-      if (active(message.status)) {
-        const deliveryWork = message.role === 'assistant'
-          ? appState.view?.works.find(work => message.taskIds.includes(work.id) && active(work.status))
-          : undefined;
-        const requested = appState.stopRequests.has(deliveryWork ? `task:${deliveryWork.id}` : `message:${message.id}`);
-        const label = message.role === 'user' ? '取消这条消息' : deliveryWork ? '停止这项工作' : '停止本轮回复';
-        const stop = button(requested ? '已请求停止' : label, () => {
-          if (deliveryWork) void hooks.stopWork(deliveryWork.id);
-          else void stopMessage(message.id);
-        });
-        stop.disabled = requested || appState.authExpired;
-        stop.dataset.actionKey = `stop-${message.id}`;
-        actions.append(stop);
+
+      usedArticleIds.add(message.id);
+      let entry = renderedArticles.get(message.id);
+      if (!entry) {
+        const el = node('article', '', 'message');
+        el.dataset.messageId = message.id;
+        el.dataset.seq = String(message.seq);
+        if (message.replyTo) el.dataset.replyTo = message.replyTo;
+        if (systemNotice) {
+          populateSystemArticle(el, message);
+        } else if (message.role === 'user') {
+          populateUserArticle(el, message, channel, isGrouped);
+        } else {
+          populateAssistantArticle(el, message, {
+            isLatestAssistant,
+            isGrouped,
+            showReplyRef,
+            replySourceText: replySourceClean,
+            channel,
+          });
+        }
+        if (isEntering) el.classList.add('is-entering');
+        entry = { el, sig };
+        renderedArticles.set(message.id, entry);
+      } else if (entry.sig !== sig) {
+        entry.el.dataset.seq = String(message.seq);
+        if (message.replyTo) entry.el.dataset.replyTo = message.replyTo;
+        else delete entry.el.dataset.replyTo;
+        if (systemNotice) {
+          populateSystemArticle(entry.el, message);
+        } else if (message.role === 'user') {
+          populateUserArticle(entry.el, message, channel, isGrouped);
+        } else {
+          populateAssistantArticle(entry.el, message, {
+            isLatestAssistant,
+            isGrouped,
+            showReplyRef,
+            replySourceText: replySourceClean,
+            channel,
+          });
+        }
+        entry.sig = sig;
       }
-      article.append(actions);
-      contents.append(article);
+
+      desiredNodes.push(entry.el);
     }
-    if (!contents.childNodes.length) {
-      contents.append(node('p', '从这里开始。直接描述目标，F.R.I.D.A.Y. 会在同一个对话中持续回复。', 'empty'));
+
+    // Reclaim obsolete cached articles, dividers, and live avatar timers.
+    for (const [id, entry] of renderedArticles) {
+      if (!usedArticleIds.has(id)) {
+        entry.el.remove();
+        renderedArticles.delete(id);
+      }
+    }
+    for (const [key, div] of renderedDividers) {
+      if (!usedDividerKeys.has(key)) {
+        div.el.remove();
+        renderedDividers.delete(key);
+      }
     }
     for (const [id, ctrl] of liveMessageAvatars) {
       if (!keptLiveIds.has(id)) {
@@ -482,14 +1279,104 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
         liveMessageAvatars.delete(id);
       }
     }
-    messagesEl.replaceChildren(contents);
+
+    if (ordered.length > 0) hasRenderedMessages = true;
+
+    if (!desiredNodes.length) {
+      emptyStateNotice = node('div', '', 'conv-empty-state');
+      if (ordered.length === 0) {
+        emptyStateNotice.append(node('p', '从这里开始。直接描述目标，F.R.I.D.A.Y. 会在同一个对话中持续回复。', 'empty'));
+      } else {
+        emptyStateNotice.append(
+          node('p', '当前筛选条件下没有可显示的消息。', 'empty'),
+          button('显示全部消息', () => {
+            channelFilter = 'all';
+            hideSystem = false;
+            writeStoredString(STORAGE_KEY_CHANNEL, 'all');
+            writeStoredString(STORAGE_KEY_HIDE_SYSTEM, 'false');
+            renderMessages();
+          }, 'mini-button'),
+        );
+      }
+      messagesEl.replaceChildren(emptyStateNotice);
+    } else {
+      if (emptyStateNotice && emptyStateNotice.parentNode === messagesEl) {
+        emptyStateNotice.remove();
+        emptyStateNotice = undefined;
+      }
+      for (let i = 0; i < desiredNodes.length; i++) {
+        const expected = desiredNodes[i]!;
+        const currentAt = messagesEl.children[i] ?? null;
+        if (currentAt !== expected) {
+          messagesEl.insertBefore(expected, currentAt);
+        }
+      }
+      while (messagesEl.children.length > desiredNodes.length) {
+        messagesEl.lastElementChild?.remove();
+      }
+    }
+
     olderBtn.hidden = !appState.historyHasMore;
     if (focus) {
       const replacement = [...messagesEl.querySelectorAll<HTMLButtonElement>('button')].find(item => item.dataset.actionKey === focus);
       replacement?.focus({ preventScroll: true });
     }
-    scrollEl.scrollTop = nearBottom ? scrollEl.scrollHeight : previousTop;
+
+    if (nearBottom) {
+      scrollEl.scrollTop = scrollEl.scrollHeight;
+      unreadWhileScrolledUp = 0;
+    } else {
+      scrollEl.scrollTop = previousTop;
+      if (newlyAddedVisible > 0) {
+        unreadWhileScrolledUp += newlyAddedVisible;
+      }
+    }
+    syncScrollBottomButton();
     renderRoutingDetail();
+    updateCompanionStatus(lastBotState);
+  }
+
+  function renderBossDecisionDock(): void {
+    const pendingWorks = (appState.view?.works ?? []).filter(
+      work => Boolean(work.pendingQuestion) && (active(work.status) || work.status === 'paused' || work.status === 'waiting_decision'),
+    );
+    if (!pendingWorks.length) {
+      bossDecisionDockEl.hidden = true;
+      bossDecisionDockEl.replaceChildren();
+      return;
+    }
+
+    const frag = document.createDocumentFragment();
+    for (const work of pendingWorks.slice(0, 2)) {
+      const pq = work.pendingQuestion!;
+      const card = node('div', '', 'boss-decision-card');
+      const head = node('div', '', 'boss-decision-head');
+      head.append(
+        node('span', '⏳ 等待老板拍板', 'boss-decision-badge'),
+        node('span', work.prompt || '后台任务请示', 'boss-decision-task'),
+        button('查看任务 ↗', () => {
+          hooks.selectTrace({ type: 'task', id: work.id, label: work.prompt || '后台任务' });
+          hooks.showPanel(true);
+        }, 'mini-button'),
+      );
+      card.append(head, node('p', pq.question, 'boss-decision-question'));
+
+      if (pq.options?.length) {
+        const optRow = node('div', '', 'boss-decision-options');
+        for (const opt of pq.options) {
+          const optBtn = button(opt, () => {
+            void sendDirectText(opt);
+          }, 'mini-button boss-decision-opt-btn');
+          optBtn.disabled = !appState.ready || appState.authExpired || appState.sending || appState.uncertain;
+          optRow.append(optBtn);
+        }
+        card.append(optRow);
+      }
+      frag.append(card);
+    }
+
+    bossDecisionDockEl.hidden = false;
+    bossDecisionDockEl.replaceChildren(frag);
   }
 
   async function jumpMessage(id: string): Promise<void> {
@@ -498,12 +1385,20 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
         mergeMessages([await api<ChatMessage>(`/api/message?${new URLSearchParams({ messageId: id })}`)]);
         renderMessages();
       }
+      let target = [...messagesEl.querySelectorAll<HTMLElement>('[data-message-id]')].find(item => item.dataset.messageId === id);
+      if (!target && (channelFilter !== 'all' || hideSystem)) {
+        channelFilter = 'all';
+        hideSystem = false;
+        writeStoredString(STORAGE_KEY_CHANNEL, 'all');
+        writeStoredString(STORAGE_KEY_HIDE_SYSTEM, 'false');
+        renderMessages();
+        target = [...messagesEl.querySelectorAll<HTMLElement>('[data-message-id]')].find(item => item.dataset.messageId === id);
+      }
       hooks.showPanel(false);
-      const target = [...messagesEl.querySelectorAll<HTMLElement>('[data-message-id]')].find(item => item.dataset.messageId === id);
       if (target) {
         scrollEl.scrollTop += target.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top - 16;
         target.classList.add('message-highlight');
-        setTimeout(() => target.classList.remove('message-highlight'), 2000);
+        setTimeout(() => target?.classList.remove('message-highlight'), 2000);
       }
     } catch (error) {
       hooks.connection(`来源消息读取失败：${errorText(error)}`, true);
@@ -520,17 +1415,49 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     const oldTop = scrollEl.scrollTop;
     try {
       const page = await api<MessagePage>(`/api/history?before=${appState.historyBefore}`);
+      for (const item of page.items) knownMessageIds.add(item.id);
       mergeMessages(page.items);
       appState.historyBefore = page.before;
       appState.historyHasMore = page.hasMore;
       renderMessages();
       scrollEl.scrollTop = oldTop + scrollEl.scrollHeight - oldHeight;
+      syncScrollBottomButton();
     } catch (error) {
       historyErrorEl.textContent = `更早消息读取失败：${errorText(error)}。可再次点击加载。`;
     } finally {
       appState.historyBusy = false;
       olderBtn.disabled = false;
       olderBtn.textContent = '加载更早消息';
+    }
+  }
+
+  async function sendDirectText(text: string): Promise<void> {
+    const trimmed = text.trim();
+    if (!trimmed || appState.sending || !appState.ready || appState.authExpired || appState.uncertain) return;
+    let payload: { requestId: string; text: string; files: string[] };
+    try {
+      payload = { requestId: makeRequestId(), text: trimmed, files: [] };
+    } catch (error) {
+      sendErrorEl.textContent = `发送失败：${errorText(error)}`;
+      return;
+    }
+    appState.sending = true;
+    sendErrorEl.textContent = '';
+    updateComposer();
+    try {
+      const accepted = await api<ChatMessage>('/api/chat', payload);
+      mergeMessages([accepted]);
+      unreadWhileScrolledUp = 0;
+      renderMessages();
+      hooks.selectTrace({ type: 'message', id: accepted.id, label: trimmed.slice(0, 80) });
+      scrollEl.scrollTop = scrollEl.scrollHeight;
+      syncScrollBottomButton();
+      hooks.scheduleRefresh();
+    } catch (error) {
+      sendErrorEl.textContent = `快捷回复发送失败：${errorText(error)}`;
+    } finally {
+      appState.sending = false;
+      updateComposer();
     }
   }
 
@@ -560,9 +1487,11 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       draftEl.value = '';
       setDraftTyping(false);
       setEmoteTrayOpen(false);
+      unreadWhileScrolledUp = 0;
       renderMessages();
       hooks.selectTrace({ type: 'message', id: accepted.id, label: submitted.text.slice(0, 80) });
       scrollEl.scrollTop = scrollEl.scrollHeight;
+      syncScrollBottomButton();
       hooks.scheduleRefresh();
     } catch (error) {
       const confirmed = [...appState.messages.values()].some(message => message.requestId === submitted.requestId);
@@ -627,10 +1556,11 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     }, 60);
   });
 
-  let resizeTimer: ReturnType<typeof setTimeout> | undefined;
-  let resizePinned = true;
   scrollEl.addEventListener('scroll', () => {
-    resizePinned = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 90;
+    const near = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 90;
+    resizePinned = near;
+    if (near) unreadWhileScrolledUp = 0;
+    syncScrollBottomButton();
   }, { passive: true });
   window.addEventListener('resize', () => {
     // A viewport change must not leave the newest reply clipped under the composer when already near bottom.
@@ -638,6 +1568,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     resizeTimer = setTimeout(() => {
       resizeTimer = undefined;
       if (resizePinned) scrollEl.scrollTop = scrollEl.scrollHeight;
+      syncScrollBottomButton();
     }, 120);
   });
   olderBtn.addEventListener('click', () => { void loadOlder(); });
@@ -650,5 +1581,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     renderRoutingDetail,
     jumpMessage,
     isDraftTyping: () => draftTypingActive,
+    updateCompanionStatus,
+    renderBossDecisionDock,
   };
 }

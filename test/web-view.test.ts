@@ -12,6 +12,30 @@ import {
   tokenizeBotMessageText,
   transformOutboundBotExpressions,
 } from '../src/web/shared/bot-expressions.js';
+import {
+  channelMeta,
+  classifyRoutingDisplay,
+  collectAvailableChannels,
+  deriveCompanionStatus,
+  extractLeadingQuote,
+  filterConversationMessages,
+  formatByteSize,
+  formatShortClock,
+  formatTimeDivider,
+  isGroupedWithPrevious,
+  resolveMessageChannel,
+  shouldShowReplyReference,
+  shouldShowTimeDivider,
+  stripLeadingQuoteForPreview,
+  summarizeSystemNotice,
+} from '../src/web/shared/chat-view.js';
+import {
+  isSafeUrl,
+  parseInlineTokens,
+  parseMarkdownBlocks,
+  renderMarkdownContent,
+  renderUserMessageContent,
+} from '../src/web/shared/markdown.js';
 import type { ChatMessage, TraceEvent } from '../src/view.js';
 
 const message = (id: string, seq: number, role: 'user' | 'assistant', replyTo?: string, version = seq): ChatMessage =>
@@ -505,4 +529,334 @@ test('makeRequestId falls back to crypto.getRandomValues and non-crypto IDs in n
   assert.ok(fallbackA.length > 8 && fallbackA.length <= 128);
   assert.ok(fallbackB.length > 8 && fallbackB.length <= 128);
   assert.notEqual(fallbackA, fallbackB);
+});
+
+function createMockDoc() {
+  interface MockNode {
+    nodeType: number;
+    tagName?: string;
+    textContent: string;
+    className: string;
+    attributes: Record<string, string>;
+    children: MockNode[];
+    href?: string;
+    target?: string;
+    rel?: string;
+    type?: string;
+    start?: number;
+    listeners: Record<string, Array<() => void>>;
+    appendChild: (child: MockNode) => MockNode;
+    setAttribute: (k: string, v: string) => void;
+    addEventListener: (ev: string, fn: () => void) => void;
+    classList: {
+      add: (c: string) => void;
+      remove: (c: string) => void;
+      toggle: (c: string) => boolean;
+      contains: (c: string) => boolean;
+    };
+  }
+  const makeNode = (nodeType: number, tagName?: string, text = ''): MockNode => {
+    const classes = new Set<string>();
+    const syncClass = (el: MockNode) => { el.className = [...classes].join(' '); };
+    const nodeObj: MockNode = {
+      nodeType,
+      ...(tagName ? { tagName: tagName.toUpperCase() } : {}),
+      textContent: text,
+      get className() { return [...classes].join(' '); },
+      set className(val: string) {
+        classes.clear();
+        for (const c of val.split(/\s+/).filter(Boolean)) classes.add(c);
+      },
+      attributes: {},
+      children: [],
+      listeners: {},
+      appendChild(child: MockNode) {
+        if (child.nodeType === 11) {
+          for (const nested of child.children) this.children.push(nested);
+        } else {
+          this.children.push(child);
+        }
+        return child;
+      },
+      setAttribute(k: string, v: string) { this.attributes[k] = v; },
+      addEventListener(ev: string, fn: () => void) {
+        this.listeners[ev] ??= [];
+        this.listeners[ev]!.push(fn);
+      },
+      classList: {
+        add(c: string) { classes.add(c); syncClass(nodeObj); },
+        remove(c: string) { classes.delete(c); syncClass(nodeObj); },
+        toggle(c: string) {
+          if (classes.has(c)) { classes.delete(c); return false; }
+          classes.add(c); return true;
+        },
+        contains(c: string) { return classes.has(c); },
+      },
+    };
+    return nodeObj;
+  };
+  const collectTags = (root: MockNode): string[] => {
+    const out: string[] = [];
+    if (root.tagName) out.push(root.tagName);
+    for (const c of root.children) out.push(...collectTags(c));
+    return out;
+  };
+  const collectText = (root: MockNode): string => {
+    if (root.nodeType === 3) return root.textContent;
+    if (root.children.length === 0) return root.textContent;
+    return root.children.map(collectText).join('');
+  };
+  const findAll = (root: MockNode, pred: (n: MockNode) => boolean): MockNode[] => {
+    const out: MockNode[] = [];
+    if (pred(root)) out.push(root);
+    for (const c of root.children) out.push(...findAll(c, pred));
+    return out;
+  };
+  const doc = {
+    createElement: (tag: string) => makeNode(1, tag),
+    createTextNode: (t: string) => makeNode(3, undefined, t),
+    createDocumentFragment: () => makeNode(11),
+  } as unknown as Document;
+  return { doc, makeNode, collectTags, collectText, findAll };
+}
+
+test('markdown parser and DOM renderer support rich formatting, streaming code fences, XSS safety, and zero <img> tags', () => {
+  assert.equal(isSafeUrl('https://example.com/a?b=1'), true);
+  assert.equal(isSafeUrl('http://127.0.0.1:8080'), true);
+  assert.equal(isSafeUrl('mailto:test@example.com'), true);
+  assert.equal(isSafeUrl('javascript:alert(1)'), false);
+  assert.equal(isSafeUrl('data:text/html,<script>alert(1)</script>'), false);
+  assert.equal(isSafeUrl('/relative/path'), false);
+
+  const mdSample = [
+    '# 总览标题',
+    '',
+    '普通段落含 **加粗**、*斜体*、~~删除~~、snake_case_var、`code [bot:happy]`，以及[安全链接](https://friday.local/doc)和[坏链接](javascript:alert(1))。',
+    '裸网址 https://example.com/path?x=1，与图片 ![avatar](https://example.com/x.png) 与原始标签 <img src=x onerror="alert(1)">。',
+    '',
+    '- [x] 已完成任务',
+    '- [ ] 待办任务',
+    '',
+    '> 引用提示 [bot:happy]',
+    '',
+    '| 指标 | 数值 | 状态 |',
+    '| :--- | ---: | :---: |',
+    '| 延迟 | 12ms | 正常 |',
+    '',
+    '---',
+    '',
+    '```ts',
+    'const x = "[bot:sad]";',
+    '```',
+  ].join('\n');
+
+  const blocks = parseMarkdownBlocks(mdSample);
+  assert.equal(blocks[0]?.kind, 'heading');
+  assert.ok(blocks.some(b => b.kind === 'list' && b.items[0]?.checked === true && b.items[1]?.checked === false));
+  assert.ok(blocks.some(b => b.kind === 'quote'));
+  assert.ok(blocks.some(b => b.kind === 'table' && b.aligns[0] === 'left' && b.aligns[1] === 'right' && b.aligns[2] === 'center'));
+  assert.ok(blocks.some(b => b.kind === 'hr'));
+  assert.ok(blocks.some(b => b.kind === 'code' && b.lang === 'ts' && b.closed === true));
+
+  // Streaming unclosed code block stays valid
+  const streamingBlocks = parseMarkdownBlocks('说明：\n```bash\necho hello');
+  assert.equal(streamingBlocks[1]?.kind, 'code');
+  if (streamingBlocks[1]?.kind === 'code') {
+    assert.equal(streamingBlocks[1].closed, false);
+    assert.equal(streamingBlocks[1].code, 'echo hello');
+  }
+
+  // Inline italic must not split snake_case_var
+  const inline = parseInlineTokens('var_a_b 与 *italic* 和 `code`');
+  assert.equal(inline.some(t => t.kind === 'text' && t.text.includes('var_a_b')), true);
+  assert.equal(inline.some(t => t.kind === 'italic'), true);
+
+  const mock = createMockDoc();
+  let emoteCount = 0;
+  const frag = renderMarkdownContent(mdSample, {
+    doc: mock.doc,
+    createEmote: expr => {
+      emoteCount++;
+      const span = mock.makeNode(1, 'span', `[emote:${expr}]`);
+      span.className = 'bot-inline-emote';
+      return span as unknown as Node;
+    },
+    createSticker: expr => mock.makeNode(1, 'span', `[sticker:${expr}]`) as unknown as Node,
+  });
+
+  const root = frag as unknown as ReturnType<typeof mock.makeNode>;
+  const tags = mock.collectTags(root);
+  assert.equal(tags.includes('IMG'), false, 'Markdown renderer must never emit <img> elements');
+  assert.equal(tags.includes('SCRIPT'), false);
+  assert.equal(tags.includes('TABLE'), true);
+  assert.equal(tags.includes('BLOCKQUOTE'), true);
+  assert.equal(emoteCount, 1, 'only the quote [bot:happy] renders as emote, not the one inside inline code or ts code fence');
+
+  const links = mock.findAll(root, n => n.tagName === 'A');
+  assert.equal(links.length, 2);
+  assert.equal(links[0]!.href, 'https://friday.local/doc');
+  assert.equal(links[0]!.target, '_blank');
+  assert.equal(links[0]!.rel, 'noopener noreferrer');
+  assert.equal(links[1]!.href, 'https://example.com/path?x=1');
+
+  const renderedAllText = mock.collectText(root);
+  assert.match(renderedAllText, /<img src=x onerror="alert\(1\)">/);
+  assert.match(renderedAllText, /\[图片: avatar\]/);
+
+  // Long code block (> 26 lines) gets collapsible wrapper and toggle button
+  const longCode = `\`\`\`js\n${Array.from({ length: 30 }, (_, idx) => `line ${idx + 1}`).join('\n')}\n\`\`\``;
+  const longFrag = renderMarkdownContent(longCode, {
+    doc: mock.doc,
+    createEmote: () => mock.makeNode(1, 'span') as unknown as Node,
+    createSticker: () => mock.makeNode(1, 'span') as unknown as Node,
+  }) as unknown as ReturnType<typeof mock.makeNode>;
+  const codeBlockEl = mock.findAll(longFrag, n => n.classList.contains('md-code-block'))[0]!;
+  assert.equal(codeBlockEl.classList.contains('is-collapsible'), true);
+  const expandBtn = mock.findAll(longFrag, n => n.classList.contains('md-code-expand-btn'))[0]!;
+  assert.match(expandBtn.textContent, /展开全部 30 行/);
+  expandBtn.listeners.click?.[0]?.();
+  assert.equal(codeBlockEl.classList.contains('is-expanded'), true);
+  assert.equal(expandBtn.textContent, '收起代码');
+
+  // User content keeps literal markdown headings intact while linking safe bare URLs
+  const userFrag = renderUserMessageContent('# 标题保持原文\n看 https://example.com。', {
+    doc: mock.doc,
+    createEmote: () => mock.makeNode(1, 'span') as unknown as Node,
+    createSticker: () => mock.makeNode(1, 'span') as unknown as Node,
+  }) as unknown as ReturnType<typeof mock.makeNode>;
+  assert.equal(mock.collectTags(userFrag).includes('H1'), false);
+  const userLinks = mock.findAll(userFrag, n => n.tagName === 'A');
+  assert.equal(userLinks.length, 1);
+  assert.equal(userLinks[0]!.href, 'https://example.com');
+});
+
+test('chat-view helpers handle channel inheritance, filtering, time dividers, reply suppression, and routing display', () => {
+  const baseAt = new Date(2026, 10, 19, 10, 0, 0).getTime();
+  const uLocal: ChatMessage = { ...message('u1', 1, 'user'), at: baseAt, origin: { channel: 'local' } };
+  const rLocal: ChatMessage = { ...message('r1', 2, 'assistant', 'u1'), at: baseAt + 10_000 };
+  const uWechat: ChatMessage = {
+    ...message('u2', 3, 'user'),
+    at: baseAt + 20_000,
+    origin: { channel: 'wechat', speakerName: '主人' },
+  };
+  const rWechat: ChatMessage = { ...message('r2', 4, 'assistant', 'u2'), at: baseAt + 30_000 };
+  const sysMsg: ChatMessage = {
+    ...message('s1', 5, 'assistant'),
+    source: 'system',
+    at: baseAt + 20 * 60_000,
+    text: '定时巡检：Git 工作区干净\n第二行详情',
+  };
+
+  const lookup = new Map<string, ChatMessage>([
+    [uLocal.id, uLocal],
+    [rLocal.id, rLocal],
+    [uWechat.id, uWechat],
+    [rWechat.id, rWechat],
+    [sysMsg.id, sysMsg],
+  ]);
+
+  assert.equal(resolveMessageChannel(uWechat, lookup), 'wechat');
+  assert.equal(resolveMessageChannel(rWechat, lookup), 'wechat', 'assistant reply inherits parent origin channel');
+  assert.equal(resolveMessageChannel(sysMsg, lookup), 'local');
+
+  const channels = collectAvailableChannels([uLocal, rLocal, uWechat, rWechat, sysMsg], lookup, ['telegram']);
+  assert.deepEqual(channels, ['all', 'local', 'wechat', 'telegram']);
+  assert.equal(channelMeta('telegram').shortLabel, 'TG');
+
+  const filtered = filterConversationMessages([uLocal, rLocal, uWechat, rWechat, sysMsg], lookup, {
+    channel: 'wechat',
+    hideSystem: true,
+  });
+  assert.deepEqual(filtered.visible.map(m => m.id), ['u2', 'r2']);
+  assert.equal(filtered.hiddenSystemCount, 1);
+  assert.equal(filtered.hiddenChannelCount, 2);
+
+  // Time dividers & grouping
+  assert.equal(shouldShowTimeDivider(undefined, uLocal), true);
+  assert.equal(shouldShowTimeDivider(uLocal, uWechat), false);
+  assert.equal(shouldShowTimeDivider(rWechat, sysMsg), true, 'gap >= 15min triggers time divider');
+  assert.equal(formatTimeDivider(baseAt, baseAt + 60_000), '今天 10:00');
+  assert.equal(formatTimeDivider(baseAt - 86_400_000, baseAt), '昨天 10:00');
+  assert.equal(formatShortClock(baseAt), '10:00');
+
+  const rLocalFollow: ChatMessage = { ...rLocal, id: 'r1b', seq: 2.5, at: rLocal.at + 30_000 };
+  assert.equal(isGroupedWithPrevious(rLocal, rLocalFollow), true);
+  assert.equal(isGroupedWithPrevious(uLocal, rLocal), false);
+
+  // Reply reference suppression when adjacent in clean mode
+  assert.equal(shouldShowReplyReference(rLocal, uLocal, false), false, 'adjacent reply hides duplicate quote in clean mode');
+  assert.equal(shouldShowReplyReference(rLocal, uLocal, true), true, 'detail mode always shows reply quote');
+  assert.equal(shouldShowReplyReference(rWechat, uLocal, false), true, 'out-of-order reply shows quote even in clean mode');
+
+  // Routing display classification
+  const pureReplyMsg: ChatMessage = {
+    ...uLocal,
+    routing: {
+      at: baseAt,
+      status: 'completed',
+      context: { execution: 'native', cwd: '/tmp', totalWorks: 0, truncated: false, works: [], messages: [] },
+      actions: [{ id: 'a1', kind: 'reply', status: 'accepted', at: baseAt }],
+    },
+  };
+  assert.equal(classifyRoutingDisplay(pureReplyMsg, false).visible, false, 'pure direct reply stays silent in clean mode');
+  assert.equal(classifyRoutingDisplay(pureReplyMsg, true).visible, true, 'detail mode exposes direct reply routing');
+  assert.equal(classifyRoutingDisplay(uLocal, false).visible, false, 'historical message without routing stays silent in clean mode');
+  assert.equal(classifyRoutingDisplay(uLocal, true).visible, true);
+
+  const taskDispatchMsg: ChatMessage = {
+    ...uLocal,
+    routing: {
+      at: baseAt,
+      status: 'completed',
+      context: { execution: 'native', cwd: '/tmp', totalWorks: 1, truncated: false, works: [], messages: [] },
+      actions: [
+        { id: 'a1', kind: 'new_work', status: 'accepted', at: baseAt, taskId: 't1', taskLabel: '检查测试', workerModel: 'claude-sonnet' },
+        { id: 'a2', kind: 'search_memory', status: 'accepted', at: baseAt, searchQuery: '测试' },
+      ],
+    },
+  };
+  const compactTask = classifyRoutingDisplay(taskDispatchMsg, false);
+  assert.equal(compactTask.visible, true);
+  assert.equal(compactTask.taskActions.length, 1);
+  assert.equal(compactTask.metaActions.length, 1);
+  assert.equal(compactTask.hasExpandableDetails, true);
+
+  const sysSummary = summarizeSystemNotice(sysMsg);
+  assert.equal(sysSummary.icon, '⏱️');
+  assert.equal(sysSummary.badge, '定时任务');
+  assert.equal(sysSummary.expandable, true);
+
+  assert.equal(deriveCompanionStatus('idle', 0, 0).text, '就绪');
+  assert.equal(deriveCompanionStatus('working', 2, 1).tone, 'warn');
+  assert.equal(formatByteSize(1536), '1.5 KB');
+
+  const qBot = extractLeadingQuote('【引用 F.R.I.D.A.Y. 的消息】\n第一行\n第二行\n\n就按这个办');
+  assert.deepEqual(qBot, {
+    label: '回复 F.R.I.D.A.Y.',
+    preview: '第一行 第二行',
+    fullText: '第一行\n第二行',
+    body: '就按这个办',
+  });
+  const qSelf = extractLeadingQuote('【引用你之前的消息】\n红色斗鱼照片\n\n再发一遍');
+  assert.equal(qSelf?.label, '回复你');
+  assert.equal(qSelf?.preview, '红色斗鱼照片');
+  assert.equal(qSelf?.body, '再发一遍');
+
+  const qSender = extractLeadingQuote('【引用 小王】\n划词引用：周报周五交\n完整原文：记得周报周五交，别忘了\n\n收到');
+  assert.equal(qSender?.label, '回复 小王');
+  assert.equal(qSender?.preview, '周报周五交');
+  assert.equal(qSender?.body, '收到');
+
+  const qUncached = extractLeadingQuote('【引用】\n[引用的历史消息未缓存 (ID: 7529101339772569352)]\n\n这次呢');
+  assert.deepEqual(qUncached, {
+    label: '回复',
+    preview: '历史消息未缓存',
+    fullText: '[引用的历史消息未缓存 (ID: 7529101339772569352)]',
+    body: '这次呢',
+    uncached: true,
+  });
+
+  assert.equal(extractLeadingQuote('普通消息没有引用'), undefined);
+  assert.equal(stripLeadingQuoteForPreview('【引用】\n[引用的历史消息未缓存 (ID: 123)]\n\n这次呢'), '这次呢');
+  assert.equal(stripLeadingQuoteForPreview('普通正文'), '普通正文');
 });

@@ -168,14 +168,20 @@ export function initMemoryHub(): MemoryHubController {
     }
   }
 
+  let lastInspectedMemoryId: string | undefined;
+
   function renderBrainInspector(item: BrainMemoryItem | undefined) {
     if (!item) {
+      lastInspectedMemoryId = undefined;
       memoryBrainInspector.replaceChildren(
         node('p', '当前全息皮层暂无神经元，新增或对话沉淀后将自动点亮琥珀神经核。', 'brain-inspector-empty'),
       );
       syncBrainCardSelectionClass(undefined);
       return;
     }
+
+    const switched = lastInspectedMemoryId !== undefined && lastInspectedMemoryId !== item.id;
+    lastInspectedMemoryId = item.id;
 
     const frag = document.createDocumentFragment();
     const kicker = node('div', '', 'brain-insp-kicker');
@@ -190,7 +196,7 @@ export function initMemoryHub(): MemoryHubController {
     titleRow.append(node('strong', item.topic, 'brain-insp-title'));
     frag.append(titleRow);
 
-    const scrollBody = node('div', '', 'brain-insp-scroll');
+    const scrollBody = node('div', '', `brain-insp-scroll${switched ? ' is-switching' : ''}`);
     const bodyText = 'content' in item ? item.content : item.preview;
     scrollBody.append(node('div', bodyText, 'brain-insp-body'));
 

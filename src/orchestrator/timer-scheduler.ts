@@ -2,15 +2,50 @@ import { randomUUID } from 'node:crypto';
 import { findFallbackTelegramChannel, resolveImDeliveryTarget } from '../im/types.js';
 import { runPlugin } from '../plugin.js';
 import { formatFlowSessionId } from '../session.js';
-import type { Store, Task, Timer } from '../store.js';
-import type { MessageOrigin } from '../view.js';
+import type { Store, Task, TaskStatus, Timer } from '../store.js';
+import type { MessageOrigin, RunInitiator } from '../view.js';
 
 export const MIN_TIMER_INTERVAL_MS = 500;
 export const MAX_TIMER_INTERVAL_MS = 604_800_000;
+export const DEFAULT_TIMER_MAX_FAILURES = 5;
+export const MAX_TIMER_MAX_FAILURES = 100;
+export const MAX_ENABLED_TIMERS = 20;
+export const CHAT_MIN_RECURRING_LLM_INTERVAL_MS = 300_000;
+export const CHAT_MIN_RECURRING_PLUGIN_INTERVAL_MS = 60_000;
+export const CHAT_MIN_ONCE_DELAY_MS = 5_000;
 
 export function clampTimerIntervalMs(intervalMs: number, fallback = 60_000): number {
   const base = Number.isFinite(intervalMs) ? Math.trunc(intervalMs) : fallback;
   return Math.max(MIN_TIMER_INTERVAL_MS, Math.min(MAX_TIMER_INTERVAL_MS, base));
+}
+
+export function clampTimerMaxFailures(maxFailures?: number, fallback = DEFAULT_TIMER_MAX_FAILURES): number {
+  if (maxFailures === undefined || !Number.isFinite(maxFailures)) return fallback;
+  return Math.max(1, Math.min(MAX_TIMER_MAX_FAILURES, Math.trunc(maxFailures)));
+}
+
+export function parseTimerIdFromRequestId(requestId?: string): string | undefined {
+  if (!requestId || !requestId.startsWith('timer:')) return undefined;
+  const rest = requestId.slice('timer:'.length);
+  const sep = rest.lastIndexOf(':');
+  if (sep <= 0) return undefined;
+  return rest.slice(0, sep);
+}
+
+export function extractGoalMetMarker(text?: string): { met: boolean; summary?: string; cleanedText: string } {
+  if (!text) return { met: false, cleanedText: '' };
+  let met = false;
+  let summary: string | undefined;
+  const cleanedText = text
+    .replace(/\[\[GOAL_MET(?:\s*[:：]\s*([^\]]+))?\]\]/gi, (_full, rawSummary?: string) => {
+      met = true;
+      const trimmed = rawSummary?.trim();
+      if (trimmed && !summary) summary = trimmed;
+      return '';
+    })
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return { met, ...(summary ? { summary } : {}), cleanedText };
 }
 
 export function nextDailyRunAt(dailyAt: string, now = Date.now()): number {
@@ -89,6 +124,9 @@ export interface AddTimerOptions {
   pluginAction?: string;
   deliverChannelId?: string;
   deliverTarget?: string;
+  goalCondition?: string;
+  maxFailures?: number;
+  enforceChatGuardrails?: boolean;
 }
 
 export interface TimerSchedulerHost {
@@ -103,7 +141,13 @@ export interface TimerSchedulerHost {
     prompt: string,
     paths: string[],
     limitMs: number,
-    chatWork: { originMessageId?: string; cwd?: string; signal: AbortSignal },
+    chatWork: {
+      originMessageId?: string;
+      cwd?: string;
+      signal: AbortSignal;
+      initiator?: RunInitiator;
+      timerId?: string;
+    },
   ) => Promise<Task>;
   notifyOutbound: () => void;
 }
@@ -124,14 +168,42 @@ export class TimerScheduler {
   ): Timer {
     const now = Date.now();
     const dailyAt = options?.dailyAt?.trim() || undefined;
-    const delayMs = options?.delayMs !== undefined ? clampTimerIntervalMs(options.delayMs, 60_000) : undefined;
+    const rawDelayMs = options?.delayMs !== undefined && Number.isFinite(options.delayMs)
+      ? Math.trunc(options.delayMs)
+      : undefined;
+    const delayMs = rawDelayMs !== undefined ? clampTimerIntervalMs(rawDelayMs, 60_000) : undefined;
     const once = options?.once ?? (delayMs !== undefined ? true : undefined);
-    const effectiveIntervalMs = dailyAt ? 86_400_000 : (delayMs ?? clampTimerIntervalMs(intervalMs, 60_000));
-    const nextRunAt = dailyAt ? nextDailyRunAt(dailyAt, now) : now + (delayMs ?? effectiveIntervalMs);
+    const goalCondition = options?.goalCondition?.trim() || undefined;
+    if (once && goalCondition) {
+      throw new Error('单次定时提醒与有终态目标不可同时设置（有终态目标会在达成后自动结束）');
+    }
     const plugin = options?.plugin?.trim() || undefined;
     const pluginAction = options?.pluginAction?.trim() || undefined;
+    if (options?.enforceChatGuardrails) {
+      if (once && !dailyAt) {
+        const checkDelay = rawDelayMs ?? (Number.isFinite(intervalMs) ? Math.trunc(intervalMs) : 60_000);
+        if (checkDelay < CHAT_MIN_ONCE_DELAY_MS) {
+          throw new Error('单次定时提醒延迟不能短于 5 秒（请设置 delayMs >= 5000）');
+        }
+      } else if (!once && !dailyAt) {
+        const checkInterval = Number.isFinite(intervalMs) ? Math.trunc(intervalMs) : 60_000;
+        if (plugin && checkInterval < CHAT_MIN_RECURRING_PLUGIN_INTERVAL_MS) {
+          throw new Error('对话中创建的插件巡检周期不能短于 1 分钟（intervalMs >= 60000）');
+        }
+        if (!plugin && checkInterval < CHAT_MIN_RECURRING_LLM_INTERVAL_MS) {
+          throw new Error('对话中创建的 AI 周期巡检间隔不能短于 5 分钟（intervalMs >= 300000，高频监控请使用零 Token 插件或调整周期）');
+        }
+      }
+    }
+    const enabledCount = this.host.store.listTimers().filter(t => t.enabled).length;
+    if (enabledCount >= MAX_ENABLED_TIMERS) {
+      throw new Error(`当前已启用的定时任务已达上限（${MAX_ENABLED_TIMERS} 个），请先关闭或删除不再需要的任务`);
+    }
+    const effectiveIntervalMs = dailyAt ? 86_400_000 : (delayMs ?? clampTimerIntervalMs(intervalMs, 60_000));
+    const nextRunAt = dailyAt ? nextDailyRunAt(dailyAt, now) : now + (delayMs ?? effectiveIntervalMs);
     const deliverChannelId = options?.deliverChannelId?.trim() || undefined;
     const deliverTarget = options?.deliverTarget?.trim() || undefined;
+    const maxFailures = clampTimerMaxFailures(options?.maxFailures);
     const timer: Timer = {
       id: randomUUID(),
       name,
@@ -143,6 +215,9 @@ export class TimerScheduler {
       ...(pluginAction ? { pluginAction } : {}),
       ...(deliverChannelId ? { deliverChannelId } : {}),
       ...(deliverTarget ? { deliverTarget } : {}),
+      ...(goalCondition ? { goalCondition } : {}),
+      maxFailures,
+      consecutiveFailures: 0,
       cwd,
       enabled: true,
       createdAt: now,
@@ -156,22 +231,219 @@ export class TimerScheduler {
     const scheduleDesc = once
       ? (dailyAt ? `单次 ${dailyAt}` : `${Math.round((delayMs ?? effectiveIntervalMs) / 1000)} 秒后单次执行`)
       : (dailyAt ? `每日 ${dailyAt}` : `每 ${Math.round(effectiveIntervalMs / 1000)} 秒`);
-    this.host.store.notice('system', 'timer_added', `已配置定时任务「${name}」（${scheduleDesc}）`);
+    const goalDesc = goalCondition ? `；终态目标：${goalCondition}` : '';
+    this.host.store.notice('system', 'timer_added', `已配置定时任务「${name}」（${scheduleDesc}${goalDesc}）`);
     return timer;
   }
 
   toggleTimer(id: string, enabled: boolean): Timer {
     const timer = this.host.store.getTimer(id);
+    if (enabled && !timer.enabled) {
+      const enabledCount = this.host.store.listTimers().filter(t => t.enabled).length;
+      if (enabledCount >= MAX_ENABLED_TIMERS) {
+        throw new Error(`当前已启用的定时任务已达上限（${MAX_ENABLED_TIMERS} 个），请先关闭或删除不再需要的任务`);
+      }
+    }
     timer.enabled = enabled;
     timer.pendingCatchup = false;
     if (enabled) {
       const safeIntervalMs = clampTimerIntervalMs(timer.intervalMs);
       timer.intervalMs = safeIntervalMs;
       timer.nextRunAt = timer.dailyAt ? nextDailyRunAt(timer.dailyAt, Date.now()) : Date.now() + safeIntervalMs;
+      timer.consecutiveFailures = 0;
+      timer.fatiguePaused = false;
+      timer.firstFailureNotified = false;
+      timer.lastError = undefined;
+      timer.goalMetAt = undefined;
+      timer.goalSummary = undefined;
+      if (timer.lastRunStatus === 'fatigue_paused' || timer.lastRunStatus === 'goal_met' || timer.lastRunStatus === 'error') {
+        timer.lastRunStatus = undefined;
+      }
     }
     this.host.store.saveTimer(timer);
     this.host.store.notice('system', enabled ? 'timer_enabled' : 'timer_disabled', `定时任务「${timer.name}」已${enabled ? '启用' : '关闭'}`);
     return timer;
+  }
+
+  completeTimer(id: string, summary?: string, options?: { notifyChat?: boolean }): Timer {
+    const timer = this.host.store.getTimer(id);
+    if (!timer.goalCondition) {
+      throw new Error('只有配置了终态目标（goalCondition）的定时任务才能标记目标达成；无终态巡检请使用关闭或删除');
+    }
+    if (timer.goalMetAt && !timer.enabled && timer.lastRunStatus === 'goal_met') {
+      return timer;
+    }
+    const cleanSummary = summary?.trim() || timer.goalSummary || `目标已达成：${timer.goalCondition}`;
+    timer.enabled = false;
+    timer.pendingCatchup = false;
+    timer.activeTaskId = undefined;
+    timer.goalMetAt = Date.now();
+    timer.goalSummary = cleanSummary;
+    timer.consecutiveFailures = 0;
+    timer.fatiguePaused = false;
+    timer.firstFailureNotified = false;
+    timer.lastError = undefined;
+    timer.lastRunStatus = 'goal_met';
+    this.host.store.saveTimer(timer);
+    this.host.store.notice('system', 'timer_goal_met', `定时目标「${timer.name}」已达成并自动停止：${cleanSummary}`);
+    if (options?.notifyChat !== false) {
+      this.postTimerSystemMessage(
+        timer,
+        `目标达成：${timer.goalCondition}`,
+        `🎯 **定时目标已达成**（已自动停止任务「${timer.name}」）\n\n- 目标条件：${timer.goalCondition}\n- 达成摘要：${cleanSummary}`,
+      );
+    }
+    return timer;
+  }
+
+  willNextFailureBeSilent(task: Pick<Task, 'timerId' | 'requestId'>): boolean {
+    const timerId = task.timerId ?? parseTimerIdFromRequestId(task.requestId);
+    if (!timerId) return false;
+    const timer = this.host.store.listTimers().find(t => t.id === timerId);
+    if (!timer) return false;
+    const threshold = clampTimerMaxFailures(timer.maxFailures);
+    const nextCount = (timer.consecutiveFailures ?? 0) + 1;
+    return nextCount > 1 && nextCount < threshold;
+  }
+
+  recordTimerSuccess(timerId: string, taskId?: string): Timer | undefined {
+    const current = this.host.store.listTimers().find(t => t.id === timerId);
+    if (!current) return undefined;
+    if (taskId && current.activeTaskId === taskId) {
+      current.activeTaskId = undefined;
+    }
+    current.consecutiveFailures = 0;
+    current.fatiguePaused = false;
+    current.firstFailureNotified = false;
+    current.lastError = undefined;
+    if (!current.goalMetAt) {
+      current.lastRunStatus = 'ok';
+    }
+    this.host.store.saveTimer(current);
+    return current;
+  }
+
+  recordTimerFailure(
+    timerId: string,
+    errorMessage: string,
+    options?: { notifyFirstFailure?: boolean; taskId?: string },
+  ): Timer | undefined {
+    const current = this.host.store.listTimers().find(t => t.id === timerId);
+    if (!current) return undefined;
+    if (options?.taskId && current.activeTaskId === options.taskId) {
+      current.activeTaskId = undefined;
+    }
+    const cleanError = errorMessage.trim() || '定时任务执行失败';
+    const threshold = clampTimerMaxFailures(current.maxFailures);
+    const nextCount = (current.consecutiveFailures ?? 0) + 1;
+    current.consecutiveFailures = nextCount;
+    current.lastError = cleanError;
+    if (nextCount >= threshold) {
+      current.enabled = false;
+      current.pendingCatchup = false;
+      current.activeTaskId = undefined;
+      current.fatiguePaused = true;
+      current.lastRunStatus = 'fatigue_paused';
+      this.host.store.saveTimer(current);
+      this.host.store.notice(
+        'system',
+        'timer_fatigue_paused',
+        `定时任务「${current.name}」连续失败 ${nextCount}/${threshold} 次，已触发疲劳熔断并自动暂停（最后错误：${cleanError}）`,
+      );
+      this.postTimerSystemMessage(
+        current,
+        `疲劳熔断（连续失败 ${nextCount} 次）`,
+        `🛑 **定时任务已触发疲劳熔断并自动暂停**（「${current.name}」）\n\n- 连续失败：${nextCount} / ${threshold} 次\n- 最近错误：${cleanError}\n- 恢复方式：排查原因后可在「定时与目标」面板中手动重新启用。`,
+      );
+      return current;
+    }
+    if (nextCount === 1 && !current.firstFailureNotified) {
+      current.firstFailureNotified = true;
+      current.lastRunStatus = 'error';
+      this.host.store.saveTimer(current);
+      this.host.store.notice(
+        'system',
+        'timer_first_failure',
+        `定时任务「${current.name}」首次执行失败（1/${threshold}），后续中间失败将静默累计直至熔断：${cleanError}`,
+      );
+      if (options?.notifyFirstFailure !== false) {
+        this.postTimerSystemMessage(
+          current,
+          `首次执行失败（1/${threshold}）`,
+          `⚠️ **定时任务「${current.name}」首次执行失败**（1/${threshold}）\n\n- 错误信息：${cleanError}\n- 说明：为避免告警轰炸，达到 ${threshold} 次连续失败前将静默记录并在达阈值后自动暂停。`,
+        );
+      }
+      return current;
+    }
+    current.lastRunStatus = 'error';
+    this.host.store.saveTimer(current);
+    this.host.store.notice(
+      'system',
+      'timer_failure_silent',
+      `定时任务「${current.name}」连续失败 ${nextCount}/${threshold} 次（静默累计中）：${cleanError}`,
+    );
+    return current;
+  }
+
+  onTimerTaskSettled(
+    task: Pick<Task, 'id' | 'timerId' | 'requestId' | 'reason'>,
+    status: TaskStatus,
+    options?: { goalMet?: boolean; goalSummary?: string; notifyFirstFailure?: boolean },
+  ): void {
+    const timerId = task.timerId ?? parseTimerIdFromRequestId(task.requestId);
+    if (!timerId) return;
+    if (status === 'completed') {
+      const updated = this.recordTimerSuccess(timerId, task.id);
+      if (updated && options?.goalMet && updated.goalCondition) {
+        this.completeTimer(updated.id, options.goalSummary);
+      }
+      return;
+    }
+    if (status === 'failed') {
+      this.recordTimerFailure(timerId, task.reason ?? '后台任务执行失败', {
+        notifyFirstFailure: options?.notifyFirstFailure,
+        taskId: task.id,
+      });
+      return;
+    }
+    if (status === 'paused' || status === 'cancelled') {
+      const current = this.host.store.listTimers().find(t => t.id === timerId);
+      if (current && current.activeTaskId === task.id) {
+        current.activeTaskId = undefined;
+        this.host.store.saveTimer(current);
+      }
+    }
+  }
+
+  private postTimerSystemMessage(timer: Timer, heading: string, text: string): void {
+    const { origin, fallbackNote } = this.resolveTriggerOriginWithFallback(timer);
+    const deliveredText = fallbackNote ? `${text}\n\n> ℹ️ ${fallbackNote}` : text;
+    const msgId = randomUUID();
+    const sessionId = formatFlowSessionId(msgId);
+    const userMsg = this.host.store.conversation.create({
+      id: msgId,
+      role: 'user',
+      source: 'system',
+      origin,
+      sessionId,
+      text: `[定时状态 · ${timer.name}] ${heading}`,
+      status: 'completed',
+      paths: [],
+      mode: this.host.mode,
+    });
+    this.host.store.conversation.create({
+      id: randomUUID(),
+      replyTo: userMsg.id,
+      role: 'assistant',
+      source: 'system',
+      origin,
+      sessionId,
+      text: deliveredText,
+      status: 'completed',
+      paths: [],
+      mode: this.host.mode,
+    });
+    this.host.notifyOutbound();
   }
 
   removeTimer(id: string): boolean {
@@ -239,43 +511,56 @@ export class TimerScheduler {
         { signal: this.host.closingSignal },
       ).then(res => {
         if (this.host.isClosing()) return;
-        if (!res.notify) {
-          this.host.store.notice('system', 'timer_plugin_silent', `定时插件「${timer.name}」(${pluginName}/${pluginAction}) 已执行（静默跳过通知）`);
+        if (!res.ok) {
+          const errMsg = res.message?.trim() || `定时插件「${timer.name}」(${pluginName}/${pluginAction}) 返回失败`;
+          this.recordTimerFailure(timer.id, errMsg, { notifyFirstFailure: true });
           return;
         }
-        const { origin, fallbackNote } = this.resolveTriggerOriginWithFallback(timer);
-        const deliveredText = fallbackNote ? `${res.message}\n\n> ℹ️ ${fallbackNote}` : res.message;
-        const timerMsgId = randomUUID();
-        const timerSessionId = formatFlowSessionId(timerMsgId);
-        const userMsg = this.host.store.conversation.create({
-          id: timerMsgId,
-          role: 'user',
-          source: 'system',
-          origin,
-          sessionId: timerSessionId,
-          text: `[定时触发 · ${timer.name}] ${timer.instruction}`,
-          status: 'completed',
-          paths: [],
-          mode: this.host.mode,
-        });
-        this.host.store.conversation.create({
-          id: randomUUID(),
-          replyTo: userMsg.id,
-          role: 'assistant',
-          source: 'system',
-          origin,
-          sessionId: timerSessionId,
-          text: deliveredText,
-          status: 'completed',
-          paths: [],
-          mode: this.host.mode,
-        });
-        this.host.store.notice('system', 'timer_plugin_completed', `定时插件「${timer.name}」(${pluginName}/${pluginAction}) 已执行并推送通知`);
-        this.host.notifyOutbound();
+        if (res.notify) {
+          const { origin, fallbackNote } = this.resolveTriggerOriginWithFallback(timer);
+          const deliveredText = fallbackNote ? `${res.message}\n\n> ℹ️ ${fallbackNote}` : res.message;
+          const timerMsgId = randomUUID();
+          const timerSessionId = formatFlowSessionId(timerMsgId);
+          const userMsg = this.host.store.conversation.create({
+            id: timerMsgId,
+            role: 'user',
+            source: 'system',
+            origin,
+            sessionId: timerSessionId,
+            text: `[定时触发 · ${timer.name}] ${timer.instruction}`,
+            status: 'completed',
+            paths: [],
+            mode: this.host.mode,
+          });
+          this.host.store.conversation.create({
+            id: randomUUID(),
+            replyTo: userMsg.id,
+            role: 'assistant',
+            source: 'system',
+            origin,
+            sessionId: timerSessionId,
+            text: deliveredText,
+            status: 'completed',
+            paths: [],
+            mode: this.host.mode,
+          });
+          this.host.store.notice('system', 'timer_plugin_completed', `定时插件「${timer.name}」(${pluginName}/${pluginAction}) 已执行并推送通知`);
+          this.host.notifyOutbound();
+        } else {
+          this.host.store.notice('system', 'timer_plugin_silent', `定时插件「${timer.name}」(${pluginName}/${pluginAction}) 已执行（静默跳过通知）`);
+        }
+        const refreshed = this.recordTimerSuccess(timer.id);
+        const dataObj = res.data && typeof res.data === 'object' ? (res.data as { goalMet?: unknown; goalSummary?: unknown }) : undefined;
+        if (refreshed?.goalCondition && dataObj?.goalMet === true) {
+          const summary = typeof dataObj.goalSummary === 'string' && dataObj.goalSummary.trim()
+            ? dataObj.goalSummary.trim()
+            : (res.message?.trim() || undefined);
+          this.completeTimer(refreshed.id, summary);
+        }
       }).catch(err => {
         if (this.host.isClosing()) return;
         const errMsg = err instanceof Error ? err.message : '插件执行失败';
-        this.host.store.notice('system', 'timer_plugin_failed', `定时插件「${timer.name}」执行失败：${errMsg}`);
+        this.recordTimerFailure(timer.id, errMsg, { notifyFirstFailure: true });
       }).finally(() => {
         this.runningPluginTimers.delete(timer.id);
         this.host.jobs.delete(job);
@@ -300,14 +585,23 @@ export class TimerScheduler {
       mode: this.host.mode,
     });
     const requestId = `timer:${timer.id}:${fireSlot}`;
+    const promptInstruction = timer.goalCondition
+      ? `${timer.instruction}\n\n[终态目标条件] ${timer.goalCondition}\n（若经核实该目标条件已经达成，请在最终汇报末尾附加 [[GOAL_MET: 一句话说明达成情况]]，系统将自动停止后续巡检。）`
+      : timer.instruction;
     this.submittingTaskTimers.add(timer.id);
     this.host.store.saveTimer(timer);
     void this.host.submit(
       requestId,
-      timer.instruction,
+      promptInstruction,
       [],
       600_000,
-      { originMessageId: message.id, cwd: timer.cwd, signal: this.host.closingSignal },
+      {
+        originMessageId: message.id,
+        cwd: timer.cwd,
+        signal: this.host.closingSignal,
+        initiator: { kind: 'timer', id: timer.id, label: timer.name },
+        timerId: timer.id,
+      },
     ).then(task => {
       if (this.host.isClosing()) return;
       const current = this.host.store.listTimers().find(item => item.id === timer.id);
@@ -317,7 +611,7 @@ export class TimerScheduler {
     }).catch(err => {
       if (this.host.isClosing()) return;
       const errMsg = err instanceof Error ? err.message : '定时任务提交失败';
-      this.host.store.notice('system', 'timer_failed', `定时任务「${timer.name}」触发失败：${errMsg}`);
+      this.recordTimerFailure(timer.id, errMsg, { notifyFirstFailure: true });
     }).finally(() => {
       this.submittingTaskTimers.delete(timer.id);
     });

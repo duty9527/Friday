@@ -3,13 +3,38 @@ import { button, element, isEditingWithin, kpiCard, node } from '../shared/dom.j
 import { errorText, formatIntervalText, json, timestamp } from '../shared/format.js';
 import { api, appState, hooks } from '../state.js';
 
+export interface PluginSurfaceLifecycle {
+  activate: () => void;
+  deactivate: () => void;
+  refreshBadge: () => Promise<void>;
+}
+
+export interface PluginSurfaceRegistration {
+  pluginName: string;
+  tabId: string;
+  panelId: string;
+  label: string;
+  messageTrigger?: RegExp;
+  load: () => Promise<PluginSurfaceLifecycle>;
+}
+
+export interface TimerPluginHubOptions {
+  pluginSurfaces?: PluginSurfaceRegistration[];
+}
+
 export interface TimerPluginHubController {
   openTimerModal: () => void;
   closeTimerModal: () => void;
   renderTimers: (force?: boolean) => void;
-  openPluginModal: (pluginName?: string, expandSource?: boolean) => void;
+  openPluginModal: (pluginName?: string, expandSource?: boolean, mode?: 'catalog' | 'surface') => void;
   closePluginModal: () => void;
+  deactivateActiveSurface: () => void;
   renderPlugins: (force?: boolean) => void;
+  syncPluginSurfaces: (opts: {
+    initial: boolean;
+    cursorReset: boolean;
+    newMessages: readonly { seq: number; text: string }[];
+  }) => void;
 }
 
 function hasActivePluginUiState(container: HTMLElement): boolean {
@@ -21,7 +46,7 @@ function hasActivePluginUiState(container: HTMLElement): boolean {
   return false;
 }
 
-export function initTimerPluginHub(): TimerPluginHubController {
+export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPluginHubController {
   const timerTopBadge = element<HTMLElement>('timer-top-badge');
   const openTimerHubTop = element<HTMLButtonElement>('open-timer-hub-top');
   const timerHubBackdrop = element<HTMLElement>('timer-hub-backdrop');
@@ -34,21 +59,133 @@ export function initTimerPluginHub(): TimerPluginHubController {
   const timerIntervalInput = element<HTMLInputElement>('timer-interval-input');
   const timerPluginInput = element<HTMLInputElement>('timer-plugin-input');
   const timerChannelInput = element<HTMLInputElement>('timer-channel-input');
+  const timerGoalInput = element<HTMLInputElement>('timer-goal-input');
+  const timerMaxFailuresInput = element<HTMLInputElement>('timer-max-failures-input');
+  const timerOnceInput = element<HTMLInputElement>('timer-once-input');
   const timerInstructionInput = element<HTMLTextAreaElement>('timer-instruction-input');
   const timerSaveBtn = element<HTMLButtonElement>('timer-save-btn');
   const timerListSubtitle = element<HTMLElement>('timer-list-subtitle');
   const timersList = element<HTMLElement>('timers-list');
 
   const pluginTopBadge = element<HTMLElement>('plugin-top-badge');
+  const pluginCatalogBadge = element<HTMLElement>('plugin-catalog-badge');
   const openPluginHubTop = element<HTMLButtonElement>('open-plugin-hub-top');
   const pluginHubBackdrop = element<HTMLElement>('plugin-hub-backdrop');
   const pluginModalClose = element<HTMLButtonElement>('plugin-modal-close');
+  const pluginSurfaceTabs = element<HTMLElement>('plugin-surface-tabs');
+  const pluginTabCatalog = element<HTMLButtonElement>('plugin-tab-catalog');
+  const pluginPanelCatalog = element<HTMLElement>('plugin-panel-catalog');
   const pluginKpiGrid = element<HTMLElement>('plugin-kpi-grid');
   const pluginListSubtitle = element<HTMLElement>('plugin-list-subtitle');
   const pluginsList = element<HTMLElement>('plugins-list');
 
+  const surfaces = (options.pluginSurfaces ?? []).map(reg => ({
+    reg,
+    tabEl: element<HTMLButtonElement>(reg.tabId),
+    panelEl: element<HTMLElement>(reg.panelId),
+  }));
+  const surfaceByName = new Map(surfaces.map(entry => [entry.reg.pluginName, entry]));
+  const surfaceLoadPromises = new Map<string, Promise<PluginSurfaceLifecycle>>();
+  const surfaceControllers = new Map<string, PluginSurfaceLifecycle>();
+  const surfaceBadgeSynced = new Set<string>();
+
   let focusedPluginName: string | undefined;
   let expandFocusedPluginSource = false;
+  let activePluginTab = 'catalog';
+  let activeSurfaceCtrl: PluginSurfaceLifecycle | undefined;
+  let tabSwitchSeq = 0;
+
+  function isSurfaceEnabled(pluginName: string): boolean {
+    const plugin = appState.view?.plugins?.find(p => p.name === pluginName);
+    return plugin ? plugin.enabled !== false : false;
+  }
+
+  function loadSurfaceController(reg: PluginSurfaceRegistration): Promise<PluginSurfaceLifecycle> {
+    const existing = surfaceControllers.get(reg.pluginName);
+    if (existing) return Promise.resolve(existing);
+    let pending = surfaceLoadPromises.get(reg.pluginName);
+    if (!pending) {
+      pending = reg.load()
+        .then(ctrl => {
+          surfaceControllers.set(reg.pluginName, ctrl);
+          return ctrl;
+        })
+        .catch(error => {
+          surfaceLoadPromises.delete(reg.pluginName);
+          throw error;
+        });
+      surfaceLoadPromises.set(reg.pluginName, pending);
+    }
+    return pending;
+  }
+
+  function deactivateActiveSurface(): void {
+    activeSurfaceCtrl?.deactivate();
+    activeSurfaceCtrl = undefined;
+  }
+
+  function syncPluginTabElements(): void {
+    const isCatalog = activePluginTab === 'catalog';
+    pluginTabCatalog.classList.toggle('active', isCatalog);
+    pluginTabCatalog.setAttribute('aria-selected', isCatalog ? 'true' : 'false');
+    pluginPanelCatalog.hidden = !isCatalog;
+
+    for (const entry of surfaces) {
+      const selected = activePluginTab === entry.reg.pluginName;
+      entry.tabEl.classList.toggle('active', selected);
+      entry.tabEl.setAttribute('aria-selected', selected ? 'true' : 'false');
+      entry.panelEl.hidden = !selected;
+    }
+  }
+
+  function switchPluginTab(targetTab: string): void {
+    const entry = targetTab === 'catalog' ? undefined : surfaceByName.get(targetTab);
+    const resolvedTab = entry && isSurfaceEnabled(entry.reg.pluginName) ? targetTab : 'catalog';
+    const seq = ++tabSwitchSeq;
+
+    if (activePluginTab !== resolvedTab) {
+      deactivateActiveSurface();
+    }
+    activePluginTab = resolvedTab;
+    syncPluginTabElements();
+
+    if (resolvedTab === 'catalog') {
+      renderPlugins(true);
+      return;
+    }
+
+    if (!entry) return;
+    surfaceBadgeSynced.add(entry.reg.pluginName);
+    void loadSurfaceController(entry.reg)
+      .then(ctrl => {
+        if (seq !== tabSwitchSeq || pluginHubBackdrop.hidden || activePluginTab !== resolvedTab) {
+          return;
+        }
+        activeSurfaceCtrl = ctrl;
+        ctrl.activate();
+      })
+      .catch(error => {
+        if (seq !== tabSwitchSeq) return;
+        hooks.connection(`加载${entry.reg.label}面板失败：${errorText(error)}`, true);
+        activePluginTab = 'catalog';
+        syncPluginTabElements();
+        renderPlugins(true);
+      });
+  }
+
+  function refreshEnabledBadges(): void {
+    if (appState.authExpired || !appState.ready) return;
+    for (const entry of surfaces) {
+      if (!isSurfaceEnabled(entry.reg.pluginName)) continue;
+      if (activePluginTab === entry.reg.pluginName || surfaceBadgeSynced.has(entry.reg.pluginName)) continue;
+      surfaceBadgeSynced.add(entry.reg.pluginName);
+      void loadSurfaceController(entry.reg)
+        .then(ctrl => ctrl.refreshBadge())
+        .catch(() => {
+          surfaceBadgeSynced.delete(entry.reg.pluginName);
+        });
+    }
+  }
 
   function renderDynamicTimerPresets(plugins: PluginView[]) {
     for (const stale of timerPresetBar.querySelectorAll<HTMLElement>('.dynamic-preset')) {
@@ -85,6 +222,15 @@ export function initTimerPluginHub(): TimerPluginHubController {
     }
   }
 
+  async function completeTimerFromUi(id: string) {
+    try {
+      await api<TimerView>('/api/timer-complete', { id });
+      await hooks.refreshView();
+    } catch (error) {
+      hooks.connection(`标记定时目标达成失败：${errorText(error)}`, true);
+    }
+  }
+
   async function removeTimerFromUi(id: string) {
     try {
       await api<unknown>('/api/timer-remove', { id });
@@ -101,7 +247,17 @@ export function initTimerPluginHub(): TimerPluginHubController {
     const pluginSpec = timerPluginInput.value.trim();
     const [plugin, pluginAction] = pluginSpec ? pluginSpec.split('/').map(s => s.trim()) : [undefined, undefined];
     const deliverChannelId = timerChannelInput.value.trim() || undefined;
+    const goalCondition = timerGoalInput.value.trim() || undefined;
+    const once = timerOnceInput.checked;
+    const rawMaxFailures = Number(timerMaxFailuresInput.value);
+    const maxFailures = Number.isInteger(rawMaxFailures) && rawMaxFailures >= 1 && rawMaxFailures <= 100
+      ? rawMaxFailures
+      : undefined;
     const instruction = timerInstructionInput.value.trim();
+    if (once && goalCondition) {
+      hooks.connection('单次定时提醒与终态目标条件不可同时设置', true);
+      return;
+    }
     if (!name || (!instruction && !plugin) || (!dailyAt && (!Number.isFinite(intervalSeconds) || intervalSeconds < 5))) return;
     timerSaveBtn.disabled = true;
     try {
@@ -109,6 +265,9 @@ export function initTimerPluginHub(): TimerPluginHubController {
         name,
         intervalMs: Math.round((Number.isFinite(intervalSeconds) && intervalSeconds >= 5 ? intervalSeconds : 60) * 1000),
         ...(dailyAt ? { dailyAt } : {}),
+        ...(once ? { once: true } : {}),
+        ...(goalCondition ? { goalCondition } : {}),
+        ...(maxFailures !== undefined ? { maxFailures } : {}),
         ...(plugin ? { plugin } : {}),
         ...(pluginAction ? { pluginAction } : {}),
         ...(deliverChannelId ? { deliverChannelId } : {}),
@@ -118,6 +277,9 @@ export function initTimerPluginHub(): TimerPluginHubController {
       timerDailyInput.value = '';
       timerPluginInput.value = '';
       timerChannelInput.value = '';
+      timerGoalInput.value = '';
+      timerMaxFailuresInput.value = '5';
+      timerOnceInput.checked = false;
       timerInstructionInput.value = '';
       await hooks.refreshView();
     } catch (error) {
@@ -127,11 +289,20 @@ export function initTimerPluginHub(): TimerPluginHubController {
     }
   }
 
+  function timerStatusRank(timer: TimerView): number {
+    if (timer.fatiguePaused || timer.lastRunStatus === 'fatigue_paused') return 0;
+    if (timer.enabled) return 1;
+    if (timer.goalMetAt || timer.lastRunStatus === 'goal_met') return 2;
+    if (timer.once && timer.lastRunAt) return 3;
+    return 4;
+  }
+
   function renderTimers(force = false) {
     const timers = appState.view?.timers ?? [];
     const plugins = appState.view?.plugins ?? [];
     const activeCount = timers.filter(t => t.enabled).length;
-    const pausedCount = timers.length - activeCount;
+    const goalMetCount = timers.filter(t => Boolean(t.goalMetAt) || t.lastRunStatus === 'goal_met').length;
+    const fatigueCount = timers.filter(t => Boolean(t.fatiguePaused) || t.lastRunStatus === 'fatigue_paused').length;
     const missedTotal = timers.reduce((sum, t) => sum + (t.missedRuns ?? 0), 0);
     timerTopBadge.textContent = timers.length ? `${activeCount}/${timers.length}` : '0';
 
@@ -143,26 +314,59 @@ export function initTimerPluginHub(): TimerPluginHubController {
 
     const kpiFrag = document.createDocumentFragment();
     kpiFrag.append(
-      kpiCard('运行中', `${activeCount}`, '', activeCount > 0 ? 'positive' : 'default'),
-      kpiCard('已暂停', `${pausedCount}`, '', 'default'),
+      kpiCard('运行中', `${activeCount}`, `${activeCount}/20 上限`, activeCount > 0 ? 'positive' : 'default'),
+      kpiCard('目标已达成', `${goalMetCount}`, '', goalMetCount > 0 ? 'accent' : 'default'),
+      kpiCard('失败熔断', `${fatigueCount}`, '', fatigueCount > 0 ? 'warning' : 'default'),
       kpiCard('漏跑补偿', `${missedTotal}`, '', missedTotal > 0 ? 'warning' : 'default'),
     );
     timerKpiGrid.replaceChildren(kpiFrag);
     timerListSubtitle.textContent = timers.length ? `${activeCount} / ${timers.length} 运行中` : '';
 
+    const sortedTimers = [...timers].sort((a, b) => timerStatusRank(a) - timerStatusRank(b) || b.createdAt - a.createdAt);
     const contents = document.createDocumentFragment();
-    for (const timer of timers) {
-      const card = node('article', '', `hub-entity-card timer-card${timer.enabled ? ' is-active' : ' is-paused'}`);
+    for (const timer of sortedTimers) {
+      const isFatigue = Boolean(timer.fatiguePaused || timer.lastRunStatus === 'fatigue_paused');
+      const isGoalMet = Boolean(timer.goalMetAt || timer.lastRunStatus === 'goal_met');
+      const cardStateClass = isFatigue ? 'is-fatigue' : timer.enabled ? 'is-active' : isGoalMet ? 'is-goal-met' : 'is-paused';
+      const card = node('article', '', `hub-entity-card timer-card ${cardStateClass}`);
       const head = node('div', '', 'hub-card-head');
       const titleGroup = node('div', '', 'hub-card-title-group');
       const scheduleText = timer.once
         ? (timer.dailyAt ? `⚡ 单次 ${timer.dailyAt}` : `⚡ 单次 ${formatIntervalText(timer.intervalMs)}`)
         : (timer.dailyAt ? `⏰ 每日 ${timer.dailyAt}` : `🔄 ${formatIntervalText(timer.intervalMs)}`);
+      const statusText = isFatigue
+        ? '🛑 连续失败熔断'
+        : timer.enabled
+          ? '● 运行中'
+          : isGoalMet
+            ? '🎯 目标已达成'
+            : (timer.once && timer.lastRunAt)
+              ? '✓ 已完成'
+              : '⏸ 已暂停';
+      const statusBadgeClass = isFatigue
+        ? 'hub-badge badge-red'
+        : timer.enabled
+          ? 'hub-badge badge-green'
+          : isGoalMet
+            ? 'hub-badge badge-purple'
+            : 'hub-badge badge-slate';
       titleGroup.append(
-        node('span', timer.enabled ? '● 运行中' : (timer.once && timer.lastRunAt ? '✓ 已完成' : '⏸ 已暂停'), `hub-badge ${timer.enabled ? 'badge-green' : 'badge-slate'}`),
+        node('span', statusText, statusBadgeClass),
         node('strong', timer.name, 'hub-card-title'),
         node('span', scheduleText, 'hub-badge badge-teal'),
       );
+      if (timer.goalCondition && !isGoalMet) {
+        titleGroup.append(node('span', '🎯 有终态目标', 'hub-badge badge-purple'));
+      }
+      if ((timer.consecutiveFailures ?? 0) > 0) {
+        titleGroup.append(
+          node(
+            'span',
+            `⚠️ 连续失败 ${timer.consecutiveFailures}/${timer.maxFailures ?? 5}`,
+            `hub-badge ${isFatigue ? 'badge-red' : 'badge-amber'}`,
+          ),
+        );
+      }
       if (timer.plugin) {
         titleGroup.append(node('span', `🔌 ${timer.plugin}/${timer.pluginAction ?? 'status'}`, 'hub-badge badge-purple'));
       }
@@ -185,7 +389,13 @@ export function initTimerPluginHub(): TimerPluginHubController {
           hooks.showPanel(true);
         }, 'mini-button'));
       }
-      const toggleBtn = button(timer.enabled ? '⏸ 暂停' : '▶️ 启用', () => { void toggleTimerFromUi(timer.id, !timer.enabled); }, 'mini-button');
+      if (timer.goalCondition && !isGoalMet) {
+        const completeBtn = button('🎯 标记达成', () => { void completeTimerFromUi(timer.id); }, 'mini-button');
+        completeBtn.disabled = appState.authExpired || !appState.ready;
+        actions.append(completeBtn);
+      }
+      const toggleLabel = timer.enabled ? '⏸ 暂停' : ((isFatigue || isGoalMet) ? '🔄 重新启用' : '▶️ 启用');
+      const toggleBtn = button(toggleLabel, () => { void toggleTimerFromUi(timer.id, !timer.enabled); }, 'mini-button');
       const delBtn = button('🗑️ 删除', () => { void removeTimerFromUi(timer.id); }, 'mini-button danger-btn');
       toggleBtn.disabled = appState.authExpired || !appState.ready;
       delBtn.disabled = appState.authExpired || !appState.ready;
@@ -194,6 +404,33 @@ export function initTimerPluginHub(): TimerPluginHubController {
       card.append(head);
 
       card.append(node('div', timer.instruction, 'hub-code-block'));
+      if (timer.goalCondition) {
+        const goalBanner = node('div', '', `timer-goal-banner${isGoalMet ? ' is-met' : ''}`);
+        goalBanner.append(node('div', `${isGoalMet ? '✅' : '🎯'} 终态目标：${timer.goalCondition}`));
+        if (isGoalMet) {
+          goalBanner.append(
+            node(
+              'div',
+              `达成摘要：${timer.goalSummary ?? '已达成'}${timer.goalMetAt ? `（${timestamp(timer.goalMetAt)}）` : ''}`,
+              'meta',
+            ),
+          );
+        }
+        card.append(goalBanner);
+      }
+      if (isFatigue || (timer.consecutiveFailures ?? 0) > 0) {
+        const fatigueBanner = node('div', '', `timer-fatigue-banner${isFatigue ? ' is-tripped' : ''}`);
+        fatigueBanner.append(
+          node(
+            'div',
+            `${isFatigue ? '🛑 已触发连续失败疲劳熔断并自动暂停' : '⚠️ 最近执行异常（中间失败静默累计中）'}：连续失败 ${timer.consecutiveFailures ?? 0} / ${timer.maxFailures ?? 5} 次`,
+          ),
+        );
+        if (timer.lastError) {
+          fatigueBanner.append(node('div', `最近错误：${timer.lastError}`, 'meta'));
+        }
+        card.append(fatigueBanner);
+      }
       if (timer.plugin) {
         const boundPlugin = plugins.find(p => p.name === timer.plugin);
         const act = timer.pluginAction ?? 'status';
@@ -214,8 +451,12 @@ export function initTimerPluginHub(): TimerPluginHubController {
       }
 
       const badgesRow = node('div', '', 'hub-badges-row');
-      badgesRow.append(node('span', `⏭ 下次触发：${timer.enabled ? timestamp(timer.nextRunAt) : '已暂停'}`, 'hub-meta-chip'));
+      const nextRunLabel = timer.enabled
+        ? timestamp(timer.nextRunAt)
+        : (isFatigue ? '已熔断暂停' : isGoalMet ? '目标已达成' : '已暂停');
+      badgesRow.append(node('span', `⏭ 下次触发：${nextRunLabel}`, 'hub-meta-chip'));
       badgesRow.append(node('span', `⏮ 上次触发：${timer.lastRunAt ? timestamp(timer.lastRunAt) : '尚未触发'}`, 'hub-meta-chip'));
+      badgesRow.append(node('span', `🛡 熔断阈值：${timer.maxFailures ?? 5} 次`, 'hub-meta-chip'));
       if (timer.cwd) badgesRow.append(node('span', `📁 ${timer.cwd}`, 'hub-meta-chip mono-chip'));
       if (timer.missedRuns > 0) badgesRow.append(node('span', `⚠️ 曾漏跑补偿 ${timer.missedRuns} 次`, 'hub-badge badge-amber'));
       card.append(badgesRow);
@@ -233,9 +474,11 @@ export function initTimerPluginHub(): TimerPluginHubController {
     const timers = appState.view?.timers ?? [];
     const totalActions = plugins.reduce((sum, p) => sum + (p.actions?.length ?? 0), 0);
     const boundTimersCount = timers.filter(t => Boolean(t.plugin)).length;
-    pluginTopBadge.textContent = String(plugins.length);
+    const countText = String(plugins.length);
+    pluginTopBadge.textContent = countText;
+    pluginCatalogBadge.textContent = countText;
 
-    if (pluginHubBackdrop.hidden && !force) {
+    if ((pluginHubBackdrop.hidden || activePluginTab !== 'catalog') && !force) {
       return;
     }
 
@@ -268,6 +511,14 @@ export function initTimerPluginHub(): TimerPluginHubController {
         titleGroup.append(node('span', '⏸ 当前平台/配置已禁用', 'hub-badge badge-slate'));
       }
       head.append(titleGroup);
+      const surfaceEntry = surfaceByName.get(plugin.name);
+      if (surfaceEntry && plugin.enabled !== false) {
+        const openSurfaceBtn = button(`📊 打开${surfaceEntry.reg.label}`, () => {
+          switchPluginTab(plugin.name);
+        }, 'mini-button');
+        openSurfaceBtn.disabled = appState.authExpired || !appState.ready;
+        head.append(openSurfaceBtn);
+      }
       card.append(head);
 
       card.append(node('p', plugin.description, 'hub-card-body-text'));
@@ -486,16 +737,63 @@ export function initTimerPluginHub(): TimerPluginHubController {
     timerHubBackdrop.hidden = true;
   }
 
-  function openPluginModal(pluginName?: string, expandSource = false) {
+  function openPluginModal(
+    pluginName?: string,
+    expandSource = false,
+    mode: 'catalog' | 'surface' = 'catalog',
+  ) {
     hooks.closeAllHubModals();
     focusedPluginName = pluginName;
     expandFocusedPluginSource = expandSource;
     pluginHubBackdrop.hidden = false;
-    renderPlugins(true);
+
+    const targetTab = mode === 'surface' && pluginName
+      ? pluginName
+      : pluginName
+        ? 'catalog'
+        : activePluginTab;
+    switchPluginTab(targetTab);
+    refreshEnabledBadges();
   }
 
   function closePluginModal() {
+    tabSwitchSeq++;
+    deactivateActiveSurface();
     pluginHubBackdrop.hidden = true;
+  }
+
+  function syncPluginSurfaces(opts: {
+    initial: boolean;
+    cursorReset: boolean;
+    newMessages: readonly { seq: number; text: string }[];
+  }): void {
+    for (const entry of surfaces) {
+      const enabled = isSurfaceEnabled(entry.reg.pluginName);
+      entry.tabEl.hidden = !enabled;
+      if (!enabled) {
+        surfaceBadgeSynced.delete(entry.reg.pluginName);
+        if (activePluginTab === entry.reg.pluginName) {
+          switchPluginTab('catalog');
+        }
+        continue;
+      }
+
+      const matchedMessage = entry.reg.messageTrigger
+        ? opts.newMessages.some(msg => entry.reg.messageTrigger!.test(msg.text))
+        : false;
+      if (opts.cursorReset || matchedMessage) {
+        surfaceBadgeSynced.delete(entry.reg.pluginName);
+      }
+
+      if (!pluginHubBackdrop.hidden && !appState.authExpired && !surfaceBadgeSynced.has(entry.reg.pluginName)) {
+        surfaceBadgeSynced.add(entry.reg.pluginName);
+        void loadSurfaceController(entry.reg)
+          .then(ctrl => ctrl.refreshBadge())
+          .catch(() => {
+            surfaceBadgeSynced.delete(entry.reg.pluginName);
+          });
+      }
+    }
   }
 
   openTimerHubTop.addEventListener('click', openTimerModal);
@@ -514,6 +812,9 @@ export function initTimerPluginHub(): TimerPluginHubController {
       ? `${chip.dataset.timerPlugin}${chip.dataset.timerAction ? `/${chip.dataset.timerAction}` : ''}`
       : '';
     timerChannelInput.value = chip.dataset.timerChannel ?? '';
+    timerGoalInput.value = chip.dataset.timerGoal ?? '';
+    timerOnceInput.checked = chip.dataset.timerOnce === 'true';
+    timerMaxFailuresInput.value = chip.dataset.timerMaxFailures ?? '5';
     timerInstructionInput.value = chip.dataset.timerCmd ?? '';
     timerAddDetails.open = true;
     timerInstructionInput.focus();
@@ -529,6 +830,12 @@ export function initTimerPluginHub(): TimerPluginHubController {
   pluginHubBackdrop.addEventListener('click', event => {
     if (event.target === pluginHubBackdrop) closePluginModal();
   });
+  pluginSurfaceTabs.addEventListener('click', event => {
+    const tabBtn = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-plugin-tab]');
+    const nextTab = tabBtn?.dataset.pluginTab;
+    if (!nextTab || nextTab === activePluginTab) return;
+    switchPluginTab(nextTab);
+  });
 
   return {
     openTimerModal,
@@ -536,6 +843,8 @@ export function initTimerPluginHub(): TimerPluginHubController {
     renderTimers,
     openPluginModal,
     closePluginModal,
+    deactivateActiveSurface,
     renderPlugins,
+    syncPluginSurfaces,
   };
 }

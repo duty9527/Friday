@@ -19,6 +19,22 @@ let channel: BroadcastChannel | undefined;
 let boundWindow: (Window & typeof globalThis) | undefined;
 let boundRightBtn: HTMLButtonElement | null = null;
 let lastWriteSucceeded = true;
+let themeTransitionTimer: ReturnType<typeof setTimeout> | undefined;
+
+function triggerThemeTransition(): void {
+  if (typeof document === 'undefined') return;
+  const root = document.documentElement;
+  if (!root?.classList) return;
+  root.classList.add('theme-transitioning');
+  if (themeTransitionTimer !== undefined) {
+    clearTimeout(themeTransitionTimer);
+  }
+  themeTransitionTimer = setTimeout(() => {
+    themeTransitionTimer = undefined;
+    root.classList.remove('theme-transitioning');
+  }, 460);
+  (themeTransitionTimer as { unref?: () => void }).unref?.();
+}
 
 function normalizeTheme(value: unknown): UiTheme {
   return value === 'industrial' ? 'industrial' : 'spatial';
@@ -102,6 +118,7 @@ function handleExternalThemeUpdate(rawTheme: unknown): void {
     applyThemeToDom(next);
     return;
   }
+  triggerThemeTransition();
   currentTheme = next;
   applyThemeToDom(next);
   notifyThemeChange(next);
@@ -160,6 +177,9 @@ export function setUiTheme(next: UiTheme): UiTheme {
   ensureCrossTabSync();
   const theme = normalizeTheme(next);
   const prev = getUiTheme();
+  if (prev !== theme) {
+    triggerThemeTransition();
+  }
   currentTheme = theme;
   lastWriteSucceeded = writeStorage(THEME_STORAGE_KEY, theme);
   applyThemeToDom(theme);
@@ -280,6 +300,19 @@ export function ensureRightDrawerOpen(): void {
       ? document.getElementById('desktop-trace-fold') as HTMLButtonElement | null
       : null);
   applyDrawerState('right', rightBtn, false);
+}
+
+export function collapseRightDrawer(): void {
+  const collapsed = typeof document !== 'undefined' && document.body?.classList
+    ? document.body.classList.contains('desktop-right-collapsed')
+    : readDrawerState(RIGHT_DRAWER_STORAGE_KEY);
+  if (collapsed) return;
+  writeStorage(RIGHT_DRAWER_STORAGE_KEY, 'true');
+  const rightBtn = boundRightBtn
+    ?? (typeof document !== 'undefined' && typeof document.getElementById === 'function'
+      ? document.getElementById('desktop-trace-fold') as HTMLButtonElement | null
+      : null);
+  applyDrawerState('right', rightBtn, true);
 }
 
 if (typeof window !== 'undefined' && typeof document !== 'undefined') {

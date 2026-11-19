@@ -1,5 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
-import type { ImChannelView, ImPlatform, MessageOrigin } from '../view.js';
+import type { ImChannelView, ImPlatform, MessageOrigin, QuietHoursConfig, RejectedStrangerView, TimerRunStatus } from '../view.js';
 
 export interface Timer {
   id: string;
@@ -21,6 +21,15 @@ export interface Timer {
   pendingCatchup?: boolean;
   missedRuns: number;
   origin?: MessageOrigin;
+  goalCondition?: string;
+  goalMetAt?: number;
+  goalSummary?: string;
+  maxFailures?: number;
+  consecutiveFailures?: number;
+  fatiguePaused?: boolean;
+  lastRunStatus?: TimerRunStatus;
+  lastError?: string;
+  firstFailureNotified?: boolean;
 }
 
 export interface ImChannelConfig {
@@ -39,6 +48,10 @@ export interface ImChannelConfig {
   defaultTarget?: string;
   allowedSenders: string[];
   apiBase?: string;
+  cdnBaseUrl?: string;
+  readLinks?: boolean;
+  quietHours?: QuietHoursConfig;
+  rejectedSenders?: RejectedStrangerView[];
   pollIntervalMs?: number;
   pollOffset?: number;
   inboundCount: number;
@@ -49,6 +62,24 @@ export interface ImChannelConfig {
   createdAt: number;
   updatedAt: number;
 }
+
+export interface WechatQuoteRecord {
+  channelId: string;
+  accountId?: string;
+  conversationId: string;
+  messageId: string;
+  direction: 'inbound' | 'outbound';
+  body: string;
+  mediaPath?: string;
+  mediaMime?: string;
+  mediaName?: string;
+  createdAt?: number;
+}
+
+const QUOTE_CACHE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const QUOTE_CACHE_MAX_PER_ACCOUNT = 10_000;
+const QUOTE_CACHE_PRUNE_INTERVAL = 100;
+const QUOTE_CACHE_MAX_BODY_CHARS = 8_000;
 
 function parseJsonSafe<T>(raw: unknown): T | undefined {
   if (raw === null || raw === undefined) return undefined;
@@ -68,6 +99,8 @@ function maskUrlCredentials(raw?: string): string | undefined {
  * Persistence for scheduled timers and external IM channel configurations.
  */
 export class RuntimeOpsStore {
+  private quoteCacheWritesSincePrune = 0;
+
   constructor(
     private readonly db: DatabaseSync,
     private readonly atomic: <T>(run: () => T) => T = run => run(),
@@ -158,6 +191,10 @@ export class RuntimeOpsStore {
       defaultTarget: channel.defaultTarget,
       allowedSenders: channel.allowedSenders,
       apiBase: maskUrlCredentials(channel.apiBase),
+      cdnBaseUrl: maskUrlCredentials(channel.cdnBaseUrl),
+      readLinks: channel.readLinks,
+      quietHours: channel.quietHours,
+      rejectedSenders: channel.rejectedSenders,
       pollIntervalMs: channel.pollIntervalMs,
       inboundCount: channel.inboundCount,
       outboundCount: channel.outboundCount,
@@ -173,7 +210,100 @@ export class RuntimeOpsStore {
     return this.listImChannels().map(channel => this.toImChannelView(channel));
   }
 
+  saveWechatQuoteRecord(record: WechatQuoteRecord): void {
+    const channelId = record.channelId.trim();
+    const conversationId = record.conversationId.trim();
+    const messageId = record.messageId.trim();
+    if (!channelId || !conversationId || !messageId) return;
+    const accountId = (record.accountId ?? '').trim();
+    const createdAt = typeof record.createdAt === 'number' && Number.isFinite(record.createdAt)
+      ? record.createdAt
+      : Date.now();
+    const body = record.body.length > QUOTE_CACHE_MAX_BODY_CHARS
+      ? record.body.slice(0, QUOTE_CACHE_MAX_BODY_CHARS)
+      : record.body;
+
+    this.atomic(() => {
+      this.db.prepare(
+        `INSERT INTO wechat_quote_cache(
+          channel_id, account_id, conversation_id, message_id,
+          direction, body, media_path, media_mime, media_name, created_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(channel_id, account_id, conversation_id, message_id) DO UPDATE SET
+          direction=excluded.direction,
+          body=CASE WHEN excluded.body != '' THEN excluded.body ELSE wechat_quote_cache.body END,
+          media_path=COALESCE(excluded.media_path, wechat_quote_cache.media_path),
+          media_mime=COALESCE(excluded.media_mime, wechat_quote_cache.media_mime),
+          media_name=COALESCE(excluded.media_name, wechat_quote_cache.media_name),
+          created_at=MAX(excluded.created_at, wechat_quote_cache.created_at)`,
+      ).run(
+        channelId,
+        accountId,
+        conversationId,
+        messageId,
+        record.direction,
+        body,
+        record.mediaPath ?? null,
+        record.mediaMime ?? null,
+        record.mediaName ?? null,
+        createdAt,
+      );
+
+      this.quoteCacheWritesSincePrune += 1;
+      if (this.quoteCacheWritesSincePrune >= QUOTE_CACHE_PRUNE_INTERVAL) {
+        this.quoteCacheWritesSincePrune = 0;
+        const cutoff = createdAt - QUOTE_CACHE_RETENTION_MS;
+        this.db.prepare(
+          'DELETE FROM wechat_quote_cache WHERE channel_id=? AND account_id=? AND created_at < ?',
+        ).run(channelId, accountId, cutoff);
+        this.db.prepare(
+          `DELETE FROM wechat_quote_cache
+           WHERE channel_id=? AND account_id=? AND message_id IN (
+             SELECT message_id FROM wechat_quote_cache
+             WHERE channel_id=? AND account_id=?
+             ORDER BY created_at DESC
+             LIMIT -1 OFFSET ?
+           )`,
+        ).run(channelId, accountId, channelId, accountId, QUOTE_CACHE_MAX_PER_ACCOUNT);
+      }
+    });
+  }
+
+  findWechatQuoteRecord(
+    channelId: string,
+    accountId: string | undefined,
+    conversationId: string,
+    messageId: string,
+  ): WechatQuoteRecord | undefined {
+    const cleanChannel = channelId.trim();
+    const cleanConv = conversationId.trim();
+    const cleanMsg = messageId.trim();
+    if (!cleanChannel || !cleanConv || !cleanMsg) return undefined;
+    const cleanAcc = (accountId ?? '').trim();
+    const row = this.db.prepare(
+      `SELECT channel_id, account_id, conversation_id, message_id, direction, body, media_path, media_mime, media_name, created_at
+       FROM wechat_quote_cache
+       WHERE channel_id=? AND account_id=? AND conversation_id=? AND message_id=?`,
+    ).get(cleanChannel, cleanAcc, cleanConv, cleanMsg) as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    return {
+      channelId: String(row.channel_id),
+      ...(row.account_id ? { accountId: String(row.account_id) } : {}),
+      conversationId: String(row.conversation_id),
+      messageId: String(row.message_id),
+      direction: row.direction === 'outbound' ? 'outbound' : 'inbound',
+      body: String(row.body ?? ''),
+      ...(typeof row.media_path === 'string' && row.media_path ? { mediaPath: row.media_path } : {}),
+      ...(typeof row.media_mime === 'string' && row.media_mime ? { mediaMime: row.media_mime } : {}),
+      ...(typeof row.media_name === 'string' && row.media_name ? { mediaName: row.media_name } : {}),
+      ...(typeof row.created_at === 'number' ? { createdAt: row.created_at } : {}),
+    };
+  }
+
   deleteImChannel(id: string): boolean {
-    return this.db.prepare('DELETE FROM im_channels WHERE id=?').run(id).changes > 0;
+    return this.atomic(() => {
+      this.db.prepare('DELETE FROM wechat_quote_cache WHERE channel_id=?').run(id);
+      return this.db.prepare('DELETE FROM im_channels WHERE id=?').run(id).changes > 0;
+    });
   }
 }

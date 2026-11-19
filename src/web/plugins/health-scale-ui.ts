@@ -1,11 +1,15 @@
 import { button, element, isEditingWithin, kpiCard, node, svgNode } from '../shared/dom.js';
 import { errorText, json, timestamp } from '../shared/format.js';
-import { api, appState, hooks } from '../state.js';
+import { api, appState } from '../state.js';
+
+export interface HealthScaleUiOptions {
+  isVisible: () => boolean;
+}
 
 export interface HealthScaleUiController {
-  openModal: () => void;
-  closeModal: () => void;
-  refreshTopBadge: () => Promise<void>;
+  activate: () => void;
+  deactivate: () => void;
+  refreshBadge: () => Promise<void>;
 }
 
 interface HealthProfile {
@@ -209,10 +213,8 @@ type HealthSourceFilterKey = 'all' | 'live' | 'history' | 'manual';
 
 const HEALTH_ACTIVE_PHASES = new Set(['scanning', 'connecting', 'measuring']);
 
-export function initHealthScaleUi(): HealthScaleUiController {
+export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiController {
   const healthTopBadge = element<HTMLElement>('health-top-badge');
-  const healthHubBackdrop = element<HTMLElement>('health-hub-backdrop');
-  const healthModalClose = element<HTMLButtonElement>('health-modal-close');
   const healthProfileSelect = element<HTMLSelectElement>('health-profile-select');
   const healthUnitKg = element<HTMLButtonElement>('health-unit-kg');
   const healthUnitJin = element<HTMLButtonElement>('health-unit-jin');
@@ -294,7 +296,7 @@ export function initHealthScaleUi(): HealthScaleUiController {
 
   function scheduleHealthMeasurePoll(delayMs = 850) {
     stopHealthMeasurePoll();
-    if (healthHubBackdrop.hidden || appState.authExpired) return;
+    if (!options.isVisible() || appState.authExpired) return;
     healthPollTimer = window.setTimeout(() => {
       void pollHealthMeasureOnce();
     }, delayMs);
@@ -424,39 +426,39 @@ export function initHealthScaleUi(): HealthScaleUiController {
       }
     }
     renderHealthTopBadge();
-    if (!healthHubBackdrop.hidden) {
+    if (options.isVisible()) {
       renderHealthModal();
     }
   }
 
   let dashboardFetchSeq = 0;
 
-  async function refreshHealthDashboard(options: { profileId?: string; quiet?: boolean } = {}) {
+  async function refreshHealthDashboard(opts: { profileId?: string; quiet?: boolean } = {}) {
     const seq = ++dashboardFetchSeq;
-    const targetProfileId = options.profileId ?? healthDashboard?.activeProfileId ?? undefined;
+    const targetProfileId = opts.profileId ?? healthDashboard?.activeProfileId ?? undefined;
     const args: Record<string, unknown> = {};
     if (targetProfileId) args.profileId = targetProfileId;
     try {
       const res = await runHealthPlugin<HealthDashboardData>('dashboard', args);
       if (seq !== dashboardFetchSeq) return;
       if (!res.ok || !res.data) {
-        if (!options.quiet) setHealthActionStatus(res.message || '读取健康看板失败', 'err');
+        if (!opts.quiet) setHealthActionStatus(res.message || '读取健康看板失败', 'err');
         return;
       }
       applyHealthDashboard(res.data);
       const phase = res.data.liveSession?.phase || '';
       healthLastSessionPhase = phase;
-      if (!healthHubBackdrop.hidden && HEALTH_ACTIVE_PHASES.has(phase)) {
+      if (options.isVisible() && HEALTH_ACTIVE_PHASES.has(phase)) {
         scheduleHealthMeasurePoll(750);
       }
     } catch (err) {
       if (seq !== dashboardFetchSeq) return;
-      if (!options.quiet) setHealthActionStatus(`读取健康数据失败：${errorText(err)}`, 'err');
+      if (!opts.quiet) setHealthActionStatus(`读取健康数据失败：${errorText(err)}`, 'err');
     }
   }
 
   async function pollHealthMeasureOnce() {
-    if (healthHubBackdrop.hidden || appState.authExpired) return;
+    if (!options.isVisible() || appState.authExpired) return;
     const seq = ++dashboardFetchSeq;
     try {
       const res = await runHealthPlugin<{ session: HealthLiveSession | null; dashboard: HealthDashboardData }>('measure-status', {});
@@ -1461,25 +1463,21 @@ export function initHealthScaleUi(): HealthScaleUiController {
     }
   }
 
-  function openModal() {
-    hooks.closeAllHubModals();
+  function activate() {
     setHealthActionStatus();
-    healthHubBackdrop.hidden = false;
     if (healthDashboard) {
       renderHealthModal();
+      window.requestAnimationFrame(() => {
+        if (options.isVisible()) renderHealthTrendChart();
+      });
     }
     void refreshHealthDashboard();
   }
 
-  function closeModal() {
+  function deactivate() {
     stopHealthMeasurePoll();
-    healthHubBackdrop.hidden = true;
   }
 
-  healthModalClose.addEventListener('click', closeModal);
-  healthHubBackdrop.addEventListener('click', event => {
-    if (event.target === healthHubBackdrop) closeModal();
-  });
   healthRefreshBtn.addEventListener('click', () => void refreshHealthDashboard());
   healthProfileSelect.addEventListener('change', () => {
     const nextId = healthProfileSelect.value;
@@ -1541,19 +1539,19 @@ export function initHealthScaleUi(): HealthScaleUiController {
   healthProfileSaveBtn.addEventListener('click', () => void saveHealthProfileFromUi());
   healthManualAddBtn.addEventListener('click', () => void addManualHealthRecordFromUi());
   window.addEventListener('resize', () => {
-    if (!healthHubBackdrop.hidden) {
+    if (options.isVisible()) {
       renderHealthTrendChart();
     }
   });
   window.addEventListener('friday:themechange', () => {
-    if (!healthHubBackdrop.hidden) {
+    if (options.isVisible()) {
       renderHealthTrendChart();
     }
   });
 
   return {
-    openModal,
-    closeModal,
-    refreshTopBadge: () => (appState.authExpired ? Promise.resolve() : refreshHealthDashboard({ quiet: true })),
+    activate,
+    deactivate,
+    refreshBadge: () => (appState.authExpired ? Promise.resolve() : refreshHealthDashboard({ quiet: true })),
   };
 }

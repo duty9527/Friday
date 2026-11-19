@@ -3,9 +3,13 @@ import { button, element, kpiCard, node } from '../shared/dom.js';
 import { errorText } from '../shared/format.js';
 import { api, appState, hooks } from '../state.js';
 
+export interface ModelHubOptions {
+  isVisible: () => boolean;
+  onBadgeChange?: (summary: { ready: boolean; badgeText: string; detailText: string }) => void;
+}
+
 export interface ModelHubController {
-  openModal: (focusProviderId?: string) => void;
-  closeModal: () => void;
+  activate: (focusProviderId?: string) => void;
   render: (force?: boolean) => void;
 }
 
@@ -16,13 +20,10 @@ function hasVisibleProbeResult(container: HTMLElement): boolean {
   return false;
 }
 
-export function initModelHub(): ModelHubController {
+export function initModelHub(options: ModelHubOptions): ModelHubController {
   const modelTopBadge = element<HTMLElement>('model-top-badge');
   const modelCurrentStatus = element<HTMLElement>('model-current-status');
-  const openModelHubTop = element<HTMLButtonElement>('open-model-hub-top');
   const modelProvidersList = element<HTMLElement>('model-providers-list');
-  const modelHubBackdrop = element<HTMLElement>('model-hub-backdrop');
-  const modelModalClose = element<HTMLButtonElement>('model-modal-close');
   const modalProviderTabs = element<HTMLElement>('modal-provider-tabs');
   const modalAuthProviderTitle = element<HTMLElement>('modal-auth-provider-title');
   const modalAuthStatusBadge = element<HTMLElement>('modal-auth-status-badge');
@@ -472,16 +473,29 @@ export function initModelHub(): ModelHubController {
     const tiers = hub?.tiers ?? appState.view?.modelTiers;
     if (!hub && !tiers) {
       modelTopBadge.textContent = '—';
-      if (!modelHubBackdrop.hidden || force) {
+      options.onBadgeChange?.({
+        ready: false,
+        badgeText: '—',
+        detailText: '模型提供方未就绪',
+      });
+      if (options.isVisible() || force) {
         modelCurrentStatus.replaceChildren();
       }
       return;
     }
     const configuredCount = hub?.providers.filter(p => p.configured && p.enabled !== false).length ?? 0;
     const pool = hub?.modelPool ?? [];
-    modelTopBadge.textContent = `${configuredCount}方·${pool.length}模`;
+    const badgeText = `${configuredCount}方·${pool.length}模`;
+    const routerModel = hub?.routerModel ?? tiers?.router ?? '—';
+    const routerProvider = hub?.routerProvider ? `${hub.routerProvider}/` : '';
+    modelTopBadge.textContent = badgeText;
+    options.onBadgeChange?.({
+      ready: true,
+      badgeText,
+      detailText: `主控 ${routerProvider}${routerModel} · 已接入 ${configuredCount} 个提供方 / ${pool.length} 款 Worker 模型`,
+    });
 
-    if (modelHubBackdrop.hidden && !force) {
+    if (!options.isVisible() && !force) {
       return;
     }
 
@@ -606,18 +620,16 @@ export function initModelHub(): ModelHubController {
     modelProvidersList.replaceChildren(listFrag);
   }
 
-  function openModal(focusProviderId?: string) {
+  function activate(focusProviderId?: string) {
     const hub = appState.view?.modelHub;
     if (!hub) {
       hooks.connection('正在读取模型中心数据，请稍候…');
       return;
     }
-    hooks.closeAllHubModals();
     if (focusProviderId) activeAuthProviderTab = focusProviderId;
     modalAuthKeyInput.value = '';
     modalAuthCustomModelsInput.value = '';
     modalAuthProbeResult.hidden = true;
-    modelHubBackdrop.hidden = false;
     render(true);
     renderModalAuthSection();
 
@@ -626,15 +638,6 @@ export function initModelHub(): ModelHubController {
     syncModalRouterModels(hub.routerModel);
   }
 
-  function closeModal() {
-    modelHubBackdrop.hidden = true;
-  }
-
-  openModelHubTop.addEventListener('click', () => openModal());
-  modelModalClose.addEventListener('click', closeModal);
-  modelHubBackdrop.addEventListener('click', event => {
-    if (event.target === modelHubBackdrop) closeModal();
-  });
   modalRouterProviderSelect.addEventListener('change', () => {
     modalRouterProbeResult.hidden = true;
     syncModalRouterModels();
@@ -656,8 +659,7 @@ export function initModelHub(): ModelHubController {
   modalSaveRoutingBtn.addEventListener('click', () => { void saveModalRoutingFromUi(); });
 
   return {
-    openModal,
-    closeModal,
+    activate,
     render,
   };
 }

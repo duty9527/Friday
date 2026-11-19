@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { lstat, mkdir, open } from 'node:fs/promises';
-import { basename, join, resolve, sep } from 'node:path';
+import { lstat, mkdir, open, readdir } from 'node:fs/promises';
+import { basename, extname, join, resolve, sep } from 'node:path';
 import type { AgentTool } from '../agent.js';
 import { publicData } from '../conversation.js';
 import type { ImGateway } from '../im.js';
@@ -28,11 +28,25 @@ import {
   type BoundedCounterMap,
   type ChatRun,
 } from './chat-coalescer.js';
-import { clampTimerIntervalMs, type AddTimerOptions } from './timer-scheduler.js';
+import {
+  CHAT_MIN_RECURRING_LLM_INTERVAL_MS,
+  CHAT_MIN_RECURRING_PLUGIN_INTERVAL_MS,
+  DEFAULT_TIMER_MAX_FAILURES,
+  MAX_TIMER_INTERVAL_MS,
+  MAX_TIMER_MAX_FAILURES,
+  type AddTimerOptions,
+} from './timer-scheduler.js';
 import { dedupeAttachments, resolveMessageAttachments, resolveTaskAttachments, type Run } from './worker-runner.js';
 
 export const WORKER_PROFILES = new Set<WorkerProfile>(['general', 'coding', 'research', 'review']);
 export const MODEL_TIERS = new Set<ModelTier>(['fast', 'balanced', 'strong']);
+const BINARY_ATTACHMENT_EXTS = new Set([
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.ico', '.heic', '.avif',
+  '.mp4', '.mov', '.avi', '.mkv', '.webm',
+  '.mp3', '.wav', '.m4a', '.ogg', '.silk',
+  '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+  '.zip', '.gz', '.tar', '.7z', '.rar',
+]);
 export const READONLY_ROUTER_TOOLS = new Set(['recall_messages', 'search_memory', 'inspect_work']);
 export const MEMBER_ALLOWED_PLUGINS = new Set(['miot', 'tv-ir', 'tv-agent']);
 
@@ -319,6 +333,7 @@ export interface RouterToolsHost {
     options?: AddTimerOptions,
   ) => import('../store.js').Timer;
   toggleTimer: (id: string, enabled: boolean) => import('../store.js').Timer;
+  completeTimer?: (id: string, summary?: string) => import('../store.js').Timer;
   removeTimer: (id: string) => boolean;
   resolveChannelOrigin: (channelSpec: string, deliverTarget?: string) => MessageOrigin | undefined;
 }
@@ -867,12 +882,12 @@ export function createRouterTools(
     },
   }, {
     name: 'manage_timer',
-    description: 'Manage persistent schedules and one-shot reminders. Input JSON {action: "add"|"list"|"toggle"|"remove", id?, name?, instruction?, intervalMs?, delayMs?, dailyAt?, once?, plugin?, pluginAction?, deliverChannelId?, deliverTarget?, cwd?, enabled?}. Use delayMs or dailyAt ("HH:mm", +once:true) for timers, plugin/pluginAction for 0-token runs, and deliverChannelId/deliverTarget for IM.',
+    description: 'Manage persistent schedules, one-shot reminders, and goal-oriented routines. Input JSON {action: "add"|"list"|"toggle"|"complete"|"remove", id?, name?, instruction?, intervalMs?, delayMs?, dailyAt?, once?, plugin?, pluginAction?, deliverChannelId?, deliverTarget?, cwd?, enabled?, goalCondition?, maxFailures?, summary?}. Use delayMs (>=5000) or dailyAt ("HH:mm", +once:true) for timers, plugin/pluginAction for 0-token runs (>=60000ms), recurring AI timers require >=300000ms (max 20 enabled), and deliverChannelId/deliverTarget for IM. Set goalCondition for end-state goals (mutually exclusive with once) and call action="complete" (or emit [[GOAL_MET: summary]]) once verified.',
     execute: async input => {
       const turn = host.getTurn();
       const context = requireActiveChat(host);
       const callerOrigin = getCallerOrigin(host, context);
-      const args = toolInput(input, ['action', 'id', 'name', 'instruction', 'intervalMs', 'delayMs', 'dailyAt', 'once', 'plugin', 'pluginAction', 'deliverChannelId', 'deliverTarget', 'cwd', 'enabled', 'summary']);
+      const args = toolInput(input, ['action', 'id', 'name', 'instruction', 'intervalMs', 'delayMs', 'dailyAt', 'once', 'plugin', 'pluginAction', 'deliverChannelId', 'deliverTarget', 'cwd', 'enabled', 'goalCondition', 'maxFailures', 'summary']);
       const action = text(args.action, 'action', 32);
       if (action === 'list') {
         const timers = host.store.listTimers().filter(t => isOriginAccessible(callerOrigin, t.origin));
@@ -885,21 +900,36 @@ export function createRouterTools(
           const targetOrigin = host.resolveChannelOrigin(deliverChannelId ?? callerOrigin.channel, deliverTarget);
           assertOriginAccessible(callerOrigin, targetOrigin, '定时投递目标');
         }
-        const delayMs = args.delayMs === undefined ? undefined : clampTimerIntervalMs(integer(args.delayMs, 60_000, 500, 604_800_000));
+        const pluginArg = args.plugin === undefined ? undefined : text(args.plugin, 'plugin', 64);
+        const pluginActionArg = args.pluginAction === undefined ? undefined : text(args.pluginAction, 'pluginAction', 64);
+        const onceArg = args.once === undefined ? undefined : Boolean(args.once);
+        const dailyAtArg = args.dailyAt === undefined ? undefined : text(args.dailyAt, 'dailyAt', 16);
+        const goalConditionArg = args.goalCondition === undefined ? undefined : text(args.goalCondition, 'goalCondition', 500);
+        const maxFailuresArg = args.maxFailures === undefined
+          ? undefined
+          : integer(args.maxFailures, DEFAULT_TIMER_MAX_FAILURES, 1, MAX_TIMER_MAX_FAILURES);
+        const defaultIntervalMs = (onceArg || args.delayMs !== undefined || dailyAtArg !== undefined)
+          ? 60_000
+          : (pluginArg ? CHAT_MIN_RECURRING_PLUGIN_INTERVAL_MS : CHAT_MIN_RECURRING_LLM_INTERVAL_MS);
+        const intervalMs = integer(args.intervalMs, defaultIntervalMs, 1, MAX_TIMER_INTERVAL_MS);
+        const delayMs = args.delayMs === undefined ? undefined : integer(args.delayMs, 60_000, 1, MAX_TIMER_INTERVAL_MS);
         const timer = host.addTimer(
-          text(args.name ?? (args.once || delayMs !== undefined ? '定时提醒' : '定时任务'), 'name', 120),
-          text(args.instruction ?? (args.plugin ? `执行插件 ${String(args.plugin)}/${String(args.pluginAction ?? 'status')}` : '定时巡检'), 'instruction'),
-          clampTimerIntervalMs(integer(args.intervalMs, 60_000, 500, 604_800_000)),
+          text(args.name ?? (onceArg || delayMs !== undefined ? '定时提醒' : '定时任务'), 'name', 120),
+          text(args.instruction ?? (pluginArg ? `执行插件 ${pluginArg}/${pluginActionArg ?? 'status'}` : '定时巡检'), 'instruction'),
+          intervalMs,
           args.cwd === undefined ? undefined : text(args.cwd, 'cwd', 4096),
           turn?.chatContext?.deliveryOrigin ?? turn?.chatContext?.message.origin ?? turn?.activeReportTask?.origin ?? context.message.origin,
           {
-            dailyAt: args.dailyAt === undefined ? undefined : text(args.dailyAt, 'dailyAt', 16),
+            dailyAt: dailyAtArg,
             delayMs,
-            once: args.once === undefined ? undefined : Boolean(args.once),
-            plugin: args.plugin === undefined ? undefined : text(args.plugin, 'plugin', 64),
-            pluginAction: args.pluginAction === undefined ? undefined : text(args.pluginAction, 'pluginAction', 64),
+            once: onceArg,
+            plugin: pluginArg,
+            pluginAction: pluginActionArg,
             deliverChannelId,
             deliverTarget,
+            goalCondition: goalConditionArg,
+            maxFailures: maxFailuresArg,
+            enforceChatGuardrails: true,
           },
         );
         return JSON.stringify({ timer });
@@ -909,6 +939,16 @@ export function createRouterTools(
         const existing = host.store.getTimer(id);
         assertOriginAccessible(callerOrigin, existing.origin, '定时器');
         return JSON.stringify({ timer: host.toggleTimer(id, Boolean(args.enabled)) });
+      }
+      if (action === 'complete') {
+        if (!host.completeTimer) {
+          throw new Error('Timer completion is not supported by this host');
+        }
+        const id = text(args.id, 'id', 128);
+        const existing = host.store.getTimer(id);
+        assertOriginAccessible(callerOrigin, existing.origin, '定时器');
+        const summary = args.summary === undefined ? undefined : text(args.summary, 'summary', 1000);
+        return JSON.stringify({ timer: host.completeTimer(id, summary) });
       }
       if (action === 'remove') {
         const id = text(args.id, 'id', 128);
@@ -972,7 +1012,7 @@ export function createRouterTools(
     },
   }, {
     name: 'send_file',
-    description: 'Send a file attachment via an authenticated IM attachment channel (WeChat or Telegram). Input JSON {name, content?}. Pass UTF-8 text/Markdown in content to stage and send directly without a Worker; omit content to send an existing staged file (1B..16MiB) from FRIDAY_WECHAT_ATTACHMENT_DIR or <home>/wechat-files.',
+    description: 'Send a file attachment via an authenticated IM attachment channel (WeChat or Telegram). Input JSON {name, content?}. Pass UTF-8 text/Markdown in content to stage and send directly without a Worker; omit content to send an existing staged file (1B..16MiB) from FRIDAY_WECHAT_ATTACHMENT_DIR or <home>/wechat-files. Never pass text/placeholder content for binary files (.jpg/.png/.mp4/.pdf/.xlsx etc.); omit content and pass the exact staged filename. On WeChat, images (.png/.jpg/.gif/.webp) and videos (.mp4/.mov) are automatically delivered as native image/video bubbles, while other extensions are sent as file attachments.',
     execute: async input => {
       if (host.isClosing()) throw new Error('Service is shutting down');
       const turn = host.getTurn();
@@ -998,17 +1038,20 @@ export function createRouterTools(
       if (!origin || (origin.channel !== 'wechat' && origin.channel !== 'telegram') || !origin.channelId || !target) {
         throw new Error('当前未找到可用的微信或 Telegram 会话/绑定通道，无法发送附件');
       }
+      const outboxRoot = resolve(resolveEnv('FRIDAY_WECHAT_ATTACHMENT_DIR', 'SUPER_AGENT_WECHAT_ATTACHMENT_DIR') || join(host.home, 'wechat-files'));
+      const targetPath = resolve(outboxRoot, fileName);
+      if (!targetPath.startsWith(`${outboxRoot}${sep}`)) {
+        throw new Error('Invalid attachment path');
+      }
       if (args.content !== undefined) {
+        if (BINARY_ATTACHMENT_EXTS.has(extname(fileName).toLowerCase())) {
+          throw new Error(`禁止用纯文本 content 生成二进制附件 "${fileName}"（图片/视频/文档等必须由 Worker 写入真实二进制文件后，再仅传 {name} 发送）。`);
+        }
         const contentText = text(args.content, 'content', 65_536);
-        const outboxRoot = resolve(resolveEnv('FRIDAY_WECHAT_ATTACHMENT_DIR', 'SUPER_AGENT_WECHAT_ATTACHMENT_DIR') || join(host.home, 'wechat-files'));
         await mkdir(outboxRoot, { recursive: true, mode: 0o700 });
         const rootStat = await lstat(outboxRoot);
         if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
           throw new Error('Outbox directory cannot be a symbolic link');
-        }
-        const targetPath = resolve(outboxRoot, fileName);
-        if (!targetPath.startsWith(`${outboxRoot}${sep}`)) {
-          throw new Error('Invalid attachment path');
         }
         let handle: Awaited<ReturnType<typeof open>> | undefined;
         try {
@@ -1021,6 +1064,38 @@ export function createRouterTools(
           throw err;
         } finally {
           await handle?.close();
+        }
+      } else {
+        try {
+          await lstat(targetPath);
+        } catch (err) {
+          const code = err && typeof err === 'object' && 'code' in err ? String(err.code) : '';
+          if (code === 'ENOENT') {
+            let available: string[] = [];
+            try {
+              const entries = await readdir(outboxRoot, { withFileTypes: true });
+              const filesWithMtime = await Promise.all(
+                entries
+                  .filter(entry => !entry.name.startsWith('.'))
+                  .map(async entry => {
+                    try {
+                      const st = await lstat(join(outboxRoot, entry.name));
+                      return { name: entry.name, mtimeMs: st.mtimeMs };
+                    } catch {
+                      return { name: entry.name, mtimeMs: 0 };
+                    }
+                  }),
+              );
+              available = filesWithMtime
+                .sort((a, b) => b.mtimeMs - a.mtimeMs)
+                .slice(0, 20)
+                .map(item => item.name);
+            } catch {
+              available = [];
+            }
+            const listed = available.length > 0 ? available.join(', ') : '目录为空';
+            throw new Error(`暂存目录中不存在 "${fileName}"。当前可用文件：${listed}。请直接使用准确文件名重试，不要虚构文件名或传 content 占位符。`);
+          }
         }
       }
       if (origin.channel === 'telegram') {

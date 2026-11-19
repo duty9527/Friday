@@ -18,7 +18,7 @@ import {
   type SearchContextOptions,
   type SearchContextResult,
 } from './store/memory-store.js';
-import { RuntimeOpsStore, type ImChannelConfig, type Timer } from './store/runtime-ops-store.js';
+import { RuntimeOpsStore, type ImChannelConfig, type Timer, type WechatQuoteRecord } from './store/runtime-ops-store.js';
 import { SqliteDb } from './store/sqlite-db.js';
 import {
   TaskConflictError,
@@ -72,6 +72,7 @@ export type {
   TaskPatchOptions,
   TaskStatus,
   Timer,
+  WechatQuoteRecord,
   UsageActor,
   UsageBucketView,
   UsageCostSource,
@@ -268,6 +269,19 @@ export class Store {
 
   deleteImChannel(id: string): boolean {
     return this.runtimeOps.deleteImChannel(id);
+  }
+
+  saveWechatQuoteRecord(record: WechatQuoteRecord): void {
+    this.runtimeOps.saveWechatQuoteRecord(record);
+  }
+
+  findWechatQuoteRecord(
+    channelId: string,
+    accountId: string | undefined,
+    conversationId: string,
+    messageId: string,
+  ): WechatQuoteRecord | undefined {
+    return this.runtimeOps.findWechatQuoteRecord(channelId, accountId, conversationId, messageId);
   }
 
   // --- Global Memories, Synapses & Hybrid Search ---

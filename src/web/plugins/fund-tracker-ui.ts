@@ -1,11 +1,15 @@
 import { button, element, isEditingWithin, kpiCard, node } from '../shared/dom.js';
 import { errorText, timestamp } from '../shared/format.js';
-import { api, appState, hooks } from '../state.js';
+import { api, appState } from '../state.js';
+
+export interface FundTrackerUiOptions {
+  isVisible: () => boolean;
+}
 
 export interface FundTrackerUiController {
-  openModal: () => void;
-  closeModal: () => void;
-  refreshTopBadge: () => Promise<void>;
+  activate: () => void;
+  deactivate: () => void;
+  refreshBadge: () => Promise<void>;
 }
 
 interface FundHoldingRow {
@@ -195,10 +199,8 @@ function getRowStatusBadge(row: FundHoldingRow): { text: string; cls: string } {
   return { text: '最近净值', cls: 'badge-slate' };
 }
 
-export function initFundTrackerUi(): FundTrackerUiController {
+export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiController {
   const fundTopBadge = element<HTMLElement>('fund-top-badge');
-  const fundHubBackdrop = element<HTMLElement>('fund-hub-backdrop');
-  const fundModalClose = element<HTMLButtonElement>('fund-modal-close');
   const fundPrivacyBtn = element<HTMLButtonElement>('fund-privacy-btn');
   const fundRefreshBtn = element<HTMLButtonElement>('fund-refresh-btn');
   const fundSettleBtn = element<HTMLButtonElement>('fund-settle-btn');
@@ -833,14 +835,14 @@ export function initFundTrackerUi(): FundTrackerUiController {
       dashboard = res.data;
       lastDataMode = opts.dataMode ?? (isRefresh ? (mode === 'settle' ? 'settle' : 'live') : 'cached');
       renderTopBadge();
-      if (!fundHubBackdrop.hidden) {
+      if (options.isVisible()) {
         renderModal();
         if (!opts.quiet) {
           setActionStatus(res.message || '数据已更新', 'ok');
         }
       }
     } catch (err) {
-      if (!opts.quiet && !fundHubBackdrop.hidden) {
+      if (!opts.quiet && options.isVisible()) {
         setActionStatus(`加载投资看板失败：${errorText(err)}`, 'err');
       }
     }
@@ -1022,31 +1024,28 @@ export function initFundTrackerUi(): FundTrackerUiController {
     }
   }
 
-  function openModal() {
-    hooks.closeAllHubModals();
+  function activate() {
     setActionStatus();
-    fundHubBackdrop.hidden = false;
     if (dashboard) {
       renderModal();
+      window.requestAnimationFrame(() => {
+        if (options.isVisible() && dashboard) renderTrendChart();
+      });
       void refreshDashboard({ refresh: true, mode: 'status', quiet: true, dataMode: 'live' });
       return;
     }
     void refreshDashboard({ refresh: false, quiet: true }).then(() => {
-      if (!fundHubBackdrop.hidden && !appState.authExpired) {
+      if (options.isVisible() && !appState.authExpired) {
         return refreshDashboard({ refresh: true, mode: 'status', quiet: true, dataMode: 'live' });
       }
       return undefined;
     });
   }
 
-  function closeModal() {
-    fundHubBackdrop.hidden = true;
+  function deactivate() {
+    deleteArmed.clear();
   }
 
-  fundModalClose.addEventListener('click', closeModal);
-  fundHubBackdrop.addEventListener('click', event => {
-    if (event.target === fundHubBackdrop) closeModal();
-  });
   fundPrivacyBtn.addEventListener('click', () => {
     privacyMode = !privacyMode;
     writePrivacyPref(privacyMode);
@@ -1109,19 +1108,19 @@ export function initFundTrackerUi(): FundTrackerUiController {
     }
   });
   window.addEventListener('resize', () => {
-    if (!fundHubBackdrop.hidden && dashboard) {
+    if (options.isVisible() && dashboard) {
       renderTrendChart();
     }
   });
   window.addEventListener('friday:themechange', () => {
-    if (!fundHubBackdrop.hidden) {
+    if (options.isVisible()) {
       renderTrendChart();
     }
   });
 
   return {
-    openModal,
-    closeModal,
-    refreshTopBadge: () => (appState.authExpired ? Promise.resolve() : refreshDashboard({ refresh: false, quiet: true })),
+    activate,
+    deactivate,
+    refreshBadge: () => (appState.authExpired ? Promise.resolve() : refreshDashboard({ refresh: false, quiet: true })),
   };
 }

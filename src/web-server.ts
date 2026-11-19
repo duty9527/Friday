@@ -567,9 +567,10 @@ export async function startWeb(options: StartWebOptions): Promise<{ url: string;
         const commands: Record<string, string> = {
           '/api/chat': 'chat', '/api/stop': 'stop', '/api/resume': 'resume', '/api/chat-stop': 'chat-stop',
           '/api/memory-save': 'memory-save', '/api/memory-link': 'memory-link', '/api/memory-pin': 'memory-pin', '/api/memory-remove': 'memory-remove',
-          '/api/timer-add': 'timer-add', '/api/timer-toggle': 'timer-toggle', '/api/timer-remove': 'timer-remove',
+          '/api/timer-add': 'timer-add', '/api/timer-toggle': 'timer-toggle', '/api/timer-complete': 'timer-complete', '/api/timer-remove': 'timer-remove',
           '/api/plugin-run': 'plugin-run',
           '/api/im-save': 'im-save', '/api/im-toggle': 'im-toggle', '/api/im-remove': 'im-remove', '/api/im-test': 'im-test',
+          '/api/im-allow-sender': 'im-allow-sender', '/api/im-dismiss-stranger': 'im-dismiss-stranger',
           '/api/im-wechat-qr-start': 'im-wechat-qr-start', '/api/im-wechat-qr-status': 'im-wechat-qr-status',
           '/api/im-telegram-quick': 'im-telegram-quick', '/api/im-telegram-sync': 'im-telegram-sync-commands',
           '/api/voice-remove': 'voice-remove', '/api/voice-clear': 'voice-clear', '/api/voice-config': 'voice-config',

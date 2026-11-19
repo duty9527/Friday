@@ -25,7 +25,7 @@ export interface AppHooks {
   selectTrace: (next: Selection, pin?: boolean) => void;
   loadTrace: (direction?: 'live' | 'earlier' | 'recent') => Promise<void>;
   loadWork: (id: string, generation: number, background?: boolean) => Promise<void>;
-  openPluginHubModal: (pluginName?: string, expandSource?: boolean) => void;
+  openPluginHubModal: (pluginName?: string, expandSource?: boolean, mode?: 'catalog' | 'surface') => void;
   closeAllHubModals: () => void;
 }
 

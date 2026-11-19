@@ -12,9 +12,13 @@ import { button, element, isEditingWithin, kpiCard, node, svgNode } from '../sha
 import { errorText, timestamp } from '../shared/format.js';
 import { api, appState, hooks } from '../state.js';
 
+export interface UsageHubOptions {
+  isVisible: () => boolean;
+  onBadgeChange?: (summary: { calls: number; badgeText: string; moneyText: string; detailText: string }) => void;
+}
+
 export interface UsageHubController {
-  openModal: () => void;
-  closeModal: () => void;
+  activate: () => void;
   render: (force?: boolean) => void;
 }
 
@@ -111,13 +115,10 @@ function localTodayDateString(): string {
   return `${y}-${m}-${d}`;
 }
 
-export function initUsageHub(): UsageHubController {
-  const openUsageHubTop = element<HTMLButtonElement>('open-usage-hub-top');
+export function initUsageHub(options: UsageHubOptions): UsageHubController {
   const usageTopBadge = element<HTMLElement>('usage-top-badge');
-  const usageHubBackdrop = element<HTMLElement>('usage-hub-backdrop');
-  const usageHubModal = element<HTMLElement>('usage-hub-modal');
+  const usagePanelEl = element<HTMLElement>('system-panel-usage');
   const usageRefreshBtn = element<HTMLButtonElement>('usage-refresh-btn');
-  const usageModalClose = element<HTMLButtonElement>('usage-modal-close');
 
   const granDayBtn = element<HTMLButtonElement>('usage-gran-day');
   const granWeekBtn = element<HTMLButtonElement>('usage-gran-week');
@@ -616,14 +617,25 @@ export function initUsageHub(): UsageHubController {
     const today = appState.view?.usageToday;
     if (!today || today.calls <= 0) {
       usageTopBadge.textContent = '0';
-      openUsageHubTop.title = '今日模型调用 0 次';
+      options.onBadgeChange?.({
+        calls: 0,
+        badgeText: '0',
+        moneyText: '',
+        detailText: '今日模型调用 0 次',
+      });
     } else {
       const primary = today.currency === 'USD' ? formatUsd(today.costUsd) : formatCny(today.costCny);
-      usageTopBadge.textContent = `${today.calls}次 · ${primary}`;
-      openUsageHubTop.title = `今日调用 ${today.calls} 次 · ${formatInt(today.totalTokens)} tokens · ${formatCny(today.costCny)} (${formatUsd(today.costUsd)})`;
+      const badgeText = `${today.calls}次 · ${primary}`;
+      usageTopBadge.textContent = badgeText;
+      options.onBadgeChange?.({
+        calls: today.calls,
+        badgeText,
+        moneyText: primary,
+        detailText: `今日调用 ${today.calls} 次 · ${formatInt(today.totalTokens)} tokens · ${formatCny(today.costCny)} (${formatUsd(today.costUsd)})`,
+      });
     }
 
-    if (usageHubBackdrop.hidden && !force) {
+    if (!options.isVisible() && !force) {
       return;
     }
 
@@ -636,24 +648,22 @@ export function initUsageHub(): UsageHubController {
     const isViewingToday = !anchorDate || anchorDate === todayStr;
     if (
       !force
-      && !usageHubBackdrop.hidden
+      && options.isVisible()
       && isViewingToday
       && !loading
       && !prefsBusy
       && !appState.authExpired
       && appState.ready
-      && !isEditingWithin(usageHubModal)
+      && !isEditingWithin(usagePanelEl)
     ) {
       void fetchReport(true);
     }
   }
 
-  function openModal() {
-    hooks.closeAllHubModals();
+  function activate() {
     granularity = 'day';
     anchorDate = undefined;
     setStatusError(undefined);
-    usageHubBackdrop.hidden = false;
     updateToolbarControls();
     const todayStr = appState.view?.usageToday?.date ?? localTodayDateString();
     if (report && report.granularity === 'day' && report.anchorDate === todayStr) {
@@ -664,15 +674,6 @@ export function initUsageHub(): UsageHubController {
     void fetchReport();
   }
 
-  function closeModal() {
-    usageHubBackdrop.hidden = true;
-  }
-
-  openUsageHubTop.addEventListener('click', openModal);
-  usageModalClose.addEventListener('click', closeModal);
-  usageHubBackdrop.addEventListener('click', event => {
-    if (event.target === usageHubBackdrop) closeModal();
-  });
   usageRefreshBtn.addEventListener('click', () => { void fetchReport(); });
 
   for (const [btn, nextGran] of [
@@ -720,8 +721,7 @@ export function initUsageHub(): UsageHubController {
   });
 
   return {
-    openModal,
-    closeModal,
+    activate,
     render,
   };
 }

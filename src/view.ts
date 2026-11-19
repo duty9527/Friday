@@ -216,13 +216,15 @@ export interface MessageOrigin {
   messageThreadId?: number;
 }
 export interface AttachmentView {
-  kind: 'image' | 'file';
+  kind: 'image' | 'file' | 'voice' | 'video';
   name: string;
   status: 'ready' | 'failed';
   path?: string;
   mimeType?: string;
   bytes?: number;
   error?: string;
+  transcript?: string;
+  durationSeconds?: number;
 }
 export interface ChatMessage {
   attachments?: AttachmentView[];
@@ -245,12 +247,23 @@ export interface PendingQuestion {
   askedAt: number;
 }
 export interface MessagePage { items: ChatMessage[]; hasMore: boolean; before?: number }
+export type InitiatorKind = 'person' | 'timer' | 'voice' | 'dream' | 'system';
+
+export interface RunInitiator {
+  kind: InitiatorKind;
+  id?: string;
+  label?: string;
+}
+
+export type TimerRunStatus = 'ok' | 'error' | 'goal_met' | 'fatigue_paused';
+
 export interface WorkView {
   id: string; prompt: string; status: string; mode: 'real' | 'offline'; createdAt: number;
   activeMs: number; limitMs: number; reason?: string; sessionId?: string; originMessageId?: string; parentTaskId?: string;
   cwd?: string; concurrentTaskIds?: string[]; profile?: WorkerProfile; workerModel?: string; modelTier?: ModelTier;
   thinkingLevel?: ThinkingLevel; decisionSource?: DecisionSource; skipQualityGate?: boolean; qualityGate?: QualityGateAssessment;
   pendingQuestion?: PendingQuestion;
+  initiator?: RunInitiator; timerId?: string;
 }
 export interface TimerView {
   id: string; name: string; instruction: string; intervalMs: number;
@@ -259,8 +272,24 @@ export interface TimerView {
   cwd?: string; enabled: boolean; createdAt: number;
   nextRunAt: number; lastRunAt?: number; activeTaskId?: string;
   pendingCatchup?: boolean; missedRuns: number;
+  goalCondition?: string; goalMetAt?: number; goalSummary?: string;
+  maxFailures?: number; consecutiveFailures?: number; fatiguePaused?: boolean;
+  lastRunStatus?: TimerRunStatus; lastError?: string; firstFailureNotified?: boolean;
 }
 export type ImPlatform = 'telegram' | 'dingtalk' | 'wechat' | 'xiaoai';
+export interface QuietHoursConfig {
+  enabled: boolean;
+  start: string;
+  end: string;
+}
+export interface RejectedStrangerView {
+  senderId: string;
+  senderName?: string;
+  lastText?: string;
+  count: number;
+  firstSeenAt: number;
+  lastSeenAt: number;
+}
 export interface ImChannelView {
   id: string;
   platform: ImPlatform;
@@ -275,6 +304,10 @@ export interface ImChannelView {
   defaultTarget?: string;
   allowedSenders: string[];
   apiBase?: string;
+  cdnBaseUrl?: string;
+  readLinks?: boolean;
+  quietHours?: QuietHoursConfig;
+  rejectedSenders?: RejectedStrangerView[];
   pollIntervalMs?: number;
   inboundCount: number;
   outboundCount: number;
@@ -292,10 +325,13 @@ export interface WechatQrLoginSession {
   qrcodeContent: string;
   qrSvgDataUrl: string;
   qrTerminal: string;
-  status: 'wait' | 'scaned' | 'confirmed' | 'expired' | 'error';
+  status: 'wait' | 'scaned' | 'verify_code' | 'confirmed' | 'expired' | 'binded_redirect' | 'error';
   accountId?: string;
   userId?: string;
   error?: string;
+  verifyRequired?: boolean;
+  refreshCount?: number;
+  alreadyConnected?: boolean;
   channel?: ImChannelView;
 }
 export interface TelegramQuickConnectView {

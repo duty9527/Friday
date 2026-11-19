@@ -257,6 +257,8 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
               pluginAction: command.pluginAction === undefined ? undefined : text(command.pluginAction, 'pluginAction', 64),
               deliverChannelId: command.deliverChannelId === undefined ? undefined : text(command.deliverChannelId, 'deliverChannelId', 128),
               deliverTarget: command.deliverTarget === undefined ? undefined : text(command.deliverTarget, 'deliverTarget', 128),
+              goalCondition: command.goalCondition === undefined ? undefined : text(command.goalCondition, 'goalCondition', 500),
+              maxFailures: command.maxFailures === undefined ? undefined : integer(command.maxFailures, 5, 1, 100),
             },
           );
           case 'timer-toggle': {
@@ -264,6 +266,10 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
             const enabled = command.enabled === undefined ? !store.getTimer(id).enabled : Boolean(command.enabled);
             return coordinator.toggleTimer(id, enabled);
           }
+          case 'timer-complete': return coordinator.completeTimer(
+            text(command.id, 'id', 128),
+            command.summary === undefined ? undefined : text(command.summary, 'summary', 1000),
+          );
           case 'timer-remove': return { removed: coordinator.removeTimer(text(command.id, 'id', 128)) };
           case 'plugin-list': return listPluginViews(home);
           case 'plugin-run': return await runPlugin(
@@ -312,6 +318,20 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
           case 'im-save': {
             const platform = text(command.platform, 'platform', 32);
             if (!['telegram', 'dingtalk', 'wechat', 'xiaoai'].includes(platform)) throw new Error('Invalid IM platform');
+            let quietHours: { enabled: boolean; start: string; end: string } | null | undefined;
+            if (command.quietHours === null) {
+              quietHours = null;
+            } else if (command.quietHours !== undefined) {
+              if (typeof command.quietHours !== 'object' || Array.isArray(command.quietHours)) {
+                throw new Error('quietHours must be an object');
+              }
+              const qh = command.quietHours as Record<string, unknown>;
+              quietHours = {
+                enabled: Boolean(qh.enabled),
+                start: typeof qh.start === 'string' ? qh.start : '23:00',
+                end: typeof qh.end === 'string' ? qh.end : '07:00',
+              };
+            }
             return coordinator.im.saveChannel({
               id: command.id === undefined ? undefined : text(command.id, 'id', 128),
               platform: platform as 'telegram' | 'dingtalk' | 'wechat' | 'xiaoai',
@@ -325,9 +345,20 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
               defaultTarget: command.defaultTarget === undefined ? undefined : String(command.defaultTarget),
               allowedSenders: Array.isArray(command.allowedSenders) ? command.allowedSenders.map(s => String(s)) : undefined,
               apiBase: command.apiBase === undefined ? undefined : String(command.apiBase),
+              cdnBaseUrl: command.cdnBaseUrl === undefined ? undefined : String(command.cdnBaseUrl),
+              readLinks: command.readLinks === undefined ? undefined : Boolean(command.readLinks),
+              ...(quietHours !== undefined ? { quietHours } : {}),
               pollIntervalMs: command.pollIntervalMs === undefined ? undefined : integer(command.pollIntervalMs, 1500, 100, 300_000),
             });
           }
+          case 'im-allow-sender': return coordinator.im.allowSender(
+            text(command.id, 'id', 128),
+            text(command.senderId, 'senderId', 256),
+          );
+          case 'im-dismiss-stranger': return coordinator.im.dismissRejectedSender(
+            text(command.id, 'id', 128),
+            command.senderId === undefined ? undefined : text(command.senderId, 'senderId', 256),
+          );
           case 'im-toggle': {
             const id = text(command.id, 'id', 128);
             const enabled = command.enabled === undefined ? !store.getImChannel(id).enabled : Boolean(command.enabled);
@@ -341,9 +372,11 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
             apiBase: command.apiBase === undefined ? undefined : String(command.apiBase),
             notifyAll: command.notifyAll === undefined ? undefined : Boolean(command.notifyAll),
             allowedSenders: Array.isArray(command.allowedSenders) ? command.allowedSenders.map(s => String(s)) : undefined,
+            newAccount: command.newAccount === undefined ? undefined : Boolean(command.newAccount),
           });
           case 'im-wechat-qr-status': return await coordinator.im.pollWechatQrLogin(
             text(command.sessionId, 'sessionId', 256),
+            command.verifyCode === undefined ? undefined : String(command.verifyCode).slice(0, 64),
           );
           case 'im-telegram-quick': {
             const botToken = text(command.botToken, 'botToken', 512).trim();
