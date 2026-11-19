@@ -214,6 +214,8 @@ export interface MessageOrigin {
   speakerId?: string; speakerName?: string; speakerRole?: 'owner' | 'member';
   replyToMessageId?: string; replyWebhook?: string; contextToken?: string;
   messageThreadId?: number;
+  /** Correlates a flat Telegram response with its source without quoting it. */
+  telegramFlatSourceId?: string;
 }
 export interface AttachmentView {
   kind: 'image' | 'file' | 'voice' | 'video';
@@ -303,6 +305,7 @@ export interface ImChannelView {
   webhookUrlMasked?: string;
   defaultTarget?: string;
   allowedSenders: string[];
+  telegramMentionExempt?: string[];
   apiBase?: string;
   cdnBaseUrl?: string;
   readLinks?: boolean;

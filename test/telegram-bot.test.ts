@@ -788,3 +788,83 @@ test('Telegram only routes authorized, explicitly addressed group messages, supp
     }
   });
 });
+
+test('Telegram mention exemptions send flat replies only for authorized, unaddressed messages in the configured chat/topic', async () => {
+  await withTempHome('friday-tg-mention-exempt-', async home => {
+    const mock = await startMockTelegramServer();
+    const coordinator = new Coordinator(home, offlineFactory(15));
+    await coordinator.ready();
+    try {
+      const { channel } = await coordinator.im.quickConnectTelegram({
+        botToken: '123456:TEST-BOT-TOKEN', apiBase: mock.baseUrl, defaultTarget: '9001',
+      });
+      const channelInput = { id: channel.id, platform: 'telegram', name: channel.name } as const;
+      assert.throws(() => coordinator.im.saveChannel({ ...channelInput, telegramMentionExempt: ['-100999:0'] }), /optional positive/);
+      const configured = coordinator.im.saveChannel({
+        ...channelInput, telegramMentionExempt: [' -100999:77 ', '-100999:77', '-100888'],
+      });
+      assert.deepEqual(configured.telegramMentionExempt, ['-100999:77', '-100888']);
+      assert.deepEqual(coordinator.im.saveChannel(channelInput).telegramMentionExempt, configured.telegramMentionExempt);
+
+      const from = { id: 9001 };
+      const chat = { id: -100999, type: 'supergroup', is_forum: true };
+      const msg = { chat, from, text: '请回复这条普通消息', message_thread_id: 77 };
+      mock.queuedUpdates.push(
+        { update_id: 1, message: { ...msg, message_id: 1 } },
+        { update_id: 2, message: { ...msg, message_id: 2, message_thread_id: 78 } },
+        { update_id: 3, message: { ...msg, message_id: 3, chat: { ...chat, id: -100777 } } },
+        { update_id: 4, message: { ...msg, message_id: 4, message_thread_id: undefined } },
+        { update_id: 5, message: { ...msg, message_id: 5, from: { id: 9002 } } },
+        { update_id: 6, message: { ...msg, message_id: 6, from: { ...from, is_bot: true } } },
+        { update_id: 7, message: { ...msg, message_id: 7, sender_chat: chat } },
+        { update_id: 8, message: { ...msg, message_id: 8, message_thread_id: '77' } },
+        { update_id: 9, message: { ...msg, message_id: 9, chat: { id: -100888, type: 'group' }, message_thread_id: undefined, text: '/id' } },
+        { update_id: 10, message: {
+          ...msg, message_id: 10, text: '@FridayTestBot 明确点名',
+          entities: [{ type: 'mention', offset: 0, length: '@FridayTestBot'.length }],
+        } },
+        { update_id: 11, message: {
+          ...msg, message_id: 11, text: '/id',
+          reply_to_message: { message_id: 700, from: { id: 777001, is_bot: true, username: 'FridayTestBot' } },
+        } },
+      );
+      await (coordinator.im as any).pollChannel(channel.id);
+      await until(() => coordinator.store.getImChannel(channel.id).pollOffset === 12);
+      await until(() => mock.sentMessages.length === 4);
+      assert.equal(coordinator.store.getImChannel(channel.id).inboundCount, 4);
+      const flat = mock.sentMessages.filter(m => !Object.hasOwn(m, 'reply_to_message_id') && !Object.hasOwn(m, 'reply_parameters'));
+      assert.deepEqual(flat.map(m => [m.chat_id, m.message_thread_id]).sort(), [['-100888', undefined], ['-100999', 77]]);
+      assert.deepEqual(mock.sentMessages.filter(m => !flat.includes(m)).map(m => [m.chat_id, m.reply_to_message_id, m.message_thread_id]).sort(), [
+        ['-100999', 10, 77],
+        ['-100999', 11, 77],
+      ]);
+      const turns = coordinator.store.conversation.history().items;
+      assert.ok(turns.some(m => m.role === 'user' && m.origin?.telegramFlatSourceId === '1' && !m.origin.replyToMessageId));
+      assert.ok(turns.some(m => m.role === 'user' && m.origin?.replyToMessageId === '10' && !m.origin.telegramFlatSourceId));
+
+      // The secret-checked webhook adapter uses the same ingest/reply path as polling.
+      const webhookResponse = await (coordinator.im as any).telegramAdapter.handleWebhook(
+        { ...coordinator.store.getImChannel(channel.id), secret: 'test-webhook-secret' },
+        'POST', new URLSearchParams(), { 'x-telegram-bot-api-secret-token': 'test-webhook-secret' },
+        JSON.stringify({ update_id: 12, message: { ...msg, message_id: 12, text: '/id' } }),
+      );
+      assert.equal(webhookResponse.status, 200);
+      assert.equal(JSON.parse(webhookResponse.body).action, 'command_id');
+      const webhookSend = mock.sentMessages.at(-1)!;
+      assert.equal(webhookSend.chat_id, '-100999');
+      assert.equal(webhookSend.message_thread_id, 77);
+      assert.equal(Object.hasOwn(webhookSend, 'reply_to_message_id'), false);
+      assert.equal(Object.hasOwn(webhookSend, 'reply_parameters'), false);
+
+      coordinator.im.saveChannel({ ...channelInput, telegramMentionExempt: [] });
+      mock.queuedUpdates.push({ update_id: 13, message: { ...msg, message_id: 13 } });
+      await (coordinator.im as any).pollChannel(channel.id);
+      await until(() => coordinator.store.getImChannel(channel.id).pollOffset === 14);
+      assert.equal(coordinator.store.getImChannel(channel.id).inboundCount, 5);
+      assert.equal(mock.sentMessages.length, 5);
+    } finally {
+      await coordinator.close();
+      await mock.close();
+    }
+  });
+});

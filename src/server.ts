@@ -318,6 +318,11 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
           case 'im-save': {
             const platform = text(command.platform, 'platform', 32);
             if (!['telegram', 'dingtalk', 'wechat', 'xiaoai'].includes(platform)) throw new Error('Invalid IM platform');
+            const telegramMentionExempt = command.telegramMentionExempt;
+            if (telegramMentionExempt !== undefined
+              && (!Array.isArray(telegramMentionExempt) || !telegramMentionExempt.every(rule => typeof rule === 'string'))) {
+              throw new Error('telegramMentionExempt must be a string array');
+            }
             let quietHours: { enabled: boolean; start: string; end: string } | null | undefined;
             if (command.quietHours === null) {
               quietHours = null;
@@ -344,6 +349,7 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
               secret: command.secret === undefined ? undefined : String(command.secret),
               defaultTarget: command.defaultTarget === undefined ? undefined : String(command.defaultTarget),
               allowedSenders: Array.isArray(command.allowedSenders) ? command.allowedSenders.map(s => String(s)) : undefined,
+              telegramMentionExempt,
               apiBase: command.apiBase === undefined ? undefined : String(command.apiBase),
               cdnBaseUrl: command.cdnBaseUrl === undefined ? undefined : String(command.cdnBaseUrl),
               readLinks: command.readLinks === undefined ? undefined : Boolean(command.readLinks),

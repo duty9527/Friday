@@ -725,7 +725,12 @@ export class Coordinator {
   private findMergeableChatRun(origin?: MessageOrigin): ChatRun | undefined {
     if (!origin?.channel || origin.channel === 'local' || origin.channel === 'xiaoai') return undefined;
     for (const run of this.chatRuns.values()) {
-      if (sameImSession(run.message.origin, origin) && !run.controller.signal.aborted && !run.settled && !run.hasSideEffectTool) {
+      // Keep flat replies separate from quoted replies and from flat replies in other topics.
+      const prior = run.message.origin;
+      if (origin.channel === 'telegram' && (origin.telegramFlatSourceId !== undefined || prior?.telegramFlatSourceId !== undefined)
+        && (origin.telegramFlatSourceId === undefined || prior?.telegramFlatSourceId === undefined
+          || origin.messageThreadId !== prior.messageThreadId)) continue;
+      if (sameImSession(prior, origin) && !run.controller.signal.aborted && !run.settled && !run.hasSideEffectTool) {
         return run;
       }
     }

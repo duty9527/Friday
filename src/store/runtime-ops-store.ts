@@ -47,6 +47,8 @@ export interface ImChannelConfig {
   secret?: string;
   defaultTarget?: string;
   allowedSenders: string[];
+  /** Telegram group chat IDs, optionally followed by `:messageThreadId`. */
+  telegramMentionExempt?: string[];
   apiBase?: string;
   cdnBaseUrl?: string;
   readLinks?: boolean;
@@ -190,6 +192,7 @@ export class RuntimeOpsStore {
       webhookUrlMasked,
       defaultTarget: channel.defaultTarget,
       allowedSenders: channel.allowedSenders,
+      ...(channel.telegramMentionExempt !== undefined ? { telegramMentionExempt: channel.telegramMentionExempt } : {}),
       apiBase: maskUrlCredentials(channel.apiBase),
       cdnBaseUrl: maskUrlCredentials(channel.cdnBaseUrl),
       readLinks: channel.readLinks,

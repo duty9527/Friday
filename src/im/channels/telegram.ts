@@ -613,10 +613,26 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
       const base = normalizeTelegramApiBase(channel.apiBase);
       const sendUrl = `${base}/bot${channel.botToken}/sendMessage`;
       const { text: cleanText, stickers } = splitTelegramTokens(text);
+      const groupTarget = options?.target && /^-\d+$/.test(options.target) ? options.target : undefined;
+      const sendMessage = async (payload: Record<string, unknown>) => {
+        const audit = groupTarget ? {
+          chatId: groupTarget,
+          messageId: payload.reply_to_message_id,
+          sourceMessageId: options?.telegramFlatSourceId,
+          threadId: payload.message_thread_id,
+          hasReplyParameters: 'reply_parameters' in payload || 'reply_to_message_id' in payload,
+        } : undefined;
+        try {
+          const replyMessageId = await this.postSendMessage(sendUrl, channel.botToken, payload);
+          if (audit) console.info('[telegram-group-send]', JSON.stringify({ ...audit, replyMessageId, action: 'accepted' }));
+        } catch (error) {
+          if (audit) console.warn('[telegram-group-send]', JSON.stringify({ ...audit, action: 'failed' }));
+          throw error;
+        }
+      };
 
       if (cleanText.trim().length > 0) {
         const chunks = splitTelegramText(cleanText, TELEGRAM_MAX_TEXT_LEN);
-        const groupTarget = options?.target && /^-\d+$/.test(options.target) ? options.target : undefined;
         for (let i = 0; i < chunks.length; i++) {
           const payload: Record<string, unknown> = {
             chat_id: options?.target,
@@ -629,27 +645,7 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
           if (i === chunks.length - 1 && options?.replyMarkup) {
             payload.reply_markup = options.replyMarkup;
           }
-          try {
-            await this.postSendMessage(sendUrl, channel.botToken, payload);
-            if (groupTarget) {
-              console.info('[telegram-group-send]', JSON.stringify({
-                chatId: groupTarget,
-                messageId: payload.reply_to_message_id,
-                threadId: options?.messageThreadId,
-                action: 'accepted',
-              }));
-            }
-          } catch (error) {
-            if (groupTarget) {
-              console.warn('[telegram-group-send]', JSON.stringify({
-                chatId: groupTarget,
-                messageId: payload.reply_to_message_id,
-                threadId: options?.messageThreadId,
-                action: 'failed',
-              }));
-            }
-            throw error;
-          }
+          await sendMessage(payload);
         }
       }
 
@@ -681,7 +677,7 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
           if (attachReplyMarkup) {
             fallbackPayload.reply_markup = attachReplyMarkup;
           }
-          await this.postSendMessage(sendUrl, channel.botToken, fallbackPayload);
+          await sendMessage(fallbackPayload);
         }
       }
       return;
@@ -702,6 +698,8 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
       const payload: Record<string, unknown> = {
         chat_id: options?.target,
         text: chunks[i],
+        ...(options?.telegramFlatSourceId !== undefined && options.messageThreadId !== undefined
+          ? { message_thread_id: options.messageThreadId } : {}),
       };
       if (i === 0 && options?.replyToMessageId && /^\d+$/.test(options.replyToMessageId)) {
         payload.reply_to_message_id = Number(options.replyToMessageId);
@@ -781,6 +779,7 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
     const chat = asTelegramObject((membership ?? msg)?.chat);
     const chatType = chat?.type;
     const isGroup = chatType === 'group' || chatType === 'supergroup';
+    let mentionExempt = false;
     const audit = (action: string) => console.info('[telegram-group-update]', JSON.stringify({
       transport,
       updateId: Number.isSafeInteger(update.update_id) ? update.update_id : undefined,
@@ -788,6 +787,7 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
       chatType,
       messageId: Number.isSafeInteger(msg?.message_id) ? msg?.message_id : undefined,
       threadId: Number.isSafeInteger(msg?.message_thread_id) ? msg?.message_thread_id : undefined,
+      mentionExempt: mentionExempt || undefined,
       action,
     }));
     if (membership) {
@@ -826,8 +826,16 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
             })
           : (channel.defaultTarget && !channel.defaultTarget.startsWith('-') && channel.defaultTarget === senderId)),
       );
+      if (senderAllowed && !addressed && typeof chat?.id === 'number' && Number.isSafeInteger(chat.id) && chat.id < 0
+        && Array.isArray(channel.telegramMentionExempt)) {
+        const chatId = String(chat.id);
+        const threadId = msg?.message_thread_id;
+        mentionExempt = channel.telegramMentionExempt.includes(chatId)
+          || (typeof threadId === 'number' && Number.isSafeInteger(threadId) && threadId > 0
+            && channel.telegramMentionExempt.includes(`${chatId}:${threadId}`));
+      }
       // Record relevant traffic, not every conversation seen with Group Privacy disabled.
-      if (!senderAllowed || !addressed) {
+      if (!senderAllowed || (!addressed && !mentionExempt)) {
         const reason = senderAllowed ? 'group_not_addressed' : 'group_sender_not_allowed';
         if (senderAllowed || addressed) audit(reason);
         return { ok: true, ignored: reason };
@@ -839,7 +847,7 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
       if (isGroup) audit('empty_message');
       return { ok: true, ignored: 'empty_message' };
     }
-    this.ctx.markTrustedTelegramInbound?.(inbound);
+    this.ctx.markTrustedTelegramInbound?.(inbound, mentionExempt);
     if (!isGroup) return this.ctx.ingestMessage(inbound);
     try {
       const outcome = await this.ctx.ingestMessage(inbound);
@@ -855,7 +863,7 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
     url: string,
     botToken: string | undefined,
     payload: Record<string, unknown>,
-  ): Promise<void> {
+  ): Promise<number | undefined> {
     let res: Response;
     try {
       res = await fetch(url, {
@@ -875,10 +883,11 @@ export class TelegramChannelAdapter implements ImChannelAdapter {
     const rawText = await res.text().catch(() => '');
     if (rawText) {
       try {
-        const data = JSON.parse(rawText) as { ok?: boolean; description?: string };
+        const data = JSON.parse(rawText) as { ok?: boolean; description?: string; result?: { message_id?: number } };
         if (data.ok === false) {
           throw new Error(`Telegram 发送失败: ${sanitizeImError(redactBotToken(data.description ?? 'API error', botToken), [botToken])}`);
         }
+        if (data.ok && Number.isSafeInteger(data.result?.message_id)) return data.result?.message_id;
       } catch (err) {
         if (err instanceof SyntaxError) return;
         throw err;

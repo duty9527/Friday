@@ -96,7 +96,7 @@ export class ImGateway {
 
   private trustedFileRequests = new WeakSet<ImInboundMessage>();
   private trustedMediaRequests = new WeakSet<ImInboundMessage>();
-  private trustedTelegramRequests = new WeakSet<ImInboundMessage>();
+  private trustedTelegramRequests = new WeakMap<ImInboundMessage, boolean>();
   private seenMessageVersions = new BoundedMap<string, number>(2_000);
   private outboundRetryQueue = new Map<string, { version: number; attempts: number; nextRetryAt: number }>();
   private pollTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -141,8 +141,8 @@ export class ImGateway {
         this.trustedFileRequests.add(inbound);
         this.trustedMediaRequests.add(inbound);
       },
-      markTrustedTelegramInbound: (inbound) => {
-        this.trustedTelegramRequests.add(inbound);
+      markTrustedTelegramInbound: (inbound, mentionExempt) => {
+        this.trustedTelegramRequests.set(inbound, mentionExempt);
       },
       scheduleChannelPoll: (channelId, delayMs) => this.scheduleChannelPoll(channelId, delayMs),
       runVoiceFastpath: (request) => tryPluginVoiceFastpath(this.homeDir, request, {
@@ -256,6 +256,7 @@ export class ImGateway {
     secret?: string;
     defaultTarget?: string;
     allowedSenders?: string[];
+    telegramMentionExempt?: string[];
     apiBase?: string;
     cdnBaseUrl?: string;
     readLinks?: boolean;
@@ -267,6 +268,17 @@ export class ImGateway {
     }
     const name = input.name.trim().slice(0, 120);
     if (!name) throw new Error('IM channel name must not be empty');
+    const mentionExempt = input.telegramMentionExempt?.map(rule => rule.trim());
+    if (mentionExempt !== undefined) {
+      if (input.platform !== 'telegram') throw new Error('telegramMentionExempt is only supported for Telegram');
+      for (const rule of mentionExempt) {
+        const match = /^(-[1-9]\d*)(?::([1-9]\d*))?$/.exec(rule);
+        if (!match || !Number.isSafeInteger(Number(match[1]))
+          || (match[2] !== undefined && !Number.isSafeInteger(Number(match[2])))) {
+          throw new Error('telegramMentionExempt must use negative chat IDs with an optional positive :threadId');
+        }
+      }
+    }
     const now = Date.now();
     let existing: ImChannelConfig | undefined;
     if (input.id) {
@@ -313,6 +325,9 @@ export class ImGateway {
       secret: input.secret !== undefined ? (input.secret.trim() || undefined) : existing?.secret,
       defaultTarget: input.defaultTarget !== undefined ? (input.defaultTarget.trim() || undefined) : existing?.defaultTarget,
       allowedSenders: nextAllowedSenders,
+      telegramMentionExempt: input.platform === 'telegram'
+        ? (mentionExempt === undefined ? existing?.telegramMentionExempt : [...new Set(mentionExempt)])
+        : undefined,
       apiBase: nextApiBase,
       ...(nextCdnBaseUrl !== undefined ? { cdnBaseUrl: nextCdnBaseUrl } : {}),
       ...(nextReadLinks !== undefined ? { readLinks: nextReadLinks } : {}),
@@ -683,9 +698,14 @@ export class ImGateway {
     this.coordinator.store.saveImChannel(channel);
 
     const rawText = inbound.text.trim();
+    const telegramMentionExempt = this.trustedTelegramRequests.get(inbound);
+    const trustedTelegram = this.trustedTelegramRequests.delete(inbound);
+    const replyIds = telegramGroup && telegramMentionExempt
+      ? { telegramFlatSourceId: inbound.externalId }
+      : { replyToMessageId: inbound.externalId };
     const replyOpts: ImSendOptions = {
       target: inbound.target ?? inbound.senderId,
-      replyToMessageId: inbound.externalId,
+      ...replyIds,
       replyWebhook: safeReplyWebhook,
       contextToken: inbound.contextToken,
       ...(inbound.messageThreadId !== undefined ? { messageThreadId: inbound.messageThreadId } : {}),
@@ -696,7 +716,6 @@ export class ImGateway {
       if (xiaoaiHandled) return xiaoaiHandled;
     }
 
-    const trustedTelegram = this.trustedTelegramRequests.delete(inbound);
     const parsedCmd = parseImSlashCommand(rawText);
     if (parsedCmd?.command === '/file') {
       if (channel.platform === 'telegram') {
@@ -755,7 +774,7 @@ export class ImGateway {
       conversationId: inbound.target ?? inbound.senderId,
       senderId: inbound.senderId,
       ...(inbound.speaker ? { speakerId: inbound.speaker.id, speakerName: inbound.speaker.name, speakerRole: inbound.speaker.role } : {}),
-      replyToMessageId: inbound.externalId,
+      ...replyIds,
       replyWebhook: safeReplyWebhook,
       contextToken: inbound.contextToken,
       ...(inbound.messageThreadId !== undefined ? { messageThreadId: inbound.messageThreadId } : {}),
@@ -1150,6 +1169,7 @@ export class ImGateway {
       await this.sendToChannel(ch.id, outboundText, {
         target: route.conversationId,
         replyToMessageId: route.replyToMessageId,
+        telegramFlatSourceId: route.telegramFlatSourceId,
         replyWebhook: route.replyWebhook,
         contextToken: route.contextToken,
         ...(route.messageThreadId !== undefined ? { messageThreadId: route.messageThreadId } : {}),

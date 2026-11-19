@@ -22,7 +22,7 @@ const help = `F.R.I.D.A.Y. (friday) — Local persistent personal AI assistant &
   timer list | add [--name NAME] [--every-ms 60000] [--delay-ms MS] [--daily-at HH:MM] [--once] [--until CONDITION] [--max-failures 5] [--plugin NAME] [--action ACTION] [--channel ID] [--target TARGET] [--cwd DIR] ["instruction"] | toggle ID [--enabled|--no-enabled] | complete ID [--summary TEXT] | remove ID
   plugin list | run NAME [ACTION] [--args JSON]
   memory list | search [--scope all|memories|works|messages] [--cwd DIR] "query" | save --topic TOPIC [--tag TAG ...] [--link ID ...] [--pinned] [--cwd DIR] "content" | link ID TARGET_ID | pin ID [--unpin] | remove ID
-  im list | login [CHANNEL_ID] [--name NAME] [--api-base URL] [--no-wait] | add --platform telegram|dingtalk|wechat|xiaoai --name NAME [--bot-token TOKEN] [--account-id ID] [--webhook-url URL] [--secret SECRET] [--target CHAT_ID] [--allow SENDER ...] [--api-base URL] [--every-ms MS] | toggle ID [--enabled|--no-enabled] | test ID ["message"] | remove ID | voice ...
+  im list | login [CHANNEL_ID] [--name NAME] [--api-base URL] [--no-wait] | add --platform telegram|dingtalk|wechat|xiaoai --name NAME [--bot-token TOKEN] [--account-id ID] [--webhook-url URL] [--secret SECRET] [--target CHAT_ID] [--allow SENDER ...] [--telegram-mention-exempt=CHAT_ID[:THREAD_ID] ...] [--api-base URL] [--every-ms MS] | toggle ID [--enabled|--no-enabled] | test ID ["message"] | remove ID | voice ...
   voice status | list | model | enroll [NAME] [--role owner|member] [--append] [--channel ID] [--target ID] [--no-wait] | remove NAME_OR_ID | clear | enable | disable | config [--threshold N] [--wake-precheck|--no-wake-precheck] | rename TARGET NEW_NAME | role TARGET owner|member
   model list | probe [PROVIDER/]MODEL ["prompt"] | set [--provider PROVIDER] [--router MODEL] [--router-provider PROVIDER] [--worker-provider PROVIDER] [--fast MODEL] [--balanced MODEL] [--strong MODEL] [--base-url URL] [--api-key KEY]
   brief            FRIDAY holographic situation report (health, active works, memory cortex, timers, IM channels)
@@ -88,6 +88,7 @@ async function main() {
       link: { type: 'string', multiple: true }, pinned: { type: 'boolean' }, unpin: { type: 'boolean' },
       platform: { type: 'string' }, 'bot-token': { type: 'string' }, 'account-id': { type: 'string' }, 'webhook-url': { type: 'string' },
       secret: { type: 'string' }, target: { type: 'string' }, allow: { type: 'string', multiple: true }, 'api-base': { type: 'string' },
+      'telegram-mention-exempt': { type: 'string', multiple: true },
       router: { type: 'string' }, provider: { type: 'string' },
       'router-provider': { type: 'string' }, 'worker-provider': { type: 'string' }, 'base-url': { type: 'string' },
       fast: { type: 'string' }, balanced: { type: 'string' }, strong: { type: 'string' }, 'api-key': { type: 'string' },
@@ -377,6 +378,8 @@ async function main() {
         secret: values.secret,
         defaultTarget: values.target,
         allowedSenders: values.allow,
+        telegramMentionExempt: values['telegram-mention-exempt']?.length === 1 && values['telegram-mention-exempt'][0] === ''
+          ? [] : values['telegram-mention-exempt'],
         apiBase: values['api-base'],
         pollIntervalMs: number(values['every-ms']),
         enabled: values.enabled ?? true,

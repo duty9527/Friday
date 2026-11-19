@@ -101,6 +101,8 @@ export interface ImWebhookResponse {
 export interface ImSendOptions {
   target?: string;
   replyToMessageId?: string;
+  /** Correlates a flat Telegram response with its source without quoting it. */
+  telegramFlatSourceId?: string;
   replyWebhook?: string;
   contextToken?: string;
   waitForCompletion?: boolean;
@@ -145,7 +147,7 @@ export interface ImGatewayContext {
   sendToChannel(channelId: string, text: string, options?: ImSendOptions): Promise<void>;
   ingestMessage(inbound: ImInboundMessage): Promise<{ ok: boolean; action: string; messageId?: string; reason?: string }>;
   markTrustedWechatInbound(inbound: ImInboundMessage): void;
-  markTrustedTelegramInbound?(inbound: ImInboundMessage): void;
+  markTrustedTelegramInbound?(inbound: ImInboundMessage, mentionExempt: boolean): void;
   scheduleChannelPoll(channelId: string, delayMs: number): void;
   runVoiceFastpath(request: VoiceFastpathRequest): Promise<VoiceFastpathResult | undefined>;
 }
