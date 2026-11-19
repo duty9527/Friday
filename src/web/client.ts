@@ -7,6 +7,7 @@ import {
 import { createSharedSseHub, type SseUpdateBatch } from './shared/sse-hub.js';
 import { element, node } from './shared/dom.js';
 import { errorText } from './shared/format.js';
+import { bindThemeButtons, initDesktopDrawers } from './shared/theme.js';
 import { initChatPanel } from './panels/chat.js';
 import { initTracePanel } from './panels/trace.js';
 import { initMemoryHub } from './hubs/memory-hub.js';
@@ -14,13 +15,15 @@ import { initTimerPluginHub } from './hubs/timer-plugin-hub.js';
 import { initImVoiceHub } from './hubs/im-voice-hub.js';
 import { initModelHub } from './hubs/model-hub.js';
 import { initUsageHub } from './hubs/usage-hub.js';
+import type { FundTrackerUiController } from './plugins/fund-tracker-ui.js';
 import type { HealthScaleUiController } from './plugins/health-scale-ui.js';
 import { api, appState, fetchMessagesBatch, hooks, request } from './state.js';
 
+const connectionBannerEl = element('connection-banner');
 const connectionEl = element('connection');
 const reconnectBtn = element<HTMLButtonElement>('reconnect');
-const modeEl = element('mode');
 const openHealthHubTop = element<HTMLButtonElement>('open-health-hub-top');
+const openFundHubTop = element<HTMLButtonElement>('open-fund-hub-top');
 const memoryHubBackdrop = element<HTMLElement>('memory-hub-backdrop');
 const timerHubBackdrop = element<HTMLElement>('timer-hub-backdrop');
 const pluginHubBackdrop = element<HTMLElement>('plugin-hub-backdrop');
@@ -28,9 +31,20 @@ const imHubBackdrop = element<HTMLElement>('im-hub-backdrop');
 const modelHubBackdrop = element<HTMLElement>('model-hub-backdrop');
 const usageHubBackdrop = element<HTMLElement>('usage-hub-backdrop');
 const healthHubBackdrop = element<HTMLElement>('health-hub-backdrop');
+const fundHubBackdrop = element<HTMLElement>('fund-hub-backdrop');
 const messagesEl = element('messages');
 const worksEl = element('works');
 const companionEl = element('companion-avatar');
+const themeSpatialBtn = element<HTMLButtonElement>('theme-spatial-btn');
+const themeIndustrialBtn = element<HTMLButtonElement>('theme-industrial-btn');
+const desktopWorkFoldBtn = element<HTMLButtonElement>('desktop-work-fold');
+const desktopTraceFoldBtn = element<HTMLButtonElement>('desktop-trace-fold');
+
+bindThemeButtons(themeSpatialBtn, themeIndustrialBtn);
+initDesktopDrawers({
+  leftBtn: desktopWorkFoldBtn,
+  rightBtn: desktopTraceFoldBtn,
+});
 
 const companionAvatar = createLiveBotAvatar({
   size: 38,
@@ -132,6 +146,13 @@ const usageHub = initUsageHub();
 
 let healthScaleUi: HealthScaleUiController | undefined;
 let healthScaleLoadPromise: Promise<HealthScaleUiController> | undefined;
+let healthBadgeSynced = false;
+let lastHealthCheckSeq = 0;
+
+let fundTrackerUi: FundTrackerUiController | undefined;
+let fundTrackerLoadPromise: Promise<FundTrackerUiController> | undefined;
+let fundBadgeSynced = false;
+let lastFundCheckSeq = 0;
 
 async function loadHealthScaleUi(): Promise<HealthScaleUiController> {
   if (healthScaleUi) return healthScaleUi;
@@ -149,14 +170,31 @@ async function loadHealthScaleUi(): Promise<HealthScaleUiController> {
   return healthScaleLoadPromise;
 }
 
+async function loadFundTrackerUi(): Promise<FundTrackerUiController> {
+  if (fundTrackerUi) return fundTrackerUi;
+  if (!fundTrackerLoadPromise) {
+    fundTrackerLoadPromise = import('./plugins/fund-tracker-ui.js')
+      .then(mod => {
+        fundTrackerUi = mod.initFundTrackerUi();
+        return fundTrackerUi;
+      })
+      .catch(error => {
+        fundTrackerLoadPromise = undefined;
+        throw error;
+      });
+  }
+  return fundTrackerLoadPromise;
+}
+
 function connection(text: string, stale = false): void {
   if (appState.authExpired) {
     text = '访问链接已失效。请从当前服务的本地启动链接重新进入（服务重启后需使用新链接）。';
     stale = true;
   }
   staleConnection = stale;
-  connectionEl.textContent = text;
-  connectionEl.parentElement?.classList.toggle('stale', stale);
+  connectionBannerEl.hidden = !stale;
+  connectionBannerEl.classList.toggle('stale', stale);
+  connectionEl.textContent = stale ? text : '';
   syncCompanionState();
 }
 
@@ -169,6 +207,8 @@ function closeAllHubModals(): void {
   usageHub.closeModal();
   healthScaleUi?.closeModal();
   healthHubBackdrop.hidden = true;
+  fundTrackerUi?.closeModal();
+  fundHubBackdrop.hidden = true;
 }
 
 function expireAuthentication(): void {
@@ -179,6 +219,7 @@ function expireAuthentication(): void {
   if (appState.refreshTimer) { clearTimeout(appState.refreshTimer); appState.refreshTimer = undefined; }
   imVoiceHub.stopWechatQrPoll();
   healthScaleUi?.closeModal();
+  fundTrackerUi?.closeModal();
   connection('访问链接已失效。请从当前服务的本地启动链接重新进入（服务重启后需使用新链接）。', true);
   reconnectBtn.disabled = true;
   chatPanel.updateComposer();
@@ -242,6 +283,10 @@ async function refreshView(initial = false): Promise<void> {
         appState.historyBefore = result.messages.before;
         appState.historyHasMore = result.messages.hasMore;
         appState.cursor = result.cursor;
+        healthBadgeSynced = false;
+        lastHealthCheckSeq = 0;
+        fundBadgeSynced = false;
+        lastFundCheckSeq = 0;
         sseHub.setCursor(result.cursor);
       }
       for (const work of result.works) {
@@ -263,8 +308,6 @@ async function refreshView(initial = false): Promise<void> {
         appState.cursor = result.cursor;
         sseHub.setCursor(result.cursor);
       }
-      modeEl.textContent = result.mode === 'offline' ? '离线模拟' : '真实模式';
-      modeEl.classList.toggle('offline', result.mode === 'offline');
       chatPanel.renderMessages();
       tracePanel.renderWorks();
       memoryHub.render();
@@ -276,9 +319,46 @@ async function refreshView(initial = false): Promise<void> {
       const healthPlugin = appState.view?.plugins?.find(p => p.name === 'health-scale');
       const healthEnabled = healthPlugin ? healthPlugin.enabled !== false : false;
       openHealthHubTop.hidden = !healthEnabled;
-      if (!healthEnabled && !healthHubBackdrop.hidden) {
-        healthScaleUi?.closeModal();
-        healthHubBackdrop.hidden = true;
+      if (!healthEnabled) {
+        healthBadgeSynced = false;
+        if (!healthHubBackdrop.hidden) {
+          healthScaleUi?.closeModal();
+          healthHubBackdrop.hidden = true;
+        }
+      } else {
+        const maxSeq = result.messages.items.reduce((acc, m) => Math.max(acc, m.seq), lastHealthCheckSeq);
+        const hasHealthMsg = maxSeq > lastHealthCheckSeq && result.messages.items.some(
+          m => m.seq > lastHealthCheckSeq && /体重|体脂|上秤|称重|health-scale/.test(m.text),
+        );
+        lastHealthCheckSeq = maxSeq;
+        if ((initial || cursorReset || !healthBadgeSynced || hasHealthMsg) && !appState.authExpired) {
+          healthBadgeSynced = true;
+          void loadHealthScaleUi()
+            .then(ctrl => ctrl.refreshTopBadge())
+            .catch(() => { healthBadgeSynced = false; });
+        }
+      }
+      const fundPlugin = appState.view?.plugins?.find(p => p.name === 'fund-tracker');
+      const fundEnabled = fundPlugin ? fundPlugin.enabled !== false : false;
+      openFundHubTop.hidden = !fundEnabled;
+      if (!fundEnabled) {
+        fundBadgeSynced = false;
+        if (!fundHubBackdrop.hidden) {
+          fundTrackerUi?.closeModal();
+          fundHubBackdrop.hidden = true;
+        }
+      } else {
+        const maxFundSeq = result.messages.items.reduce((acc, m) => Math.max(acc, m.seq), lastFundCheckSeq);
+        const hasFundMsg = maxFundSeq > lastFundCheckSeq && result.messages.items.some(
+          m => m.seq > lastFundCheckSeq && /持仓晚间结算|持仓午间估值|持仓总览|fund-tracker/.test(m.text),
+        );
+        lastFundCheckSeq = maxFundSeq;
+        if ((initial || cursorReset || !fundBadgeSynced || hasFundMsg) && !appState.authExpired) {
+          fundBadgeSynced = true;
+          void loadFundTrackerUi()
+            .then(ctrl => ctrl.refreshTopBadge())
+            .catch(() => { fundBadgeSynced = false; });
+        }
       }
       chatPanel.updateComposer();
       followLatestMessage();
@@ -370,7 +450,9 @@ const sseHub = createSharedSseHub({
   },
 });
 
-window.addEventListener('pagehide', () => { sseHub.stop(); });
+window.addEventListener('pagehide', () => {
+  sseHub.stop();
+});
 
 let sseStarted = false;
 
@@ -422,7 +504,24 @@ openHealthHubTop.addEventListener('click', () => {
     .finally(() => { openHealthHubTop.disabled = false; });
 });
 
-const modalBackdrops = [memoryHubBackdrop, timerHubBackdrop, pluginHubBackdrop, imHubBackdrop, modelHubBackdrop, usageHubBackdrop, healthHubBackdrop];
+openFundHubTop.addEventListener('click', () => {
+  openFundHubTop.disabled = true;
+  void loadFundTrackerUi()
+    .then(ctrl => ctrl.openModal())
+    .catch(error => connection(`加载投资管理看板模块失败：${errorText(error)}`, true))
+    .finally(() => { openFundHubTop.disabled = false; });
+});
+
+const modalBackdrops = [
+  memoryHubBackdrop,
+  timerHubBackdrop,
+  pluginHubBackdrop,
+  imHubBackdrop,
+  modelHubBackdrop,
+  usageHubBackdrop,
+  healthHubBackdrop,
+  fundHubBackdrop,
+];
 document.addEventListener('keydown', event => {
   if (event.key !== 'Escape') return;
   if (memoryHub.isImmersive()) {

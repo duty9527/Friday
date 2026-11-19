@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { mergeMessages, orderConversation, routeLabel, routeState, spanDuration, spanNodes, spanTree, usageSummary } from '../src/web/model.js';
 import { layoutBrainGraph } from '../src/web/brain.js';
 import { buildOverviewFlowchart, buildSessionFlowchart, type MindmapSession, type MindmapTaskFlow } from '../src/web/mindmap-data.js';
-import { consumeSseStream, isValidAccessToken, LEGACY_TOKEN_STORAGE_KEY, resolveBootstrapToken, TOKEN_STORAGE_KEY } from '../src/web/shared/auth-http.js';
+import { consumeSseStream, createHttpClient, hasOpenAuthCookie, isValidAccessToken, LEGACY_TOKEN_STORAGE_KEY, OPEN_AUTH_SENTINEL_TOKEN, resolveBootstrapToken, TOKEN_STORAGE_KEY } from '../src/web/shared/auth-http.js';
+import { makeRequestId } from '../src/web/shared/format.js';
 import { computePoseFrame, deriveFridayBotState, renderBotStaticSvgString } from '../src/web/shared/bot-avatar.js';
 import {
   BOT_EXPRESSIONS,
@@ -415,4 +416,93 @@ test('bot avatar 3D projection, static SVG rendering, state derivation, and inli
     text: '搞定啦',
     stickers: [],
   });
+});
+
+test('auth-http open-auth cookie enables tokenless bootstrap without polluting sessionStorage and keeps #token precedence', async () => {
+  const store = new Map<string, string>();
+  const origLocation = Object.getOwnPropertyDescriptor(globalThis, 'location');
+  const origHistory = Object.getOwnPropertyDescriptor(globalThis, 'history');
+  const origStorage = Object.getOwnPropertyDescriptor(globalThis, 'sessionStorage');
+  const origDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  const origFetch = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
+
+  const storageMock = {
+    getItem: (key: string) => store.get(key) ?? null,
+    setItem: (key: string, value: string) => { store.set(key, value); },
+    removeItem: (key: string) => { store.delete(key); },
+  };
+  const calls: Array<{ url: string; headers: Headers }> = [];
+  try {
+    Object.defineProperty(globalThis, 'location', {
+      configurable: true,
+      value: { hash: '', pathname: '/', search: '' },
+    });
+    Object.defineProperty(globalThis, 'history', {
+      configurable: true,
+      value: { replaceState: () => {} },
+    });
+    Object.defineProperty(globalThis, 'sessionStorage', { configurable: true, value: storageMock });
+    Object.defineProperty(globalThis, 'document', {
+      configurable: true,
+      value: { cookie: 'foo=1; friday_auth_mode=none' },
+    });
+    Object.defineProperty(globalThis, 'fetch', {
+      configurable: true,
+      value: async (url: string | URL, init?: RequestInit) => {
+        calls.push({ url: String(url), headers: new Headers(init?.headers) });
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+    });
+
+    assert.equal(hasOpenAuthCookie(), true);
+    const openState = resolveBootstrapToken();
+    assert.equal(openState.token, OPEN_AUTH_SENTINEL_TOKEN);
+    assert.equal(store.has(TOKEN_STORAGE_KEY), false);
+
+    const openClient = createHttpClient({ token: openState.token });
+    await openClient.api('/api/view');
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.headers.has('authorization'), false);
+
+    const realToken = 'b'.repeat(64);
+    Object.defineProperty(globalThis, 'location', {
+      configurable: true,
+      value: { hash: `#token=${realToken}`, pathname: '/', search: '' },
+    });
+    const explicitState = resolveBootstrapToken();
+    assert.equal(explicitState.token, realToken);
+    assert.equal(store.get(TOKEN_STORAGE_KEY), realToken);
+
+    const explicitClient = createHttpClient({ token: explicitState.token });
+    await explicitClient.api('/api/chat', { text: 'hi' });
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1]!.headers.get('authorization'), `Bearer ${realToken}`);
+    assert.equal(calls[1]!.headers.get('content-type'), 'application/json');
+  } finally {
+    const restore = (name: string, desc: PropertyDescriptor | undefined) => {
+      if (desc) Object.defineProperty(globalThis, name, desc);
+      else delete (globalThis as Record<string, unknown>)[name];
+    };
+    restore('location', origLocation);
+    restore('history', origHistory);
+    restore('sessionStorage', origStorage);
+    restore('document', origDocument);
+    restore('fetch', origFetch);
+  }
+});
+
+test('makeRequestId falls back to crypto.getRandomValues and non-crypto IDs in non-secure HTTP contexts', () => {
+  const uuidFromRandomValues = makeRequestId({
+    getRandomValues: arr => {
+      for (let i = 0; i < arr.length; i++) arr[i] = (i * 17 + 3) & 0xff;
+      return arr;
+    },
+  });
+  assert.match(uuidFromRandomValues, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+
+  const fallbackA = makeRequestId(undefined);
+  const fallbackB = makeRequestId({});
+  assert.ok(fallbackA.length > 8 && fallbackA.length <= 128);
+  assert.ok(fallbackB.length > 8 && fallbackB.length <= 128);
+  assert.notEqual(fallbackA, fallbackB);
 });

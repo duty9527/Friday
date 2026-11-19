@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="spatial">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
   <title>F.R.I.D.A.Y. · 持续对话</title>
   <link rel="icon" type="image/png" href="/logo.png">
   <link rel="stylesheet" href="/style.css">
@@ -13,48 +13,69 @@
   <header class="topbar">
     <div class="brand"><span class="brand-logo" aria-hidden="true"></span> F.R.I.D.A.Y.</div>
     <button id="work-toggle" class="fold-control" type="button" aria-expanded="false" aria-controls="work-sidebar">任务列表</button>
+    <button id="desktop-work-fold" class="desktop-fold-btn" type="button" aria-pressed="false" title="收起或展开左侧任务列表">◧ 任务舱</button>
     <div class="topbar-hub-bar" role="toolbar" aria-label="系统功能中心">
       <button id="open-memory-hub-top" class="hub-pill-btn memory-amber-pill" type="button">
+        <span class="te-key-prefix" aria-hidden="true">M1</span>
         <span class="amber-core-dot" aria-hidden="true"></span>
         <span>全息记忆</span>
         <span id="memory-top-badge" class="hub-pill-badge">0</span>
       </button>
       <button id="open-timer-hub-top" class="hub-pill-btn" type="button">
-        <span class="hub-pill-icon" aria-hidden="true">⏱️</span>
+        <span class="te-key-prefix" aria-hidden="true">M2</span>
+        <span class="hub-pill-icon" aria-hidden="true"><svg class="hub-svg-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5"/><path d="M9 2h6"/><path d="M12 2v3"/></svg></span>
         <span>定时巡检</span>
         <span id="timer-top-badge" class="hub-pill-badge">0</span>
       </button>
       <button id="open-plugin-hub-top" class="hub-pill-btn" type="button">
-        <span class="hub-pill-icon" aria-hidden="true">🔌</span>
+        <span class="te-key-prefix" aria-hidden="true">M3</span>
+        <span class="hub-pill-icon" aria-hidden="true"><svg class="hub-svg-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/></svg></span>
         <span>功能插件</span>
         <span id="plugin-top-badge" class="hub-pill-badge">0</span>
       </button>
       <button id="open-im-hub-top" class="hub-pill-btn" type="button">
-        <span class="hub-pill-icon" aria-hidden="true">📱</span>
+        <span class="te-key-prefix" aria-hidden="true">M4</span>
+        <span class="hub-pill-icon" aria-hidden="true"><svg class="hub-svg-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2" width="12" height="20" rx="2.5"/><path d="M10 18h4"/></svg></span>
         <span>IM 接入</span>
         <span id="im-top-badge" class="hub-pill-badge">0</span>
       </button>
       <button id="open-model-hub-top" class="hub-pill-btn" type="button">
-        <span class="hub-pill-icon" aria-hidden="true">⚙️</span>
+        <span class="te-key-prefix" aria-hidden="true">M5</span>
+        <span class="hub-pill-icon" aria-hidden="true"><svg class="hub-svg-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg></span>
         <span>模型与提供方</span>
         <span id="model-top-badge" class="hub-pill-badge">—</span>
       </button>
       <button id="open-usage-hub-top" class="hub-pill-btn" type="button">
-        <span class="hub-pill-icon" aria-hidden="true">📊</span>
+        <span class="te-key-prefix" aria-hidden="true">M6</span>
+        <span class="hub-pill-icon" aria-hidden="true"><svg class="hub-svg-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg></span>
         <span>模型用量</span>
         <span id="usage-top-badge" class="hub-pill-badge">0</span>
       </button>
       <button id="open-health-hub-top" class="hub-pill-btn health-pill-btn" type="button">
-        <span class="hub-pill-icon" aria-hidden="true">❤️</span>
+        <span class="te-key-prefix" aria-hidden="true">M7</span>
+        <span class="hub-pill-icon" aria-hidden="true"><svg class="hub-svg-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/></svg></span>
         <span>健康管理</span>
         <span id="health-top-badge" class="hub-pill-badge">—</span>
       </button>
+      <button id="open-fund-hub-top" class="hub-pill-btn fund-pill-btn" type="button">
+        <span class="te-key-prefix" aria-hidden="true">M8</span>
+        <span class="hub-pill-icon" aria-hidden="true"><svg class="hub-svg-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m22 7-8.5 8.5-5-5L2 17"/><path d="M16 7h6v6"/></svg></span>
+        <span>投资管理</span>
+        <span id="fund-top-badge" class="hub-pill-badge">—</span>
+      </button>
       <a id="open-mindmap-top" class="hub-pill-btn mindmap-pill-link" href="/mindmap">
-        <span class="hub-pill-icon" aria-hidden="true">🧭</span>
+        <span class="te-key-prefix" aria-hidden="true">M9</span>
+        <span class="hub-pill-icon" aria-hidden="true"><svg class="hub-svg-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"/></svg></span>
         <span>思考流程图</span>
       </a>
     </div>
-    <span id="mode" class="mode meta">正在连接</span>
+    <div class="topbar-right-controls">
+      <div id="theme-switcher" class="theme-switcher" role="group" aria-label="界面视觉风格切换">
+        <button id="theme-spatial-btn" class="theme-switch-btn active" type="button" aria-pressed="true" title="Fey × visionOS 深空流光空间玻璃">✦ 流光玻璃</button>
+        <button id="theme-industrial-btn" class="theme-switch-btn" type="button" aria-pressed="false" title="Teenage Engineering × Nothing 精密机械点阵">▣ 机械点阵</button>
+      </div>
+      <button id="desktop-trace-fold" class="desktop-fold-btn" type="button" aria-pressed="false" title="收起或展开右侧执行链路">执行链路 ◨</button>
+    </div>
   </header>
   <div class="app">
     <aside id="work-sidebar" class="sidebar" aria-label="任务列表">
@@ -63,48 +84,54 @@
       <div id="works" class="works"><p class="empty">正在读取任务…</p></div>
     </aside>
     <main class="sheet">
-      <div class="titlebar">
-        <div class="titlebar-brand">
-          <span id="companion-avatar" class="companion-avatar" role="button" tabindex="0" aria-label="F.R.I.D.A.Y. 动态头像（点击互动）" title="点击与 F.R.I.D.A.Y. 互动"></span>
-          <h1>与 F.R.I.D.A.Y. 对话</h1>
-        </div>
-        <button id="stop-work" type="button" disabled>停止选中任务</button>
-      </div>
-      <div class="connection-bar" role="status" aria-live="polite"><span id="connection">正在连接…</span><button id="reconnect" type="button">重新连接</button></div>
-      <div class="panel-nav" aria-label="面板导航"><button id="show-chat" type="button" aria-pressed="true">主对话</button><button id="show-trace" type="button" aria-pressed="false">执行轨迹</button></div>
+      <div class="panel-nav" aria-label="面板导航"><button id="show-chat" type="button" aria-pressed="true">主对话</button><button id="show-trace" type="button" aria-pressed="false">执行链路</button></div>
       <div id="panels" class="panels">
         <section class="conversation" aria-label="主对话">
+          <div class="conv-dock">
+            <span id="companion-avatar" class="companion-avatar" role="button" tabindex="0" aria-label="F.R.I.D.A.Y. 动态头像（点击互动）" title="点击与 F.R.I.D.A.Y. 互动"></span>
+            <div id="connection-banner" class="connection-bar" role="status" aria-live="polite" hidden><span id="connection"></span><button id="reconnect" class="mini-button" type="button">重新连接</button></div>
+          </div>
           <div id="messages-scroll" class="messages-scroll" tabindex="0" aria-label="消息记录">
             <button id="older" class="older" type="button" hidden>加载更早消息</button>
             <div id="history-error" class="error" role="status"></div>
             <div id="messages"><p class="empty">正在读取对话…</p></div>
           </div>
           <form id="composer" class="composer">
-            <textarea id="draft" rows="3" maxlength="16384" placeholder="输入指令或问题…" aria-label="消息输入" disabled></textarea>
-            <details id="paths-disclosure" class="paths-disclosure"><summary>工作路径（可选）</summary><label for="paths">文件或文件夹绝对路径（每行一个）</label><textarea id="paths" rows="2" spellcheck="false" placeholder="/Users/用户名/项目/README.md" disabled></textarea></details>
-            <p id="send-error" class="error" role="alert"></p>
+            <p id="send-error" class="error composer-error" role="alert"></p>
             <div id="bot-emote-tray" class="bot-emote-tray" hidden role="group" aria-label="插入 F.R.I.D.A.Y. 小表情"></div>
-            <div class="composer-bottom">
-              <div class="composer-meta-group">
-                <button id="emote-toggle" class="emote-toggle-btn" type="button" aria-expanded="false" aria-controls="bot-emote-tray" disabled>小表情 ▾</button>
-                <span class="meta">Enter 发送 · Shift + Enter 换行</span>
-              </div>
-              <button id="send" class="primary" type="submit" disabled>发送 ↑</button>
+            <div class="composer-row">
+              <button id="emote-toggle" class="composer-icon-btn emote-toggle-btn" type="button" aria-expanded="false" aria-controls="bot-emote-tray" aria-label="选择表情" title="选择表情" disabled><svg class="composer-svg-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9.5"/><path d="M8.5 14.5c.9 1.3 2.1 2 3.5 2s2.6-.7 3.5-2"/><circle cx="9" cy="9.8" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="9.8" r="1" fill="currentColor" stroke="none"/></svg></button>
+              <textarea id="draft" rows="1" maxlength="16384" placeholder="输入指令或问题…" aria-label="消息输入" disabled></textarea>
+              <button id="send" class="composer-send-btn primary" type="submit" aria-label="发送消息" title="发送消息" disabled><svg class="send-arrow-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 12h14.5"/><path d="m13 6 6 6-6 6"/></svg></button>
             </div>
           </form>
         </section>
-        <aside class="trace" aria-label="执行轨迹">
-          <div class="trace-heading"><h2>执行轨迹</h2><button id="clear-filter" type="button">全部轨迹</button></div>
+        <aside class="trace" aria-label="执行链路">
+          <div class="trace-heading">
+            <h2>执行链路</h2>
+            <div class="trace-heading-actions">
+              <button id="trace-wide-toggle" class="mini-button" type="button" aria-pressed="false" title="切换宽屏双栏检视">⤢ 宽屏双栏</button>
+              <button id="clear-filter" class="mini-button" type="button">全部记录</button>
+            </div>
+          </div>
           <p id="trace-scope" class="meta trace-scope">全部事件</p>
-          <div class="trace-tabs" aria-label="轨迹显示方式"><button id="step-mode" class="tab active" type="button" aria-pressed="true">逐步过程</button><button id="graph-mode" class="tab" type="button" aria-pressed="false">因果线路</button><button id="timeline-mode" class="tab" type="button" aria-pressed="false">原始事件</button></div>
-          <div class="trace-scroll">
-            <p id="trace-error" class="error" role="status"></p>
-            <button id="trace-retry" type="button" hidden>重试</button>
-            <div id="trace-content" class="trace-content"><p class="empty">等待读取轨迹…</p></div>
-            <button id="trace-more" class="trace-more" type="button" hidden>加载更多</button>
-            <section id="routing-detail" class="routing-detail" aria-label="本次路由上下文" hidden></section>
-            <section id="event-detail" class="event-detail" aria-label="选中节点详情"><h3>节点详情</h3></section>
-            <section id="work-detail" class="work-detail" aria-label="任务详情" hidden></section>
+          <section id="work-detail" class="work-detail work-overview-card" aria-label="任务执行总览" hidden></section>
+          <section id="routing-detail" class="routing-detail" aria-label="本次路由上下文" hidden></section>
+          <div class="trace-tabs" role="tablist" aria-label="执行链路筛选">
+            <button id="step-mode" class="tab active" type="button" role="tab" aria-pressed="true" data-cat="all">全部链路</button>
+            <button id="filter-msg-mode" class="tab" type="button" role="tab" aria-pressed="false" data-cat="message">📨 消息</button>
+            <button id="graph-mode" class="tab" type="button" role="tab" aria-pressed="false" data-cat="llm">🧠 模型调用</button>
+            <button id="timeline-mode" class="tab" type="button" role="tab" aria-pressed="false" data-cat="tool">🔧 工具执行</button>
+            <button id="filter-route-mode" class="tab" type="button" role="tab" aria-pressed="false" data-cat="routing">🧭 路由质检</button>
+          </div>
+          <div class="trace-studio">
+            <div class="trace-chain-pane">
+              <p id="trace-error" class="error" role="status"></p>
+              <button id="trace-retry" type="button" hidden>重试</button>
+              <div id="trace-content" class="trace-content"><p class="empty">等待读取执行链路…</p></div>
+              <button id="trace-more" class="trace-more" type="button" hidden>加载更早记录</button>
+            </div>
+            <section id="event-detail" class="event-detail trace-inspector-pane" aria-label="动作语义详情" hidden></section>
           </div>
         </aside>
       </div>
@@ -800,7 +827,159 @@
       </div>
     </div>
   </div>
-  <!-- 7. 模型用量统计弹窗 -->
+  <!-- 7. 投资管理看板弹窗 -->
+  <div id="fund-hub-backdrop" class="modal-backdrop" hidden>
+    <div id="fund-hub-modal" class="model-modal hub-modal fund-modal" role="dialog" aria-modal="true" aria-labelledby="fund-modal-title">
+      <div class="model-modal-header fund-modal-header">
+        <div>
+          <h2 id="fund-modal-title">📈 投资管理 · 股票与基金持仓监控</h2>
+          <p class="health-header-sub">A 股 / 港股 / 美股 QDII 盘中实时估值、晚间正式净值结算、每日收益曲线与持仓管理</p>
+        </div>
+        <div class="fund-header-actions">
+          <button id="fund-privacy-btn" class="mini-button" type="button">👁 隐藏金额</button>
+          <button id="fund-refresh-btn" class="mini-button" type="button">🔄 实时估值</button>
+          <button id="fund-settle-btn" class="mini-button" type="button">🌙 净值结算</button>
+          <button id="fund-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
+        </div>
+      </div>
+      <div class="model-modal-body">
+        <p id="fund-action-status" class="health-status-banner" hidden></p>
+
+        <section class="model-modal-section fund-hero-grid" aria-label="投资资产与仓位总览">
+          <div class="fund-hero-card fund-overview-card">
+            <div class="modal-row-head">
+              <span id="fund-mode-badge" class="hub-badge badge-slate">缓存快照</span>
+              <span id="fund-updated-meta" class="meta">—</span>
+            </div>
+            <div id="fund-hero-asset" class="fund-hero-asset">--</div>
+            <div id="fund-hero-daily" class="fund-hero-daily">当日收益：—</div>
+            <div id="fund-hero-cost-pnl" class="hint">总成本：— · 累计盈亏：—</div>
+          </div>
+
+          <div class="fund-hero-card">
+            <div class="modal-row-head">
+              <h3>📈 股票仓位</h3>
+              <span id="fund-stocks-weight" class="hub-badge badge-blue">0%</span>
+            </div>
+            <div id="fund-stocks-body" class="fund-group-body">
+              <p class="empty">暂无股票持仓</p>
+            </div>
+          </div>
+
+          <div class="fund-hero-card">
+            <div class="modal-row-head">
+              <h3>🏦 基金仓位</h3>
+              <span id="fund-funds-weight" class="hub-badge badge-teal">0%</span>
+            </div>
+            <div id="fund-funds-body" class="fund-group-body">
+              <p class="empty">暂无基金持仓</p>
+            </div>
+          </div>
+        </section>
+
+        <div id="fund-kpi-grid" class="hub-kpi-grid"></div>
+
+        <section id="fund-chart-section" class="model-modal-section" aria-label="收益与净值趋势图">
+          <div class="modal-row-head">
+            <h3>收益与净值走势</h3>
+            <div class="modal-btn-group">
+              <div id="fund-trend-metrics" class="hub-filter-pills" role="tablist" aria-label="趋势维度选择">
+                <button class="hub-filter-pill active" type="button" data-metric="asset">总资产</button>
+                <button class="hub-filter-pill" type="button" data-metric="totalPnl">累计收益</button>
+                <button class="hub-filter-pill" type="button" data-metric="dailyPnl">单日盈亏</button>
+                <button class="hub-filter-pill" type="button" data-metric="holdingNav">标的净值</button>
+              </div>
+              <select id="fund-nav-select" aria-label="选择查看净值走势的标的" hidden></select>
+              <div id="fund-trend-ranges" class="hub-filter-pills" role="tablist" aria-label="趋势跨度选择">
+                <button class="hub-filter-pill" type="button" data-range="7">近 7 次</button>
+                <button class="hub-filter-pill active" type="button" data-range="30">近 30 次</button>
+                <button class="hub-filter-pill" type="button" data-range="120">全部</button>
+              </div>
+            </div>
+          </div>
+          <div class="health-chart-shell">
+            <canvas id="fund-trend-canvas" class="health-trend-canvas" width="920" height="220" aria-label="投资收益与净值趋势图"></canvas>
+            <div id="fund-trend-caption" class="meta health-trend-caption">暂无足够数据绘制趋势。</div>
+          </div>
+        </section>
+
+        <section class="model-modal-section" aria-label="持仓明细">
+          <div class="modal-row-head">
+            <div>
+              <h3>持仓明细</h3>
+              <span id="fund-holdings-subtitle" class="meta">共 0 只标的</span>
+            </div>
+            <div class="modal-btn-group">
+              <div id="fund-type-filters" class="hub-filter-pills" role="tablist" aria-label="持仓类型筛选">
+                <button class="hub-filter-pill active" type="button" data-filter="all">全部</button>
+                <button class="hub-filter-pill" type="button" data-filter="stock">股票</button>
+                <button class="hub-filter-pill" type="button" data-filter="fund">基金</button>
+              </div>
+              <button id="fund-add-jump-btn" class="mini-button" type="button">＋ 新增持仓</button>
+            </div>
+          </div>
+          <div id="fund-holdings-list" class="fund-holdings-list"><p class="empty">尚无持仓记录。</p></div>
+        </section>
+
+        <section class="model-modal-section" aria-label="新增或修改持仓">
+          <details id="fund-form-details" class="hub-compose-details">
+            <summary id="fund-form-summary" class="hub-compose-summary">➕ 新增或修改股票 / 基金持仓</summary>
+            <div class="hub-compose-body">
+              <input id="fund-edit-original-code" type="hidden">
+              <div class="modal-form-grid">
+                <label>标的代码
+                  <input id="fund-form-code" type="text" placeholder="如：000300 / 600519">
+                </label>
+                <label>标的名称
+                  <input id="fund-form-name" type="text" placeholder="如：沪深300指数A">
+                </label>
+                <label>资产类别
+                  <select id="fund-form-type">
+                    <option value="a_index">A股指数基金 (a_index)</option>
+                    <option value="a_etf_feeder">A股ETF联接 (a_etf_feeder)</option>
+                    <option value="hk_etf_feeder">港股ETF联接 QDII (hk_etf_feeder)</option>
+                    <option value="us_qdii">美股QDII基金 (us_qdii)</option>
+                    <option value="gold_feeder">黄金ETF联接 (gold_feeder)</option>
+                    <option value="a_stock">A股股票 (a_stock)</option>
+                    <option value="other">其他混合/主动基金 (other)</option>
+                  </select>
+                </label>
+                <label>总成本 (元)
+                  <input id="fund-form-cost" type="number" min="0" step="0.01" placeholder="如：10000">
+                </label>
+                <label>持有份额 / 股数（可空，按基准净值日反推）
+                  <input id="fund-form-shares" type="number" min="0" step="0.0001" placeholder="可选，留空自动推算">
+                </label>
+                <label>跟踪指数 / 行情代码
+                  <input id="fund-form-proxy" type="text" placeholder="如：sh000300 / hkHSTECH / usINX">
+                </label>
+                <label>跟踪标的名称
+                  <input id="fund-form-proxy-name" type="text" placeholder="如：沪深300 / 标普500">
+                </label>
+                <label>仓位映射系数 (0~1]
+                  <input id="fund-form-ratio" type="number" min="0.05" max="1" step="0.01" placeholder="基金默认 0.95，股票默认 1">
+                </label>
+                <label>建仓基准净值（可选）
+                  <input id="fund-form-init-nav" type="number" min="0.0001" step="0.0001" placeholder="可选，默认 1.0">
+                </label>
+                <label>基准净值日期（可选）
+                  <input id="fund-form-init-date" type="date">
+                </label>
+              </div>
+              <div class="modal-row-head">
+                <span class="hint">A 股股票留空行情代码时自动补全 sh/sz/bj 前缀；修改持仓时直接点击列表中对应行的「编辑」即可回填。</span>
+                <div class="modal-btn-group">
+                  <button id="fund-form-reset-btn" class="mini-button" type="button">🧹 重置表单</button>
+                  <button id="fund-form-save-btn" class="primary" type="button">💾 保存持仓</button>
+                </div>
+              </div>
+            </div>
+          </details>
+        </section>
+      </div>
+    </div>
+  </div>
+  <!-- 8. 模型用量统计弹窗 -->
   <div id="usage-hub-backdrop" class="modal-backdrop" hidden>
     <div id="usage-hub-modal" class="model-modal hub-modal usage-modal" role="dialog" aria-modal="true" aria-labelledby="usage-modal-title">
       <div class="model-modal-header usage-modal-header">

@@ -5,6 +5,7 @@ import { api, appState, hooks } from '../state.js';
 export interface HealthScaleUiController {
   openModal: () => void;
   closeModal: () => void;
+  refreshTopBadge: () => Promise<void>;
 }
 
 interface HealthProfile {
@@ -458,9 +459,7 @@ export function initHealthScaleUi(): HealthScaleUiController {
     if (healthHubBackdrop.hidden || appState.authExpired) return;
     const seq = ++dashboardFetchSeq;
     try {
-      const args: Record<string, unknown> = {};
-      if (healthDashboard?.activeProfileId) args.profileId = healthDashboard.activeProfileId;
-      const res = await runHealthPlugin<{ session: HealthLiveSession | null; dashboard: HealthDashboardData }>('measure-status', args);
+      const res = await runHealthPlugin<{ session: HealthLiveSession | null; dashboard: HealthDashboardData }>('measure-status', {});
       if (seq !== dashboardFetchSeq) return;
       if (!res.ok || !res.data) {
         scheduleHealthMeasurePoll(1200);
@@ -781,13 +780,17 @@ export function initHealthScaleUi(): HealthScaleUiController {
     healthPlottedPoints = [];
 
     if (series.length === 0) {
-      ctx.fillStyle = '#8b949e';
+      ctx.fillStyle = '#94a3b8';
       ctx.font = '13px sans-serif';
       ctx.textAlign = 'center';
       ctx.fillText('暂无该指标的历史趋势数据，完成测量或补录后自动绘制', cssW / 2, cssH / 2);
       healthTrendCaption.textContent = '暂无可用数据点。';
       return;
     }
+
+    const isIndustrial = document.documentElement.dataset.theme === 'industrial';
+    const focusAccent = isIndustrial ? '#ff6b1a' : '#fbbf24';
+    const focusCrosshair = isIndustrial ? 'rgba(255, 107, 26, 0.50)' : 'rgba(251, 191, 36, 0.45)';
 
     const firstSeries = series[0];
     if (!firstSeries) return;
@@ -914,7 +917,7 @@ export function initHealthScaleUi(): HealthScaleUiController {
       const isActive = i === activeHoverIdx || isSelected;
       if (isActive) {
         ctx.save();
-        ctx.strokeStyle = 'rgba(251, 191, 36, 0.45)';
+        ctx.strokeStyle = focusCrosshair;
         ctx.lineWidth = 1;
         ctx.setLineDash([3, 3]);
         ctx.beginPath();
@@ -925,9 +928,9 @@ export function initHealthScaleUi(): HealthScaleUiController {
       }
       ctx.beginPath();
       ctx.arc(p.x, p.y, isActive ? 5.2 : 3.2, 0, Math.PI * 2);
-      ctx.fillStyle = isSelected ? '#fbbf24' : i === activeHoverIdx ? '#7dd3fc' : '#38bdf8';
+      ctx.fillStyle = isSelected ? focusAccent : i === activeHoverIdx ? '#7dd3fc' : '#38bdf8';
       ctx.fill();
-      ctx.strokeStyle = '#0f172a';
+      ctx.strokeStyle = '#090b10';
       ctx.lineWidth = 1.5;
       ctx.stroke();
     }
@@ -1537,9 +1540,20 @@ export function initHealthScaleUi(): HealthScaleUiController {
   healthProfileNewBtn.addEventListener('click', clearHealthProfileFormForNew);
   healthProfileSaveBtn.addEventListener('click', () => void saveHealthProfileFromUi());
   healthManualAddBtn.addEventListener('click', () => void addManualHealthRecordFromUi());
+  window.addEventListener('resize', () => {
+    if (!healthHubBackdrop.hidden) {
+      renderHealthTrendChart();
+    }
+  });
+  window.addEventListener('friday:themechange', () => {
+    if (!healthHubBackdrop.hidden) {
+      renderHealthTrendChart();
+    }
+  });
 
   return {
     openModal,
     closeModal,
+    refreshTopBadge: () => (appState.authExpired ? Promise.resolve() : refreshHealthDashboard({ quiet: true })),
   };
 }

@@ -2,6 +2,8 @@ import { record } from '../model.js';
 
 export const TOKEN_STORAGE_KEY = 'friday.local-access-token';
 export const LEGACY_TOKEN_STORAGE_KEY = 'super-agent.local-access-token';
+export const OPEN_AUTH_COOKIE_NAME = 'friday_auth_mode';
+export const OPEN_AUTH_SENTINEL_TOKEN = '0'.repeat(64);
 const TOKEN_PATTERN = /^[a-f\d]{64}$/i;
 const DEFAULT_MAX_SSE_BUFFER_BYTES = 4_300_000;
 
@@ -12,6 +14,14 @@ export interface BootstrapTokenState {
 
 export function isValidAccessToken(candidate: string): boolean {
   return TOKEN_PATTERN.test(candidate);
+}
+
+/**
+ * Returns true when the server has signaled no-auth LAN mode via a SameSite cookie.
+ */
+export function hasOpenAuthCookie(): boolean {
+  if (typeof document === 'undefined' || typeof document.cookie !== 'string') return false;
+  return /(?:^|;\s*)friday_auth_mode=none(?:;|$)/.test(document.cookie);
 }
 
 /**
@@ -51,6 +61,9 @@ export function resolveBootstrapToken(): BootstrapTokenState {
     } catch {
       storageUnavailable = true;
     }
+    if (!isValidAccessToken(token) && hasOpenAuthCookie()) {
+      return { token: OPEN_AUTH_SENTINEL_TOKEN, storageUnavailable };
+    }
   }
   return { token: isValidAccessToken(token) ? token : '', storageUnavailable };
 }
@@ -82,7 +95,9 @@ export function createHttpClient(options: HttpClientOptions): HttpClient {
   async function request(path: string, init: RequestInit = {}): Promise<Response> {
     if (!options.token || options.isExpired?.()) throw new ApiError(missingMessage, 401);
     const headers = new Headers(init.headers);
-    headers.set('Authorization', `Bearer ${options.token}`);
+    if (!(options.token === OPEN_AUTH_SENTINEL_TOKEN && hasOpenAuthCookie())) {
+      headers.set('Authorization', `Bearer ${options.token}`);
+    }
     if (init.body !== undefined) headers.set('Content-Type', 'application/json');
     const response = await fetch(path, { ...init, headers, credentials: 'omit', cache: 'no-store' });
     if (!response.ok) {

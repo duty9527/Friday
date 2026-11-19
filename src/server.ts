@@ -4,6 +4,7 @@ import lockfile from 'proper-lockfile';
 import { privateHome } from './files.js';
 import { realFactory, offlineFactory } from './agent.js';
 import { Coordinator } from './coordinator.js';
+import { buildExecutionTraceBundle } from './execution-trace.js';
 import { buildMindmapSnapshot } from './mindmap-flow.js';
 import { listPluginViews, runPlugin } from './plugin.js';
 import { integer, REQUEST_LIMIT, RESPONSE_LIMIT, socketPath, text, type Response } from './protocol.js';
@@ -215,6 +216,11 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
             taskId: command.taskId === undefined ? undefined : text(command.taskId, 'taskId', 128),
           }, command.after === undefined ? undefined : integer(command.after, 0, 0, Number.MAX_SAFE_INTEGER),
             command.before === undefined ? undefined : integer(command.before, 0, 0, Number.MAX_SAFE_INTEGER));
+          case 'execution-trace': return buildExecutionTraceBundle(store, {
+            taskId: command.taskId === undefined ? undefined : text(command.taskId, 'taskId', 128),
+            messageId: command.messageId === undefined ? undefined : text(command.messageId, 'messageId', 128),
+            limit: command.limit === undefined ? undefined : integer(command.limit, 1200, 50, 2500),
+          });
           case 'updates': {
             const after = integer(command.after, 0, 0, Number.MAX_SAFE_INTEGER);
             const events = store.conversation.trace({}, after);

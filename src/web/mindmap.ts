@@ -25,6 +25,7 @@ import {
 } from './mindmap-data.js';
 import { ApiError, createHttpClient, resolveBootstrapToken } from './shared/auth-http.js';
 import { createSharedSseHub, type SseUpdateBatch } from './shared/sse-hub.js';
+import { bindThemeButtons } from './shared/theme.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -109,6 +110,7 @@ const fitBtn = el<HTMLButtonElement>('mm-fit-btn');
 const refreshBtn = el<HTMLButtonElement>('mm-refresh-btn');
 const connPillEl = el<HTMLSpanElement>('mm-conn-pill');
 const canvasControlsEl = el<HTMLElement>('mm-canvas-controls');
+bindThemeButtons(el<HTMLButtonElement>('mm-theme-spatial'), el<HTMLButtonElement>('mm-theme-industrial'));
 
 const kpiSessionsEl = el<HTMLElement>('kpi-sessions');
 const kpiFlowsEl = el<HTMLElement>('kpi-flows');

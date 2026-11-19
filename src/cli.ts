@@ -12,7 +12,7 @@ const help = `F.R.I.D.A.Y. (friday) — Local persistent personal AI assistant &
   serve [--mode real|offline] [--offline-delay-ms 100]
   login [provider]   Authenticate via PI OAuth (default: openai Sign in with ChatGPT)
   logout [provider]  Remove stored OAuth credentials (default: openai)
-  web [--port 0]   Open the single main conversation via an authenticated local URL
+  web [--host 127.0.0.1] [--port 0] [--allow-host HOST ...] [--no-auth] [--token HEX64]   Open the single main conversation via a local or LAN URL
   tui              Interactive terminal chat & work monitor
   watchdog [--mode real|offline] [--interval-ms 2000] [--max-retries 3] [--systemd-unit UNIT]
   submit [--file PATH ...] [--limit-ms 600000] [--request-id ID] "instruction"
@@ -41,7 +41,7 @@ commands run as your OS account and can modify files, access outside cwd and use
 --file optionally hints a working path; real tasks need no attachment.
 Offline mode remains read-only snapshot simulation (32 files, 256 KiB each, 1 MiB total).
 The serve command stays in the foreground; use another terminal for web/client commands.
-Web binds only 127.0.0.1, connects to the same --home daemon, and prints a private entry link.
+Web binds 127.0.0.1 by default (override with --host/--allow-host/--no-auth), connects to the same --home daemon, and prints the entry link.
 Closing the browser or web bridge does not stop the daemon or its background work.
 `;
 
@@ -78,6 +78,8 @@ async function main() {
       home: { type: 'string' }, mode: { type: 'string' }, file: { type: 'string', multiple: true },
       'limit-ms': { type: 'string' }, 'request-id': { type: 'string' }, after: { type: 'string' },
       'offline-delay-ms': { type: 'string' }, port: { type: 'string' },
+      host: { type: 'string' }, 'allow-host': { type: 'string', multiple: true },
+      auth: { type: 'boolean' }, token: { type: 'string' },
       name: { type: 'string' }, 'every-ms': { type: 'string' }, 'delay-ms': { type: 'string' }, 'daily-at': { type: 'string' }, once: { type: 'boolean' },
       plugin: { type: 'string' }, action: { type: 'string' }, channel: { type: 'string' }, args: { type: 'string' },
       cwd: { type: 'string' },
@@ -158,7 +160,21 @@ async function main() {
   }
   if (command === 'web') {
     const { startWeb } = await import('./web-server.js');
-    const web = await startWeb({ home, port: number(values.port) });
+    const envAllowHosts = resolveEnv('FRIDAY_WEB_ALLOW_HOSTS');
+    const allowHosts = [
+      ...(envAllowHosts ? [envAllowHosts] : []),
+      ...(values['allow-host'] ?? []),
+    ];
+    const noAuthEnv = resolveEnv('FRIDAY_WEB_NO_AUTH');
+    const auth = values.auth ?? (noAuthEnv === '1' || noAuthEnv?.toLowerCase() === 'true' ? false : undefined);
+    const web = await startWeb({
+      home,
+      port: number(values.port),
+      host: values.host ?? resolveEnv('FRIDAY_WEB_HOST'),
+      allowHosts: allowHosts.length > 0 ? allowHosts : undefined,
+      auth,
+      token: values.token ?? resolveEnv('FRIDAY_WEB_TOKEN'),
+    });
     attachGracefulShutdown(() => web.close());
     process.stdout.write(JSON.stringify({ status: 'web_ready', url: web.url, home: web.home, pid: process.pid }) + '\n');
     return;

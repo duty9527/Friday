@@ -1471,6 +1471,76 @@ function resolveProfilesAndActive(db, requestedProfileId) {
   return { profiles, activeProfile: active };
 }
 
+function computeProfileReferenceWeight(db, profile) {
+  const primaryRows = db.prepare(`
+    SELECT weight_kg FROM measurements
+    WHERE profile_id = ? AND source IN ('live', 'manual')
+    ORDER BY measured_at DESC, created_at DESC
+    LIMIT 7
+  `).all(profile.id);
+  const rows = primaryRows.length > 0
+    ? primaryRows
+    : db.prepare(`
+      SELECT weight_kg FROM measurements
+      WHERE profile_id = ?
+      ORDER BY measured_at DESC, created_at DESC
+      LIMIT 7
+    `).all(profile.id);
+
+  const weights = rows
+    .map(r => Number(r.weight_kg))
+    .filter(w => Number.isFinite(w) && w > 0)
+    .sort((a, b) => a - b);
+  if (weights.length > 0) {
+    const mid = Math.floor(weights.length / 2);
+    const median = weights.length % 2 === 1
+      ? weights[mid]
+      : (weights[mid - 1] + weights[mid]) / 2;
+    return { weightKg: roundTo(median, 2), basis: 'records' };
+  }
+
+  const targetKg = asFiniteNumber(profile.targetWeightKg);
+  if (targetKg !== undefined && targetKg > 0) {
+    return { weightKg: roundTo(targetKg, 2), basis: 'target' };
+  }
+
+  const h = Number(profile.heightCm || 170) / 100;
+  const bmiRef = profile.sex === 'female' ? 20.5 : 22.2;
+  return { weightKg: roundTo(bmiRef * h * h, 2), basis: 'bmi_ref' };
+}
+
+/**
+ * Resolve which member profile owns a weight measurement based on proximity to
+ * each profile's reference weight, falling back to `fallbackProfileId` on ties/ambiguity.
+ */
+export function resolveMeasurementProfile(
+  db,
+  profiles,
+  fallbackProfileId,
+  weightKg,
+  { source = 'live', explicitProfile = false } = {},
+) {
+  if (!Array.isArray(profiles) || profiles.length === 0) return null;
+  const fallback = (fallbackProfileId && profiles.find(p => p.id === fallbackProfileId))
+    || profiles.find(p => p.isDefault)
+    || profiles[0];
+  if (profiles.length === 1 || !(Number(weightKg) > 0)) return fallback;
+  if (source === 'manual' && explicitProfile) return fallback;
+
+  const targetKg = Number(weightKg);
+  const scored = profiles.map(profile => {
+    const ref = computeProfileReferenceWeight(db, profile);
+    return { profile, diff: Math.abs(targetKg - ref.weightKg) };
+  }).sort((a, b) => a.diff - b.diff);
+
+  const best = scored[0];
+  const fallbackEntry = scored.find(s => s.profile.id === fallback.id) || best;
+  if (!best || best.profile.id === fallback.id) return fallback;
+
+  const marginKg = source === 'history' ? 1.5 : 2.5;
+  return (fallbackEntry.diff - best.diff) >= marginKg ? best.profile : fallback;
+}
+
 function computeDeltas(records, activeProfile, nowMs) {
   if (!records.length) return null;
   const latest = records[0];
@@ -1668,16 +1738,33 @@ function readLiveSessionSnapshot(dataDir, db, activeProfileId, nowMs, ingestComp
     }, nowMs);
   }
 
+  const { profiles } = resolveProfilesAndActive(db, activeProfileId);
   const ingestedIds = [];
   const targetProfileId = raw.profileId || activeProfileId || null;
+  const readoutWeight = decoded.latestStableWeight
+    ?? (decoded.latestAdc?.weightKg && decoded.latestAdc.weightKg > 0 ? decoded.latestAdc : null)
+    ?? decoded.latestWeight;
+  const readoutKg = readoutWeight?.weightKg ?? null;
+  const matchedLiveProfile = (readoutKg && readoutKg > 0)
+    ? resolveMeasurementProfile(db, profiles, targetProfileId, readoutKg, { source: 'live' })
+    : null;
+  let finalLiveProfile = matchedLiveProfile;
+
   if (ingestCompleted && targetProfileId) {
     for (const h of decoded.historyEvents) {
       if (!h.weight || !(h.weight.weightKg > 0)) continue;
+      const histProfile = resolveMeasurementProfile(
+        db,
+        profiles,
+        targetProfileId,
+        h.weight.weightKg,
+        { source: 'history' },
+      );
       const tsMs = h.time && h.time > 1_000_000_000 ? h.time * 1000 : nowMs;
       const dedupKey = `history:${devMac}:${h.time || 0}:${h.weight.weightG}`;
       const res = insertMeasurement(db, {
         dedupKey,
-        profileId: targetProfileId,
+        profileId: histProfile?.id || targetProfileId,
         measuredAt: tsMs,
         source: 'history',
         deviceMac: devMac,
@@ -1708,12 +1795,13 @@ function readLiveSessionSnapshot(dataDir, db, activeProfileId, nowMs, ingestComp
         lockedWeight || (decoded.latestAdc && firstValidResistance(decoded.latestAdc.impedances) !== undefined),
       );
       if (weightKg && weightKg > 0) {
+        finalLiveProfile = resolveMeasurementProfile(db, profiles, targetProfileId, weightKg, { source: 'live' });
         const adcs = decoded.latestAdc?.adcs || [];
         const impedances = decoded.latestAdc?.impedances || normalizeImpedances(adcs, weightKg);
         const dedupKey = `live:${raw.sessionId}`;
         const res = insertMeasurement(db, {
           dedupKey,
-          profileId: targetProfileId,
+          profileId: finalLiveProfile?.id || targetProfileId,
           measuredAt: raw.updatedAt || nowMs,
           source: 'live',
           deviceMac: devMac,
@@ -1747,9 +1835,6 @@ function readLiveSessionSnapshot(dataDir, db, activeProfileId, nowMs, ingestComp
     }
   }
 
-  const readoutWeight = decoded.latestStableWeight
-    ?? (decoded.latestAdc?.weightKg && decoded.latestAdc.weightKg > 0 ? decoded.latestAdc : null)
-    ?? decoded.latestWeight;
   const hasValidImpedance = Boolean(decoded.latestAdc && firstValidResistance(decoded.latestAdc.impedances) !== undefined);
   const liveReadout = decoded.latestAdc || decoded.latestWeight
     ? {
@@ -1769,10 +1854,13 @@ function readLiveSessionSnapshot(dataDir, db, activeProfileId, nowMs, ingestComp
   return {
     sessionId: raw.sessionId,
     profileId: raw.profileId || activeProfileId,
+    matchedProfileId: finalLiveProfile?.id || targetProfileId,
+    matchedProfileName: finalLiveProfile?.name || null,
     pid: raw.pid,
     phase,
     startedAt: raw.startedAt,
     updatedAt: raw.updatedAt,
+    timeoutSec: raw.timeoutSec ?? 45,
     message,
     error,
     device: raw.device || null,
@@ -2013,7 +2101,7 @@ async function handleMeasureStart(ctx) {
         ok: true,
         notify: false,
         title: '已启动实时称重测量',
-        message: `已开始监听沃莱 A1 ${targetDesc}，请赤脚站上体脂秤（限时 ${timeoutSec} 秒）。`,
+        message: `沃莱 A1 ${targetDesc} 已就绪，请赤脚站上体脂秤（${timeoutSec} 秒内有效）。`,
         data: { session },
       };
     } finally {
@@ -2036,8 +2124,11 @@ async function handleMeasureStatus(ctx) {
     };
   }
 
+  const effectiveProfileId = (!ctx.args.lockProfile && session?.matchedProfileId)
+    ? session.matchedProfileId
+    : (session.profileId || activeId);
   const dashboard = buildDashboardData(ctx.db, ctx.dataDir, {
-    profileId: session.profileId || activeId,
+    profileId: effectiveProfileId,
     nowMs: ctx.nowMs,
     config: ctx.config,
   });
@@ -2219,7 +2310,7 @@ function handleProfileDelete(ctx) {
 }
 
 function handleRecordAdd(ctx) {
-  const { activeProfile } = resolveProfilesAndActive(ctx.db, ctx.args.profileId);
+  const { profiles, activeProfile } = resolveProfilesAndActive(ctx.db, ctx.args.profileId);
   if (!activeProfile) {
     throw new Error('尚未创建成员健康档案，请先调用 profile-save 创建档案后再补录体重。');
   }
@@ -2233,6 +2324,11 @@ function handleRecordAdd(ctx) {
     throw new Error('体重应在 5 ~ 250 kg 之间');
   }
 
+  const explicitProfile = Boolean(ctx.args.profileId && String(ctx.args.profileId).trim());
+  const targetProfile = explicitProfile
+    ? activeProfile
+    : (resolveMeasurementProfile(ctx.db, profiles, activeProfile.id, weightKg, { source: 'manual', explicitProfile: false }) || activeProfile);
+
   const imp = asFiniteNumber(ctx.args.impedanceOhm ?? ctx.args.impedance);
   const impedances = imp !== undefined && imp > 0 ? [imp] : [];
   const measuredAt = asInt(ctx.args.measuredAt) ?? (ctx.args.measuredAtIso ? Date.parse(String(ctx.args.measuredAtIso)) : ctx.nowMs);
@@ -2241,7 +2337,7 @@ function handleRecordAdd(ctx) {
   const note = ctx.args.note ? String(ctx.args.note).trim() : '手动补录';
 
   const res = insertMeasurement(ctx.db, {
-    profileId: activeProfile.id,
+    profileId: targetProfile.id,
     measuredAt: finalTs,
     source: 'manual',
     weightKg,
@@ -2251,12 +2347,12 @@ function handleRecordAdd(ctx) {
     note,
   }, ctx.nowMs);
 
-  const dashboard = buildDashboardData(ctx.db, ctx.dataDir, { profileId: activeProfile.id, nowMs: ctx.nowMs, config: ctx.config });
+  const dashboard = buildDashboardData(ctx.db, ctx.dataDir, { profileId: targetProfile.id, nowMs: ctx.nowMs, config: ctx.config });
   return {
     ok: true,
     notify: false,
     title: '已添加体重记录',
-    message: `已为「${activeProfile.name}」补录 ${weightKg.toFixed(2)} kg (${(weightKg * 2).toFixed(2)} 斤)。`,
+    message: `已为「${targetProfile.name}」补录 ${weightKg.toFixed(2)} kg (${(weightKg * 2).toFixed(2)} 斤)。`,
     data: {
       insertedId: res.id,
       ...dashboard,
@@ -2499,13 +2595,15 @@ function stripHealthFastpathText(rawText) {
     .trim();
 }
 
-function formatFastpathWeightSpeech(latest, deltas) {
+function formatFastpathWeightSpeech(latest, deltas, options = {}) {
   if (!latest) return '当前还没有体重测量记录。';
   const kg = Number(latest.weightKg);
   const jin = Number(latest.weightJin ?? kg * 2);
   const kgText = kg.toFixed(2).replace(/\.?0+$/, '');
   const jinText = jin.toFixed(1).replace(/\.0$/, '');
-  const parts = [`最新体重${kgText}公斤，合${jinText}斤`];
+  const who = options.multiProfile && options.profileName ? String(options.profileName).trim() : '';
+  const head = `${options.completedAnnouncement ? '测量完成，' : ''}${who}最新体重${kgText}公斤，合${jinText}斤`;
+  const parts = [head];
   if (deltas && deltas.prevDiffKg !== null && deltas.prevDiffKg !== undefined) {
     const diff = Number(deltas.prevDiffKg);
     if (Math.abs(diff) < 0.005) {
@@ -2524,21 +2622,124 @@ function formatFastpathWeightSpeech(latest, deltas) {
 }
 
 /**
- * In-process voice fastpath for unambiguous health-scale commands (start/retry/stop/status).
+ * In-process voice fastpath for unambiguous health-scale commands (start/retry/stop/status)
+ * plus internal `measure_poll` / `assistant_reply` session lifecycle hooks.
  * Leaves profile edits, deletions, and open-ended follow-ups to the Router LLM.
  */
 export async function handleVoiceFastpath(request, context = {}) {
-  if (!request || typeof request !== 'object' || request.sessionState?.event === 'assistant_reply') {
+  if (!request || typeof request !== 'object') {
     return { handled: false };
   }
+  const paths = resolveScalePaths({}, context);
+  const nowMs = typeof context.nowFn === 'function' ? context.nowFn() : Date.now();
+  const sPath = sessionFilePath(paths.pluginDataDir);
+
+  if (request.sessionState?.event === 'measure_poll') {
+    const live = readJsonSafe(sPath, null);
+    const watchId = request.sessionState.watchMeasureSessionId;
+    if (!live || (watchId && live.sessionId !== watchId)) {
+      return {
+        handled: true,
+        plugin: 'health-scale',
+        action: 'measure-poll',
+        data: { phase: 'superseded' },
+      };
+    }
+    const activePhases = new Set(['scanning', 'connecting', 'measuring']);
+    const staleDeadHelper = Boolean(
+      live.pid
+      && process.platform === 'linux'
+      && !isBleHelperPid(Number(live.pid))
+      && (nowMs - Number(live.updatedAt || live.startedAt || 0) > 1500),
+    );
+    if (activePhases.has(live.phase) && !staleDeadHelper) {
+      return {
+        handled: true,
+        plugin: 'health-scale',
+        action: 'measure-poll',
+        data: { phase: live.phase, sessionId: live.sessionId },
+      };
+    }
+
+    const res = await runAction('measure-status', {}, context);
+    const session = res.data?.session;
+    const dashboard = res.data?.dashboard ?? res.data;
+    const latest = dashboard?.latest;
+    const deltas = dashboard?.deltas;
+    if (
+      session?.phase === 'completed'
+      && latest
+      && Number(latest.measuredAt || 0) >= Number(session.startedAt || 0) - 5000
+    ) {
+      return {
+        handled: true,
+        plugin: 'health-scale',
+        action: 'measure-completed',
+        ok: true,
+        speech: formatFastpathWeightSpeech(latest, deltas, {
+          profileName: dashboard?.activeProfile?.name,
+          multiProfile: (dashboard?.profiles?.length ?? 0) > 1,
+          completedAnnouncement: true,
+        }),
+        data: {
+          phase: 'completed',
+          sessionId: session.sessionId,
+          matchedProfileId: session.matchedProfileId,
+        },
+      };
+    }
+    if (session?.phase === 'timeout') {
+      return {
+        handled: true,
+        plugin: 'health-scale',
+        action: 'measure-timeout',
+        ok: true,
+        speech: '体脂秤等待45秒超时，本次没有收到稳定称重数据。',
+        data: { phase: 'timeout', sessionId: session.sessionId },
+      };
+    }
+    return {
+      handled: true,
+      plugin: 'health-scale',
+      action: 'measure-ended',
+      ok: false,
+      data: {
+        phase: session?.phase || 'ended',
+        sessionId: session?.sessionId || live.sessionId,
+      },
+    };
+  }
+
+  if (request.sessionState?.event === 'assistant_reply') {
+    const live = readJsonSafe(sPath, null);
+    const startedAgeMs = live ? nowMs - Number(live.startedAt || 0) : Number.POSITIVE_INFINITY;
+    if (
+      live
+      && ['scanning', 'connecting', 'measuring'].includes(live.phase)
+      && Number.isFinite(startedAgeMs)
+      && startedAgeMs >= 0
+      && startedAgeMs <= 20_000
+    ) {
+      return {
+        handled: true,
+        plugin: 'health-scale',
+        action: 'measure-watch',
+        followUp: false,
+        data: {
+          watchMeasureSessionId: live.sessionId,
+          timeoutSec: Number(live.timeoutSec || 45),
+        },
+      };
+    }
+    return { handled: false };
+  }
+
   const text = stripHealthFastpathText(request.text);
   if (!text || text.length > 32 || HEALTH_FASTPATH_EXCLUDE_RE.test(text)) {
     return { handled: false };
   }
 
-  const paths = resolveScalePaths({}, context);
-  const nowMs = typeof context.nowFn === 'function' ? context.nowFn() : Date.now();
-  const live = readJsonSafe(sessionFilePath(paths.pluginDataDir), null);
+  const live = readJsonSafe(sPath, null);
   const liveAgeMs = live ? nowMs - Number(live.updatedAt || live.startedAt || 0) : Number.POSITIVE_INFINITY;
   const recentStartSession = Boolean(live && Number.isFinite(liveAgeMs) && liveAgeMs >= 0 && liveAgeMs <= 180_000);
   const recentQuerySession = Boolean(live && Number.isFinite(liveAgeMs) && liveAgeMs >= 0 && liveAgeMs <= 300_000);
@@ -2558,17 +2759,26 @@ export async function handleVoiceFastpath(request, context = {}) {
 
   if (HEALTH_FASTPATH_START_RE.test(text) || ((recentStartSession || inFollowUp) && HEALTH_FASTPATH_RETRY_RE.test(text))) {
     const res = await runAction('measure-start', {}, context);
+    const sessionData = res.data?.session;
     return {
       handled: true,
       plugin: 'health-scale',
       action: 'measure-start',
       ok: Boolean(res.ok),
       speech: res.ok
-        ? '好，已经开始监听体脂秤，现在赤脚上秤吧，限时45秒。'
+        ? '好，体脂秤已就绪，现在赤脚上秤吧，45秒内有效。'
         : (res.message || '暂时无法启动蓝牙测量。'),
       followUp: false,
       clearSessionState: true,
-      data: res.data,
+      data: {
+        ...(res.data && typeof res.data === 'object' ? res.data : {}),
+        ...(res.ok && sessionData?.sessionId
+          ? {
+              watchMeasureSessionId: sessionData.sessionId,
+              timeoutSec: Number(sessionData.timeoutSec ?? 45),
+            }
+          : {}),
+      },
     };
   }
 
@@ -2640,10 +2850,17 @@ export async function handleVoiceFastpath(request, context = {}) {
       plugin: 'health-scale',
       action,
       ok: true,
-      speech: formatFastpathWeightSpeech(latest, deltas),
+      speech: formatFastpathWeightSpeech(latest, deltas, {
+        profileName: dashboard?.activeProfile?.name,
+        multiProfile: (dashboard?.profiles?.length ?? 0) > 1,
+      }),
       followUp: false,
       clearSessionState: true,
-      data: { latest, deltas },
+      data: {
+        latest,
+        deltas,
+        ...(session?.phase === 'completed' ? { announcedMeasureSessionId: session.sessionId } : {}),
+      },
     };
   }
 

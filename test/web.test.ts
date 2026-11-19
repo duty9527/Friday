@@ -23,13 +23,15 @@ async function fixture() {
   const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
   return { home, daemon, web, base, headers, close: async () => { await web.close(); await daemon.close(); await rm(home, { recursive: true, force: true }); } };
 }
-async function raw(url: string, headers: Record<string, string>) {
-  return new Promise<{ status: number; text: string }>((resolve, reject) => {
-    const req = httpRequest(url, { headers }, response => {
+async function raw(url: string, headers: Record<string, string>, options?: { method?: string; body?: string }) {
+  return new Promise<{ status: number; headers: Record<string, string | string[] | undefined>; text: string }>((resolve, reject) => {
+    const req = httpRequest(url, { method: options?.method ?? 'GET', headers }, response => {
       let text = ''; response.on('data', bytes => { text += bytes; });
-      response.on('end', () => resolve({ status: response.statusCode!, text }));
+      response.on('end', () => resolve({ status: response.statusCode!, headers: response.headers, text }));
     });
-    req.once('error', reject); req.end();
+    req.once('error', reject);
+    if (options?.body !== undefined) req.write(options.body);
+    req.end();
   });
 }
 async function batch(base: string, headers: Record<string, string>, after: number) {
@@ -171,6 +173,7 @@ test('every nested module the page or mindmap imports is served and path escapes
     assert.ok(visited.has('/hubs/memory-hub.js'), 'nested hub module must be reached and served');
     assert.ok(visited.has('/panels/chat.js'), 'nested panel module must be reached and served');
     assert.ok(visited.has('/plugins/health-scale-ui.js'), 'lazy plugin UI module must be reached and served');
+    assert.ok(visited.has('/plugins/fund-tracker-ui.js'), 'lazy fund plugin UI module must be reached and served');
     assert.equal((await fetch(`${f.base}/../src/agent.ts`)).status, 404, 'path escape must return 404');
     assert.equal((await fetch(`${f.base}/shared/%2e%2e/%2e%2e/package.json`)).status, 404, 'encoded traversal must return 404');
     assert.equal((await fetch(`${f.base}/client.ts`)).status, 404, 'non-allowlisted extension must return 404');
@@ -267,7 +270,7 @@ test('Web chat accepts a folder path and completes reads for every nested file',
     assert.equal(work.operations.length, 2);
     assert.ok(work.operations.every((operation: { status: string }) => operation.status === 'succeeded'));
     const html = await (await fetch(f.base)).text();
-    assert.match(html, /文件或文件夹/);
+    assert.doesNotMatch(html, /id="paths-disclosure"/);
     assert.doesNotMatch(html, /不接受目录/);
   } finally { await f.close(); }
 });
@@ -498,6 +501,9 @@ test('Web console lazy-loads health-scale UI, serves redacted PluginView metadat
     assert.match(html, /id="open-health-hub-top"/);
     assert.match(html, /id="health-hub-modal"/);
     assert.match(html, /id="health-trend-canvas"/);
+    assert.match(html, /id="open-fund-hub-top"/);
+    assert.match(html, /id="fund-hub-modal"/);
+    assert.match(html, /id="fund-trend-canvas"/);
     assert.doesNotMatch(html, /\sstyle="/i);
     assert.doesNotMatch(html, /<input[^>]+type=["']file["']/i);
     assert.doesNotMatch(html, /018168|192\.168\./, 'index.html must not contain hardcoded personal samples');
@@ -505,9 +511,12 @@ test('Web console lazy-loads health-scale UI, serves redacted PluginView metadat
     const clientJs = await (await fetch(`${f.base}/client.js`)).text();
     assert.match(clientJs, /import\(\s*['"]\.\/plugins\/health-scale-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load health-scale-ui.js');
     assert.doesNotMatch(clientJs, /healthDashboard/, 'health-scale dashboard logic must not be eagerly bundled into client.js');
+    assert.match(clientJs, /import\(\s*['"]\.\/plugins\/fund-tracker-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load fund-tracker-ui.js');
 
     const healthUiJs = await (await fetch(`${f.base}/plugins/health-scale-ui.js`)).text();
     assert.match(healthUiJs, /initHealthScaleUi/);
+    const fundUiJs = await (await fetch(`${f.base}/plugins/fund-tracker-ui.js`)).text();
+    assert.match(fundUiJs, /initFundTrackerUi/);
 
     const viewRes = await (await fetch(`${f.base}/api/view`, { headers: f.headers })).json() as MainView;
     for (const plugin of viewRes.plugins ?? []) {
@@ -552,5 +561,135 @@ test('Web console lazy-loads health-scale UI, serves redacted PluginView metadat
     })).json() as { ok: boolean; data?: { records: unknown[] } };
     assert.equal(dashRes.ok, true);
     assert.equal(dashRes.data?.records.length, 1);
+
+    const fundDashRes = await (await fetch(`${f.base}/api/plugin-run`, {
+      method: 'POST',
+      headers: f.headers,
+      body: JSON.stringify({ plugin: 'fund-tracker', action: 'dashboard', args: { offline: true } }),
+    })).json() as { ok: boolean; notify: boolean; plugin: string; data?: { holdings: unknown[]; snapshots: unknown[] } };
+    assert.equal(fundDashRes.ok, true);
+    assert.equal(fundDashRes.notify, false);
+    assert.equal(fundDashRes.plugin, 'fund-tracker');
+    assert.equal(Array.isArray(fundDashRes.data?.holdings), true);
+    assert.equal(Array.isArray(fundDashRes.data?.snapshots), true);
   } finally { await f.close(); }
+});
+
+test('Web console and mindmap expose dual-skin theme switching, streamlined workspace, and zero inline styles', async () => {
+  const f = await fixture();
+  try {
+    const themeRes = await fetch(`${f.base}/shared/theme.js`);
+    assert.equal(themeRes.status, 200);
+    assert.match(themeRes.headers.get('content-type') ?? '', /javascript/);
+    const themeJs = await themeRes.text();
+    for (const sym of ['getUiTheme', 'setUiTheme', 'bindThemeButtons', 'initDesktopDrawers']) {
+      assert.ok(themeJs.includes(sym), `shared/theme.js must export ${sym}`);
+    }
+    assert.doesNotMatch(themeJs, /\.style\./);
+    assert.doesNotMatch(themeJs, /\.innerHTML\b/);
+
+    const indexHtml = await (await fetch(f.base)).text();
+    assert.match(indexHtml, /<html[^>]+data-theme="spatial"/);
+    assert.match(indexHtml, /viewport-fit=cover/);
+    for (const marker of [
+      'id="theme-spatial-btn"',
+      'id="theme-industrial-btn"',
+      'id="desktop-work-fold"',
+      'id="desktop-trace-fold"',
+      'id="companion-avatar"',
+      'id="emote-toggle"',
+      'id="bot-emote-tray"',
+      'id="send"',
+      'class="send-arrow-icon"',
+      'class="hub-svg-icon"',
+    ]) {
+      assert.ok(indexHtml.includes(marker), `index.html must include ${marker}`);
+    }
+    for (const removed of [
+      'id="mode"',
+      'id="stop-work"',
+      'id="paths-disclosure"',
+      'id="te-oled-strip"',
+      '与 F.R.I.D.A.Y. 对话',
+    ]) {
+      assert.ok(!indexHtml.includes(removed), `index.html must not include ${removed}`);
+    }
+    assert.doesNotMatch(indexHtml, /\sstyle="/i);
+
+    const mindmapHtml = await (await fetch(`${f.base}/mindmap`)).text();
+    assert.match(mindmapHtml, /<html[^>]+data-theme="spatial"/);
+    assert.match(mindmapHtml, /viewport-fit=cover/);
+    assert.match(mindmapHtml, /id="mm-theme-spatial"/);
+    assert.match(mindmapHtml, /id="mm-theme-industrial"/);
+    assert.doesNotMatch(mindmapHtml, /\sstyle="/i);
+
+    const styleCss = await (await fetch(`${f.base}/style.css`)).text();
+    assert.ok(styleCss.includes('html[data-theme="spatial"]'));
+    assert.ok(styleCss.includes('html[data-theme="industrial"]'));
+    assert.ok(styleCss.includes('(pointer: coarse)'));
+    assert.ok(styleCss.includes('font-size:16px'));
+
+    const mindmapCss = await (await fetch(`${f.base}/mindmap.css`)).text();
+    assert.ok(mindmapCss.includes('html[data-theme="spatial"]'));
+    assert.ok(mindmapCss.includes('html[data-theme="industrial"]'));
+  } finally {
+    await f.close();
+  }
+});
+
+test('Web supports --no-auth LAN mode with allowHosts while preserving Host and Origin protections', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-web-lan-'));
+  const daemon = await serve({ home, mode: 'offline', offlineDelayMs: 30 });
+  const web = await startWeb({
+    home,
+    host: '127.0.0.1',
+    allowHosts: ['livis.bot', '192.168.31.124:3210'],
+    auth: false,
+  });
+  try {
+    const entry = new URL(web.url);
+    assert.equal(entry.hash, '');
+    const page = await raw(entry.origin, { host: 'livis.bot' });
+    assert.equal(page.status, 200);
+    const setCookie = Array.isArray(page.headers['set-cookie'])
+      ? page.headers['set-cookie'].join('; ')
+      : (page.headers['set-cookie'] ?? '');
+    assert.match(setCookie, /friday_auth_mode=none/);
+    assert.match(setCookie, /SameSite=Strict/);
+
+    const view = await raw(`${entry.origin}/api/view`, { host: 'livis.bot' });
+    assert.equal(view.status, 200);
+    const viewJson = JSON.parse(view.text) as MainView;
+    assert.ok(typeof viewJson.cursor === 'number');
+
+    const chat = await raw(`${entry.origin}/api/chat`, {
+      host: 'livis.bot',
+      origin: 'http://livis.bot',
+      'content-type': 'application/json',
+    }, {
+      method: 'POST',
+      body: JSON.stringify({ requestId: randomUUID(), text: 'LAN hello', files: [] }),
+    });
+    assert.equal(chat.status, 200);
+
+    const crossOrigin = await raw(`${entry.origin}/api/view`, {
+      host: 'livis.bot',
+      origin: 'https://evil.example',
+    });
+    assert.equal(crossOrigin.status, 403);
+
+    const badHost = await raw(`${entry.origin}/api/view`, {
+      host: 'rebound.example',
+    });
+    assert.equal(badHost.status, 403);
+
+    const chatJs = await raw(`${entry.origin}/panels/chat.js`, { host: 'livis.bot' });
+    assert.equal(chatJs.status, 200);
+    assert.doesNotMatch(chatJs.text, /crypto\.randomUUID/);
+    assert.match(chatJs.text, /\bmakeRequestId\b/);
+  } finally {
+    await web.close();
+    await daemon.close();
+    await rm(home, { recursive: true, force: true });
+  }
 });

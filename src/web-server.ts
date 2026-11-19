@@ -333,9 +333,34 @@ function createSseBroadcaster(home: string) {
   };
 }
 
-export async function startWeb(options: { home: string; port?: number }): Promise<{ url: string; home: string; close(): Promise<void> }> {
+export interface StartWebOptions {
+  home: string;
+  port?: number;
+  host?: string;
+  allowHosts?: readonly string[];
+  auth?: boolean;
+  token?: string;
+}
+
+export async function startWeb(options: StartWebOptions): Promise<{ url: string; home: string; close(): Promise<void> }> {
   const home = resolve(options.home);
   const port = integer(options.port, 0, 0, 65535);
+  const bindHost = options.host?.trim() || '127.0.0.1';
+  const requireAuth = options.auth !== false;
+  if (options.token !== undefined && !/^[a-f\d]{64}$/i.test(options.token)) {
+    throw new Error('Web token must be a 64-character hex string');
+  }
+  const normalizedAllowHosts: string[] = [];
+  for (const rawEntry of options.allowHosts ?? []) {
+    for (const part of rawEntry.split(',')) {
+      const trimmed = part.trim();
+      if (!trimmed) continue;
+      if (!isValidHttpHostHeader(trimmed)) {
+        throw new Error(`Invalid allowed Host: ${trimmed}`);
+      }
+      normalizedAllowHosts.push(trimmed.toLowerCase());
+    }
+  }
   await bridge(home, { command: 'health' });
   const assetCache = new Map<string, Buffer>();
   const loadAsset = async (filePath: string) => {
@@ -355,9 +380,10 @@ export async function startWeb(options: { home: string; port?: number }): Promis
   if (!indexAsset) throw new Error('Missing web entrypoint');
   await loadAsset(indexAsset.filePath);
   const sseBroadcaster = createSseBroadcaster(home);
-  const token = randomBytes(32).toString('hex');
-  const credential = Buffer.from(`Bearer ${token}`);
+  const token = requireAuth ? (options.token ?? randomBytes(32).toString('hex')) : '';
+  const credential = requireAuth ? Buffer.from(`Bearer ${token}`) : undefined;
   let host = '';
+  const allowedHosts = new Set<string>();
   const connections = new Set<Socket>();
   const server = createServer({ maxHeaderSize: 8192, requestTimeout: 15000, headersTimeout: 10000 }, (incoming, response) => {
     response.setHeader('content-security-policy', policy);
@@ -368,14 +394,15 @@ export async function startWeb(options: { home: string; port?: number }): Promis
     response.setHeader('cross-origin-opener-policy', 'same-origin');
     void (async () => {
       if (!isValidHttpHostHeader(incoming.headers.host)) throw new HttpFailure(403, 'Invalid local Host');
-      const origin = `http://${host}`;
+      const reqHost = incoming.headers.host.toLowerCase();
+      const reqOrigin = new URL(`http://${reqHost}`).origin;
       let url: URL;
       try {
-        url = new URL(incoming.url ?? '/', origin);
+        url = new URL(incoming.url ?? '/', reqOrigin);
       } catch {
         throw new HttpFailure(400, 'Malformed request URL');
       }
-      if (url.origin !== origin) throw new HttpFailure(403, 'Invalid request origin');
+      if (url.origin !== reqOrigin) throw new HttpFailure(403, 'Invalid request origin');
       if (url.pathname.startsWith('/im/webhook/')) {
         if ('origin' in incoming.headers || 'sec-fetch-site' in incoming.headers) {
           throw new HttpFailure(403, 'Cross-site browser webhook access is forbidden');
@@ -404,7 +431,7 @@ export async function startWeb(options: { home: string; port?: number }): Promis
         response.end(method === 'HEAD' ? undefined : result.body);
         return;
       }
-      if (incoming.headers.host !== host) throw new HttpFailure(403, 'Invalid local Host');
+      if (!allowedHosts.has(reqHost)) throw new HttpFailure(403, 'Invalid local Host');
       if (!url.pathname.startsWith('/api/')) {
         if (!['GET', 'HEAD'].includes(incoming.method ?? '')) throw new HttpFailure(404, 'Not found');
         const rawPath = (incoming.url ?? '/').split('?')[0] ?? '/';
@@ -412,20 +439,30 @@ export async function startWeb(options: { home: string; port?: number }): Promis
         const asset = resolveStaticAsset(url.pathname);
         if (!asset) throw new HttpFailure(404, 'Not found');
         const bytes = await loadAsset(asset.filePath);
-        response.writeHead(200, { 'content-type': asset.mime });
+        const headers: Record<string, string> = { 'content-type': asset.mime };
+        if (asset.mime.startsWith('text/html')) {
+          if (!requireAuth) {
+            headers['set-cookie'] = 'friday_auth_mode=none; Path=/; SameSite=Strict';
+          } else if (typeof incoming.headers.cookie === 'string' && incoming.headers.cookie.includes('friday_auth_mode=')) {
+            headers['set-cookie'] = 'friday_auth_mode=; Path=/; Max-Age=0; SameSite=Strict';
+          }
+        }
+        response.writeHead(200, headers);
         response.end(incoming.method === 'HEAD' ? undefined : bytes);
         return;
       }
       const secFetchSite = incoming.headers['sec-fetch-site'];
       if (
-        (incoming.headers.origin && incoming.headers.origin !== origin)
+        (incoming.headers.origin && incoming.headers.origin.toLowerCase() !== reqOrigin)
         || (typeof secFetchSite === 'string' && secFetchSite !== 'same-origin' && secFetchSite !== 'none')
       ) {
         throw new HttpFailure(403, 'Cross-origin API access is forbidden');
       }
-      const authorization = incoming.headers.authorization;
-      const supplied = Buffer.from(typeof authorization === 'string' ? authorization : '');
-      if (supplied.length !== credential.length || !timingSafeEqual(supplied, credential)) throw new HttpFailure(401, '请使用 web 命令输出的本地访问链接；访问令牌缺失或已失效。');
+      if (credential) {
+        const authorization = incoming.headers.authorization;
+        const supplied = Buffer.from(typeof authorization === 'string' ? authorization : '');
+        if (supplied.length !== credential.length || !timingSafeEqual(supplied, credential)) throw new HttpFailure(401, '请使用 web 命令输出的本地访问链接；访问令牌缺失或已失效。');
+      }
       const search = url.searchParams;
       const numeric = (name: string) => {
         if (!search.has(name)) return undefined;
@@ -493,6 +530,7 @@ export async function startWeb(options: { home: string; port?: number }): Promis
           case '/api/message': command = { command: 'message', messageId: search.get('messageId') }; break;
           case '/api/history': command = { command: 'history', before: numeric('before') }; break;
           case '/api/trace': command = { command: 'trace', messageId: search.get('messageId') ?? undefined, taskId: search.get('taskId') ?? undefined, after: numeric('after'), before: numeric('before') }; break;
+          case '/api/execution-trace': command = { command: 'execution-trace', taskId: search.get('taskId') ?? undefined, messageId: search.get('messageId') ?? undefined, limit: numeric('limit') }; break;
           case '/api/work': command = { command: 'get', taskId: search.get('taskId') }; break;
           case '/api/timers': command = { command: 'timer-list' }; break;
           case '/api/plugins': command = { command: 'plugin-list' }; break;
@@ -568,14 +606,35 @@ export async function startWeb(options: { home: string; port?: number }): Promis
   try {
     await new Promise<void>((resolve, reject) => {
       server.once('error', reject);
-      server.listen(port, '127.0.0.1', () => { server.off('error', reject); resolve(); });
+      server.listen(port, bindHost, () => { server.off('error', reject); resolve(); });
     });
   } catch (error) { server.close(); throw error; }
   const address = server.address();
   if (!address || typeof address === 'string') { server.close(); throw new Error('Local Web address unavailable'); }
-  host = `127.0.0.1:${address.port}`;
+  if (bindHost === '0.0.0.0' || bindHost === '::') {
+    host = `127.0.0.1:${address.port}`;
+  } else if (bindHost.includes(':') && !bindHost.startsWith('[')) {
+    host = `[${bindHost}]:${address.port}`;
+  } else {
+    host = `${bindHost}:${address.port}`;
+  }
+  allowedHosts.add(host.toLowerCase());
+  if (address.port === 80) {
+    allowedHosts.add(new URL(`http://${host}`).host.toLowerCase());
+  }
+  if (bindHost === '0.0.0.0' || bindHost === '::') {
+    allowedHosts.add(`127.0.0.1:${address.port}`);
+    allowedHosts.add(`localhost:${address.port}`);
+    if (address.port === 80) {
+      allowedHosts.add('127.0.0.1');
+      allowedHosts.add('localhost');
+    }
+  }
+  for (const allowed of normalizedAllowHosts) {
+    allowedHosts.add(allowed);
+  }
   let closing: Promise<void> | undefined;
-  return { home, url: `http://${host}/#token=${token}`, close: () => closing ??= (async () => {
+  return { home, url: requireAuth ? `http://${host}/#token=${token}` : `http://${host}/`, close: () => closing ??= (async () => {
     sseBroadcaster.closeAll();
     const closed = new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     for (const socket of connections) socket.destroy();

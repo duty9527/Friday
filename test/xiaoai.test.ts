@@ -69,7 +69,8 @@ import { Coordinator } from '../src/coordinator.js';
 import { compactHostEventText, offlineFactory, prepareRouterSessionModel, type AgentFactory } from '../src/agent.js';
 import { Store, type ImChannelConfig } from '../src/store.js';
 import { ImGateway } from '../src/im.js';
-import { tryPluginVoiceFastpath } from '../src/plugin.js';
+import { listPluginsSync, runPlugin, tryPluginVoiceFastpath } from '../src/plugin.js';
+import { resolvePluginDataDir } from '../src/paths.js';
 
 async function until(predicate: () => boolean | Promise<boolean>, attempts = 300) {
   for (let i = 0; i < attempts; i++) {
@@ -293,6 +294,8 @@ test('XiaoAI speech sanitization and segmentation', () => {
   assert.match(rejoined, /第二句/);
   assert.match(rejoined, /第三句/);
   assert.match(rejoined, /第四句/);
+
+  assert.equal(sanitizeForSpeech('好，已经开始监听体脂秤。'), '好，已经开始检测体脂秤。');
 });
 
 test('XiaoAI query interception, SSH multi-speaker target parsing, pollability, and webhook parsing', () => {
@@ -3638,6 +3641,258 @@ test('XiaoaiKwsMonitor early 120ms right-context lookahead flush triggers stream
     assert.equal(asrRescueCalls, 0, 'Streaming KWS should wake on 120ms early flush without falling back to offline ASR rescue');
 
     monitor.close();
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('XiaoaiKwsMonitor ASR rescue ignores faint non-member audio during recognition and recovers silent wakes', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-rescue-tv-'));
+  try {
+    const extractorFactory = createBandSpeakerExtractorFactory();
+    const manager = new XiaoaiSpeakerManager({ homeDir: home, extractorFactory });
+    const ownerEmb = manager.extractEmbedding(synthToneSamples(200, 1200))!;
+    manager.enrollEmbeddings({ name: '主人', role: 'owner', embeddings: [ownerEmb] });
+
+    let audioStream: PassThrough | undefined;
+    const wakeEvents: Array<{ keyword: string; chime?: boolean }> = [];
+    const cancelEvents: Array<{ keyword: string; reason: string }> = [];
+
+    const channel = makeChannel({
+      id: 'xiaoai-rescue-tv',
+      apiBase: 'ssh://lx06=root@192.0.2.104',
+    });
+
+    const monitor = new XiaoaiKwsMonitor({
+      homeDir: home,
+      cooldownMs: 40,
+      probeDurationMs: 25,
+      chimeDiscardMs: 20,
+      maxWaitSpeechMs: 1_200,
+      endSilenceMs: 60,
+      asrWakeRescue: true,
+      idleEnergyGate: false,
+      sshRunner: async () => ({ stdout: '', stderr: '', code: 0 }),
+      streamFactory: () => {
+        audioStream = new PassThrough();
+        return { stdout: audioStream, sampleFormat: 's16le', kill: () => audioStream?.end(), onClose: () => {} };
+      },
+      spotterFactory: () => ({
+        createStream: () => ({}),
+        acceptWaveform: () => {},
+        isReady: () => false,
+        decode: () => {},
+        getResult: () => '',
+        reset: () => {},
+      }),
+      recognizerFactory: () => ({
+        transcribe: async () => {
+          // Simulate ASR latency during which faint background / non-member TV audio arrives
+          await delay(90);
+          return '星期五。';
+        },
+      }),
+      vadFactory: () => ({
+        isSpeech: (samples) => computeRms(samples) >= 0.004,
+        reset: () => {},
+      }),
+      speakerGate: {
+        isActive: () => manager.isVerificationActive(),
+        verifyWake: ({ keyword, samples, sampleRate }) => manager.verifyWakeSlice(samples, sampleRate, keyword),
+        verifyUtterance: ({ samples, sampleRate }) => manager.verifyAndTrimUtterance(samples, sampleRate),
+      },
+      onWake: async (ev) => {
+        wakeEvents.push({ keyword: ev.keyword, chime: ev.chime });
+        return { woken: true, suppressed: false };
+      },
+      onCaptureCancel: (ev) => {
+        cancelEvents.push({ keyword: ev.keyword, reason: ev.reason });
+      },
+    });
+
+    monitor.sync([channel]);
+    await until(() => Boolean(audioStream));
+
+    const writeChunkedTone = (freqHz: number, totalMs: number, amp: number, chunkMs = 50) => {
+      for (let off = 0; off < totalMs; off += chunkMs) {
+        const dur = Math.min(chunkMs, totalMs - off);
+        audioStream!.write(encodeFloat32ToS16Le(synthToneSamples(freqHz, dur, amp)));
+      }
+    };
+
+    // Owner says "星期五" (600ms, amp=0.2) -> 350ms pause triggers ASR rescue -> faint/TV audio arrives during ASR
+    writeChunkedTone(200, 600, 0.2);
+    writeChunkedTone(0, 350, 0);
+    await delay(15);
+    // Faint background TV tone (3200Hz, amp=0.015 < minPostRms) during kwsRescueInFlight must NOT trigger silent live mode
+    writeChunkedTone(3200, 300, 0.015);
+
+    await until(() => wakeEvents.length === 1);
+    assert.deepEqual(wakeEvents[0], { keyword: '星期五', chime: true });
+    assert.equal(cancelEvents.length, 0);
+
+    monitor.close();
+    manager.close();
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('XiaoaiSpeakerManager preserves fullRes match on >2.2s utterances when trailing noise fails tailCheck and 1.2s sub-windows are borderline', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-fullres-preserve-'));
+  try {
+    // Custom extractor: full 2.8s utterance passes (0.61), 1.2s tail fails (0.15),
+    // and 1.2s sub-windows score 0.36 (< 0.39 anchorWindowThreshold when threshold=0.45 -> 0.45-0.06=0.39).
+    const factory = (): XiaoaiSpeakerExtractor => ({
+      dim: 2,
+      extract: (samples) => {
+        let s = 0.36;
+        if (samples.length >= SPEAKER_SAMPLE_RATE * 2.5) {
+          s = 0.61;
+        } else if (samples.length <= SPEAKER_SAMPLE_RATE * 1.25 && (samples[0] ?? 0) < 0) {
+          // Tail slice marker (negative samples)
+          s = 0.15;
+        }
+        return new Float32Array([s, Math.sqrt(Math.max(0, 1 - s * s))]);
+      },
+      free() {},
+    });
+
+    const manager = new XiaoaiSpeakerManager({ homeDir: home, extractorFactory: factory });
+    manager.enrollEmbeddings({ name: '主人', role: 'owner', embeddings: [new Float32Array([1, 0])] });
+    manager.configure({ threshold: 0.45 });
+
+    // 2.8s utterance: first 1.6s positive (owner), last 1.2s negative (TV tail)
+    const clip = new Float32Array(Math.round(SPEAKER_SAMPLE_RATE * 2.8));
+    clip.fill(0.2, 0, Math.round(SPEAKER_SAMPLE_RATE * 1.6));
+    clip.fill(-0.2, Math.round(SPEAKER_SAMPLE_RATE * 1.6));
+
+    const syncRes = manager.verifyAndTrimUtterance(clip, SPEAKER_SAMPLE_RATE);
+    const asyncRes = await manager.verifyAndTrimUtteranceAsync(clip, SPEAKER_SAMPLE_RATE);
+    for (const res of [syncRes, asyncRes]) {
+      assert.equal(res.matched, true, 'Full-clip match (0.61 >= 0.45) must not be overturned when 1.2s sub-windows miss anchor');
+      assert.equal(res.speaker?.name, '主人');
+      assert.equal(res.trimmed, false);
+    }
+    manager.close();
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('XiaoaiChannelAdapter auto-watches active health-scale session and announces completed measurement via TTS', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-measure-watch-'));
+  try {
+    const healthMeta = listPluginsSync(home).find(p => p.name === 'health-scale');
+    if (!healthMeta?.enabled) {
+      return;
+    }
+    await runPlugin(home, 'health-scale', 'profile-save', {
+      id: 'owner',
+      name: 'Boss',
+      sex: 'male',
+      age: 26,
+      heightCm: 176,
+      targetWeightKg: 80,
+      unit: 'kg',
+      setDefault: true,
+    });
+
+    const pluginDataDir = resolvePluginDataDir(home, 'health-scale');
+    const sessionPath = join(pluginDataDir, 'live-session.json');
+    const startedAt = Date.now();
+    await writeFile(sessionPath, JSON.stringify({
+      sessionId: 'meas-auto-watch-1',
+      profileId: 'owner',
+      pid: null,
+      phase: 'scanning',
+      startedAt,
+      updatedAt: startedAt,
+      timeoutSec: 45,
+      notifications: [],
+    }));
+
+    const routerFactory: AgentFactory = {
+      mode: 'real',
+      nativeTools: true,
+      async create(role) {
+        if (role !== 'router') return offlineFactory().create(role, role, []);
+        return {
+          close() {},
+          async prompt() {
+            return '秤已经开了，赤脚上去站好，45秒内。[[END]]';
+          },
+        };
+      },
+    };
+
+    const ttsPayloads: string[] = [];
+    const coordinator = new Coordinator(home, routerFactory, { skipExecutor: true });
+    await coordinator.ready();
+    try {
+      coordinator.im.xiaoaiDeps = {
+        measurePollIntervalMs: 30,
+        sshRunner: async (_target, remoteCommand) => {
+          if (remoteCommand.includes('text_to_speech')) {
+            ttsPayloads.push(remoteCommand);
+          }
+          return { stdout: '{"code":0,"info":"{ \\"status\\": 0 }"}', stderr: '', code: 0 };
+        },
+      };
+      coordinator.im.saveChannel({
+        id: 'xiaoai-watch',
+        platform: 'xiaoai',
+        name: '小爱自动播报测试',
+        enabled: true,
+        notifyAll: false,
+        allowedSenders: [],
+        apiBase: 'ssh://lx06=root@192.0.2.104',
+        defaultTarget: 'lx06',
+        pollIntervalMs: 50,
+      });
+      coordinator.im.start();
+
+      const res = await coordinator.im.ingestMessage({
+        channelId: 'xiaoai-watch',
+        externalId: 'ext-watch-1',
+        senderId: 'lx06',
+        target: 'lx06',
+        text: '再开一下体脂秤',
+        explicitWake: true,
+      });
+      assert.equal(res.action, 'routed_to_chat');
+
+      // Wait for Router reply TTS + assistant_reply hook to arm watch
+      await until(() => ttsPayloads.some(cmd => cmd.includes('秤已经开了')));
+      await delay(50);
+
+      // Write completed Scale27 BLE notifications (80.35 kg, 484 ohm) into live-session.json
+      await writeFile(sessionPath, JSON.stringify({
+        sessionId: 'meas-auto-watch-1',
+        profileId: 'owner',
+        pid: null,
+        phase: 'completed',
+        startedAt,
+        updatedAt: Date.now(),
+        timeoutSec: 45,
+        device: { address: 'D0:5C:00:3A:38:8C', name: 'AFU-WL-TZ-A1', rssi: -72 },
+        notifications: [
+          { hex: 'AC29806939DE020005400064000000000029D509' },
+          { hex: 'AC29020001E401A701806939DE0000000029D60F' },
+        ],
+      }));
+
+      await until(() => ttsPayloads.some(cmd => cmd.includes('测量完成') && cmd.includes('80.35')));
+      const history = coordinator.store.conversation.history(undefined, 20).items;
+      assert.ok(
+        history.some(m => m.role === 'user' && m.text === '[体脂秤实测同步]'),
+        'Completed auto-broadcast must be recorded in conversation history',
+      );
+      const dash = await runPlugin(home, 'health-scale', 'dashboard', {});
+      assert.equal(((dash.data as Record<string, unknown>).latest as Record<string, unknown>)?.weightKg, 80.35);
+    } finally {
+      await coordinator.close();
+    }
   } finally {
     await rm(home, { recursive: true, force: true });
   }

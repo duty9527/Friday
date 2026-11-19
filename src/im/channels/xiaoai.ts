@@ -88,10 +88,17 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
   private readonly fastpathSessions = new BoundedMap<string, FastpathSessionEntry>(128);
   private readonly outboundChains = new Map<string, Promise<void>>();
   private readonly prewarmedTargets = new Set<string>();
+  private readonly healthMeasureWatches = new Map<string, { sessionId: string; stop: () => void }>();
+  private readonly announcedMeasureSessions = new BoundedMap<string, number>(64);
 
   constructor(private readonly ctx: ImGatewayContext) {}
 
   async close(): Promise<void> {
+    for (const watch of [...this.healthMeasureWatches.values()]) {
+      watch.stop();
+    }
+    this.healthMeasureWatches.clear();
+    this.announcedMeasureSessions.clear();
     this.kwsMonitor?.close();
     this.kwsMonitor = undefined;
     this.kwsDepsRef = undefined;
@@ -391,6 +398,9 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
       const hookResult = msg.status === 'completed'
         ? await this.runAssistantReplyHook(channel, targetId, cleanBody)
         : undefined;
+      if (!this.ctx.isClosing()) {
+        this.handleFastpathMeasureHooks(channel.id, targetId, hookResult);
+      }
       const hookData = asRecord(hookResult?.data);
       const continuous = this.isContinuousFastpathActive(channel.id, targetId);
       const expectFollowUp = (msg.status === 'completed'
@@ -908,11 +918,165 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
       await setXiaoaiSpeakerLed(sshTarget, 'off', this.deps?.sshRunner).catch(() => {});
     }
 
+    this.handleFastpathMeasureHooks(channel.id, targetId, result);
+
     return {
       ok: result.ok ?? true,
       action: result.action ?? 'voice_fastpath',
       ...(recordedMessageId ? { messageId: recordedMessageId } : {}),
     };
+  }
+
+  private stopHealthMeasureWatch(key: string): void {
+    const existing = this.healthMeasureWatches.get(key);
+    if (existing) {
+      existing.stop();
+      this.healthMeasureWatches.delete(key);
+    }
+  }
+
+  private handleFastpathMeasureHooks(
+    channelId: string,
+    targetId: string,
+    result: VoiceFastpathResult | undefined,
+  ): void {
+    if (!result) return;
+    const key = `${channelId}:${targetId}`;
+    const dataObj = asRecord(result.data);
+    const announcedId = typeof dataObj?.announcedMeasureSessionId === 'string'
+      ? dataObj.announcedMeasureSessionId.trim()
+      : '';
+    if (announcedId) {
+      this.announcedMeasureSessions.set(announcedId, Date.now());
+      if (this.healthMeasureWatches.get(key)?.sessionId === announcedId) {
+        this.stopHealthMeasureWatch(key);
+      }
+    }
+    if (result.plugin === 'health-scale' && result.action === 'measure-stop') {
+      this.stopHealthMeasureWatch(key);
+    }
+    const watchId = typeof dataObj?.watchMeasureSessionId === 'string'
+      ? dataObj.watchMeasureSessionId.trim()
+      : '';
+    if (watchId) {
+      const timeoutSec = Number(dataObj?.timeoutSec ?? 45);
+      this.startHealthMeasureWatch(channelId, targetId, watchId, Number.isFinite(timeoutSec) ? timeoutSec : 45);
+    }
+  }
+
+  private startHealthMeasureWatch(
+    channelId: string,
+    targetId: string,
+    sessionId: string,
+    timeoutSec = 45,
+  ): void {
+    if (this.ctx.isClosing() || !sessionId || this.announcedMeasureSessions.has(sessionId)) {
+      return;
+    }
+    const key = `${channelId}:${targetId}`;
+    const existing = this.healthMeasureWatches.get(key);
+    if (existing?.sessionId === sessionId) return;
+    existing?.stop();
+
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const entry = {
+      sessionId,
+      stop: () => {
+        stopped = true;
+        if (timer) {
+          clearTimeout(timer);
+          timer = undefined;
+        }
+        if (this.healthMeasureWatches.get(key) === entry) {
+          this.healthMeasureWatches.delete(key);
+        }
+      },
+    };
+    this.healthMeasureWatches.set(key, entry);
+
+    const pollIntervalMs = Math.max(20, this.deps?.measurePollIntervalMs ?? 1_500);
+    const deadline = Date.now() + (Math.min(120, Math.max(10, timeoutSec)) + 8) * 1000;
+
+    void (async () => {
+      try {
+        while (!stopped && !this.ctx.isClosing() && Date.now() <= deadline) {
+          await new Promise<void>((resolve) => {
+            timer = setTimeout(() => {
+              timer = undefined;
+              resolve();
+            }, pollIntervalMs);
+            timer.unref?.();
+          });
+          if (stopped || this.ctx.isClosing()) break;
+
+          const pollRes = await this.ctx.runVoiceFastpath({
+            text: '',
+            channelId,
+            platform: 'xiaoai',
+            targetId,
+            allowedPlugins: ['health-scale'],
+            sessionState: {
+              event: 'measure_poll',
+              watchMeasureSessionId: sessionId,
+            },
+          }).catch(() => undefined);
+
+          if (stopped || this.ctx.isClosing() || !pollRes?.handled) break;
+
+          const dataObj = asRecord(pollRes.data);
+          const phase = String(dataObj?.phase ?? '');
+          if (['scanning', 'connecting', 'measuring'].includes(phase)) {
+            continue;
+          }
+
+          entry.stop();
+          if (phase === 'superseded' || this.announcedMeasureSessions.has(sessionId)) {
+            break;
+          }
+          this.announcedMeasureSessions.set(sessionId, Date.now());
+
+          const speech = pollRes.speech?.trim();
+          if (!speech) break;
+
+          if (phase === 'completed' && this.ctx.coordinator.recordFastpathTurn) {
+            const replyId = randomUUID();
+            this.ctx.markMessageDelivered(replyId, Number.MAX_SAFE_INTEGER);
+            try {
+              const ch = this.ctx.coordinator.store.getImChannel(channelId);
+              const recorded = await Promise.resolve(this.ctx.coordinator.recordFastpathTurn({
+                channelId,
+                senderId: targetId,
+                senderName: targetId,
+                userText: '[体脂秤实测同步]',
+                replyText: `${speech} [[END]]`,
+                pluginName: 'health-scale',
+                action: 'measure-completed',
+                latencyMs: 0,
+                replyId,
+                origin: {
+                  channel: ch.platform,
+                  channelId: ch.id,
+                  accountId: ch.accountId,
+                  conversationId: targetId,
+                  senderId: targetId,
+                },
+              }));
+              if (recorded?.replyMessage?.id) {
+                this.ctx.markMessageDelivered(recorded.replyMessage.id, Number.MAX_SAFE_INTEGER);
+              }
+            } catch {
+              this.ctx.clearMessageDelivered(replyId);
+            }
+          }
+
+          this.enqueueDirectSpeech(channelId, targetId, speech);
+          break;
+        }
+      } finally {
+        entry.stop();
+      }
+    })();
   }
 
   private async handleKwsCaptureCancel(event: {

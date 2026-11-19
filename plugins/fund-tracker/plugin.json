@@ -5,7 +5,7 @@
   "promptHint": "管理基金持仓（add-holding/remove-holding/set-holding/config）与查询盘中估值/晚间正式净值结算（status/noon/settle）。",
   "description": "独立基金持仓管理、盘中多源实时估值（12:00）与晚间正式净值结算（21:30）插件。使用 Node 22 内置 node:sqlite 与 fetch，个人持仓从 <pluginDataDir>/config.json 加载。",
   "entry": "index.mjs",
-  "actions": ["status", "noon", "settle", "init", "config", "add-holding", "remove-holding", "set-holding"],
+  "actions": ["status", "noon", "settle", "dashboard", "init", "config", "add-holding", "remove-holding", "set-holding"],
   "actionSpecs": [
     {
       "name": "status",
@@ -23,6 +23,12 @@
       "name": "settle",
       "label": "21:30 晚间正式结算",
       "description": "交易日 21:30 触发：从东方财富拉取当日最新正式单位净值入库结算，区分已出当日净值基金与 QDII 待更新基金；周末默认静默跳过，传 force:true 可强制输出。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "dashboard",
+      "label": "Web 投资管理看板数据",
+      "description": "供 Web 顶栏与投资管理看板读取持仓汇总、历史快照走势与基金净值历史（传 refresh:true 实时拉取最新净值与行情；默认静默读取缓存，不触发推送）。",
       "defaultArgs": {}
     },
     {

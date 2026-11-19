@@ -302,6 +302,7 @@ export function sanitizeForSpeech(text: string): string {
   result = result.replace(/^[•\-*]\s+/gm, '');
   result = result.replace(/\*\*|__|\*/g, '');
   result = result.replace(/`/g, '');
+  result = result.replace(/监听/g, '检测');
 
   result = result.replace(/([。！？；：.!?;:，,、])[ \t]*\n+\s*/g, '$1');
   result = result.replace(/[ \t]*\n{2,}\s*/g, '。');

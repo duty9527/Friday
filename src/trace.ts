@@ -32,7 +32,7 @@ export class PromptTrace {
       else if (!this.timer) { this.timer = setTimeout(() => this.flush(), 100); this.timer.unref(); }
     } else if (event.kind === 'turn_start') {
       this.flush(); this.currentTurn = id;
-      this.span(id, this.id, '模型推理调用', 'started');
+      this.span(id, this.id, '模型推理调用', 'started', event.data);
     }
     else if (event.kind === 'turn_end') {
       this.flush();

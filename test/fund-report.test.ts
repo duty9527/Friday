@@ -4,7 +4,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Coordinator } from '../src/coordinator.js';
 import { offlineFactory } from '../src/agent.js';
-import { parseQuoteTimestamp, runAction as runFundTrackerAction } from '../plugins/fund-tracker/index.mjs';
+import { expectedUsQdiiNavDate, parseQuoteTimestamp, runAction as runFundTrackerAction } from '../plugins/fund-tracker/index.mjs';
 import { until } from './helpers/async.js';
 import { withTempHome } from './helpers/tmp-home.js';
 
@@ -278,5 +278,199 @@ test('fund-tracker parses HK/US/A-share quote timestamps, degrades gracefully pe
     assert.equal(stockRow2?.quoteMissing, true);
     assert.equal(stockRow2?.dailyPnl, 0);
     assert.equal(summary2.stocks.dailyPnl, 0);
+  });
+});
+
+test('fund-tracker settles US QDII T-1 NAV on winter 21:30 settle, switches to live estimation at 23:30, handles US holidays cleanly, and serves dashboard', async () => {
+  await withTempHome('friday-fund-qdii-', async home => {
+    const pluginDataDir = join(home, 'plugins', 'fund-tracker');
+    await mkdir(pluginDataDir, { recursive: true, mode: 0o700 });
+    await writeFile(join(pluginDataDir, 'config.json'), JSON.stringify({
+      holdings: [
+        {
+          code: '018064',
+          name: '华夏标普500ETF发起式联接(QDII)A',
+          fundType: 'us_qdii',
+          proxySymbol: '',
+          proxyName: '',
+          positionRatio: 0.95,
+          initAmount: 7000,
+          cost: 7000,
+          initNav: 1.565,
+          initNavDate: '2025-10-01',
+          shares: 4472.7389,
+        },
+        {
+          code: '016055',
+          name: '博时纳斯达克100ETF发起式联接(QDII)A',
+          fundType: 'us_qdii',
+          proxySymbol: 'usNDX',
+          proxyName: '纳斯达克100',
+          positionRatio: 0.95,
+          initAmount: 318.66,
+          cost: 300,
+          initNav: 1.9969,
+          initNavDate: '2026-11-09',
+          shares: 159.5773,
+        },
+      ],
+    }), { mode: 0o600 });
+
+    assert.equal(expectedUsQdiiNavDate({ date: '2026-11-18', weekday: 'Wed', isWeekend: false }), '2026-11-17');
+    assert.equal(expectedUsQdiiNavDate({ date: '2026-11-16', weekday: 'Mon', isWeekend: false }), '2026-11-13');
+    assert.equal(expectedUsQdiiNavDate({ date: '2026-11-21', weekday: 'Sat', isWeekend: true }), null);
+
+    // 1. Update proxySymbol via set-holding
+    const setProxy = await runFundTrackerAction('set-holding', {
+      code: '018064',
+      proxySymbol: 'usINX',
+      proxyName: '标普500',
+    }, { pluginDataDir });
+    assert.equal(setProxy.ok, true);
+    assert.equal((setProxy.data as Record<string, unknown>)?.proxy_symbol, 'usINX');
+    assert.equal((setProxy.data as Record<string, unknown>)?.proxy_name, '标普500');
+
+    const makeQuoteLine = (key: string, name: string, code: string, price: string, prevClose: string, quoteTime: string, changePct: string) => {
+      const parts = new Array(40).fill('0');
+      parts[0] = '200';
+      parts[1] = name;
+      parts[2] = code;
+      parts[3] = price;
+      parts[4] = prevClose;
+      parts[30] = quoteTime;
+      parts[32] = changePct;
+      return `v_${key}="${parts.join('~')}";`;
+    };
+
+    let quotePhase: 'pre_open' | 'night_open' | 'holiday' = 'pre_open';
+    const mockFetch: typeof fetch = async input => {
+      const url = String(input);
+      if (url.includes('api.fund.eastmoney.com')) {
+        if (quotePhase === 'holiday') {
+          return new Response(JSON.stringify({
+            Data: {
+              LSJZList: [
+                { FSRQ: '2026-11-16', DWJZ: url.includes('018064') ? '1.6397' : '1.9479', LJJZ: '1.6397', JZZZL: '-1.83' },
+              ],
+            },
+          }), { status: 200 });
+        }
+        if (url.includes('fundCode=018064')) {
+          return new Response(JSON.stringify({
+            Data: {
+              LSJZList: [
+                { FSRQ: '2026-11-17', DWJZ: '1.6228', LJJZ: '1.6228', JZZZL: '-1.03' },
+                { FSRQ: '2026-11-16', DWJZ: '1.6397', LJJZ: '1.6397', JZZZL: '-1.83' },
+              ],
+            },
+          }), { status: 200 });
+        }
+        return new Response(JSON.stringify({
+          Data: {
+            LSJZList: [
+              { FSRQ: '2026-11-17', DWJZ: '1.9343', LJJZ: '1.9343', JZZZL: '-0.70' },
+              { FSRQ: '2026-11-16', DWJZ: '1.9479', LJJZ: '1.9479', JZZZL: '-2.55' },
+            ],
+          },
+        }), { status: 200 });
+      }
+      if (quotePhase === 'pre_open') {
+        return new Response(new TextEncoder().encode([
+          makeQuoteLine('usINX', '标普500', '.INX', '7340.53', '7393.00', '2026-11-17 17:15:59', '-0.71'),
+          makeQuoteLine('usNDX', '纳斯达克100', 'NDX', '27001.78', '27198.00', '2026-11-17 17:15:59', '-0.72'),
+        ].join('\n')), { status: 200 });
+      }
+      if (quotePhase === 'night_open') {
+        return new Response(new TextEncoder().encode([
+          makeQuoteLine('usINX', '标普500', '.INX', '7324.54', '7340.53', '2026-11-18 10:30:00', '-0.22'),
+          makeQuoteLine('usNDX', '纳斯达克100', 'NDX', '27061.40', '27001.78', '2026-11-18 10:30:00', '0.22'),
+        ].join('\n')), { status: 200 });
+      }
+      return new Response(new TextEncoder().encode([
+        makeQuoteLine('usINX', '标普500', '.INX', '7393.00', '7393.00', '2026-11-16 17:15:59', '0.00'),
+        makeQuoteLine('usNDX', '纳斯达克100', 'NDX', '27198.00', '27198.00', '2026-11-16 17:15:59', '0.00'),
+      ].join('\n')), { status: 200 });
+    };
+
+    // 2. 21:30 settle on 2026-11-18 (winter): official 2026-11-17 NAV disclosed even though Tencent US quote is still 2026-11-17
+    const settleNow = Date.parse('2026-11-18T21:30:01+08:00');
+    const settleRes = await runFundTrackerAction('settle', {}, {
+      pluginDataDir,
+      nowFn: () => settleNow,
+      fetchFn: mockFetch,
+    });
+    assert.equal(settleRes.ok, true);
+    const settleMsg = String(settleRes.message ?? '');
+    assert.match(settleMsg, /华夏标普500.*当日 -75\.59（-1\.03%）.*✅ 正式净值\(2026-11-17，QDII晚间披露\)/);
+    assert.match(settleMsg, /博时纳斯达克100.*当日 -2\.17（-0\.70%）.*✅ 正式净值\(2026-11-17，QDII晚间披露\)/);
+    assert.doesNotMatch(settleMsg, /数据过期/);
+
+    // 3. Cached dashboard (refresh=false) reads today's settle snapshot silently (notify=false) and populates snapshots + navHistory
+    const dashCached = await runFundTrackerAction('dashboard', { refresh: false }, {
+      pluginDataDir,
+      nowFn: () => settleNow,
+      fetchFn: async () => { throw new Error('offline cached dashboard must not fetch'); },
+    });
+    assert.equal(dashCached.ok, true);
+    assert.equal(dashCached.notify, false);
+    const dashData = dashCached.data as {
+      summary: { totalDailyPnl: number; holdings: Array<{ code: string; hasTodayOfficialNav: boolean }> };
+      snapshots: Array<{ date: string; kind: string; dailyPnl: number }>;
+      navHistory: Record<string, Array<{ navDate: string; nav: number }>>;
+    };
+    assert.equal(dashData.summary.totalDailyPnl, -77.76);
+    assert.equal(dashData.summary.holdings.every(h => h.hasTodayOfficialNav), true);
+    assert.equal(dashData.snapshots.length, 1);
+    assert.equal(dashData.snapshots[0]?.kind, 'settle');
+    assert.equal(dashData.navHistory['018064']?.length, 2);
+
+    // 4. Night 23:30 status after US market opens switches to live night-session valuation on top of 2026-11-17 NAV
+    quotePhase = 'night_open';
+    const nightRes = await runFundTrackerAction('status', {}, {
+      pluginDataDir,
+      nowFn: () => Date.parse('2026-11-18T23:30:00+08:00'),
+      fetchFn: mockFetch,
+    });
+    assert.equal(nightRes.ok, true);
+    const nightMsg = String(nightRes.message ?? '');
+    assert.match(nightMsg, /华夏标普500.*盘中估值\(锚定标普500 -0\.22%，报价时间 2026-11-18 10:30:00\)/);
+    assert.match(nightMsg, /博时纳斯达克100.*盘中估值\(锚定纳斯达克100 \+0\.22%，报价时间 2026-11-18 10:30:00\)/);
+
+    // 5. US holiday: Eastmoney and Tencent stop cleanly at an earlier date -> calm holiday label instead of stale error
+    await withTempHome('friday-fund-holiday-', async holidayHome => {
+      const holidayDir = join(holidayHome, 'plugins', 'fund-tracker');
+      await mkdir(holidayDir, { recursive: true, mode: 0o700 });
+      await writeFile(join(holidayDir, 'config.json'), JSON.stringify({
+        holdings: [
+          {
+            code: '018064',
+            name: '华夏标普500ETF发起式联接(QDII)A',
+            fundType: 'us_qdii',
+            proxySymbol: 'usINX',
+            proxyName: '标普500',
+            positionRatio: 0.95,
+            initAmount: 7000,
+            cost: 7000,
+            initNav: 1.6397,
+            initNavDate: '2026-11-16',
+            shares: 4472.7389,
+          },
+        ],
+      }), { mode: 0o600 });
+      quotePhase = 'holiday';
+      const holidayRes = await runFundTrackerAction('settle', {}, {
+        pluginDataDir: holidayDir,
+        nowFn: () => settleNow,
+        fetchFn: mockFetch,
+      });
+      assert.equal(holidayRes.ok, true);
+      const hMsg = String(holidayRes.message ?? '');
+      assert.match(hMsg, /📅 美股休市\/未开盘/);
+      assert.doesNotMatch(hMsg, /⚠️ 数据过期/);
+      const hSummary = holidayRes.data as { holdings: Array<{ dailyPnl: number; quoteStale?: boolean; usMarketClosed?: boolean }> };
+      assert.equal(hSummary.holdings[0]?.dailyPnl, 0);
+      assert.equal(hSummary.holdings[0]?.quoteStale, false);
+      assert.equal(hSummary.holdings[0]?.usMarketClosed, true);
+    });
   });
 });

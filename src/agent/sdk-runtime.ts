@@ -456,10 +456,43 @@ export class SdkAgent implements AgentPort {
         }
       }
       if (!onEvent) return;
-      if (event.type === 'turn_start') { turn = randomUUID(); onEvent({ kind: 'turn_start', id: turn }); }
+      if (event.type === 'turn_start') {
+        turn = randomUUID();
+        onEvent({
+          kind: 'turn_start',
+          id: turn,
+          data: {
+            provider: this.session.model?.provider || this.configuredModel?.provider,
+            model: this.session.model?.id || this.configuredModel?.id,
+          },
+        });
+      }
       else if (event.type === 'turn_end') {
         const message = event.message;
-        const publicText = message.role === 'assistant' ? message.content.filter(item => item.type === 'text').map(item => item.text).join('\n') : '';
+        const content = message.role === 'assistant' && Array.isArray(message.content) ? message.content : [];
+        const publicText = message.role === 'assistant' ? content.filter(item => item.type === 'text').map(item => item.text).join('\n') : '';
+        const toolCalls = content
+          .map(item => item as unknown as { type?: unknown; id?: unknown; name?: unknown; arguments?: unknown; input?: unknown })
+          .filter(item => item && (item.type === 'toolCall' || item.type === 'tool_use'))
+          .slice(0, 12)
+          .map(item => {
+            const rawArgs = item.arguments ?? item.input;
+            let argsStr = '';
+            if (typeof rawArgs === 'string') {
+              argsStr = rawArgs;
+            } else if (rawArgs !== undefined) {
+              try {
+                argsStr = JSON.stringify(rawArgs) ?? '';
+              } catch {
+                argsStr = String(rawArgs);
+              }
+            }
+            return {
+              id: typeof item.id === 'string' ? item.id : String(item.id ?? ''),
+              name: typeof item.name === 'string' ? item.name : String(item.name ?? ''),
+              argsPreview: argsStr.slice(0, 240),
+            };
+          });
         const errorMessage = message.role === 'assistant' && 'errorMessage' in message && typeof message.errorMessage === 'string'
           ? message.errorMessage.slice(0, 600)
           : undefined;
@@ -475,6 +508,7 @@ export class SdkAgent implements AgentPort {
                 usage: message.usage,
                 publicText: publicText.slice(0, 1600),
                 publicTextTruncated: publicText.length > 1600,
+                ...(toolCalls.length > 0 ? { toolCalls } : {}),
               }
             : undefined,
         });

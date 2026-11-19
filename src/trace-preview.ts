@@ -32,5 +32,5 @@ export function tracePreview(kind: 'input' | 'output', value: unknown): Record<s
 export function boundedTraceData(value: unknown): unknown {
   const safe = publicData(value);
   const encoded = JSON.stringify(safe);
-  return encoded && encoded.length > 3000 ? { preview: encoded.slice(0, 1500), truncated: true } : safe;
+  return encoded && encoded.length > 5200 ? { preview: encoded.slice(0, 2600), truncated: true } : safe;
 }

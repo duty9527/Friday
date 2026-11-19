@@ -496,6 +496,9 @@ test('health-scale handleVoiceFastpath handles start, retry, stop, status querie
       assert.equal(startRes.handled, true);
       assert.equal(startRes.action, 'measure-start');
       assert.equal(startRes.ok, true);
+      assert.doesNotMatch(String(startRes.speech), /监听/);
+      assert.match(String(startRes.speech), /赤脚上秤/);
+      assert.ok((startRes.data as Record<string, unknown>)?.watchMeasureSessionId);
 
       const stopRes = await mod.handleVoiceFastpath(
         { text: '停止称重', channelId: 'xiaoai-lx06', platform: 'xiaoai' },
@@ -505,6 +508,167 @@ test('health-scale handleVoiceFastpath handles start, retry, stop, status querie
       assert.equal(stopRes.action, 'measure-stop');
       assert.equal(stopRes.ok, true);
     }
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('health-scale smartly attributes live and offline history measurements across family profiles and supports measure_poll lifecycle', async () => {
+  const mod = await loadPluginModule();
+  const dataDir = mkdtempSync(join(tmpdir(), 'health-scale-multiuser-'));
+  try {
+    // Seed Boss (~80kg, default) and 郭蛋蛋 (~51kg)
+    await mod.runAction('profile-save', {
+      id: 'owner',
+      name: 'Boss',
+      sex: 'male',
+      age: 26,
+      heightCm: 176,
+      targetWeightKg: 80,
+      unit: 'kg',
+      setDefault: true,
+    }, { dataDir, nowFn: () => 1_700_000_000_000 });
+
+    const bSave = await mod.runAction('profile-save', {
+      name: '郭蛋蛋',
+      sex: 'female',
+      age: 23,
+      heightCm: 164,
+      setDefault: false,
+    }, { dataDir, nowFn: () => 1_700_000_005_000 });
+    const memberId = ((bSave.data as Record<string, unknown>).activeProfile as Record<string, unknown>).id as string;
+
+    await mod.runAction('record-add', {
+      profileId: 'owner',
+      weightKg: 80.1,
+      impedanceOhm: 470,
+    }, { dataDir, nowFn: () => 1_700_000_010_000 });
+
+    await mod.runAction('record-add', {
+      profileId: memberId,
+      weightKg: 51.0,
+    }, { dataDir, nowFn: () => 1_700_000_020_000 });
+
+    // Unspecified manual record ~50.4 kg routes automatically to 郭蛋蛋
+    const autoManual = await mod.runAction('record-add', {
+      weightKg: 50.4,
+      note: '自动归属测试',
+    }, { dataDir, nowFn: () => 1_700_000_030_000 });
+    assert.equal(autoManual.ok, true);
+    assert.equal(((autoManual.data as Record<string, unknown>).activeProfile as Record<string, unknown>).id, memberId);
+
+    // Explicit profileId still overrides smart attribution
+    const explicitManual = await mod.runAction('record-add', {
+      profileId: 'owner',
+      weightKg: 51.2,
+      note: '强制指定测试',
+    }, { dataDir, nowFn: () => 1_700_000_035_000 });
+    assert.equal(((explicitManual.data as Record<string, unknown>).activeProfile as Record<string, unknown>).id, 'owner');
+
+    // Simulate live measurement by 郭蛋蛋 (~50.6kg) + offline history (~48.65kg) while session.profileId was 'owner'
+    const w506 = Buffer.alloc(4);
+    w506.writeUInt32BE(encodeWeightU32(50600, { stable: true, dianji: 1 }), 0);
+    const weightBody = new Array<number>(16).fill(0);
+    weightBody[0] = w506[0]!; weightBody[1] = w506[1]!; weightBody[2] = w506[2]!; weightBody[3] = w506[3]!;
+    weightBody[4] = 1; weightBody[6] = 90;
+
+    const adcBody = new Array<number>(16).fill(0);
+    adcBody[0] = 2;
+    adcBody[2] = 0x02; adcBody[3] = 0x10; // 528 ohm
+    adcBody[4] = 0x01; adcBody[5] = 0xe0; // 480 ohm
+    adcBody[6] = 1;
+    adcBody[7] = w506[0]!; adcBody[8] = w506[1]!; adcBody[9] = w506[2]!; adcBody[10] = w506[3]!;
+
+    const histBody = new Array<number>(16).fill(0);
+    histBody[0] = 2;
+    const tsBuf = Buffer.alloc(4);
+    tsBuf.writeUInt32BE(1_699_900_000, 0);
+    histBody[1] = tsBuf[0]!; histBody[2] = tsBuf[1]!; histBody[3] = tsBuf[2]!; histBody[4] = tsBuf[3]!;
+    const hwBuf = Buffer.alloc(4);
+    hwBuf.writeUInt32BE(encodeWeightU32(48650, { stable: true, kgDiv: 0 }), 0);
+    histBody[5] = hwBuf[0]!; histBody[6] = hwBuf[1]!; histBody[7] = hwBuf[2]!; histBody[8] = hwBuf[3]!;
+    histBody[10] = 1; histBody[11] = 0x02; histBody[12] = 0x05;
+
+    // Active session first -> assistant_reply hook detects watch, measure_poll stays pending
+    const sessionPath = join(dataDir, 'live-session.json');
+    writeFileSync(sessionPath, JSON.stringify({
+      sessionId: 'meas-multi-1',
+      profileId: 'owner',
+      pid: null,
+      phase: 'scanning',
+      startedAt: 1_700_000_098_000,
+      updatedAt: 1_700_000_099_000,
+      timeoutSec: 45,
+      notifications: [],
+    }));
+    const watchHook = await mod.handleVoiceFastpath(
+      { text: '', channelId: 'xiaoai-lx06', platform: 'xiaoai', sessionState: { event: 'assistant_reply', assistantReply: '秤已经开了' } },
+      { dataDir, nowFn: () => 1_700_000_100_000 },
+    );
+    assert.equal(watchHook.handled, true);
+    assert.equal((watchHook.data as Record<string, unknown>)?.watchMeasureSessionId, 'meas-multi-1');
+
+    const pendingPoll = await mod.handleVoiceFastpath(
+      { text: '', channelId: 'xiaoai-lx06', platform: 'xiaoai', sessionState: { event: 'measure_poll', watchMeasureSessionId: 'meas-multi-1' } },
+      { dataDir, nowFn: () => 1_700_000_101_000 },
+    );
+    assert.equal(pendingPoll.handled, true);
+    assert.equal((pendingPoll.data as Record<string, unknown>)?.phase, 'scanning');
+
+    // Scale completes with 50.60kg live + 48.65kg history -> measure_poll ingests under 郭蛋蛋 and formats speech with her name
+    writeFileSync(sessionPath, JSON.stringify({
+      sessionId: 'meas-multi-1',
+      profileId: 'owner',
+      pid: null,
+      phase: 'completed',
+      startedAt: 1_700_000_098_000,
+      updatedAt: 1_700_000_110_000,
+      timeoutSec: 45,
+      device: { address: 'D0:5C:00:3A:38:8C', name: 'AFU-WL-TZ-A1', rssi: -72 },
+      notifications: [
+        { hex: buildScale27Packet(mod.PACKET_WEIGHT, 0x27, weightBody).toString('hex').toUpperCase() },
+        { hex: buildScale27Packet(mod.PACKET_ADC, 0x27, adcBody).toString('hex').toUpperCase() },
+        { hex: buildScale27Packet(mod.PACKET_HISTORY, 0x27, histBody).toString('hex').toUpperCase() },
+      ],
+    }));
+
+    const completedPoll = await mod.handleVoiceFastpath(
+      { text: '', channelId: 'xiaoai-lx06', platform: 'xiaoai', sessionState: { event: 'measure_poll', watchMeasureSessionId: 'meas-multi-1' } },
+      { dataDir, nowFn: () => 1_700_000_111_000 },
+    );
+    assert.equal(completedPoll.handled, true);
+    assert.equal(completedPoll.action, 'measure-completed');
+    assert.equal((completedPoll.data as Record<string, unknown>)?.matchedProfileId, memberId);
+    assert.match(String(completedPoll.speech), /^测量完成，郭蛋蛋最新体重50\.6公斤/);
+
+    // Verify Boss's records stayed clean (2 records: 80.1 + explicit 51.2) while 郭蛋蛋 gained both 50.6 and 48.65
+    const memberDash = await mod.runAction('dashboard', { profileId: memberId }, { dataDir, nowFn: () => 1_700_000_112_000 });
+    const memberWeights = ((memberDash.data as Record<string, unknown>).records as Array<Record<string, unknown>>).map(r => r.weightKg);
+    assert.ok(memberWeights.includes(50.6));
+    assert.ok(memberWeights.includes(48.65));
+
+    const bossDash = await mod.runAction('dashboard', { profileId: 'owner' }, { dataDir, nowFn: () => 1_700_000_112_000 });
+    const bossWeights = ((bossDash.data as Record<string, unknown>).records as Array<Record<string, unknown>>).map(r => r.weightKg);
+    assert.equal(bossWeights.includes(50.6), false);
+    assert.equal(bossWeights.includes(48.65), false);
+
+    // Timeout session returns friendly timeout speech
+    writeFileSync(sessionPath, JSON.stringify({
+      sessionId: 'meas-multi-2',
+      profileId: 'owner',
+      pid: null,
+      phase: 'timeout',
+      startedAt: 1_700_000_120_000,
+      updatedAt: 1_700_000_165_000,
+      timeoutSec: 45,
+    }));
+    const timeoutPoll = await mod.handleVoiceFastpath(
+      { text: '', channelId: 'xiaoai-lx06', platform: 'xiaoai', sessionState: { event: 'measure_poll', watchMeasureSessionId: 'meas-multi-2' } },
+      { dataDir, nowFn: () => 1_700_000_166_000 },
+    );
+    assert.equal(timeoutPoll.handled, true);
+    assert.equal(timeoutPoll.action, 'measure-timeout');
+    assert.match(String(timeoutPoll.speech), /超时/);
   } finally {
     rmSync(dataDir, { recursive: true, force: true });
   }

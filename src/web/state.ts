@@ -67,6 +67,11 @@ export const appState = {
   selectedSpan: undefined as string | undefined,
   workData: undefined as unknown,
   workRequest: 0,
+  traceBundle: undefined as unknown,
+  traceCategory: 'all' as 'all' | 'message' | 'llm' | 'tool' | 'routing',
+  selectedNodeId: undefined as string | undefined,
+  traceWide: false,
+  operationTextCache: new Map<string, { loading?: boolean; text?: string; error?: string }>(),
   voiceprintState: undefined as VoiceprintStatusView | undefined,
 };
 

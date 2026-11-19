@@ -19,7 +19,7 @@ import {
   tokenizeBotMessageText,
 } from '../shared/bot-expressions.js';
 import { button, element, node } from '../shared/dom.js';
-import { errorText, statusText, timestamp } from '../shared/format.js';
+import { errorText, makeRequestId, statusText, timestamp } from '../shared/format.js';
 import { api, appState, fetchMessagesBatch, hooks } from '../state.js';
 
 export interface ChatPanelController {
@@ -42,7 +42,6 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
   const historyErrorEl = element('history-error');
   const composerEl = element<HTMLFormElement>('composer');
   const draftEl = element<HTMLTextAreaElement>('draft');
-  const pathsEl = element<HTMLTextAreaElement>('paths');
   const sendBtn = element<HTMLButtonElement>('send');
   const emoteToggleBtn = element<HTMLButtonElement>('emote-toggle');
   const emoteTrayEl = element('bot-emote-tray');
@@ -74,6 +73,11 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     }
   }
 
+  function setEmoteTrayOpen(open: boolean): void {
+    emoteTrayEl.hidden = !open;
+    emoteToggleBtn.setAttribute('aria-expanded', String(open));
+  }
+
   function insertBotEmote(tag: string): void {
     if (draftEl.disabled || draftEl.readOnly) return;
     const start = draftEl.selectionStart ?? draftEl.value.length;
@@ -87,8 +91,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     const caret = before.length + snippet.length;
     draftEl.focus();
     draftEl.setSelectionRange(caret, caret);
-    emoteTrayEl.hidden = true;
-    emoteToggleBtn.setAttribute('aria-expanded', 'false');
+    setEmoteTrayOpen(false);
     setDraftTyping(true);
     updateComposer();
   }
@@ -105,27 +108,41 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     emoteTrayEl.append(itemBtn);
   }
 
-  emoteToggleBtn.addEventListener('click', () => {
+  emoteToggleBtn.addEventListener('click', event => {
+    event.stopPropagation();
     if (emoteToggleBtn.disabled) return;
-    const nextOpen = emoteTrayEl.hidden;
-    emoteTrayEl.hidden = !nextOpen;
-    emoteToggleBtn.setAttribute('aria-expanded', String(nextOpen));
+    setEmoteTrayOpen(emoteTrayEl.hidden);
+  });
+
+  document.addEventListener('click', event => {
+    if (emoteTrayEl.hidden) return;
+    if (event.target instanceof Node && (emoteTrayEl.contains(event.target) || emoteToggleBtn.contains(event.target))) {
+      return;
+    }
+    setEmoteTrayOpen(false);
+  });
+
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && !emoteTrayEl.hidden) {
+      setEmoteTrayOpen(false);
+    }
   });
 
   function updateComposer(): void {
     const locked = !appState.ready || appState.authExpired;
     draftEl.disabled = locked;
-    pathsEl.disabled = locked;
     draftEl.readOnly = appState.sending || appState.uncertain;
-    pathsEl.readOnly = appState.sending || appState.uncertain;
     const emoteLocked = locked || appState.sending || appState.uncertain;
     emoteToggleBtn.disabled = emoteLocked;
     if (emoteLocked && !emoteTrayEl.hidden) {
-      emoteTrayEl.hidden = true;
-      emoteToggleBtn.setAttribute('aria-expanded', 'false');
+      setEmoteTrayOpen(false);
     }
     sendBtn.disabled = locked || appState.sending || (!appState.uncertain && !draftEl.value.trim());
-    sendBtn.textContent = appState.sending ? '正在发送…' : appState.uncertain ? '重试原请求' : '发送 ↑';
+    const sendLabel = appState.sending ? '正在发送…' : appState.uncertain ? '重试原请求' : '发送消息';
+    sendBtn.setAttribute('aria-label', sendLabel);
+    sendBtn.title = sendLabel;
+    sendBtn.classList.toggle('is-sending', appState.sending);
+    sendBtn.classList.toggle('is-retry', appState.uncertain);
   }
 
   function mergeMessages(items: ChatMessage[]): void {
@@ -134,7 +151,6 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       appState.pending = undefined;
       appState.uncertain = false;
       draftEl.value = '';
-      pathsEl.value = '';
       sendErrorEl.textContent = '已从持久记录确认接收，无需重发。';
       updateComposer();
     }
@@ -523,12 +539,13 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     if (!appState.uncertain) {
       const text = draftEl.value.trim();
       if (!text) return;
-      const files = pathsEl.value.split(/\r?\n/).map(path => path.trim()).filter(Boolean);
-      if (files.length > 32 || files.some(path => path.length > 4096 || !path.startsWith('/') || path.includes('\0'))) {
-        sendErrorEl.textContent = '最多提供 32 个本机绝对路径（文件或文件夹，以 / 开头、每个不超过 4096 字符）；用于提示工作位置，由服务进一步校验。';
+      const files: string[] = [];
+      try {
+        appState.pending = { requestId: makeRequestId(), text, files };
+      } catch (error) {
+        sendErrorEl.textContent = `发送失败，草稿已保留：${errorText(error)}`;
         return;
       }
-      appState.pending = { requestId: crypto.randomUUID(), text, files };
     }
     if (!appState.pending) return;
     const submitted = appState.pending;
@@ -541,10 +558,8 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       appState.pending = undefined;
       appState.uncertain = false;
       draftEl.value = '';
-      pathsEl.value = '';
       setDraftTyping(false);
-      emoteTrayEl.hidden = true;
-      emoteToggleBtn.setAttribute('aria-expanded', 'false');
+      setEmoteTrayOpen(false);
       renderMessages();
       hooks.selectTrace({ type: 'message', id: accepted.id, label: submitted.text.slice(0, 80) });
       scrollEl.scrollTop = scrollEl.scrollHeight;
@@ -555,7 +570,6 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
         appState.pending = undefined;
         appState.uncertain = false;
         draftEl.value = '';
-        pathsEl.value = '';
         sendErrorEl.textContent = '已从持久记录确认接收，无需重发。';
         return;
       }
@@ -585,6 +599,9 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     }
   }
 
+  sendBtn.addEventListener('pointerdown', event => {
+    if (!sendBtn.disabled) event.preventDefault();
+  });
   composerEl.addEventListener('submit', event => {
     event.preventDefault();
     void send();
@@ -601,6 +618,13 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       event.preventDefault();
       void send();
     }
+  });
+  draftEl.addEventListener('blur', () => {
+    setTimeout(() => {
+      if (window.scrollY !== 0 || window.scrollX !== 0) {
+        window.scrollTo(0, 0);
+      }
+    }, 60);
   });
 
   let resizeTimer: ReturnType<typeof setTimeout> | undefined;

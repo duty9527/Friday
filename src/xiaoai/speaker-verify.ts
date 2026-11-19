@@ -1148,6 +1148,9 @@ export class XiaoaiSpeakerManager {
     }
 
     const { winLen, earlyLimit, starts } = buildUtteranceWindowPlan(samples.length, sampleRate);
+    const anchorWindowThreshold = opts?.thresholdOverride !== undefined
+      ? threshold
+      : Math.max(0.32, threshold - 0.06);
     let anchorProfile: XiaoaiSpeakerProfile | undefined;
     let anchorStartIdx = -1;
     let bestAnchorScore = 0;
@@ -1157,9 +1160,10 @@ export class XiaoaiSpeakerManager {
       if (start === undefined) continue;
       if (start > earlyLimit) break;
       const slice = samples.subarray(start, start + winLen);
-      const winMatch = this.matchSamples(slice, sampleRate, {
+      const evalSlice = trimShortUtteranceSilence(slice, sampleRate);
+      const winMatch = this.matchSamples(evalSlice, sampleRate, {
         speakerVerify: opts?.speakerVerify,
-        thresholdOverride: threshold,
+        thresholdOverride: anchorWindowThreshold,
       });
       if (winMatch.matched && winMatch.speaker) {
         const matchedSpeakerId = winMatch.speaker.id;
@@ -1174,6 +1178,13 @@ export class XiaoaiSpeakerManager {
     }
 
     if (!anchorProfile || anchorStartIdx < 0) {
+      if (fullRes.matched && fullRes.speaker) {
+        return enforceLeastPrivilegeOnMixedRoles(fullRes, tailRes, {
+          ...fullRes,
+          samples,
+          trimmed: false,
+        });
+      }
       return {
         ...fullRes,
         speaker: undefined,
@@ -1243,6 +1254,9 @@ export class XiaoaiSpeakerManager {
     }
 
     const { winLen, earlyLimit, starts } = buildUtteranceWindowPlan(samples.length, sampleRate);
+    const anchorWindowThreshold = opts?.thresholdOverride !== undefined
+      ? threshold
+      : Math.max(0.32, threshold - 0.06);
     let anchorProfile: XiaoaiSpeakerProfile | undefined;
     let anchorStartIdx = -1;
     let bestAnchorScore = 0;
@@ -1253,9 +1267,10 @@ export class XiaoaiSpeakerManager {
       if (start > earlyLimit) break;
       await yieldEventLoop();
       const slice = samples.subarray(start, start + winLen);
-      const winMatch = this.matchSamples(slice, sampleRate, {
+      const evalSlice = trimShortUtteranceSilence(slice, sampleRate);
+      const winMatch = this.matchSamples(evalSlice, sampleRate, {
         speakerVerify: opts?.speakerVerify,
-        thresholdOverride: threshold,
+        thresholdOverride: anchorWindowThreshold,
       });
       if (winMatch.matched && winMatch.speaker) {
         const matchedSpeakerId = winMatch.speaker.id;
@@ -1271,6 +1286,13 @@ export class XiaoaiSpeakerManager {
 
     if (!anchorProfile || anchorStartIdx < 0) {
       await yieldEventLoop();
+      if (fullRes.matched && fullRes.speaker) {
+        return enforceLeastPrivilegeOnMixedRoles(fullRes, tailRes, {
+          ...fullRes,
+          samples,
+          trimmed: false,
+        });
+      }
       return {
         ...fullRes,
         speaker: undefined,

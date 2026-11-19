@@ -1,28 +1,22 @@
 #!/usr/bin/env node
-// End-to-end check of the local Web conversation and trace in a real browser.
+// End-to-end check of the local Web conversation and Execution Chain Studio in a real browser.
 //
 //   node scripts/browser-check.mjs <entry-url> [--cdp-lib PATH] [--sample /absolute/path.txt] [--out-dir DIR]
 //
 // <entry-url> is the URL printed by `node dist/cli.js web`. The daemon behind it must be running
-// (offline mode is fine). Requires Node 22+ and an installed Chrome/Edge/Chromium, plus the
-// tasteskill CDP helper: pass --cdp-lib <path/to/lib/cdp.mjs> or set CDP_HELPER_PATH.
+// (offline mode is fine). Requires Node 22+ and Chromium/Playwright (or pass --cdp-lib <path/to/lib/cdp.mjs> / CDP_HELPER_PATH).
 // This script submits real messages to that daemon's transcript, so point it at a demo data directory.
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { resolve } from 'node:path';
 
 const args = process.argv.slice(2);
 const entryUrl = args.find(argument => /^https?:\/\//.test(argument));
 const option = (name) => { const index = args.indexOf(`--${name}`); return index === -1 ? undefined : args[index + 1]; };
 const helperPath = option('cdp-lib') ?? process.env.CDP_HELPER_PATH ?? process.env.CDP_HELPER;
-if (!helperPath) {
-  throw new Error('CDP helper path is required. Pass --cdp-lib <path/to/lib/cdp.mjs> or set CDP_HELPER_PATH.');
-}
-let cdp;
-try { cdp = await import(pathToFileURL(resolve(helperPath)).href); }
-catch { throw new Error(`CDP helper not found at ${helperPath}. Install the tasteskill CDP helper and set CDP_HELPER_PATH or pass --cdp-lib.`); }
-const { Browser, sleep } = cdp;
 
 if (!entryUrl) throw new Error('usage: node scripts/browser-check.mjs <entry-url from `web`> [--cdp-lib PATH] [--sample /abs/file.txt] [--out-dir DIR]');
 const outDir = resolve(option('out-dir') ?? option('out') ?? 'tmp/browser-smoke');
@@ -30,38 +24,117 @@ const samplePath = option('sample');
 const sample = samplePath ? resolve(samplePath) : undefined;
 if (sample) await writeFile(sample, 'Router maintains one continuous conversation.\nWorkers execute isolated read-only tasks.\n').catch(() => {});
 
+async function launchBrowserAdapter() {
+  if (helperPath) {
+    let cdp;
+    try { cdp = await import(pathToFileURL(resolve(helperPath)).href); }
+    catch { throw new Error(`CDP helper not found at ${helperPath}. Install the CDP helper or omit --cdp-lib to use Playwright.`); }
+    const { Browser, sleep } = cdp;
+    const browser = await Browser.launch();
+    const page = await browser.newPage({ width: 1440, height: 900 });
+    return { browser, page, sleep };
+  }
+
+  let playwright;
+  try {
+    playwright = await import('playwright');
+  } catch {
+    const candidates = [
+      process.env.PLAYWRIGHT_PATH,
+      join(homedir(), '.local/share/mise/installs/npm-playwright/latest/node_modules/playwright/index.mjs'),
+    ].filter(Boolean);
+    for (const candidate of candidates) {
+      if (existsSync(candidate)) {
+        playwright = await import(pathToFileURL(candidate).href);
+        break;
+      }
+    }
+  }
+  if (!playwright?.chromium) {
+    throw new Error('Playwright or --cdp-lib is required to run browser-check.mjs.');
+  }
+  const executablePath = existsSync('/usr/bin/chromium') ? '/usr/bin/chromium' : undefined;
+  const pwBrowser = await playwright.chromium.launch({
+    ...(executablePath ? { executablePath } : {}),
+    headless: true,
+    args: ['--no-sandbox'],
+  });
+  const context = await pwBrowser.newContext({ viewport: { width: 1440, height: 900 } });
+  const pwPage = await context.newPage();
+  const consoleErrors = [];
+  pwPage.on('console', msg => { if (msg.type() === 'error') consoleErrors.push(msg.text()); });
+  pwPage.on('pageerror', err => consoleErrors.push(err instanceof Error ? err.message : String(err)));
+  const sleep = (ms) => new Promise(resolveSleep => setTimeout(resolveSleep, ms));
+
+  const page = {
+    consoleErrors,
+    async goto(url, { settleMs = 250 } = {}) {
+      await pwPage.goto(url, { waitUntil: 'domcontentloaded' });
+      await sleep(settleMs);
+    },
+    async eval(fnOrExpr, arg) {
+      return pwPage.evaluate(fnOrExpr, arg);
+    },
+    async send(method, params = {}) {
+      if (method === 'Input.dispatchKeyEvent' && params.type === 'keyDown' && params.key) {
+        await pwPage.keyboard.press(params.key);
+      }
+    },
+    async setViewport({ width, height }) {
+      await pwPage.setViewportSize({ width, height });
+    },
+    async screenshot({ path, quality = 85 }) {
+      const isPng = String(path).toLowerCase().endsWith('.png');
+      await pwPage.screenshot({ path, ...(isPng ? {} : { type: 'jpeg', quality }) });
+    },
+  };
+  return {
+    browser: { close: () => pwBrowser.close() },
+    page,
+    sleep,
+  };
+}
+
 await mkdir(outDir, { recursive: true });
 const entry = new URL(entryUrl);
 const token = new URLSearchParams(entry.hash.slice(1)).get('token');
 assert.match(token ?? '', /^[a-f0-9]{64}$/, 'entry URL must carry the access token fragment');
-const browser = await Browser.launch();
-const page = await browser.newPage({ width: 1440, height: 900 });
+
+const { browser, page, sleep } = await launchBrowserAdapter();
 const checks = [];
 async function until(predicate, description, attempts = 200) {
   for (let attempt = 0; attempt < attempts; attempt++) { if (await predicate()) return; await sleep(100); }
   throw new Error(`Timed out: ${description}`);
 }
 const count = () => page.eval("document.querySelectorAll('#messages article').length");
-async function fill(text, paths = '') {
-  await page.eval(({ text, paths }) => {
+async function fill(text) {
+  await page.eval(({ text }) => {
     const draft = document.querySelector('#draft');
     draft.value = text;
     draft.dispatchEvent(new Event('input', { bubbles: true }));
-    document.querySelector('#paths').value = paths;
     draft.focus();
-  }, { text, paths });
+  }, { text });
 }
 const pressEnter = async () => {
   await page.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
   await page.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
 };
 const burst = (texts) => page.eval(async ({ texts }) => {
-  const token = sessionStorage.getItem('friday.local-access-token') ?? sessionStorage.getItem('super-agent.local-access-token');
+  const tok = sessionStorage.getItem('friday.local-access-token') ?? sessionStorage.getItem('super-agent.local-access-token');
   for (const text of texts) {
-    await fetch('/api/chat', { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ requestId: crypto.randomUUID(), text, files: [] }) });
+    await fetch('/api/chat', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ requestId: crypto.randomUUID(), text, files: [] }),
+    });
   }
 }, { texts });
+
+function assertNoRawJsonDump(text, label) {
+  assert.doesNotMatch(text, /^\s*(?:\{"[^"]+"\s*:|\[\s*\{)/m, `${label} must not contain raw JSON objects/arrays`);
+  assert.doesNotMatch(text, /\{"type"\s*:\s*"text"|\{"content"\s*:\s*\[|\{"input"\s*:\s*"\{/, `${label} must not leak raw protocol/tool JSON`);
+  assert.doesNotMatch(text, /sk-[A-Za-z0-9]{12,}/, `${label} must never expose credentials`);
+}
 
 try {
   await page.goto(entryUrl, { settleMs: 250 });
@@ -99,45 +172,140 @@ try {
   assert.equal(await page.eval("document.querySelectorAll('#messages img').length"), 0);
   checks.push('user and model text is rendered as text, never as HTML');
 
+  // Create a background work (with explicit authorized file if --sample provided, else via delegation command)
+  const usersBefore = await page.eval("document.querySelectorAll('#messages .user-message').length");
   if (sample) {
-    const usersBefore = await page.eval("document.querySelectorAll('#messages .user-message').length");
-    await fill('分析这份文件，说明职责边界', sample);
+    await page.eval(async ({ filePath }) => {
+      const tok = sessionStorage.getItem('friday.local-access-token') ?? sessionStorage.getItem('super-agent.local-access-token');
+      await fetch('/api/chat', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ requestId: crypto.randomUUID(), text: '分析这份文件，说明职责边界', files: [filePath] }),
+      });
+    }, { filePath: sample });
+  } else {
+    await fill('派发：代码审查与职责检查');
     await pressEnter();
-    await until(() => page.eval(`document.querySelectorAll('#messages .user-message').length === ${usersBefore + 1}`), 'the submitted message');
-    await until(() => page.eval("document.querySelectorAll('.work-row').length > 0"), 'background work');
-    await until(() => page.eval("[...document.querySelectorAll('.work-row')].some(x => x.innerText.includes('已完成'))"), 'work completion');
-    // Select exactly the work this message created, not an older work from an earlier message.
-    await until(() => page.eval("[...document.querySelectorAll('#messages .user-message')].at(-1)?.querySelector('.routing-summary .route-target') !== null && [...document.querySelectorAll('#messages .user-message')].at(-1)?.querySelector('.routing-summary .route-target') !== undefined"), 'routing target for the new work');
-    await page.eval(() => [...document.querySelectorAll('#messages .user-message')].at(-1).querySelector('.routing-summary .route-target').click());
-    await until(() => page.eval("document.querySelector('#trace-content').innerText.includes('读取文件副本')"), 'worker tool step');
-    await until(() => page.eval("document.querySelector('#trace-content').innerText.includes('Worker 接收任务')"), 'process start');
-    await until(() => page.eval("document.querySelector('#trace-content').innerText.includes('F.R.I.D.A.Y. 处理新输入')"), 'routing decision that created the work');
-    assert.equal(await page.eval("document.querySelector('#step-mode').getAttribute('aria-pressed')"), 'true', 'the readable process is the default');
-    const steps = await page.eval("document.querySelector('#trace-content').innerText");
-    assert.match(steps, /F\.R\.I\.D\.A\.Y\. 处理新输入/);
-    assert.match(steps, /新建工作/);
-    assert.match(steps, /Worker 接收任务/);
-    assert.match(steps, /文件: /, 'a file read names the file instead of its internal id');
-    assert.doesNotMatch(steps, /sk-[A-Za-z0-9]{12,}/, 'recorded steps never expose credentials');
-    await page.eval(() => [...document.querySelectorAll('#trace-content .timeline-step details')]
-      .find(detail => detail.innerText.includes('已记录的'))?.setAttribute('open', ''));
-    assert.match(await page.eval("document.querySelector('#trace-content').innerText"), /已记录的 \d+ 条记录/);
-    assert.match(await page.eval("document.querySelector('#messages').innerText"), /新建工作/);
-    checks.push('readable steps: F.R.I.D.A.Y. input, routing decision, Worker task and file read, with recorded details on demand');
-  } else checks.push('skipped path analysis (no --sample given)');
+  }
+  await until(() => page.eval(`document.querySelectorAll('#messages .user-message').length === ${usersBefore + 1}`), 'the submitted task message');
+  await until(() => page.eval("document.querySelectorAll('.work-row').length > 0"), 'background work');
+  await until(() => page.eval("[...document.querySelectorAll('.work-row')].some(x => x.innerText.includes('已完成'))"), 'work completion');
 
-  await page.eval(() => document.querySelector('#graph-mode').click());
-  await sleep(200);
-  await page.eval(() => document.querySelector('#trace-content .node-button')?.click());
-  assert.match(await page.eval("document.querySelector('#event-detail').innerText"), /Span|Token|状态/);
-  await page.eval(() => document.querySelector('#step-mode').click());
-  await sleep(200);
-  assert.equal(await page.eval("document.querySelector('#event-detail').hidden"), true, 'step mode keeps the raw node inspector closed');
+  // Collapse the right drawer first to verify clicking a task auto-opens it
+  await page.eval(() => document.querySelector('#desktop-trace-fold')?.click());
+  await until(() => page.eval("document.body.classList.contains('desktop-right-collapsed')"), 'right drawer collapsed before task click');
+
+  await until(() => page.eval("[...document.querySelectorAll('#messages .user-message')].at(-1)?.querySelector('.routing-summary .route-target') !== null"), 'routing target for the new work');
+  await page.eval(() => [...document.querySelectorAll('#messages .user-message')].at(-1).querySelector('.routing-summary .route-target').click());
+  await until(() => page.eval("!document.body.classList.contains('desktop-right-collapsed')"), 'right drawer auto-opens on task click');
+
+  await until(() => page.eval("document.querySelector('#work-detail').hidden === false && document.querySelector('#work-detail').innerText.includes('已完成')"), 'task overview header');
+  await until(() => page.eval("document.querySelectorAll('#trace-content .chain-card').length >= 5"), 'execution chain nodes rendered');
+  if (sample) {
+    await until(() => page.eval("document.querySelector('#trace-content').innerText.includes('读取文件副本')"), 'worker tool step');
+  }
+  assert.equal(await page.eval("document.querySelector('#step-mode').getAttribute('aria-pressed')"), 'true', 'all-chain mode is active by default');
+
+  const chainSnapshot = await page.eval(() => {
+    const parseOffset = (raw) => {
+      const m = /^\+(?:(\d+)h)?(?:(\d+)m)?(\d+(?:\.\d+)?)s$/.exec((raw || '').trim());
+      if (m) return (Number(m[1] || 0) * 3600) + (Number(m[2] || 0) * 60) + Number(m[3] || 0);
+      const hm = /^\+(\d+)h(\d+)m$/.exec((raw || '').trim());
+      if (hm) return Number(hm[1]) * 3600 + Number(hm[2]) * 60;
+      return -1;
+    };
+    const cards = [...document.querySelectorAll('#trace-content .chain-card')].map(el => ({
+      classes: el.className,
+      clock: el.querySelector('.chain-clock')?.textContent?.trim() ?? '',
+      offset: el.querySelector('.chain-offset')?.textContent?.trim() ?? '',
+      offsetSec: parseOffset(el.querySelector('.chain-offset')?.textContent),
+      title: el.querySelector('.chain-title')?.textContent?.trim() ?? '',
+      hasWaterfall: Boolean(el.querySelector('svg.chain-waterfall rect.wf-track') && el.querySelector('svg.chain-waterfall rect.wf-bar')),
+    }));
+    return {
+      cards,
+      workText: document.querySelector('#work-detail')?.innerText ?? '',
+      chainText: document.querySelector('#trace-content')?.innerText ?? '',
+      hasOverviewMetrics: Boolean(document.querySelector('#work-detail .work-overview-head') && document.querySelector('#work-detail .work-metrics-strip .work-metric-pill')),
+    };
+  });
+
+  assert.equal(chainSnapshot.hasOverviewMetrics, true, 'task overview renders structured header and metric pills');
+  assertNoRawJsonDump(chainSnapshot.workText, 'work-detail');
+  assertNoRawJsonDump(chainSnapshot.chainText, 'trace-content');
+  assert.ok(chainSnapshot.cards.every(c => /^\d{2}:\d{2}:\d{2}$/.test(c.clock) && c.offsetSec >= 0 && c.hasWaterfall),
+    'every execution chain card must show clock, relative offset, and SVG waterfall bar');
+  for (let i = 1; i < chainSnapshot.cards.length; i++) {
+    assert.ok(chainSnapshot.cards[i].offsetSec >= chainSnapshot.cards[i - 1].offsetSec,
+      `execution chain must be sorted chronologically (${chainSnapshot.cards[i - 1].offset} -> ${chainSnapshot.cards[i].offset})`);
+  }
+  assert.ok(chainSnapshot.cards.some(c => c.classes.includes('cat-message') && c.title.includes('收到消息')), 'chain contains received message node');
+  assert.ok(chainSnapshot.cards.some(c => c.classes.includes('cat-message') && c.title.includes('公开回复交付')), 'chain contains reply delivery node');
+  assert.ok(chainSnapshot.cards.some(c => c.classes.includes('cat-routing')), 'chain contains routing node');
+  assert.ok(chainSnapshot.cards.some(c => c.classes.includes('cat-llm')), 'chain contains model call node');
+  if (sample) {
+    assert.ok(chainSnapshot.cards.some(c => c.classes.includes('cat-tool') && c.title.includes('读取文件副本')), 'chain contains tool execution node');
+  }
+  assert.match(await page.eval("document.querySelector('#messages').innerText"), /新建工作/);
+  checks.push('auto-opened drawer, task overview card, chronological execution chain with offsets and SVG waterfalls');
+
+  // Verify direction / category filters
+  const filterCases = [
+    { btn: '#filter-msg-mode', catClass: 'cat-message', required: true },
+    { btn: '#graph-mode', catClass: 'cat-llm', required: true },
+    { btn: '#timeline-mode', catClass: 'cat-tool', required: Boolean(sample) },
+    { btn: '#filter-route-mode', catClass: 'cat-routing', required: true },
+  ];
+  for (const fc of filterCases) {
+    await page.eval(({ btn }) => document.querySelector(btn)?.click(), { btn: fc.btn });
+    await sleep(100);
+    assert.equal(await page.eval(`document.querySelector('${fc.btn}').getAttribute('aria-pressed')`), 'true', `${fc.btn} active`);
+    const filtered = await page.eval(() => [...document.querySelectorAll('#trace-content .chain-card')].map(el => el.className));
+    if (fc.required) assert.ok(filtered.length > 0, `${fc.btn} must render matching nodes`);
+    assert.ok(filtered.every(cls => cls.includes(fc.catClass)), `${fc.btn} must only show ${fc.catClass} nodes`);
+  }
+  await page.eval(() => document.querySelector('#step-mode')?.click());
+  await sleep(100);
+  checks.push('category filter tabs filter timeline accurately across message, llm, tool, and routing');
+
+  // Verify semantic inspector for tool & llm nodes (zero raw JSON)
+  if (sample) {
+    await page.eval(() => document.querySelector('#trace-content .chain-card.cat-tool')?.click());
+    await until(() => page.eval("document.querySelector('#event-detail').hidden === false && document.querySelector('#event-detail').innerText.includes('Router maintains one continuous conversation')"), 'tool inspector with readable output');
+    const toolInspectorText = await page.eval("document.querySelector('#event-detail').innerText");
+    assert.match(toolInspectorText, /调用工具/);
+    assert.match(toolInspectorText, /使用参数/);
+    assert.match(toolInspectorText, /获取结果/);
+    assert.match(toolInspectorText, /读取文件副本/);
+    assertNoRawJsonDump(toolInspectorText, 'tool-inspector');
+  }
+
+  await page.eval(() => document.querySelector('#trace-content .chain-card.cat-llm')?.click());
+  await until(() => page.eval("document.querySelector('#event-detail').hidden === false && document.querySelector('#event-detail').innerText.includes('模型与 Token 消耗')"), 'LLM inspector rendered');
+  const llmInspector = await page.eval(() => ({
+    text: document.querySelector('#event-detail')?.innerText ?? '',
+    hasDecisionBtn: Boolean(document.querySelector('#event-detail .tool-decision-btn:not(:disabled)')),
+  }));
+  assertNoRawJsonDump(llmInspector.text, 'llm-inspector');
+  if (llmInspector.hasDecisionBtn) {
+    await page.eval(() => document.querySelector('#event-detail .tool-decision-btn:not(:disabled)')?.click());
+    await sleep(120);
+    assert.equal(await page.eval("document.querySelector('#event-detail').hidden"), false, 'clicking tool decision jumps to target node');
+  }
+  // Test wide toggle and inspector close button
+  await page.eval(() => document.querySelector('#trace-wide-toggle')?.click());
+  assert.equal(await page.eval("document.querySelector('#panels').classList.contains('trace-wide')"), true, 'wide toggle expands studio');
+  await page.eval(() => document.querySelector('#trace-wide-toggle')?.click());
+  assert.equal(await page.eval("document.querySelector('#panels').classList.contains('trace-wide')"), false, 'wide toggle restores width');
+  await page.eval(() => document.querySelector('#event-detail .inspector-close-btn')?.click());
+  await sleep(100);
+  assert.equal(await page.eval("document.querySelector('#event-detail').hidden"), true, 'inspector close button hides detail pane');
+  checks.push('semantic inspector renders Chinese tool/LLM details, tool jump navigation, wide toggle, and zero raw JSON');
+
   const beforeSelection = await count();
   await page.eval(() => document.querySelector('.work-row')?.click());
   await sleep(150);
   assert.equal(await count(), beforeSelection, 'selecting a work must not change the conversation');
-  checks.push('causal graph and raw node details stay available; step mode hides raw inspector; a work never switches conversation');
 
   // A per-run marker keeps this check independent of whatever an earlier run left in the fixture.
   const burstTag = `连续消息-${Date.now().toString(36)}`;
@@ -151,8 +319,8 @@ try {
     return articles.filter(item => item.dataset.replyTo && index.has(item.dataset.replyTo) && index.get(item.dataset.replyTo) > index.get(item.dataset.messageId)).length;
   });
   assert.equal(orphans, 0, 'no reply may appear before the user message it belongs to');
-  assert.doesNotMatch(await page.eval("[...document.querySelectorAll('#trace-content .timeline-step .step-title')].map(item => item.innerText).join(' ')"), /关联后台工作/,
-    'bookkeeping events stay out of the readable process');
+  assert.doesNotMatch(await page.eval("[...document.querySelectorAll('#trace-content .chain-card .chain-title')].map(item => item.innerText).join(' ')"), /关联后台工作/,
+    'bookkeeping events stay out of the readable execution chain');
   assert.doesNotMatch(await page.eval("document.querySelector('#trace-scope').innerText"), new RegExp(burstTag),
     'a scope the reader opened stays put instead of jumping to a burst of new messages');
   checks.push('every shown reply carries its user message; a pinned scope holds while bookkeeping stays out');
@@ -176,24 +344,46 @@ try {
   assert.match(await page.eval("document.querySelector('#routing-detail').innerText"), /分配记录与当时上下文/);
   checks.push('all message blocks remain in durable sequence order after reload; source references and routing context survive');
 
-  for (const [width, height, name] of [[768, 1024, 'tablet'], [390, 844, 'mobile']]) {
-    await page.setViewport({ width, height, mobile: width < 600 });
-    await page.eval(() => document.querySelector('#show-chat').click());
-    await sleep(300);
-    await page.screenshot({ path: `${outDir}/${name}-chat.jpg`, quality: 85 });
-    assert.equal(await page.eval('document.documentElement.scrollWidth <= innerWidth'), true, `${name}: no horizontal page overflow`);
-    await page.eval(() => document.querySelector('#show-trace').click());
-    await sleep(300);
-    await page.screenshot({ path: `${outDir}/${name}-trace.jpg`, quality: 85 });
-    assert.equal(await page.eval('document.documentElement.scrollWidth <= innerWidth'), true, `${name}: no horizontal page overflow`);
-    await page.eval(() => document.querySelector('#work-toggle').click());
-    assert.equal(await page.eval("document.querySelector('#work-toggle').getAttribute('aria-expanded')"), 'true');
-    await page.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
-    assert.equal(await page.eval("document.querySelector('#work-toggle').getAttribute('aria-expanded')"), 'false');
-  }
-  checks.push('768/390 conversation, trace, work drawer and Escape, with no page overflow');
+  // Re-select the completed work so responsive & dual-theme checks inspect a populated Execution Chain Studio
+  await page.eval(() => document.querySelector('.work-row .work-row-main')?.click());
+  await until(() => page.eval("document.querySelectorAll('#trace-content .chain-card').length >= 4"), 'task chain reloaded after refresh');
 
-  await page.setViewport({ width: 1440, height: 900 });
+  for (const [themeName, themeBtn] of [['spatial', '#theme-spatial-btn'], ['industrial', '#theme-industrial-btn']]) {
+    await page.eval(({ themeBtn }) => document.querySelector(themeBtn)?.click(), { themeBtn });
+    await sleep(120);
+    assert.equal(await page.eval("document.documentElement.getAttribute('data-theme')"), themeName, `theme switched to ${themeName}`);
+
+    await page.setViewport({ width: 1440, height: 900, mobile: false });
+    await sleep(200);
+    assert.equal(await page.eval('document.documentElement.scrollWidth <= innerWidth'), true, `1440x900 (${themeName}): no horizontal page overflow`);
+
+    for (const [width, height, name] of [[768, 1024, 'tablet'], [390, 844, 'mobile']]) {
+      await page.setViewport({ width, height, mobile: width < 600 });
+      await page.eval(() => document.querySelector('#show-chat').click());
+      await sleep(250);
+      if (themeName === 'spatial') await page.screenshot({ path: `${outDir}/${name}-chat.jpg`, quality: 85 });
+      assert.equal(await page.eval('document.documentElement.scrollWidth <= innerWidth'), true, `${name} (${themeName}) chat: no horizontal page overflow`);
+
+      await page.eval(() => document.querySelector('#show-trace').click());
+      await sleep(250);
+      if (themeName === 'spatial') await page.screenshot({ path: `${outDir}/${name}-trace.jpg`, quality: 85 });
+      assert.equal(await page.eval('document.documentElement.scrollWidth <= innerWidth'), true, `${name} (${themeName}) trace: no horizontal page overflow`);
+
+      await page.eval(() => document.querySelector('#trace-content .chain-card')?.click());
+      await sleep(150);
+      assert.equal(await page.eval('document.documentElement.scrollWidth <= innerWidth'), true, `${name} (${themeName}) trace+inspector: no horizontal page overflow`);
+      await page.eval(() => document.querySelector('#event-detail .inspector-close-btn')?.click());
+
+      await page.eval(() => document.querySelector('#work-toggle').click());
+      assert.equal(await page.eval("document.querySelector('#work-toggle').getAttribute('aria-expanded')"), 'true');
+      await page.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+      assert.equal(await page.eval("document.querySelector('#work-toggle').getAttribute('aria-expanded')"), 'false');
+    }
+  }
+  checks.push('spatial & industrial themes across 1440x900, 768x1024, 390x844 (chat, trace, inspector, work drawer + Escape) with zero page overflow');
+
+  await page.eval(() => document.querySelector('#theme-spatial-btn')?.click());
+  await page.setViewport({ width: 1440, height: 900, mobile: false });
   await page.eval(() => document.querySelector('#show-chat').click());
   await sleep(300);
   await page.screenshot({ path: `${outDir}/filled-desktop.jpg`, quality: 85 });

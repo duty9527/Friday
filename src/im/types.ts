@@ -200,6 +200,7 @@ export interface XiaoaiDeps {
   speakerExtractorFactory?: (config: { modelPath: string }) => XiaoaiSpeakerExtractor;
   speakerMinEnrollMs?: number;
   speakerEnrollWaitMs?: number;
+  measurePollIntervalMs?: number;
 }
 
 /** Build a standard UTF-8 JSON webhook response. */
