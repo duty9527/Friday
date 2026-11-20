@@ -174,6 +174,7 @@ test('every nested module the page or mindmap imports is served and path escapes
     assert.ok(visited.has('/panels/chat.js'), 'nested panel module must be reached and served');
     assert.ok(visited.has('/plugins/health-scale-ui.js'), 'lazy plugin UI module must be reached and served');
     assert.ok(visited.has('/plugins/fund-tracker-ui.js'), 'lazy fund plugin UI module must be reached and served');
+    assert.ok(visited.has('/plugins/netlea-ui.js'), 'lazy netlea plugin UI module must be reached and served');
     assert.equal((await fetch(`${f.base}/../src/agent.ts`)).status, 404, 'path escape must return 404');
     assert.equal((await fetch(`${f.base}/shared/%2e%2e/%2e%2e/package.json`)).status, 404, 'encoded traversal must return 404');
     assert.equal((await fetch(`${f.base}/client.ts`)).status, 404, 'non-allowlisted extension must return 404');
@@ -507,6 +508,9 @@ test('Web console lazy-loads health-scale UI, serves redacted PluginView metadat
     assert.match(html, /id="plugin-tab-fund-tracker"/);
     assert.match(html, /id="plugin-panel-fund-tracker"/);
     assert.match(html, /id="fund-trend-canvas"/);
+    assert.match(html, /id="plugin-tab-netlea"/);
+    assert.match(html, /id="plugin-panel-netlea"/);
+    assert.match(html, /id="netlea-spectrum-canvas"/);
     assert.doesNotMatch(html, /id="open-health-hub-top"/, 'health surface must live inside M3 plugin hub');
     assert.doesNotMatch(html, /id="open-fund-hub-top"/, 'fund surface must live inside M3 plugin hub');
     assert.doesNotMatch(html, /\sstyle="/i);
@@ -517,11 +521,15 @@ test('Web console lazy-loads health-scale UI, serves redacted PluginView metadat
     assert.match(clientJs, /import\(\s*['"]\.\/plugins\/health-scale-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load health-scale-ui.js');
     assert.doesNotMatch(clientJs, /healthDashboard/, 'health-scale dashboard logic must not be eagerly bundled into client.js');
     assert.match(clientJs, /import\(\s*['"]\.\/plugins\/fund-tracker-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load fund-tracker-ui.js');
+    assert.match(clientJs, /import\(\s*['"]\.\/plugins\/netlea-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load netlea-ui.js');
 
     const healthUiJs = await (await fetch(`${f.base}/plugins/health-scale-ui.js`)).text();
     assert.match(healthUiJs, /initHealthScaleUi/);
     const fundUiJs = await (await fetch(`${f.base}/plugins/fund-tracker-ui.js`)).text();
     assert.match(fundUiJs, /initFundTrackerUi/);
+    const netleaUiJs = await (await fetch(`${f.base}/plugins/netlea-ui.js`)).text();
+    assert.match(netleaUiJs, /initNetleaUi/);
+    assert.doesNotMatch(netleaUiJs, /\.style\.|setAttribute\(\s*['"]style['"]/, 'netlea-ui must obey strict CSP without inline style mutations');
 
     const viewRes = await (await fetch(`${f.base}/api/view`, { headers: f.headers })).json() as MainView;
     for (const plugin of viewRes.plugins ?? []) {
@@ -577,6 +585,18 @@ test('Web console lazy-loads health-scale UI, serves redacted PluginView metadat
     assert.equal(fundDashRes.plugin, 'fund-tracker');
     assert.equal(Array.isArray(fundDashRes.data?.holdings), true);
     assert.equal(Array.isArray(fundDashRes.data?.snapshots), true);
+
+    if (process.platform === 'linux') {
+      const netleaDashRes = await (await fetch(`${f.base}/api/plugin-run`, {
+        method: 'POST',
+        headers: f.headers,
+        body: JSON.stringify({ plugin: 'netlea', action: 'dashboard', args: {} }),
+      })).json() as { ok: boolean; notify: boolean; plugin: string; data?: { config?: Record<string, unknown> } };
+      assert.equal(netleaDashRes.ok, true);
+      assert.equal(netleaDashRes.notify, false);
+      assert.equal(netleaDashRes.plugin, 'netlea');
+      assert.equal(typeof netleaDashRes.data?.config, 'object');
+    }
   } finally { await f.close(); }
 });
 

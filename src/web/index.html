@@ -513,6 +513,10 @@
               <span>📈 投资管理</span>
               <span id="fund-top-badge" class="hub-pill-badge">—</span>
             </button>
+            <button id="plugin-tab-netlea" class="hub-surface-tab" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-netlea" data-plugin-tab="netlea" hidden>
+              <span>🐠 鱼缸灯光</span>
+              <span id="netlea-top-badge" class="hub-pill-badge">—</span>
+            </button>
           </div>
           <button id="plugin-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
         </div>
@@ -879,6 +883,111 @@
             </div>
           </details>
         </section>
+        </div>
+
+        <div id="plugin-panel-netlea" class="hub-tab-panel" role="tabpanel" aria-labelledby="plugin-tab-netlea" hidden>
+          <div class="plugin-surface-bar">
+            <div>
+              <h3>🐠 鱼缸灯光 · 尼特利蓝牙智控中心</h3>
+              <p class="health-header-sub">SG-X-PRO 低功耗蓝牙短连接直控：四通道光谱调光、临时照明、一键恢复 24h 自动行程</p>
+            </div>
+            <div class="health-header-actions">
+              <button id="netlea-scan-btn" class="mini-button" type="button">🔍 扫描广播</button>
+              <button id="netlea-sync-btn" class="primary" type="button">🔄 实时读取</button>
+              <button id="netlea-refresh-btn" class="mini-button" type="button">↻ 刷新看板</button>
+            </div>
+          </div>
+          <p id="netlea-action-status" class="health-status-banner" hidden></p>
+
+          <div id="netlea-kpi-grid" class="hub-kpi-grid"></div>
+
+          <section class="model-modal-section netlea-hero-grid" aria-label="快捷控光与光谱预览">
+            <div class="hub-form-card">
+              <h3>⚡ 快捷开关与观赏预设</h3>
+              <div class="modal-btn-group">
+                <button id="netlea-on-btn" class="primary" type="button">💡 临时开灯</button>
+                <button id="netlea-off-btn" class="mini-button" type="button">🌑 临时关灯</button>
+                <button id="netlea-resume-btn" class="mini-button" type="button">🕒 恢复 24h 行程</button>
+              </div>
+              <div id="netlea-preset-bar" class="hub-filter-pills" role="group" aria-label="观赏光谱预设">
+                <button class="hub-filter-pill" type="button" data-netlea-preset="vivid">🌿 增艳全光谱</button>
+                <button class="hub-filter-pill" type="button" data-netlea-preset="daylight">☀️ 清澈日光</button>
+                <button class="hub-filter-pill" type="button" data-netlea-preset="sunset">🌇 暖金晚霞</button>
+                <button class="hub-filter-pill" type="button" data-netlea-preset="moonlight">🌙 静谧月光</button>
+              </div>
+              <div class="netlea-slider-row">
+                <label for="netlea-brightness-range">总亮度比例 (<span id="netlea-brightness-val">100%</span>)</label>
+                <input id="netlea-brightness-range" type="range" min="1" max="100" value="100">
+                <button id="netlea-brightness-btn" class="mini-button" type="button">✨ 按比例调光</button>
+              </div>
+            </div>
+
+            <div class="hub-form-card">
+              <h3>🎨 四通道实时光谱图</h3>
+              <div class="netlea-canvas-wrap">
+                <canvas id="netlea-spectrum-canvas" class="netlea-spectrum-canvas" width="560" height="156"></canvas>
+              </div>
+              <p id="netlea-device-meta" class="meta">尚未读取鱼缸灯实时数据，点击右上角「实时读取」连接灯具。</p>
+            </div>
+          </section>
+
+          <section class="model-modal-section" aria-label="四通道精细调光与设备配置">
+            <div class="hub-form-card">
+              <h3>🎛️ R / G / W / B 通道与风扇调光</h3>
+              <div class="netlea-sliders-grid">
+                <label class="netlea-slider-field">
+                  <span>红光 R (<strong id="netlea-ch-red-val">69</strong>%)</span>
+                  <input id="netlea-ch-red" type="range" min="0" max="100" value="69">
+                </label>
+                <label class="netlea-slider-field">
+                  <span>绿光 G (<strong id="netlea-ch-green-val">54</strong>%)</span>
+                  <input id="netlea-ch-green" type="range" min="0" max="100" value="54">
+                </label>
+                <label class="netlea-slider-field">
+                  <span>白光 W (<strong id="netlea-ch-white-val">98</strong>%)</span>
+                  <input id="netlea-ch-white" type="range" min="0" max="100" value="98">
+                </label>
+                <label class="netlea-slider-field">
+                  <span>蓝光 B (<strong id="netlea-ch-blue-val">54</strong>%)</span>
+                  <input id="netlea-ch-blue" type="range" min="0" max="100" value="54">
+                </label>
+                <label class="netlea-slider-field">
+                  <span>散热风扇 (<strong id="netlea-ch-fan-val">0</strong> 档)</span>
+                  <input id="netlea-ch-fan" type="range" min="0" max="5" value="0">
+                </label>
+                <label class="netlea-slider-field">
+                  <span>渐变时长（秒）</span>
+                  <input id="netlea-fade-sec" type="number" min="0" max="60" value="3">
+                </label>
+              </div>
+              <div class="modal-row-head">
+                <span class="hint">拖动滑块可实时预览光谱比例；点击「下发当前光谱」将通过蓝牙短连接写入灯具。</span>
+                <div class="modal-btn-group">
+                  <button id="netlea-save-default-btn" class="mini-button" type="button">💾 存为默认开灯光谱</button>
+                  <button id="netlea-apply-channels-btn" class="primary" type="button">🚀 下发当前光谱</button>
+                </div>
+              </div>
+            </div>
+
+            <details class="hub-compose-details">
+              <summary class="hub-compose-summary">⚙️ 蓝牙绑定参数与扫描列表</summary>
+              <div class="hub-compose-body">
+                <div class="hub-form-grid">
+                  <label>绑定灯具 MAC（可选）
+                    <input id="netlea-cfg-mac" type="text" placeholder="留空自动发现，或填 AA:BB:CC:DD:EE:FF">
+                  </label>
+                  <label>蓝牙名称前缀
+                    <input id="netlea-cfg-prefix" type="text" placeholder="SG-">
+                  </label>
+                </div>
+                <div class="modal-row-head">
+                  <span class="hint">绑定指定 MAC 后将仅连接该台灯具；留空则自动匹配信号最强的尼特利设备。</span>
+                  <button id="netlea-cfg-save-btn" class="primary" type="button">💾 保存绑定配置</button>
+                </div>
+                <div id="netlea-scan-list" class="netlea-scan-list"></div>
+              </div>
+            </details>
+          </section>
         </div>
       </div>
     </div>

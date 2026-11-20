@@ -26,6 +26,7 @@ const imHubBackdrop = element<HTMLElement>('im-hub-backdrop');
 const systemHubBackdrop = element<HTMLElement>('system-hub-backdrop');
 const healthSurfacePanel = element<HTMLElement>('plugin-panel-health-scale');
 const fundSurfacePanel = element<HTMLElement>('plugin-panel-fund-tracker');
+const netleaSurfacePanel = element<HTMLElement>('plugin-panel-netlea');
 const messagesEl = element('messages');
 const worksEl = element('works');
 const companionEl = element('companion-avatar');
@@ -154,6 +155,17 @@ const pluginSurfaces: PluginSurfaceRegistration[] = [
     load: () => import('./plugins/fund-tracker-ui.js').then(mod =>
       mod.initFundTrackerUi({
         isVisible: () => !pluginHubBackdrop.hidden && !fundSurfacePanel.hidden,
+      })),
+  },
+  {
+    pluginName: 'netlea',
+    tabId: 'plugin-tab-netlea',
+    panelId: 'plugin-panel-netlea',
+    label: '鱼缸灯光',
+    messageTrigger: /鱼缸灯|尼特利|水草灯|netlea/i,
+    load: () => import('./plugins/netlea-ui.js').then(mod =>
+      mod.initNetleaUi({
+        isVisible: () => !pluginHubBackdrop.hidden && !netleaSurfacePanel.hidden,
       })),
   },
 ];
