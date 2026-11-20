@@ -2,8 +2,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { completeSrpClientChallenge, createSrpClientEphemeral } from './icloud-srp.mjs';
 
 export const APPLE_WIDGET_KEY = 'd39ba9916b7251055b22c7f910e2ea796ee65e98b2ddecea8f5dde8d9d1a815d';
-const DEFAULT_USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3.1 Safari/605.1.15';
 const DEFAULT_HTTP_TIMEOUT_MS = 15_000;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export class AppleClientError extends Error {
   /**
@@ -21,28 +22,33 @@ export class AppleClientError extends Error {
 
 /**
  * Resolve Apple IDMSa & iCloud regional endpoints.
- * Defaults to China mainland (`cn` / GCBD `.com.cn`).
+ * Apple ID authentication always targets `https://idmsa.apple.com`, while
+ * China mainland (`cn` / GCBD) routes home & setup/services via `.icloud.com.cn`.
  * @param {string} [region]
  * @returns {{ region: 'cn' | 'global'; authOrigin: string; authBase: string; homeOrigin: string; setupBase: string }}
  */
 export function resolveRegionEndpoints(region = 'cn') {
   const normalized = String(region ?? 'cn').trim().toLowerCase();
-  if (normalized === 'global' || normalized === 'us' || normalized === 'intl') {
-    return {
-      region: 'global',
-      authOrigin: 'https://idmsa.apple.com',
-      authBase: 'https://idmsa.apple.com/appleauth/auth',
-      homeOrigin: 'https://www.icloud.com',
-      setupBase: 'https://setup.icloud.com/setup/ws/1',
-    };
-  }
+  const isGlobal = normalized === 'global' || normalized === 'us' || normalized === 'intl';
+  const suffix = isGlobal ? '' : '.cn';
   return {
-    region: 'cn',
-    authOrigin: 'https://idmsa.apple.com.cn',
-    authBase: 'https://idmsa.apple.com.cn/appleauth/auth',
-    homeOrigin: 'https://www.icloud.com.cn',
-    setupBase: 'https://setup.icloud.com.cn/setup/ws/1',
+    region: isGlobal ? 'global' : 'cn',
+    authOrigin: 'https://idmsa.apple.com',
+    authBase: 'https://idmsa.apple.com/appleauth/auth',
+    homeOrigin: `https://www.icloud.com${suffix}`,
+    setupBase: `https://setup.icloud.com${suffix}/setup/ws/1`,
   };
+}
+
+/**
+ * Normalize clientId into a standard lowercase UUID expected by Apple's `frame_id` / `X-Apple-OAuth-State`.
+ * @param {unknown} raw
+ * @returns {string}
+ */
+export function normalizeClientId(raw) {
+  const s = String(raw ?? '').trim();
+  if (UUID_RE.test(s)) return s.toLowerCase();
+  return randomUUID().toLowerCase();
 }
 
 /**
@@ -201,7 +207,8 @@ function extractAppleServiceError(data, fallback) {
   if (data && typeof data === 'object') {
     const list = Array.isArray(data.serviceErrors) ? data.serviceErrors : [];
     if (list.length > 0 && list[0]?.message) {
-      return String(list[0].message);
+      const codePrefix = list[0]?.code !== undefined ? `[${list[0].code}] ` : '';
+      return `${codePrefix}${String(list[0].message)}`;
     }
     if (typeof data.error === 'string' && data.error.trim()) {
       return data.error.trim();
@@ -214,41 +221,52 @@ function extractAppleServiceError(data, fallback) {
 }
 
 /**
- * Build standard Apple IDMSa authentication headers.
+ * Build Apple IDMSa authentication headers aligned with upstream `pyicloud`.
  * @param {{ authOrigin: string; homeOrigin: string }} endpoints
  * @param {Record<string, unknown>} session
+ * @param {Record<string, string>} [overrides]
  * @returns {Record<string, string>}
  */
-function buildIdmsaHeaders(endpoints, session) {
+function buildIdmsaHeaders(endpoints, session, overrides = {}) {
+  const clientId = normalizeClientId(session.clientId);
   /** @type {Record<string, string>} */
   const headers = {
-    Accept: 'application/json',
+    Accept: 'application/json, text/javascript',
     'Content-Type': 'application/json',
-    Origin: endpoints.authOrigin,
-    Referer: `${endpoints.authOrigin}/`,
+    Origin: endpoints.homeOrigin,
+    Referer: endpoints.authOrigin,
     'User-Agent': DEFAULT_USER_AGENT,
-    'X-Apple-Widget-Key': APPLE_WIDGET_KEY,
     'X-Apple-OAuth-Client-Id': APPLE_WIDGET_KEY,
     'X-Apple-OAuth-Client-Type': 'firstPartyAuth',
     'X-Apple-OAuth-Redirect-URI': endpoints.homeOrigin,
+    'X-Apple-OAuth-Require-Grant-Code': 'true',
     'X-Apple-OAuth-Response-Mode': 'web_message',
     'X-Apple-OAuth-Response-Type': 'code',
-    'X-Requested-With': 'XMLHttpRequest',
+    'X-Apple-OAuth-State': clientId,
+    'X-Apple-Frame-Id': clientId,
+    'X-Apple-Widget-Key': APPLE_WIDGET_KEY,
+    'X-Apple-FD-Client-Info': JSON.stringify({
+      U: DEFAULT_USER_AGENT,
+      L: 'en-US',
+      Z: 'GMT+00:00',
+      V: '1.1',
+      F: '',
+    }),
   };
-  if (typeof session.clientId === 'string' && session.clientId) {
-    headers['X-Apple-OAuth-State'] = session.clientId;
-  }
   if (typeof session.scnt === 'string' && session.scnt) {
     headers.scnt = session.scnt;
   }
   if (typeof session.appleSessionId === 'string' && session.appleSessionId) {
     headers['X-Apple-ID-Session-Id'] = session.appleSessionId;
   }
+  if (typeof session.authAttributes === 'string' && session.authAttributes) {
+    headers['X-Apple-Auth-Attributes'] = session.authAttributes;
+  }
   const cookieStr = serializeCookies(/** @type {Record<string, string> | undefined} */ (session.cookies));
   if (cookieStr) {
     headers.Cookie = cookieStr;
   }
-  return headers;
+  return { ...headers, ...overrides };
 }
 
 /**
@@ -271,6 +289,23 @@ function buildIcloudHeaders(endpoints, session) {
     headers.Cookie = cookieStr;
   }
   return headers;
+}
+
+/**
+ * Build standard iCloud setup/FMiP query parameters (`clientBuildNumber`, `clientMasteringNumber`, `clientId`, optional `dsid`).
+ * @param {Record<string, any>} session
+ * @returns {string}
+ */
+function buildSetupQuery(session) {
+  const params = new URLSearchParams({
+    clientBuildNumber: '2534Project66',
+    clientMasteringNumber: '2534B22',
+    clientId: normalizeClientId(session.clientId),
+  });
+  if (session.dsid) {
+    params.set('dsid', String(session.dsid));
+  }
+  return params.toString();
 }
 
 /**
@@ -334,17 +369,19 @@ function absorbAuthResponse(session, headers, setCookies) {
   const sessionToken = readHeader(headers, 'x-apple-session-token');
   const trustToken = readHeader(headers, 'x-apple-twosv-trust-token');
   const accountCountry = readHeader(headers, 'x-apple-id-account-country');
+  const authAttributes = readHeader(headers, 'x-apple-auth-attributes');
   if (scnt) session.scnt = scnt;
   if (appleSessionId) session.appleSessionId = appleSessionId;
   if (sessionToken) session.sessionToken = sessionToken;
   if (trustToken) session.trustToken = trustToken;
   if (accountCountry) session.accountCountry = accountCountry;
+  if (authAttributes) session.authAttributes = authAttributes;
   session.cookies = mergeCookies(session.cookies, setCookies);
 }
 
 /**
  * Exchange `sessionToken` + optional `trustToken` at `/setup/ws/1/accountLogin` to obtain
- * `findme` regional host URL and iCloud webauth cookies.
+ * `findme` regional host URL, `dsid`, and iCloud webauth cookies.
  * @param {{
  *   session: Record<string, any>;
  *   fetchFn?: typeof fetch;
@@ -356,15 +393,15 @@ export async function completeAccountLogin({ session, fetchFn = fetch, signal })
   if (!session.sessionToken) {
     throw new AppleClientError('缺少 X-Apple-Session-Token，无法完成 iCloud 登录', 'AUTH_EXPIRED', 401);
   }
-  const url = `${endpoints.setupBase}/accountLogin?clientBuildNumber=2510Project50&clientMasteringNumber=2510B20&clientId=${encodeURIComponent(session.clientId || randomUUID())}`;
+  const url = `${endpoints.setupBase}/accountLogin?${buildSetupQuery(session)}`;
   const resp = await httpJson(fetchFn, url, {
     method: 'POST',
     headers: buildIcloudHeaders(endpoints, session),
     body: {
-      apple_id: session.appleId,
+      ...(session.accountCountry ? { accountCountryCode: session.accountCountry } : {}),
       dsWebAuthToken: session.sessionToken,
-      ...(session.trustToken ? { trustToken: session.trustToken } : {}),
       extended_login: true,
+      trustToken: session.trustToken || '',
     },
     signal,
   });
@@ -377,6 +414,10 @@ export async function completeAccountLogin({ session, fetchFn = fetch, signal })
       resp.status,
     );
   }
+  if (resp.data?.dsInfo?.dsid) {
+    session.dsid = String(resp.data.dsInfo.dsid);
+  }
+  session.trustedSession = Boolean(resp.data?.hsaTrustedBrowser);
   const rawFindme = resp.data?.webservices?.findme?.url;
   const findmeUrl = validateFindMeUrl(rawFindme);
   session.findmeUrl = findmeUrl;
@@ -387,7 +428,55 @@ export async function completeAccountLogin({ session, fetchFn = fetch, signal })
 }
 
 /**
- * Inspect trusted phone numbers available for SMS 2FA fallback.
+ * Extract `<script class="boot_args">` JSON embedded in Apple's HTML MFA shell if present.
+ * @param {string} html
+ * @returns {Record<string, any> | null}
+ */
+function parseBootArgsFromHtml(html) {
+  if (!html) return null;
+  const match = /<script[^>]*class="[^"]*boot_args[^"]*"[^>]*>([\s\S]*?)<\/script>/i.exec(html);
+  if (!match?.[1]) return null;
+  try {
+    const parsed = JSON.parse(match[1]);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Collect deduplicated trusted phone numbers from Apple's HTML boot args and JSON MFA payloads.
+ * @param {any} source
+ * @param {Map<number, { id: number; numberWithDialCode: string; pushMode: string }>} target
+ */
+function collectPhonesFromPayload(source, target) {
+  if (!source || typeof source !== 'object') return;
+  const candidates = [];
+  if (Array.isArray(source.trustedPhoneNumbers)) {
+    candidates.push(...source.trustedPhoneNumbers);
+  }
+  if (source.trustedPhoneNumber && typeof source.trustedPhoneNumber === 'object') {
+    candidates.push(source.trustedPhoneNumber);
+  }
+  if (Array.isArray(source.phoneNumberVerification?.trustedPhoneNumbers)) {
+    candidates.push(...source.phoneNumberVerification.trustedPhoneNumbers);
+  }
+  if (source.phoneNumberVerification?.trustedPhoneNumber) {
+    candidates.push(source.phoneNumberVerification.trustedPhoneNumber);
+  }
+  for (const p of candidates) {
+    const id = Number(p?.id);
+    if (!Number.isInteger(id) || id < 1) continue;
+    const label = String(p?.numberWithDialCode ?? p?.obfuscatedNumber ?? '');
+    const pushMode = String(p?.pushMode ?? 'sms');
+    if (!target.has(id)) {
+      target.set(id, { id, numberWithDialCode: label, pushMode });
+    }
+  }
+}
+
+/**
+ * Inspect trusted phone numbers available for SMS 2FA fallback via HTML boot args + JSON auth probe.
  * @param {{
  *   session: Record<string, any>;
  *   fetchFn?: typeof fetch;
@@ -396,28 +485,45 @@ export async function completeAccountLogin({ session, fetchFn = fetch, signal })
  */
 async function fetchTrustedPhones({ session, fetchFn = fetch, signal }) {
   const endpoints = resolveRegionEndpoints(session.region);
+  /** @type {Map<number, { id: number; numberWithDialCode: string; pushMode: string }>} */
+  const phones = new Map();
+
   try {
-    const resp = await httpJson(fetchFn, endpoints.authBase, {
+    const htmlResp = await httpJson(fetchFn, endpoints.authBase, {
       method: 'GET',
-      headers: buildIdmsaHeaders(endpoints, session),
+      headers: buildIdmsaHeaders(endpoints, session, { Accept: 'text/html' }),
       signal,
     });
-    absorbAuthResponse(session, resp.headers, resp.setCookies);
-    const list = Array.isArray(resp.data?.trustedPhoneNumbers) ? resp.data.trustedPhoneNumbers : [];
-    return list
-      .filter(p => p && typeof p.id === 'number')
-      .map(p => ({
-        id: p.id,
-        numberWithDialCode: String(p.numberWithDialCode ?? ''),
-        pushMode: String(p.pushMode ?? 'sms'),
-      }));
+    absorbAuthResponse(session, htmlResp.headers, htmlResp.setCookies);
+    if (htmlResp.data && Object.keys(htmlResp.data).length > 0) {
+      collectPhonesFromPayload(htmlResp.data, phones);
+    } else {
+      const boot = parseBootArgsFromHtml(htmlResp.rawText);
+      if (boot) {
+        collectPhonesFromPayload(boot.direct ?? boot, phones);
+      }
+    }
   } catch {
-    return [];
+    // Ignore optional HTML shell probe failure
   }
+
+  try {
+    const jsonResp = await httpJson(fetchFn, endpoints.authBase, {
+      method: 'GET',
+      headers: buildIdmsaHeaders(endpoints, session, { Accept: 'application/json' }),
+      signal,
+    });
+    absorbAuthResponse(session, jsonResp.headers, jsonResp.setCookies);
+    collectPhonesFromPayload(jsonResp.data, phones);
+  } catch {
+    // Ignore optional JSON MFA probe failure
+  }
+
+  return Array.from(phones.values());
 }
 
 /**
- * Initiate Apple ID SRP-6a authentication against China mainland or global IDMSa endpoints.
+ * Initiate Apple ID SRP-6a authentication against Apple IDMSa + regional iCloud setup endpoints.
  * Password is used strictly in-memory to compute the SRP proof and is never persisted.
  * @param {{
  *   appleId: string;
@@ -425,6 +531,7 @@ async function fetchTrustedPhones({ session, fetchFn = fetch, signal }) {
  *   region?: string;
  *   existingTrustToken?: string;
  *   clientId?: string;
+ *   pause2FA?: boolean;
  *   fetchFn?: typeof fetch;
  *   signal?: AbortSignal;
  * }} params
@@ -435,6 +542,7 @@ export async function startAppleLogin({
   region = 'cn',
   existingTrustToken,
   clientId,
+  pause2FA = false,
   fetchFn = fetch,
   signal,
 }) {
@@ -444,7 +552,7 @@ export async function startAppleLogin({
     throw new AppleClientError('请输入 Apple ID 账号与密码', 'INVALID_CREDENTIALS');
   }
   const endpoints = resolveRegionEndpoints(region);
-  const resolvedClientId = String(clientId || `auth-${randomUUID()}`);
+  const resolvedClientId = normalizeClientId(clientId);
   const session = /** @type {Record<string, any>} */ ({
     region: endpoints.region,
     appleId: cleanId,
@@ -453,6 +561,36 @@ export async function startAppleLogin({
     ...(existingTrustToken ? { trustToken: existingTrustToken } : {}),
   });
 
+  // 1. Pre-flight OAuth widget bootstrap to establish X-Apple-Auth-Attributes & initial scnt/cookies
+  const authorizeParams = new URLSearchParams({
+    frame_id: resolvedClientId,
+    skVersion: '7',
+    iframeid: resolvedClientId,
+    client_id: APPLE_WIDGET_KEY,
+    response_type: 'code',
+    redirect_uri: endpoints.homeOrigin,
+    response_mode: 'web_message',
+    state: resolvedClientId,
+    authVersion: 'latest',
+  });
+  const authorizeResp = await httpJson(fetchFn, `${endpoints.authBase}/authorize/signin?${authorizeParams.toString()}`, {
+    method: 'GET',
+    headers: buildIdmsaHeaders(endpoints, session),
+    signal,
+  });
+  absorbAuthResponse(session, authorizeResp.headers, authorizeResp.setCookies);
+  if (authorizeResp.status === 429 || authorizeResp.status === 503) {
+    throw new AppleClientError(`苹果认证预检限流或不可用 (HTTP ${authorizeResp.status})，请稍后再试`, 'RATE_LIMITED', authorizeResp.status);
+  }
+  if (!authorizeResp.ok) {
+    throw new AppleClientError(
+      extractAppleServiceError(authorizeResp.data, `苹果 OAuth 登录初始化失败 (HTTP ${authorizeResp.status})`),
+      'AUTH_BOOTSTRAP_FAILED',
+      authorizeResp.status,
+    );
+  }
+
+  // 2. SRP-6a init
   const { aHex, aBase64 } = createSrpClientEphemeral();
   const initResp = await httpJson(fetchFn, `${endpoints.authBase}/signin/init`, {
     method: 'POST',
@@ -467,7 +605,7 @@ export async function startAppleLogin({
   absorbAuthResponse(session, initResp.headers, initResp.setCookies);
 
   if (initResp.status === 429 || initResp.status === 503) {
-    throw new AppleClientError('苹果认证服务当前限流或不可用 (HTTP ' + initResp.status + ')，请稍后再试', 'RATE_LIMITED', initResp.status);
+    throw new AppleClientError(`苹果认证服务当前限流或不可用 (HTTP ${initResp.status})，请稍后再试`, 'RATE_LIMITED', initResp.status);
   }
   if (!initResp.ok) {
     throw new AppleClientError(
@@ -487,6 +625,7 @@ export async function startAppleLogin({
     throw new AppleClientError('苹果服务器返回的 SRP 参数不完整或不支持的协议', 'INVALID_SRP_CHALLENGE', initResp.status);
   }
 
+  // 3. SRP-6a client proof & complete
   const { m1Base64, m2Base64 } = completeSrpClientChallenge({
     accountName: cleanId,
     password: cleanPass,
@@ -502,11 +641,12 @@ export async function startAppleLogin({
     headers: buildIdmsaHeaders(endpoints, session),
     body: {
       accountName: cleanId,
-      rememberMe: true,
-      trustTokens: existingTrustToken ? [existingTrustToken] : [],
+      c: cToken,
       m1: m1Base64,
       m2: m2Base64,
-      c: cToken,
+      rememberMe: true,
+      trustTokens: existingTrustToken ? [existingTrustToken] : [],
+      ...(pause2FA ? { pause2FA: true } : {}),
     },
     signal,
   });
@@ -518,6 +658,14 @@ export async function startAppleLogin({
   }
 
   if (completeResp.status === 409) {
+    if (pause2FA && session.sessionToken) {
+      try {
+        await completeAccountLogin({ session, fetchFn, signal });
+        return session;
+      } catch {
+        // Fall through to standard 2FA flow if one-factor Find My setup wasn't accepted
+      }
+    }
     session.state = 'pending_2fa';
     session.pending2faAt = Date.now();
     session.trustedPhones = await fetchTrustedPhones({ session, fetchFn, signal });
@@ -525,15 +673,17 @@ export async function startAppleLogin({
   }
 
   if (completeResp.status === 401 || completeResp.status === 403) {
+    const detail = extractAppleServiceError(completeResp.data, '');
+    const suffix = detail ? `（${detail}）` : '';
     throw new AppleClientError(
-      'Apple ID 或密码不正确（注意 Find My 必须使用 Apple ID 主密码，不能使用 App 专用密码）',
+      `Apple ID 或密码不正确（HTTP ${completeResp.status}${suffix}；注意必须使用 Apple ID 主密码，不能使用 App 专用密码）`,
       'INVALID_CREDENTIALS',
       completeResp.status,
     );
   }
   if (completeResp.status === 412) {
     throw new AppleClientError(
-      '账号需要先在苹果官网或设备上确认隐私条款/安全提示后才能登录',
+      '账号需要先在苹果官网或设备上确认隐私条款/安全提示后才能登录 (HTTP 412)',
       'PRECONDITION_REQUIRED',
       412,
     );
@@ -571,7 +721,7 @@ export async function requestSmsCode({ session, phoneId, fetchFn = fetch, signal
     : (session.trustedPhones?.[0]?.id ?? 1);
   const resp = await httpJson(fetchFn, `${endpoints.authBase}/verify/phone`, {
     method: 'PUT',
-    headers: buildIdmsaHeaders(endpoints, session),
+    headers: buildIdmsaHeaders(endpoints, session, { Accept: 'application/json' }),
     body: {
       phoneNumber: { id: targetPhoneId },
       mode: 'sms',
@@ -588,6 +738,44 @@ export async function requestSmsCode({ session, phoneId, fetchFn = fetch, signal
   }
   session.lastSmsPhoneId = targetPhoneId;
   return session;
+}
+
+/**
+ * Attempt one-factor Find My access using the pre-2FA `sessionToken` without a 6-digit code.
+ * Matches Apple's Find My allowance for locating a lost trusted device.
+ * @param {{
+ *   session: Record<string, any>;
+ *   fetchFn?: typeof fetch;
+ *   signal?: AbortSignal;
+ * }} params
+ */
+export async function bypass2faForFindMy({ session, fetchFn = fetch, signal }) {
+  if (!session || (session.state !== 'pending_2fa' && session.state !== 'expired')) {
+    throw new AppleClientError('当前没有可直通的待验证会话，请先使用账号密码发起登录', 'NOT_PENDING_2FA');
+  }
+  if (!session.sessionToken) {
+    throw new AppleClientError('当前会话缺少临时 Token，无法使用免码直通，请提交 6 位验证码', 'MISSING_SESSION_TOKEN', 401);
+  }
+  await completeAccountLogin({ session, fetchFn, signal });
+  return session;
+}
+
+/**
+ * Determine whether Apple accepted the submitted 6-digit security code.
+ * Apple may return HTTP 200/204, HTTP 409 with `securityCode.valid === true`,
+ * or HTTP 412 with `X-Apple-Repair-Session-Token`.
+ * @param {{ ok: boolean; status: number; data: any; headers: Headers | Record<string, unknown> }} verifyResp
+ * @returns {boolean}
+ */
+function isAccepted2faResponse(verifyResp) {
+  if (verifyResp.ok) return true;
+  if (verifyResp.status === 409 && verifyResp.data?.securityCode?.valid === true) {
+    return true;
+  }
+  if (verifyResp.status === 412 && Boolean(readHeader(verifyResp.headers, 'x-apple-repair-session-token'))) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -627,19 +815,22 @@ export async function verify2faCode({
   const verifyBody = isSms
     ? { securityCode: { code: cleanCode }, phoneNumber: { id: targetPhoneId }, mode: 'sms' }
     : { securityCode: { code: cleanCode } };
+  const acceptOverride = isSms ? 'application/json, plain/text' : 'application/json';
 
   const verifyResp = await httpJson(fetchFn, verifyUrl, {
     method: 'POST',
-    headers: buildIdmsaHeaders(endpoints, session),
+    headers: buildIdmsaHeaders(endpoints, session, { Accept: acceptOverride }),
     body: verifyBody,
     signal,
   });
   absorbAuthResponse(session, verifyResp.headers, verifyResp.setCookies);
 
-  if (!verifyResp.ok) {
-    const invalidCode = verifyResp.status === 400 || verifyResp.status === 401 || verifyResp.status === 422;
+  if (!isAccepted2faResponse(verifyResp)) {
+    const invalidCode = verifyResp.status === 400 || verifyResp.status === 401 || verifyResp.status === 422 || verifyResp.status === 409;
     throw new AppleClientError(
-      invalidCode ? '双重认证验证码无效或已过期，请核对后重试' : extractAppleServiceError(verifyResp.data, `2FA 验证失败 (HTTP ${verifyResp.status})`),
+      invalidCode
+        ? extractAppleServiceError(verifyResp.data, '双重认证验证码无效或已过期，请核对后重试')
+        : extractAppleServiceError(verifyResp.data, `2FA 验证失败 (HTTP ${verifyResp.status})`),
       invalidCode ? 'INVALID_2FA_CODE' : 'TWO_FA_FAILED',
       verifyResp.status,
     );
@@ -747,7 +938,7 @@ export function normalizeFmipDevice(raw) {
 }
 
 /**
- * Call an FMiP endpoint with automatic 1-time `accountLogin` renewal on `401` / `450`.
+ * Call an FMiP endpoint with setup query params and automatic 1-time `accountLogin` renewal on `401` / `450`.
  * @param {{
  *   session: Record<string, any>;
  *   path: string;
@@ -763,7 +954,7 @@ async function postFmipWithRefresh({ session, path, body, fetchFn = fetch, signa
   const endpoints = resolveRegionEndpoints(session.region);
   const makeCall = async () => {
     const base = validateFindMeUrl(session.findmeUrl);
-    return httpJson(fetchFn, `${base}${path}`, {
+    return httpJson(fetchFn, `${base}${path}?${buildSetupQuery(session)}`, {
       method: 'POST',
       headers: buildIcloudHeaders(endpoints, session),
       body,
@@ -774,7 +965,7 @@ async function postFmipWithRefresh({ session, path, body, fetchFn = fetch, signa
   let resp = await makeCall();
   session.cookies = mergeCookies(session.cookies, resp.setCookies);
 
-  if ((resp.status === 401 || resp.status === 450) && session.sessionToken && session.trustToken) {
+  if ((resp.status === 401 || resp.status === 450) && session.sessionToken) {
     await completeAccountLogin({ session, fetchFn, signal });
     resp = await makeCall();
     session.cookies = mergeCookies(session.cookies, resp.setCookies);
@@ -782,6 +973,7 @@ async function postFmipWithRefresh({ session, path, body, fetchFn = fetch, signa
 
   if (resp.status === 401 || resp.status === 450) {
     session.state = 'expired';
+    session.fmipServerContext = undefined;
     throw new AppleClientError(
       'Apple 会话已过期（约 30～60 天需重新完成一次 2FA 授权），请重新登录绑定',
       'AUTH_EXPIRED',
@@ -799,30 +991,89 @@ async function postFmipWithRefresh({ session, path, body, fetchFn = fetch, signa
 }
 
 /**
- * Fetch and normalize Find My devices via `/fmipservice/client/web/refreshClient`.
+ * Sanitize & persist FMiP serverContext onto session so subsequent refresh calls don't trigger theftLoss errors.
+ * @param {Record<string, any>} session
+ * @param {any} payload
+ */
+function storeFmipServerContext(session, payload) {
+  if (payload?.serverContext && typeof payload.serverContext === 'object') {
+    const ctx = { ...payload.serverContext };
+    if ('theftLoss' in ctx) ctx.theftLoss = null;
+    session.fmipServerContext = ctx;
+  }
+}
+
+/**
+ * Fetch and normalize Find My devices, calling `/initClient` first when no `serverContext` is cached,
+ * then `/refreshClient` for active location/battery refresh.
  * @param {{
  *   session: Record<string, any>;
+ *   locate?: boolean;
  *   fetchFn?: typeof fetch;
  *   signal?: AbortSignal;
  * }} params
  */
-export async function fetchFindMyDevices({ session, fetchFn = fetch, signal }) {
-  const payload = await postFmipWithRefresh({
-    session,
-    path: '/fmipservice/client/web/refreshClient',
-    body: {
-      clientContext: {
-        appName: 'iCloud Find (Web)',
-        appVersion: '2.0',
-        timezone: 'Asia/Shanghai',
-        inactiveTime: 1,
-        apiVersion: '3.0',
-        fmly: false,
+export async function fetchFindMyDevices({ session, locate = true, fetchFn = fetch, signal }) {
+  const baseClientContext = {
+    appName: 'iCloud Find (Web)',
+    appVersion: '2.0',
+    apiVersion: '3.0',
+    deviceListVersion: 1,
+    fmly: false,
+    timezone: 'Asia/Shanghai',
+    inactiveTime: 0,
+  };
+
+  let payload;
+  if (!session.fmipServerContext) {
+    const initPayload = await postFmipWithRefresh({
+      session,
+      path: '/fmipservice/client/web/initClient',
+      body: { clientContext: baseClientContext },
+      fetchFn,
+      signal,
+    });
+    storeFmipServerContext(session, initPayload);
+    payload = initPayload;
+
+    if (locate && session.fmipServerContext) {
+      const refreshed = await postFmipWithRefresh({
+        session,
+        path: '/fmipservice/client/web/refreshClient',
+        body: {
+          clientContext: {
+            ...baseClientContext,
+            shouldLocate: true,
+            selectedDevice: 'all',
+          },
+          serverContext: session.fmipServerContext,
+          isUpdatingAllLocations: true,
+        },
+        fetchFn,
+        signal,
+      });
+      storeFmipServerContext(session, refreshed);
+      if (Array.isArray(refreshed?.content) && refreshed.content.length > 0) {
+        payload = refreshed;
+      }
+    }
+  } else {
+    payload = await postFmipWithRefresh({
+      session,
+      path: '/fmipservice/client/web/refreshClient',
+      body: {
+        clientContext: {
+          ...baseClientContext,
+          ...(locate ? { shouldLocate: true, selectedDevice: 'all' } : {}),
+        },
+        serverContext: session.fmipServerContext,
+        ...(locate ? { isUpdatingAllLocations: true } : {}),
       },
-    },
-    fetchFn,
-    signal,
-  });
+      fetchFn,
+      signal,
+    });
+    storeFmipServerContext(session, payload);
+  }
 
   const content = Array.isArray(payload?.content) ? payload.content : [];
   const entries = [];
@@ -857,6 +1108,7 @@ export async function playFindMySound({ session, rawDeviceId, subject, fetchFn =
     body: {
       device: rawDeviceId,
       subject: String(subject || 'F.R.I.D.A.Y. 查找设备提醒').trim().slice(0, 120),
+      clientContext: { fmly: false },
     },
     fetchFn,
     signal,

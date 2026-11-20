@@ -15,6 +15,7 @@ import {
 } from '../_shared/config-store.mjs';
 import {
   AppleClientError,
+  bypass2faForFindMy,
   fetchFindMyDevices,
   playFindMySound,
   requestSmsCode,
@@ -291,6 +292,7 @@ function loadDeviceCache(cachePath) {
  *   region: 'cn' | 'global';
  *   appleId: string;
  *   authenticatedAt: number | null;
+ *   trustedSession: boolean;
  *   trustedPhones: Array<{ id: number; numberWithDialCode: string; pushMode: string }>;
  * }}
  */
@@ -304,6 +306,7 @@ function buildPublicAuthSummary(session, config) {
     region: normalizeRegion(session?.region ?? config.region),
     appleId: maskAppleId(session?.appleId),
     authenticatedAt: typeof session?.authenticatedAt === 'number' ? session.authenticatedAt : null,
+    trustedSession: Boolean(session?.trustedSession),
     trustedPhones: authState === 'pending_2fa' && Array.isArray(session?.trustedPhones)
       ? session.trustedPhones.map(p => ({
           id: Number(p.id),
@@ -579,12 +582,14 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
       : undefined;
 
     try {
+      const pause2FA = args.bypass2fa === true || args.pause2FA === true;
       const session = await startAppleLogin({
         appleId,
         password,
         region,
         existingTrustToken,
         clientId: existingSession?.clientId,
+        pause2FA,
         fetchFn,
         signal,
       });
@@ -601,7 +606,7 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
           ok: true,
           notify: true,
           title: '🔐 需要苹果双重认证 (2FA)',
-          message: `已向 ${auth.appleId} 的受信任设备发送 6 位验证码${phoneHint}。请使用 auth-verify 提交验证码，或调用 auth-sms 改发短信验证码。`,
+          message: `${auth.appleId} 账号密码校验通过，已进入双重认证 (2FA) 阶段${phoneHint}。若苹果设备未自动弹出验证码，请点击「📩 改发短信验证码」，或在 iPhone「设置 → Apple 账户 → 登录与安全性 → 双重认证 → 获取验证码」手动生成 6 位码提交；也可选择免码临时直通模式（bypass2fa=true）立即使用查找。`,
           data: { ...auth, requires2fa: true },
         };
       }
@@ -674,7 +679,8 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
 
   if (cleanAction === 'auth-verify') {
     const session = loadSession(paths.sessionPath);
-    if (!session || session.state !== 'pending_2fa') {
+    const bypass2fa = args.bypass2fa === true || String(args.mode ?? '').trim().toLowerCase() === 'pause_2fa';
+    if (!session || (session.state !== 'pending_2fa' && !(bypass2fa && session.state === 'expired'))) {
       return {
         ok: false,
         notify: true,
@@ -683,10 +689,14 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
       };
     }
     try {
-      const code = String(args.code ?? args.securityCode ?? '').trim();
-      const mode = String(args.mode ?? 'trusted_device').trim().toLowerCase() === 'sms' ? 'sms' : 'trusted_device';
-      const phoneId = clampInt(args.phoneId, 1, 999);
-      await verify2faCode({ session, code, mode, phoneId, fetchFn, signal });
+      if (bypass2fa) {
+        await bypass2faForFindMy({ session, fetchFn, signal });
+      } else {
+        const code = String(args.code ?? args.securityCode ?? '').trim();
+        const mode = String(args.mode ?? 'trusted_device').trim().toLowerCase() === 'sms' ? 'sms' : 'trusted_device';
+        const phoneId = clampInt(args.phoneId, 1, 999);
+        await verify2faCode({ session, code, mode, phoneId, fetchFn, signal });
+      }
       await withFileLock(paths.sessionPath, () => saveSession(paths.sessionPath, session));
       const auth = buildPublicAuthSummary(session, config);
 
@@ -708,15 +718,17 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
       return {
         ok: true,
         notify: true,
-        title: '✅ Apple 双重认证成功',
-        message: `已完成 ${auth.appleId} 长期受信任会话绑定，共发现 ${devices.length} 台设备。`,
+        title: bypass2fa ? '⚡ 已开启 Find My 免码直通会话' : '✅ Apple 双重认证成功',
+        message: bypass2fa
+          ? `已使用单因素查找直通通道绑定 ${auth.appleId}，共发现 ${devices.length} 台设备（仅限查找/电量/响铃，不含长期信任票据）。`
+          : `已完成 ${auth.appleId} 长期受信任会话绑定，共发现 ${devices.length} 台设备。`,
         data: { ...auth, fetchedAt, devices },
       };
     } catch (err) {
       return {
         ok: false,
         notify: true,
-        title: '双重认证校验失败',
+        title: bypass2fa ? '免码直通开启失败' : '双重认证校验失败',
         message: errMsg(err),
         data: { errorCode: err instanceof AppleClientError ? err.code : 'VERIFY_FAILED' },
       };

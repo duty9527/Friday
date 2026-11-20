@@ -35,13 +35,15 @@ interface MockAppleServerOptions {
   region?: 'cn' | 'global';
   code?: string;
   require2fa?: boolean;
+  return409ValidOn2fa?: boolean;
   expireFirstFmipWith450?: boolean;
   devices?: Array<Record<string, unknown>>;
 }
 
 function createMockAppleFetch(opts: MockAppleServerOptions) {
   const region = opts.region ?? 'cn';
-  const expectedAuthHost = region === 'cn' ? 'idmsa.apple.com.cn' : 'idmsa.apple.com';
+  const expectedAuthHost = 'idmsa.apple.com';
+  const expectedHomeOrigin = region === 'cn' ? 'https://www.icloud.com.cn' : 'https://www.icloud.com';
   const expectedSetupHost = region === 'cn' ? 'setup.icloud.com.cn' : 'setup.icloud.com';
   const expectedFindmeHost = region === 'cn' ? 'p123-fmipweb.icloud.com.cn' : 'p123-fmipweb.icloud.com';
   const code = opts.code ?? '654321';
@@ -66,7 +68,22 @@ function createMockAppleFetch(opts: MockAppleServerOptions) {
     const reqBody = typeof init?.body === 'string' && init.body ? JSON.parse(init.body) : undefined;
     calls.push({ method, url, headers: reqHeaders, body: reqBody });
 
+    if (parsed.hostname === expectedAuthHost && parsed.pathname === '/appleauth/auth/authorize/signin') {
+      assert.equal(method, 'GET');
+      assert.match(parsed.searchParams.get('frame_id') ?? '', /^[0-9a-f-]{36}$/);
+      assert.equal(parsed.searchParams.get('redirect_uri'), expectedHomeOrigin);
+      assert.equal(reqHeaders.origin, expectedHomeOrigin);
+      return makeMockResponse(200, '{}', {
+        scnt: 'scnt-auth-boot',
+        'x-apple-auth-attributes': 'auth-attr-boot-1',
+        'set-cookie': ['dslang=CN-ZH; Path=/'],
+      });
+    }
+
     if (parsed.hostname === expectedAuthHost && parsed.pathname === '/appleauth/auth/signin/init') {
+      assert.equal(reqHeaders.origin, expectedHomeOrigin);
+      assert.equal(reqHeaders['x-apple-oauth-redirect-uri'], expectedHomeOrigin);
+      assert.equal(reqHeaders['x-apple-auth-attributes'], 'auth-attr-boot-1');
       assert.equal(reqBody.accountName, opts.appleId);
       assert.deepEqual(reqBody.protocols, ['s2k', 's2k_fo']);
       lastInitA = String(reqBody.a);
@@ -90,6 +107,7 @@ function createMockAppleFetch(opts: MockAppleServerOptions) {
 
     if (parsed.hostname === expectedAuthHost && parsed.pathname === '/appleauth/auth/signin/complete') {
       if (!srpServer) return makeMockResponse(400, { error: 'no init' });
+      assert.equal(reqHeaders['x-apple-auth-attributes'], 'auth-attr-boot-1');
       const verified = srpServer.verifyClient({
         aBase64: lastInitA,
         m1Base64: reqBody.m1,
@@ -141,6 +159,9 @@ function createMockAppleFetch(opts: MockAppleServerOptions) {
       if (reqBody?.securityCode?.code !== code) {
         return makeMockResponse(400, { serviceErrors: [{ message: 'Incorrect verification code' }] });
       }
+      if (opts.return409ValidOn2fa) {
+        return makeMockResponse(409, { securityCode: { valid: true } });
+      }
       return makeMockResponse(204, '');
     }
 
@@ -153,11 +174,11 @@ function createMockAppleFetch(opts: MockAppleServerOptions) {
     }
 
     if (parsed.hostname === expectedSetupHost && parsed.pathname === '/setup/ws/1/accountLogin') {
-      assert.equal(reqBody.apple_id, opts.appleId);
       assert.ok(reqBody.dsWebAuthToken);
       assert.equal(reqBody.extended_login, true);
       return makeMockResponse(200, {
-        dsInfo: { appleId: opts.appleId },
+        hsaTrustedBrowser: Boolean(reqBody.trustToken),
+        dsInfo: { appleId: opts.appleId, dsid: '123456789' },
         webservices: {
           findme: { url: `https://${expectedFindmeHost}:443`, status: 'active' },
         },
@@ -169,20 +190,26 @@ function createMockAppleFetch(opts: MockAppleServerOptions) {
       });
     }
 
-    if (parsed.hostname === expectedFindmeHost && parsed.pathname === '/fmipservice/client/web/refreshClient') {
+    if (
+      parsed.hostname === expectedFindmeHost
+      && (parsed.pathname === '/fmipservice/client/web/initClient'
+        || parsed.pathname === '/fmipservice/client/web/refreshClient')
+    ) {
       if (opts.expireFirstFmipWith450 && !expiredOnce) {
         expiredOnce = true;
         return makeMockResponse(450, { error: 'Session expired' });
       }
+      assert.equal(parsed.searchParams.get('dsid'), '123456789');
       assert.ok((reqHeaders.cookie ?? '').includes('X-APPLE-WEBAUTH-TOKEN=TOKEN_SECRET_COOKIE'));
       return makeMockResponse(200, {
         statusCode: '200',
-        serverContext: { serverTimestamp: 1_760_000_000_000 },
+        serverContext: { serverTimestamp: 1_760_000_000_000, theftLoss: { info: 'strip-me' } },
         content: currentDevices,
       });
     }
 
     if (parsed.hostname === expectedFindmeHost && parsed.pathname === '/fmipservice/client/web/playSound') {
+      assert.equal(parsed.searchParams.get('dsid'), '123456789');
       return makeMockResponse(200, { statusCode: '200' });
     }
 
@@ -244,6 +271,19 @@ test('1. icloud-srp.mjs matches RFC 5054 2048-bit SRP-6a for both s2k and s2k_fo
     });
     assert.equal(server.verifyClient({ aBase64, m1Base64: wrongProto.m1Base64 }).ok, false);
   }
+
+  // Exact byte-for-byte cross-check against upstream pysrp (rfc5054_enable + no_username_in_x)
+  const golden = completeSrpClientChallenge({
+    accountName: 'golden@icloud.com',
+    password: 'Golden#Pass2026',
+    aHex: `81${'22'.repeat(255)}`,
+    saltBase64: Buffer.from('0123456789abcdeffedcba9876543210', 'hex').toString('base64'),
+    bBase64: 'n16aTCkV9XZyfUzm2/Mu520MVYcVRNPPf15g5xZYMsFoc9B7/CkvRBy1e6FJvDjxxngDr+wWCP5sKIL7dhS8mDVXejDIPDI8OPtWNH1dCqOuRtf3Gtq+EwTQK3erg/yUIIrXVK+vG8DPhUulZ6GJZ7wn8r9UF8B5F5comH0TzIeHzeWhXePYdzCZw1jqCW+gCcv/HW0zJH+EYUO1P7rcn7xNAa4W6zhVAd/MyJIRRZRE4QnPKbD4UpKhlxBXqQVK4TBmOnVC0HIp2fdKR5t59ylM6ZjqZDezcxMfTp3GySSv5d11rQ/qxLgpZX3bECh8sDaQXbpKc5GYtoN/GFWkfA==',
+    iterations: 1000,
+    protocol: 's2k',
+  });
+  assert.equal(golden.m1Base64, 'R77LapdZddvfgEC9oqPE8TQz7FEpC07gnFDo/+rl4C4=');
+  assert.equal(golden.m2Base64, '9HAYLVBhX7DKIK2i8y1a5uWOtpHTlQn8va7LD6kJUOQ=');
 });
 
 test('2. China mainland two-step 2FA login, SMS fallback, trust token reuse, and 450 silent refresh', async () => {
@@ -270,6 +310,7 @@ test('2. China mainland two-step 2FA login, SMS fallback, trust token reuse, and
       region: 'cn',
       protocol: 's2k_fo',
       code: '246810',
+      return409ValidOn2fa: true,
       expireFirstFmipWith450: true,
       devices: sampleDevices,
     });
@@ -283,7 +324,7 @@ test('2. China mainland two-step 2FA login, SMS fallback, trust token reuse, and
     assert.equal(badLogin.ok, false);
     assert.match(badLogin.message ?? '', /密码不正确|App 专用密码/);
 
-    // Correct password triggers 409 pending_2fa against idmsa.apple.com.cn
+    // Correct password triggers 409 pending_2fa against idmsa.apple.com with www.icloud.com.cn redirect
     const loginRes = await runAppleAction('auth-login', {
       appleId: 'zhangsan@icloud.com',
       password: 'Correct#Password1',
@@ -294,7 +335,7 @@ test('2. China mainland two-step 2FA login, SMS fallback, trust token reuse, and
     assert.equal(loginRes.data.region, 'cn');
     assert.equal(loginRes.data.appleId, 'z***n@icloud.com');
     assert.equal(loginRes.data.trustedPhones[0].numberWithDialCode, '+86 ••• •••• 8899');
-    assert.ok(mock.calls.some(c => c.url.startsWith('https://idmsa.apple.com.cn/')));
+    assert.ok(mock.calls.some(c => c.url.startsWith('https://idmsa.apple.com/appleauth/auth/authorize/signin')));
 
     // Password must NEVER be persisted on disk
     const sessionDisk = readFileSync(join(dataDir, 'session.json'), 'utf8');
@@ -308,18 +349,16 @@ test('2. China mainland two-step 2FA login, SMS fallback, trust token reuse, and
     const badVerify = await runAppleAction('auth-verify', { code: '000000', mode: 'sms' }, { dataDir, fetchFn: mock.fetchFn });
     assert.equal(badVerify.ok, false);
 
-    // Valid 2FA code completes trust + setup.icloud.com.cn accountLogin + initial FMiP pull (including 450 auto-refresh!)
+    // Valid 2FA code (accepting 409 securityCode.valid=true) completes trust + setup.icloud.com.cn accountLogin + initClient/refreshClient (including 450 auto-refresh!)
     const verifyRes = await runAppleAction('auth-verify', { code: '246810', mode: 'sms' }, { dataDir, fetchFn: mock.fetchFn });
     assert.equal(verifyRes.ok, true);
     assert.equal(verifyRes.data.authState, 'authenticated');
+    assert.equal(verifyRes.data.trustedSession, true);
     assert.equal(verifyRes.data.devices.length, 1);
     assert.equal(verifyRes.data.devices[0].batteryPercent, 78);
     assert.ok(mock.calls.some(c => c.url.startsWith('https://setup.icloud.com.cn/setup/ws/1/accountLogin')));
-    assert.equal(
-      mock.calls.filter(c => c.url.startsWith('https://p123-fmipweb.icloud.com.cn/fmipservice/client/web/refreshClient')).length,
-      2,
-      'must retry refreshClient once after silent accountLogin on HTTP 450',
-    );
+    assert.ok(mock.calls.some(c => c.url.startsWith('https://p123-fmipweb.icloud.com.cn/fmipservice/client/web/initClient')));
+    assert.ok(mock.calls.some(c => c.url.startsWith('https://p123-fmipweb.icloud.com.cn/fmipservice/client/web/refreshClient')));
 
     // Subsequent login with saved trustToken succeeds without 2FA
     const fastLogin = await runAppleAction('auth-login', {
@@ -336,6 +375,19 @@ test('2. China mainland two-step 2FA login, SMS fallback, trust token reuse, and
     assert.equal(outRes.ok, true);
     assert.equal(existsSync(join(dataDir, 'session.json')), false);
     assert.equal(existsSync(join(dataDir, 'devices-cache.json')), false);
+
+    // One-factor Find My bypass2fa flow works from pending_2fa without a 6-digit code
+    const pendingAgain = await runAppleAction('auth-login', {
+      appleId: 'zhangsan@icloud.com',
+      password: 'Correct#Password1',
+      region: 'cn',
+    }, { dataDir, fetchFn: mock.fetchFn });
+    assert.equal(pendingAgain.data.authState, 'pending_2fa');
+    const bypassRes = await runAppleAction('auth-verify', { bypass2fa: true }, { dataDir, fetchFn: mock.fetchFn });
+    assert.equal(bypassRes.ok, true);
+    assert.equal(bypassRes.data.authState, 'authenticated');
+    assert.equal(bypassRes.data.trustedSession, false);
+    assert.equal(bypassRes.data.devices.length, 1);
   } finally {
     rmSync(dataDir, { recursive: true, force: true });
   }

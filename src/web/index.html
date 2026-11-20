@@ -929,19 +929,23 @@
                   <strong>📱 请输入 6 位双重认证验证码</strong>
                   <span id="apple-2fa-phones" class="meta"></span>
                 </div>
+                <p class="hint">提示：网页登录默认不自动弹窗，可点「📩 改发短信验证码」，或在 iPhone「设置 → Apple 账户 → 登录与安全性 → 双重认证 → 获取验证码」手动生成 6 位码填入；也可点「⚡ 免码临时直通」直接启用查找。</p>
                 <div class="modal-form-grid">
                   <label>6 位验证码
                     <input id="apple-2fa-code-input" type="text" inputmode="numeric" maxlength="6" placeholder="例如 123456">
                   </label>
                   <label>验证方式
                     <select id="apple-2fa-mode-select">
-                      <option value="trusted_device">受信任 Apple 设备弹窗验证码</option>
+                      <option value="trusted_device">受信任 Apple 设备验证码</option>
                       <option value="sms">受信任手机短信验证码</option>
                     </select>
                   </label>
                 </div>
                 <div class="modal-row-head">
-                  <button id="apple-sms-btn" class="mini-button" type="button">📩 改发短信验证码</button>
+                  <div class="modal-btn-group">
+                    <button id="apple-sms-btn" class="mini-button" type="button">📩 改发短信验证码</button>
+                    <button id="apple-bypass-2fa-btn" class="mini-button" type="button">⚡ 免码临时直通</button>
+                  </div>
                   <button id="apple-2fa-verify-btn" class="primary" type="button">✅ 完成双重认证</button>
                 </div>
               </div>

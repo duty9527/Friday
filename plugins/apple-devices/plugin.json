@@ -57,8 +57,8 @@
     },
     {
       "name": "auth-verify",
-      "label": "提交 6 位双重认证码",
-      "description": "提交 6 位数字验证码（code）完成受信任会话建权并获取长期免密票据。mode 可选 trusted_device（默认，受信任设备弹窗）或 sms（短信验证码）。",
+      "label": "提交 6 位双重认证码 / 免码直通",
+      "description": "提交 6 位数字验证码（code）完成受信任会话建权并获取长期免密票据；mode 可选 trusted_device（默认）或 sms。若仅需查找功能且不便收码，可传 bypass2fa=true 启用 Find My 单因素直通。",
       "defaultArgs": { "code": "", "mode": "trusted_device" }
     },
     {

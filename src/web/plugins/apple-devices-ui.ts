@@ -201,6 +201,7 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
   const twoFaCodeInput = element<HTMLInputElement>('apple-2fa-code-input');
   const twoFaModeSelect = element<HTMLSelectElement>('apple-2fa-mode-select');
   const smsBtn = element<HTMLButtonElement>('apple-sms-btn');
+  const bypass2faBtn = element<HTMLButtonElement>('apple-bypass-2fa-btn');
   const twoFaVerifyBtn = element<HTMLButtonElement>('apple-2fa-verify-btn');
   const kpiGrid = element<HTMLElement>('apple-kpi-grid');
   const devicesSubtitle = element<HTMLElement>('apple-devices-subtitle');
@@ -529,10 +530,28 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
     }
   }
 
+  async function handleBypass2fa(): Promise<void> {
+    if (busy) return;
+    busy = true;
+    bypass2faBtn.disabled = true;
+    setStatus('正在尝试 Find My 单因素免码直通通道…', 'warn');
+    try {
+      const res = await runApplePlugin('auth-verify', { bypass2fa: true });
+      if (res.data) render(res.data);
+      setStatus(res.message, res.ok ? 'ok' : 'err');
+    } catch (err) {
+      setStatus(`免码直通失败：${errorText(err)}`, 'err');
+    } finally {
+      busy = false;
+      bypass2faBtn.disabled = false;
+    }
+  }
+
   refreshBtn.addEventListener('click', () => { void loadStatus(true); });
   cachedBtn.addEventListener('click', () => { void loadStatus(false); });
   loginBtn.addEventListener('click', () => { void handleLogin(); });
   smsBtn.addEventListener('click', () => { void handleSendSms(); });
+  bypass2faBtn.addEventListener('click', () => { void handleBypass2fa(); });
   twoFaVerifyBtn.addEventListener('click', () => { void handleVerify2fa(); });
   logoutBtn.addEventListener('click', () => { void handleLogout(); });
   cfgSaveBtn.addEventListener('click', () => { void handleSaveConfig(); });
