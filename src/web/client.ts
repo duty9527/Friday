@@ -26,6 +26,7 @@ const imHubBackdrop = element<HTMLElement>('im-hub-backdrop');
 const systemHubBackdrop = element<HTMLElement>('system-hub-backdrop');
 const healthSurfacePanel = element<HTMLElement>('plugin-panel-health-scale');
 const fundSurfacePanel = element<HTMLElement>('plugin-panel-fund-tracker');
+const appleSurfacePanel = element<HTMLElement>('plugin-panel-apple-devices');
 const messagesEl = element('messages');
 const worksEl = element('works');
 const companionEl = element('companion-avatar');
@@ -154,6 +155,17 @@ const pluginSurfaces: PluginSurfaceRegistration[] = [
     load: () => import('./plugins/fund-tracker-ui.js').then(mod =>
       mod.initFundTrackerUi({
         isVisible: () => !pluginHubBackdrop.hidden && !fundSurfacePanel.hidden,
+      })),
+  },
+  {
+    pluginName: 'apple-devices',
+    tabId: 'plugin-tab-apple-devices',
+    panelId: 'plugin-panel-apple-devices',
+    label: '苹果设备',
+    messageTrigger: /iPhone|iPad|AirPods|Apple\s*Watch|Find\s*My|苹果设备|apple-devices/i,
+    load: () => import('./plugins/apple-devices-ui.js').then(mod =>
+      mod.initAppleDevicesUi({
+        isVisible: () => !pluginHubBackdrop.hidden && !appleSurfacePanel.hidden,
       })),
   },
 ];

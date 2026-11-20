@@ -513,6 +513,10 @@
               <span>📈 投资管理</span>
               <span id="fund-top-badge" class="hub-pill-badge">—</span>
             </button>
+            <button id="plugin-tab-apple-devices" class="hub-surface-tab" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-apple-devices" data-plugin-tab="apple-devices" hidden>
+              <span>🍎 苹果设备</span>
+              <span id="apple-top-badge" class="hub-pill-badge">—</span>
+            </button>
           </div>
           <button id="plugin-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
         </div>
@@ -879,6 +883,117 @@
             </div>
           </details>
         </section>
+        </div>
+
+        <div id="plugin-panel-apple-devices" class="hub-tab-panel" role="tabpanel" aria-labelledby="plugin-tab-apple-devices" hidden>
+          <div class="plugin-surface-bar">
+            <div>
+              <h3>🍎 苹果设备 · iCloud Find My 管控中心</h3>
+              <p class="health-header-sub">国区（云上贵州 icloud.com.cn）/ 国际区免密托管会话 · 实时电量、位置围栏、响铃寻物与低电量静默巡航</p>
+            </div>
+            <div class="health-header-actions">
+              <span id="apple-auth-pill" class="hub-badge badge-slate">未绑定</span>
+              <button id="apple-refresh-btn" class="mini-button" type="button">🔄 实时刷新</button>
+              <button id="apple-logout-btn" class="mini-button danger-btn" type="button" hidden>🚪 退出账号</button>
+            </div>
+          </div>
+          <p id="apple-action-status" class="health-status-banner" hidden></p>
+
+          <section id="apple-auth-section" class="model-modal-section" aria-label="Apple ID 本地绑定与双重认证">
+            <div class="apple-auth-card">
+              <div class="modal-row-head">
+                <h3>🔐 本地绑定 Apple ID（SRP-6a + 2FA）</h3>
+                <span id="apple-bound-account" class="meta">密码仅在当次计算密码学证明，绝不落盘、不进入聊天上下文</span>
+              </div>
+              <div id="apple-login-form" class="modal-form-grid">
+                <label>账号区域
+                  <select id="apple-region-select">
+                    <option value="cn">中国大陆 · 云上贵州 (icloud.com.cn)</option>
+                    <option value="global">国际区 (icloud.com)</option>
+                  </select>
+                </label>
+                <label>Apple ID（邮箱或手机号）
+                  <input id="apple-id-input" type="text" autocomplete="username" placeholder="name@icloud.com">
+                </label>
+                <label>Apple ID 主密码（非 App 专用密码）
+                  <input id="apple-password-input" type="password" autocomplete="current-password" placeholder="仅本机直连验证，不保存明文">
+                </label>
+              </div>
+              <div id="apple-login-actions" class="modal-row-head">
+                <span class="hint apple-security-note">凭证直接通过本机回环接口提交给守护进程，不经过大模型与聊天历史；2FA 通过后约 30～60 天内免密复用。</span>
+                <button id="apple-login-btn" class="primary" type="button">🔑 发起登录</button>
+              </div>
+
+              <div id="apple-2fa-box" class="apple-2fa-box" hidden>
+                <div class="modal-row-head">
+                  <strong>📱 请输入 6 位双重认证验证码</strong>
+                  <span id="apple-2fa-phones" class="meta"></span>
+                </div>
+                <div class="modal-form-grid">
+                  <label>6 位验证码
+                    <input id="apple-2fa-code-input" type="text" inputmode="numeric" maxlength="6" placeholder="例如 123456">
+                  </label>
+                  <label>验证方式
+                    <select id="apple-2fa-mode-select">
+                      <option value="trusted_device">受信任 Apple 设备弹窗验证码</option>
+                      <option value="sms">受信任手机短信验证码</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="modal-row-head">
+                  <button id="apple-sms-btn" class="mini-button" type="button">📩 改发短信验证码</button>
+                  <button id="apple-2fa-verify-btn" class="primary" type="button">✅ 完成双重认证</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <div id="apple-kpi-grid" class="hub-kpi-grid"></div>
+
+          <section class="model-modal-section" aria-label="已发现的苹果设备">
+            <div class="modal-row-head">
+              <div>
+                <h3>设备列表与实时状态</h3>
+                <span id="apple-devices-subtitle" class="meta">完成绑定后展示名下 iPhone、iPad、Mac、Apple Watch 与 AirPods</span>
+              </div>
+              <button id="apple-cached-btn" class="mini-button" type="button">📦 读取缓存快照</button>
+            </div>
+            <div id="apple-devices-grid" class="hub-cards-grid apple-devices-grid">
+              <p class="empty">尚未拉取设备数据。</p>
+            </div>
+          </section>
+
+          <section class="model-modal-section" aria-label="防耗电缓存与地点围栏配置">
+            <details id="apple-config-details" class="hub-compose-details">
+              <summary class="hub-compose-summary">⚙️ 缓存冷却、低电量告警阈值与常用地点围栏配置</summary>
+              <div class="hub-compose-body">
+                <div class="modal-form-grid">
+                  <label>缓存有效期（秒，防频繁唤醒耗电）
+                    <input id="apple-cfg-cache-ttl" type="number" min="0" max="86400" value="300">
+                  </label>
+                  <label>最小强制刷新冷却（秒）
+                    <input id="apple-cfg-cooldown" type="number" min="5" max="3600" value="30">
+                  </label>
+                  <label>低电量告警阈值（%）
+                    <input id="apple-cfg-min-battery" type="number" min="5" max="90" value="25">
+                  </label>
+                  <label>巡航监控设备（逗号分隔，留空默认手机/平板/手表）
+                    <input id="apple-cfg-watch" type="text" placeholder="例如：iPhone, iPad">
+                  </label>
+                  <label>设备别名映射（每行一条：别名=设备名）
+                    <textarea id="apple-cfg-aliases" rows="2" placeholder="主力机=我的 iPhone"></textarea>
+                  </label>
+                  <label>常用地点围栏（每行一条：地点=纬度,经度,半径米）
+                    <textarea id="apple-cfg-places" rows="2" placeholder="家=31.2304,121.4737,250"></textarea>
+                  </label>
+                </div>
+                <div class="modal-row-head">
+                  <span class="hint">配置保存在本机私有目录（0600 权限）；开启定时 patrol 巡航时将按上述阈值在低电量且未充电时主动告警。</span>
+                  <button id="apple-cfg-save-btn" class="primary" type="button">💾 保存配置</button>
+                </div>
+              </div>
+            </details>
+          </section>
         </div>
       </div>
     </div>
