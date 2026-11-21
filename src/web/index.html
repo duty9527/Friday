@@ -2,16 +2,27 @@
 <html lang="zh-CN" data-theme="spatial">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
   <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#06070b">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="F.R.I.D.A.Y.">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <title>F.R.I.D.A.Y. · 持续对话</title>
   <link rel="icon" type="image/png" href="/logo.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+  <link rel="manifest" href="/manifest.webmanifest">
   <link rel="stylesheet" href="/style.css">
   <script type="module" src="/client.js"></script>
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand"><span class="brand-logo" aria-hidden="true"></span> F.R.I.D.A.Y.</div>
+  <div id="mobile-nav-scrim" class="mobile-drawer-scrim" hidden></div>
+  <header id="app-topbar" class="topbar">
+    <div class="topbar-brand-head">
+      <div class="brand"><span class="brand-logo" aria-hidden="true"></span> F.R.I.D.A.Y.</div>
+      <button id="mobile-nav-close" class="mobile-only-btn mobile-drawer-close" type="button" aria-label="关闭功能菜单">✕</button>
+    </div>
     <button id="work-toggle" class="fold-control" type="button" aria-expanded="false" aria-controls="work-sidebar">任务列表</button>
     <button id="desktop-work-fold" class="desktop-fold-btn" type="button" aria-pressed="false" title="收起或展开左侧任务列表">◧ 任务舱</button>
     <div class="topbar-hub-bar" role="toolbar" aria-label="系统功能中心">
@@ -55,8 +66,12 @@
     </div>
   </header>
   <div class="app">
+    <div id="mobile-sidebar-scrim" class="mobile-drawer-scrim" hidden></div>
     <aside id="work-sidebar" class="sidebar" aria-label="任务列表">
-      <h2 class="sidebar-label">任务列表</h2>
+      <div class="sidebar-head-row">
+        <h2 class="sidebar-label">任务列表</h2>
+        <button id="work-sidebar-close" class="mobile-only-btn mobile-drawer-close" type="button" aria-label="关闭任务列表">✕</button>
+      </div>
       <select id="work-filter" aria-label="任务筛选"><option value="all">全部任务</option><option value="active">进行中</option><option value="settled">已结束 / 暂停</option></select>
       <div id="works" class="works"><p class="empty">正在读取任务…</p></div>
     </aside>
@@ -65,6 +80,9 @@
       <div id="panels" class="panels">
         <section class="conversation" aria-label="主对话">
           <header class="conv-dock">
+            <button id="mobile-nav-btn" class="mobile-only-btn mobile-header-icon-btn" type="button" aria-expanded="false" aria-controls="app-topbar" aria-label="打开功能菜单" title="菜单与功能">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="4" y1="6.5" x2="20" y2="6.5"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17.5" x2="20" y2="17.5"/></svg>
+            </button>
             <div class="conv-identity">
               <span id="companion-avatar" class="companion-avatar" role="button" tabindex="0" aria-label="F.R.I.D.A.Y. 动态头像（点击互动）" title="点击与 F.R.I.D.A.Y. 互动"></span>
               <div class="conv-identity-text">
@@ -75,10 +93,20 @@
                 </div>
               </div>
             </div>
-            <div class="conv-controls" role="toolbar" aria-label="对话显示控制">
+            <div id="conv-controls" class="conv-controls" role="toolbar" aria-label="对话显示控制">
               <div id="conv-channel-filters" class="conv-channel-filters" role="group" aria-label="按渠道筛选消息"></div>
               <button id="conv-hide-system-btn" class="conv-ctrl-chip mini-button" type="button" aria-pressed="false" title="隐藏系统状态与定时播报消息">静默系统</button>
               <button id="conv-detail-mode-btn" class="conv-ctrl-chip mini-button" type="button" aria-pressed="false" title="展开全部路由摘要、回应引用与审计明细">审计详情</button>
+            </div>
+            <div class="mobile-only-flex mobile-header-actions">
+              <button id="mobile-filter-btn" class="mobile-header-icon-btn" type="button" aria-expanded="false" aria-controls="conv-controls" aria-label="消息筛选与显示设置" title="筛选与显示">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.95" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="6" x2="20" y2="6"/><line x1="7" y1="12" x2="17" y2="12"/><line x1="10" y1="18" x2="14" y2="18"/></svg>
+                <span id="mobile-filter-dot" class="mobile-action-dot" hidden aria-hidden="true"></span>
+              </button>
+              <button id="mobile-trace-btn" class="mobile-header-icon-btn" type="button" aria-expanded="false" aria-controls="trace-panel" aria-label="查看执行链路" title="执行链路">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.95" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                <span id="mobile-trace-dot" class="mobile-action-dot is-pulse" hidden aria-hidden="true"></span>
+              </button>
             </div>
           </header>
           <div id="connection-banner" class="connection-bar" role="status" aria-live="polite" hidden><span id="connection"></span><button id="reconnect" class="mini-button" type="button">重新连接</button></div>
@@ -95,12 +123,14 @@
             <div id="bot-emote-tray" class="bot-emote-tray" hidden role="group" aria-label="插入 F.R.I.D.A.Y. 小表情"></div>
             <div class="composer-row">
               <button id="emote-toggle" class="composer-icon-btn emote-toggle-btn" type="button" aria-expanded="false" aria-controls="bot-emote-tray" aria-label="选择表情" title="选择表情" disabled><svg class="composer-svg-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9.5"/><path d="M8.5 14.5c.9 1.3 2.1 2 3.5 2s2.6-.7 3.5-2"/><circle cx="9" cy="9.8" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="9.8" r="1" fill="currentColor" stroke="none"/></svg></button>
-              <textarea id="draft" rows="1" maxlength="16384" placeholder="说点什么，或直接下达指令… (Enter 发送 · Shift+Enter 换行)" aria-label="消息输入" disabled></textarea>
+              <textarea id="draft" rows="1" maxlength="16384" placeholder="说点什么，或直接下达指令…" aria-label="消息输入" disabled></textarea>
               <button id="send" class="composer-send-btn primary" type="submit" aria-label="发送消息" title="发送消息" disabled><svg class="send-arrow-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 12h14.5"/><path d="m13 6 6 6-6 6"/></svg></button>
             </div>
           </form>
         </section>
-        <aside class="trace" aria-label="执行链路">
+        <div id="mobile-trace-scrim" class="mobile-trace-scrim" aria-hidden="true"></div>
+        <aside id="trace-panel" class="trace" aria-label="执行链路">
+          <div class="trace-sheet-grab" aria-hidden="true"></div>
           <div class="trace-heading">
             <h2>执行链路</h2>
             <div class="trace-heading-actions">

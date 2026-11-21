@@ -62,13 +62,32 @@ test('Web is authenticated, same-origin and loopback only with restrictive stati
     const page = await fetch(f.base);
     assert.equal(page.status, 200);
     assert.match(page.headers.get('content-security-policy')!, /frame-ancestors 'none'/);
+    assert.match(page.headers.get('content-security-policy')!, /manifest-src 'self'/);
     assert.equal(page.headers.get('referrer-policy'), 'no-referrer');
     assert.doesNotMatch(await page.text(), new RegExp(f.home));
-    for (const icon of ['/logo.png', '/favicon.ico', '/avatar.png']) {
+    for (const icon of [
+      '/logo.png',
+      '/favicon.ico',
+      '/avatar.png',
+      '/apple-touch-icon.png',
+      '/apple-touch-icon-precomposed.png',
+      '/icon-192.png',
+      '/icon-512.png',
+    ]) {
       const res = await fetch(`${f.base}${icon}`);
       assert.equal(res.status, 200);
       assert.equal(res.headers.get('content-type'), 'image/png');
     }
+    const manifestRes = await fetch(`${f.base}/manifest.webmanifest`);
+    assert.equal(manifestRes.status, 200);
+    assert.equal(manifestRes.headers.get('content-type'), 'application/manifest+json; charset=utf-8');
+    const manifest = await manifestRes.json() as {
+      display?: string;
+      icons?: Array<{ src?: string; sizes?: string }>;
+    };
+    assert.equal(manifest.display, 'standalone');
+    assert.ok(manifest.icons?.some(item => item.src === '/icon-192.png' && item.sizes === '192x192'));
+    assert.ok(manifest.icons?.some(item => item.src === '/icon-512.png' && item.sizes === '512x512'));
     assert.equal((await fetch(`${f.base}/api/view`)).status, 401);
     assert.equal((await fetch(`${f.base}/api/view?token=${f.web.url.split('token=')[1]}`)).status, 401);
     assert.equal((await fetch(`${f.base}/api/view`, { headers: { ...f.headers, origin: 'https://malicious.example' } })).status, 403);
@@ -688,6 +707,7 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
     const indexHtml = await (await fetch(f.base)).text();
     assert.match(indexHtml, /<html[^>]+data-theme="spatial"/);
     assert.match(indexHtml, /viewport-fit=cover/);
+    assert.match(indexHtml, /interactive-widget=resizes-content/);
     for (const marker of [
       'id="theme-spatial-btn"',
       'id="theme-industrial-btn"',
@@ -697,6 +717,11 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
       'id="emote-toggle"',
       'id="bot-emote-tray"',
       'id="send"',
+      'id="mobile-nav-btn"',
+      'id="mobile-trace-btn"',
+      'id="mobile-filter-btn"',
+      'apple-touch-icon',
+      'manifest.webmanifest',
       'class="send-arrow-icon"',
       'class="hub-svg-icon"',
     ]) {
@@ -708,6 +733,7 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
       'id="paths-disclosure"',
       'id="te-oled-strip"',
       '与 F.R.I.D.A.Y. 对话',
+      'Enter 发送 · Shift+Enter 换行',
     ]) {
       assert.ok(!indexHtml.includes(removed), `index.html must not include ${removed}`);
     }

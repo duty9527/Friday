@@ -16,6 +16,8 @@ const staticRoutes: Record<string, string> = {
   '/mindmap': 'mindmap.html',
   '/mindmap.html': 'mindmap.html',
   '/favicon.ico': 'logo.png',
+  '/apple-touch-icon.png': 'apple-touch-icon.png',
+  '/apple-touch-icon-precomposed.png': 'apple-touch-icon.png',
 };
 const staticMimeTypes: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -23,6 +25,7 @@ const staticMimeTypes: Record<string, string> = {
   '.js': 'application/javascript; charset=utf-8',
   '.png': 'image/png',
   '.woff2': 'font/woff2',
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
 };
 const adjacentWebRoot = resolve(fileURLToPath(new URL('./web/', import.meta.url)));
 const webRoot = existsSync(resolve(adjacentWebRoot, 'client.js'))
@@ -51,7 +54,7 @@ function resolveStaticAsset(pathname: string): { filePath: string; mime: string 
   const mime = Object.hasOwn(staticMimeTypes, ext) ? staticMimeTypes[ext] : undefined;
   return mime ? { filePath, mime } : undefined;
 }
-const policy = "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
+const policy = "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
 function send(
   response: ServerResponse,
   status: number,

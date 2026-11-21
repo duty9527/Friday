@@ -38,6 +38,16 @@ const themeSpatialBtn = element<HTMLButtonElement>('theme-spatial-btn');
 const themeIndustrialBtn = element<HTMLButtonElement>('theme-industrial-btn');
 const desktopWorkFoldBtn = element<HTMLButtonElement>('desktop-work-fold');
 const desktopTraceFoldBtn = element<HTMLButtonElement>('desktop-trace-fold');
+const mobileNavBtn = document.getElementById('mobile-nav-btn') as HTMLButtonElement | null;
+const mobileNavCloseBtn = document.getElementById('mobile-nav-close') as HTMLButtonElement | null;
+const mobileNavScrim = document.getElementById('mobile-nav-scrim');
+const appTopbar = document.getElementById('app-topbar');
+
+function setMobileNavOpen(open: boolean): void {
+  document.body.classList.toggle('mobile-nav-open', open);
+  if (mobileNavScrim) mobileNavScrim.hidden = !open;
+  mobileNavBtn?.setAttribute('aria-expanded', String(open));
+}
 
 bindThemeButtons(themeSpatialBtn, themeIndustrialBtn);
 initDesktopDrawers({
@@ -501,6 +511,28 @@ const modalBackdrops = [
   imHubBackdrop,
   systemHubBackdrop,
 ];
+mobileNavBtn?.addEventListener('click', () => {
+  const next = !document.body.classList.contains('mobile-nav-open');
+  if (next) {
+    tracePanel.showPanel(false);
+    tracePanel.closeSidebar();
+  }
+  setMobileNavOpen(next);
+});
+mobileNavCloseBtn?.addEventListener('click', () => {
+  setMobileNavOpen(false);
+});
+mobileNavScrim?.addEventListener('click', () => {
+  setMobileNavOpen(false);
+});
+appTopbar?.addEventListener('click', event => {
+  if (!document.body.classList.contains('mobile-nav-open')) return;
+  const target = event.target instanceof Element ? event.target : null;
+  if (!target) return;
+  if (target.closest('#work-toggle, #open-memory-hub-top, #open-timer-hub-top, #open-plugin-hub-top, #open-im-hub-top, #open-system-hub-top')) {
+    setMobileNavOpen(false);
+  }
+});
 document.addEventListener('keydown', event => {
   if (event.key !== 'Escape') return;
   if (memoryHub.isImmersive()) {
@@ -508,9 +540,18 @@ document.addEventListener('keydown', event => {
     memoryHub.exitImmersive();
   } else if (modalBackdrops.some(el => !el.hidden)) {
     closeAllHubModals();
+  } else if (document.body.classList.contains('mobile-nav-open')) {
+    setMobileNavOpen(false);
+    mobileNavBtn?.focus();
   } else if (tracePanel.isSidebarOpen()) {
     tracePanel.closeSidebar();
     tracePanel.focusSidebarToggle();
+  } else if (
+    typeof window.matchMedia === 'function'
+    && window.matchMedia('(max-width: 730px)').matches
+    && tracePanel.isTraceVisible()
+  ) {
+    tracePanel.showPanel(false);
   }
 });
 

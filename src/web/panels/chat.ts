@@ -58,6 +58,23 @@ const STORAGE_KEY_CHANNEL = 'friday.chat-channel-filter';
 const STORAGE_KEY_HIDE_SYSTEM = 'friday.chat-hide-system';
 const STORAGE_KEY_DETAIL_MODE = 'friday.chat-detail-mode';
 const LONG_MESSAGE_COLLAPSE_CHARS = 4800;
+const MOBILE_SCROLLABLE_SELECTOR = [
+  '.messages-scroll',
+  '#draft',
+  '.works',
+  '.trace-chain-pane',
+  '.trace-inspector-pane',
+  '.inspector-body',
+  '.work-overview-card',
+  '.routing-detail',
+  '.model-modal-body',
+  '.plugin-main',
+  '.plugin-sidebar',
+  '.bot-emote-tray',
+  '.topbar',
+  'pre',
+  '.md-table-wrap',
+].join(', ');
 
 function singleLine(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
@@ -191,6 +208,10 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
   const filterBannerEl = element('conv-filter-banner');
   const scrollBottomBtn = element<HTMLButtonElement>('scroll-bottom-btn');
   const bossDecisionDockEl = element('boss-decision-dock');
+  const convControlsEl = document.getElementById('conv-controls');
+  const mobileFilterBtn = document.getElementById('mobile-filter-btn') as HTMLButtonElement | null;
+  const mobileFilterDot = document.getElementById('mobile-filter-dot');
+  const mobileTraceDot = document.getElementById('mobile-trace-dot');
 
   let channelFilter: ChatChannelFilter = normalizeStoredChannel(readStoredString(STORAGE_KEY_CHANNEL));
   let hideSystem = readStoredString(STORAGE_KEY_HIDE_SYSTEM) === 'true';
@@ -290,17 +311,38 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     setEmoteTrayOpen(emoteTrayEl.hidden);
   });
 
+  function setMobileFilterOpen(open: boolean): void {
+    if (!convControlsEl || !mobileFilterBtn) return;
+    convControlsEl.classList.toggle('is-mobile-open', open);
+    mobileFilterBtn.setAttribute('aria-expanded', String(open));
+  }
+
+  mobileFilterBtn?.addEventListener('click', event => {
+    event.stopPropagation();
+    const isOpen = convControlsEl?.classList.contains('is-mobile-open') ?? false;
+    setMobileFilterOpen(!isOpen);
+  });
+
   document.addEventListener('click', event => {
-    if (emoteTrayEl.hidden) return;
-    if (event.target instanceof Node && (emoteTrayEl.contains(event.target) || emoteToggleBtn.contains(event.target))) {
-      return;
+    if (!emoteTrayEl.hidden) {
+      if (!(event.target instanceof Node && (emoteTrayEl.contains(event.target) || emoteToggleBtn.contains(event.target)))) {
+        setEmoteTrayOpen(false);
+      }
     }
-    setEmoteTrayOpen(false);
+    if (convControlsEl?.classList.contains('is-mobile-open')) {
+      if (!(event.target instanceof Node && (convControlsEl.contains(event.target) || mobileFilterBtn?.contains(event.target)))) {
+        setMobileFilterOpen(false);
+      }
+    }
   });
 
   document.addEventListener('keydown', event => {
-    if (event.key === 'Escape' && !emoteTrayEl.hidden) {
+    if (event.key !== 'Escape') return;
+    if (!emoteTrayEl.hidden) {
       setEmoteTrayOpen(false);
+    }
+    if (convControlsEl?.classList.contains('is-mobile-open')) {
+      setMobileFilterOpen(false);
     }
   });
 
@@ -345,6 +387,10 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       activeWorksBtn.hidden = true;
       activeWorksBtn.classList.remove('is-waiting');
     }
+    if (mobileTraceDot) {
+      mobileTraceDot.hidden = activeWorks.length === 0 && waitingWorks.length === 0;
+      mobileTraceDot.classList.toggle('is-waiting', waitingWorks.length > 0);
+    }
   }
 
   activeWorksBtn.addEventListener('click', () => {
@@ -386,6 +432,10 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     hideSystemBtn.setAttribute('aria-pressed', String(hideSystem));
     detailModeBtn.classList.toggle('active', detailMode);
     detailModeBtn.setAttribute('aria-pressed', String(detailMode));
+
+    const hasMobileFilterBadge = channelFilter !== 'all' || hideSystem || detailMode;
+    if (mobileFilterDot) mobileFilterDot.hidden = !hasMobileFilterBadge;
+    mobileFilterBtn?.classList.toggle('has-active', hasMobileFilterBadge);
 
     const hasActiveFilter = channelFilter !== 'all' || hideSystem;
     if (!hasActiveFilter || (hiddenSystemCount === 0 && hiddenChannelCount === 0 && channelFilter === 'all')) {
@@ -1571,6 +1621,64 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       syncScrollBottomButton();
     }, 120);
   });
+
+  if (typeof window !== 'undefined' && window.visualViewport) {
+    window.visualViewport.addEventListener('scroll', () => {
+      if (window.scrollY !== 0 || window.scrollX !== 0) {
+        window.scrollTo(0, 0);
+      }
+    }, { passive: true });
+    window.visualViewport.addEventListener('resize', () => {
+      if (window.scrollY !== 0 || window.scrollX !== 0) {
+        window.scrollTo(0, 0);
+      }
+      if (resizePinned) scrollEl.scrollTop = scrollEl.scrollHeight;
+      syncScrollBottomButton();
+    }, { passive: true });
+  }
+
+  let touchStartX = 0;
+  let touchStartY = 0;
+  document.addEventListener('touchstart', event => {
+    if (event.touches.length !== 1) return;
+    const touch = event.touches[0];
+    if (!touch) return;
+    touchStartX = touch.clientX;
+    touchStartY = touch.clientY;
+  }, { passive: true });
+
+  document.addEventListener('touchmove', event => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    if (!window.matchMedia('(max-width: 730px)').matches) return;
+    if (event.touches.length !== 1) return;
+    const touch = event.touches[0];
+    if (!touch) return;
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target) return;
+    if (target.closest('.brain-viewport-wrap, canvas, input[type="range"]')) return;
+
+    const dx = touch.clientX - touchStartX;
+    const dy = touch.clientY - touchStartY;
+    const horizontal = Math.abs(dx) > Math.abs(dy);
+    if (horizontal && target.closest('textarea, input')) return;
+
+    let cursor: Element | null = target;
+    while (cursor && cursor !== document.body && cursor !== document.documentElement) {
+      if (cursor.matches(MOBILE_SCROLLABLE_SELECTOR)) {
+        if (horizontal) {
+          if (cursor.scrollWidth > cursor.clientWidth + 1) return;
+        } else if (cursor.scrollHeight > cursor.clientHeight + 1) {
+          const atTop = cursor.scrollTop <= 0 && dy > 0;
+          const atBottom = cursor.scrollTop + cursor.clientHeight >= cursor.scrollHeight - 1 && dy < 0;
+          if (!atTop && !atBottom) return;
+        }
+      }
+      cursor = cursor.parentElement;
+    }
+
+    if (event.cancelable) event.preventDefault();
+  }, { passive: false });
+
   olderBtn.addEventListener('click', () => { void loadOlder(); });
 
   return {

@@ -21,6 +21,7 @@ export interface TracePanelController {
   renderWorks: () => void;
   stopWork: (target?: string) => Promise<void>;
   showPanel: (trace: boolean) => void;
+  isTraceVisible: () => boolean;
   closeSidebar: () => void;
   isSidebarOpen: () => boolean;
   focusSidebarToggle: () => void;
@@ -212,6 +213,10 @@ export function initTracePanel(): TracePanelController {
   const traceCloseBtn = document.getElementById('trace-close-btn') as HTMLButtonElement | null;
   const filterMsgBtn = document.getElementById('filter-msg-mode') as HTMLButtonElement | null;
   const filterRouteBtn = document.getElementById('filter-route-mode') as HTMLButtonElement | null;
+  const mobileTraceBtn = document.getElementById('mobile-trace-btn') as HTMLButtonElement | null;
+  const mobileTraceScrim = document.getElementById('mobile-trace-scrim');
+  const mobileSidebarScrim = document.getElementById('mobile-sidebar-scrim');
+  const workSidebarCloseBtn = document.getElementById('work-sidebar-close') as HTMLButtonElement | null;
 
   const categoryTabs: ReadonlyArray<{ cat: ChainCategory; label: string; btn: HTMLButtonElement | null }> = [
     { cat: 'all', label: '全部链路', btn: stepModeBtn },
@@ -238,11 +243,18 @@ export function initTracePanel(): TracePanelController {
     panelsEl.classList.toggle('trace-visible', trace);
     showChatBtn.setAttribute('aria-pressed', String(!trace));
     showTraceBtn.setAttribute('aria-pressed', String(trace));
+    mobileTraceBtn?.setAttribute('aria-expanded', String(trace));
+    mobileTraceBtn?.classList.toggle('active', trace);
+  }
+
+  function setSidebarOpen(open: boolean): void {
+    sidebarEl.classList.toggle('open', open);
+    workToggleBtn.setAttribute('aria-expanded', String(open));
+    if (mobileSidebarScrim) mobileSidebarScrim.hidden = !open;
   }
 
   function closeSidebar(): void {
-    sidebarEl.classList.remove('open');
-    workToggleBtn.setAttribute('aria-expanded', 'false');
+    setSidebarOpen(false);
   }
 
   function syncWideToggle(): void {
@@ -1407,9 +1419,15 @@ export function initTracePanel(): TracePanelController {
 
   showChatBtn.addEventListener('click', () => showPanel(false));
   showTraceBtn.addEventListener('click', () => showPanel(true));
+  mobileTraceBtn?.addEventListener('click', () => {
+    showPanel(!panelsEl.classList.contains('trace-visible'));
+  });
+  mobileTraceScrim?.addEventListener('click', () => showPanel(false));
+  workSidebarCloseBtn?.addEventListener('click', closeSidebar);
+  mobileSidebarScrim?.addEventListener('click', closeSidebar);
   workToggleBtn.addEventListener('click', () => {
-    const open = sidebarEl.classList.toggle('open');
-    workToggleBtn.setAttribute('aria-expanded', String(open));
+    const open = !sidebarEl.classList.contains('open');
+    setSidebarOpen(open);
     if (open) workFilterEl.focus();
   });
   document.addEventListener('click', event => {
@@ -1425,6 +1443,7 @@ export function initTracePanel(): TracePanelController {
     renderWorks,
     stopWork,
     showPanel,
+    isTraceVisible: () => panelsEl.classList.contains('trace-visible'),
     closeSidebar,
     isSidebarOpen: () => sidebarEl.classList.contains('open'),
     focusSidebarToggle: () => workToggleBtn.focus(),

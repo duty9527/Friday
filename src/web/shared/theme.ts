@@ -95,6 +95,12 @@ function applyThemeToDom(theme: UiTheme): void {
     if (meta) {
       meta.setAttribute('content', scheme);
     }
+    const themeColorMeta = typeof document.querySelector === 'function'
+      ? document.querySelector('meta[name="theme-color"]')
+      : null;
+    if (themeColorMeta) {
+      themeColorMeta.setAttribute('content', theme === 'industrial' ? '#ddd7ca' : '#06070b');
+    }
   }
   syncThemeButtons(theme);
 }
