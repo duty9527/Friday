@@ -61,6 +61,7 @@ export interface SubconsciousRuntime {
   distillerEnabled?: boolean;
   distillIdleMs?: number;
   distillCheckIntervalMs?: number;
+  pluginAutoRefresh?: boolean;
 }
 
 export function isRunningUnderNodeTest(): boolean {

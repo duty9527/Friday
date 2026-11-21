@@ -3,16 +3,24 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import json
 import math
 import os
 from pathlib import Path
 import re
 import sqlite3
+import sys
 import threading
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 import urllib.request
+
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo
+    _SHANGHAI_TZ: Optional[Any] = _ZoneInfo("Asia/Shanghai")
+except Exception:
+    _SHANGHAI_TZ = None
 
 VALID_SIZES: Tuple[str, ...] = ("1x1", "2x1", "1x2", "2x2")
 VALID_MARQUEE_MODES: Tuple[str, ...] = ("auto_pause", "continuous", "static")
@@ -34,6 +42,22 @@ LAIFEN_MODE_ZH: Dict[int, str] = {
     3: "强劲清洁",
     4: "高频亮白",
 }
+
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _localize_laifen_name(raw_name: Any) -> str:
+    s = str(raw_name or "").strip()
+    if s and _CJK_RE.search(s):
+        return s[:16]
+    return "徕芬电动牙刷"
+
+
+def _localize_netlea_name(raw_name: Any) -> str:
+    s = str(raw_name or "").strip()
+    if s and _CJK_RE.search(s):
+        return s[:18]
+    return "尼特利鱼缸灯"
 
 APPLE_CATEGORY_ZH: Dict[str, str] = {
     "iphone": "手机",
@@ -766,7 +790,7 @@ def discover_widget_catalog(
             "kind": "laifen",
             "category": "plugin",
             "plugin": "laifen",
-            "title": "口腔护理",
+            "title": "徕芬电动牙刷",
             "subtitle": "牙刷电量 · 护齿模式 · 刷牙打卡与刷头寿命",
             "defaultSize": "1x1",
             "supportedSizes": list(VALID_SIZES),
@@ -776,7 +800,7 @@ def discover_widget_catalog(
             "kind": "netlea",
             "category": "plugin",
             "plugin": "netlea",
-            "title": "生态水草灯",
+            "title": "尼特利鱼缸灯",
             "subtitle": "灯具状态 · 四通道光谱比例 · 自动日出日落",
             "defaultSize": "1x1",
             "supportedSizes": list(VALID_SIZES),
@@ -892,12 +916,23 @@ def discover_widget_catalog(
     return catalog
 
 
-def _is_market_hours_now() -> bool:
-    lt = time.localtime()
-    if lt.tm_wday >= 5:
-        return False
-    hm = lt.tm_hour * 60 + lt.tm_min
-    return (9 * 60 + 15 <= hm <= 15 * 60 + 15) or (hm >= 21 * 60) or (hm <= 5 * 60)
+def _is_market_hours_now(now_ts: Optional[float] = None) -> bool:
+    ts = time.time() if now_ts is None else float(now_ts)
+    if _SHANGHAI_TZ is not None:
+        dt = datetime.fromtimestamp(ts, tz=_SHANGHAI_TZ)
+        wday = dt.weekday()
+        hm = dt.hour * 60 + dt.minute
+    else:
+        lt = time.localtime(ts)
+        wday = lt.tm_wday
+        hm = lt.tm_hour * 60 + lt.tm_min
+    is_mon_to_fri = 0 <= wday <= 4
+    is_tue_to_sat = 1 <= wday <= 5
+    if is_mon_to_fri and ((9 * 60 + 15 <= hm <= 16 * 60 + 15) or hm >= 21 * 60):
+        return True
+    if is_tue_to_sat and hm <= 5 * 60:
+        return True
+    return False
 
 
 def _fmt_money(v: float) -> str:
@@ -1132,6 +1167,7 @@ class WidgetDataHub:
         self._hashes: Dict[str, str] = {}
         self._last_poll_at: Dict[str, float] = {}
         self._last_mtime: Dict[str, float] = {}
+        self._last_live_attempt_at: Dict[str, float] = {}
         self._last_proc_cpu: Optional[Tuple[int, int]] = None
         self._force_kinds: Set[str] = set()
         self.data_rev: int = 1
@@ -1207,18 +1243,22 @@ class WidgetDataHub:
                 self._collect_system_pulse(last_view)
 
         if "fund-tracker" in by_kind:
-            ttl = 60.0 if _is_market_hours_now() else 300.0
+            ttl = 60.0 if _is_market_hours_now() else 180.0
             db_path = self.home / "plugins" / "fund-tracker" / "funds.sqlite"
-            mtime_changed = self._file_mtime_changed("fund-tracker", db_path)
-            if self._should_poll("fund-tracker", ttl, now_mono, force=force, mtime_changed=mtime_changed):
-                self._collect_fund_tracker(db_path, connected=connected, allow_refresh=_is_market_hours_now())
+            wal_path = self.home / "plugins" / "fund-tracker" / "funds.sqlite-wal"
+            m1 = self._file_mtime_changed("fund-tracker:db", db_path)
+            m2 = self._file_mtime_changed("fund-tracker:wal", wal_path)
+            if self._should_poll("fund-tracker", ttl, now_mono, force=force, mtime_changed=(m1 or m2)):
+                self._collect_fund_tracker(db_path, connected=connected, allow_refresh=False)
 
         if "health-scale" in by_kind:
             db_path = self.home / "plugins" / "health-scale" / "health.db"
+            wal_path = self.home / "plugins" / "health-scale" / "health.db-wal"
             sess_path = self.home / "plugins" / "health-scale" / "live-session.json"
             m1 = self._file_mtime_changed("health-scale:db", db_path)
-            m2 = self._file_mtime_changed("health-scale:sess", sess_path)
-            if self._should_poll("health-scale", 600.0, now_mono, force=force, mtime_changed=(m1 or m2)):
+            m2 = self._file_mtime_changed("health-scale:wal", wal_path)
+            m3 = self._file_mtime_changed("health-scale:sess", sess_path)
+            if self._should_poll("health-scale", 600.0, now_mono, force=force, mtime_changed=(m1 or m2 or m3)):
                 self._collect_health_scale(db_path, connected=connected)
 
         if "miot" in by_kind:
@@ -1229,9 +1269,12 @@ class WidgetDataHub:
 
         if "ninebot" in by_kind:
             db_path = self.home / "plugins" / "ninebot" / "ninebot.sqlite"
+            wal_path = self.home / "plugins" / "ninebot" / "ninebot.sqlite-wal"
             img_path = self.home / "plugins" / "ninebot" / "vehicle-dark.png"
-            m_changed = self._file_mtime_changed("ninebot:db", db_path) or self._file_mtime_changed("ninebot:img", img_path)
-            if self._should_poll("ninebot", 180.0, now_mono, force=force, mtime_changed=m_changed):
+            m1 = self._file_mtime_changed("ninebot:db", db_path)
+            m2 = self._file_mtime_changed("ninebot:wal", wal_path)
+            m3 = self._file_mtime_changed("ninebot:img", img_path)
+            if self._should_poll("ninebot", 180.0, now_mono, force=force, mtime_changed=(m1 or m2 or m3)):
                 self._collect_ninebot(db_path, connected=connected)
 
         if "laifen" in by_kind:
@@ -1322,6 +1365,39 @@ class WidgetDataHub:
                 self._last_mtime[tag] = mt
                 return True
             return False
+
+    def _can_attempt_live(self, key: str, cooldown_sec: float, now_mono: Optional[float] = None) -> bool:
+        if self.disable_network:
+            return False
+        mono = time.monotonic() if now_mono is None else float(now_mono)
+        with self._lock:
+            last = self._last_live_attempt_at.get(key)
+            if last is not None and (mono - last) < cooldown_sec:
+                return False
+            self._last_live_attempt_at[key] = mono
+            return True
+
+    def _is_ble_peer_busy(self) -> bool:
+        now_wall = time.time()
+        checks = (
+            (self.home / "plugins" / "health-scale" / "live-session.json", 90.0, ("scanning", "connecting", "measuring")),
+            (self.home / "plugins" / "laifen" / "live-session.json", 200.0, ("scanning", "connecting", "monitoring")),
+            (self.home / "plugins" / "laifen" / "watch-state.json", 60.0, ("connecting", "syncing", "brushing")),
+        )
+        for path, max_age_sec, phases in checks:
+            try:
+                if not path.is_file():
+                    continue
+                st = path.stat()
+                if (now_wall - st.st_mtime) >= max_age_sec:
+                    continue
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                phase = str((raw or {}).get("phase") or "").strip().lower() if isinstance(raw, dict) else ""
+                if phase in phases:
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _read_proc_cpu_pct(self) -> float:
         try:
@@ -1513,8 +1589,8 @@ class WidgetDataHub:
                 },
             )
 
-    def _collect_fund_tracker(self, db_path: Path, *, connected: bool, allow_refresh: bool) -> None:
-        # 1) Try Friday RPC dashboard first (fast SQLite computation, optional live fetch during market hours)
+    def _collect_fund_tracker(self, db_path: Path, *, connected: bool, allow_refresh: bool = False) -> None:
+        # 1) Try Friday RPC dashboard first (fast SQLite computation without blocking on network)
         summary: Optional[Dict[str, Any]] = None
         snapshots: List[Dict[str, Any]] = []
         updated_at: float = 0.0
@@ -1525,9 +1601,9 @@ class WidgetDataHub:
                         "command": "plugin-run",
                         "plugin": "fund-tracker",
                         "action": "dashboard",
-                        "args": {"refresh": bool(allow_refresh)},
+                        "args": {"refresh": False, "silent": True},
                     },
-                    10.0 if allow_refresh else 5.0,
+                    5.0,
                 )
                 data = (res or {}).get("data") if isinstance(res, dict) else None
                 if isinstance(data, dict) and isinstance(data.get("summary"), dict):
@@ -1557,6 +1633,7 @@ class WidgetDataHub:
                     total_asset = float(latest_s["total_asset"] or total_asset)
                     daily_pnl = float(latest_s["daily_pnl"] or 0.0)
                     total_pnl = float(latest_s["total_pnl"] or (total_asset - total_cost))
+                    updated_at = float(latest_s["created_at"] or 0.0)
                     base_asset = max(1.0, total_asset - daily_pnl)
                     daily_pct = (daily_pnl / base_asset) * 100.0
                     total_pct = (total_pnl / max(1.0, total_cost)) * 100.0
@@ -1586,6 +1663,53 @@ class WidgetDataHub:
                 snapshots = [dict(r) for r in reversed(s_rows)]
             except Exception:
                 summary = None
+
+        # 3) Bounded fallback live refresh if cached snapshot is stale (e.g. Core refresh disabled/lagged)
+        has_holdings = bool(summary.get("holdings")) if isinstance(summary, dict) else False
+        if not has_holdings and summary is None:
+            cfg_path = db_path.parent / "config.json"
+            if cfg_path.is_file():
+                try:
+                    cfg_raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+                    has_holdings = bool(isinstance(cfg_raw, dict) and cfg_raw.get("holdings"))
+                except Exception:
+                    has_holdings = False
+        if not has_holdings and db_path.is_file():
+            try:
+                con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+                cnt_row = con.execute("SELECT COUNT(*) FROM holdings").fetchone()
+                con.close()
+                has_holdings = bool(cnt_row and int(cnt_row[0] or 0) > 0)
+            except Exception:
+                pass
+
+        now_ms = time.time() * 1000.0
+        snap_age_sec = ((now_ms - updated_at) / 1000.0) if updated_at > 0 else 999999.0
+        stale_limit_sec = 300.0 if _is_market_hours_now() else 2100.0
+        if (
+            connected
+            and not self.disable_network
+            and has_holdings
+            and (allow_refresh or snap_age_sec > stale_limit_sec)
+            and self._can_attempt_live("fund-tracker", 300.0)
+        ):
+            try:
+                res = self._rpc(
+                    {
+                        "command": "plugin-run",
+                        "plugin": "fund-tracker",
+                        "action": "dashboard",
+                        "args": {"refresh": True, "silent": True},
+                    },
+                    20.0,
+                )
+                data = (res or {}).get("data") if isinstance(res, dict) else None
+                if isinstance(data, dict) and isinstance(data.get("summary"), dict):
+                    summary = data["summary"]
+                    snapshots = list(data.get("snapshots") or [])
+                    updated_at = float(data.get("updatedAt") or now_ms)
+            except Exception:
+                pass
 
         if not summary:
             self._store_widget(
@@ -1743,21 +1867,46 @@ class WidgetDataHub:
     def _collect_miot(self, cache_path: Path, *, connected: bool) -> None:
         cached_devices: List[Dict[str, Any]] = []
         fetched_at = 0.0
+        live_fetched_at = 0.0
         if cache_path.is_file():
             try:
                 parsed = json.loads(cache_path.read_text(encoding="utf-8"))
                 cached_devices = list(parsed.get("devices") or [])
                 fetched_at = float(parsed.get("hotDataFetchedAt") or parsed.get("fetchedAt") or 0.0)
+                live_fetched_at = float(parsed.get("liveFetchedAt") or 0.0)
             except Exception:
                 cached_devices = []
         raw_devices: List[Dict[str, Any]] = list(cached_devices)
 
-        cache_age_sec = (time.time() * 1000.0 - fetched_at) / 1000.0 if fetched_at > 0 else 999999.0
-        if connected and (not raw_devices or cache_age_sec > 360.0):
+        cfg_path = cache_path.parent / "config.json"
+        configured = False
+        if cfg_path.is_file():
+            try:
+                cfg_obj = json.loads(cfg_path.read_text(encoding="utf-8"))
+                configured = bool(isinstance(cfg_obj, dict) and str(cfg_obj.get("routerSsh") or "").strip())
+            except Exception:
+                configured = False
+
+        now_ms = time.time() * 1000.0
+        hot_age_sec = (now_ms - fetched_at) / 1000.0 if fetched_at > 0 else 999999.0
+        live_age_sec = (now_ms - live_fetched_at) / 1000.0 if live_fetched_at > 0 else 999999.0
+        if (
+            connected
+            and not self.disable_network
+            and configured
+            and (not raw_devices or hot_age_sec > 720.0 or live_age_sec > 2100.0)
+            and self._can_attempt_live("miot", 300.0)
+        ):
+            want_live = live_age_sec > 2100.0
             try:
                 res = self._rpc(
-                    {"command": "plugin-run", "plugin": "miot", "action": "devices", "args": {"live": False}},
-                    6.0,
+                    {
+                        "command": "plugin-run",
+                        "plugin": "miot",
+                        "action": "devices",
+                        "args": {"refresh": True, "live": want_live, "silent": True},
+                    },
+                    25.0,
                 )
                 data = (res or {}).get("data") if isinstance(res, dict) else None
                 if isinstance(data, dict) and isinstance(data.get("devices"), list):
@@ -1962,6 +2111,32 @@ class WidgetDataHub:
             (nb_dir / "session.json").is_file() or (nb_dir / "config.json").is_file()
         )
         snap = (dash or {}).get("snapshot") if isinstance(dash, dict) else None
+        cap_ms_raw = float(snap.get("capturedAt") or 0.0) if isinstance(snap, dict) else 0.0
+        snap_age_sec = ((time.time() * 1000.0 - cap_ms_raw) / 1000.0) if cap_ms_raw > 0 else 999999.0
+        if (
+            connected
+            and not self.disable_network
+            and configured
+            and (not isinstance(snap, dict) or snap_age_sec > 2100.0)
+            and self._can_attempt_live("ninebot", 600.0)
+        ):
+            try:
+                res = self._rpc(
+                    {
+                        "command": "plugin-run",
+                        "plugin": "ninebot",
+                        "action": "dashboard",
+                        "args": {"refresh": True, "limit": 16, "silent": True},
+                    },
+                    20.0,
+                )
+                d = (res or {}).get("data") if isinstance(res, dict) else None
+                if isinstance(d, dict):
+                    dash = d
+                    configured = bool(d.get("configured", configured))
+                    snap = d.get("snapshot")
+            except Exception:
+                pass
         if not isinstance(snap, dict):
             self._store_widget(
                 "ninebot",
@@ -2254,8 +2429,7 @@ class WidgetDataHub:
         total_sessions = int(stats.get("totalSessions") or 0)
         has_data = (dev is not None) or (total_sessions > 0) or (today_count > 0)
 
-        raw_name = str((dev or {}).get("name") or "").strip()
-        name = "徕芬声波牙刷" if (not raw_name or raw_name.upper() == "LFTB") else raw_name[:16]
+        name = _localize_laifen_name((dev or {}).get("name"))
         batt = int(round(float(dev["batteryPct"]))) if dev and dev.get("batteryPct") is not None else None
         mode = int(dev["activeMode"]) if dev and dev.get("activeMode") is not None else None
         mode_label = LAIFEN_MODE_ZH.get(mode, f"{mode}档" if mode else ("未连接" if has_data else "待同步")) if mode is not None else ("未连接" if has_data else "待同步")
@@ -2339,8 +2513,10 @@ class WidgetDataHub:
                     cfg_raw = {}
             data = {
                 "updatedAt": snap_raw.get("updatedAt"),
+                "lastAddress": snap_raw.get("lastAddress"),
                 "device": snap_raw.get("device"),
                 "state": snap_raw.get("state"),
+                "schedule": snap_raw.get("schedule"),
                 "config": cfg_raw,
             }
 
@@ -2348,10 +2524,55 @@ class WidgetDataHub:
         st = data.get("state") if isinstance(data.get("state"), dict) else None
         cfg = data.get("config") if isinstance(data.get("config"), dict) else {}
         updated_at = float(data.get("updatedAt") or 0.0)
+        state_age_sec = ((time.time() * 1000.0 - updated_at) / 1000.0) if updated_at > 0 else 999999.0
+        has_bound_lamp = bool(
+            str(cfg.get("targetMac") or "").strip()
+            or str(data.get("lastAddress") or "").strip()
+            or str((dev or {}).get("address") or "").strip()
+        )
+        is_linux = os.name == "posix" and sys.platform.startswith("linux")
+        if (
+            connected
+            and not self.disable_network
+            and is_linux
+            and has_bound_lamp
+            and (not isinstance(st, dict) or state_age_sec > 2100.0)
+            and (not self._is_ble_peer_busy())
+            and self._can_attempt_live("netlea", 600.0)
+        ):
+            try:
+                has_sched = isinstance(data.get("schedule"), dict)
+                st_res = self._rpc(
+                    {
+                        "command": "plugin-run",
+                        "plugin": "netlea",
+                        "action": "status",
+                        "args": {"minimal": has_sched, "silent": True},
+                    },
+                    25.0,
+                )
+                if isinstance(st_res, dict) and st_res.get("ok"):
+                    dash_res = self._rpc(
+                        {
+                            "command": "plugin-run",
+                            "plugin": "netlea",
+                            "action": "dashboard",
+                            "args": {"refresh": False, "silent": True},
+                        },
+                        5.0,
+                    )
+                    d2 = (dash_res or {}).get("data") if isinstance(dash_res, dict) else None
+                    if isinstance(d2, dict):
+                        data = d2
+                        dev = data.get("device") if isinstance(data.get("device"), dict) else None
+                        st = data.get("state") if isinstance(data.get("state"), dict) else None
+                        cfg = data.get("config") if isinstance(data.get("config"), dict) else {}
+                        updated_at = float(data.get("updatedAt") or 0.0)
+            except Exception:
+                pass
         updated_hm = time.strftime("%H:%M", time.localtime(updated_at / 1000.0)) if updated_at > 0 else ""
 
-        raw_name = str((dev or {}).get("name") or "").strip()
-        name = raw_name[:18] if raw_name else "尼特利水草灯"
+        name = _localize_netlea_name((dev or {}).get("name"))
 
         if not isinstance(st, dict):
             self._store_widget(
@@ -2370,7 +2591,7 @@ class WidgetDataHub:
                     "fan": 0,
                     "updatedHm": updated_hm,
                     "headline": "待同步灯具",
-                    "subline": "在「生态水草灯」面板同步状态",
+                    "subline": "在「鱼缸灯光」面板同步状态",
                 },
             )
             return
@@ -2438,8 +2659,13 @@ class WidgetDataHub:
         if connected:
             try:
                 res = self._rpc(
-                    {"command": "plugin-run", "plugin": "apple-devices", "action": "status", "args": {"refresh": False}},
-                    4.5,
+                    {
+                        "command": "plugin-run",
+                        "plugin": "apple-devices",
+                        "action": "status",
+                        "args": {"cacheOnly": True, "silent": True},
+                    },
+                    5.0,
                 )
                 d = (res or {}).get("data") if isinstance(res, dict) else None
                 if isinstance(d, dict):
@@ -2532,9 +2758,35 @@ class WidgetDataHub:
             }
 
         auth_state = str(data.get("authState") or "unauthenticated")
+        fetched_ms = float(data.get("fetchedAt") or 0.0)
+        cache_age_sec = ((time.time() * 1000.0 - fetched_ms) / 1000.0) if fetched_ms > 0 else 999999.0
+        if (
+            connected
+            and not self.disable_network
+            and auth_state == "authenticated"
+            and (fetched_ms <= 0 or cache_age_sec > 3900.0)
+            and self._can_attempt_live("apple-devices", 600.0)
+        ):
+            try:
+                res = self._rpc(
+                    {
+                        "command": "plugin-run",
+                        "plugin": "apple-devices",
+                        "action": "status",
+                        "args": {"refresh": True, "silent": True},
+                    },
+                    25.0,
+                )
+                d2 = (res or {}).get("data") if isinstance(res, dict) else None
+                if isinstance(res, dict) and res.get("ok") and isinstance(d2, dict):
+                    data = d2
+                    auth_state = str(data.get("authState") or auth_state)
+                    fetched_ms = float(data.get("fetchedAt") or 0.0)
+            except Exception:
+                pass
+
         cfg_d = data.get("config") if isinstance(data.get("config"), dict) else {}
         min_batt_pct = int(cfg_d.get("minBatteryPct") or 25)
-        fetched_ms = float(data.get("fetchedAt") or 0.0)
         updated_hm = time.strftime("%H:%M", time.localtime(fetched_ms / 1000.0)) if fetched_ms > 0 else ""
 
         raw_devs = [d for d in (data.get("devices") or []) if isinstance(d, dict)]
@@ -2699,7 +2951,7 @@ class WidgetDataHub:
         ok = False
         if connected:
             try:
-                res = self._rpc({"command": "plugin-run", "plugin": "tv-ir", "action": "status", "args": {}}, 4.0)
+                res = self._rpc({"command": "plugin-run", "plugin": "tv-ir", "action": "status", "args": {}}, 8.0)
                 if isinstance(res, dict):
                     ok = bool(res.get("ok"))
                     if isinstance(res.get("data"), dict):

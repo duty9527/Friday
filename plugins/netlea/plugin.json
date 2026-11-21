@@ -1,6 +1,6 @@
 {
   "name": "netlea",
-  "title": "尼特利鱼缸灯蓝牙直控 (Netlea BLE)",
+  "title": "尼特利鱼缸灯蓝牙直控",
   "runtime": "in-process",
   "voiceFastpath": false,
   "platforms": [

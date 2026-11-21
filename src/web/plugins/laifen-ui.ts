@@ -178,6 +178,11 @@ const PHASE_BADGES: Record<string, { text: string; cls: string }> = {
   error: { text: '异常', cls: 'badge-red' },
 };
 
+function formatLaifenDisplayName(raw?: string | null): string {
+  const s = (raw || '').trim();
+  return s && /[\u4e00-\u9fff]/.test(s) ? s : '徕芬电动牙刷';
+}
+
 export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
   const panelEl = element<HTMLElement>('plugin-panel-laifen');
   const topBadge = element<HTMLElement>('laifen-top-badge');
@@ -529,7 +534,7 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
         dev.reminder30s ? '30s提醒开' : '30s提醒关',
         dev.airplaneMode ? '✈️飞行锁定' : '正常解锁',
       ].join(' · ');
-      deviceMetaEl.textContent = `${dev.name || 'Laifen'} · ${dev.protocol.toUpperCase()} · RSSI ${dev.rssi ?? '--'} dBm · ${flags}`;
+      deviceMetaEl.textContent = `${formatLaifenDisplayName(dev.name)} · ${dev.protocol.toUpperCase()} · RSSI ${dev.rssi ?? '--'} dBm · ${flags}`;
     } else {
       deviceMetaEl.textContent = data.config.targetMac
         ? '已绑定设备（尚未采集状态帧）'

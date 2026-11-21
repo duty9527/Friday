@@ -1725,3 +1725,38 @@ test('37. handleVoiceFastpath executes AC (16..31°C), fryer, switches, enforces
     assert.equal(yieldMissingFan.handled, false);
   });
 });
+
+test('38. devices with live:true persists BLE Mesh on state and liveFetchedAt to hub-cache.json without clobbering fryer 2.1 or leaking tokens', async () => {
+  await withTmp(async dir => {
+    const h = createMockHarness({
+      dir,
+      bleProps: { '110022001': false, '110022002': true, '110022003': true },
+      fryerReadQueue: [{ '2.1': 4, '2.4': 195, '2.3': 12 }],
+    });
+
+    const liveRes = await runAction('devices', { refresh: true, live: true }, h.deps);
+    assert.equal(liveRes.ok, true);
+    assert.equal(liveRes.data.liveFetchedAt, 1_700_000_000_000);
+
+    const cachePath = join(dir, 'plugins', 'miot', 'hub-cache.json');
+    const cache1 = JSON.parse(await readFile(cachePath, 'utf8'));
+    assert.equal(cache1.liveFetchedAt, 1_700_000_000_000);
+    const fish1 = cache1.devices.find((d: any) => d.did === '110022001');
+    const balcony1 = cache1.devices.find((d: any) => d.did === '110022002');
+    const fryer1 = cache1.devices.find((d: any) => d.did === '881122334');
+    assert.equal(fish1.cachedState.properties['2.1'].value, false);
+    assert.equal(fish1.cachedState.properties['2.1'].ts, 1_700_000_000_000);
+    assert.equal(balcony1.cachedState.properties['2.1'].value, true);
+    assert.notEqual(typeof fryer1.cachedState?.properties?.['2.1']?.value, 'boolean');
+    assertNoTokenLeak(cache1, 'hub-cache after live');
+
+    // Subsequent hub-only refresh (live: false) preserves liveFetchedAt
+    h.advanceTime(60_000);
+    const hubOnly = await runAction('devices', { refresh: true, live: false }, h.deps);
+    assert.equal(hubOnly.ok, true);
+    assert.equal(hubOnly.data.liveFetchedAt, 1_700_000_000_000);
+    const cache2 = JSON.parse(await readFile(cachePath, 'utf8'));
+    assert.equal(cache2.hotDataFetchedAt, 1_700_000_060_000);
+    assert.equal(cache2.liveFetchedAt, 1_700_000_000_000);
+  });
+});

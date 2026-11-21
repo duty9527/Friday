@@ -569,6 +569,9 @@ test('Netlea plugin all 10 actions work end-to-end with mocked bleRunner and fil
     assert.equal(calls.length, callsBeforeCache);
     const dashData = dashCached.data as Record<string, unknown>;
     assert.equal(dashData['灯内时钟'], '01:27:57');
+    assert.equal(dashData['设备'], '尼特利鱼缸灯');
+    assert.ok(String(dashCached.message).includes('尼特利鱼缸灯'));
+    assert.equal((dashData.device as { name: string }).name, 'SG-X-PRO-60w11');
     assert.equal(dashData.refreshed, false);
     assert.ok(dashData.catalog && typeof dashData.catalog === 'object');
     assert.ok(dashData.tempConfig && typeof dashData.tempConfig === 'object');
@@ -743,4 +746,43 @@ test('Python ble_helper.py matching and 0x14/0x1A/0x12/0x02 reply detection work
     `assert m.is_expected_netlea_reply(bytes.fromhex(${JSON.stringify(`${GOLDEN_0X14_ON.slice(0, -2)}00`)})) == (False, False)`,
   ].join('\n');
   await execFileAsync('python3', ['-c', pyScript]);
+});
+
+test('netlea writes ble-active.lock during BLE execution and removes it on success and error', async () => {
+  const mod = await loadPluginModule();
+  const dataDir = mkdtempSync(join(tmpdir(), 'friday-netlea-lock-'));
+  try {
+    const activeLock = join(dataDir, 'ble-active.lock');
+    let sawLockInSuccess = false;
+    const okRes = await mod.runAction('status', { minimal: true }, {
+      pluginDataDir: dataDir,
+      platform: 'linux',
+      bleRunner: async () => {
+        sawLockInSuccess = existsSync(activeLock);
+        return {
+          ok: true,
+          device: { address: 'AA:BB:CC:DD:EE:FF', name: 'SG-X-PRO-60w11', rssi: -55 },
+          stateHex: GOLDEN_0X14_ON,
+        };
+      },
+    });
+    assert.equal(okRes.ok, true);
+    assert.equal(sawLockInSuccess, true, 'ble-active.lock must exist while bleRunner executes');
+    assert.equal(existsSync(activeLock), false, 'ble-active.lock must be removed after success');
+
+    let sawLockInError = false;
+    const errRes = await mod.runAction('status', { minimal: true }, {
+      pluginDataDir: dataDir,
+      platform: 'linux',
+      bleRunner: async () => {
+        sawLockInError = existsSync(activeLock);
+        throw new Error('simulated ble failure');
+      },
+    });
+    assert.equal(errRes.ok, false);
+    assert.equal(sawLockInError, true, 'ble-active.lock must exist while failing bleRunner executes');
+    assert.equal(existsSync(activeLock), false, 'ble-active.lock must be removed in finally on failure');
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true });
+  }
 });

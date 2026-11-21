@@ -462,6 +462,11 @@ function drawTimelineCanvas(
   ctx.fillText(`现在 ${formatHm(now.getHours(), now.getMinutes())}`, Math.min(w - 76, Math.max(padL + 2, nowX + 4)), padT + 12);
 }
 
+function formatNetleaDisplayName(raw?: string | null): string {
+  const s = (raw || '').trim();
+  return s && /[\u4e00-\u9fff]/.test(s) ? s : '尼特利鱼缸灯';
+}
+
 export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
   const panel = element<HTMLElement>('plugin-panel-netlea');
   const topBadge = element<HTMLElement>('netlea-top-badge');
@@ -1067,7 +1072,7 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
     const adv = dev?.advertisement;
     const maxW = catalog?.maxWatts ?? st?.maxWatts ?? 22;
 
-    modelPill.textContent = `${catalog?.modelKey || dev?.name || 'SG-X-PRO-60'} · ${maxW}W`;
+    modelPill.textContent = `${formatNetleaDisplayName(dev?.name)} · ${maxW}W`;
 
     const statusLabel = st ? (st.runModeLabel || (st.on ? '开启' : '关闭')) : '未知';
     const statusTone = st ? (st.on ? 'positive' : 'default') : 'warning';
@@ -1085,7 +1090,7 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
 
     const kpiFrag = document.createDocumentFragment();
     kpiFrag.append(
-      kpiCard('运行模式与开关', statusLabel, dev?.name || (cfg.targetMac ? '已绑定设备' : '未读取'), statusTone),
+      kpiCard('运行模式与开关', statusLabel, dev ? formatNetleaDisplayName(dev.name) : (cfg.targetMac ? '已绑定设备' : '未读取'), statusTone),
       kpiCard('光谱与功率', chText, sceneSub, st?.on ? 'accent' : 'default'),
       kpiCard('定时行程 / 信号', `${schedKpi} · ${rssiText}`, dev ? '已连接发现' : '自动发现', typeof dev?.rssi === 'number' && dev.rssi > -75 ? 'positive' : 'default'),
       kpiCard('灯内时钟 (RTC)', rtcText.length >= 19 ? rtcText.slice(11, 19) : rtcText, payload.updatedAt ? `同步于 ${timestamp(payload.updatedAt)}` : '尚无缓存', 'default'),
@@ -1094,7 +1099,7 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
 
     if (dev || st) {
       const parts = [
-        dev?.name ? `设备：${dev.name}` : '',
+        dev ? `设备：${formatNetleaDisplayName(dev.name)}` : '',
         adv?.rtc ? `灯内 RTC：${adv.rtc}` : '',
         payload.tempConfig ? `灯内临时时长：开 ${payload.tempConfig.onMinutes}m / 关 ${payload.tempConfig.offMinutes}m` : '',
         payload.updatedAt ? `缓存时间：${timestamp(payload.updatedAt)}` : '',
@@ -1206,7 +1211,7 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
       const info = node('div');
       const adv = dev.advertisement?.rtc ? ` · RTC ${dev.advertisement.rtc}` : '';
       info.append(
-        node('strong', dev.name || 'Netlea'),
+        node('strong', formatNetleaDisplayName(dev.name)),
         node('div', `${dev.address} · RSSI ${dev.rssi ?? '--'} dBm${adv}`, 'meta'),
       );
       const bindBtn = button('设为绑定 MAC', () => {

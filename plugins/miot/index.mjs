@@ -479,7 +479,7 @@ function parseHotValue(raw) {
  * Turn raw device_v4 / appMsg rows into `{ homeId, fetchedAt, devices, tokenByDid }`.
  * `devices` never carries the raw token (only `hasToken`); tokens live in `tokenByDid` for MiIO callers.
  * @param {{ devInfoRows?: any[]; hotDataRows?: any[]; nowMs?: number; hotDataFetchedAt?: number }} [opts]
- * @returns {{ homeId: string; fetchedAt: number; hotDataFetchedAt: number; devices: any[]; tokenByDid: Record<string, string> }}
+ * @returns {{ homeId: string; fetchedAt: number; hotDataFetchedAt: number; liveFetchedAt?: number; devices: any[]; tokenByDid: Record<string, string> }}
  */
 export function parseHubSnapshot({ devInfoRows = [], hotDataRows = [], nowMs, hotDataFetchedAt } = {}) {
   const cachedByDid = new Map();
@@ -1226,6 +1226,7 @@ function normalizeHubCacheRecord(raw, tokenRaw) {
     homeId: String(raw.homeId ?? ''),
     fetchedAt: raw.fetchedAt,
     hotDataFetchedAt: typeof raw.hotDataFetchedAt === 'number' ? raw.hotDataFetchedAt : raw.fetchedAt,
+    ...(typeof raw.liveFetchedAt === 'number' ? { liveFetchedAt: raw.liveFetchedAt } : {}),
     devices: raw.devices,
     tokenByDid: { ...legacyTokens, ...isolatedTokens },
   };
@@ -1272,6 +1273,7 @@ function writeHubCache(paths, snapshot) {
       homeId: normalized.homeId,
       fetchedAt: normalized.fetchedAt,
       hotDataFetchedAt: normalized.hotDataFetchedAt,
+      ...(typeof normalized.liveFetchedAt === 'number' ? { liveFetchedAt: normalized.liveFetchedAt } : {}),
       devices: normalized.devices,
     };
     writeSecureJson(paths.cachePath, publicCache);
@@ -1334,6 +1336,9 @@ async function loadSnapshot(ctx, { refresh = false, needHotData = true } = {}) {
     });
     const hotDataFetchedAt = includeHotData ? now : (cached?.hotDataFetchedAt ?? 0);
     const parsed = parseHubSnapshot({ ...rows, nowMs: now, hotDataFetchedAt });
+    if (typeof cached?.liveFetchedAt === 'number') {
+      parsed.liveFetchedAt = cached.liveFetchedAt;
+    }
     if (!includeHotData && cached && Array.isArray(cached.devices)) {
       const prevStateByDid = new Map(cached.devices.map(d => [d.did, d.cachedState]));
       for (const dev of parsed.devices) {
@@ -1490,6 +1495,41 @@ async function handleDevices(ctx) {
   const filtered = applyDeviceFilters(snap.devices, args);
   const wantLive = args.live === true || args.live === 'true';
   const live = wantLive ? await liveForDevices(ctx, filtered) : new Map();
+  let liveFetchedAt = snap.liveFetchedAt;
+  if (wantLive) {
+    const now = ctx.now();
+    const isUnfiltered = !args.room && !args.category && !(args.controllableOnly === true || args.controllableOnly === 'true');
+    let mergedAny = false;
+    const updatedDevices = snap.devices.map(dev => {
+      const l = live.get(dev.did);
+      if (dev.controlChannel === 'bt_mesh' && l && l.on !== undefined) {
+        const prevCached = dev.cachedState && typeof dev.cachedState === 'object' ? dev.cachedState : { properties: {} };
+        const prevProps = prevCached.properties && typeof prevCached.properties === 'object' ? prevCached.properties : {};
+        mergedAny = true;
+        return {
+          ...dev,
+          cachedState: {
+            ...prevCached,
+            properties: {
+              ...prevProps,
+              '2.1': { value: Boolean(l.on), ts: now },
+            },
+          },
+        };
+      }
+      return dev;
+    });
+    const anyLiveOk = live.size === 0 || [...live.values()].some(entry => entry && !entry.error);
+    if (mergedAny || (isUnfiltered && anyLiveOk)) {
+      const nextLiveFetchedAt = isUnfiltered && anyLiveOk ? now : snap.liveFetchedAt;
+      writeHubCache(ctx.paths, {
+        ...snap,
+        devices: updatedDevices,
+        ...(typeof nextLiveFetchedAt === 'number' ? { liveFetchedAt: nextLiveFetchedAt } : {}),
+      });
+      liveFetchedAt = nextLiveFetchedAt;
+    }
+  }
   const items = filtered.map(d => {
     const l = live.get(d.did);
     const extra = {};
@@ -1517,6 +1557,7 @@ async function handleDevices(ctx) {
     homeId: snap.homeId,
     fetchedAt: snap.fetchedAt,
     hotDataFetchedAt: snap.hotDataFetchedAt,
+    ...(typeof liveFetchedAt === 'number' ? { liveFetchedAt } : {}),
     source: snap.source,
     ageMs: snap.ageMs,
     live: wantLive,

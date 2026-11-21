@@ -49,6 +49,7 @@ import {
   type SleepDriveInput,
   type SubconsciousRuntime,
 } from './orchestrator/subconscious-loop.js';
+import { PluginRefreshScheduler } from './orchestrator/plugin-refresh.js';
 import {
   TimerScheduler,
   extractGoalMetMarker,
@@ -176,6 +177,7 @@ export class Coordinator {
   private readonly outboundListeners = new Set<() => void>();
   private readonly timers: TimerScheduler;
   private readonly subconscious: SubconsciousController;
+  private readonly pluginRefresh: PluginRefreshScheduler;
   private timer?: NodeJS.Timeout;
   private closing = false;
   private closingPromise?: Promise<void>;
@@ -257,6 +259,15 @@ export class Coordinator {
       isClosing: () => this.closing,
       hasRouter: () => Boolean(this.router),
       hasActiveWork: () => this.chatRuns.size > 0 || this.runs.size > 0 || this.submissions.size > 0,
+    });
+
+    this.pluginRefresh = new PluginRefreshScheduler({
+      home: this.home,
+      mode: this.factory.mode,
+      closingSignal: this.closingAbort.signal,
+      isClosing: () => this.closing,
+      enabled: this.subconsciousRuntime?.pluginAutoRefresh,
+      nowFn: this.subconsciousRuntime?.now,
     });
   }
 
@@ -2648,6 +2659,7 @@ export class Coordinator {
       }
     }
     this.timers.tick();
+    this.pluginRefresh.tick();
     this.subconscious.tickDistiller();
     this.subconscious.tickSubconscious();
   }
@@ -2675,6 +2687,7 @@ export class Coordinator {
       await this.routerSwapPromise.catch(() => {});
       await Promise.allSettled([...this.submissions]);
       await this.subconscious.awaitSettled();
+      await this.pluginRefresh.awaitSettled();
       if (this.executor) await this.executor.close();
       await Promise.allSettled([...this.jobs]);
       await Promise.allSettled([...this.chatJobs]);

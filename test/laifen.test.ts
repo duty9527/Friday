@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { promisify } from 'node:util';
 import { listPluginsSync, runPlugin } from '../src/plugin.js';
+
+const execFileAsync = promisify(execFile);
 
 type LaifenModule = {
   DEFAULT_MAC: string;
@@ -370,8 +374,18 @@ test('laifen plugin actions support scan/bind, sync, set, power, sessions/streak
     assert.equal(dash.batteryPct, 76);
 
     // Calling dashboard again must NOT duplicate the ingested monitor session
-    const dash2 = (await mod.runAction('dashboard', {}, { dataDir, nowFn: () => fakeNow })).data as { stats: { totalSessions: number } };
+    const dash2Res = await mod.runAction('dashboard', {}, { dataDir, nowFn: () => fakeNow });
+    const dash2 = dash2Res.data as { device: { name: string }; stats: { totalSessions: number } };
     assert.equal(dash2.stats.totalSessions, 4);
+    assert.equal(dash2.device.name, 'LFTB01-P-TEST');
+    assert.ok(String(dash2Res.message).includes('徕芬电动牙刷'));
+    assert.equal(String(dash2Res.message).includes('LFTB01-P-TEST'), false);
+
+    const statusRes = await mod.runAction('status', {}, { dataDir, nowFn: () => fakeNow });
+    assert.equal(statusRes.ok, true);
+    assert.ok(String(statusRes.message).includes('徕芬电动牙刷'));
+    assert.equal(String(statusRes.message).includes('LFTB01-P-TEST'), false);
+    assert.equal((statusRes.data as { device: { name: string } }).device.name, 'LFTB01-P-TEST');
 
     // Delete one session and verify count drops
     const delRes = await mod.runAction('session-delete', { id: createdMorningId }, { dataDir, nowFn: () => fakeNow });
@@ -609,5 +623,45 @@ test('laifen supports autoWakeSync watch lifecycle, watch-outbox ingestion, and 
     }
   } finally {
     rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('laifen WatchSession._check_yield respects fresh netlea ble-active.lock and ignores removed or stale locks', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'friday-laifen-peer-lock-'));
+  try {
+    const laifenDir = join(home, 'plugins', 'laifen');
+    const netleaDir = join(home, 'plugins', 'netlea');
+    mkdirSync(laifenDir, { recursive: true });
+    mkdirSync(netleaDir, { recursive: true });
+    const stateFile = join(laifenDir, 'watch-state.json');
+    const netleaLock = join(netleaDir, 'ble-active.lock');
+
+    const pyScript = [
+      'import importlib.util, json, os, sys, time, types',
+      'for mod in ["dbus", "dbus.mainloop", "dbus.mainloop.glib", "gi", "gi.repository"]:',
+      '    sys.modules[mod] = types.ModuleType(mod)',
+      'sys.modules["dbus.mainloop.glib"].DBusGMainLoop = lambda **kw: None',
+      'sys.modules["gi.repository"].GLib = types.SimpleNamespace()',
+      `spec = importlib.util.spec_from_file_location("lfh", ${JSON.stringify(join(process.cwd(), 'plugins/laifen/ble_helper.py'))})`,
+      'm = importlib.util.module_from_spec(spec)',
+      'spec.loader.exec_module(m)',
+      'ws = object.__new__(m.WatchSession)',
+      `ws.state_file = ${JSON.stringify(stateFile)}`,
+      'ws.yield_lock_file = ""',
+      'ws.peer_session_file = ""',
+      'assert ws._check_yield() == (False, "")',
+      `lock_path = ${JSON.stringify(netleaLock)}`,
+      'with open(lock_path, "w") as f: json.dump({"pid": 1234}, f)',
+      'yielding, reason = ws._check_yield()',
+      'assert yielding is True and "水草灯" in reason, (yielding, reason)',
+      'old = time.time() - 60.0',
+      'os.utime(lock_path, (old, old))',
+      'assert ws._check_yield() == (False, ""), "stale >40s lock must be ignored"',
+      'os.unlink(lock_path)',
+      'assert ws._check_yield() == (False, "")',
+    ].join('\n');
+    await execFileAsync('python3', ['-c', pyScript]);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
   }
 });

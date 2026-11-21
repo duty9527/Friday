@@ -1999,6 +1999,19 @@ class WatchSession(BaseBleSession):
         except Exception:
             return False
 
+    def _is_peer_ble_lock_active(self) -> bool:
+        if not self.state_file:
+            return False
+        plugins_root = os.path.dirname(os.path.dirname(os.path.abspath(self.state_file)))
+        netlea_lock = os.path.join(plugins_root, "netlea", "ble-active.lock")
+        if not os.path.exists(netlea_lock):
+            return False
+        try:
+            st = os.stat(netlea_lock)
+            return (time.time() - st.st_mtime) < 40.0
+        except OSError:
+            return False
+
     def _check_yield(self) -> tuple[bool, str]:
         if self._is_manual_lock_active():
             return True, "等待手动操作完成"
@@ -2007,6 +2020,8 @@ class WatchSession(BaseBleSession):
             return True, "等待手动监听或同步完成"
         if self._is_active_session_file(self.peer_session_file, 90.0, ("scanning", "connecting", "measuring")):
             return True, "体脂秤测量中，蓝牙礼让"
+        if self._is_peer_ble_lock_active():
+            return True, "水草灯蓝牙通讯中，蓝牙礼让"
         return False, ""
 
     def can_accept_candidate(self) -> bool:

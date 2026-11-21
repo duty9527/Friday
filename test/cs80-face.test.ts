@@ -597,7 +597,17 @@ finally:
 
 # 3. LayoutStore, Bento packer, all-15-builtin + custom plugin catalog & telemetry collectors
 import sqlite3, time as _time
-from widgets import WidgetDataHub, _extract_scalars, _wgs84_to_gcj02, default_pages_payload
+from widgets import WidgetDataHub, _extract_scalars, _localize_laifen_name, _localize_netlea_name, _wgs84_to_gcj02, default_pages_payload
+
+assert _localize_laifen_name("LFTB01-P-640A") == "徕芬电动牙刷"
+assert _localize_laifen_name("LFTB02-PRO") == "徕芬电动牙刷"
+assert _localize_laifen_name("LFTB") == "徕芬电动牙刷"
+assert _localize_laifen_name("") == "徕芬电动牙刷"
+assert _localize_laifen_name("主卧牙刷") == "主卧牙刷"
+assert _localize_netlea_name("SG-X-PRO-60w11") == "尼特利鱼缸灯"
+assert _localize_netlea_name("SG-AT5-45") == "尼特利鱼缸灯"
+assert _localize_netlea_name("") == "尼特利鱼缸灯"
+assert _localize_netlea_name("客厅水草灯") == "客厅水草灯"
 
 expected_builtin_kinds = {
     "fund-tracker", "health-scale", "miot", "ninebot", "laifen", "netlea", "apple-devices",
@@ -1135,4 +1145,259 @@ test('5. CS80 scene classifiers & inbound preview formatter accurately distingui
     '请打印附件',
   );
   assert.equal(formatInboundMarqueePreview('请查看收到的附件。', true, '[图片]'), '[图片]');
+});
+
+test('6. CS80 WidgetDataHub honors Shanghai market hours, WAL mtime changes, cacheOnly Apple reads, and bounded fallback live refreshes', async () => {
+  const tmpHome = await mkdtemp(join(await realpath(tmpdir()), 'friday-cs80-refresh-'));
+  try {
+    const pyScript = `
+import json, os, sqlite3, sys, time
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, ${JSON.stringify(join(REPO_ROOT, 'tools', 'cs80-face'))})
+from widgets import LayoutStore, WidgetDataHub, _is_market_hours_now
+
+tz = ZoneInfo("Asia/Shanghai")
+def sh_ts(y, m, d, hh, mm):
+    return datetime(y, m, d, hh, mm, tzinfo=tz).timestamp()
+
+# 1. _is_market_hours_now edge cases (2026-11-16 is Monday)
+assert _is_market_hours_now(sh_ts(2026, 11, 16, 2, 0)) is False, "Mon 02:00 must be False"
+assert _is_market_hours_now(sh_ts(2026, 11, 16, 9, 15)) is True, "Mon 09:15 must be True"
+assert _is_market_hours_now(sh_ts(2026, 11, 16, 15, 30)) is True, "HK 15:30 must be True"
+assert _is_market_hours_now(sh_ts(2026, 11, 16, 16, 15)) is True, "HK 16:15 must be True"
+assert _is_market_hours_now(sh_ts(2026, 11, 16, 19, 0)) is False, "Post-market 19:00 must be False"
+assert _is_market_hours_now(sh_ts(2026, 11, 16, 21, 0)) is True, "Mon 21:00 must be True"
+assert _is_market_hours_now(sh_ts(2026, 11, 21, 2, 0)) is True, "Sat 02:00 US Fri night must be True"
+assert _is_market_hours_now(sh_ts(2026, 11, 21, 5, 1)) is False, "Sat 05:01 must be False"
+assert _is_market_hours_now(sh_ts(2026, 11, 22, 10, 0)) is False, "Sun 10:00 must be False"
+
+home = Path(${JSON.stringify(tmpHome)})
+ls = LayoutStore(home / "plugins" / "cs80-face")
+ls.apply_patch({
+    "pages": [{
+        "id": "p1",
+        "name": "测试页",
+        "cards": [
+            {"id": "c-fund", "kind": "fund-tracker", "size": "1x1"},
+            {"id": "c-health", "kind": "health-scale", "size": "1x1"},
+            {"id": "c-ninebot", "kind": "ninebot", "size": "1x1"},
+        ],
+    }],
+})
+
+now_ms = int(time.time() * 1000)
+stale_ms = now_ms - (70 * 60 * 1000) # 70 min ago -> stale for all collectors
+
+# Seed stale disk caches for all 5 plugins
+fund_dir = home / "plugins" / "fund-tracker"
+fund_dir.mkdir(parents=True, exist_ok=True)
+(fund_dir / "config.json").write_text(json.dumps({"holdings": [{"code": "000001"}]}), encoding="utf-8")
+fund_db = fund_dir / "funds.sqlite"
+con_f = sqlite3.connect(str(fund_db))
+con_f.execute("PRAGMA journal_mode=WAL")
+con_f.execute("CREATE TABLE holdings (code TEXT PRIMARY KEY, name TEXT, cost REAL, shares REAL, last_nav REAL, last_nav_date TEXT)")
+con_f.execute("CREATE TABLE snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, date TEXT, total_cost REAL, total_asset REAL, daily_pnl REAL, total_pnl REAL, detail_json TEXT, created_at INTEGER)")
+con_f.execute("INSERT INTO holdings VALUES ('000001', '测试基', 1000, 1000, 1.0, '2026-11-20')")
+con_f.execute("INSERT INTO snapshots (kind, date, total_cost, total_asset, daily_pnl, total_pnl, detail_json, created_at) VALUES ('status', '2026-11-20', 1000, 1010, 10, 10, '[]', ?)", (stale_ms,))
+con_f.commit()
+
+health_dir = home / "plugins" / "health-scale"
+health_dir.mkdir(parents=True, exist_ok=True)
+health_db = health_dir / "health.db"
+con_h = sqlite3.connect(str(health_db))
+con_h.execute("PRAGMA journal_mode=WAL")
+con_h.execute("CREATE TABLE profiles (id TEXT PRIMARY KEY, name TEXT, is_default INTEGER, updated_at INTEGER)")
+con_h.execute("CREATE TABLE measurements (id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id TEXT, weight_kg REAL, heart_rate INTEGER, measured_at INTEGER)")
+con_h.execute("INSERT INTO profiles VALUES ('p1', '默认', 1, ?)", (now_ms,))
+con_h.execute("INSERT INTO measurements (profile_id, weight_kg, heart_rate, measured_at) VALUES ('p1', 68.5, 70, ?)", (now_ms,))
+con_h.commit()
+
+miot_dir = home / "plugins" / "miot"
+miot_dir.mkdir(parents=True, exist_ok=True)
+(miot_dir / "config.json").write_text(json.dumps({"routerSsh": "root@192.0.2.1"}), encoding="utf-8")
+miot_cache = miot_dir / "hub-cache.json"
+miot_cache.write_text(json.dumps({
+    "fetchedAt": stale_ms,
+    "hotDataFetchedAt": stale_ms,
+    "liveFetchedAt": stale_ms,
+    "devices": [{"did": "d1", "dev_name": "客厅灯", "room_name": "客厅", "online": True, "controllable": True, "cachedState": {"properties": {"2.1": {"value": False}}}}],
+}), encoding="utf-8")
+
+nb_dir = home / "plugins" / "ninebot"
+nb_dir.mkdir(parents=True, exist_ok=True)
+(nb_dir / "session.json").write_text(json.dumps({"accessToken": "tok"}), encoding="utf-8")
+nb_db = nb_dir / "ninebot.sqlite"
+con_n = sqlite3.connect(str(nb_db))
+con_n.execute("PRAGMA journal_mode=WAL")
+con_n.execute("CREATE TABLE snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, sn TEXT, captured_at INTEGER, battery INTEGER, aux_battery INTEGER, voltage_v REAL, temp_c REAL, charging INTEGER, charging_power_w REAL, effective_range_km REAL, odometer_km REAL, power_on INTEGER, locked INTEGER, gcj_lat REAL, gcj_lon REAL, address TEXT, payload_json TEXT)")
+con_n.execute("CREATE TABLE trips (sn TEXT, travel_id TEXT, end_time INTEGER, distance_km REAL, max_speed_kmh REAL)")
+con_n.execute("CREATE TABLE alert_state (sn TEXT, alert_key TEXT, active INTEGER)")
+con_n.execute("INSERT INTO snapshots (sn, captured_at, battery, effective_range_km, odometer_km, power_on, locked, address, payload_json) VALUES ('S1', ?, 80, 60.0, 120.0, 0, 1, '公司', ?)", (stale_ms, json.dumps({"name": "小9", "capturedAt": stale_ms, "battery": 80, "effectiveRangeKm": 60.0, "locked": True, "location": {"address": "公司"}})))
+con_n.commit()
+
+netlea_dir = home / "plugins" / "netlea"
+netlea_dir.mkdir(parents=True, exist_ok=True)
+(netlea_dir / "config.json").write_text(json.dumps({"targetMac": "11:22:33:44:55:66"}), encoding="utf-8")
+netlea_state = netlea_dir / "last-state.json"
+netlea_state.write_text(json.dumps({
+    "updatedAt": stale_ms,
+    "lastAddress": "11:22:33:44:55:66",
+    "device": {"name": "尼特利水草灯", "address": "11:22:33:44:55:66"},
+    "state": {"on": True, "channels": {"red": 40, "green": 50, "white": 70, "blue": 30, "fan": 1}, "master": {"lampMode": 0, "stateType": 1}},
+}), encoding="utf-8")
+
+apple_dir = home / "plugins" / "apple-devices"
+apple_dir.mkdir(parents=True, exist_ok=True)
+(apple_dir / "session.json").write_text(json.dumps({"state": "authenticated"}), encoding="utf-8")
+apple_cache = apple_dir / "devices-cache.json"
+apple_cache.write_text(json.dumps({
+    "fetchedAt": stale_ms,
+    "entries": [{"device": {"name": "我的 iPhone", "category": "iphone", "batteryPercent": 77, "batteryStatus": "NotCharging", "online": True}}],
+}), encoding="utf-8")
+
+# 2. disable_network=True must suppress ALL live fallback refreshes even when stale
+offline_calls = []
+def _offline_rpc(req, timeout):
+    offline_calls.append((req.get("plugin"), req.get("action"), dict(req.get("args") or {}), timeout))
+    if req.get("plugin") == "fund-tracker":
+        return {"ok": True, "data": {"updatedAt": stale_ms, "summary": {"totalDailyPnl": 10, "dailyPnlPct": 1.0, "totalAsset": 1010, "totalPnl": 10, "totalPnlPct": 1.0, "holdings": [{"code": "000001", "name": "基", "changePct": 1.0, "dailyPnl": 10, "currentAsset": 1010}]}, "snapshots": []}}
+    if req.get("plugin") == "ninebot":
+        return {"ok": True, "data": {"configured": True, "snapshot": {"name": "小9", "capturedAt": stale_ms, "battery": 80, "effectiveRangeKm": 60.0, "locked": True}, "history": [], "tripSummary": {}, "activeAlerts": []}}
+    if req.get("plugin") == "netlea":
+        return {"ok": True, "data": {"updatedAt": stale_ms, "device": {"name": "水草灯", "address": "11:22:33:44:55:66"}, "state": {"on": True, "channels": {"red": 40, "green": 50, "white": 70, "blue": 30, "fan": 1}, "master": {}}, "config": {"targetMac": "11:22:33:44:55:66"}}}
+    if req.get("plugin") == "apple-devices":
+        return {"ok": True, "data": {"authState": "authenticated", "fetchedAt": stale_ms, "devices": [{"name": "我的 iPhone", "category": "iphone", "batteryPercent": 77, "batteryStatus": "NotCharging", "online": True}], "config": {"minBatteryPct": 25}}}
+    return {"ok": True, "data": {}}
+
+hub_off = WidgetDataHub(home, _offline_rpc, ls, disable_network=True)
+hub_off._collect_fund_tracker(fund_db, connected=True)
+hub_off._collect_miot(miot_cache, connected=True)
+hub_off._collect_ninebot(nb_db, connected=True)
+hub_off._collect_netlea(netlea_state, connected=True)
+hub_off._collect_apple_devices(apple_cache, connected=True)
+assert not any(args.get("refresh") is True or args.get("live") is True or act == "status" and plug == "netlea" for plug, act, args, _ in offline_calls), offline_calls
+apple_off_call = next(c for c in offline_calls if c[0] == "apple-devices")
+assert apple_off_call[2].get("cacheOnly") is True, apple_off_call
+
+# 3. disable_network=False triggers bounded fallback live refreshes when stale & respects cooldown
+live_calls = []
+netlea_state_flag = {"refreshed": False}
+def _live_rpc(req, timeout):
+    plug = req.get("plugin")
+    act = req.get("action")
+    args = dict(req.get("args") or {})
+    live_calls.append((plug, act, args, timeout))
+    if plug == "fund-tracker":
+        is_ref = bool(args.get("refresh"))
+        return {"ok": True, "data": {"updatedAt": now_ms if is_ref else stale_ms, "summary": {"totalDailyPnl": 25 if is_ref else 10, "dailyPnlPct": 2.5 if is_ref else 1.0, "totalAsset": 1025, "totalPnl": 25, "totalPnlPct": 2.5, "holdings": [{"code": "000001", "name": "基", "changePct": 2.5, "dailyPnl": 25, "currentAsset": 1025}]}, "snapshots": []}}
+    if plug == "miot":
+        return {"ok": True, "data": {"devices": [{"did": "d1", "dev_name": "客厅灯", "room_name": "客厅", "online": True, "controllable": True, "state": {"on": True}}]}}
+    if plug == "ninebot":
+        is_ref = bool(args.get("refresh"))
+        return {"ok": True, "data": {"configured": True, "snapshot": {"name": "小9", "capturedAt": now_ms if is_ref else stale_ms, "battery": 78 if is_ref else 80, "effectiveRangeKm": 58.0, "locked": True}, "history": [], "tripSummary": {}, "activeAlerts": []}}
+    if plug == "netlea":
+        if act == "status":
+            netlea_state_flag["refreshed"] = True
+            return {"ok": True, "data": {"state": {"on": False}}}
+        is_ref = netlea_state_flag["refreshed"]
+        return {"ok": True, "data": {"updatedAt": now_ms if is_ref else stale_ms, "device": {"name": "水草灯", "address": "11:22:33:44:55:66"}, "state": {"on": not is_ref, "channels": {"red": 0, "green": 0, "white": 0, "blue": 0, "fan": 0}, "master": {}}, "config": {"targetMac": "11:22:33:44:55:66"}}}
+    if plug == "apple-devices":
+        is_ref = bool(args.get("refresh"))
+        return {"ok": True, "data": {"authState": "authenticated", "fetchedAt": now_ms if is_ref else stale_ms, "devices": [{"name": "我的 iPhone", "category": "iphone", "batteryPercent": 64 if is_ref else 77, "batteryStatus": "NotCharging", "online": True}], "config": {"minBatteryPct": 25}}}
+    return {"ok": True, "data": {}}
+
+hub_live = WidgetDataHub(home, _live_rpc, ls, disable_network=False)
+hub_live._collect_fund_tracker(fund_db, connected=True)
+hub_live._collect_miot(miot_cache, connected=True)
+hub_live._collect_ninebot(nb_db, connected=True)
+hub_live._collect_netlea(netlea_state, connected=True)
+hub_live._collect_apple_devices(apple_cache, connected=True)
+
+assert any(p == "fund-tracker" and a == "dashboard" and ag.get("refresh") is True and t >= 20.0 for p, a, ag, t in live_calls), live_calls
+assert any(p == "miot" and a == "devices" and ag.get("refresh") is True and ag.get("live") is True and t >= 20.0 for p, a, ag, t in live_calls), live_calls
+assert any(p == "ninebot" and a == "dashboard" and ag.get("refresh") is True and t >= 20.0 for p, a, ag, t in live_calls), live_calls
+assert any(p == "netlea" and a == "status" and ag.get("minimal") is False and t >= 20.0 for p, a, ag, t in live_calls), live_calls
+assert any(p == "apple-devices" and a == "status" and ag.get("cacheOnly") is True for p, a, ag, t in live_calls), live_calls
+assert any(p == "apple-devices" and a == "status" and ag.get("refresh") is True and t >= 20.0 for p, a, ag, t in live_calls), live_calls
+assert hub_live.get_widget("fund-tracker")["dailyPct"] == 2.5
+assert hub_live.get_widget("miot")["onCount"] == 1
+assert hub_live.get_widget("ninebot")["battery"] == 78
+assert hub_live.get_widget("netlea")["on"] is False
+assert hub_live.get_widget("apple-devices")["devices"][0]["battery"] == 64
+
+# Cooldown suppresses immediate repeat live refresh if disk stays stale
+calls_before_cd = len(live_calls)
+hub_live._collect_apple_devices(apple_cache, connected=True)
+apple_cd_calls = live_calls[calls_before_cd:]
+assert len(apple_cd_calls) == 1 and apple_cd_calls[0][2].get("cacheOnly") is True, apple_cd_calls
+
+# 4. netlea skips fallback live refresh when BLE peer is busy
+netlea_state_flag["refreshed"] = False
+(health_dir / "live-session.json").write_text(json.dumps({"phase": "measuring"}), encoding="utf-8")
+hub_busy = WidgetDataHub(home, _live_rpc, ls, disable_network=False)
+calls_before_busy = len(live_calls)
+hub_busy._collect_netlea(netlea_state, connected=True)
+assert not any(p == "netlea" and a == "status" for p, a, _, _ in live_calls[calls_before_busy:]), live_calls[calls_before_busy:]
+(health_dir / "live-session.json").unlink()
+
+# 5. refresh_due detects WAL mtime changes for fund-tracker, health-scale, and ninebot
+wal_calls = []
+def _wal_rpc(req, timeout):
+    wal_calls.append(req.get("plugin"))
+    return {"ok": True, "data": {}}
+
+hub_wal = WidgetDataHub(home, _wal_rpc, ls, disable_network=True)
+hub_wal.refresh_due(None, connected=True, force=False)
+wal_calls.clear()
+
+# Without WAL change & before TTL -> 0 calls
+hub_wal.refresh_due(None, connected=True, force=False)
+assert wal_calls == [], wal_calls
+
+# Touch -wal files (ensure distinct mtime) -> all 3 re-collect immediately
+future_s = time.time() + 10.0
+for wal_name in (
+    fund_dir / "funds.sqlite-wal",
+    health_dir / "health.db-wal",
+    nb_dir / "ninebot.sqlite-wal",
+):
+    if not wal_name.exists():
+        wal_name.write_bytes(b"wal")
+    os.utime(wal_name, (future_s, future_s))
+
+hub_wal.refresh_due(None, connected=True, force=False)
+assert set(wal_calls) == {"fund-tracker", "health-scale", "ninebot"}, wal_calls
+
+# 6. Verify _collect_laifen and _collect_netlea localize BLE model names while preserving CJK custom names
+laifen_loc_dir = home / "plugins" / "laifen"
+laifen_loc_dir.mkdir(parents=True, exist_ok=True)
+con_lf_loc = sqlite3.connect(str(laifen_loc_dir / "laifen.db"))
+con_lf_loc.execute("CREATE TABLE device_state (id TEXT PRIMARY KEY, name TEXT, battery_pct INTEGER, active_mode INTEGER, modes_json TEXT, duration_sec INTEGER, status TEXT, updated_at INTEGER, last_synced_at INTEGER)")
+con_lf_loc.execute("CREATE TABLE brush_sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, brushed_at INTEGER)")
+con_lf_loc.execute("INSERT INTO device_state VALUES ('primary', 'LFTB01-P-640A', 88, 2, ?, 120, 'Idle', ?, ?)", (json.dumps({"2": {"strength": 10, "range": 8, "speed": 6}}), now_ms, now_ms))
+con_lf_loc.commit()
+con_lf_loc.close()
+hub_off._collect_laifen(laifen_loc_dir / "laifen.db", connected=False)
+assert hub_off.get_widget("laifen")["name"] == "徕芬电动牙刷", hub_off.get_widget("laifen")
+
+netlea_state.write_text(json.dumps({
+    "updatedAt": now_ms,
+    "lastAddress": "11:22:33:44:55:66",
+    "device": {"name": "SG-X-PRO-60w11", "address": "11:22:33:44:55:66"},
+    "state": {"on": True, "channels": {"red": 40, "green": 50, "white": 70, "blue": 30, "fan": 1}, "master": {"lampMode": 0, "stateType": 1}},
+}), encoding="utf-8")
+hub_off._collect_netlea(netlea_state, connected=False)
+assert hub_off.get_widget("netlea")["name"] == "尼特利鱼缸灯", hub_off.get_widget("netlea")
+
+con_f.close()
+con_h.close()
+con_n.close()
+`;
+    execFileSync('python3', ['-c', pyScript], { cwd: REPO_ROOT, stdio: 'pipe' });
+  } finally {
+    await rm(tmpHome, { recursive: true, force: true });
+  }
 });

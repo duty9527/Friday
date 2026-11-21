@@ -3343,7 +3343,7 @@ class FaceRenderer:
         self._draw_card_frame(
             ctx,
             card,
-            card.title or str(d.get("name") or "口腔护理"),
+            card.title or str(d.get("name") or "徕芬电动牙刷"),
             badge,
             border,
             accent,
@@ -3529,7 +3529,7 @@ class FaceRenderer:
         self._draw_card_frame(
             ctx,
             card,
-            card.title or str(d.get("name") or "生态水草灯"),
+            card.title or str(d.get("name") or "尼特利鱼缸灯"),
             badge,
             border,
             accent,
@@ -3541,7 +3541,7 @@ class FaceRenderer:
             ctx.set_font_size(19.0)
             ctx.set_source_rgb(*COL_AMBER)
             ctx.move_to(x + 18.0, y + 92.0)
-            ctx.show_text(_fit_single_line_cairo(ctx, str(d.get("subline") or "靠近水草灯蓝牙即可同步光谱"), w - 36.0))
+            ctx.show_text(_fit_single_line_cairo(ctx, str(d.get("subline") or "靠近鱼缸灯蓝牙即可同步光谱"), w - 36.0))
             return
 
         bri = d.get("brightness")

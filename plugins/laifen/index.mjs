@@ -1464,6 +1464,16 @@ function applyWriteResultToDb(ctx, raw, patch, targetMac, source = 'set') {
   }, ctx.nowMs, { source, synced: true });
 }
 
+/**
+ * Format a user-facing Chinese display name for a Laifen toothbrush without mutating raw BLE/DB names.
+ * @param {unknown} rawName
+ * @returns {string}
+ */
+function formatLaifenDisplayName(rawName) {
+  const s = typeof rawName === 'string' ? rawName.trim() : '';
+  return s && /[\u4e00-\u9fff]/.test(s) ? s : '徕芬电动牙刷';
+}
+
 async function handleDashboard(ctx) {
   await ensureWatchDaemonIfEnabled(ctx);
   const data = buildDashboardData(ctx.db, ctx.dataDir, {
@@ -1474,7 +1484,7 @@ async function handleDashboard(ctx) {
   });
   const dev = data.device;
   const msg = dev
-    ? `徕芬 ${dev.name || 'Wave'}：电量 ${dev.batteryPct ?? '--'}%，Mode ${dev.activeMode ?? '--'}（强度 ${dev.activeStrength ?? '--'}/扫幅 ${dev.activeRange ?? '--'}/扫速 ${dev.activeSpeed ?? '--'}），今日打卡 ${data.todayCount}/${data.stats.dailyGoalCount} 次，刷头余 ${data.brushHeadDaysLeft} 天。`
+    ? `${formatLaifenDisplayName(dev.name)}：电量 ${dev.batteryPct ?? '--'}%，Mode ${dev.activeMode ?? '--'}（强度 ${dev.activeStrength ?? '--'}/扫幅 ${dev.activeRange ?? '--'}/扫速 ${dev.activeSpeed ?? '--'}），今日打卡 ${data.todayCount}/${data.stats.dailyGoalCount} 次，刷头余 ${data.brushHeadDaysLeft} 天。`
     : `尚未同步徕芬牙刷状态；今日打卡 ${data.todayCount}/${data.stats.dailyGoalCount} 次，刷头余 ${data.brushHeadDaysLeft} 天。`;
   return {
     ok: true,
@@ -1500,7 +1510,7 @@ async function handleStatus(ctx) {
   const bh = dash.stats.brushHead;
   const bhHint = bh.needsReplacement ? `（建议更换刷头，仅余 ${bh.daysLeft} 天）` : `刷头余 ${bh.daysLeft} 天 (${bh.percentLeft}%)`;
   const msg = dev
-    ? `徕芬牙刷 ${dev.name || dev.mac || '已绑定'}：电量 ${dev.batteryPct ?? '--'}%，当前 Mode ${dev.activeMode}（振动 ${dev.activeStrength} / 扫幅 ${dev.activeRange} / 扫速 ${dev.activeSpeed}），定时 ${dev.durationSec}s，今日刷牙 ${dash.todayCount}/${dash.stats.dailyGoalCount} 次，${bhHint}。`
+    ? `${formatLaifenDisplayName(dev.name)}：电量 ${dev.batteryPct ?? '--'}%，当前 Mode ${dev.activeMode}（振动 ${dev.activeStrength} / 扫幅 ${dev.activeRange} / 扫速 ${dev.activeSpeed}），定时 ${dev.durationSec}s，今日刷牙 ${dash.todayCount}/${dash.stats.dailyGoalCount} 次，${bhHint}。`
     : `徕芬牙刷尚未连接同步（${dash.config.targetMac ? `已配置 ${dash.config.targetMac}` : '未绑定 MAC'}）；今日刷牙 ${dash.todayCount}/${dash.stats.dailyGoalCount} 次，${bhHint}。`;
 
   return {
@@ -1664,7 +1674,7 @@ async function handleScan(ctx) {
 
   const top = devices[0];
   const msg = devices.length > 0
-    ? `发现徕芬牙刷 ${top.name || 'LFTB'} (${top.address})，信号 ${top.rssi ?? '--'} dBm${ctx.args.bind === true ? `，已绑定 ${boundMac}` : ''}。`
+    ? `发现${formatLaifenDisplayName(top.name)}（${top.address}），信号 ${top.rssi ?? '--'} dBm${ctx.args.bind === true ? `，已绑定 ${boundMac}` : ''}。`
     : '本次未扫到唤醒中的徕芬牙刷（牙刷深度休眠时不广播，请拿起或轻按亮灯后重试）。';
 
   return {
@@ -1723,7 +1733,7 @@ async function handleSync(ctx) {
       ok: true,
       notify: false,
       title: '已同步并写入暂存参数',
-      message: `已同步 ${saved.name || saved.mac} 并自动下发暂存设定：电量 ${saved.batteryPct ?? '--'}%，Mode ${saved.activeMode}（振动 ${saved.activeStrength} / 扫幅 ${saved.activeRange} / 扫速 ${saved.activeSpeed}），定时 ${saved.durationSec}s。`,
+      message: `已同步${formatLaifenDisplayName(saved.name)}并自动下发暂存设定：电量 ${saved.batteryPct ?? '--'}%，Mode ${saved.activeMode}（振动 ${saved.activeStrength} / 扫幅 ${saved.activeRange} / 扫速 ${saved.activeSpeed}），定时 ${saved.durationSec}s。`,
       data: {
         device: saved,
         statusHex: raw.afterHex || raw.baselineHex || null,
@@ -1797,7 +1807,7 @@ async function handleSync(ctx) {
     ok: true,
     notify: false,
     title: '牙刷状态已同步',
-    message: `已同步 ${saved.name || saved.mac}：电量 ${saved.batteryPct ?? '--'}%，Mode ${saved.activeMode}（振动 ${saved.activeStrength} / 扫幅 ${saved.activeRange} / 扫速 ${saved.activeSpeed}），定时 ${saved.durationSec}s。`,
+    message: `已同步${formatLaifenDisplayName(saved.name)}：电量 ${saved.batteryPct ?? '--'}%，Mode ${saved.activeMode}（振动 ${saved.activeStrength} / 扫幅 ${saved.activeRange} / 扫速 ${saved.activeSpeed}），定时 ${saved.durationSec}s。`,
     data: {
       device: saved,
       statusHex: raw.statusHex,
@@ -1981,7 +1991,7 @@ async function handleSet(ctx) {
     ok: true,
     notify: false,
     title: '牙刷参数已更新',
-    message: `已写入并校验 ${saved.name || saved.mac}：Mode ${saved.activeMode}（振动 ${saved.activeStrength} / 扫幅 ${saved.activeRange} / 扫速 ${saved.activeSpeed}），定时 ${saved.durationSec}s，30秒提醒 ${saved.reminder30s ? '开' : '关'}，高频 ${saved.highFrequency ? '开' : '关'}。`,
+    message: `已写入并校验${formatLaifenDisplayName(saved.name)}：Mode ${saved.activeMode}（振动 ${saved.activeStrength} / 扫幅 ${saved.activeRange} / 扫速 ${saved.activeSpeed}），定时 ${saved.durationSec}s，30秒提醒 ${saved.reminder30s ? '开' : '关'}，高频 ${saved.highFrequency ? '开' : '关'}。`,
     data: {
       device: saved,
       patch: mergedPatch,
@@ -2071,7 +2081,7 @@ async function handlePower(ctx) {
     ok: true,
     notify: false,
     title: '牙刷动作已执行',
-    message: `${saved.name || saved.mac} ${actionDesc}。`,
+    message: `${formatLaifenDisplayName(saved.name)} ${actionDesc}。`,
     data: {
       device: saved,
       patch,

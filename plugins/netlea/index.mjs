@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, unlinkSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -928,6 +928,16 @@ function formatChannels(ch) {
 }
 
 /**
+ * Format a user-facing Chinese display name for a Netlea aquarium light without mutating raw BLE model names.
+ * @param {unknown} rawName
+ * @returns {string}
+ */
+function formatNetleaDisplayName(rawName) {
+  const s = typeof rawName === 'string' ? rawName.trim() : '';
+  return s && /[\u4e00-\u9fff]/.test(s) ? s : '尼特利鱼缸灯';
+}
+
+/**
  * Format a compact device summary for `status` and control actions.
  * @param {Record<string, unknown> | null | undefined} device
  * @param {ReturnType<typeof decodeLampsStateFrame>} state
@@ -937,7 +947,7 @@ function formatChannels(ch) {
 function formatStatusMessage(device, state, prefix = '') {
   const parts = [];
   if (prefix) parts.push(prefix);
-  const name = typeof device?.name === 'string' && device.name.trim() ? device.name.trim() : '尼特利鱼缸灯';
+  const name = formatNetleaDisplayName(device?.name);
   const rssi = typeof device?.rssi === 'number' ? `（RSSI ${device.rssi} dBm）` : '';
   parts.push(`${name}${rssi}`);
   if (state) {
@@ -1169,12 +1179,26 @@ function readCachedSnapshot(statePath) {
  */
 async function invokeBleLocked(lockPath, bleRunner, cmdArgs, timeoutMs, signal, allowRetry = true) {
   return await withFileLock(lockPath, async () => {
-    let raw = await bleRunner(cmdArgs, timeoutMs, signal);
-    if (allowRetry && raw && raw.ok === false && raw.code === 'CONNECT_FAILED') {
-      await new Promise(resolvePause => setTimeout(resolvePause, 250));
-      raw = await bleRunner(cmdArgs, timeoutMs, signal);
+    const activeLockPath = join(dirname(lockPath), 'ble-active.lock');
+    try {
+      writeJsonAtomic(activeLockPath, { pid: process.pid, at: Date.now() }, { mode: 0o600 });
+    } catch {
+      // Best-effort peer lock indicator
     }
-    return raw;
+    try {
+      let raw = await bleRunner(cmdArgs, timeoutMs, signal);
+      if (allowRetry && raw && raw.ok === false && raw.code === 'CONNECT_FAILED') {
+        await new Promise(resolvePause => setTimeout(resolvePause, 250));
+        raw = await bleRunner(cmdArgs, timeoutMs, signal);
+      }
+      return raw;
+    } finally {
+      try {
+        if (existsSync(activeLockPath)) unlinkSync(activeLockPath);
+      } catch {
+        // Ignore cleanup failure
+      }
+    }
   });
 }
 
@@ -1342,7 +1366,7 @@ function buildDashboardResponse(statePath, config, refreshed, nowMs) {
       行程: activeTrip ? `当前「${activeTrip.name}」` : schedSummary,
       信号: typeof dev?.rssi === 'number' ? `${dev.rssi} dBm` : '--',
       灯内时钟: shortRtc,
-      设备: (typeof dev?.name === 'string' && dev.name) ? dev.name.slice(0, 22) : (config.targetMac || '自动发现'),
+      设备: dev ? formatNetleaDisplayName(dev.name).slice(0, 22) : (config.targetMac ? '已绑定鱼缸灯' : '自动发现'),
       渐变: `${config.fadeSeconds}s`,
       refreshed,
       updatedAt: snap.updatedAt,
@@ -2063,7 +2087,7 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
     const summary = devices
       .map(d => {
         const adv = d.advertisement ? `｜时钟 ${d.advertisement.rtc}` : '';
-        return `${d.name || 'Netlea'} (${d.address}, RSSI ${d.rssi ?? '--'} dBm${adv})`;
+        return `${formatNetleaDisplayName(d.name)} (${d.address}, RSSI ${d.rssi ?? '--'} dBm${adv})`;
       })
       .join('；');
 
@@ -2132,7 +2156,7 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
     title: titleMap[effectiveAction] ?? '尼特利鱼缸灯',
     message: state
       ? formatStatusMessage(deviceView, state, prefixMap[effectiveAction] ?? '')
-      : `${prefixMap[effectiveAction] || '指令已确认'}（${deviceView?.name || '尼特利鱼缸灯'}）`,
+      : `${prefixMap[effectiveAction] || '指令已确认'}（${formatNetleaDisplayName(deviceView?.name)}）`,
     data: {
       live: true,
       action: effectiveAction,
