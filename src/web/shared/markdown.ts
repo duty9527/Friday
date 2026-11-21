@@ -578,23 +578,34 @@ function appendInlineDom(parent: Node, tokens: readonly InlineToken[], opts: Mar
   }
 }
 
+const copyResetTimers = new WeakMap<HTMLButtonElement, ReturnType<typeof setTimeout>>();
+
 function defaultCopyCode(code: string, btn: HTMLButtonElement): void {
   const original = '复制';
+  const scheduleReset = (delayMs: number, clearCopiedClass: boolean) => {
+    const prevTimer = copyResetTimers.get(btn);
+    if (prevTimer !== undefined) clearTimeout(prevTimer);
+    const timer = setTimeout(() => {
+      copyResetTimers.delete(btn);
+      if (clearCopiedClass) btn.classList.remove('is-copied');
+      btn.textContent = original;
+    }, delayMs);
+    copyResetTimers.set(btn, timer);
+  };
   if (typeof navigator === 'undefined' || !navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
+    btn.classList.remove('is-copied');
     btn.textContent = '不可复制';
-    setTimeout(() => { btn.textContent = original; }, 1400);
+    scheduleReset(1400, false);
     return;
   }
   void navigator.clipboard.writeText(code).then(() => {
     btn.classList.add('is-copied');
     btn.textContent = '✓ 已复制';
-    setTimeout(() => {
-      btn.classList.remove('is-copied');
-      btn.textContent = original;
-    }, 1500);
+    scheduleReset(1500, true);
   }).catch(() => {
+    btn.classList.remove('is-copied');
     btn.textContent = '复制失败';
-    setTimeout(() => { btn.textContent = original; }, 1400);
+    scheduleReset(1400, false);
   });
 }
 

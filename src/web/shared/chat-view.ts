@@ -326,7 +326,8 @@ export function summarizeSystemNotice(message: ChatMessage): {
 } {
   const raw = (message.text || '').trim();
   const lines = raw.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-  const firstLine = (lines[0] ?? '系统状态更新').replace(/^\[?系统(?:通知|消息)?\]?\s*[·:：-]?\s*/i, '');
+  const strippedFirst = (lines[0] ?? '').replace(/^\[?系统(?:通知|消息)?\]?\s*[·:：-]?\s*/i, '').trim();
+  const firstLine = strippedFirst || lines[1] || '系统状态更新';
 
   let icon = '🔔';
   let badge = '系统通知';

@@ -238,6 +238,7 @@ export function initTracePanel(): TracePanelController {
   let lastInspectorNodeId: string | undefined;
   const seenChainNodeIds = new Set<string>();
   let lastChainScopeKey = '';
+  let activeInspectorOperationKey: string | undefined;
 
   function showPanel(trace: boolean): void {
     panelsEl.classList.toggle('trace-visible', trace);
@@ -337,7 +338,14 @@ export function initTracePanel(): TracePanelController {
     generation: number,
   ): Promise<void> {
     if (!appState.ready || appState.authExpired) return;
-    if (appState.operationTextCache.size > 200) appState.operationTextCache.clear();
+    if (appState.operationTextCache.size >= 200) {
+      for (const [k, v] of appState.operationTextCache) {
+        if (!v.loading) {
+          appState.operationTextCache.delete(k);
+          if (appState.operationTextCache.size < 200) break;
+        }
+      }
+    }
     appState.operationTextCache.set(cacheKey, { loading: true });
     try {
       const raw = await api<unknown>(`/api/operation?${new URLSearchParams({ taskId, operationId })}`);
@@ -353,7 +361,7 @@ export function initTracePanel(): TracePanelController {
         error: errorText(error),
       });
     }
-    if (generation === appState.selectionGeneration) {
+    if (generation === appState.selectionGeneration || activeInspectorOperationKey === cacheKey) {
       renderTrace();
     }
   }
@@ -745,6 +753,7 @@ export function initTracePanel(): TracePanelController {
     const opId = tool.operationId;
     if (opId && opTaskId) {
       const cacheKey = `${opTaskId}:${opId}`;
+      activeInspectorOperationKey = cacheKey;
       let cached = appState.operationTextCache.get(cacheKey);
       if (!cached && appState.ready && !appState.authExpired) {
         const generation = appState.selectionGeneration;
@@ -1021,6 +1030,7 @@ export function initTracePanel(): TracePanelController {
       ? chainView.nodes.find(item => item.id === appState.selectedNodeId)
       : undefined;
 
+    activeInspectorOperationKey = undefined;
     if (!selectedNode) {
       lastInspectorNodeId = undefined;
       eventDetailEl.replaceChildren();
@@ -1340,6 +1350,7 @@ export function initTracePanel(): TracePanelController {
     panelsEl.classList.remove('has-inspector');
     syncWideToggle();
     syncCategoryTabs();
+    syncTraceMore();
 
     traceScopeEl.textContent = next.type === 'all'
       ? '全部已记录执行链路'

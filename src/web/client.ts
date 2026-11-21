@@ -308,6 +308,8 @@ function scheduleRefresh(): void {
 
 let activeRefresh: Promise<void> | undefined;
 let refreshRunSeq = 0;
+let pendingCursorReset = false;
+let cursorResetEpoch = 0;
 
 async function refreshView(initial = false): Promise<void> {
   if (activeRefresh) {
@@ -319,19 +321,29 @@ async function refreshView(initial = false): Promise<void> {
   appState.refreshBusy = true;
   const run = (async () => {
     try {
+      const resetEpochAtStart = cursorResetEpoch;
+      const hadPendingReset = pendingCursorReset;
       const result = await api<MainView>('/api/view');
       const selectedTaskId = appState.selection.type === 'task' ? appState.selection.id : undefined;
       const previousWorkStatus = appState.view?.works.find(work => work.id === selectedTaskId)?.status;
-      const cursorReset = !initial && result.cursor < appState.cursor;
+      const cursorReset = !initial && (hadPendingReset || result.cursor < appState.cursor);
+      if (hadPendingReset && cursorResetEpoch === resetEpochAtStart) {
+        pendingCursorReset = false;
+      }
       appState.view = result;
       appState.voiceprintState = result.voiceprint;
       if (cursorReset) {
         appState.messages.clear();
         appState.followedMessage = undefined;
+        appState.selectionPinned = false;
         appState.traceAfter = 0;
         appState.traceEvents = [];
         appState.traceHasMore = false;
         appState.traceHasEarlier = false;
+        appState.traceBundle = undefined;
+        appState.workData = undefined;
+        appState.operationTextCache.clear();
+        appState.stopRequests.clear();
         appState.historyBefore = result.messages.before;
         appState.historyHasMore = result.messages.hasMore;
         appState.cursor = result.cursor;
@@ -339,7 +351,7 @@ async function refreshView(initial = false): Promise<void> {
         sseHub.setCursor(result.cursor);
       }
       for (const work of result.works) {
-        if (['completed', 'failed', 'cancelled'].includes(work.status)) {
+        if (!active(work.status)) {
           appState.stopRequests.delete(`task:${work.id}`);
         }
       }
@@ -375,6 +387,9 @@ async function refreshView(initial = false): Promise<void> {
       chatPanel.updateComposer();
       chatPanel.renderBossDecisionDock();
       followLatestMessage();
+      if (cursorReset && !appState.followedMessage) {
+        tracePanel.selectTrace({ type: 'all' }, false);
+      }
       trackCompanionTransitions(initial);
       if (
         !initial
@@ -437,10 +452,22 @@ const sseHub = createSharedSseHub({
     if (appState.authExpired) return;
     const cursorReset = Boolean(batch.reset) || batch.cursor < appState.cursor;
     if (cursorReset) {
+      pendingCursorReset = true;
+      cursorResetEpoch += 1;
       appState.messages.clear();
       appState.followedMessage = undefined;
+      appState.selectionPinned = false;
       appState.traceAfter = 0;
       appState.traceEvents = [];
+      appState.traceHasMore = false;
+      appState.traceHasEarlier = false;
+      appState.traceBundle = undefined;
+      appState.workData = undefined;
+      appState.operationTextCache.clear();
+      appState.historyBefore = undefined;
+      appState.historyHasMore = false;
+      appState.stopRequests.clear();
+      lastPluginCheckSeq = 0;
       appState.cursor = batch.cursor;
       scheduleRefresh();
       return;
@@ -482,13 +509,15 @@ async function connect(forceReconnect = false): Promise<void> {
     await refreshView(initial);
     if (generation !== appState.connectionGeneration || appState.authExpired) return;
     if (initial) {
-      const latest = [...appState.messages.values()]
-        .sort((a, b) => b.seq - a.seq)
-        .find(message => message.role === 'user');
-      tracePanel.selectTrace(
-        latest ? { type: 'message', id: latest.id, label: latest.text.slice(0, 80) } : { type: 'all' },
-        false,
-      );
+      if (appState.selectionGeneration === 0) {
+        const latest = [...appState.messages.values()]
+          .sort((a, b) => b.seq - a.seq)
+          .find(message => message.role === 'user');
+        tracePanel.selectTrace(
+          latest ? { type: 'message', id: latest.id, label: latest.text.slice(0, 80) } : { type: 'all' },
+          false,
+        );
+      }
     } else if (!appState.traceHasMore) {
       void tracePanel.loadTrace('live');
     }

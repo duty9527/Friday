@@ -236,23 +236,23 @@ function createSseBroadcaster(home: string) {
               continue;
             }
             const cursorRolledBack = batch.head < client.cursor;
-            if (cursorRolledBack) {
-              client.cursor = 0;
-            }
+            const effectiveCursor = cursorRolledBack ? 0 : client.cursor;
             const relevant = batch.events.length
-              ? batch.events.filter(event => event.seq > client.cursor)
+              ? batch.events.filter(event => event.seq > effectiveCursor)
               : [];
             if (relevant.length) {
-              const clientCursor = relevant.at(-1)?.seq ?? client.cursor;
-              const payload = relevant.length === batch.events.length
+              const clientCursor = relevant.at(-1)?.seq ?? effectiveCursor;
+              const basePayload = relevant.length === batch.events.length
                 ? batch
                 : { events: relevant, cursor: clientCursor, head: batch.head };
+              const payload = cursorRolledBack ? { ...basePayload, reset: true } : basePayload;
               if (writeClient(client, `event: updates\ndata: ${JSON.stringify(payload)}\n\n`)) {
                 client.cursor = clientCursor;
                 client.heartbeat = now;
               }
             } else if (cursorRolledBack) {
               if (writeClient(client, `event: updates\ndata: ${JSON.stringify({ events: [], cursor: 0, head: batch.head, reset: true })}\n\n`)) {
+                client.cursor = 0;
                 client.heartbeat = now;
               }
             } else {
@@ -471,7 +471,9 @@ export async function startWeb(options: StartWebOptions): Promise<{ url: string;
       const search = url.searchParams;
       const numeric = (name: string) => {
         if (!search.has(name)) return undefined;
-        try { return integer(Number(search.get(name)), 0, 0, Number.MAX_SAFE_INTEGER); }
+        const raw = search.get(name) ?? '';
+        if (!raw.trim()) throw new HttpFailure(400, `Invalid ${name} cursor`);
+        try { return integer(Number(raw), 0, 0, Number.MAX_SAFE_INTEGER); }
         catch { throw new HttpFailure(400, `Invalid ${name} cursor`); }
       };
       const sanitizeVoiceprint = (raw: unknown): unknown => {

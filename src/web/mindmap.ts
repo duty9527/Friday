@@ -71,6 +71,8 @@ let sseCursor = 0;
 let sseStarted = false;
 let refreshTimer: number | undefined;
 let refreshSeq = 0;
+let dbEpoch = 0;
+let pendingDbReset = false;
 const expandedTextCache = new Map<string, string>();
 
 function rememberExpandedText(key: string, value: string): void {
@@ -146,6 +148,7 @@ const viewportEl = el<SVGGElement>('mm-viewport');
 const framesLayerEl = el<SVGGElement>('mm-frames');
 const edgesLayerEl = el<SVGGElement>('mm-edges');
 const nodesLayerEl = el<SVGGElement>('mm-nodes');
+const inspectorEl = el<HTMLElement>('mm-inspector');
 const inspectorBodyEl = el<HTMLElement>('mm-inspector-body');
 
 function markAuthExpired() {
@@ -773,7 +776,7 @@ function rebuildAndRenderCanvas(shouldFit: boolean) {
   }
 
   const prevSelected = selectedNodeId;
-  const prevScrollTop = inspectorBodyEl.scrollTop;
+  const prevScrollTop = inspectorEl.scrollTop;
   const activeNode = (selectedNodeId && currentGraph.nodes.find(n => n.id === selectedNodeId)) ?? currentGraph.nodes[0];
   if (activeNode) selectedNodeId = activeNode.id;
 
@@ -781,7 +784,7 @@ function rebuildAndRenderCanvas(shouldFit: boolean) {
   if (shouldFit) fitWidthTop();
   if (activeNode) {
     renderInspectorForNode(activeNode);
-    if (activeNode.id === prevSelected) inspectorBodyEl.scrollTop = prevScrollTop;
+    if (activeNode.id === prevSelected) inspectorEl.scrollTop = prevScrollTop;
   }
 }
 
@@ -1486,6 +1489,8 @@ const sseHub = createSharedSseHub({
     if (authExpired) return;
     const cursorReset = Boolean(batch.reset) || batch.cursor < sseCursor;
     if (cursorReset) {
+      pendingDbReset = true;
+      dbEpoch += 1;
       sseCursor = batch.cursor;
       if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = undefined; }
       void refreshMindmap(false);
@@ -1510,12 +1515,17 @@ window.addEventListener('pagehide', () => {
 async function refreshMindmap(fitOnFirst = false) {
   if (authExpired) return;
   const seq = ++refreshSeq;
+  const hadPendingReset = pendingDbReset;
+  const epochAtStart = dbEpoch;
   try {
     setConnState('loading', '同步中…');
     const data = await apiGet<MindmapSnapshot>('/api/mindmap?limit=120');
     if (seq !== refreshSeq || authExpired) return;
+    if (hadPendingReset && dbEpoch === epochAtStart) {
+      pendingDbReset = false;
+    }
     authBannerEl.hidden = true;
-    const dbReset = Boolean(snapshot && data.cursor < snapshot.cursor);
+    const dbReset = hadPendingReset || Boolean(snapshot && data.cursor < snapshot.cursor);
     const prevIds = new Set(loadedFlows.map(flow => flow.id));
     const latestIds = new Set(data.flows.map(flow => flow.id));
     const olderPreserved = dbReset ? [] : loadedFlows.filter(flow => !latestIds.has(flow.id));
@@ -1523,6 +1533,7 @@ async function refreshMindmap(fitOnFirst = false) {
     const hasPaginationGap = !dbReset && olderPreserved.length > 0 && data.hasMore && !hasOverlapWithLoaded;
 
     if (dbReset) {
+      dbEpoch += 1;
       collapseOverride.clear();
       expandedTextCache.clear();
       sseCursor = data.cursor;
@@ -1562,11 +1573,12 @@ async function refreshMindmap(fitOnFirst = false) {
 
 async function loadMoreFlows() {
   if (!snapshot?.hasMore || snapshot.beforeSeq === undefined || authExpired || loadMoreBtn.disabled) return;
+  const epoch = dbEpoch;
   loadMoreBtn.disabled = true;
   loadMoreBtn.textContent = '加载中…';
   try {
     const older = await apiGet<MindmapSnapshot>(`/api/mindmap?limit=100&before=${snapshot.beforeSeq}`);
-    if (authExpired) return;
+    if (authExpired || epoch !== dbEpoch || !snapshot) return;
     const seen = new Set(loadedFlows.map(f => f.id));
     for (const f of older.flows) {
       if (!seen.has(f.id)) loadedFlows.push(f);
@@ -1732,6 +1744,10 @@ window.addEventListener('mouseup', () => {
   if (dragMoved) {
     window.setTimeout(() => { dragMoved = false; }, 0);
   }
+});
+window.addEventListener('blur', () => {
+  isDragging = false;
+  dragMoved = false;
 });
 
 svgElRoot.addEventListener('wheel', ev => {

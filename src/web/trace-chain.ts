@@ -2151,7 +2151,7 @@ export function buildExecutionChain(bundle: ExecutionTraceBundle): ExecutionChai
       actor: pair.first.actor,
       actorLabel: ACTOR_LABELS[pair.first.actor],
       title: pair.first.label,
-      preview: clipText(err ?? summaryItems.map(i => `${i.label}: ${i.value}`).join(' · ') ?? pair.first.label, 120),
+      preview: clipText(err ?? (summaryItems.length ? summaryItems.map(i => `${i.label}: ${i.value}`).join(' · ') : pair.first.label), 120),
       status: pair.latest.status,
       statusLabel: resolveStatusLabel(pair.latest.status),
       tone: resolveTone(pair.latest.status, { hasError: Boolean(err) }),

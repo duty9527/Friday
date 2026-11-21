@@ -176,9 +176,10 @@ export function createSharedSseHub(options: SharedSseHubOptions): SharedSseHub {
         onEvent: async (eventName, rawData) => {
           if (eventName !== 'updates' || !active || role !== 'leader' || generation !== streamGeneration) return;
           const batch = JSON.parse(rawData) as SseUpdateBatch;
-          if (batch.reset) localCursor = 0;
+          const cursorReset = Boolean(batch.reset) || (typeof batch.cursor === 'number' && batch.cursor < localCursor);
+          if (cursorReset) localCursor = 0;
           if (typeof batch.cursor === 'number') {
-            localCursor = batch.reset ? batch.cursor : Math.max(localCursor, batch.cursor);
+            localCursor = cursorReset ? batch.cursor : Math.max(localCursor, batch.cursor);
           }
           retryDelay = 500;
           post({ type: 'sse-updates', leaderId: tabId, batch });
@@ -355,9 +356,10 @@ export function createSharedSseHub(options: SharedSseHubOptions): SharedSseHub {
           if (msg.leaderId === tabId) return;
           if (role !== 'follower') enterFollower(msg.leaderId, true);
           lastLeaderSeenAt = Date.now();
-          if (msg.batch.reset) localCursor = 0;
+          const cursorReset = Boolean(msg.batch.reset) || (typeof msg.batch.cursor === 'number' && msg.batch.cursor < localCursor);
+          if (cursorReset) localCursor = 0;
           if (typeof msg.batch.cursor === 'number') {
-            localCursor = msg.batch.reset ? msg.batch.cursor : Math.max(localCursor, msg.batch.cursor);
+            localCursor = cursorReset ? msg.batch.cursor : Math.max(localCursor, msg.batch.cursor);
           }
           enqueueUpdates(msg.batch);
           break;

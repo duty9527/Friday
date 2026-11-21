@@ -61,15 +61,35 @@ const LONG_MESSAGE_COLLAPSE_CHARS = 4800;
 const MOBILE_SCROLLABLE_SELECTOR = [
   '.messages-scroll',
   '#draft',
+  'textarea',
   '.works',
+  '.trace-tabs',
   '.trace-chain-pane',
   '.trace-inspector-pane',
   '.inspector-body',
+  '.inspector-text-box',
+  '.param-code',
+  '.diff-old',
+  '.diff-new',
+  '.result-box',
   '.work-overview-card',
   '.routing-detail',
   '.model-modal-body',
+  '.hub-search-hits-grid',
+  '.modal-pool-select-list',
   '.plugin-main',
+  '.plugin-stage',
   '.plugin-sidebar',
+  '.plugin-nav-sortable-wrap',
+  '.hub-code-block',
+  '.cs80-config-scroll',
+  '.brain-insp-scroll',
+  '.notebook-modal-body',
+  '.notebook-item-list',
+  '.notebook-tag-chips',
+  '.note-content-input',
+  '.note-preview-pane',
+  '.diary-reader-body',
   '.bot-emote-tray',
   '.topbar',
   'pre',
@@ -506,6 +526,8 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       appState.pending = undefined;
       appState.uncertain = false;
       draftEl.value = '';
+      setDraftTyping(false);
+      setEmoteTrayOpen(false);
       sendErrorEl.textContent = '已从持久记录确认接收，无需重发。';
       updateComposer();
     }
@@ -838,6 +860,8 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       isGrouped: boolean;
       showReplyRef: boolean;
       replySourcePreview: string;
+      channel: ReturnType<typeof resolveMessageChannel>;
+      quoteJumpId?: string;
     },
   ): string {
     const workStates = [
@@ -865,6 +889,8 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       opts.isLatestAssistant ? 'L' : 'S',
       opts.isGrouped ? 'G' : 'N',
       opts.showReplyRef ? `R:${opts.replySourcePreview}` : 'R0',
+      opts.channel,
+      opts.quoteJumpId ?? '',
       detailMode ? 'D' : 'C',
       expandedRoutingIds.has(message.id) ? 'ER' : '',
       expandedSystemIds.has(message.id) ? 'ES' : '',
@@ -896,10 +922,13 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     message: ChatMessage,
     channel: ReturnType<typeof resolveMessageChannel>,
     isGrouped: boolean,
+    parsedQuote = extractLeadingQuote(message.text),
+    quoteJumpId = parsedQuote && !parsedQuote.uncached
+      ? findQuotedJumpTargetId(message, parsedQuote.label, parsedQuote.preview)
+      : undefined,
   ): void {
     article.className = `message user-message${isGrouped ? ' is-grouped' : ''}${isMessageMatchedByTraceSelection(message) ? ' is-trace-selected' : ''}`;
     const children: Node[] = [];
-    const parsedQuote = extractLeadingQuote(message.text);
     const displayBody = parsedQuote ? parsedQuote.body : message.text;
 
     const row = node('div', '', 'user-row');
@@ -918,9 +947,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     const bubble = node('div', '', 'user-bubble');
     if (parsedQuote) {
       const fullLine = `↩ ${parsedQuote.label}：${parsedQuote.preview}`;
-      const jumpId = !parsedQuote.uncached
-        ? findQuotedJumpTargetId(message, parsedQuote.label, parsedQuote.preview)
-        : undefined;
+      const jumpId = quoteJumpId;
       if (jumpId) {
         const quoteBtn = button('', () => {
           void jumpMessage(jumpId);
@@ -1256,12 +1283,18 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       const replySourceClean = replySource ? stripLeadingQuoteForPreview(replySource.text) : '';
       const replySourcePreview = replySourceClean.slice(0, 72);
       const channel = resolveMessageChannel(message, appState.messages);
+      const parsedQuote = !systemNotice && message.role === 'user' ? extractLeadingQuote(message.text) : undefined;
+      const quoteJumpId = parsedQuote && !parsedQuote.uncached
+        ? findQuotedJumpTargetId(message, parsedQuote.label, parsedQuote.preview)
+        : undefined;
 
       const sig = buildMessageSignature(message, {
         isLatestAssistant,
         isGrouped,
         showReplyRef,
         replySourcePreview,
+        channel,
+        quoteJumpId,
       });
 
       usedArticleIds.add(message.id);
@@ -1274,7 +1307,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
         if (systemNotice) {
           populateSystemArticle(el, message);
         } else if (message.role === 'user') {
-          populateUserArticle(el, message, channel, isGrouped);
+          populateUserArticle(el, message, channel, isGrouped, parsedQuote, quoteJumpId);
         } else {
           populateAssistantArticle(el, message, {
             isLatestAssistant,
@@ -1294,7 +1327,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
         if (systemNotice) {
           populateSystemArticle(entry.el, message);
         } else if (message.role === 'user') {
-          populateUserArticle(entry.el, message, channel, isGrouped);
+          populateUserArticle(entry.el, message, channel, isGrouped, parsedQuote, quoteJumpId);
         } else {
           populateAssistantArticle(entry.el, message, {
             isLatestAssistant,
@@ -1457,6 +1490,8 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
 
   async function loadOlder(): Promise<void> {
     if (appState.historyBusy || appState.historyBefore === undefined) return;
+    const beforeAtStart = appState.historyBefore;
+    const cursorAtStart = appState.cursor;
     appState.historyBusy = true;
     olderBtn.disabled = true;
     olderBtn.textContent = '正在读取…';
@@ -1464,7 +1499,8 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     const oldHeight = scrollEl.scrollHeight;
     const oldTop = scrollEl.scrollTop;
     try {
-      const page = await api<MessagePage>(`/api/history?before=${appState.historyBefore}`);
+      const page = await api<MessagePage>(`/api/history?before=${beforeAtStart}`);
+      if (appState.authExpired || appState.cursor < cursorAtStart || appState.historyBefore !== beforeAtStart) return;
       for (const item of page.items) knownMessageIds.add(item.id);
       mergeMessages(page.items);
       appState.historyBefore = page.before;
@@ -1549,6 +1585,8 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
         appState.pending = undefined;
         appState.uncertain = false;
         draftEl.value = '';
+        setDraftTyping(false);
+        setEmoteTrayOpen(false);
         sendErrorEl.textContent = '已从持久记录确认接收，无需重发。';
         return;
       }
