@@ -148,8 +148,6 @@ function toTuple(cost, modelId) {
   const out = Number(cost.output ?? 0);
   const crRaw = cost.cache_read ?? cost.cacheRead;
   const cwRaw = cost.cache_write ?? cost.cacheWrite;
-  const cr = crRaw !== undefined && Number.isFinite(Number(crRaw)) && Number(crRaw) >= 0 ? roundRate(crRaw) : -1;
-  const cw = cwRaw !== undefined && Number.isFinite(Number(cwRaw)) && Number(cwRaw) >= 0 ? roundRate(cwRaw) : -1;
 
   if (!Number.isFinite(inp) || !Number.isFinite(out) || inp < 0 || out < 0) return undefined;
   if (inp === 0 && out === 0) {
@@ -158,6 +156,10 @@ function toTuple(cost, modelId) {
     }
     return undefined;
   }
+  // On paid models, 0 in upstream metadata denotes "unspecified / no explicit cache rate",
+  // not free ($0/1M) caching; emit -1 so runtime derives the model's true cache rate.
+  const cr = crRaw !== undefined && Number.isFinite(Number(crRaw)) && Number(crRaw) > 0 ? roundRate(crRaw) : -1;
+  const cw = cwRaw !== undefined && Number.isFinite(Number(cwRaw)) && Number(cwRaw) > 0 ? roundRate(cwRaw) : -1;
   return [roundRate(inp), roundRate(out), cr, cw];
 }
 

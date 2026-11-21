@@ -121,6 +121,13 @@ const DEVICE_STATE_LABELS: Record<string, string> = {
 const BOT_STATE_LABELS: Record<string, string> = {
   idle: '待机守候',
   listening: '正在倾听',
+  speaking: '语音播报',
+  sending_msg: '发送消息',
+  printing: '正在打印',
+  operating_xiaoai: '操控小爱',
+  operating_tv: '操控电视',
+  managing_laifen: '牙刷管理',
+  weighing_scale: '体脂测重',
   thinking: '思考推演',
   searching: '记忆检索',
   streaming: '正在回复',
@@ -141,6 +148,13 @@ const EXPRESSION_LABELS: Record<string, string> = {
   auto: '自动表情',
   happy: '开心',
   listening: '专注倾听',
+  speaking: '语音播报',
+  sending_msg: '发送消息',
+  printing: '正在打印',
+  operating_xiaoai: '操控小爱',
+  operating_tv: '操控电视',
+  managing_laifen: '牙刷管理',
+  weighing_scale: '体脂测重',
   inspecting: '打量',
   surprised: '惊喜',
   calm: '平静',
@@ -500,9 +514,9 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
       head.append(titleEl, tagEl);
 
       const valText = widgetData?.headline || '等待数据采集';
-      const subText = widgetData?.subline || cat?.subtitle || card.kind;
+      const subText = widgetData?.subline || '';
       const valEl = node('div', valText, 'cs80-editor-card-value');
-      const subEl = node('div', subText, 'cs80-editor-card-sub');
+      const subEl = subText ? node('div', subText, 'cs80-editor-card-sub') : undefined;
 
       const tools = node('div', '', 'cs80-editor-card-tools');
       const sizeGroup = node('div', '', 'cs80-size-group');
@@ -544,7 +558,8 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
       moveGroup.append(upBtn, downBtn, delBtn);
       tools.append(sizeGroup, moveGroup);
 
-      box.append(head, valEl, subEl, tools);
+      if (subEl) box.append(head, valEl, subEl, tools);
+      else box.append(head, valEl, tools);
 
       if (cat?.configurableAction || card.kind.startsWith('plugin:')) {
         const optsRow = node('div', '', 'cs80-custom-opts');
@@ -592,7 +607,7 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
   function renderCatalogPicker(): void {
     const catalog = latestData?.catalog ?? [];
     const curPage = activePage();
-    catalogMetaEl.textContent = `共发现 ${catalog.length} 个可用卡片源（含全部已安装插件与核心状态）`;
+    catalogMetaEl.textContent = `共 ${catalog.length} 个可用卡片源`;
     catalogPickerEl.replaceChildren();
 
     for (const item of catalog) {
@@ -612,7 +627,6 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
         node('span', item.title, 'cs80-catalog-title'),
         node('span', catLabel, `hub-badge ${catTone}`),
       );
-      const sub = node('div', item.subtitle || item.kind, 'cs80-catalog-sub');
       const addBtn = button('＋ 添加到此页', () => {
         if (!draftLayout) return;
         const page = activePage();
@@ -637,7 +651,7 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
       if (curPage && curPage.cards.some(c => c.kind === item.kind) && item.category !== 'custom_plugin') {
         addBtn.textContent = '＋ 再添一张';
       }
-      card.append(head, sub, addBtn);
+      card.append(head, addBtn);
       catalogPickerEl.append(card);
     }
   }
@@ -828,9 +842,11 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
     if (!btn) return;
     const expr = btn.dataset.expr || 'auto';
     const poke = btn.dataset.poke || undefined;
+    const channel = btn.dataset.channel || undefined;
     await callPlugin('express', {
       expr,
       ...(poke ? { poke } : {}),
+      ...(channel ? { channel } : {}),
       holdSec: expr === 'auto' ? 0 : 8,
     });
     setTimeout(() => {

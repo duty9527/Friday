@@ -373,7 +373,6 @@ export function initImVoiceHub(): ImVoiceHubController {
         node('span', `🎙️ 样本 ${p.sampleCount} 条`, 'hub-meta-chip'),
         node('span', `🧬 ${p.dim} 维特征`, 'hub-meta-chip'),
         node('span', `🕒 更新于 ${timestamp(p.updatedAt)}`, 'hub-meta-chip'),
-        node('span', `🆔 ${p.id}`, 'hub-meta-chip mono-chip'),
       );
       card.append(badges);
       listFrag.append(card);

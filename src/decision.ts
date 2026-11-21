@@ -72,7 +72,7 @@ export interface DecisionRouteResult {
   needsQualityGateProb?: number;
   source: DecisionSource;
   attempted: boolean;
-  usage?: { inputTokens: number; outputTokens?: number; totalTokens: number };
+  usage?: { inputTokens: number; outputTokens?: number; cacheReadTokens?: number; totalTokens: number };
   fallbackReason?: string;
 }
 
@@ -90,7 +90,7 @@ export interface CompletionEvaluationInput {
 export interface CompletionEvaluationResult {
   assessment: QualityGateAssessment;
   attempted: boolean;
-  usage?: { inputTokens: number; outputTokens?: number; totalTokens: number };
+  usage?: { inputTokens: number; outputTokens?: number; cacheReadTokens?: number; totalTokens: number };
   fallbackReason?: string;
 }
 
@@ -120,7 +120,7 @@ export interface SessionContinuityResult {
   relation: 'answer_clarification' | 'post_task_discussion' | 'topic_continuity' | 'dialogue_followup' | 'new_topic';
   source: DecisionSource;
   attempted: boolean;
-  usage?: { inputTokens: number; outputTokens?: number; totalTokens: number };
+  usage?: { inputTokens: number; outputTokens?: number; cacheReadTokens?: number; totalTokens: number };
   fallbackReason?: string;
 }
 
@@ -186,7 +186,14 @@ interface DecisionResponseAnswer {
 
 interface DecisionApiResponse {
   answers?: Record<string, DecisionResponseAnswer>;
-  usage?: { total_input_tokens?: number; total_output_tokens?: number; total_tokens?: number };
+  usage?: {
+    total_input_tokens?: number;
+    total_output_tokens?: number;
+    total_cached_tokens?: number;
+    cached_input_tokens?: number;
+    cached_tokens?: number;
+    total_tokens?: number;
+  };
   error?: { message?: string };
 }
 
@@ -201,13 +208,14 @@ export function resolveDecisionEndpoint(baseUrl?: string): string {
 }
 
 function mergeDecisionUsage(res: {
-  usage?: { inputTokens: number; totalTokens: number };
+  usage?: { inputTokens: number; cacheReadTokens?: number; totalTokens: number };
   outputTokens?: number;
-}): { inputTokens: number; outputTokens?: number; totalTokens: number } | undefined {
+}): { inputTokens: number; outputTokens?: number; cacheReadTokens?: number; totalTokens: number } | undefined {
   if (!res.usage) return undefined;
   return {
     inputTokens: res.usage.inputTokens,
     ...(res.outputTokens !== undefined ? { outputTokens: res.outputTokens } : {}),
+    ...(res.usage.cacheReadTokens ? { cacheReadTokens: res.usage.cacheReadTokens } : {}),
     totalTokens: res.usage.totalTokens,
   };
 }
@@ -218,7 +226,7 @@ export async function requestGeminiDecisions(
   questions: Record<string, DecisionQuestion>,
 ): Promise<{
   answers: Record<string, DecisionResponseAnswer>;
-  usage?: { inputTokens: number; totalTokens: number };
+  usage?: { inputTokens: number; cacheReadTokens?: number; totalTokens: number };
   outputTokens?: number;
 }> {
   const endpoint = resolveDecisionEndpoint(credentials.baseUrl);
@@ -247,15 +255,24 @@ export async function requestGeminiDecisions(
   if (!payload.usage) {
     return { answers: payload.answers };
   }
-  const inputTokens = Number(payload.usage.total_input_tokens ?? 0);
+  const rawInput = Number(payload.usage.total_input_tokens ?? 0);
+  const rawCached = Number(
+    payload.usage.total_cached_tokens
+      ?? payload.usage.cached_input_tokens
+      ?? payload.usage.cached_tokens
+      ?? 0,
+  );
+  const cacheReadTokens = Number.isFinite(rawCached) && rawCached > 0 ? Math.round(rawCached) : 0;
+  const inputTokens = Math.max(0, (Number.isFinite(rawInput) && rawInput > 0 ? Math.round(rawInput) : 0) - cacheReadTokens);
   const rawTotal = Number(payload.usage.total_tokens ?? 0);
   const rawOut = payload.usage.total_output_tokens;
   const outputTokens = typeof rawOut === 'number' && Number.isFinite(rawOut)
     ? Math.max(0, rawOut)
-    : Math.max(0, rawTotal - inputTokens);
+    : Math.max(0, rawTotal - inputTokens - cacheReadTokens);
   const usage = {
     inputTokens,
-    totalTokens: rawTotal > 0 ? rawTotal : inputTokens + outputTokens,
+    ...(cacheReadTokens > 0 ? { cacheReadTokens } : {}),
+    totalTokens: rawTotal > 0 ? rawTotal : inputTokens + cacheReadTokens + outputTokens,
   };
   return { answers: payload.answers, usage, outputTokens };
 }

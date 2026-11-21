@@ -77,6 +77,7 @@ COL_EMERALD = (0x10 / 255.0, 0xB9 / 255.0, 0x81 / 255.0)
 COL_RED = (0xEF / 255.0, 0x44 / 255.0, 0x44 / 255.0)
 COL_SKY = (0x38 / 255.0, 0xBD / 255.0, 0xF8 / 255.0)
 COL_SLATE = (0x94 / 255.0, 0xA3 / 255.0, 0xB8 / 255.0)
+COL_NB_LIME = (0x3E / 255.0, 0xE6 / 255.0, 0x4E / 255.0)
 
 STATE_BADGES = {
     "idle": ("待机守候", COL_AMBER),
@@ -89,6 +90,13 @@ STATE_BADGES = {
     "finished": ("执行完成", COL_EMERALD),
     "failed": ("执行受阻", COL_RED),
     "sleeping": ("静默休眠", COL_AMBER_DIM),
+    "speaking": ("语音播报", COL_AMBER_BRIGHT),
+    "sending_msg": ("发送消息", COL_EMERALD),
+    "printing": ("正在打印", COL_AMBER_BRIGHT),
+    "operating_xiaoai": ("操控小爱", COL_EMERALD),
+    "operating_tv": ("操控电视", COL_SKY),
+    "managing_laifen": ("牙刷管理", COL_SKY),
+    "weighing_scale": ("体脂测重", COL_EMERALD),
 }
 
 _PROFILE_ZH: Dict[str, str] = {
@@ -148,8 +156,8 @@ def _localize_headline_source(src: str) -> str:
     head_up = parts[0].upper()
     if head_up in _HEADLINE_SRC_ZH:
         parts[0] = _HEADLINE_SRC_ZH[head_up]
-        return " · ".join(p for p in parts if p)[:16]
-    return clean[:16]
+        return " · ".join(p for p in parts if p)[:18]
+    return clean[:18]
 
 
 @dataclass(frozen=True)
@@ -185,6 +193,9 @@ class HudState:
     marquee_speed: int = 2
     layout_rev: int = 1
     data_rev: int = 1
+    headline_incoming: bool = False
+    scene_channel: str = ""
+    scene_caption: str = ""
 
 
 class MarqueeController:
@@ -782,6 +793,105 @@ def _draw_progress_bar(
         ctx.fill()
 
 
+def _draw_segmented_bar_cairo(
+    ctx,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    ratio: float,
+    fill_col: Tuple[float, float, float],
+    segments: int = 16,
+) -> None:
+    count = max(4, int(segments))
+    gap = 3.5 if count <= 14 else 3.0
+    seg_w = max(3.0, (w - gap * (count - 1)) / float(count))
+    lit = int(round(clamp(float(ratio), 0.0, 1.0) * count))
+    rad = min(2.5, h * 0.35, seg_w * 0.35)
+    for idx in range(count):
+        sx = x + idx * (seg_w + gap)
+        _cairo_rounded_rect(ctx, sx, y, seg_w, h, rad)
+        if idx < lit:
+            ctx.set_source_rgb(*fill_col)
+        else:
+            ctx.set_source_rgba(COL_SLATE[0], COL_SLATE[1], COL_SLATE[2], 0.22)
+        ctx.fill()
+
+
+def _draw_scooter_silhouette_cairo(
+    ctx,
+    cx: float,
+    cy: float,
+    box_w: float,
+    box_h: float,
+    col: Tuple[float, float, float],
+) -> None:
+    scale = min(box_w / 140.0, box_h / 82.0)
+    ox = cx - 70.0 * scale
+    oy = cy - 41.0 * scale
+    px = lambda vx: ox + vx * scale
+    py = lambda vy: oy + vy * scale
+
+    ctx.set_source_rgba(0.0, 0.0, 0.0, 0.55)
+    ctx.save()
+    ctx.translate(cx, py(72.0))
+    ctx.scale(46.0 * scale, 5.0 * scale)
+    ctx.new_path()
+    ctx.arc(0.0, 0.0, 1.0, 0.0, math.pi * 2.0)
+    ctx.fill()
+    ctx.restore()
+
+    for wx in (34.0, 108.0):
+        ctx.new_path()
+        ctx.arc(px(wx), py(60.0), 12.0 * scale, 0.0, math.pi * 2.0)
+        ctx.set_source_rgb(0.14, 0.18, 0.24)
+        ctx.fill_preserve()
+        ctx.set_source_rgb(*COL_SLATE)
+        ctx.set_line_width(max(1.8, 2.5 * scale))
+        ctx.stroke()
+
+        ctx.new_path()
+        ctx.arc(px(wx), py(60.0), 5.2 * scale, 0.0, math.pi * 2.0)
+        ctx.set_source_rgb(*col)
+        ctx.set_line_width(max(1.2, 1.6 * scale))
+        ctx.stroke()
+
+    pts = (
+        (36.0, 56.0),
+        (52.0, 58.0),
+        (86.0, 58.0),
+        (104.0, 44.0),
+        (114.0, 38.0),
+        (104.0, 30.0),
+        (78.0, 32.0),
+        (68.0, 46.0),
+        (50.0, 46.0),
+        (44.0, 26.0),
+        (35.0, 23.0),
+        (30.0, 31.0),
+        (38.0, 51.0),
+    )
+    ctx.new_path()
+    ctx.move_to(px(pts[0][0]), py(pts[0][1]))
+    for vx, vy in pts[1:]:
+        ctx.line_to(px(vx), py(vy))
+    ctx.close_path()
+    ctx.set_source_rgba(col[0], col[1], col[2], 0.16)
+    ctx.fill_preserve()
+    ctx.set_source_rgb(*COL_WHITE)
+    ctx.set_line_width(max(1.4, 1.8 * scale))
+    ctx.stroke()
+
+    ctx.set_source_rgb(*col)
+    ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+    ctx.set_line_width(max(1.8, 2.2 * scale))
+    ctx.new_path()
+    ctx.move_to(px(36.0), py(22.0))
+    ctx.line_to(px(42.0), py(12.0))
+    ctx.line_to(px(51.0), py(11.0))
+    ctx.stroke()
+
+
 def _draw_pill(
     ctx,
     x: float,
@@ -1068,6 +1178,7 @@ class FaceRenderer:
         self._bento_surface = None
         self._bento_key: Optional[Any] = None
         self._measure_ctx = None
+        self._ninebot_img_cache: Dict[str, Tuple[int, Any]] = {}
 
         if cairo is not None:
             self._surface = cairo.ImageSurface.create_for_data(
@@ -1200,6 +1311,8 @@ class FaceRenderer:
             clock_str,
             hud.friday_connected,
             hud.voice_caption,
+            hud.scene_channel,
+            hud.scene_caption,
             round(face.pose.normal_z, 3),
         )
         if (not face.settled) or (self._stage_key != stage_key):
@@ -1293,6 +1406,8 @@ class FaceRenderer:
             badge_col = COL_EMERALD
         elif face.state_id == "working" and face.worker_count > 0:
             badge_text = f"协同执行 · {face.worker_count}项"
+        elif face.state_id == "sending_msg" and hud.scene_channel == "telegram":
+            badge_col = COL_SKY
 
         dot_col = COL_EMERALD if hud.friday_connected else COL_RED
         ctx.new_path()
@@ -1380,12 +1495,652 @@ class FaceRenderer:
         ctx.set_line_width(2.5)
         ctx.stroke()
 
+    def _draw_paper_plane_cairo(
+        self,
+        ctx,
+        x: float,
+        y: float,
+        angle: float,
+        size: float,
+        col: Tuple[float, float, float],
+    ) -> None:
+        ca = math.cos(angle)
+        sa = math.sin(angle)
+
+        def pt(lx: float, ly: float) -> Tuple[float, float]:
+            return (x + lx * ca - ly * sa, y + lx * sa + ly * ca)
+
+        nose = pt(size * 1.15, 0.0)
+        top_wing = pt(-size * 0.85, -size * 0.68)
+        fold = pt(-size * 0.42, 0.0)
+        bot_wing = pt(-size * 0.85, size * 0.68)
+
+        ctx.new_path()
+        ctx.move_to(*nose)
+        ctx.line_to(*top_wing)
+        ctx.line_to(*fold)
+        ctx.line_to(*bot_wing)
+        ctx.close_path()
+        ctx.set_source_rgba(col[0], col[1], col[2], 0.24)
+        ctx.fill_preserve()
+        ctx.set_source_rgb(*col)
+        ctx.set_line_width(3.0)
+        ctx.set_line_join(cairo.LINE_JOIN_ROUND)
+        ctx.stroke()
+
+        ctx.new_path()
+        ctx.move_to(*fold)
+        ctx.line_to(*nose)
+        ctx.set_source_rgb(*COL_WHITE)
+        ctx.set_line_width(2.2)
+        ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+        ctx.stroke()
+
+    def _draw_scene_effects_cairo(
+        self,
+        ctx,
+        face: FaceSnapshot,
+        hud: HudState,
+        cx: float,
+        cy: float,
+        cur_cx: float,
+        cur_cy: float,
+        fr: float,
+        s: float,
+    ) -> None:
+        key = face.state_id
+        clock = face.clock
+
+        if key == "speaking":
+            ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+            for i in range(3):
+                cyc = (clock * 0.85 + i * 0.333) % 1.0
+                r = fr * (1.16 + cyc * 0.44)
+                op = (1.0 - cyc) * 0.82
+                col = COL_AMBER_BRIGHT if i % 2 == 0 else COL_EMERALD
+                ctx.set_source_rgba(col[0], col[1], col[2], op)
+                ctx.set_line_width(max(1.6, 3.4 - cyc * 1.2))
+                ctx.new_path()
+                ctx.arc(cur_cx, cur_cy, r, math.pi * 0.76, math.pi * 1.24)
+                ctx.stroke()
+                ctx.new_path()
+                ctx.arc(cur_cx, cur_cy, r, -math.pi * 0.24, math.pi * 0.24)
+                ctx.stroke()
+
+            base_y = cy + fr * 1.12
+            for i in range(9):
+                center_dist = abs(i - 4) / 4.0
+                env = 1.0 - center_dist * 0.55
+                v = 0.28 + 0.72 * abs(math.sin(clock * 8.4 + i * 0.65)) * abs(math.cos(clock * 3.1 - i * 0.4))
+                bh = (9.0 + 25.0 * env * v) * s
+                bx = cur_cx + (i - 4) * 18.0 * s
+                bw = max(5.0, 8.0 * s)
+                ctx.set_source_rgb(*(COL_AMBER_BRIGHT if i % 2 == 0 else COL_WHITE))
+                _cairo_rounded_rect(ctx, bx - bw * 0.5, base_y - bh * 0.5, bw, bh, bw * 0.5)
+                ctx.fill()
+            return
+
+        if key == "sending_msg":
+            accent = COL_SKY if hud.scene_channel == "telegram" else COL_EMERALD
+            cyc = (clock * 0.55) % 1.0
+            p0 = (cur_cx + fr * 0.78, cur_cy + fr * 0.10)
+            p1 = (cur_cx + fr * 1.05, cur_cy - fr * 0.45)
+            p2 = (cx + 235.0 * s, max(110.0, cy - 154.0 * s))
+            p3 = (cx + 322.0 * s, max(96.0, cy - 222.0 * s))
+
+            def bez(t: float) -> Tuple[float, float]:
+                u = 1.0 - t
+                u2 = u * u
+                t2 = t * t
+                return (
+                    u2 * u * p0[0] + 3.0 * u2 * t * p1[0] + 3.0 * u * t2 * p2[0] + t2 * t * p3[0],
+                    u2 * u * p0[1] + 3.0 * u2 * t * p1[1] + 3.0 * u * t2 * p2[1] + t2 * t * p3[1],
+                )
+
+            if cyc < 0.45:
+                u = cyc / 0.45
+                ctx.new_path()
+                ctx.arc(p0[0], p0[1], (10.0 + u * 34.0) * s, 0.0, math.pi * 2.0)
+                ctx.set_source_rgba(accent[0], accent[1], accent[2], (1.0 - u) * 0.70)
+                ctx.set_line_width(2.5)
+                ctx.stroke()
+
+            fly_u = min(1.0, cyc / 0.78)
+            for d in range(1, 8):
+                dt = fly_u - d * 0.055
+                if dt <= 0.0:
+                    continue
+                tx, ty = bez(dt)
+                alpha = (1.0 - d / 8.0) * (max(0.0, 1.0 - (cyc - 0.78) / 0.22) if cyc > 0.78 else 0.85)
+                dot_col = COL_AMBER_BRIGHT if d % 2 == 0 else accent
+                ctx.new_path()
+                ctx.arc(tx, ty, max(1.4, (4.6 - d * 0.45) * s), 0.0, math.pi * 2.0)
+                ctx.set_source_rgba(dot_col[0], dot_col[1], dot_col[2], alpha)
+                ctx.fill()
+
+            if cyc <= 0.82:
+                px, py = bez(fly_u)
+                nx, ny = bez(min(1.0, fly_u + 0.02))
+                ang = math.atan2(ny - py, nx - px)
+                scale_plane = 1.0 - fly_u * 0.18
+                self._draw_paper_plane_cairo(ctx, px, py, ang, 24.0 * scale_plane * s, accent)
+            else:
+                u = (cyc - 0.82) / 0.18
+                op = math.sin(u * math.pi)
+                ctx.new_path()
+                ctx.arc(p3[0], p3[1], (18.0 + u * 22.0) * s, 0.0, math.pi * 2.0)
+                ctx.set_source_rgba(accent[0], accent[1], accent[2], op * 0.85)
+                ctx.set_line_width(2.6)
+                ctx.stroke()
+
+                ctx.set_source_rgba(COL_AMBER_BRIGHT[0], COL_AMBER_BRIGHT[1], COL_AMBER_BRIGHT[2], op)
+                _cairo_four_star(ctx, p3[0] - 24.0 * s, p3[1] - 18.0 * s, 8.0 * s)
+                _cairo_four_star(ctx, p3[0] + 22.0 * s, p3[1] + 16.0 * s, 6.0 * s)
+
+                ctx.new_path()
+                ctx.move_to(p3[0] - 11.0 * s, p3[1] + 1.0 * s)
+                ctx.line_to(p3[0] - 3.0 * s, p3[1] + 10.0 * s)
+                ctx.line_to(p3[0] + 13.0 * s, p3[1] - 9.0 * s)
+                ctx.set_source_rgba(1.0, 1.0, 1.0, op)
+                ctx.set_line_width(max(2.5, 4.0 * s))
+                ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+                ctx.set_line_join(cairo.LINE_CAP_ROUND)
+                ctx.stroke()
+            return
+
+        if key == "printing":
+            dx = cx + 232.0 * s
+            dy = cy - 12.0 * s
+            pw = 166.0 * s
+            ph = 92.0 * s
+
+            pulse = (clock * 1.8) % 1.0
+            for i in range(3):
+                u = (pulse + i * 0.33) % 1.0
+                lx = cur_cx + fr * 0.55 + ((dx - pw * 0.58) - (cur_cx + fr * 0.55)) * u
+                ly = (cur_cy - 12.0 * s) + ((dy - 10.0 * s) - (cur_cy - 12.0 * s)) * u
+                ctx.new_path()
+                ctx.arc(lx, ly, max(2.2, 4.0 * s), 0.0, math.pi * 2.0)
+                ctx.set_source_rgba(COL_AMBER_BRIGHT[0], COL_AMBER_BRIGHT[1], COL_AMBER_BRIGHT[2], math.sin(u * math.pi) * 0.85)
+                ctx.fill()
+
+            _cairo_rounded_rect(ctx, dx - 44.0 * s, dy - ph * 0.5 - 38.0 * s, 88.0 * s, 42.0 * s, 6.0 * s)
+            ctx.set_source_rgba(COL_AMBER[0], COL_AMBER[1], COL_AMBER[2], 0.16)
+            ctx.fill_preserve()
+            ctx.set_source_rgb(*COL_AMBER_DIM)
+            ctx.set_line_width(2.2)
+            ctx.stroke()
+
+            _cairo_rounded_rect(ctx, dx - pw * 0.5, dy - ph * 0.5, pw, ph, 16.0 * s)
+            ctx.set_source_rgb(0x0F / 255.0, 0x09 / 255.0, 0x02 / 255.0)
+            ctx.fill_preserve()
+            ctx.set_source_rgb(*COL_AMBER_BRIGHT)
+            ctx.set_line_width(2.6)
+            ctx.stroke()
+
+            _cairo_rounded_rect(ctx, dx - pw * 0.40, dy - ph * 0.34, pw * 0.80, 14.0 * s, 4.0 * s)
+            ctx.set_source_rgba(COL_AMBER[0], COL_AMBER[1], COL_AMBER[2], 0.25)
+            ctx.fill()
+
+            led_alpha = 0.4 + 0.6 * abs(math.sin(clock * 6.0))
+            ctx.new_path()
+            ctx.arc(dx + pw * 0.36, dy - ph * 0.27, max(2.8, 5.0 * s), 0.0, math.pi * 2.0)
+            ctx.set_source_rgba(COL_EMERALD[0], COL_EMERALD[1], COL_EMERALD[2], led_alpha)
+            ctx.fill()
+
+            head_x = dx + math.sin(clock * 5.2) * (pw * 0.28)
+            _cairo_rounded_rect(ctx, head_x - 13.0 * s, dy - 10.0 * s, 26.0 * s, 8.0 * s, 4.0 * s)
+            ctx.set_source_rgb(*COL_AMBER_BRIGHT)
+            ctx.fill()
+            ctx.new_path()
+            ctx.arc(head_x, dy - 6.0 * s, 12.0 * s, 0.0, math.pi * 2.0)
+            ctx.set_source_rgba(COL_AMBER_BRIGHT[0], COL_AMBER_BRIGHT[1], COL_AMBER_BRIGHT[2], 0.25)
+            ctx.fill()
+
+            _cairo_rounded_rect(ctx, dx - 56.0 * s, dy + ph * 0.24, 112.0 * s, 10.0 * s, 4.0 * s)
+            ctx.set_source_rgb(*COL_BG)
+            ctx.fill_preserve()
+            ctx.set_source_rgb(*COL_AMBER_DIM)
+            ctx.set_line_width(1.6)
+            ctx.stroke()
+
+            feed = (clock * 0.48) % 1.0
+            sheet_h = (14.0 + feed * 86.0) * s
+            paper_top = dy + ph * 0.26
+            ctx.save()
+            ctx.new_path()
+            ctx.rectangle(dx - 54.0 * s, dy + ph * 0.28, 108.0 * s, 118.0 * s)
+            ctx.clip()
+            _cairo_rounded_rect(ctx, dx - 46.0 * s, paper_top, 92.0 * s, sheet_h, 5.0 * s)
+            ctx.set_source_rgb(*COL_WHITE)
+            ctx.fill_preserve()
+            ctx.set_source_rgb(*COL_AMBER)
+            ctx.set_line_width(2.0)
+            ctx.stroke()
+            for li in range(5):
+                ly = paper_top + (15.0 + li * 15.0) * s
+                if ly + 4.0 * s < paper_top + sheet_h - 8.0 * s:
+                    lw = (52.0 if li == 0 else (38.0 if li == 4 else 66.0)) * s
+                    _cairo_rounded_rect(ctx, dx - 34.0 * s, ly, lw, 4.5 * s, 2.0 * s)
+                    ctx.set_source_rgb(*(COL_AMBER if li == 0 else COL_AMBER_DIM))
+                    ctx.fill()
+            ctx.restore()
+            return
+
+        if key == "operating_xiaoai":
+            sx = cx + 238.0 * s
+            sy = cy + 14.0 * s
+            sw = 88.0 * s
+            sh = 152.0 * s
+
+            ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+            for i in range(3):
+                u = (clock * 0.95 + i * 0.333) % 1.0
+                bx = (cur_cx + fr * 0.56) + ((sx - sw * 0.65) - (cur_cx + fr * 0.56)) * u
+                by = (cur_cy - 18.0 * s) + ((sy - 38.0 * s) - (cur_cy - 18.0 * s)) * u
+                op = math.sin(u * math.pi) * 0.90
+                ctx.new_path()
+                ctx.arc(bx - 10.0 * s, by, (18.0 + u * 10.0) * s, -math.pi * 0.34, math.pi * 0.34)
+                ctx.set_source_rgba(COL_EMERALD[0], COL_EMERALD[1], COL_EMERALD[2], op)
+                ctx.set_line_width(3.0)
+                ctx.stroke()
+
+            for i in range(2):
+                cyc = (clock * 0.65 + i * 0.5) % 1.0
+                ctx.new_path()
+                ctx.arc(sx, sy - sh * 0.44, (24.0 + cyc * 72.0) * s, math.pi * 1.15, math.pi * 1.95)
+                ctx.set_source_rgba(COL_SKY[0], COL_SKY[1], COL_SKY[2], (1.0 - cyc) * 0.72)
+                ctx.set_line_width(2.4)
+                ctx.stroke()
+
+            nodes = (
+                (sx - 56.0 * s, sy - 118.0 * s, COL_AMBER_BRIGHT),
+                (sx + 2.0 * s, sy - 134.0 * s, COL_EMERALD),
+                (sx + 56.0 * s, sy - 112.0 * s, COL_SKY),
+            )
+            for idx, (nx, ny, ncol) in enumerate(nodes):
+                glow = 0.55 + 0.45 * math.sin(clock * 4.5 + idx * 1.7)
+                ctx.new_path()
+                ctx.arc(nx, ny, 11.0 * s, 0.0, math.pi * 2.0)
+                ctx.set_source_rgba(ncol[0], ncol[1], ncol[2], 0.16 * glow)
+                ctx.fill_preserve()
+                ctx.set_source_rgba(ncol[0], ncol[1], ncol[2], 0.90 * glow)
+                ctx.set_line_width(2.0)
+                ctx.stroke()
+                ctx.new_path()
+                ctx.arc(nx, ny, max(2.2, 3.6 * s), 0.0, math.pi * 2.0)
+                ctx.set_source_rgb(*ncol)
+                ctx.fill()
+
+            _cairo_rounded_rect(ctx, sx - sw * 0.5, sy - sh * 0.5, sw, sh, 22.0 * s)
+            ctx.set_source_rgb(0x07 / 255.0, 0x11 / 255.0, 0x0E / 255.0)
+            ctx.fill_preserve()
+            ctx.set_source_rgb(*COL_EMERALD)
+            ctx.set_line_width(2.6)
+            ctx.stroke()
+
+            ctx.set_source_rgba(COL_EMERALD[0], COL_EMERALD[1], COL_EMERALD[2], 0.45)
+            for row in range(5):
+                for col_i in range(-3, 4):
+                    ctx.new_path()
+                    ctx.arc(sx + col_i * 9.5 * s, sy + (12.0 + row * 10.5) * s, max(1.2, 1.8 * s), 0.0, math.pi * 2.0)
+                    ctx.fill()
+
+            ring_y = sy - sh * 0.5 + 15.0 * s
+            ctx.save()
+            ctx.translate(sx, ring_y)
+            ctx.scale(1.0, 0.34)
+            ctx.new_path()
+            ctx.arc(0.0, 0.0, sw * 0.38, 0.0, math.pi * 2.0)
+            ctx.set_source_rgb(*COL_SKY)
+            ctx.set_line_width(5.0)
+            ctx.stroke()
+            bead_ang = clock * 4.2
+            ctx.new_path()
+            ctx.arc(math.cos(bead_ang) * sw * 0.38, math.sin(bead_ang) * sw * 0.38, max(3.0, 5.5 * s), 0.0, math.pi * 2.0)
+            ctx.set_source_rgb(*COL_WHITE)
+            ctx.fill()
+            ctx.restore()
+            return
+
+        if key == "operating_tv":
+            tv_x = cx + 236.0 * s
+            tv_y = cy - 54.0 * s
+            tv_w = 166.0 * s
+            tv_h = 104.0 * s
+
+            _cairo_rounded_rect(ctx, tv_x - tv_w * 0.5, tv_y - tv_h * 0.5, tv_w, tv_h, 10.0 * s)
+            ctx.set_source_rgb(0x05 / 255.0, 0x0C / 255.0, 0x14 / 255.0)
+            ctx.fill_preserve()
+            ctx.set_source_rgb(*COL_SKY)
+            ctx.set_line_width(2.6)
+            ctx.stroke()
+
+            ctx.set_source_rgb(*COL_SKY)
+            ctx.set_line_width(3.0)
+            ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+            ctx.new_path()
+            ctx.move_to(tv_x, tv_y + tv_h * 0.5)
+            ctx.line_to(tv_x, tv_y + tv_h * 0.5 + 18.0 * s)
+            ctx.move_to(tv_x - 36.0 * s, tv_y + tv_h * 0.5 + 19.0 * s)
+            ctx.line_to(tv_x + 36.0 * s, tv_y + tv_h * 0.5 + 19.0 * s)
+            ctx.stroke()
+
+            focus_idx = int(clock * 2.2) % 3
+            for i in range(3):
+                tile_x = tv_x + (-66.0 + i * 46.0) * s
+                tile_y = tv_y - 26.0 * s
+                active = i == focus_idx
+                base_c = COL_SKY if active else COL_AMBER
+                _cairo_rounded_rect(ctx, tile_x, tile_y, 40.0 * s, 34.0 * s, 5.0 * s)
+                ctx.set_source_rgba(base_c[0], base_c[1], base_c[2], 0.34 if active else 0.10)
+                ctx.fill_preserve()
+                if active:
+                    ctx.set_source_rgb(*COL_WHITE)
+                    ctx.set_line_width(2.2)
+                else:
+                    ctx.set_source_rgba(COL_SKY[0], COL_SKY[1], COL_SKY[2], 0.45)
+                    ctx.set_line_width(1.2)
+                ctx.stroke()
+
+            _cairo_rounded_rect(ctx, tv_x - 64.0 * s, tv_y + 22.0 * s, 128.0 * s, 7.0 * s, 3.5 * s)
+            ctx.set_source_rgba(COL_SKY[0], COL_SKY[1], COL_SKY[2], 0.25)
+            ctx.fill()
+            bar_w = (36.0 + 70.0 * (0.5 + 0.5 * math.sin(clock * 2.6))) * s
+            _cairo_rounded_rect(ctx, tv_x - 64.0 * s, tv_y + 22.0 * s, bar_w, 7.0 * s, 3.5 * s)
+            ctx.set_source_rgb(*COL_EMERALD)
+            ctx.fill()
+
+            rx = cx + 196.0 * s
+            ry = cy + 84.0 * s
+            rr = 30.0 * s
+            ctx.new_path()
+            ctx.arc(rx, ry, rr, 0.0, math.pi * 2.0)
+            ctx.set_source_rgba(COL_SKY[0], COL_SKY[1], COL_SKY[2], 0.12)
+            ctx.fill_preserve()
+            ctx.set_source_rgb(*COL_SKY)
+            ctx.set_line_width(2.4)
+            ctx.stroke()
+
+            press_beat = max(0.0, math.sin(clock * 5.6))
+            ctx.new_path()
+            ctx.arc(rx, ry, rr * (0.34 + 0.04 * press_beat), 0.0, math.pi * 2.0)
+            ctx.set_source_rgba(COL_AMBER_BRIGHT[0], COL_AMBER_BRIGHT[1], COL_AMBER_BRIGHT[2], 0.25 + 0.40 * press_beat)
+            ctx.fill_preserve()
+            ctx.set_source_rgb(*COL_AMBER_BRIGHT)
+            ctx.set_line_width(1.8)
+            ctx.stroke()
+
+            dirs = ((0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0))
+            active_dir = int(clock * 2.2) % 4
+            chev = rr * 0.13
+            ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+            ctx.set_line_join(cairo.LINE_JOIN_ROUND)
+            for idx, (dx, dy) in enumerate(dirs):
+                px = rx + dx * rr * 0.67
+                py = ry + dy * rr * 0.67
+                nx, ny = -dy, dx
+                ctx.new_path()
+                ctx.move_to(px - dx * chev * 0.5 + nx * chev, py - dy * chev * 0.5 + ny * chev)
+                ctx.line_to(px + dx * chev * 0.7, py + dy * chev * 0.7)
+                ctx.line_to(px - dx * chev * 0.5 - nx * chev, py - dy * chev * 0.5 - ny * chev)
+                ctx.set_source_rgb(*(COL_AMBER_BRIGHT if idx == active_dir else COL_WHITE))
+                ctx.set_line_width(2.6 if idx == active_dir else 1.8)
+                ctx.stroke()
+
+            for i in range(3):
+                u = (clock * 1.4 + i * 0.333) % 1.0
+                bx = rx + ((tv_x - 10.0 * s) - rx) * u
+                by = (ry - rr - 4.0 * s) + ((tv_y + tv_h * 0.5 + 14.0 * s) - (ry - rr - 4.0 * s)) * u
+                col = COL_SKY if i % 2 == 0 else COL_EMERALD
+                ctx.new_path()
+                ctx.arc(bx, by, (12.0 + u * 8.0) * s, -math.pi * 0.76, -math.pi * 0.24)
+                ctx.set_source_rgba(col[0], col[1], col[2], math.sin(u * math.pi) * 0.90)
+                ctx.set_line_width(2.6)
+                ctx.stroke()
+            return
+
+        if key == "managing_laifen":
+            bx = cx + 248.0 * s
+            by = cy + 14.0 * s
+
+            ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+            for i in range(3):
+                u = (clock * 1.15 + i * 0.333) % 1.0
+                wx = (cur_cx + fr * 0.62) + ((bx - 42.0 * s) - (cur_cx + fr * 0.62)) * u
+                wy = (cur_cy + 8.0 * s) + ((by + 16.0 * s) - (cur_cy + 8.0 * s)) * u
+                col = COL_SKY if i % 2 == 0 else COL_EMERALD
+                ctx.new_path()
+                ctx.arc(wx - 8.0 * s, wy, (15.0 + u * 9.0) * s, -math.pi * 0.32, math.pi * 0.32)
+                ctx.set_source_rgba(col[0], col[1], col[2], math.sin(u * math.pi) * 0.88)
+                ctx.set_line_width(2.8)
+                ctx.stroke()
+
+            for i in range(5):
+                u = (clock * 0.72 + i * 0.2) % 1.0
+                bbx = bx - 30.0 * s + (math.sin(clock * 3.1 + i * 1.4) * 16.0 + (i - 2) * 9.0) * s
+                bby = (by - 92.0 * s) - u * 54.0 * s
+                br = (3.4 + (i % 3) * 1.6) * (0.7 + 0.4 * math.sin(u * math.pi)) * s
+                bop = math.sin(u * math.pi) * 0.85
+                bcol = COL_SKY if i % 2 == 0 else COL_EMERALD
+                ctx.new_path()
+                ctx.arc(bbx, bby, br, 0.0, math.pi * 2.0)
+                ctx.set_source_rgba(bcol[0], bcol[1], bcol[2], bop * 0.16)
+                ctx.fill_preserve()
+                ctx.set_source_rgba(bcol[0], bcol[1], bcol[2], bop)
+                ctx.set_line_width(1.6)
+                ctx.stroke()
+                ctx.new_path()
+                ctx.arc(bbx - br * 0.32, bby - br * 0.32, max(1.0, br * 0.26), 0.0, math.pi * 2.0)
+                ctx.set_source_rgba(1.0, 1.0, 1.0, bop)
+                ctx.fill()
+
+            sp0 = max(0.0, math.sin(clock * 4.2))
+            sp1 = max(0.0, math.cos(clock * 3.6 + 0.8))
+            ctx.set_source_rgba(1.0, 1.0, 1.0, 0.35 + 0.65 * sp0)
+            _cairo_four_star(ctx, bx - 54.0 * s, by - 118.0 * s, 7.5 * s)
+            ctx.set_source_rgba(COL_AMBER_BRIGHT[0], COL_AMBER_BRIGHT[1], COL_AMBER_BRIGHT[2], 0.35 + 0.65 * sp1)
+            _cairo_four_star(ctx, bx + 26.0 * s, by - 124.0 * s, 6.0 * s)
+
+            vib_x = math.sin(clock * 28.0) * 1.2 * s
+            ctx.save()
+            ctx.translate(bx + vib_x, by)
+            ctx.rotate(0.18)
+
+            _cairo_rounded_rect(ctx, -20.0 * s, -30.0 * s, 40.0 * s, 134.0 * s, 17.0 * s)
+            ctx.set_source_rgb(6.0 / 255.0, 17.0 / 255.0, 24.0 / 255.0)
+            ctx.fill_preserve()
+            ctx.set_source_rgb(*COL_SKY)
+            ctx.set_line_width(2.6)
+            ctx.stroke()
+
+            _cairo_rounded_rect(ctx, -6.0 * s, -2.0 * s, 12.0 * s, 22.0 * s, 6.0 * s)
+            ctx.set_source_rgba(COL_SKY[0], COL_SKY[1], COL_SKY[2], 0.18)
+            ctx.fill_preserve()
+            ctx.set_source_rgba(COL_SKY[0], COL_SKY[1], COL_SKY[2], 0.72)
+            ctx.set_line_width(1.5)
+            ctx.stroke()
+
+            active_mode_led = int(clock * 1.6) % 3
+            for idx, ly in enumerate((38.0 * s, 52.0 * s, 66.0 * s)):
+                is_lit = idx == active_mode_led
+                pulse = (0.72 + 0.28 * math.sin(clock * 8.0)) if is_lit else 0.35
+                lcol = COL_EMERALD if is_lit else COL_AMBER_BRIGHT
+                ctx.new_path()
+                ctx.arc(0.0, ly, (4.4 if is_lit else 2.8) * s, 0.0, math.pi * 2.0)
+                ctx.set_source_rgba(lcol[0], lcol[1], lcol[2], pulse)
+                ctx.fill()
+                if is_lit:
+                    ctx.new_path()
+                    ctx.arc(0.0, ly, 1.8 * s, 0.0, math.pi * 2.0)
+                    ctx.set_source_rgb(*COL_WHITE)
+                    ctx.fill()
+
+            ctx.new_path()
+            ctx.move_to(-12.0 * s, 88.0 * s)
+            ctx.line_to(12.0 * s, 88.0 * s)
+            ctx.set_source_rgba(COL_AMBER_BRIGHT[0], COL_AMBER_BRIGHT[1], COL_AMBER_BRIGHT[2], 0.75)
+            ctx.set_line_width(2.2)
+            ctx.stroke()
+
+            _cairo_rounded_rect(ctx, -5.5 * s, -78.0 * s, 11.0 * s, 50.0 * s, 4.0 * s)
+            ctx.set_source_rgb(6.0 / 255.0, 17.0 / 255.0, 24.0 / 255.0)
+            ctx.fill_preserve()
+            ctx.set_source_rgb(*COL_SKY)
+            ctx.set_line_width(2.2)
+            ctx.stroke()
+
+            sweep_ang = math.sin(clock * 7.5) * 0.24
+            ctx.save()
+            ctx.translate(0.0, -76.0 * s)
+            ctx.rotate(sweep_ang)
+
+            ctx.new_path()
+            ctx.arc(0.0, -24.0 * s, 30.0 * s, -math.pi * 0.85, -math.pi * 0.45)
+            ctx.set_source_rgba(COL_SKY[0], COL_SKY[1], COL_SKY[2], 0.65)
+            ctx.set_line_width(2.0)
+            ctx.stroke()
+
+            ctx.new_path()
+            ctx.arc(0.0, -24.0 * s, 35.0 * s, math.pi * 0.55, math.pi * 0.92)
+            ctx.set_source_rgba(COL_AMBER_BRIGHT[0], COL_AMBER_BRIGHT[1], COL_AMBER_BRIGHT[2], 0.55)
+            ctx.set_line_width(1.8)
+            ctx.stroke()
+
+            _cairo_rounded_rect(ctx, -9.0 * s, -46.0 * s, 18.0 * s, 44.0 * s, 8.0 * s)
+            ctx.set_source_rgb(6.0 / 255.0, 17.0 / 255.0, 24.0 / 255.0)
+            ctx.fill_preserve()
+            ctx.set_source_rgb(*COL_SKY)
+            ctx.set_line_width(2.4)
+            ctx.stroke()
+
+            for ti in range(6):
+                ty = (-40.0 + ti * 6.0) * s
+                tlen = (11.0 if ti in (0, 5) else 14.0) * s
+                ctx.new_path()
+                ctx.move_to(-9.0 * s, ty)
+                ctx.line_to(-9.0 * s - tlen, ty)
+                ctx.set_source_rgb(*(COL_WHITE if ti % 2 == 0 else COL_EMERALD))
+                ctx.set_line_width(max(2.2, 3.2 * s))
+                ctx.stroke()
+
+            ctx.restore()
+            ctx.restore()
+            return
+
+        if key == "weighing_scale":
+            sx = cx + 244.0 * s
+            sy = cy + 10.0 * s
+            sw = 154.0 * s
+            sh = 154.0 * s
+
+            ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+            for i in range(3):
+                u = (clock * 1.1 + i * 0.333) % 1.0
+                wx = (cur_cx + fr * 0.60) + ((sx - sw * 0.54) - (cur_cx + fr * 0.60)) * u
+                wy = (cur_cy + 8.0 * s) + ((sy - 6.0 * s) - (cur_cy + 8.0 * s)) * u
+                col = COL_EMERALD if i % 2 == 0 else COL_SKY
+                ctx.new_path()
+                ctx.arc(wx - 8.0 * s, wy, (15.0 + u * 9.0) * s, -math.pi * 0.34, math.pi * 0.34)
+                ctx.set_source_rgba(col[0], col[1], col[2], math.sin(u * math.pi) * 0.88)
+                ctx.set_line_width(2.8)
+                ctx.stroke()
+
+            ctx.set_source_rgba(COL_EMERALD[0], COL_EMERALD[1], COL_EMERALD[2], 0.55)
+            _cairo_rounded_rect(ctx, sx - 52.0 * s, sy + sh * 0.5 + 1.0 * s, 20.0 * s, 4.0 * s, 2.0 * s)
+            ctx.fill()
+            _cairo_rounded_rect(ctx, sx + 32.0 * s, sy + sh * 0.5 + 1.0 * s, 20.0 * s, 4.0 * s, 2.0 * s)
+            ctx.fill()
+
+            _cairo_rounded_rect(ctx, sx - sw * 0.5, sy - sh * 0.5, sw, sh, 24.0 * s)
+            ctx.set_source_rgb(6.0 / 255.0, 18.0 / 255.0, 14.0 / 255.0)
+            ctx.fill_preserve()
+            ctx.set_source_rgb(*COL_EMERALD)
+            ctx.set_line_width(2.6)
+            ctx.stroke()
+
+            _cairo_rounded_rect(ctx, sx - sw * 0.5 + 6.0 * s, sy - sh * 0.5 + 6.0 * s, sw - 12.0 * s, sh - 12.0 * s, 19.0 * s)
+            ctx.set_source_rgba(COL_EMERALD[0], COL_EMERALD[1], COL_EMERALD[2], 0.22)
+            ctx.set_line_width(1.4)
+            ctx.stroke()
+
+            _cairo_rounded_rect(ctx, sx - 48.0 * s, sy - 62.0 * s, 96.0 * s, 30.0 * s, 8.0 * s)
+            ctx.set_source_rgb(*COL_BG)
+            ctx.fill_preserve()
+            ctx.set_source_rgba(COL_EMERALD[0], COL_EMERALD[1], COL_EMERALD[2], 0.55)
+            ctx.set_line_width(1.6)
+            ctx.stroke()
+
+            cyc = (clock * 0.35) % 1.0
+            if cyc < 0.38:
+                lit_bar = int(clock * 6.0) % 4
+                for b in range(4):
+                    _cairo_rounded_rect(ctx, sx - 32.0 * s + b * 17.0 * s, sy - 50.0 * s, 12.0 * s, 6.0 * s, 3.0 * s)
+                    if b == lit_bar:
+                        ctx.set_source_rgb(*COL_EMERALD)
+                    else:
+                        ctx.set_source_rgba(COL_AMBER_BRIGHT[0], COL_AMBER_BRIGHT[1], COL_AMBER_BRIGHT[2], 0.65 if b < lit_bar else 0.20)
+                    ctx.fill()
+            else:
+                locked = cyc >= 0.78
+                w_val = "68.4" if locked else f"{68.2 + abs(math.sin(clock * 6.4)) * 0.3:.1f}"
+                ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+                ctx.set_font_size(18.0 * s)
+                tw = ctx.text_extents(w_val).x_advance
+                ctx.set_source_rgb(*(COL_EMERALD if locked else COL_WHITE))
+                ctx.move_to(sx - tw * 0.5 - 8.0 * s, sy - 41.0 * s)
+                ctx.show_text(w_val)
+                ctx.set_font_size(11.0 * s)
+                ctx.set_source_rgb(*COL_AMBER_BRIGHT)
+                ctx.move_to(sx + tw * 0.5 - 5.0 * s, sy - 41.0 * s)
+                ctx.show_text("kg")
+                if locked and math.sin(clock * 10.0) > -0.3:
+                    ctx.new_path()
+                    ctx.arc(sx - 38.0 * s, sy - 47.0 * s, max(2.0, 3.0 * s), 0.0, math.pi * 2.0)
+                    ctx.set_source_rgb(*COL_EMERALD)
+                    ctx.fill()
+
+            active_pad = int(clock * 3.2) % 4
+            pad_centers = (
+                (sx - 32.0 * s, sy + 5.0 * s),
+                (sx + 32.0 * s, sy + 5.0 * s),
+                (sx + 32.0 * s, sy + 49.0 * s),
+                (sx - 32.0 * s, sy + 49.0 * s),
+            )
+            for idx, (px, py) in enumerate(pad_centers):
+                active = idx == active_pad
+                pcol = (COL_EMERALD if idx % 2 == 0 else COL_SKY) if active else COL_EMERALD
+                _cairo_rounded_rect(ctx, px - 27.0 * s, py - 19.0 * s, 54.0 * s, 38.0 * s, 10.0 * s)
+                ctx.set_source_rgba(pcol[0], pcol[1], pcol[2], 0.24 if active else 0.08)
+                ctx.fill_preserve()
+                ctx.set_source_rgba(pcol[0], pcol[1], pcol[2], 0.95 if active else 0.34)
+                ctx.set_line_width(2.2 if active else 1.4)
+                ctx.stroke()
+
+            bia_cy = sy + 27.0 * s
+            for i in range(2):
+                w = (clock * 0.78 + i * 0.5) % 1.0
+                r = (12.0 + w * 44.0) * s
+                col = COL_EMERALD if i == 0 else COL_SKY
+                ctx.new_path()
+                ctx.arc(sx, bia_cy, r, 0.0, math.pi * 2.0)
+                ctx.set_source_rgba(col[0], col[1], col[2], (1.0 - w) * 0.78)
+                ctx.set_line_width(2.2)
+                ctx.stroke()
+            ctx.new_path()
+            ctx.arc(sx, bia_cy, max(2.8, 4.5 * s), 0.0, math.pi * 2.0)
+            ctx.set_source_rgb(*COL_AMBER_BRIGHT)
+            ctx.fill()
+
     def _draw_stage_cairo(self, ctx, face: FaceSnapshot, hud: HudState, geo: Dict[str, float]) -> None:
         cx = geo["face_cx"]
         cy = geo["face_cy"]
         fr = geo["face_r"]
+        cur_cx = face.pose.center_x
+        cur_cy = face.pose.center_y
         scale = fr / 192.0
-        sats = self._compute_satellites(face, cx, cy, fr)
+        s = fr / 162.0
+        sats = self._compute_satellites(face, cur_cx, cur_cy, fr)
 
         # Bilateral emerald voice-wave equalizer when actively listening
         if face.state_id == "listening":
@@ -1415,6 +2170,8 @@ class FaceRenderer:
                     ctx.set_source_rgb(*col)
                     _cairo_rounded_rect(ctx, bx - bw * 0.5, by, bw, bh, bw * 0.5)
                     ctx.fill()
+        elif face.state_id in ("speaking", "printing", "operating_xiaoai", "operating_tv", "managing_laifen", "weighing_scale"):
+            self._draw_scene_effects_cairo(ctx, face, hud, cx, cy, cur_cx, cur_cy, fr, s)
 
         # Back-side radar rings
         if face.morph == "radar":
@@ -1451,9 +2208,17 @@ class FaceRenderer:
             ctx.set_source_rgb(*COL_AMBER)
             ctx.fill_preserve()
 
-            edge_col = COL_EMERALD if face.state_id == "listening" else COL_AMBER_BRIGHT
+            edge_col = COL_AMBER_BRIGHT
+            if face.state_id in ("listening", "operating_xiaoai", "weighing_scale"):
+                edge_col = COL_EMERALD
+            elif face.state_id in ("operating_tv", "managing_laifen"):
+                edge_col = COL_SKY
+            elif face.state_id == "sending_msg":
+                edge_col = COL_SKY if hud.scene_channel == "telegram" else COL_EMERALD
             ctx.set_source_rgb(*edge_col)
-            ctx.set_line_width(2.2 if face.state_id == "listening" else 2.0)
+            ctx.set_line_width(
+                2.2 if face.state_id in ("listening", "speaking", "sending_msg", "printing", "operating_xiaoai", "operating_tv", "managing_laifen", "weighing_scale") else 2.0
+            )
             ctx.stroke()
 
             ctx.save()
@@ -1488,6 +2253,9 @@ class FaceRenderer:
                 ctx.arc(sx, sy, max(2.0, sr * 0.42), 0.0, math.pi * 2.0)
                 ctx.fill()
 
+        if face.state_id == "sending_msg":
+            self._draw_scene_effects_cairo(ctx, face, hud, cx, cy, cur_cx, cur_cy, fr, s)
+
         if face.morph == "radar":
             a0 = face.clock * 3.1
             a1 = a0 + 1.25
@@ -1500,34 +2268,64 @@ class FaceRenderer:
 
         if face.morph == "thinking":
             dot_s = (0.65 + 0.35 * face.morph_progress) * scale
-            base_y = cy + fr * 1.28
+            base_y = cur_cy + fr * 1.28
             for i in range(3):
                 ph = face.clock * 4.4 - i * 0.85
                 lift = max(0.0, math.sin(ph))
-                dx = cx + (i - 1) * 48.0 * dot_s
+                dx = cur_cx + (i - 1) * 48.0 * dot_s
                 dy = base_y - lift * 20.0 * scale
                 ctx.new_path()
                 ctx.set_source_rgb(*(COL_AMBER_BRIGHT if i == 1 else COL_AMBER))
                 ctx.arc(dx, dy, 11.0 * dot_s, 0.0, math.pi * 2.0)
                 ctx.fill()
 
-        # Speaker-lock caption below listening face
+        # Bottom stage caption pill for listening & dynamic scene states
+        scene_cap = ""
+        cap_col = COL_EMERALD
         if face.state_id == "listening":
-            cap = _sanitize_hud_text(hud.voice_caption or "请说话 · 正在监听声纹与指令")[:36]
+            scene_cap = hud.voice_caption or "请说话 · 正在监听声纹与指令"
+            cap_col = COL_EMERALD
+        elif face.state_id == "speaking":
+            scene_cap = hud.scene_caption or "小爱音箱正在播报回复…"
+            cap_col = COL_AMBER_BRIGHT
+        elif face.state_id == "sending_msg":
+            is_tg = hud.scene_channel == "telegram"
+            scene_cap = hud.scene_caption or ("电报消息发送中…" if is_tg else "微信消息发送中…")
+            cap_col = COL_SKY if is_tg else COL_EMERALD
+        elif face.state_id == "printing":
+            scene_cap = hud.scene_caption or "正在操作打印机输出文档…"
+            cap_col = COL_AMBER_BRIGHT
+        elif face.state_id == "operating_xiaoai":
+            scene_cap = hud.scene_caption or "正在通过小爱音箱操控家居设备…"
+            cap_col = COL_EMERALD
+        elif face.state_id == "operating_tv":
+            scene_cap = hud.scene_caption or "正在遥控客厅电视…"
+            cap_col = COL_SKY
+        elif face.state_id == "managing_laifen":
+            scene_cap = hud.scene_caption or "正在蓝牙同步与管理徕芬牙刷…"
+            cap_col = COL_SKY
+        elif face.state_id == "weighing_scale":
+            scene_cap = hud.scene_caption or "沃莱 A1 测试模式 · 请赤脚上秤测量…"
+            cap_col = COL_EMERALD
+
+        if scene_cap:
+            cap = _sanitize_hud_text(scene_cap)[:36]
             ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
             ctx.set_font_size(18.0 if hud.grid_rows == 2 else 15.5)
+            cap = _fit_single_line_cairo(ctx, cap, 600.0)
             tw = ctx.text_extents(cap).x_advance
             cap_w = min(640.0, tw + 34.0)
             cap_h = 34.0 if hud.grid_rows == 2 else 28.0
             cap_x = cx - cap_w * 0.5
-            cap_y = min(geo["marquee_y"] - cap_h - 10.0, cy + fr * 1.18)
+            min_y = (cy + fr * 1.12 + 23.0 * s) if face.state_id == "speaking" else (cy + fr * 1.18)
+            cap_y = min(geo["marquee_y"] - cap_h - 6.0, min_y)
             _cairo_rounded_rect(ctx, cap_x, cap_y, cap_w, cap_h, cap_h * 0.5)
-            ctx.set_source_rgba(COL_EMERALD[0], COL_EMERALD[1], COL_EMERALD[2], 0.14)
+            ctx.set_source_rgba(cap_col[0], cap_col[1], cap_col[2], 0.14)
             ctx.fill_preserve()
-            ctx.set_source_rgb(*COL_EMERALD)
+            ctx.set_source_rgb(*cap_col)
             ctx.set_line_width(1.6)
             ctx.stroke()
-            ctx.move_to(cap_x + 17.0, cap_y + cap_h * 0.68)
+            ctx.move_to(cap_x + (cap_w - tw) * 0.5, cap_y + cap_h * 0.68)
             ctx.set_source_rgb(*COL_WHITE)
             ctx.show_text(cap)
 
@@ -1566,10 +2364,11 @@ class FaceRenderer:
         y0 = geo["marquee_y"]
         h = geo["marquee_h"]
 
-        border_col = COL_EMERALD if face.state_id == "listening" else COL_AMBER_DIM
+        is_in = hud.headline_incoming or (face.state_id == "listening")
+        border_col = COL_EMERALD if is_in else COL_AMBER_DIM
         _cairo_rounded_rect(ctx, x0, y0, w, h, 14.0)
         ctx.set_source_rgb(*border_col)
-        ctx.set_line_width(1.6)
+        ctx.set_line_width(1.8 if hud.headline_incoming else 1.6)
         ctx.stroke()
 
         # Left source pill
@@ -1581,15 +2380,15 @@ class FaceRenderer:
         pill_h = h - 18.0
         pill_x = x0 + 12.0
         pill_y = y0 + 9.0
-        pill_col = COL_EMERALD if face.state_id == "listening" else COL_AMBER
+        pill_col = COL_EMERALD if is_in else COL_AMBER
         _cairo_rounded_rect(ctx, pill_x, pill_y, pill_w, pill_h, 8.0)
-        ctx.set_source_rgba(pill_col[0], pill_col[1], pill_col[2], 0.12)
+        ctx.set_source_rgba(pill_col[0], pill_col[1], pill_col[2], 0.14 if hud.headline_incoming else 0.12)
         ctx.fill_preserve()
         ctx.set_source_rgb(*pill_col)
         ctx.set_line_width(1.5)
         ctx.stroke()
         ctx.move_to(pill_x + (pill_w - sw) * 0.5, pill_y + pill_h * 0.72)
-        ctx.set_source_rgb(*COL_AMBER_BRIGHT)
+        ctx.set_source_rgb(*(COL_WHITE if hud.headline_incoming else COL_AMBER_BRIGHT))
         ctx.show_text(src)
 
         # Clipped horizontally scrolling message viewport
@@ -2114,6 +2913,91 @@ class FaceRenderer:
             ctx.move_to(px + 22.0, py + ph * 0.80)
             ctx.show_text(_fit_single_line_cairo(ctx, f"{dev.get('room', '')} · {st_lbl}", pw - 28.0))
 
+    def _get_ninebot_scooter_surface(self, image_path: str, mtime_ns: int = 0) -> Optional[Any]:
+        if cairo is None or not image_path:
+            return None
+        p = Path(image_path)
+        try:
+            if p.is_symlink() or not p.is_file():
+                return None
+            st = p.stat()
+            cur_mtime = int(mtime_ns or st.st_mtime_ns)
+            if st.st_size < 64 or st.st_size > 512 * 1024:
+                return None
+            cached = self._ninebot_img_cache.get(image_path)
+            if cached is not None and cached[0] == cur_mtime:
+                return cached[1]
+            surf = cairo.ImageSurface.create_from_png(str(p))
+            if surf.get_width() <= 0 or surf.get_height() <= 0:
+                return None
+            if len(self._ninebot_img_cache) >= 4:
+                self._ninebot_img_cache.clear()
+            self._ninebot_img_cache[image_path] = (cur_mtime, surf)
+            return surf
+        except Exception:
+            return None
+
+    def _draw_ninebot_showroom_cairo(
+        self,
+        ctx,
+        sx: float,
+        sy: float,
+        sw: float,
+        sh: float,
+        accent: Tuple[float, float, float],
+        image_path: str,
+        mtime_ns: int,
+        footer_text: str,
+    ) -> None:
+        _cairo_rounded_rect(ctx, sx, sy, sw, sh, 11.0)
+        ctx.set_source_rgba(1.0, 1.0, 1.0, 0.03)
+        ctx.fill_preserve()
+        ctx.set_source_rgba(accent[0], accent[1], accent[2], 0.28)
+        ctx.set_line_width(1.0)
+        ctx.stroke()
+
+        stage_cx = sx + sw * 0.5
+        stage_h = sh - (22.0 if footer_text else 4.0)
+        stage_cy = sy + stage_h * 0.50
+
+        glow_r = min(sw, stage_h) * 0.52
+        rg = cairo.RadialGradient(stage_cx, stage_cy, 2.0, stage_cx, stage_cy, max(12.0, glow_r))
+        rg.add_color_stop_rgba(0.0, accent[0], accent[1], accent[2], 0.24)
+        rg.add_color_stop_rgba(1.0, accent[0], accent[1], accent[2], 0.0)
+        ctx.save()
+        ctx.set_source(rg)
+        ctx.new_path()
+        ctx.arc(stage_cx, stage_cy, max(12.0, glow_r), 0.0, math.pi * 2.0)
+        ctx.fill()
+        ctx.restore()
+
+        surf = self._get_ninebot_scooter_surface(image_path, mtime_ns)
+        if surf is not None:
+            iw = float(surf.get_width())
+            ih = float(surf.get_height())
+            scale = min((sw - 14.0) / max(1.0, iw), (stage_h - 6.0) / max(1.0, ih))
+            dw = iw * scale
+            dh = ih * scale
+            dx = sx + (sw - dw) * 0.5
+            dy = sy + (stage_h - dh) * 0.5
+            ctx.save()
+            ctx.translate(dx, dy)
+            ctx.scale(scale, scale)
+            ctx.set_source_surface(surf, 0.0, 0.0)
+            ctx.paint()
+            ctx.restore()
+        else:
+            _draw_scooter_silhouette_cairo(ctx, stage_cx, stage_cy, sw - 20.0, stage_h - 8.0, accent)
+
+        if footer_text:
+            ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            ctx.set_font_size(12.5)
+            txt = _fit_single_line_cairo(ctx, footer_text, sw - 16.0)
+            tw = ctx.text_extents(txt).x_advance
+            ctx.set_source_rgb(*COL_AMBER_BRIGHT)
+            ctx.move_to(sx + (sw - tw) * 0.5, sy + sh - 7.0)
+            ctx.show_text(txt)
+
     def _card_ninebot(self, ctx, card: PlacedCard, d: Dict[str, Any]) -> None:
         ok = bool(d.get("ok"))
         batt = d.get("battery")
@@ -2121,8 +3005,7 @@ class FaceRenderer:
         charging = bool(d.get("charging"))
         power_on = bool(d.get("powerOn"))
         locked = d.get("locked")
-        alerts = int(d.get("alertCount") or 0)
-        is_warn = alerts > 0 or (not charging and (power_on or locked is False)) or (batt_val is not None and batt_val <= 20 and not charging)
+        is_low = batt_val is not None and batt_val <= 20 and not charging
 
         badge_icon: Optional[str] = None
         if not ok:
@@ -2130,37 +3013,50 @@ class FaceRenderer:
             border = COL_AMBER_DIM
             dot = COL_AMBER_DIM
             badge = "待绑定"
-        elif is_warn:
+        elif charging:
+            accent = COL_NB_LIME
+            border = COL_NB_LIME
+            dot = COL_NB_LIME
+            pw_w = d.get("chargingPowerW")
+            badge = f"{pw_w}W 快充" if pw_w else "充电中"
+            badge_icon = "bolt"
+        elif locked is False:
             accent = COL_RED
             border = COL_RED
             dot = COL_RED
-            if power_on or locked is False:
-                badge = "未锁车"
-                badge_icon = "unlock"
-            else:
-                badge = f"告警 {alerts}"
-        elif charging:
-            accent = COL_EMERALD
-            border = COL_EMERALD
-            dot = COL_EMERALD
-            pw_w = d.get("chargingPowerW")
-            badge = f"{pw_w}W 充电中" if pw_w else "充电中"
+            badge = "未上锁"
+            badge_icon = "unlock"
+        elif power_on:
+            accent = COL_AMBER_BRIGHT
+            border = COL_AMBER_BRIGHT
+            dot = COL_AMBER_BRIGHT
+            badge = "电门开启"
             badge_icon = "bolt"
         else:
-            accent = COL_EMERALD if (batt_val is not None and batt_val >= 40) else COL_AMBER_BRIGHT
-            border = COL_EMERALD if (batt_val is not None and batt_val >= 40) else COL_AMBER_DIM
-            dot = accent
+            badge_icon = "lock" if locked is True else None
             upd = str(d.get("updatedHm") or "")
-            if locked is True:
-                badge_icon = "lock"
-                badge = f"已锁 · {upd}" if upd else "已锁"
+            if is_low:
+                accent = COL_RED
+                border = COL_RED
+                dot = COL_RED
+                badge = "已上锁 · 低电" if locked is True else "低电量提醒"
             else:
-                badge = upd or "在线"
+                accent = COL_NB_LIME if (batt_val is None or batt_val >= 35) else COL_AMBER_BRIGHT
+                border = COL_NB_LIME if (batt_val is None or batt_val >= 35) else COL_AMBER_DIM
+                dot = accent
+                if locked is True:
+                    badge = f"已上锁 · {upd}" if upd else "已上锁"
+                else:
+                    badge = upd or "在线"
+
+        name_str = str(d.get("name") or "九号座驾")
+        color_str = str(d.get("color") or "").strip()
+        hdr_title = card.title or (f"{name_str} · {color_str}" if color_str else name_str)
 
         self._draw_card_frame(
             ctx,
             card,
-            card.title or str(d.get("name") or "九号座驾"),
+            hdr_title,
             badge,
             border,
             accent,
@@ -2173,124 +3069,247 @@ class FaceRenderer:
             ctx.set_font_size(19.0)
             ctx.set_source_rgb(*COL_AMBER)
             ctx.move_to(x + 18.0, y + 92.0)
-            ctx.show_text(_fit_single_line_cairo(ctx, str(d.get("subline") or "请在「九号座驾」绑定九号账号"), w - 36.0))
+            ctx.show_text(_fit_single_line_cairo(ctx, str(d.get("subline") or "请在「九号守护」绑定九号账号"), w - 36.0))
             return
 
-        batt_str = f"{batt_val}%" if batt_val is not None else "--%"
-        ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-        ctx.set_font_size(35.0 if card.w_span == 2 else 31.0)
-        ctx.set_source_rgb(*accent)
-        ctx.move_to(x + 16.0, y + 84.0)
-        ctx.show_text(batt_str)
-        bw = ctx.text_extents(batt_str).x_advance
-
         range_km = d.get("rangeKm")
-        ctx.set_font_size(17.0)
-        ctx.set_source_rgb(*COL_WHITE)
-        ctx.move_to(x + 24.0 + bw, y + 84.0)
-        ctx.show_text(f"续航 {float(range_km):.1f} 公里" if range_km is not None else "续航 --")
-
-        # Battery progress bar
-        bar_w = w * 0.48 if card.w_span == 2 else (w - 32.0)
-        bar_y = y + 96.0
-        _draw_progress_bar(ctx, x + 16.0, bar_y, bar_w, 8.0, float(batt_val or 0) / 100.0, accent)
-
-        # BMS telemetry line
-        parts = []
-        if d.get("voltageV") is not None:
-            parts.append(f"{float(d['voltageV']):.1f}V")
-        if d.get("tempC") is not None:
-            parts.append(f"{float(d['tempC']):.0f}℃")
-        if d.get("auxBattery") is not None:
-            parts.append(f"备电{d['auxBattery']}%")
-        if charging and d.get("remainChargeTime"):
-            parts.append(f"余{d['remainChargeTime']}")
-        bms_line = " · ".join(parts) or ("电门开启" if power_on else "已关机")
-
-        ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
-        ctx.set_font_size(15.0)
-        ctx.set_source_rgb(*COL_AMBER_BRIGHT)
-        ctx.move_to(x + 16.0, y + 128.0)
-        ctx.show_text(_fit_single_line_cairo(ctx, bms_line, bar_w))
-
+        range_num = f"{float(range_km):.1f}" if range_km is not None else "--"
+        batt_str = f"{batt_val}%" if batt_val is not None else "--%"
         addr_str = _sanitize_hud_text(str(d.get("address") or "暂无定位"))
         spark = d.get("spark") or []
+        img_path = str(d.get("imagePath") or "")
+        img_mtime = int(d.get("imageMtimeNs") or 0)
+
+        volt_s = f"{float(d['voltageV']):.1f}V" if d.get("voltageV") is not None else ""
+        temp_s = f"{float(d['tempC']):.0f}℃" if d.get("tempC") is not None else ""
+        bms_text = " · ".join(p for p in (volt_s, temp_s) if p) or "BMS待机"
+        aux_s = f"备电 {int(d['auxBattery'])}%" if d.get("auxBattery") is not None else ""
+        lock_pill = "充电中" if charging else ("未上锁" if locked is False else ("电门开" if power_on else ("已设防" if locked is True else "待机")))
+        lock_col = COL_NB_LIME if (locked is True or charging) else (COL_RED if locked is False else COL_AMBER_BRIGHT)
+
+        odo_s = f"总{d['odometerKm']:.0f}km" if d.get("odometerKm") is not None else ""
+        mon_s = f"本月{float(d.get('monthKm') or 0.0):.0f}km" if float(d.get("monthKm") or 0.0) > 0 else ""
+        spd_s = f"极速{float(d.get('maxSpeedKmh') or 0.0):.0f}" if float(d.get("maxSpeedKmh") or 0.0) > 0 else ""
+        ride_footer = " · ".join(p for p in (mon_s, spd_s) if p) or odo_s
+
         if card.w_span == 2 and card.h_span == 1:
-            _draw_sparkline_cairo(ctx, x + w * 0.56, y + 54.0, w * 0.40, h - 86.0, spark, accent)
-            _cairo_pin_glyph(ctx, x + 16.0, y + 148.0, 14.5, COL_AMBER_BRIGHT)
-            ctx.set_font_size(15.0)
+            left_w = w * 0.54
+            ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(34.0)
             ctx.set_source_rgb(*COL_WHITE)
-            ctx.move_to(x + 31.0, y + 161.0)
-            ctx.show_text(_fit_single_line_cairo(ctx, addr_str, w * 0.50 - 15.0))
-            odo_s = f"总 {d['odometerKm']:.0f}km" if d.get("odometerKm") is not None else ""
-            spd_s = f"极速 {d['maxSpeedKmh']:.0f}km/h" if float(d.get("maxSpeedKmh") or 0) > 0 else ""
-            right_info = " · ".join(p for p in (odo_s, spd_s) if p)
-            if right_info:
-                rw = ctx.text_extents(right_info).x_advance
-                ctx.set_source_rgb(*COL_AMBER)
-                ctx.move_to(x + w - 16.0 - rw, y + h - 14.0)
-                ctx.show_text(right_info)
-        elif card.h_span == 1:
-            _cairo_pin_glyph(ctx, x + 16.0, y + 148.0, 14.5, COL_AMBER_BRIGHT)
+            ctx.move_to(x + 16.0, y + 79.0)
+            ctx.show_text(range_num)
+            rw = ctx.text_extents(range_num).x_advance
+
+            ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            ctx.set_font_size(14.5)
+            ctx.set_source_rgb(*COL_SLATE)
+            ctx.move_to(x + 22.0 + rw, y + 79.0)
+            ctx.show_text("km 续航")
+
+            ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(29.0)
+            sw_txt = ctx.text_extents(batt_str).x_advance
+            ctx.set_source_rgb(*accent)
+            ctx.move_to(x + 16.0 + left_w - sw_txt, y + 79.0)
+            ctx.show_text(batt_str)
+
+            _draw_segmented_bar_cairo(ctx, x + 16.0, y + 90.0, left_w, 10.0, float(batt_val or 0) / 100.0, accent, segments=16)
+
+            px_cur = x + 16.0
+            py_pill = y + 111.0
+            pw_used = _draw_pill(ctx, px_cur, py_pill, 23.0, lock_pill, lock_col, font_size=12.5, pad_x=8.5, font_family=self.font_family, text_col=COL_WHITE)
+            px_cur += pw_used + 7.0
+            pw_used = _draw_pill(ctx, px_cur, py_pill, 23.0, bms_text, COL_SKY, font_size=12.5, pad_x=8.5, font_family=self.font_family, text_col=COL_WHITE)
+            px_cur += pw_used + 7.0
+            if aux_s and px_cur + 84.0 <= x + 16.0 + left_w:
+                _draw_pill(ctx, px_cur, py_pill, 23.0, aux_s, COL_EMERALD, font_size=12.5, pad_x=8.0, font_family=self.font_family, text_col=COL_WHITE)
+
+            _cairo_pin_glyph(ctx, x + 16.0, y + h - 30.0, 14.5, COL_AMBER_BRIGHT)
+            ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
             ctx.set_font_size(14.5)
             ctx.set_source_rgb(*COL_WHITE)
-            ctx.move_to(x + 31.0, y + 161.0)
-            ctx.show_text(_fit_single_line_cairo(ctx, addr_str, w - 47.0))
-        elif card.w_span == 2 and card.h_span == 2:
-            _draw_sparkline_cairo(ctx, x + 16.0, y + 150.0, w * 0.48, h - 172.0, spark, accent)
+            ctx.move_to(x + 31.0, y + h - 16.5)
+            ctx.show_text(_fit_single_line_cairo(ctx, addr_str, left_w - 15.0))
+
+            self._draw_ninebot_showroom_cairo(
+                ctx,
+                x + w * 0.585,
+                y + 49.0,
+                w * 0.39,
+                h - 60.0,
+                accent,
+                img_path,
+                img_mtime,
+                ride_footer,
+            )
+            return
+
+        if card.w_span == 1 and card.h_span == 1:
+            ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(31.0)
+            ctx.set_source_rgb(*accent)
+            ctx.move_to(x + 16.0, y + 79.0)
+            ctx.show_text(batt_str)
+            bw = ctx.text_extents(batt_str).x_advance
+
+            ctx.set_font_size(16.5)
+            ctx.set_source_rgb(*COL_WHITE)
+            ctx.move_to(x + 24.0 + bw, y + 79.0)
+            ctx.show_text(f"续航 {range_num}km")
+
+            _draw_segmented_bar_cairo(ctx, x + 16.0, y + 90.0, w - 32.0, 9.5, float(batt_val or 0) / 100.0, accent, segments=12)
+
+            px_cur = x + 16.0
+            pw_used = _draw_pill(ctx, px_cur, y + 111.0, 23.0, lock_pill, lock_col, font_size=12.5, pad_x=8.5, font_family=self.font_family, text_col=COL_WHITE)
+            px_cur += pw_used + 7.0
+            if px_cur + 80.0 < x + w - 14.0:
+                _draw_pill(ctx, px_cur, y + 111.0, 23.0, bms_text, COL_SKY, font_size=12.5, pad_x=8.5, font_family=self.font_family, text_col=COL_WHITE)
+
+            _cairo_pin_glyph(ctx, x + 16.0, y + h - 30.0, 14.0, COL_AMBER_BRIGHT)
+            ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            ctx.set_font_size(14.0)
+            ctx.set_source_rgb(*COL_WHITE)
+            ctx.move_to(x + 30.0, y + h - 16.5)
+            ctx.show_text(_fit_single_line_cairo(ctx, addr_str, w - 46.0))
+            return
+
+        if card.w_span == 2 and card.h_span == 2:
+            left_w = w * 0.51
+            ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(36.0)
+            ctx.set_source_rgb(*COL_WHITE)
+            ctx.move_to(x + 16.0, y + 84.0)
+            ctx.show_text(range_num)
+            rw = ctx.text_extents(range_num).x_advance
+
+            ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            ctx.set_font_size(15.0)
+            ctx.set_source_rgb(*COL_SLATE)
+            ctx.move_to(x + 22.0 + rw, y + 84.0)
+            ctx.show_text("km 续航")
+
+            ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(30.0)
+            sw_txt = ctx.text_extents(batt_str).x_advance
+            ctx.set_source_rgb(*accent)
+            ctx.move_to(x + 16.0 + left_w - sw_txt, y + 84.0)
+            ctx.show_text(batt_str)
+
+            _draw_segmented_bar_cairo(ctx, x + 16.0, y + 96.0, left_w, 10.5, float(batt_val or 0) / 100.0, accent, segments=16)
+
+            px_cur = x + 16.0
+            py_pill = y + 118.0
+            pw_used = _draw_pill(ctx, px_cur, py_pill, 24.0, lock_pill, lock_col, font_size=13.0, pad_x=9.0, font_family=self.font_family, text_col=COL_WHITE)
+            px_cur += pw_used + 8.0
+            pw_used = _draw_pill(ctx, px_cur, py_pill, 24.0, bms_text, COL_SKY, font_size=13.0, pad_x=9.0, font_family=self.font_family, text_col=COL_WHITE)
+            px_cur += pw_used + 8.0
+            if aux_s and px_cur + 84.0 <= x + 16.0 + left_w:
+                _draw_pill(ctx, px_cur, py_pill, 24.0, aux_s, COL_EMERALD, font_size=13.0, pad_x=8.5, font_family=self.font_family, text_col=COL_WHITE)
+
+            ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            ctx.set_font_size(13.5)
+            ctx.set_source_rgb(*COL_SLATE)
+            ctx.move_to(x + 16.0, y + 164.0)
+            ctx.show_text("电量变化趋势")
+            _draw_sparkline_cairo(ctx, x + 16.0, y + 174.0, left_w, h - 190.0, spark, accent)
+
+            self._draw_ninebot_showroom_cairo(
+                ctx,
+                x + w * 0.555,
+                y + 50.0,
+                w * 0.42,
+                162.0,
+                accent,
+                img_path,
+                img_mtime,
+                "",
+            )
+
             rows = [
                 ("总里程", f"{d['odometerKm']:.1f} 公里" if d.get("odometerKm") is not None else "--"),
                 ("本月骑行", f"{float(d.get('monthKm') or 0.0):.1f} 公里"),
-                ("最高极速", f"{float(d.get('maxSpeedKmh') or 0.0):.1f} 公里/时" if float(d.get("maxSpeedKmh") or 0) > 0 else "--"),
-                ("安防锁车", "充电保护中" if charging else ("已上锁" if locked is True else ("未锁车" if locked is False else "待机"))),
+                ("最高极速", f"{float(d.get('maxSpeedKmh') or 0.0):.1f} km/h" if float(d.get("maxSpeedKmh") or 0) > 0 else "--"),
                 ("停放位置", addr_str),
             ]
-            ry = y + 72.0
-            pitch = 56.0 if h >= 450 else 48.0
-            rx = x + w * 0.54
-            rw = w * 0.42
+            ry = y + 244.0
+            rx = x + w * 0.555
+            rw_col = w * 0.42
+            pitch = (y + h - 18.0 - ry) / float(max(1, len(rows) - 1)) if len(rows) > 1 else 44.0
+            pitch = min(46.0, max(36.0, pitch))
             for idx, (lbl, val) in enumerate(rows):
                 if idx > 0:
                     ctx.new_path()
                     ctx.move_to(rx, ry - 22.0)
-                    ctx.line_to(rx + rw, ry - 22.0)
+                    ctx.line_to(rx + rw_col, ry - 22.0)
                     ctx.set_source_rgba(COL_AMBER_DARK_LINE[0], COL_AMBER_DARK_LINE[1], COL_AMBER_DARK_LINE[2], 0.45)
                     ctx.set_line_width(1.0)
                     ctx.stroke()
-                ctx.set_font_size(15.0)
+                ctx.set_font_size(14.5)
                 ctx.set_source_rgb(*COL_AMBER)
                 ctx.move_to(rx, ry)
                 ctx.show_text(lbl)
                 ctx.set_source_rgb(*COL_WHITE)
-                vs = _fit_single_line_cairo(ctx, val, rw - 88.0)
+                vs = _fit_single_line_cairo(ctx, val, rw_col - 82.0)
                 vw = ctx.text_extents(vs).x_advance
-                ctx.move_to(rx + rw - vw, ry)
+                ctx.move_to(rx + rw_col - vw, ry)
                 ctx.show_text(vs)
                 ry += pitch
-        else:
-            spark_h = 82.0 if h < 450 else 96.0
-            _draw_sparkline_cairo(ctx, x + 16.0, y + 144.0, w - 32.0, spark_h, spark, accent)
-            rows = [
-                ("总里程", f"{d['odometerKm']:.1f} 公里" if d.get("odometerKm") is not None else "--"),
-                ("本月骑行", f"{float(d.get('monthKm') or 0.0):.1f} 公里"),
-                ("最高极速", f"{float(d.get('maxSpeedKmh') or 0.0):.1f} 公里/时" if float(d.get("maxSpeedKmh") or 0) > 0 else "--"),
-                ("停放位置", addr_str),
-            ]
-            ry = y + 144.0 + spark_h + 24.0
-            pitch = 34.0 if h < 450 else 38.0
-            for lbl, val in rows:
-                if ry + 14.0 > y + h - 8.0:
-                    break
-                ctx.set_font_size(15.0)
-                ctx.set_source_rgb(*COL_AMBER)
-                ctx.move_to(x + 16.0, ry)
-                ctx.show_text(lbl)
-                ctx.set_source_rgb(*COL_WHITE)
-                vs = _fit_single_line_cairo(ctx, val, w - 120.0)
-                vw = ctx.text_extents(vs).x_advance
-                ctx.move_to(x + w - 16.0 - vw, ry)
-                ctx.show_text(vs)
-                ry += pitch
+            return
+
+        # 1x2 vertical cockpit
+        ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        ctx.set_font_size(31.0)
+        ctx.set_source_rgb(*accent)
+        ctx.move_to(x + 16.0, y + 79.0)
+        ctx.show_text(batt_str)
+        bw = ctx.text_extents(batt_str).x_advance
+        ctx.set_font_size(16.5)
+        ctx.set_source_rgb(*COL_WHITE)
+        ctx.move_to(x + 24.0 + bw, y + 79.0)
+        ctx.show_text(f"续航 {range_num}km")
+
+        _draw_segmented_bar_cairo(ctx, x + 16.0, y + 90.0, w - 32.0, 9.5, float(batt_val or 0) / 100.0, accent, segments=12)
+
+        px_cur = x + 16.0
+        pw_used = _draw_pill(ctx, px_cur, y + 109.0, 22.0, lock_pill, lock_col, font_size=12.0, pad_x=8.0, font_family=self.font_family, text_col=COL_WHITE)
+        px_cur += pw_used + 6.0
+        _draw_pill(ctx, px_cur, y + 109.0, 22.0, bms_text, COL_SKY, font_size=12.0, pad_x=8.0, font_family=self.font_family, text_col=COL_WHITE)
+
+        stage_h = 114.0 if h < 450 else 136.0
+        self._draw_ninebot_showroom_cairo(
+            ctx,
+            x + 16.0,
+            y + 140.0,
+            w - 32.0,
+            stage_h,
+            accent,
+            img_path,
+            img_mtime,
+            ride_footer,
+        )
+
+        rows = [
+            ("总里程", f"{d['odometerKm']:.1f} 公里" if d.get("odometerKm") is not None else "--"),
+            ("本月骑行", f"{float(d.get('monthKm') or 0.0):.1f} 公里"),
+            ("最高极速", f"{float(d.get('maxSpeedKmh') or 0.0):.1f} km/h" if float(d.get("maxSpeedKmh") or 0) > 0 else "--"),
+            ("停放位置", addr_str),
+        ]
+        ry = y + 140.0 + stage_h + 26.0
+        pitch = 34.0 if h < 450 else 38.0
+        for lbl, val in rows:
+            if ry + 10.0 > y + h - 8.0:
+                break
+            ctx.set_font_size(14.5)
+            ctx.set_source_rgb(*COL_AMBER)
+            ctx.move_to(x + 16.0, ry)
+            ctx.show_text(lbl)
+            ctx.set_source_rgb(*COL_WHITE)
+            vs = _fit_single_line_cairo(ctx, val, w - 116.0)
+            vw = ctx.text_extents(vs).x_advance
+            ctx.move_to(x + w - 16.0 - vw, ry)
+            ctx.show_text(vs)
+            ry += pitch
 
     def _card_laifen(self, ctx, card: PlacedCard, d: Dict[str, Any]) -> None:
         ok = bool(d.get("ok"))
@@ -3562,10 +4581,11 @@ class FaceRenderer:
                             off = (y * WIDTH + x) * 4
                             bgra[off : off + 4] = white_px
 
-        # Equalizer indicator when listening
+        # Equalizer / scene indicator when listening or running dynamic scenes
         emerald_px = bytes((0x81, 0xB9, 0x10, 0xFF))
         amber_bright_px = bytes((0x24, 0xBF, 0xFB, 0xFF))
         amber_dim_px = bytes((0x09, 0x53, 0xB4, 0xFF))
+        sky_px = bytes((0xF8, 0xBD, 0x38, 0xFF))
         if face.state_id == "listening":
             for side in (-1, 1):
                 bx = int(geo["face_cx"] + side * (geo["face_r"] * 1.28))
@@ -3573,11 +4593,24 @@ class FaceRenderer:
                 for dy in range(-28, 29):
                     off = ((cy + dy) * WIDTH + bx) * 4
                     bgra[off : off + 6 * 4] = emerald_px * 6
+        elif face.state_id in ("speaking", "sending_msg", "printing", "operating_xiaoai", "operating_tv", "managing_laifen", "weighing_scale"):
+            accent_px = sky_px if (
+                face.state_id in ("operating_tv", "managing_laifen")
+                or (face.state_id == "sending_msg" and hud.scene_channel == "telegram")
+            ) else (
+                emerald_px if face.state_id in ("sending_msg", "operating_xiaoai", "weighing_scale") else amber_bright_px
+            )
+            bx = int(min(WIDTH - 24, geo["face_cx"] + geo["face_r"] * 1.35))
+            cy = int(geo["face_cy"])
+            for dy in range(-24, 25):
+                off = ((cy + dy) * WIDTH + bx) * 4
+                bgra[off : off + 6 * 4] = accent_px * 6
 
         # Marquee box + animated scroll tick pixel marker (inside marquee strip only -> tiny tile patch!)
         my0 = int(geo["marquee_y"])
         my1 = int(geo["marquee_y"] + geo["marquee_h"])
-        self._draw_rect_outline_bgra(36, my0, 763, my1, emerald_px if face.state_id == "listening" else amber_dim_px)
+        m_outline = emerald_px if (hud.headline_incoming or face.state_id == "listening") else amber_dim_px
+        self._draw_rect_outline_bgra(36, my0, 763, my1, m_outline)
         if self.marquee.text:
             tick_x = 140 + int(self.marquee.scroll_x) % 560
             tick_y = my0 + 18

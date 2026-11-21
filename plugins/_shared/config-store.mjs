@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 
 /**
  * Resolve the active runtime home directory (`FRIDAY_HOME` -> `SUPER_AGENT_HOME`
@@ -53,7 +53,7 @@ export function resolveHomeDir(contextOrDeps = {}) {
  * @returns {import('./types.d.ts').PluginPaths}
  */
 export function resolvePluginPaths(pluginName, contextOrDeps = {}, extraFiles = {}) {
-  const homeDir = resolveHomeDir(contextOrDeps);
+  const fallbackHomeDir = resolveHomeDir(contextOrDeps);
   const env = contextOrDeps?.env ?? process.env;
 
   const explicitPluginDataDir =
@@ -62,6 +62,9 @@ export function resolvePluginPaths(pluginName, contextOrDeps = {}, extraFiles = 
     typeof contextOrDeps?.dataDir === 'string' ? contextOrDeps.dataDir.trim() : '';
   const explicitHomeDir =
     typeof contextOrDeps?.homeDir === 'string' ? contextOrDeps.homeDir.trim() : '';
+  const passedEnvHome = contextOrDeps?.env
+    ? String(contextOrDeps.env.FRIDAY_HOME ?? contextOrDeps.env.SUPER_AGENT_HOME ?? '').trim()
+    : '';
   const passedEnvPluginDataDir =
     contextOrDeps?.env && typeof contextOrDeps.env.PLUGIN_DATA_DIR === 'string'
       ? contextOrDeps.env.PLUGIN_DATA_DIR.trim()
@@ -77,11 +80,17 @@ export function resolvePluginPaths(pluginName, contextOrDeps = {}, extraFiles = 
   } else if (passedEnvPluginDataDir) {
     pluginDataDir = resolve(passedEnvPluginDataDir);
   } else if (explicitHomeDir) {
-    pluginDataDir = join(homeDir, 'plugins', pluginName);
+    pluginDataDir = join(fallbackHomeDir, 'plugins', pluginName);
   } else if (ambientPluginDataDir) {
     pluginDataDir = resolve(ambientPluginDataDir);
   } else {
-    pluginDataDir = join(homeDir, 'plugins', pluginName);
+    pluginDataDir = join(fallbackHomeDir, 'plugins', pluginName);
+  }
+
+  let homeDir = fallbackHomeDir;
+  if (!explicitHomeDir && !passedEnvHome && (explicitPluginDataDir || explicitDataDir || passedEnvPluginDataDir)) {
+    const parentDir = dirname(pluginDataDir);
+    homeDir = basename(parentDir) === 'plugins' ? dirname(parentDir) : pluginDataDir;
   }
 
   /** @type {import('./types.d.ts').PluginPaths} */

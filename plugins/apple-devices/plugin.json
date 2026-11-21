@@ -22,7 +22,7 @@
     {
       "name": "status",
       "label": "查看绑定状态与缓存摘要",
-      "description": "检查 Apple ID 会话绑定状态（未登录 / 等待 2FA / 已绑定 / 已过期）、区域（cn/global）及本地缓存设备摘要；默认不请求苹果服务器（不耗电）。传 refresh=true 可同步触发一次刷新。",
+      "description": "检查 Apple ID 会话绑定状态（未登录 / 等待 2FA / 已绑定 / 已过期）、区域（cn/global）及设备摘要；缓存过期或全员未就绪时自动同步，传 cacheOnly=true 严格只读本地缓存（不耗电），传 refresh=true 强制触发一次实时唤醒刷新。",
       "defaultArgs": {}
     },
     {
@@ -76,7 +76,7 @@
     {
       "name": "config",
       "label": "读取或更新插件配置",
-      "description": "查看或更新 region（\"cn\" 中国大陆 / \"global\" 国际区）、cacheTtlSec（缓存秒数，默认 300）、minRefreshIntervalSec（最小强制刷新冷却秒数，默认 30）、minBatteryPct（低电量告警阈值，默认 25）、watchDevices（巡航监控设备列表）、customAliases（别名映射）与 places（地点围栏 {名称:{lat,lng,radiusMeters}}）。",
+      "description": "查看或更新 region（\"cn\" 中国大陆 / \"global\" 国际区）、includeFamily（是否包含家人共享查找设备，默认 true）、cacheTtlSec（缓存秒数，默认 300）、minRefreshIntervalSec（最小强制刷新冷却秒数，默认 30）、minBatteryPct（低电量告警阈值，默认 25）、watchDevices（巡航监控设备列表）、customAliases（别名映射）与 places（地点围栏 {名称:{lat,lng,radiusMeters}}）。",
       "defaultArgs": {}
     }
   ]

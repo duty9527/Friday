@@ -3,9 +3,12 @@ import type { DatabaseSync } from 'node:sqlite';
 import { normalizeProviderId, parseModelSpec as parseCatalogModelSpec, splitModelAndLevel } from '../models/catalog.js';
 import {
   calculateModelCallCost,
+  computeCacheSavingsUsd,
   DEFAULT_USD_TO_CNY_RATE,
   FALLBACK_PRICES_VERSION,
   normalizeSdkUsage,
+  resolveModelUnitPrice,
+  roundSignedUsd,
   roundUsd,
   type CatalogCostRateInput,
   type UsageCostSource,
@@ -30,18 +33,27 @@ export interface UsageTotalsView {
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
+  cacheWrite1hTokens: number;
   reasoningTokens: number;
   totalTokens: number;
+  cacheHitRate: number;
   costUsd: number;
   costCny: number;
+  cacheSavingsUsd: number;
+  cacheSavingsCny: number;
 }
 
 export interface UsageTodaySummary {
   date: string;
   calls: number;
   totalTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  cacheHitRate: number;
   costUsd: number;
   costCny: number;
+  cacheSavingsUsd: number;
+  cacheSavingsCny: number;
   currency: UsageCurrency;
   usdToCnyRate: number;
 }
@@ -54,6 +66,8 @@ export interface UsageModelBreakdownView extends UsageTotalsView {
   costShare: number;
   unitInputUsdPer1M: number;
   unitOutputUsdPer1M: number;
+  unitCacheReadUsdPer1M: number;
+  unitCacheWriteUsdPer1M: number;
   costSource: UsageCostSource;
   actors: Partial<Record<UsageActor, number>>;
   lastUsedAt: number;
@@ -67,6 +81,8 @@ export interface UsageBucketView {
   calls: number;
   inputTokens: number;
   outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
   totalTokens: number;
   costUsd: number;
   costCny: number;
@@ -111,6 +127,7 @@ export interface UsageRecordInput {
   outputTokens?: number;
   cacheReadTokens?: number;
   cacheWriteTokens?: number;
+  cacheWrite1hTokens?: number;
   reasoningTokens?: number;
   totalTokens?: number;
   providerReportedTotalUsd?: number;
@@ -153,11 +170,14 @@ interface RawUsageRow {
   output_tokens: number;
   cache_read_tokens: number;
   cache_write_tokens: number;
+  cache_write_1h_tokens: number;
   reasoning_tokens: number;
   total_tokens: number;
   cost_usd: number;
   unit_input_usd: number;
   unit_output_usd: number;
+  unit_cache_read_usd: number;
+  unit_cache_write_usd: number;
   cost_source: string;
   status: string;
 }
@@ -170,14 +190,18 @@ interface MutableTotals {
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
+  cacheWrite1hTokens: number;
   reasoningTokens: number;
   totalTokens: number;
   costUsd: number;
+  cacheSavingsUsd: number;
 }
 
 const PREFS_META_KEY = 'usage_prefs_v1';
 const BACKFILL_META_KEY = 'usage_backfill_v1';
 const REPRICE_META_KEY = 'usage_reprice_version';
+const CACHE_REPRICE_META_KEY = 'usage_cache_reprice_version';
+const CACHE_REPRICE_VERSION = 'cache-pricing-v1';
 const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
 const WEEKDAY_ZH = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'] as const;
@@ -222,9 +246,40 @@ function emptyMutableTotals(): MutableTotals {
     outputTokens: 0,
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
+    cacheWrite1hTokens: 0,
     reasoningTokens: 0,
     totalTokens: 0,
     costUsd: 0,
+    cacheSavingsUsd: 0,
+  };
+}
+
+function resolveRowCacheRates(row: {
+  provider: string;
+  model: string;
+  unit_input_usd: number;
+  unit_output_usd: number;
+  unit_cache_read_usd?: number;
+  unit_cache_write_usd?: number;
+}): { unitCacheRead: number; unitCacheWrite: number } {
+  const unitIn = Number(row.unit_input_usd ?? 0);
+  if (!Number.isFinite(unitIn) || unitIn <= 0) {
+    return { unitCacheRead: 0, unitCacheWrite: 0 };
+  }
+  const storedCr = Number(row.unit_cache_read_usd ?? 0);
+  const storedCw = Number(row.unit_cache_write_usd ?? 0);
+  if (storedCr > 0 && storedCw > 0) {
+    return { unitCacheRead: storedCr, unitCacheWrite: storedCw };
+  }
+  const resolved = resolveModelUnitPrice(row.provider, row.model, {
+    costInput: unitIn,
+    costOutput: Number(row.unit_output_usd ?? 0),
+    ...(storedCr > 0 ? { costCacheRead: storedCr } : {}),
+    ...(storedCw > 0 ? { costCacheWrite: storedCw } : {}),
+  });
+  return {
+    unitCacheRead: storedCr > 0 ? storedCr : resolved.cacheReadUsdPer1M,
+    unitCacheWrite: storedCw > 0 ? storedCw : resolved.cacheWriteUsdPer1M,
   };
 }
 
@@ -232,17 +287,39 @@ function addRowToTotals(acc: MutableTotals, row: RawUsageRow): void {
   acc.calls += 1;
   if (row.status === 'completed') acc.successCalls += 1;
   else acc.failedCalls += 1;
-  acc.inputTokens += Number(row.input_tokens ?? 0);
-  acc.outputTokens += Number(row.output_tokens ?? 0);
-  acc.cacheReadTokens += Number(row.cache_read_tokens ?? 0);
-  acc.cacheWriteTokens += Number(row.cache_write_tokens ?? 0);
+  const inputTokens = Number(row.input_tokens ?? 0);
+  const outputTokens = Number(row.output_tokens ?? 0);
+  const cacheReadTokens = Number(row.cache_read_tokens ?? 0);
+  const cacheWriteTokens = Number(row.cache_write_tokens ?? 0);
+  const cacheWrite1hTokens = Number(row.cache_write_1h_tokens ?? 0);
+  acc.inputTokens += inputTokens;
+  acc.outputTokens += outputTokens;
+  acc.cacheReadTokens += cacheReadTokens;
+  acc.cacheWriteTokens += cacheWriteTokens;
+  acc.cacheWrite1hTokens += cacheWrite1hTokens;
   acc.reasoningTokens += Number(row.reasoning_tokens ?? 0);
   acc.totalTokens += Number(row.total_tokens ?? 0);
   acc.costUsd += Number(row.cost_usd ?? 0);
+  if (cacheReadTokens > 0 || cacheWriteTokens > 0) {
+    const { unitCacheRead, unitCacheWrite } = resolveRowCacheRates(row);
+    acc.cacheSavingsUsd += computeCacheSavingsUsd({
+      cacheReadTokens,
+      cacheWriteTokens,
+      cacheWrite1hTokens,
+      unitInputUsdPer1M: Number(row.unit_input_usd ?? 0),
+      unitCacheReadUsdPer1M: unitCacheRead,
+      unitCacheWriteUsdPer1M: unitCacheWrite,
+    });
+  }
 }
 
 function finalizeTotals(acc: MutableTotals, usdToCnyRate: number): UsageTotalsView {
   const costUsd = roundUsd(acc.costUsd);
+  const totalPromptTokens = acc.inputTokens + acc.cacheReadTokens + acc.cacheWriteTokens;
+  const cacheHitRate = totalPromptTokens > 0
+    ? Math.min(1, Math.max(0, Number((acc.cacheReadTokens / totalPromptTokens).toFixed(6))))
+    : 0;
+  const cacheSavingsUsd = roundSignedUsd(acc.cacheSavingsUsd);
   return {
     calls: acc.calls,
     successCalls: acc.successCalls,
@@ -251,10 +328,14 @@ function finalizeTotals(acc: MutableTotals, usdToCnyRate: number): UsageTotalsVi
     outputTokens: acc.outputTokens,
     cacheReadTokens: acc.cacheReadTokens,
     cacheWriteTokens: acc.cacheWriteTokens,
+    cacheWrite1hTokens: acc.cacheWrite1hTokens,
     reasoningTokens: acc.reasoningTokens,
     totalTokens: acc.totalTokens,
+    cacheHitRate,
     costUsd,
     costCny: roundUsd(costUsd * usdToCnyRate),
+    cacheSavingsUsd,
+    cacheSavingsCny: roundSignedUsd(cacheSavingsUsd * usdToCnyRate),
   };
 }
 
@@ -503,6 +584,12 @@ export class UsageStore {
     const cacheWriteTokens = input.cacheWriteTokens !== undefined
       ? sanitizeTokenInt(input.cacheWriteTokens)
       : (parsedFromUsage?.cacheWriteTokens ?? 0);
+    const cacheWrite1hTokens = Math.min(
+      cacheWriteTokens,
+      input.cacheWrite1hTokens !== undefined
+        ? sanitizeTokenInt(input.cacheWrite1hTokens)
+        : (parsedFromUsage?.cacheWrite1hTokens ?? 0),
+    );
     const reasoningTokens = input.reasoningTokens !== undefined
       ? sanitizeTokenInt(input.reasoningTokens)
       : (parsedFromUsage?.reasoningTokens ?? 0);
@@ -530,6 +617,7 @@ export class UsageStore {
       outputTokens,
       cacheReadTokens,
       cacheWriteTokens,
+      cacheWrite1hTokens,
       reasoningTokens,
       providerReportedTotalUsd,
       totalFromProvider,
@@ -545,9 +633,9 @@ export class UsageStore {
     this.db.prepare(`
       INSERT OR IGNORE INTO model_usage(
         id, at, actor, provider, model,
-        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens,
-        cost_usd, unit_input_usd, unit_output_usd, cost_source, status, task_id, message_id
-      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cache_write_1h_tokens, reasoning_tokens, total_tokens,
+        cost_usd, unit_input_usd, unit_output_usd, unit_cache_read_usd, unit_cache_write_usd, cost_source, status, task_id, message_id
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(
       id,
       at,
@@ -558,11 +646,14 @@ export class UsageStore {
       outputTokens,
       cacheReadTokens,
       cacheWriteTokens,
+      cacheWrite1hTokens,
       reasoningTokens,
       totalTokens,
       cost.costUsd,
       cost.unitInputUsdPer1M,
       cost.unitOutputUsdPer1M,
+      cost.unitCacheReadUsdPer1M,
+      cost.unitCacheWriteUsdPer1M,
       cost.costSource,
       status,
       input.taskId ?? null,
@@ -583,6 +674,7 @@ export class UsageStore {
     const meta = this.readMeta<UsageBackfillMeta>(BACKFILL_META_KEY);
     if (meta && (!cleanDefaultProvider || Boolean(meta.defaultProvider))) {
       this.repriceUnknownUsageIfNeeded();
+      this.repriceCacheUsageIfNeeded();
       return 0;
     }
 
@@ -634,18 +726,18 @@ export class UsageStore {
       `);
 
       const existingBackfillStmt = this.db.prepare(
-        'SELECT provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens FROM model_usage WHERE id=?',
+        'SELECT provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cache_write_1h_tokens, reasoning_tokens FROM model_usage WHERE id=?',
       );
       const insertStmt = this.db.prepare(`
         INSERT OR IGNORE INTO model_usage(
           id, at, actor, provider, model,
-          input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens,
-          cost_usd, unit_input_usd, unit_output_usd, cost_source, status, task_id, message_id
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cache_write_1h_tokens, reasoning_tokens, total_tokens,
+          cost_usd, unit_input_usd, unit_output_usd, unit_cache_read_usd, unit_cache_write_usd, cost_source, status, task_id, message_id
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       `);
       const updateUnknownStmt = this.db.prepare(`
         UPDATE model_usage
-        SET provider=?, model=?, cost_usd=?, unit_input_usd=?, unit_output_usd=?, cost_source=?
+        SET provider=?, model=?, cost_usd=?, unit_input_usd=?, unit_output_usd=?, unit_cache_read_usd=?, unit_cache_write_usd=?, cost_source=?
         WHERE id=?
       `);
 
@@ -765,6 +857,7 @@ export class UsageStore {
                 output_tokens: number;
                 cache_read_tokens: number;
                 cache_write_tokens: number;
+                cache_write_1h_tokens: number;
                 reasoning_tokens: number;
               }
             | undefined;
@@ -783,6 +876,7 @@ export class UsageStore {
                 outputTokens: Number(existing.output_tokens ?? 0),
                 cacheReadTokens: Number(existing.cache_read_tokens ?? 0),
                 cacheWriteTokens: Number(existing.cache_write_tokens ?? 0),
+                cacheWrite1hTokens: Number(existing.cache_write_1h_tokens ?? 0),
                 reasoningTokens: Number(existing.reasoning_tokens ?? 0),
                 providerReportedTotalUsd: usage.providerReportedTotalUsd,
                 totalFromProvider: usage.totalFromProvider,
@@ -794,6 +888,8 @@ export class UsageStore {
                 cost.costUsd,
                 cost.unitInputUsdPer1M,
                 cost.unitOutputUsdPer1M,
+                cost.unitCacheReadUsdPer1M,
+                cost.unitCacheWriteUsdPer1M,
                 cost.costSource,
                 backfillId,
               );
@@ -809,6 +905,7 @@ export class UsageStore {
             outputTokens: usage.outputTokens,
             cacheReadTokens: usage.cacheReadTokens,
             cacheWriteTokens: usage.cacheWriteTokens,
+            cacheWrite1hTokens: usage.cacheWrite1hTokens,
             reasoningTokens: usage.reasoningTokens,
             providerReportedTotalUsd: usage.providerReportedTotalUsd,
             totalFromProvider: usage.totalFromProvider,
@@ -825,11 +922,14 @@ export class UsageStore {
             usage.outputTokens,
             usage.cacheReadTokens,
             usage.cacheWriteTokens,
+            usage.cacheWrite1hTokens ?? 0,
             usage.reasoningTokens,
             usage.totalTokens,
             cost.costUsd,
             cost.unitInputUsdPer1M,
             cost.unitOutputUsdPer1M,
+            cost.unitCacheReadUsdPer1M,
+            cost.unitCacheWriteUsdPer1M,
             cost.costSource,
             status,
             taskId ?? null,
@@ -851,6 +951,7 @@ export class UsageStore {
       };
       this.writeMeta(BACKFILL_META_KEY, nextMeta);
       this.repriceUnknownUsageIfNeeded();
+      this.repriceCacheUsageIfNeeded();
       return changed;
     });
   }
@@ -868,7 +969,7 @@ export class UsageStore {
         return 0;
       }
       const rows = this.db.prepare(`
-        SELECT id, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens
+        SELECT id, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cache_write_1h_tokens, reasoning_tokens
         FROM model_usage
         WHERE cost_source = 'unknown'
       `).all() as Array<{
@@ -879,12 +980,13 @@ export class UsageStore {
         output_tokens: number;
         cache_read_tokens: number;
         cache_write_tokens: number;
+        cache_write_1h_tokens: number;
         reasoning_tokens: number;
       }>;
 
       const updateStmt = this.db.prepare(`
         UPDATE model_usage
-        SET cost_usd=?, unit_input_usd=?, unit_output_usd=?, cost_source=?
+        SET cost_usd=?, unit_input_usd=?, unit_output_usd=?, unit_cache_read_usd=?, unit_cache_write_usd=?, cost_source=?
         WHERE id=?
       `);
       const journalStmt = this.db.prepare('SELECT body FROM journal WHERE seq=?');
@@ -899,6 +1001,7 @@ export class UsageStore {
           outputTokens: Number(row.output_tokens ?? 0),
           cacheReadTokens: Number(row.cache_read_tokens ?? 0),
           cacheWriteTokens: Number(row.cache_write_tokens ?? 0),
+          cacheWrite1hTokens: Number(row.cache_write_1h_tokens ?? 0),
           reasoningTokens: Number(row.reasoning_tokens ?? 0),
         });
         if (cost.costSource === 'unknown' && row.id.startsWith('backfill:')) {
@@ -920,6 +1023,7 @@ export class UsageStore {
                     outputTokens: Number(row.output_tokens ?? 0),
                     cacheReadTokens: Number(row.cache_read_tokens ?? 0),
                     cacheWriteTokens: Number(row.cache_write_tokens ?? 0),
+                    cacheWrite1hTokens: Number(row.cache_write_1h_tokens ?? 0),
                     reasoningTokens: Number(row.reasoning_tokens ?? 0),
                     sdkCatalogTotalUsd,
                   });
@@ -933,6 +1037,8 @@ export class UsageStore {
             cost.costUsd,
             cost.unitInputUsdPer1M,
             cost.unitOutputUsdPer1M,
+            cost.unitCacheReadUsdPer1M,
+            cost.unitCacheWriteUsdPer1M,
             cost.costSource,
             row.id,
           );
@@ -941,6 +1047,88 @@ export class UsageStore {
       }
 
       this.writeMeta(REPRICE_META_KEY, FALLBACK_PRICES_VERSION);
+      return updated;
+    });
+  }
+
+  /**
+   * One-time idempotent migration that backfills missing cache unit prices and repairs
+   * historical cache cost calculations ONLY for `cost_source IN ('catalog', 'estimated')`.
+   * Provider-billed rows (`cost_source = 'provider'`) are strictly left untouched.
+   */
+  repriceCacheUsageIfNeeded(force = false): number {
+    if (!force && this.readMeta<string>(CACHE_REPRICE_META_KEY) === CACHE_REPRICE_VERSION) {
+      return 0;
+    }
+    return this.atomic(() => {
+      if (!force && this.readMeta<string>(CACHE_REPRICE_META_KEY) === CACHE_REPRICE_VERSION) {
+        return 0;
+      }
+      const rows = this.db.prepare(`
+        SELECT
+          id, provider, model,
+          input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cache_write_1h_tokens, reasoning_tokens,
+          cost_usd, unit_input_usd, unit_output_usd, unit_cache_read_usd, unit_cache_write_usd, cost_source
+        FROM model_usage
+        WHERE cost_source IN ('catalog', 'estimated')
+          AND (
+            cache_read_tokens > 0
+            OR cache_write_tokens > 0
+            OR (unit_input_usd > 0 AND (unit_cache_read_usd <= 0 OR unit_cache_write_usd <= 0))
+          )
+      `).all() as Array<{
+        id: string;
+        provider: string;
+        model: string;
+        input_tokens: number;
+        output_tokens: number;
+        cache_read_tokens: number;
+        cache_write_tokens: number;
+        cache_write_1h_tokens: number;
+        reasoning_tokens: number;
+        cost_usd: number;
+        unit_input_usd: number;
+        unit_output_usd: number;
+        unit_cache_read_usd: number;
+        unit_cache_write_usd: number;
+        cost_source: string;
+      }>;
+
+      const updateStmt = this.db.prepare(`
+        UPDATE model_usage
+        SET cost_usd=?, unit_input_usd=?, unit_output_usd=?, unit_cache_read_usd=?, unit_cache_write_usd=?
+        WHERE id=? AND cost_source IN ('catalog', 'estimated')
+      `);
+
+      let updated = 0;
+      for (const row of rows) {
+        const storedIn = Number(row.unit_input_usd ?? 0);
+        const storedOut = Number(row.unit_output_usd ?? 0);
+        const useStoredCatalog = row.cost_source === 'catalog' && (storedIn > 0 || storedOut > 0);
+        const nextCost = calculateModelCallCost({
+          provider: row.provider,
+          model: row.model,
+          inputTokens: Number(row.input_tokens ?? 0),
+          outputTokens: Number(row.output_tokens ?? 0),
+          cacheReadTokens: Number(row.cache_read_tokens ?? 0),
+          cacheWriteTokens: Number(row.cache_write_tokens ?? 0),
+          cacheWrite1hTokens: Number(row.cache_write_1h_tokens ?? 0),
+          reasoningTokens: Number(row.reasoning_tokens ?? 0),
+          ...(useStoredCatalog ? { catalogRate: { costInput: storedIn, costOutput: storedOut } } : {}),
+        });
+        if (nextCost.costSource === 'unknown') continue;
+        const res = updateStmt.run(
+          nextCost.costUsd,
+          nextCost.unitInputUsdPer1M,
+          nextCost.unitOutputUsdPer1M,
+          nextCost.unitCacheReadUsdPer1M,
+          nextCost.unitCacheWriteUsdPer1M,
+          row.id,
+        );
+        if (res.changes > 0) updated += 1;
+      }
+
+      this.writeMeta(CACHE_REPRICE_META_KEY, CACHE_REPRICE_VERSION);
       return updated;
     });
   }
@@ -955,23 +1143,32 @@ export class UsageStore {
     const startAt = shiftedMidnightToEpoch(parsed.year, parsed.month - 1, parsed.day, explicitTz, dtf);
     const endAt = shiftedMidnightToEpoch(tomorrow.year, tomorrow.month - 1, tomorrow.day, explicitTz, dtf);
 
-    const row = this.db.prepare(`
+    const rows = this.db.prepare(`
       SELECT
-        COUNT(*) AS calls,
-        COALESCE(SUM(total_tokens), 0) AS total_tokens,
-        COALESCE(SUM(cost_usd), 0) AS cost_usd
+        id, at, actor, provider, model,
+        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cache_write_1h_tokens, reasoning_tokens, total_tokens,
+        cost_usd, unit_input_usd, unit_output_usd, unit_cache_read_usd, unit_cache_write_usd, cost_source, status
       FROM model_usage
       WHERE at >= ? AND at < ?
-    `).get(startAt, endAt) as { calls?: number; total_tokens?: number; cost_usd?: number } | undefined;
+    `).all(startAt, endAt) as unknown as RawUsageRow[];
 
     const prefs = this.getUsagePrefs();
-    const costUsd = roundUsd(Number(row?.cost_usd ?? 0));
+    const acc = emptyMutableTotals();
+    for (const row of rows) {
+      addRowToTotals(acc, row);
+    }
+    const fin = finalizeTotals(acc, prefs.usdToCnyRate);
     return {
       date: todayDate,
-      calls: Number(row?.calls ?? 0),
-      totalTokens: Number(row?.total_tokens ?? 0),
-      costUsd,
-      costCny: roundUsd(costUsd * prefs.usdToCnyRate),
+      calls: fin.calls,
+      totalTokens: fin.totalTokens,
+      cacheReadTokens: fin.cacheReadTokens,
+      cacheWriteTokens: fin.cacheWriteTokens,
+      cacheHitRate: fin.cacheHitRate,
+      costUsd: fin.costUsd,
+      costCny: fin.costCny,
+      cacheSavingsUsd: fin.cacheSavingsUsd,
+      cacheSavingsCny: fin.cacheSavingsCny,
       currency: prefs.currency,
       usdToCnyRate: prefs.usdToCnyRate,
     };
@@ -1037,6 +1234,8 @@ export class UsageStore {
             calls: 0,
             inputTokens: 0,
             outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
             totalTokens: 0,
             costUsd: 0,
             costCny: 0,
@@ -1055,6 +1254,8 @@ export class UsageStore {
             calls: 0,
             inputTokens: 0,
             outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
             totalTokens: 0,
             costUsd: 0,
             costCny: 0,
@@ -1111,6 +1312,8 @@ export class UsageStore {
           calls: 0,
           inputTokens: 0,
           outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
           totalTokens: 0,
           costUsd: 0,
           costCny: 0,
@@ -1163,6 +1366,8 @@ export class UsageStore {
           calls: 0,
           inputTokens: 0,
           outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
           totalTokens: 0,
           costUsd: 0,
           costCny: 0,
@@ -1196,8 +1401,8 @@ export class UsageStore {
     const periodRows = this.db.prepare(`
       SELECT
         id, at, actor, provider, model,
-        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens,
-        cost_usd, unit_input_usd, unit_output_usd, cost_source, status
+        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cache_write_1h_tokens, reasoning_tokens, total_tokens,
+        cost_usd, unit_input_usd, unit_output_usd, unit_cache_read_usd, unit_cache_write_usd, cost_source, status
       FROM model_usage
       WHERE at >= ? AND at < ?
       ORDER BY at ASC, rowid ASC
@@ -1213,6 +1418,8 @@ export class UsageStore {
       actors: Partial<Record<UsageActor, number>>;
       unitInputUsdPer1M: number;
       unitOutputUsdPer1M: number;
+      unitCacheReadUsdPer1M: number;
+      unitCacheWriteUsdPer1M: number;
       costSource: UsageCostSource;
       lastUsedAt: number;
     }>();
@@ -1235,6 +1442,7 @@ export class UsageStore {
       const rowCostSource: UsageCostSource = VALID_COST_SOURCES.has(row.cost_source as UsageCostSource)
         ? (row.cost_source as UsageCostSource)
         : 'unknown';
+      const { unitCacheRead, unitCacheWrite } = resolveRowCacheRates(row);
       if (!modelAcc) {
         modelAcc = {
           spec,
@@ -1244,6 +1452,8 @@ export class UsageStore {
           actors: {},
           unitInputUsdPer1M: Number(row.unit_input_usd ?? 0),
           unitOutputUsdPer1M: Number(row.unit_output_usd ?? 0),
+          unitCacheReadUsdPer1M: unitCacheRead,
+          unitCacheWriteUsdPer1M: unitCacheWrite,
           costSource: rowCostSource,
           lastUsedAt: row.at,
         };
@@ -1255,6 +1465,8 @@ export class UsageStore {
         modelAcc.lastUsedAt = row.at;
         modelAcc.unitInputUsdPer1M = Number(row.unit_input_usd ?? 0);
         modelAcc.unitOutputUsdPer1M = Number(row.unit_output_usd ?? 0);
+        modelAcc.unitCacheReadUsdPer1M = unitCacheRead;
+        modelAcc.unitCacheWriteUsdPer1M = unitCacheWrite;
         modelAcc.costSource = rowCostSource;
       }
 
@@ -1266,6 +1478,8 @@ export class UsageStore {
         bucket.calls += 1;
         bucket.inputTokens += Number(row.input_tokens ?? 0);
         bucket.outputTokens += Number(row.output_tokens ?? 0);
+        bucket.cacheReadTokens += Number(row.cache_read_tokens ?? 0);
+        bucket.cacheWriteTokens += Number(row.cache_write_tokens ?? 0);
         bucket.totalTokens += Number(row.total_tokens ?? 0);
         bucket.costUsd += Number(row.cost_usd ?? 0);
       }
@@ -1298,6 +1512,8 @@ export class UsageStore {
             : 0,
           unitInputUsdPer1M: entry.unitInputUsdPer1M,
           unitOutputUsdPer1M: entry.unitOutputUsdPer1M,
+          unitCacheReadUsdPer1M: entry.unitCacheReadUsdPer1M,
+          unitCacheWriteUsdPer1M: entry.unitCacheWriteUsdPer1M,
           costSource: entry.costSource,
           actors: entry.actors,
           lastUsedAt: entry.lastUsedAt,

@@ -917,6 +917,11 @@ export function normalizeFmipDevice(raw) {
       }
     : null;
 
+  const soundCapable = raw?.features && typeof raw.features === 'object' && 'SND' in raw.features
+    ? Boolean(raw.features.SND)
+    : true;
+  const isFamily = Boolean(raw?.fmlyShare || raw?.prsId);
+
   return {
     rawId,
     device: {
@@ -932,6 +937,8 @@ export function normalizeFmipDevice(raw) {
       lowPowerMode: Boolean(raw?.lowPowerMode),
       lostModeCapable: Boolean(raw?.lostModeCapable),
       isLocating: Boolean(raw?.isLocating),
+      soundCapable,
+      isFamily,
       location,
     },
   };
@@ -991,35 +998,141 @@ async function postFmipWithRefresh({ session, path, body, fetchFn = fetch, signa
 }
 
 /**
+ * Sleep for `ms` milliseconds while honoring an optional `AbortSignal`.
+ * @param {number} ms
+ * @param {AbortSignal} [signal]
+ */
+function sleepWithSignal(ms, signal) {
+  if (signal?.aborted) {
+    return Promise.reject(signal.reason ?? new Error('Request aborted'));
+  }
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    let timer;
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason ?? new Error('Request aborted'));
+    };
+    timer = setTimeout(() => {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
+}
+
+/**
+ * Check whether two Sets contain identical elements.
+ * @param {Set<string>} a
+ * @param {Set<string>} b
+ * @returns {boolean}
+ */
+function setsEqual(a, b) {
+  if (a.size !== b.size) return false;
+  for (const item of a) {
+    if (!b.has(item)) return false;
+  }
+  return true;
+}
+
+/**
+ * Inspect an FMiP payload to determine which devices or family members are still settling.
+ * @param {any} payload
+ * @param {boolean} includeFamily
+ */
+function collectUnsettledState(payload, includeFamily) {
+  const content = Array.isArray(payload?.content) ? payload.content : [];
+  /** @type {Set<string>} */
+  const locatingIds = new Set();
+  /** @type {Set<string>} */
+  const pendingIds = new Set();
+  /** @type {Set<string>} */
+  const unknownOnlineIds = new Set();
+
+  for (const d of content) {
+    const id = String(d?.id ?? '');
+    if (Boolean(d?.isLocating)) {
+      locatingIds.add(id);
+    }
+    const statusCode = String(d?.deviceStatus ?? '');
+    if (statusCode === '203') {
+      pendingIds.add(id);
+    } else if (statusCode === '200' && (!d?.batteryStatus || d.batteryStatus === 'Unknown')) {
+      unknownOnlineIds.add(id);
+    }
+  }
+
+  /** @type {Set<string>} */
+  const loadingMembers = new Set();
+  if (includeFamily && payload?.userInfo?.hasMembers && payload?.userInfo?.membersInfo && typeof payload.userInfo.membersInfo === 'object') {
+    for (const [key, member] of Object.entries(payload.userInfo.membersInfo)) {
+      if (member && typeof member === 'object' && /** @type {any} */ (member).deviceFetchStatus === 'LOADING') {
+        loadingMembers.add(key);
+      }
+    }
+  }
+
+  return { locatingIds, pendingIds, unknownOnlineIds, loadingMembers };
+}
+
+/**
  * Sanitize & persist FMiP serverContext onto session so subsequent refresh calls don't trigger theftLoss errors.
  * @param {Record<string, any>} session
  * @param {any} payload
+ * @param {boolean} [includeFamily]
  */
-function storeFmipServerContext(session, payload) {
+function storeFmipServerContext(session, payload, includeFamily) {
   if (payload?.serverContext && typeof payload.serverContext === 'object') {
     const ctx = { ...payload.serverContext };
     if ('theftLoss' in ctx) ctx.theftLoss = null;
     session.fmipServerContext = ctx;
+    if (includeFamily !== undefined) {
+      session.fmipIncludeFamily = Boolean(includeFamily);
+    }
   }
 }
 
 /**
- * Fetch and normalize Find My devices, calling `/initClient` first when no `serverContext` is cached,
- * then `/refreshClient` for active location/battery refresh.
+ * Fetch and normalize Find My devices, calling `/initClient` first when no `serverContext` is cached
+ * (or when `includeFamily` setting changed), then `/refreshClient` with bounded wake-settling polls.
  * @param {{
  *   session: Record<string, any>;
  *   locate?: boolean;
+ *   includeFamily?: boolean;
+ *   locatePollDelayMs?: number;
+ *   maxLocatePolls?: number;
  *   fetchFn?: typeof fetch;
  *   signal?: AbortSignal;
  * }} params
  */
-export async function fetchFindMyDevices({ session, locate = true, fetchFn = fetch, signal }) {
+export async function fetchFindMyDevices({
+  session,
+  locate = true,
+  includeFamily = true,
+  locatePollDelayMs,
+  maxLocatePolls = 2,
+  fetchFn = fetch,
+  signal,
+}) {
+  const wantFamily = Boolean(includeFamily);
+  if (
+    session.fmipServerContext
+    && ((session.fmipIncludeFamily !== undefined && session.fmipIncludeFamily !== wantFamily)
+      || (session.fmipIncludeFamily === undefined && wantFamily))
+  ) {
+    session.fmipServerContext = undefined;
+  }
+
   const baseClientContext = {
     appName: 'iCloud Find (Web)',
     appVersion: '2.0',
     apiVersion: '3.0',
     deviceListVersion: 1,
-    fmly: false,
+    fmly: wantFamily,
     timezone: 'Asia/Shanghai',
     inactiveTime: 0,
   };
@@ -1029,11 +1142,16 @@ export async function fetchFindMyDevices({ session, locate = true, fetchFn = fet
     const initPayload = await postFmipWithRefresh({
       session,
       path: '/fmipservice/client/web/initClient',
-      body: { clientContext: baseClientContext },
+      body: {
+        clientContext: {
+          ...baseClientContext,
+          ...(locate ? { shouldLocate: true, selectedDevice: 'all' } : {}),
+        },
+      },
       fetchFn,
       signal,
     });
-    storeFmipServerContext(session, initPayload);
+    storeFmipServerContext(session, initPayload, wantFamily);
     payload = initPayload;
 
     if (locate && session.fmipServerContext) {
@@ -1052,7 +1170,7 @@ export async function fetchFindMyDevices({ session, locate = true, fetchFn = fet
         fetchFn,
         signal,
       });
-      storeFmipServerContext(session, refreshed);
+      storeFmipServerContext(session, refreshed, wantFamily);
       if (Array.isArray(refreshed?.content) && refreshed.content.length > 0) {
         payload = refreshed;
       }
@@ -1072,7 +1190,68 @@ export async function fetchFindMyDevices({ session, locate = true, fetchFn = fet
       fetchFn,
       signal,
     });
-    storeFmipServerContext(session, payload);
+    storeFmipServerContext(session, payload, wantFamily);
+  }
+
+  if (locate && maxLocatePolls > 0 && session.fmipServerContext) {
+    /** @type {Set<string> | null} */
+    let prevPendingIds = null;
+    /** @type {Set<string> | null} */
+    let prevLoadingMembers = null;
+    for (let poll = 0; poll < maxLocatePolls; poll += 1) {
+      const state = collectUnsettledState(payload, wantFamily);
+      if (
+        state.locatingIds.size === 0
+        && state.pendingIds.size === 0
+        && state.unknownOnlineIds.size === 0
+        && state.loadingMembers.size === 0
+      ) {
+        break;
+      }
+      if (
+        poll > 0
+        && state.locatingIds.size === 0
+        && state.unknownOnlineIds.size === 0
+        && prevPendingIds
+        && prevLoadingMembers
+        && setsEqual(state.pendingIds, prevPendingIds)
+        && setsEqual(state.loadingMembers, prevLoadingMembers)
+      ) {
+        break;
+      }
+      prevPendingIds = state.pendingIds;
+      prevLoadingMembers = state.loadingMembers;
+
+      const serverDelayRaw = Number(payload?.serverContext?.callbackIntervalInMS ?? 2200);
+      const boundedServerDelay = Number.isFinite(serverDelayRaw)
+        ? Math.max(800, Math.min(2500, serverDelayRaw))
+        : 2200;
+      const delayMs = typeof locatePollDelayMs === 'number' && locatePollDelayMs >= 0
+        ? locatePollDelayMs
+        : boundedServerDelay;
+
+      await sleepWithSignal(delayMs, signal);
+
+      const refreshed = await postFmipWithRefresh({
+        session,
+        path: '/fmipservice/client/web/refreshClient',
+        body: {
+          clientContext: {
+            ...baseClientContext,
+            shouldLocate: true,
+            selectedDevice: 'all',
+          },
+          serverContext: session.fmipServerContext,
+          isUpdatingAllLocations: true,
+        },
+        fetchFn,
+        signal,
+      });
+      storeFmipServerContext(session, refreshed, wantFamily);
+      if (Array.isArray(refreshed?.content) && refreshed.content.length > 0) {
+        payload = refreshed;
+      }
+    }
   }
 
   const content = Array.isArray(payload?.content) ? payload.content : [];
@@ -1108,7 +1287,12 @@ export async function playFindMySound({ session, rawDeviceId, subject, fetchFn =
     body: {
       device: rawDeviceId,
       subject: String(subject || 'F.R.I.D.A.Y. 查找设备提醒').trim().slice(0, 120),
-      clientContext: { fmly: false },
+      clientContext: {
+        appName: 'iCloud Find (Web)',
+        appVersion: '2.0',
+        fmly: true,
+      },
+      ...(session.fmipServerContext ? { serverContext: session.fmipServerContext } : {}),
     },
     fetchFn,
     signal,

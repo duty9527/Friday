@@ -598,7 +598,7 @@ export function initTracePanel(): TracePanelController {
         for (const mem of memories) {
           const card = node('div', '', 'memory-chip-card');
           const memHead = node('div', '', 'memory-chip-head');
-          memHead.append(node('strong', mem.topic || mem.id, 'memory-chip-topic'));
+          memHead.append(node('strong', mem.topic || '未命名记忆', 'memory-chip-topic'));
           if (Array.isArray(mem.tags) && mem.tags.length) {
             const tagsRow = node('div', '', 'memory-chip-tags');
             for (const tag of mem.tags) {
@@ -614,11 +614,7 @@ export function initTracePanel(): TracePanelController {
         }
         body.append(list);
       } else if (memoryIds.length) {
-        const idsRow = node('div', '', 'token-pills');
-        for (const mid of memoryIds) {
-          idsRow.append(node('span', mid, 'token-pill'));
-        }
-        body.append(idsRow);
+        body.append(node('p', `已挂载 ${memoryIds.length} 条记忆卡片`, 'meta'));
       }
       ctxDetails.append(body);
       frag.append(ctxDetails);
@@ -942,7 +938,7 @@ export function initTracePanel(): TracePanelController {
     const summarySec = appendSection(body, rt.kindLabel || '路由与质检详情');
     if (rt.targetTaskId && (appState.selection.type !== 'task' || appState.selection.id !== rt.targetTaskId)) {
       const jumpWrap = node('div', '', 'inspector-actions');
-      jumpWrap.append(button(`打开关联工作：${rt.targetTaskLabel ?? rt.targetTaskId}`, () => {
+      jumpWrap.append(button(`打开关联工作：${rt.targetTaskLabel ?? '关联工作'}`, () => {
         selectTrace({ type: 'task', id: rt.targetTaskId!, label: rt.targetTaskLabel ?? '关联工作' });
       }, 'mini-button'));
       summarySec.append(jumpWrap);
@@ -987,7 +983,7 @@ export function initTracePanel(): TracePanelController {
       for (const mem of rt.memories) {
         const card = node('div', '', 'memory-chip-card');
         const memHead = node('div', '', 'memory-chip-head');
-        memHead.append(node('strong', mem.topic || mem.id, 'memory-chip-topic'));
+        memHead.append(node('strong', mem.topic || '未命名记忆', 'memory-chip-topic'));
         if (mem.tags.length) {
           const tags = node('div', '', 'memory-chip-tags');
           for (const tag of mem.tags) tags.append(node('span', tag, 'memory-chip-tag'));

@@ -36,7 +36,24 @@ import {
   renderMarkdownContent,
   renderUserMessageContent,
 } from '../src/web/shared/markdown.js';
-import type { ChatMessage, TraceEvent } from '../src/view.js';
+import {
+  classifyPluginActions,
+  clearPluginOrder,
+  filterAndGroupPlugins,
+  formatActionDefaultArgs,
+  getPluginStatusInfo,
+  getPluginSummary,
+  isCustomOrder,
+  mergePluginOrder,
+  movePluginStep,
+  readPluginOrder,
+  readSidebarCollapsed,
+  reorderPluginList,
+  summarizePluginRunMessage,
+  writePluginOrder,
+  writeSidebarCollapsed,
+} from '../src/web/shared/plugin-catalog.js';
+import type { ChatMessage, PluginView, TimerView, TraceEvent } from '../src/view.js';
 
 const message = (id: string, seq: number, role: 'user' | 'assistant', replyTo?: string, version = seq): ChatMessage =>
   ({ id, seq, version, role, replyTo, text: id, status: 'completed', at: seq, mode: 'offline', paths: [], taskIds: [] });
@@ -859,4 +876,204 @@ test('chat-view helpers handle channel inheritance, filtering, time dividers, re
   assert.equal(extractLeadingQuote('普通消息没有引用'), undefined);
   assert.equal(stripLeadingQuoteForPreview('【引用】\n[引用的历史消息未缓存 (ID: 123)]\n\n这次呢'), '这次呢');
   assert.equal(stripLeadingQuoteForPreview('普通正文'), '普通正文');
+});
+
+test('plugin sidebar order reconciliation, drag reorder, keyboard stepping, and storage persistence handle edge cases cleanly', () => {
+  const defaults = ['health-scale', 'fund-tracker', 'cs80-face', 'laifen', 'ninebot'];
+
+  // Newly installed plugin appended; uninstalled plugin ignored; duplicates deduped
+  assert.deepEqual(
+    mergePluginOrder(['ninebot', 'removed-old', 'ninebot', 'fund-tracker'], [...defaults, 'custom-new']),
+    ['ninebot', 'fund-tracker', 'health-scale', 'cs80-face', 'laifen', 'custom-new'],
+  );
+
+  // Drag reorder before / after while retaining hidden plugins in full order
+  const withHidden = ['health-scale', 'disabled-ble', 'fund-tracker', 'ninebot'];
+  assert.deepEqual(
+    reorderPluginList(withHidden, 'ninebot', 'health-scale', 'before'),
+    ['ninebot', 'health-scale', 'disabled-ble', 'fund-tracker'],
+  );
+  assert.deepEqual(
+    reorderPluginList(withHidden, 'health-scale', 'fund-tracker', 'after'),
+    ['disabled-ble', 'fund-tracker', 'health-scale', 'ninebot'],
+  );
+
+  // Keyboard Alt+ArrowUp / ArrowDown moves across visible items while preserving hidden entries
+  const visible = ['health-scale', 'fund-tracker', 'ninebot'];
+  assert.deepEqual(
+    movePluginStep(withHidden, visible, 'fund-tracker', -1),
+    ['fund-tracker', 'health-scale', 'disabled-ble', 'ninebot'],
+  );
+  assert.deepEqual(
+    movePluginStep(withHidden, visible, 'health-scale', 1),
+    ['disabled-ble', 'fund-tracker', 'health-scale', 'ninebot'],
+  );
+  assert.deepEqual(movePluginStep(withHidden, visible, 'health-scale', -1), withHidden);
+
+  // Custom order detection ignores irrelevant/default order
+  assert.equal(isCustomOrder([], defaults), false);
+  assert.equal(isCustomOrder(defaults, defaults), false);
+  assert.equal(isCustomOrder(['ninebot', 'health-scale'], defaults), true);
+
+  // Mock storage persistence + corrupt JSON resilience
+  const mem = new Map<string, string>();
+  const store = {
+    getItem: (k: string) => mem.get(k) ?? null,
+    setItem: (k: string, v: string) => { mem.set(k, v); },
+    removeItem: (k: string) => { mem.delete(k); },
+  };
+  assert.equal(readSidebarCollapsed(store), null);
+  assert.equal(writeSidebarCollapsed(true, store), true);
+  assert.equal(readSidebarCollapsed(store), true);
+  assert.equal(writeSidebarCollapsed(false, store), true);
+  assert.equal(readSidebarCollapsed(store), false);
+
+  assert.deepEqual(readPluginOrder(store), []);
+  writePluginOrder(['ninebot', 'ninebot', ' fund-tracker ', ''], store);
+  assert.deepEqual(readPluginOrder(store), ['ninebot', 'fund-tracker']);
+  clearPluginOrder(store);
+  assert.deepEqual(readPluginOrder(store), []);
+
+  store.setItem('friday.plugin-order', '{corrupt json');
+  assert.deepEqual(readPluginOrder(store), []);
+});
+
+test('plugin catalog classification, human-readable formatting, status reasons, and search/filter/grouping work cleanly', () => {
+  const plugins: PluginView[] = [
+    {
+      name: 'apple-devices',
+      title: 'Apple 设备管理',
+      description: 'SRP-6a + 2FA 获取电量',
+      entry: 'index.mjs',
+      enabled: true,
+      runtime: 'in-process',
+      voiceFastpath: true,
+      isBuiltin: true,
+      actions: ['status', 'devices', 'locate', 'play-sound', 'auth-login', 'config'],
+      actionSpecs: [
+        { name: 'status', label: '查看绑定状态', defaultArgs: {} },
+        { name: 'devices', label: '获取设备列表', defaultArgs: { refresh: false } },
+        { name: 'locate', label: '定位单台设备', defaultArgs: { device: '手机', refresh: false } },
+        { name: 'play-sound', label: '远程响铃寻物', defaultArgs: { device: '手机', dryRun: true } },
+        { name: 'auth-login', label: '发起登录', defaultArgs: { region: 'cn' } },
+        { name: 'config', label: '插件配置', defaultArgs: {} },
+      ],
+    },
+    {
+      name: 'health-scale',
+      title: '沃莱 A1 体脂秤',
+      description: '蓝牙采集',
+      entry: 'index.mjs',
+      enabled: false,
+      platforms: ['linux'],
+      runtime: 'in-process',
+      voiceFastpath: true,
+      isBuiltin: true,
+      actions: ['dashboard', 'status', 'scan'],
+    },
+    {
+      name: 'miot',
+      title: '全屋米家',
+      description: '控制灯与空气炸锅',
+      entry: 'index.mjs',
+      enabled: true,
+      runtime: 'in-process',
+      voiceFastpath: true,
+      isBuiltin: true,
+      actions: ['status', 'devices', 'set', 'cook', 'config'],
+    },
+    {
+      name: 'custom-weather',
+      title: '自定义天气',
+      description: '读取本机天气预报并保存在 <pluginDataDir>/config.json（仅 0600 权限保存）。第二句补充细节。',
+      entry: 'index.mjs',
+      enabled: true,
+      runtime: 'subprocess',
+      isBuiltin: false,
+      actions: ['config'],
+    },
+  ];
+
+  const timers: TimerView[] = [
+    {
+      id: 't1',
+      name: '苹果低电巡航',
+      instruction: '巡航',
+      intervalMs: 3600_000,
+      plugin: 'apple-devices',
+      pluginAction: 'patrol',
+      enabled: true,
+      createdAt: 1000,
+      nextRunAt: 2000,
+      missedRuns: 0,
+    },
+  ];
+
+  // Action tiering separates user-facing features from internal auth/config actions
+  const appleActions = classifyPluginActions(plugins[0]!);
+  assert.deepEqual(appleActions.primary.map(a => a.name), ['status', 'devices', 'locate', 'play-sound']);
+  assert.deepEqual(appleActions.management.map(a => a.name), ['auth-login', 'config']);
+
+  // Fallback when all actions are internal
+  const customActions = classifyPluginActions(plugins[3]!);
+  assert.deepEqual(customActions.primary.map(a => a.name), ['config']);
+  assert.deepEqual(customActions.management, []);
+
+  // Platform-disabled reason is surfaced clearly
+  const healthStatus = getPluginStatusInfo(plugins[1]!);
+  assert.equal(healthStatus.tone, 'amber');
+  assert.equal(healthStatus.label, '仅限 Linux');
+  assert.match(healthStatus.detail, /Linux/);
+
+  // Custom plugin summary strips internal path / 0600 jargon
+  const customSummary = getPluginSummary(plugins[3]!);
+  assert.doesNotMatch(customSummary, /<pluginDataDir>|0600/);
+  assert.match(customSummary, /天气预报/);
+
+  // Readable default argument pills & run message summary
+  assert.deepEqual(formatActionDefaultArgs({}), []);
+  assert.deepEqual(formatActionDefaultArgs({ device: '手机', dryRun: true, timeoutSec: 5 }), [
+    { key: 'device', label: '目标设备', value: '手机' },
+    { key: 'dryRun', label: '预演模式', value: '是' },
+    { key: 'timeoutSec', label: '超时', value: '5 秒' },
+  ]);
+  assert.match(summarizePluginRunMessage('{"ok":true,"raw":1}'), /结构化状态数据/);
+  assert.equal(summarizePluginRunMessage('第一行正常\n第二行补充\n第三行忽略'), '第一行正常 · 第二行补充');
+
+  // Filtering, searching, and grouped view follow custom order
+  const surfaces = new Set(['apple-devices', 'health-scale']);
+  const groupedAll = filterAndGroupPlugins({
+    plugins,
+    timers,
+    surfaceNames: surfaces,
+    order: ['health-scale', 'apple-devices'],
+    filter: 'all',
+    query: '',
+  });
+  assert.equal(groupedAll.grouped, true);
+  assert.deepEqual(groupedAll.counts, { all: 4, surface: 2, extension: 2, voice: 3, timer: 1 });
+  assert.deepEqual(groupedAll.surfaces.map(p => p.name), ['health-scale', 'apple-devices']);
+  assert.deepEqual(groupedAll.extensions.map(p => p.name), ['miot', 'custom-weather']);
+
+  const timerOnly = filterAndGroupPlugins({
+    plugins,
+    timers,
+    surfaceNames: surfaces,
+    order: [],
+    filter: 'timer',
+    query: '',
+  });
+  assert.equal(timerOnly.grouped, false);
+  assert.deepEqual(timerOnly.items.map(p => p.name), ['apple-devices']);
+
+  const searchHit = filterAndGroupPlugins({
+    plugins,
+    timers,
+    surfaceNames: surfaces,
+    order: [],
+    filter: 'all',
+    query: '响铃',
+  });
+  assert.equal(searchHit.grouped, false);
+  assert.deepEqual(searchHit.items.map(p => p.name), ['apple-devices']);
 });

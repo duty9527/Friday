@@ -6,6 +6,7 @@ import {
   type ThinkingLevel,
 } from '../decision.js';
 import type { ModelCatalogEntry, ModelTier, ModelTierConfig, WorkerProfile } from '../view.js';
+import { resolveModelUnitPrice } from './pricing.js';
 
 export interface WorkerModelResolutionInput {
   model?: string;
@@ -222,6 +223,8 @@ export const FALLBACK_PROVIDER_MODELS: Record<string, ModelCatalogEntry[]> = {
       maxTokens: 8_192,
       costInput: 0.27,
       costOutput: 1.1,
+      costCacheRead: 0.07,
+      costCacheWrite: 0.27,
       thinkingLevels: ['off'],
     },
     {
@@ -233,61 +236,63 @@ export const FALLBACK_PROVIDER_MODELS: Record<string, ModelCatalogEntry[]> = {
       maxTokens: 64_000,
       costInput: 0.55,
       costOutput: 2.19,
+      costCacheRead: 0.14,
+      costCacheWrite: 0.55,
       thinkingLevels: ['off', 'low', 'high', 'max'],
     },
   ],
   anthropic: [
-    { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', supportsImages: true, reasoning: true, contextWindow: 200_000, maxTokens: 64_000, costInput: 1, costOutput: 5 },
-    { id: 'claude-sonnet-4-20250514', name: 'Claude Sonnet 4', supportsImages: true, reasoning: true, contextWindow: 200_000, maxTokens: 64_000, costInput: 3, costOutput: 15 },
-    { id: 'claude-opus-4-20250514', name: 'Claude Opus 4', supportsImages: true, reasoning: true, contextWindow: 200_000, maxTokens: 32_000, costInput: 15, costOutput: 75 },
+    { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', supportsImages: true, reasoning: true, contextWindow: 200_000, maxTokens: 64_000, costInput: 1, costOutput: 5, costCacheRead: 0.1, costCacheWrite: 1.25 },
+    { id: 'claude-sonnet-4-20250514', name: 'Claude Sonnet 4', supportsImages: true, reasoning: true, contextWindow: 200_000, maxTokens: 64_000, costInput: 3, costOutput: 15, costCacheRead: 0.3, costCacheWrite: 3.75 },
+    { id: 'claude-opus-4-20250514', name: 'Claude Opus 4', supportsImages: true, reasoning: true, contextWindow: 200_000, maxTokens: 32_000, costInput: 15, costOutput: 75, costCacheRead: 1.5, costCacheWrite: 18.75 },
   ],
   openai: [
-    { id: 'gpt-4.1-mini', name: 'GPT-4.1 Mini', supportsImages: true, reasoning: false, contextWindow: 1_047_576, maxTokens: 32_768, costInput: 0.4, costOutput: 1.6 },
-    { id: 'gpt-4.1', name: 'GPT-4.1', supportsImages: true, reasoning: false, contextWindow: 1_047_576, maxTokens: 32_768, costInput: 2, costOutput: 8 },
-    { id: 'o4-mini', name: 'o4-mini', supportsImages: true, reasoning: true, contextWindow: 200_000, maxTokens: 100_000, costInput: 1.1, costOutput: 4.4 },
+    { id: 'gpt-4.1-mini', name: 'GPT-4.1 Mini', supportsImages: true, reasoning: false, contextWindow: 1_047_576, maxTokens: 32_768, costInput: 0.4, costOutput: 1.6, costCacheRead: 0.1, costCacheWrite: 0.4 },
+    { id: 'gpt-4.1', name: 'GPT-4.1', supportsImages: true, reasoning: false, contextWindow: 1_047_576, maxTokens: 32_768, costInput: 2, costOutput: 8, costCacheRead: 0.5, costCacheWrite: 2 },
+    { id: 'o4-mini', name: 'o4-mini', supportsImages: true, reasoning: true, contextWindow: 200_000, maxTokens: 100_000, costInput: 1.1, costOutput: 4.4, costCacheRead: 0.275, costCacheWrite: 1.1 },
   ],
   'openai-codex': [
-    { id: 'gpt-4.1-mini', name: 'GPT-4.1 Mini (Codex)', supportsImages: true, reasoning: false, contextWindow: 1_047_576, maxTokens: 32_768, costInput: 0.4, costOutput: 1.6 },
-    { id: 'gpt-4.1', name: 'GPT-4.1 (Codex)', supportsImages: true, reasoning: false, contextWindow: 1_047_576, maxTokens: 32_768, costInput: 2, costOutput: 8 },
-    { id: 'o4-mini', name: 'o4-mini (Codex)', supportsImages: true, reasoning: true, contextWindow: 200_000, maxTokens: 100_000, costInput: 1.1, costOutput: 4.4 },
+    { id: 'gpt-4.1-mini', name: 'GPT-4.1 Mini (Codex)', supportsImages: true, reasoning: false, contextWindow: 1_047_576, maxTokens: 32_768, costInput: 0.4, costOutput: 1.6, costCacheRead: 0.1, costCacheWrite: 0.4 },
+    { id: 'gpt-4.1', name: 'GPT-4.1 (Codex)', supportsImages: true, reasoning: false, contextWindow: 1_047_576, maxTokens: 32_768, costInput: 2, costOutput: 8, costCacheRead: 0.5, costCacheWrite: 2 },
+    { id: 'o4-mini', name: 'o4-mini (Codex)', supportsImages: true, reasoning: true, contextWindow: 200_000, maxTokens: 100_000, costInput: 1.1, costOutput: 4.4, costCacheRead: 0.275, costCacheWrite: 1.1 },
   ],
   google: [
-    { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', supportsImages: true, reasoning: true, contextWindow: 1_048_576, maxTokens: 65_536, costInput: 0.3, costOutput: 2.5 },
-    { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', supportsImages: true, reasoning: true, contextWindow: 1_048_576, maxTokens: 65_536, costInput: 1.25, costOutput: 10 },
+    { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', supportsImages: true, reasoning: true, contextWindow: 1_048_576, maxTokens: 65_536, costInput: 0.3, costOutput: 2.5, costCacheRead: 0.03, costCacheWrite: 0.3 },
+    { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', supportsImages: true, reasoning: true, contextWindow: 1_048_576, maxTokens: 65_536, costInput: 1.25, costOutput: 10, costCacheRead: 0.125, costCacheWrite: 1.25 },
   ],
   openrouter: [
-    { id: 'anthropic/claude-sonnet-4', name: 'Claude Sonnet 4 (OR)', supportsImages: true, reasoning: true, contextWindow: 200_000, costInput: 3, costOutput: 15 },
-    { id: 'google/gemini-2.5-pro', name: 'Gemini 2.5 Pro (OR)', supportsImages: true, reasoning: true, contextWindow: 1_048_576, costInput: 1.25, costOutput: 10 },
-    { id: 'deepseek/deepseek-chat-v3-0324', name: 'DeepSeek V3 (OR)', supportsImages: false, reasoning: false, contextWindow: 128_000, costInput: 0.2, costOutput: 0.8 },
+    { id: 'anthropic/claude-sonnet-4', name: 'Claude Sonnet 4 (OR)', supportsImages: true, reasoning: true, contextWindow: 200_000, costInput: 3, costOutput: 15, costCacheRead: 0.3, costCacheWrite: 3.75 },
+    { id: 'google/gemini-2.5-pro', name: 'Gemini 2.5 Pro (OR)', supportsImages: true, reasoning: true, contextWindow: 1_048_576, costInput: 1.25, costOutput: 10, costCacheRead: 0.125, costCacheWrite: 0.375 },
+    { id: 'deepseek/deepseek-chat-v3-0324', name: 'DeepSeek V3 (OR)', supportsImages: false, reasoning: false, contextWindow: 128_000, costInput: 0.2, costOutput: 0.8, costCacheRead: 0.07, costCacheWrite: 0.2 },
   ],
   dashscope: [
-    { id: 'qwen-max-latest', name: 'Qwen Max', supportsImages: false, reasoning: true, contextWindow: 131_072, costInput: 1.6, costOutput: 6.4 },
-    { id: 'qwen-coder-plus-latest', name: 'Qwen Coder Plus', supportsImages: false, reasoning: false, contextWindow: 131_072, costInput: 0.5, costOutput: 1.5 },
-    { id: 'qwen-vl-max-latest', name: 'Qwen VL Max', supportsImages: true, reasoning: false, contextWindow: 131_072, costInput: 0.8, costOutput: 2.4 },
-    { id: 'qwen-turbo-latest', name: 'Qwen Turbo', supportsImages: false, reasoning: false, contextWindow: 1_000_000, costInput: 0.05, costOutput: 0.2 },
+    { id: 'qwen-max-latest', name: 'Qwen Max', supportsImages: false, reasoning: true, contextWindow: 131_072, costInput: 1.6, costOutput: 6.4, costCacheRead: 0.32, costCacheWrite: 2 },
+    { id: 'qwen-coder-plus-latest', name: 'Qwen Coder Plus', supportsImages: false, reasoning: false, contextWindow: 131_072, costInput: 0.5, costOutput: 1.5, costCacheRead: 0.1, costCacheWrite: 0.625 },
+    { id: 'qwen-vl-max-latest', name: 'Qwen VL Max', supportsImages: true, reasoning: false, contextWindow: 131_072, costInput: 0.8, costOutput: 2.4, costCacheRead: 0.16, costCacheWrite: 1 },
+    { id: 'qwen-turbo-latest', name: 'Qwen Turbo', supportsImages: false, reasoning: false, contextWindow: 1_000_000, costInput: 0.05, costOutput: 0.2, costCacheRead: 0.01, costCacheWrite: 0.0625 },
   ],
   moonshot: [
-    { id: 'kimi-k2-0711-preview', name: 'Kimi K2', supportsImages: false, reasoning: true, contextWindow: 131_072, costInput: 1, costOutput: 3 },
-    { id: 'moonshot-v1-128k-vision-preview', name: 'Moonshot 128K Vision', supportsImages: true, reasoning: false, contextWindow: 128_000, costInput: 1, costOutput: 3 },
-    { id: 'moonshot-v1-32k', name: 'Moonshot 32K', supportsImages: false, reasoning: false, contextWindow: 32_768, costInput: 0.2, costOutput: 0.6 },
+    { id: 'kimi-k2-0711-preview', name: 'Kimi K2', supportsImages: false, reasoning: true, contextWindow: 131_072, costInput: 1, costOutput: 3, costCacheRead: 0.2, costCacheWrite: 1 },
+    { id: 'moonshot-v1-128k-vision-preview', name: 'Moonshot 128K Vision', supportsImages: true, reasoning: false, contextWindow: 128_000, costInput: 1, costOutput: 3, costCacheRead: 0.2, costCacheWrite: 1 },
+    { id: 'moonshot-v1-32k', name: 'Moonshot 32K', supportsImages: false, reasoning: false, contextWindow: 32_768, costInput: 0.2, costOutput: 0.6, costCacheRead: 0.04, costCacheWrite: 0.2 },
   ],
   zhipu: [
-    { id: 'glm-4.5', name: 'GLM-4.5', supportsImages: false, reasoning: true, contextWindow: 128_000, costInput: 0.8, costOutput: 2 },
-    { id: 'glm-4v-plus', name: 'GLM-4V Plus', supportsImages: true, reasoning: false, contextWindow: 128_000, costInput: 0.8, costOutput: 2 },
-    { id: 'glm-4-flash', name: 'GLM-4 Flash', supportsImages: false, reasoning: false, contextWindow: 128_000, costInput: 0, costOutput: 0 },
+    { id: 'glm-4.5', name: 'GLM-4.5', supportsImages: false, reasoning: true, contextWindow: 128_000, costInput: 0.8, costOutput: 2, costCacheRead: 0.16, costCacheWrite: 0.8 },
+    { id: 'glm-4v-plus', name: 'GLM-4V Plus', supportsImages: true, reasoning: false, contextWindow: 128_000, costInput: 0.8, costOutput: 2, costCacheRead: 0.16, costCacheWrite: 0.8 },
+    { id: 'glm-4-flash', name: 'GLM-4 Flash', supportsImages: false, reasoning: false, contextWindow: 128_000, costInput: 0, costOutput: 0, costCacheRead: 0, costCacheWrite: 0 },
   ],
   siliconflow: [
-    { id: 'deepseek-ai/DeepSeek-R1', name: 'DeepSeek R1 (SF)', supportsImages: false, reasoning: true, contextWindow: 128_000, costInput: 0.5, costOutput: 2 },
-    { id: 'deepseek-ai/DeepSeek-V3', name: 'DeepSeek V3 (SF)', supportsImages: false, reasoning: false, contextWindow: 128_000, costInput: 0.2, costOutput: 0.8 },
-    { id: 'Qwen/Qwen2.5-Coder-32B-Instruct', name: 'Qwen2.5 Coder 32B', supportsImages: false, reasoning: false, contextWindow: 128_000, costInput: 0.15, costOutput: 0.15 },
+    { id: 'deepseek-ai/DeepSeek-R1', name: 'DeepSeek R1 (SF)', supportsImages: false, reasoning: true, contextWindow: 128_000, costInput: 0.5, costOutput: 2, costCacheRead: 0.14, costCacheWrite: 0.5 },
+    { id: 'deepseek-ai/DeepSeek-V3', name: 'DeepSeek V3 (SF)', supportsImages: false, reasoning: false, contextWindow: 128_000, costInput: 0.2, costOutput: 0.8, costCacheRead: 0.05, costCacheWrite: 0.2 },
+    { id: 'Qwen/Qwen2.5-Coder-32B-Instruct', name: 'Qwen2.5 Coder 32B', supportsImages: false, reasoning: false, contextWindow: 128_000, costInput: 0.15, costOutput: 0.15, costCacheRead: 0.03, costCacheWrite: 0.15 },
   ],
   xai: [
-    { id: 'grok-4', name: 'Grok 4', supportsImages: true, reasoning: true, contextWindow: 256_000, costInput: 3, costOutput: 15 },
-    { id: 'grok-3-mini', name: 'Grok 3 Mini', supportsImages: false, reasoning: true, contextWindow: 131_072, costInput: 0.3, costOutput: 0.5 },
+    { id: 'grok-4', name: 'Grok 4', supportsImages: true, reasoning: true, contextWindow: 256_000, costInput: 3, costOutput: 15, costCacheRead: 0.75, costCacheWrite: 3 },
+    { id: 'grok-3-mini', name: 'Grok 3 Mini', supportsImages: false, reasoning: true, contextWindow: 131_072, costInput: 0.3, costOutput: 0.5, costCacheRead: 0.075, costCacheWrite: 0.3 },
   ],
   ollama: [
-    { id: 'qwen2.5-coder:latest', name: 'Qwen2.5 Coder (Local)', supportsImages: false, reasoning: false, contextWindow: 128_000, costInput: 0, costOutput: 0 },
-    { id: 'deepseek-r1:latest', name: 'DeepSeek R1 (Local)', supportsImages: false, reasoning: true, contextWindow: 128_000, costInput: 0, costOutput: 0 },
+    { id: 'qwen2.5-coder:latest', name: 'Qwen2.5 Coder (Local)', supportsImages: false, reasoning: false, contextWindow: 128_000, costInput: 0, costOutput: 0, costCacheRead: 0, costCacheWrite: 0 },
+    { id: 'deepseek-r1:latest', name: 'DeepSeek R1 (Local)', supportsImages: false, reasoning: true, contextWindow: 128_000, costInput: 0, costOutput: 0, costCacheRead: 0, costCacheWrite: 0 },
   ],
 };
 
@@ -331,9 +336,24 @@ export function ensureRealProviderCatalog(runtime: ModelRuntime, targetProviderI
     for (const def of defaults) {
       if (filteredSet.has(def.id)) continue;
       changed = true;
-      const base = (existingById.get(def.id) ?? template) as RuntimeModelItem & {
+      const matchedExisting = existingById.get(def.id);
+      const base = (matchedExisting ?? template) as RuntimeModelItem & {
         thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>>;
       };
+      // Never inherit cache rates from an unrelated fictional SDK template model.
+      const resolvedFallback = resolveModelUnitPrice(providerId, def.id, {
+        costInput: def.costInput,
+        costOutput: def.costOutput,
+        ...(def.costCacheRead !== undefined ? { costCacheRead: def.costCacheRead } : {}),
+        ...(def.costCacheWrite !== undefined ? { costCacheWrite: def.costCacheWrite } : {}),
+      });
+      const exactCost = matchedExisting?.cost;
+      const cacheRead = (exactCost?.cacheRead ?? 0) > 0
+        ? exactCost!.cacheRead
+        : (def.costCacheRead ?? resolvedFallback.cacheReadUsdPer1M);
+      const cacheWrite = (exactCost?.cacheWrite ?? 0) > 0
+        ? exactCost!.cacheWrite
+        : (def.costCacheWrite ?? resolvedFallback.cacheWriteUsdPer1M);
       const entry = {
         ...base,
         id: def.id,
@@ -346,8 +366,8 @@ export function ensureRealProviderCatalog(runtime: ModelRuntime, targetProviderI
         cost: {
           input: def.costInput,
           output: def.costOutput,
-          cacheRead: base.cost?.cacheRead ?? 0,
-          cacheWrite: base.cost?.cacheWrite ?? 0,
+          cacheRead,
+          cacheWrite,
         },
         contextWindow: def.contextWindow,
         maxTokens: def.maxTokens ?? base.maxTokens ?? 16_384,

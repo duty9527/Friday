@@ -93,6 +93,18 @@ function formatPrimaryMoney(totals: Pick<UsageTotalsView, 'costUsd' | 'costCny'>
   return currency === 'USD' ? formatUsd(totals.costUsd) : formatCny(totals.costCny);
 }
 
+function formatPrimarySavings(
+  totals: Pick<UsageTotalsView, 'cacheSavingsUsd' | 'cacheSavingsCny'>,
+  currency: UsageCurrency,
+): string {
+  return currency === 'USD' ? formatUsd(totals.cacheSavingsUsd) : formatCny(totals.cacheSavingsCny);
+}
+
+function formatPercent(ratio: number): string {
+  if (!Number.isFinite(ratio) || ratio <= 0) return '0.0%';
+  return `${Math.min(100, Math.max(0, ratio * 100)).toFixed(1)}%`;
+}
+
 function formatUnitRate(usdPer1M: number): string {
   if (!Number.isFinite(usdPer1M) || usdPer1M <= 0) return '$0';
   if (usdPer1M >= 1) return `$${usdPer1M.toFixed(2)}`;
@@ -221,11 +233,11 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
     const safeMax = maxVal > 0 ? maxVal : 1;
 
     if (metricMode === 'cost') {
-      usageChartSubtitle.textContent = `柱高按折算金额（${currency === 'USD' ? '美元 $' : '人民币 ¥'}）绘制 · 悬停柱状查看调用与 Token 明细`;
+      usageChartSubtitle.textContent = `按折算金额（${currency === 'USD' ? '美元 $' : '人民币 ¥'}）`;
     } else if (metricMode === 'tokens') {
-      usageChartSubtitle.textContent = '当前周期均为免费/零费用模型，柱高按 Token 消耗量绘制 · 悬停查看明细';
+      usageChartSubtitle.textContent = '按 Token 消耗量';
     } else {
-      usageChartSubtitle.textContent = '当前周期暂无计费数据，柱高按调用次数绘制';
+      usageChartSubtitle.textContent = '按调用次数';
     }
 
     const vbWidth = 860;
@@ -284,10 +296,26 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
 
       const group = svgNode('g', { class: 'usage-chart-bar-group' });
       const title = svgNode('title');
+      const bucketCacheRead = bucket.cacheReadTokens ?? 0;
+      const bucketCacheWrite = bucket.cacheWriteTokens ?? 0;
+      const bucketPrompt = bucket.inputTokens + bucketCacheRead + bucketCacheWrite;
+      const bucketTokenParts = [
+        `输入 ${formatInt(bucket.inputTokens)}`,
+        `输出 ${formatInt(bucket.outputTokens)}`,
+      ];
+      if (bucketCacheRead > 0) {
+        bucketTokenParts.push(`缓读 ${formatInt(bucketCacheRead)}`);
+      }
+      if (bucketCacheWrite > 0) {
+        bucketTokenParts.push(`缓写 ${formatInt(bucketCacheWrite)}`);
+      }
+      const bucketHitSuffix = bucketCacheRead > 0 && bucketPrompt > 0
+        ? ` · 缓存命中 ${formatPercent(bucketCacheRead / bucketPrompt)}`
+        : '';
       title.textContent = [
         bucket.label,
         `调用：${formatInt(bucket.calls)} 次`,
-        `Token：${formatInt(bucket.totalTokens)}（输入 ${formatInt(bucket.inputTokens)} / 输出 ${formatInt(bucket.outputTokens)}）`,
+        `Token：${formatInt(bucket.totalTokens)}（${bucketTokenParts.join(' / ')}）${bucketHitSuffix}`,
         `金额：${formatCny(bucket.costCny)} (${formatUsd(bucket.costUsd)})`,
       ].join('\n');
       group.append(title);
@@ -409,14 +437,41 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
     );
     const cacheTotal = item.cacheReadTokens + item.cacheWriteTokens;
     if (cacheTotal > 0) {
-      tokensRow.append(node('span', `缓存读/写: ${formatInt(item.cacheReadTokens)} / ${formatInt(item.cacheWriteTokens)}`, 'hub-meta-chip'));
+      const hitSuffix = item.cacheReadTokens > 0 ? ` · 命中 ${formatPercent(item.cacheHitRate)}` : '';
+      const write1hSuffix = item.cacheWrite1hTokens > 0 ? `（含 1h 写 ${formatInt(item.cacheWrite1hTokens)}）` : '';
+      tokensRow.append(
+        node(
+          'span',
+          `缓存读/写: ${formatInt(item.cacheReadTokens)} / ${formatInt(item.cacheWriteTokens)}${write1hSuffix}${hitSuffix}`,
+          item.cacheReadTokens > 0 ? 'hub-meta-chip usage-cache-chip-hit' : 'hub-meta-chip',
+        ),
+      );
+      if (item.cacheSavingsUsd > 0) {
+        tokensRow.append(
+          node(
+            'span',
+            `缓存净省: ${formatPrimarySavings(item, current.prefs.currency)}`,
+            'hub-meta-chip usage-cache-chip-savings',
+          ),
+        );
+      } else if (item.cacheSavingsUsd < 0) {
+        tokensRow.append(
+          node(
+            'span',
+            `缓写净增: ${formatPrimarySavings({ cacheSavingsUsd: Math.abs(item.cacheSavingsUsd), cacheSavingsCny: Math.abs(item.cacheSavingsCny) }, current.prefs.currency)}`,
+            'hub-meta-chip usage-cache-chip-surcharge',
+          ),
+        );
+      }
     }
     if (item.reasoningTokens > 0) {
       tokensRow.append(node('span', `思考(含于输出): ${formatInt(item.reasoningTokens)}`, 'hub-meta-chip'));
     }
     const unitRateText = item.costSource === 'free'
       ? '单价: 免费'
-      : `单价参考: ${formatUnitRate(item.unitInputUsdPer1M)} / ${formatUnitRate(item.unitOutputUsdPer1M)} per 1M`;
+      : item.unitInputUsdPer1M <= 0 && item.unitOutputUsdPer1M <= 0
+        ? '单价: 未知'
+        : `单价参考: 输 ${formatUnitRate(item.unitInputUsdPer1M)} / 出 ${formatUnitRate(item.unitOutputUsdPer1M)} / 缓读 ${formatUnitRate(item.unitCacheReadUsdPer1M)} / 缓写 ${formatUnitRate(item.unitCacheWriteUsdPer1M)} per 1M`;
     tokensRow.append(node('span', unitRateText, 'hub-meta-chip'));
     if (item.lastUsedAt > 0) {
       tokensRow.append(node('span', `最近调用: ${timestamp(item.lastUsedAt)}`, 'hub-meta-chip'));
@@ -475,18 +530,30 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
     }
 
     const { totals, byModel } = current;
-    const cacheTokens = totals.cacheReadTokens + totals.cacheWriteTokens;
     const tokenSubParts = [
       `输入 ${formatCompact(totals.inputTokens)}`,
       `输出 ${formatCompact(totals.outputTokens)}`,
-      `缓存 ${formatCompact(cacheTokens)}`,
     ];
+    if (totals.cacheReadTokens > 0) {
+      tokenSubParts.push(`缓读 ${formatCompact(totals.cacheReadTokens)} (命中 ${formatPercent(totals.cacheHitRate)})`);
+    }
+    if (totals.cacheWriteTokens > 0) {
+      tokenSubParts.push(`缓写 ${formatCompact(totals.cacheWriteTokens)}`);
+    }
+    if (totals.cacheReadTokens === 0 && totals.cacheWriteTokens === 0) {
+      tokenSubParts.push('缓存 0');
+    }
     if (totals.reasoningTokens > 0) {
       tokenSubParts.push(`思考 ${formatCompact(totals.reasoningTokens)}`);
     }
 
     const primaryMoney = formatPrimaryMoney(totals, currency);
     const secondaryMoney = currency === 'USD' ? formatCny(totals.costCny) : formatUsd(totals.costUsd);
+    const savingsSub = totals.cacheSavingsUsd > 0
+      ? ` · 缓存净省 ${formatPrimarySavings(totals, currency)}`
+      : totals.cacheSavingsUsd < 0
+        ? ` · 缓写净增 ${formatPrimarySavings({ cacheSavingsUsd: Math.abs(totals.cacheSavingsUsd), cacheSavingsCny: Math.abs(totals.cacheSavingsCny) }, currency)}`
+        : '';
     const topModel = byModel[0];
     const topModelValue = topModel ? topModel.model : '—';
     const topModelSub = topModel
@@ -512,7 +579,7 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
       kpiCard(
         '换算金额',
         primaryMoney,
-        `约 ${secondaryMoney} · 1 USD = ¥${current.prefs.usdToCnyRate.toFixed(2)}`,
+        `约 ${secondaryMoney} · 1 USD = ¥${current.prefs.usdToCnyRate.toFixed(2)}${savingsSub}`,
         totals.costUsd > 0 ? 'positive' : 'default',
       ),
       kpiCard(
@@ -590,6 +657,7 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
           currency: updated.currency,
           usdToCnyRate: updated.usdToCnyRate,
           costCny: appState.view.usageToday.costUsd * updated.usdToCnyRate,
+          cacheSavingsCny: (appState.view.usageToday.cacheSavingsUsd ?? 0) * updated.usdToCnyRate,
         };
       }
       render(true);
@@ -627,11 +695,14 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
       const primary = today.currency === 'USD' ? formatUsd(today.costUsd) : formatCny(today.costCny);
       const badgeText = `${today.calls}次 · ${primary}`;
       usageTopBadge.textContent = badgeText;
+      const cacheBadgeDetail = (today.cacheReadTokens ?? 0) > 0
+        ? ` · 缓存命中 ${formatPercent(today.cacheHitRate ?? 0)}${(today.cacheSavingsUsd ?? 0) > 0 ? ` (净省 ${formatPrimarySavings({ cacheSavingsUsd: today.cacheSavingsUsd ?? 0, cacheSavingsCny: today.cacheSavingsCny ?? 0 }, today.currency)})` : ''}`
+        : '';
       options.onBadgeChange?.({
         calls: today.calls,
         badgeText,
         moneyText: primary,
-        detailText: `今日调用 ${today.calls} 次 · ${formatInt(today.totalTokens)} tokens · ${formatCny(today.costCny)} (${formatUsd(today.costUsd)})`,
+        detailText: `今日调用 ${today.calls} 次 · ${formatInt(today.totalTokens)} tokens · ${formatCny(today.costCny)} (${formatUsd(today.costUsd)})${cacheBadgeDetail}`,
       });
     }
 

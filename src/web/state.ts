@@ -26,6 +26,7 @@ export interface AppHooks {
   loadTrace: (direction?: 'live' | 'earlier' | 'recent') => Promise<void>;
   loadWork: (id: string, generation: number, background?: boolean) => Promise<void>;
   openPluginHubModal: (pluginName?: string, expandSource?: boolean, mode?: 'catalog' | 'surface') => void;
+  openSystemHubModal: (tab?: 'models' | 'usage' | 'services', focusProviderId?: string) => void;
   closeAllHubModals: () => void;
 }
 
@@ -92,6 +93,7 @@ export const hooks: AppHooks = {
   loadTrace: async () => {},
   loadWork: async () => {},
   openPluginHubModal: () => {},
+  openSystemHubModal: () => {},
   closeAllHubModals: () => {},
 };
 

@@ -41,9 +41,12 @@ type UsageQueryStore = {
       outputTokens: number;
       cacheReadTokens: number;
       cacheWriteTokens?: number;
+      cacheHitRate?: number;
       totalTokens: number;
       costUsd: number;
       costCny: number;
+      cacheSavingsUsd?: number;
+      cacheSavingsCny?: number;
     };
     byModel?: Array<{
       spec: string;
@@ -320,11 +323,17 @@ export async function tryHandleImSlashCommand(params: {
       await ctx.sendToChannel(channel.id, emptyLines.join('\n'), replyOpts).catch(() => {});
       return { ok: true, action: 'command_usage' };
     }
+    const hitRateStr = totals.cacheReadTokens > 0 && typeof totals.cacheHitRate === 'number'
+      ? ` · 命中 ${(totals.cacheHitRate * 100).toFixed(1)}%`
+      : '';
+    const savingsStr = typeof totals.cacheSavingsUsd === 'number' && totals.cacheSavingsUsd > 0
+      ? ` · 缓存净省 ¥${formatMoney(totals.cacheSavingsCny ?? 0)} ($${formatMoney(totals.cacheSavingsUsd)})`
+      : '';
     const lines = [
       `📊 今日模型用量 (${label})`,
       `• 调用次数: ${totals.calls} 次${totals.failedCalls ? ` (成功 ${totals.successCalls ?? 0} / 失败 ${totals.failedCalls})` : ''}`,
-      `• Token 总数: ${formatCount(totals.totalTokens)} (输入 ${formatCount(totals.inputTokens)} / 输出 ${formatCount(totals.outputTokens)} / 缓存读 ${formatCount(totals.cacheReadTokens)}${totals.cacheWriteTokens ? ` / 缓存写 ${formatCount(totals.cacheWriteTokens)}` : ''})`,
-      `• 折算费用: ¥${formatMoney(totals.costCny)} ($${formatMoney(totals.costUsd)})${report.prefs?.usdToCnyRate ? ` · 汇率 ${report.prefs.usdToCnyRate}` : ''}`,
+      `• Token 总数: ${formatCount(totals.totalTokens)} (输入 ${formatCount(totals.inputTokens)} / 输出 ${formatCount(totals.outputTokens)} / 缓存读 ${formatCount(totals.cacheReadTokens)}${totals.cacheWriteTokens ? ` / 缓存写 ${formatCount(totals.cacheWriteTokens)}` : ''}${hitRateStr})`,
+      `• 折算费用: ¥${formatMoney(totals.costCny)} ($${formatMoney(totals.costUsd)})${report.prefs?.usdToCnyRate ? ` · 汇率 ${report.prefs.usdToCnyRate}` : ''}${savingsStr}`,
     ];
     const topModels = (report.byModel ?? []).slice(0, 5);
     if (topModels.length > 0) {

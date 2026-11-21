@@ -186,7 +186,7 @@ export function initMemoryHub(): MemoryHubController {
     const frag = document.createDocumentFragment();
     const kicker = node('div', '', 'brain-insp-kicker');
     kicker.append(
-      node('span', `NEURON · ${item.id.slice(0, 8)}`),
+      node('span', '记忆神经元'),
       node('span', `提取 ${item.accessCount ?? 0} 次`),
     );
     frag.append(kicker);
@@ -219,7 +219,7 @@ export function initMemoryHub(): MemoryHubController {
       const basePool = fullMemoriesCache ?? appState.view?.memoryDirectory?.items ?? [];
       for (const syn of item.synapses.slice(0, 8)) {
         const targetMem = basePool.find(m => m.id === syn.targetId);
-        const targetTitle = syn.targetTopic ?? targetMem?.topic ?? syn.targetId.slice(0, 8);
+        const targetTitle = syn.targetTopic ?? targetMem?.topic ?? '关联记忆';
         const relText = synapseRelationNames[syn.relation] ?? syn.relation;
         synList.append(button(
           `⚡ ${targetTitle} · ${Math.round(syn.weight * 100)}% (${relText})`,
@@ -375,7 +375,7 @@ export function initMemoryHub(): MemoryHubController {
         const synBox = node('div', '', 'hub-synapse-box');
         synBox.append(node('span', `⚡ 突触连接 (${item.synapses.length})：`, 'hub-synapse-label'));
         for (const syn of item.synapses.slice(0, 6)) {
-          const targetTitle = syn.targetTopic ?? fullMemoriesCache?.find(m => m.id === syn.targetId)?.topic ?? syn.targetId.slice(0, 8);
+          const targetTitle = syn.targetTopic ?? fullMemoriesCache?.find(m => m.id === syn.targetId)?.topic ?? '关联记忆';
           const relText = synapseRelationNames[syn.relation] ?? syn.relation;
           const chip = button(
             `🔗 ${targetTitle} · ${Math.round(syn.weight * 100)}% (${relText})`,

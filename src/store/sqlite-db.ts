@@ -77,11 +77,14 @@ export class SqliteDb {
         output_tokens INTEGER NOT NULL DEFAULT 0,
         cache_read_tokens INTEGER NOT NULL DEFAULT 0,
         cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0,
         reasoning_tokens INTEGER NOT NULL DEFAULT 0,
         total_tokens INTEGER NOT NULL DEFAULT 0,
         cost_usd REAL NOT NULL DEFAULT 0,
         unit_input_usd REAL NOT NULL DEFAULT 0,
         unit_output_usd REAL NOT NULL DEFAULT 0,
+        unit_cache_read_usd REAL NOT NULL DEFAULT 0,
+        unit_cache_write_usd REAL NOT NULL DEFAULT 0,
         cost_source TEXT NOT NULL DEFAULT 'unknown',
         status TEXT NOT NULL DEFAULT 'completed',
         task_id TEXT,
@@ -110,6 +113,28 @@ export class SqliteDb {
       this.db.exec('CREATE INDEX IF NOT EXISTS memories_active_pinned ON memories(superseded_by, pinned DESC, updated_at DESC);');
       this.db.exec('PRAGMA user_version = 2;');
     }
+    if (version < 3) {
+      this.migrateModelUsageCacheColumns();
+      this.db.exec('PRAGMA user_version = 3;');
+    }
+  }
+
+  private migrateModelUsageCacheColumns(): void {
+    const cols = new Set(
+      (this.db.prepare('PRAGMA table_info(model_usage)').all() as Array<Record<string, unknown>>)
+        .map(row => String(row.name ?? '')),
+    );
+    this.transaction(() => {
+      if (!cols.has('cache_write_1h_tokens')) {
+        this.db.exec('ALTER TABLE model_usage ADD COLUMN cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0;');
+      }
+      if (!cols.has('unit_cache_read_usd')) {
+        this.db.exec('ALTER TABLE model_usage ADD COLUMN unit_cache_read_usd REAL NOT NULL DEFAULT 0;');
+      }
+      if (!cols.has('unit_cache_write_usd')) {
+        this.db.exec('ALTER TABLE model_usage ADD COLUMN unit_cache_write_usd REAL NOT NULL DEFAULT 0;');
+      }
+    });
   }
 
   private migrateMemoriesColumns(): void {

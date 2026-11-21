@@ -8,6 +8,12 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { offlineFactory } from '../src/agent.js';
 import { Coordinator } from '../src/coordinator.js';
+import {
+  classifyBashCommandCs80Scene,
+  classifyFastpathCs80Scene,
+  classifyPluginCs80Scene,
+  formatInboundMarqueePreview,
+} from '../src/cs80-scene.js';
 import { SubconsciousController } from '../src/orchestrator/subconscious-loop.js';
 import { listPlugins, runPlugin } from '../src/plugin.js';
 import { Store } from '../src/store.js';
@@ -242,6 +248,84 @@ test('3. End-to-end daemon.py --mock-sidecar integrates with cs80-face plugin fo
       body: JSON.stringify({ action: 'voice', phase: 'idle' }),
     });
 
+    // Inbound message preview push + dynamic scene states + priority protection
+    const inRes = await fetch(`http://127.0.0.1:${port}/api/control`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'inbound', channel: 'wechat', text: '帮我打开客厅空调并打印报表', holdSec: 8 }),
+    });
+    assert.equal(inRes.status, 200);
+
+    for (const [scene, channel] of [
+      ['speaking', 'xiaoai'],
+      ['sending_msg', 'wechat'],
+      ['sending_msg', 'telegram'],
+      ['printing', ''],
+      ['operating_xiaoai', ''],
+      ['operating_tv', ''],
+      ['managing_laifen', ''],
+      ['weighing_scale', ''],
+    ] as const) {
+      const scResp = await fetch(`http://127.0.0.1:${port}/api/control`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'scene', scene, phase: 'start', channel, holdSec: 5, force: true }),
+      });
+      assert.equal(scResp.status, 200);
+      await until(async () => {
+        const st = await (await fetch(`http://127.0.0.1:${port}/api/status`)).json() as { botState?: string };
+        return st.botState === scene;
+      }, 50, 15);
+    }
+
+    // Priority check: speaking (prio 1) must not overwrite active operating_xiaoai (prio 2)
+    await fetch(`http://127.0.0.1:${port}/api/control`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'scene', scene: 'operating_xiaoai', phase: 'start', holdSec: 5, force: true }),
+    });
+    await fetch(`http://127.0.0.1:${port}/api/control`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'scene', scene: 'speaking', phase: 'start', channel: 'xiaoai', holdSec: 5 }),
+    });
+    const stPrio = await (await fetch(`http://127.0.0.1:${port}/api/status`)).json() as { botState?: string };
+    assert.equal(stPrio.botState, 'operating_xiaoai');
+
+    // Explicit wake interrupts any scene back to listening, and idle restores auto state
+    await fetch(`http://127.0.0.1:${port}/api/control`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'voice', phase: 'listening', keyword: '星期五', followUp: false }),
+    });
+    const stWake = await (await fetch(`http://127.0.0.1:${port}/api/status`)).json() as { botState?: string };
+    assert.equal(stWake.botState, 'listening');
+    await fetch(`http://127.0.0.1:${port}/api/control`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'voice', phase: 'idle' }),
+    });
+
+    // Live health-scale BLE session file transitions daemon cleanly to weighing_scale and back to idle
+    const hsSessDir = join(home, 'plugins', 'health-scale');
+    await mkdir(hsSessDir, { recursive: true });
+    await writeFile(
+      join(hsSessDir, 'live-session.json'),
+      JSON.stringify({ sessionId: 'm-live-1', phase: 'measuring', updatedAt: Date.now() }),
+    );
+    await until(async () => {
+      const st = await (await fetch(`http://127.0.0.1:${port}/api/status`)).json() as { botState?: string };
+      return st.botState === 'weighing_scale';
+    }, 80, 20);
+    await writeFile(
+      join(hsSessDir, 'live-session.json'),
+      JSON.stringify({ sessionId: 'm-live-1', phase: 'completed', updatedAt: Date.now() }),
+    );
+    await until(async () => {
+      const st = await (await fetch(`http://127.0.0.1:${port}/api/status`)).json() as { botState?: string };
+      return st.botState !== 'weighing_scale';
+    }, 80, 20);
+
     // Dashboard & layout actions via cs80-face plugin
     const dashRes = await runPlugin(home, 'cs80-face', 'dashboard', {});
     assert.equal(dashRes.ok, true);
@@ -388,6 +472,10 @@ class _Surf:
     @classmethod
     def create_for_data(cls, buf, fmt, w, h, stride):
         return cls(fmt, w, h)
+    @classmethod
+    def create_from_png(cls, path):
+        return cls(0, 710, 624)
+    def get_width(self): return self._w
     def get_height(self): return self._h
     def flush(self): pass
     def write_to_png(self, buf): buf.write(b"\\x89PNG\\r\\n\\x1a\\nfakepng")
@@ -398,6 +486,8 @@ class _Ctx:
     def save(self): pass
     def restore(self): pass
     def translate(self, x, y): pass
+    def scale(self, sx, sy): pass
+    def rotate(self, rad): pass
     def set_antialias(self, a): pass
     def set_source_rgb(self, *rgb): pass
     def set_source_rgba(self, *rgba): pass
@@ -435,6 +525,7 @@ fake_cairo.LINE_JOIN_ROUND = 1
 fake_cairo.ImageSurface = _Surf
 fake_cairo.Context = _Ctx
 fake_cairo.LinearGradient = _Grad
+fake_cairo.RadialGradient = _Grad
 
 import renderer as rmod
 from avatar_math import BotAnimator
@@ -479,29 +570,34 @@ assert n_full == 1 and n_band == 1, (n_full, n_band)
 assert _st.unpack_from("<HH", tiles_band, 0) == (96, 656) and tiles_band[:1032] == tiles_full[:1032]
 
 # 2. Check fallback tile-diff count stays <= 160 during marquee step
-r_fb = rmod.FaceRenderer()
-anim = BotAnimator()
-anim.set_state("idle")
-snap = anim.step(0.05)
-hud_scroll = rmod.HudState(
-    headline_source="WX · 22:00",
-    headline_text="A" * 80,
-    marquee_mode="continuous",
-    friday_connected=True,
-    clock_hm="22:00",
-)
-r_fb.render_frame(snap, hud_scroll)
-r_fb.marquee.phase = "scroll"
-r_fb.marquee.scroll_x += 32.0
-# Advance marquee only while keeping stage/bento identical
-r_fb._render_fallback_bgra(snap, hud_scroll, placed_cards=())
-r_fb.fast.bgra_to_bgr565(r_fb._bgra, r_fb._curr565)
-dirty = r_fb.fast.diff_tiles(r_fb._prev565, r_fb._curr565, r_fb._tiles_buf, 160)
-assert dirty <= 160, f"marquee step dirtied {dirty} tiles > 160"
+_orig_cairo = rmod.cairo
+rmod.cairo = None
+try:
+    r_fb = rmod.FaceRenderer()
+    anim = BotAnimator()
+    anim.set_state("idle")
+    snap = anim.step(0.05)
+    hud_scroll = rmod.HudState(
+        headline_source="WX · 22:00",
+        headline_text="A" * 80,
+        marquee_mode="continuous",
+        friday_connected=True,
+        clock_hm="22:00",
+    )
+    r_fb.render_frame(snap, hud_scroll)
+    r_fb.marquee.phase = "scroll"
+    r_fb.marquee.scroll_x += 32.0
+    # Advance marquee only while keeping stage/bento identical
+    r_fb._render_fallback_bgra(snap, hud_scroll, placed_cards=())
+    r_fb.fast.bgra_to_bgr565(r_fb._bgra, r_fb._curr565)
+    dirty = r_fb.fast.diff_tiles(r_fb._prev565, r_fb._curr565, r_fb._tiles_buf, 160)
+    assert dirty <= 160, f"marquee step dirtied {dirty} tiles > 160"
+finally:
+    rmod.cairo = _orig_cairo
 
 # 3. LayoutStore, Bento packer, all-15-builtin + custom plugin catalog & telemetry collectors
 import sqlite3, time as _time
-from widgets import WidgetDataHub, _extract_scalars, default_pages_payload
+from widgets import WidgetDataHub, _extract_scalars, _wgs84_to_gcj02, default_pages_payload
 
 expected_builtin_kinds = {
     "fund-tracker", "health-scale", "miot", "ninebot", "laifen", "netlea", "apple-devices",
@@ -686,6 +782,27 @@ assert hub.get_widget("netlea")["brightness"] == 100
 hub._collect_apple_devices(apple_cache, connected=True)
 assert hub.get_widget("apple-devices")["online"] == 1
 
+# Verify GCJ-02 geofence matches WGS-84 Apple location & outside-fence shortAddress displays without leaking coordinates
+gcj_home_lat, gcj_home_lon = _wgs84_to_gcj02(31.2305, 121.4738)
+(apple_dir / "config.json").write_text(json.dumps({
+    "minBatteryPct": 25,
+    "places": {"家": {"lat": gcj_home_lat, "lng": gcj_home_lon, "radiusMeters": 120}},
+}), encoding="utf-8")
+apple_cache.write_text(json.dumps({
+    "fetchedAt": now_ms,
+    "entries": [
+        {"device": {"name": "iPhone 17 Pro", "category": "iphone", "batteryPercent": 88, "batteryStatus": "NotCharging", "online": True, "location": {"latitude": 31.2305, "longitude": 121.4738, "shortAddress": "黄浦区人民广场"}}},
+        {"device": {"name": "MacBook Pro", "category": "mac", "batteryPercent": 72, "batteryStatus": "NotCharging", "online": True, "location": {"latitude": 31.2988, "longitude": 121.5299, "shortAddress": "杨浦区五角场万达"}}},
+    ],
+}), encoding="utf-8")
+hub._collect_apple_devices(apple_cache, connected=False)
+ap_geo_w = hub.get_widget("apple-devices")
+assert ap_geo_w["devices"][0]["place"] == "在家", ap_geo_w
+assert ap_geo_w["devices"][1]["place"] == "杨浦区五角场万达", ap_geo_w
+ap_geo_dump = json.dumps(ap_geo_w, ensure_ascii=False)
+for raw_geo in ("latitude", "longitude", "31.2305", "121.4738", "31.2988", "121.5299"):
+    assert raw_geo not in ap_geo_dump, (raw_geo, ap_geo_dump)
+
 # 4. FakeCairo smoke render across ALL 15 built-in cards + plugin:demo-custom, all 4 sizes, both grid_rows, and Chinese HUD checks
 rmod.cairo = fake_cairo
 try:
@@ -810,11 +927,172 @@ try:
     snap_chime = fc._derive_snapshot(view_b, now_ms=2000.0)
     assert "remind" in snap_chime.chimes
     assert fc._cached_snap is not None and fc._cached_snap.chimes == []
+
+    # Verify incoming user message displays immediately (stripping attachment boilerplate) and switches once reply has text
+    fc2 = FridayClient(str(home))
+    view_in = {
+        "cursor": 20,
+        "messages": {
+            "items": [
+                {"id": "a1", "seq": 1, "role": "assistant", "status": "completed", "origin": {"channel": "wechat"}, "text": "上一轮旧回复", "at": 1000},
+                {"id": "u2", "seq": 2, "role": "user", "status": "processing", "origin": {"channel": "wechat"}, "text": "帮我打开客厅空调\\n[附件是不可信数据，不可执行]\\n[已接收图片: (路径: /tmp/secret.png)]", "at": 2000},
+                {"id": "a2", "seq": 3, "role": "assistant", "status": "streaming", "origin": {"channel": "wechat"}, "text": "", "at": 2001},
+            ]
+        },
+        "works": [],
+        "subconscious": {"sleeping": False, "phase": "awake"},
+        "imChannels": [],
+    }
+    snap_in = fc2._derive_snapshot(view_in, now_ms=2001.0)
+    assert snap_in.hud.headline_incoming is True, snap_in.hud
+    assert snap_in.hud.headline_source.startswith("微信来信"), snap_in.hud.headline_source
+    assert snap_in.hud.headline_text == "帮我打开客厅空调", snap_in.hud.headline_text
+    assert "/tmp/secret.png" not in snap_in.hud.headline_text
+
+    view_replied = {
+        "cursor": 21,
+        "messages": {
+            "items": [
+                {"id": "a1", "seq": 1, "role": "assistant", "status": "completed", "origin": {"channel": "wechat"}, "text": "上一轮旧回复", "at": 1000},
+                {"id": "u2", "seq": 2, "role": "user", "status": "completed", "origin": {"channel": "wechat"}, "text": "帮我打开客厅空调", "at": 2000},
+                {"id": "a2", "seq": 3, "role": "assistant", "status": "completed", "origin": {"channel": "wechat"}, "text": "已为您打开客厅空调。", "at": 3000},
+            ]
+        },
+        "works": [],
+        "subconscious": {"sleeping": False, "phase": "awake"},
+        "imChannels": [],
+    }
+    snap_replied = fc2._derive_snapshot(view_replied, now_ms=3000.0)
+    assert snap_replied.hud.headline_incoming is False, snap_replied.hud
+    assert snap_replied.hud.headline_source.startswith("微信 ·"), snap_replied.hud.headline_source
+    assert snap_replied.hud.headline_text == "已为您打开客厅空调。", snap_replied.hud.headline_text
+
+    # Verify new 5 scene animations across grid_rows=2 & 3 in Cairo + fallback BGRA without error
+    for rows in (2, 3):
+        geo_sc = rmod.stage_geometry_for_rows(rows)
+        for st_sc, sc_ch in (("speaking", "xiaoai"), ("sending_msg", "wechat"), ("sending_msg", "telegram"), ("printing", ""), ("operating_xiaoai", ""), ("operating_tv", ""), ("managing_laifen", ""), ("weighing_scale", "")):
+            anim_sc = BotAnimator()
+            anim_sc.set_state(st_sc)
+            sc_snap = anim_sc.step(0.12, center_x=geo_sc["face_cx"], center_y=geo_sc["face_cy"], base_radius=geo_sc["face_r"])
+            hud_sc = rmod.HudState(
+                grid_rows=rows,
+                headline_source="微信来信 · 15:20",
+                headline_text="收到测试来信",
+                headline_incoming=True,
+                scene_channel=sc_ch,
+                friday_connected=True,
+                clock_hm="15:20",
+            )
+            r_fc.render_frame(sc_snap, hud_sc, placed_cards=(), widget_data={})
+            r_fb._render_fallback_bgra(sc_snap, hud_sc, placed_cards=())
+
+    # Verify Ninebot collector + renderer on locked low-battery M95C state (never misreports unlocked)
+    nb_dir = home / "plugins" / "ninebot"
+    nb_dir.mkdir(parents=True, exist_ok=True)
+    (nb_dir / "config.json").write_text(json.dumps({"defaultSn": "M95C-LOCK-TST"}), encoding="utf-8")
+    (nb_dir / "vehicle-dark.png").write_bytes(b"\\x89PNG\\r\\n\\x1a\\n" + b"\\x00" * 80)
+    nb_db = nb_dir / "ninebot.sqlite"
+    con_nb = sqlite3.connect(str(nb_db))
+    con_nb.execute("CREATE TABLE snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, sn TEXT, captured_at INTEGER, battery INTEGER, aux_battery INTEGER, voltage_v REAL, temp_c REAL, charging INTEGER, charging_power_w REAL, effective_range_km REAL, odometer_km REAL, power_on INTEGER, locked INTEGER, gcj_lat REAL, gcj_lon REAL, address TEXT, payload_json TEXT)")
+    con_nb.execute("CREATE TABLE trips (sn TEXT, travel_id TEXT, start_time INTEGER, end_time INTEGER, duration_sec INTEGER, distance_km REAL, max_speed_kmh REAL, avg_speed_kmh REAL, used_electricity REAL, month TEXT, payload_json TEXT, updated_at INTEGER)")
+    con_nb.execute("CREATE TABLE alert_state (sn TEXT, alert_key TEXT, active INTEGER, last_notified_at INTEGER, last_value TEXT)")
+    nb_payload = {"name": "小9", "modelName": "九号电动M95C", "color": "英伦绿", "capturedAt": now_ms, "battery": 12, "auxBattery": 100, "voltageV": 71.3, "temperatureC": 12, "charging": False, "effectiveRangeKm": 11.5, "odometerKm": 16529.8, "powerOn": False, "locked": True, "location": {"valid": True, "address": "科技路1号"}}
+    con_nb.execute("INSERT INTO snapshots (sn, captured_at, battery, aux_battery, voltage_v, temp_c, charging, effective_range_km, odometer_km, power_on, locked, address, payload_json) VALUES (?, ?, 12, 100, 71.3, 12, 0, 11.5, 16529.8, 0, 1, '科技路1号', ?)", ("M95C-LOCK-TST", now_ms, json.dumps(nb_payload, ensure_ascii=False)))
+    con_nb.execute("INSERT INTO alert_state VALUES (?, 'low_battery', 1, ?, '12')", ("M95C-LOCK-TST", now_ms))
+    con_nb.commit()
+    con_nb.close()
+    hub._collect_ninebot(nb_db, connected=False)
+    nb_w = hub.get_widget("ninebot")
+    assert nb_w["ok"] is True and nb_w["locked"] is True and nb_w["powerOn"] is False, nb_w
+    assert nb_w["subline"].startswith("已上锁") and nb_w["imagePath"].endswith("vehicle-dark.png"), nb_w
+
+    _Ctx.shown_texts.clear()
+    geo3 = rmod.stage_geometry_for_rows(3)
+    for sz in ("1x1", "2x1", "1x2", "2x2"):
+        cards_nb, _ = pack_bento_page([{"id": "nb", "kind": "ninebot", "size": sz}], grid_rows=3, x0=36.0, y0=geo3["grid_y"], total_w=728.0, total_h=geo3["grid_h"], gap=geo3["gap"])
+        r_fc.render_frame(lsnap, rmod.HudState(grid_rows=3, friday_connected=True, auto_task_overlay=False), placed_cards=cards_nb, widget_data={"ninebot": nb_w})
+    nb_rendered = " | ".join(_Ctx.shown_texts)
+    assert "已上锁 · 低电" in nb_rendered and "已设防" in nb_rendered, nb_rendered
+    assert "未锁车" not in nb_rendered and "未上锁" not in nb_rendered, nb_rendered
 finally:
-    rmod.cairo = None
+    rmod.cairo = _orig_cairo
 `;
     execFileSync('python3', ['-c', pySmoke], { cwd: REPO_ROOT, stdio: 'pipe' });
   } finally {
     await rm(tmpHome, { recursive: true, force: true });
   }
+});
+
+test('5. CS80 scene classifiers & inbound preview formatter accurately distinguish mutating actions from readonly queries', () => {
+  assert.deepEqual(classifyPluginCs80Scene('tv-ir', 'press', { key: 'ok' })?.scene, 'operating_tv');
+  assert.equal(classifyPluginCs80Scene('tv-ir', 'status', {}), undefined);
+  assert.equal(classifyPluginCs80Scene('tv-ir', 'press', { key: 'ok', dryRun: true }), undefined);
+
+  assert.deepEqual(classifyPluginCs80Scene('tv-agent', 'open_app', { app: 'bili' })?.scene, 'operating_tv');
+  assert.deepEqual(classifyPluginCs80Scene('tv-agent', 'volume', { level: 30 })?.scene, 'operating_tv');
+  assert.equal(classifyPluginCs80Scene('tv-agent', 'volume', {}), undefined);
+  assert.equal(classifyPluginCs80Scene('tv-agent', 'cast', { op: 'info' }), undefined);
+  assert.deepEqual(classifyPluginCs80Scene('tv-agent', 'cast', { op: 'play', url: 'http://x' })?.scene, 'operating_tv');
+
+  assert.deepEqual(classifyPluginCs80Scene('miot', 'set', { device: '客厅灯', on: true })?.scene, 'operating_xiaoai');
+  assert.deepEqual(classifyPluginCs80Scene('miot', 'set', { device: '客厅电视', on: false })?.scene, 'operating_tv');
+  assert.equal(classifyPluginCs80Scene('miot', 'devices', { live: true }), undefined);
+  assert.equal(classifyPluginCs80Scene('miot', 'cook', { op: 'status' }), undefined);
+  assert.deepEqual(classifyPluginCs80Scene('miot', 'cook', { op: 'start', tempC: 180 })?.scene, 'operating_xiaoai');
+
+  assert.deepEqual(classifyFastpathCs80Scene({ text: '打开客厅灯', platform: 'xiaoai' }, { handled: true, plugin: 'miot', action: 'set' })?.scene, 'operating_xiaoai');
+  assert.deepEqual(classifyFastpathCs80Scene({ text: '确认', platform: 'xiaoai' }, { handled: true, plugin: 'tv-ir', action: 'press' })?.scene, 'operating_tv');
+  assert.equal(classifyFastpathCs80Scene({ text: '', sessionState: { event: 'assistant_reply' } }, { handled: true, plugin: 'tv-ir', action: 'press' }), undefined);
+  assert.equal(classifyFastpathCs80Scene({ text: '退出遥控', platform: 'xiaoai' }, { handled: true, plugin: 'tv-ir', action: 'tv_remote_exit' })?.phase, 'end');
+
+  assert.deepEqual(classifyBashCommandCs80Scene('lp -d Office_HP /tmp/report.pdf')?.scene, 'printing');
+  assert.deepEqual(classifyBashCommandCs80Scene('cd /tmp && lpr out.ps')?.scene, 'printing');
+  assert.equal(classifyBashCommandCs80Scene('lpstat -p -d'), undefined);
+  assert.equal(classifyBashCommandCs80Scene('grep lp README.md'), undefined);
+
+  // Laifen toothbrush & Wolai A1 scale scenes (mutating triggers vs readonly queries)
+  assert.deepEqual(classifyPluginCs80Scene('laifen', 'sync', {})?.scene, 'managing_laifen');
+  assert.deepEqual(classifyPluginCs80Scene('laifen', 'set', { mode: 2 })?.scene, 'managing_laifen');
+  assert.deepEqual(classifyPluginCs80Scene('laifen', 'status', { live: true })?.scene, 'managing_laifen');
+  assert.equal(classifyPluginCs80Scene('laifen', 'status', {}), undefined);
+  assert.equal(classifyPluginCs80Scene('laifen', 'dashboard', {}), undefined);
+  assert.equal(classifyPluginCs80Scene('laifen', 'monitor-status', {}), undefined);
+  assert.equal(classifyPluginCs80Scene('laifen', 'watch-start', {}), undefined);
+  assert.equal(classifyPluginCs80Scene('laifen', 'config', {}), undefined);
+  assert.equal(classifyPluginCs80Scene('laifen', 'monitor-stop', {})?.phase, 'end');
+
+  assert.deepEqual(classifyPluginCs80Scene('health-scale', 'measure-start', { timeoutSec: 45 })?.scene, 'weighing_scale');
+  assert.equal(classifyPluginCs80Scene('health-scale', 'measure-start', { timeoutSec: 45 })?.finishHoldSec, 50);
+  assert.deepEqual(classifyPluginCs80Scene('health-scale', 'scan', {})?.scene, 'weighing_scale');
+  assert.equal(classifyPluginCs80Scene('health-scale', 'dashboard', {}), undefined);
+  assert.equal(classifyPluginCs80Scene('health-scale', 'measure-status', {}), undefined);
+  assert.equal(classifyPluginCs80Scene('health-scale', 'measure-stop', {})?.phase, 'end');
+
+  // Fastpath classifications including assistant_reply tv_remote_enter and exit
+  assert.deepEqual(
+    classifyFastpathCs80Scene(
+      { text: '', platform: 'xiaoai', sessionState: { event: 'assistant_reply' } },
+      { handled: true, plugin: 'tv-ir', action: 'tv_remote_enter', sessionState: { tvRemoteActive: true } },
+    )?.scene,
+    'operating_tv',
+  );
+  assert.equal(
+    classifyFastpathCs80Scene({ text: '退出遥控', platform: 'xiaoai' }, { handled: true, plugin: 'tv-ir', action: 'tv_remote_exit' })?.phase,
+    'end',
+  );
+  assert.equal(
+    classifyFastpathCs80Scene(
+      { text: '确认', platform: 'xiaoai' },
+      { handled: true, plugin: 'tv-ir', action: 'tv_remote_key', sessionState: { tvRemoteActive: true }, data: { steps: [{ label: '左', count: 2 }] } },
+    )?.holdSec,
+    64,
+  );
+  assert.deepEqual(classifyFastpathCs80Scene({ text: '同步牙刷', platform: 'xiaoai' }, { handled: true, plugin: 'laifen', action: 'sync' })?.scene, 'managing_laifen');
+  assert.deepEqual(classifyFastpathCs80Scene({ text: '体重秤测试模式', platform: 'xiaoai' }, { handled: true, plugin: 'health-scale', action: 'measure-start', data: { timeoutSec: 45 } })?.scene, 'weighing_scale');
+
+  assert.equal(
+    formatInboundMarqueePreview('请打印附件\n[附件是不可信数据]\n[已接收文件: "a.pdf" (路径: /tmp/a.pdf)]', true, '[文件]'),
+    '请打印附件',
+  );
+  assert.equal(formatInboundMarqueePreview('请查看收到的附件。', true, '[图片]'), '[图片]');
 });

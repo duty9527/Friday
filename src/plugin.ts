@@ -4,6 +4,7 @@ import { mkdir } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
+import { classifyFastpathCs80Scene, classifyPluginCs80Scene, notifyCs80Scene } from './cs80-scene.js';
 import { resolveFridayHome, resolvePluginDataDir } from './paths.js';
 import type { PluginActionSpec, PluginRuntimeMode, PluginView } from './view.js';
 
@@ -311,6 +312,8 @@ export function toPluginView(manifest: PluginManifest): PluginView {
     description: manifest.description,
     entry: manifest.entry,
     enabled: manifest.enabled,
+    ...(manifest.platforms && manifest.platforms.length > 0 ? { platforms: [...manifest.platforms] } : {}),
+    ...(manifest.isBuiltin !== undefined ? { isBuiltin: manifest.isBuiltin } : {}),
     runtime: manifest.runtime,
     ...(manifest.promptHint ? { promptHint: manifest.promptHint } : {}),
     ...(manifest.voiceFastpath ? { voiceFastpath: true } : {}),
@@ -650,18 +653,57 @@ export async function runPlugin(
     throw new Error(`Plugin call depth limit (${MAX_PLUGIN_CALL_DEPTH}) exceeded invoking "${cleanName}"`);
   }
 
-  if (manifest.runtime === 'in-process') {
-    return runPluginInProcess(resolvedHome, cleanName, action, args, timeoutMs, {
-      ...options,
-      ...(allowedPlugins ? { allowedPlugins } : {}),
-      callDepth,
+  const cs80Scene = callDepth === 0 ? classifyPluginCs80Scene(cleanName, action, args) : undefined;
+  if (cs80Scene && cs80Scene.phase !== 'end') {
+    notifyCs80Scene({
+      scene: cs80Scene.scene,
+      phase: 'start',
+      ...(cs80Scene.channel ? { channel: cs80Scene.channel } : {}),
+      ...(cs80Scene.caption ? { caption: cs80Scene.caption } : {}),
+      holdSec: cs80Scene.holdSec ?? 18,
     });
+  }
+  const finishCs80Scene = (ok: boolean) => {
+    if (!cs80Scene) return;
+    if (cs80Scene.phase === 'end') {
+      if (ok) {
+        notifyCs80Scene({ scene: cs80Scene.scene, phase: 'end', tailSec: cs80Scene.tailSec ?? 0 });
+      }
+      return;
+    }
+    if (!ok || options?.signal?.aborted) {
+      notifyCs80Scene({ scene: cs80Scene.scene, phase: 'end', tailSec: 0 });
+      return;
+    }
+    notifyCs80Scene({
+      scene: cs80Scene.scene,
+      phase: 'pulse',
+      ...(cs80Scene.channel ? { channel: cs80Scene.channel } : {}),
+      ...(cs80Scene.caption ? { caption: cs80Scene.caption } : {}),
+      holdSec: cs80Scene.finishHoldSec ?? 3.8,
+    });
+  };
+
+  if (manifest.runtime === 'in-process') {
+    let ok = false;
+    try {
+      const res = await runPluginInProcess(resolvedHome, cleanName, action, args, timeoutMs, {
+        ...options,
+        ...(allowedPlugins ? { allowedPlugins } : {}),
+        callDepth,
+      });
+      ok = res.ok;
+      return res;
+    } finally {
+      finishCs80Scene(ok);
+    }
   }
 
   const pluginDataDir = resolvePluginDataDir(resolvedHome, cleanName);
   await mkdir(pluginDataDir, { recursive: true, mode: 0o700 });
 
   let stdout = '';
+  let subprocessFailed = false;
   try {
     const out = await execFileAsync(
       process.execPath,
@@ -678,6 +720,7 @@ export async function runPlugin(
   } catch (err) {
     const e = err as { name?: string; stdout?: unknown; killed?: boolean };
     if (options?.signal?.aborted || e?.name === 'AbortError' || e?.killed) {
+      finishCs80Scene(false);
       throw err;
     }
     const errStdout = typeof e?.stdout === 'string'
@@ -690,28 +733,36 @@ export async function runPlugin(
         const parsed = JSON.parse(errStdout) as unknown;
         if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
           const obj = parsed as Record<string, unknown>;
-          return formatPluginResult(
+          const formatted = formatPluginResult(
             cleanName,
             action,
             obj.ok === undefined ? { ...obj, ok: false } : obj,
             errStdout,
           );
+          finishCs80Scene(formatted.ok);
+          return formatted;
         }
       } catch {
         /* non-JSON stdout falls through to rethrowing process failure */
       }
     }
+    subprocessFailed = true;
+    finishCs80Scene(false);
     throw err;
   }
 
   const trimmed = stdout.trim();
   if (!trimmed) {
+    if (!subprocessFailed) finishCs80Scene(true);
     return { ok: true, plugin: cleanName, action, notify: false, message: '' };
   }
   try {
     const parsed = JSON.parse(trimmed) as unknown;
-    return formatPluginResult(cleanName, action, parsed, trimmed);
+    const formatted = formatPluginResult(cleanName, action, parsed, trimmed);
+    finishCs80Scene(formatted.ok);
+    return formatted;
   } catch {
+    finishCs80Scene(true);
     return {
       ok: true,
       plugin: cleanName,
@@ -765,10 +816,29 @@ export async function tryPluginVoiceFastpath(
         ),
       );
       if (result && result.handled) {
-        return {
+        const effectiveResult: VoiceFastpathResult = {
           ...result,
           plugin: result.plugin ?? manifest.name,
         };
+        const fastScene = classifyFastpathCs80Scene(request, effectiveResult);
+        if (fastScene) {
+          if (fastScene.phase === 'end') {
+            notifyCs80Scene({
+              scene: fastScene.scene,
+              phase: 'end',
+              tailSec: fastScene.tailSec ?? 0,
+            });
+          } else {
+            notifyCs80Scene({
+              scene: fastScene.scene,
+              phase: fastScene.phase ?? 'pulse',
+              ...(fastScene.channel ? { channel: fastScene.channel } : {}),
+              ...(fastScene.caption ? { caption: fastScene.caption } : {}),
+              holdSec: fastScene.holdSec ?? 3.8,
+            });
+          }
+        }
+        return effectiveResult;
       }
     } catch {
       /* voice fastpaths must fail open so the Router can still handle the utterance */

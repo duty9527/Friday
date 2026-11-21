@@ -496,7 +496,7 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
         dev ? `Mode ${dev.activeMode}` : '未连接',
         dev
           ? `振 ${dev.activeStrength ?? '--'} · 幅 ${dev.activeRange ?? '--'} · 速 ${dev.activeSpeed ?? '--'} · ${dev.durationSec}s`
-          : '支持 V1 / V2 Pro 三维自定义',
+          : '待同步',
         'accent',
       ),
       kpiCard(
@@ -529,10 +529,10 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
         dev.reminder30s ? '30s提醒开' : '30s提醒关',
         dev.airplaneMode ? '✈️飞行锁定' : '正常解锁',
       ].join(' · ');
-      deviceMetaEl.textContent = `${dev.name || 'Laifen'} [${dev.mac || data.config.targetMac || '未绑定'}] · ${dev.protocol.toUpperCase()} · RSSI ${dev.rssi ?? '--'} dBm · ${flags}`;
+      deviceMetaEl.textContent = `${dev.name || 'Laifen'} · ${dev.protocol.toUpperCase()} · RSSI ${dev.rssi ?? '--'} dBm · ${flags}`;
     } else {
       deviceMetaEl.textContent = data.config.targetMac
-        ? `已绑定 MAC ${data.config.targetMac}（尚未采集状态帧）`
+        ? '已绑定设备（尚未采集状态帧）'
         : '尚未绑定设备，可点击「扫描设备」自动绑定';
     }
 

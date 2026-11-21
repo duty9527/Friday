@@ -28,7 +28,7 @@
     {
       "name": "express",
       "label": "触发副屏表情与动作",
-      "description": "临时切换 F.R.I.D.A.Y. 的脸部表情（neutral/listening/happy/calm/surprised/inspecting/squinted/sleepy/confused/sad）、触发交互动画（poke: bounce/nod/spin）或在跑马灯上展示醒目提示。",
+      "description": "临时切换 F.R.I.D.A.Y. 的脸部表情（neutral/listening/speaking/happy/calm/surprised/inspecting/squinted/sleepy/confused/sad）或场景动画（speaking/sending_msg/printing/operating_xiaoai/operating_tv/managing_laifen/weighing_scale）、触发交互动画（poke: bounce/nod/spin）或在跑马灯上展示醒目提示。",
       "defaultArgs": { "expr": "happy", "poke": "bounce", "holdSec": 10 }
     },
     {

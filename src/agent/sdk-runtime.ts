@@ -772,7 +772,12 @@ export async function realFactory(home: string, config: {
         baseUrl: fallbackBaseUrl,
         reasoning: fetched?.reasoning ?? false,
         input: fetched?.supportsImages ? (['text', 'image'] as Array<'text' | 'image'>) : inferModelInput(id, provId),
-        cost: { input: fetched?.costInput ?? 0, output: fetched?.costOutput ?? 0, cacheRead: 0, cacheWrite: 0 },
+        cost: {
+          input: fetched?.costInput ?? 0,
+          output: fetched?.costOutput ?? 0,
+          cacheRead: fetched?.costCacheRead ?? 0,
+          cacheWrite: fetched?.costCacheWrite ?? 0,
+        },
         contextWindow: fetched?.contextWindow ?? 128_000,
         maxTokens: fetched?.maxTokens ?? 8192,
       };

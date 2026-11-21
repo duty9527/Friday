@@ -1,5 +1,7 @@
 import { createServer, type Socket } from 'node:net';
 import { chmod, rm } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import lockfile from 'proper-lockfile';
 import { privateHome } from './files.js';
 import { realFactory, offlineFactory } from './agent.js';
@@ -9,6 +11,18 @@ import { buildMindmapSnapshot } from './mindmap-flow.js';
 import { listPluginViews, runPlugin } from './plugin.js';
 import { integer, REQUEST_LIMIT, RESPONSE_LIMIT, socketPath, text, type Response } from './protocol.js';
 import type { ThinkingLevel, UsageCurrency, UsageGranularity } from './view.js';
+import type * as AmapGeoApi from '../plugins/_shared/amap-geo.js';
+
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+let cachedGeoModule: Promise<typeof AmapGeoApi> | undefined;
+
+function loadAmapGeo(): Promise<typeof AmapGeoApi> {
+  if (!cachedGeoModule) {
+    const modUrl = pathToFileURL(resolve(REPO_ROOT, 'plugins', '_shared', 'amap-geo.mjs')).href;
+    cachedGeoModule = import(modUrl) as Promise<typeof AmapGeoApi>;
+  }
+  return cachedGeoModule;
+}
 
 function parseUsageGranularity(raw: unknown): UsageGranularity {
   if (raw === undefined) return 'day';
@@ -188,6 +202,25 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
             apiKey: command.apiKey === undefined ? undefined : String(command.apiKey),
             baseUrl: command.baseUrl === undefined ? undefined : String(command.baseUrl),
           });
+          case 'geo-status': {
+            const geo = await loadAmapGeo();
+            return geo.getSystemGeoStatus({ homeDir: home });
+          }
+          case 'geo-configure': {
+            const geo = await loadAmapGeo();
+            return await geo.saveSystemGeoConfig({
+              homeDir: home,
+              amapKey: command.amapKey === undefined ? undefined : String(command.amapKey).slice(0, 256),
+              clearAmapKey: command.clearAmapKey === undefined ? undefined : Boolean(command.clearAmapKey),
+            });
+          }
+          case 'geo-probe': {
+            const geo = await loadAmapGeo();
+            return await geo.probeAmapKey({
+              homeDir: home,
+              amapKey: command.amapKey === undefined ? undefined : String(command.amapKey).slice(0, 256),
+            });
+          }
           case 'chat': {
             const files = command.files ?? [];
             if (!Array.isArray(files) || !files.every(file => typeof file === 'string')) throw new Error('files must be a string array');

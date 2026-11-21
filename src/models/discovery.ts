@@ -10,19 +10,69 @@ import {
 } from './catalog.js';
 import { resolveModelUnitPrice } from './pricing.js';
 
+interface RemoteModelPricing {
+  prompt?: string | number;
+  completion?: string | number;
+  input_cache_read?: string | number;
+  input_cache_write?: string | number;
+}
+
+function parsePerTokenRateToPer1M(value: string | number | undefined): number | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const num = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(num) || num < 0) return undefined;
+  return Number((num * 1_000_000).toFixed(6));
+}
+
 function resolveDiscoveryCost(
   providerId: string,
   modelId: string,
-  baseModel?: { cost?: { input?: number; output?: number } },
-): { costInput: number; costOutput: number } {
+  baseModel?: { cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number } },
+  remotePricing?: RemoteModelPricing,
+): { costInput: number; costOutput: number; costCacheRead?: number; costCacheWrite?: number } {
+  const remoteIn = parsePerTokenRateToPer1M(remotePricing?.prompt);
+  const remoteOut = parsePerTokenRateToPer1M(remotePricing?.completion);
+  const remoteCr = parsePerTokenRateToPer1M(remotePricing?.input_cache_read);
+  const remoteCw = parsePerTokenRateToPer1M(remotePricing?.input_cache_write);
+  if (remoteIn !== undefined && remoteOut !== undefined && (remoteIn > 0 || remoteOut > 0 || (remoteIn === 0 && remoteOut === 0 && /(?::free|-free)$/i.test(modelId)))) {
+    const resolved = resolveModelUnitPrice(providerId, modelId, {
+      costInput: remoteIn,
+      costOutput: remoteOut,
+      ...(remoteCr !== undefined && remoteCr > 0 ? { costCacheRead: remoteCr } : {}),
+      ...(remoteCw !== undefined && remoteCw > 0 ? { costCacheWrite: remoteCw } : {}),
+    });
+    return {
+      costInput: resolved.inputUsdPer1M,
+      costOutput: resolved.outputUsdPer1M,
+      costCacheRead: resolved.cacheReadUsdPer1M,
+      costCacheWrite: resolved.cacheWriteUsdPer1M,
+    };
+  }
+
   const sdkIn = baseModel?.cost?.input ?? 0;
   const sdkOut = baseModel?.cost?.output ?? 0;
   if (sdkIn > 0 || sdkOut > 0) {
-    return { costInput: sdkIn, costOutput: sdkOut };
+    const resolved = resolveModelUnitPrice(providerId, modelId, {
+      costInput: sdkIn,
+      costOutput: sdkOut,
+      ...((baseModel?.cost?.cacheRead ?? 0) > 0 ? { costCacheRead: baseModel!.cost!.cacheRead } : {}),
+      ...((baseModel?.cost?.cacheWrite ?? 0) > 0 ? { costCacheWrite: baseModel!.cost!.cacheWrite } : {}),
+    });
+    return {
+      costInput: resolved.inputUsdPer1M,
+      costOutput: resolved.outputUsdPer1M,
+      costCacheRead: resolved.cacheReadUsdPer1M,
+      costCacheWrite: resolved.cacheWriteUsdPer1M,
+    };
   }
   const fallback = resolveModelUnitPrice(providerId, modelId);
   if (fallback.source !== 'unknown') {
-    return { costInput: fallback.inputUsdPer1M, costOutput: fallback.outputUsdPer1M };
+    return {
+      costInput: fallback.inputUsdPer1M,
+      costOutput: fallback.outputUsdPer1M,
+      costCacheRead: fallback.cacheReadUsdPer1M,
+      costCacheWrite: fallback.cacheWriteUsdPer1M,
+    };
   }
   return { costInput: 0, costOutput: 0 };
 }
@@ -75,7 +125,7 @@ export async function fetchRemoteModelsFromEndpoint(
       const id = item.name.replace(/^models\//, '');
       if (/(?:tts|image-generation|embedding|aqa|imagen|veo|robotics|computer-use|audio)/i.test(id)) continue;
       const baseModel = baseById.get(id) ?? getPristineSdkModel(providerId, id);
-      const { costInput, costOutput } = resolveDiscoveryCost(providerId, id, baseModel);
+      const { costInput, costOutput, costCacheRead, costCacheWrite } = resolveDiscoveryCost(providerId, id, baseModel);
       entries.push({
         id,
         name: item.displayName || baseModel?.name || id,
@@ -89,6 +139,8 @@ export async function fetchRemoteModelsFromEndpoint(
           : (baseModel?.maxTokens ?? 65_536),
         costInput,
         costOutput,
+        ...(costCacheRead !== undefined ? { costCacheRead } : {}),
+        ...(costCacheWrite !== undefined ? { costCacheWrite } : {}),
       });
     }
     if (!entries.length) {
@@ -121,7 +173,7 @@ export async function fetchRemoteModelsFromEndpoint(
     for (const item of rawList) {
       if (!item.id) continue;
       const baseModel = baseById.get(item.id) ?? getPristineSdkModel(providerId, item.id);
-      const { costInput, costOutput } = resolveDiscoveryCost(providerId, item.id, baseModel);
+      const { costInput, costOutput, costCacheRead, costCacheWrite } = resolveDiscoveryCost(providerId, item.id, baseModel);
       entries.push({
         id: item.id,
         name: item.display_name || baseModel?.name || item.id,
@@ -131,6 +183,8 @@ export async function fetchRemoteModelsFromEndpoint(
         maxTokens: baseModel?.maxTokens ?? 16_384,
         costInput,
         costOutput,
+        ...(costCacheRead !== undefined ? { costCacheRead } : {}),
+        ...(costCacheWrite !== undefined ? { costCacheWrite } : {}),
       });
     }
     if (!entries.length) {
@@ -169,6 +223,7 @@ export async function fetchRemoteModelsFromEndpoint(
       input_modalities?: string[];
       reasoning?: boolean;
       supports_reasoning_effort_updates?: boolean;
+      pricing?: RemoteModelPricing;
     }>;
     models?: Array<{
       id?: string;
@@ -182,6 +237,7 @@ export async function fetchRemoteModelsFromEndpoint(
       input_modalities?: string[];
       reasoning?: boolean;
       supports_reasoning_effort_updates?: boolean;
+      pricing?: RemoteModelPricing;
     }>;
   };
   const rawList = Array.isArray(data.data)
@@ -203,7 +259,7 @@ export async function fetchRemoteModelsFromEndpoint(
       : typeof item.max_context_window === 'number' && item.max_context_window > 0
         ? item.max_context_window
         : (baseModel?.contextWindow ?? 128_000);
-    const { costInput, costOutput } = resolveDiscoveryCost(providerId, id, baseModel);
+    const { costInput, costOutput, costCacheRead, costCacheWrite } = resolveDiscoveryCost(providerId, id, baseModel, item.pricing);
     entries.push({
       id,
       name: item.name || item.display_name || item.title || baseModel?.name || id,
@@ -215,6 +271,8 @@ export async function fetchRemoteModelsFromEndpoint(
         : (baseModel?.maxTokens ?? 16_384),
       costInput,
       costOutput,
+      ...(costCacheRead !== undefined ? { costCacheRead } : {}),
+      ...(costCacheWrite !== undefined ? { costCacheWrite } : {}),
     });
   }
   if (!entries.length) {

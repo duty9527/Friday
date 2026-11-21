@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
+import { notifyCs80Scene } from '../cs80-scene.js';
 import { BoundedMap, buildRequestSignal, isAllowedReplyWebhook, sanitizeImError } from '../im/types.js';
 import type { ImChannelConfig } from '../store.js';
 import {
@@ -374,10 +375,20 @@ export async function sendXiaoaiSpeech(
   }
   const webhookUrl = requestedReplyWebhook
     || (sshTargets.length === 0 ? channel.webhookUrl?.trim() : undefined);
+  const cs80Opts = { skipWhenMocked: Boolean(options?.sshRunner || options?.fetchImpl) };
+  const estimateTotalSpeechSec = (segs: readonly string[]) => {
+    const ms = segs.reduce((sum, s) => sum + Math.min(18_000, Math.max(2_200, s.length * 190 + 900)), 0);
+    return Math.min(45, Math.max(3.5, ms / 1000 + 1.2));
+  };
 
   if (webhookUrl) {
     const segments = splitSpeechSegments(rawText);
     if (segments.length === 0) return { segments: [], mode: 'webhook' };
+    const estHoldSec = estimateTotalSpeechSec(segments);
+    notifyCs80Scene(
+      { scene: 'speaking', phase: 'start', channel: 'xiaoai', holdSec: estHoldSec, caption: '小爱音箱正在播报回复…' },
+      cs80Opts,
+    );
 
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     const sameAsConfiguredWebhook = Boolean(channel.webhookUrl?.trim() && webhookUrl === channel.webhookUrl.trim());
@@ -400,11 +411,17 @@ export async function sendXiaoaiSpeech(
         signal: buildRequestSignal(15_000, options?.shutdownSignal),
       });
     } catch (err) {
+      notifyCs80Scene({ scene: 'speaking', phase: 'end', tailSec: 0 }, cs80Opts);
       throw new Error(sanitizeImError(err, [channel.botToken, channel.secret]));
     }
     if (!res.ok) {
+      notifyCs80Scene({ scene: 'speaking', phase: 'end', tailSec: 0 }, cs80Opts);
       throw new Error(`小爱 Webhook 发送失败: HTTP ${res.status}`);
     }
+    notifyCs80Scene(
+      { scene: 'speaking', phase: 'pulse', channel: 'xiaoai', holdSec: Math.min(15, estHoldSec), caption: '小爱音箱正在播报回复…' },
+      cs80Opts,
+    );
     return { segments, mode: 'webhook' };
   }
 
@@ -435,51 +452,76 @@ export async function sendXiaoaiSpeech(
     }
     const speechEpoch = getXiaoaiSpeechEpoch(channel.id, target.id);
     const isEpochCancelled = () => getXiaoaiSpeechEpoch(channel.id, target.id) !== speechEpoch;
-    for (let i = 0; i < segments.length; i++) {
-      if (isEpochCancelled() || options?.shutdownSignal?.aborted) break;
-      const seg = segments[i]!;
-      const spokenSeg = smoothXiaoaiTtsProsody(seg) || seg;
-      const estimatedSpeechMs = Math.min(18_000, Math.max(2_200, spokenSeg.length * 190 + 900));
-      const segStartedAt = Date.now();
-      markXiaoaiSpeakingGuard(channel.id, target.id, estimatedSpeechMs);
-      const jsonPayload = JSON.stringify({ text: spokenSeg, save: 0 });
-      const cmd = `rm -f /tmp/friday_led_tok; touch /tmp/friday_speaking; (/bin/shut_led 1 >/dev/null 2>&1; /bin/shut_led 2 >/dev/null 2>&1 || true); ubus call mibrain text_to_speech '${escapeShellSingleQuote(jsonPayload)}' >/dev/null 2>&1 || /usr/sbin/tts_play.sh '${escapeShellSingleQuote(spokenSeg)}'`;
-      const res = await sshRunner(target, cmd, { timeoutMs: 12_000 });
-      if (res.code !== 0) {
-        throw new Error(res.stderr.trim() || `小爱 SSH TTS 失败 (exit=${res.code})`);
-      }
-      if (i < segments.length - 1 || options?.waitForCompletion) {
-        const outcome = await waitForXiaoaiSegmentPlayback(
-          target,
-          sshRunner,
-          spokenSeg.length,
-          isEpochCancelled,
-          options?.shutdownSignal,
-        );
-        if (outcome === 'completed') {
-          if (i === segments.length - 1 && !isEpochCancelled()) {
-            markXiaoaiSpeakingGuard(channel.id, target.id, 350, true);
-          }
-        } else if (outcome === 'unknown' && !isEpochCancelled()) {
-          // Playback status could not be confirmed: preserve remaining estimated speech guard
-          // (do NOT shrink to 350ms), and wait remainingMs before starting any subsequent segment.
-          const remainingMs = Math.max(0, estimatedSpeechMs - (Date.now() - segStartedAt));
-          if (i < segments.length - 1 && remainingMs > 0) {
-            await delay(
-              Math.min(remainingMs, 15_000),
-              undefined,
-              options?.shutdownSignal ? { signal: options.shutdownSignal } : undefined,
-            ).catch(() => {});
-          }
-          if (i === segments.length - 1 && !isEpochCancelled()) {
-            markXiaoaiSpeakingGuard(channel.id, target.id, Math.max(350, remainingMs), true);
-          }
-        }
-      } else {
+    const estHoldSec = estimateTotalSpeechSec(segments);
+    notifyCs80Scene(
+      { scene: 'speaking', phase: 'start', channel: 'xiaoai', holdSec: estHoldSec, caption: '小爱音箱正在播报回复…' },
+      cs80Opts,
+    );
+    let lastEstimatedMs = 3_000;
+    let waitedLastSegment = false;
+    try {
+      for (let i = 0; i < segments.length; i++) {
+        if (isEpochCancelled() || options?.shutdownSignal?.aborted) break;
+        const seg = segments[i]!;
+        const spokenSeg = smoothXiaoaiTtsProsody(seg) || seg;
+        const estimatedSpeechMs = Math.min(18_000, Math.max(2_200, spokenSeg.length * 190 + 900));
+        lastEstimatedMs = estimatedSpeechMs;
+        const segStartedAt = Date.now();
         markXiaoaiSpeakingGuard(channel.id, target.id, estimatedSpeechMs);
+        const jsonPayload = JSON.stringify({ text: spokenSeg, save: 0 });
+        const cmd = `rm -f /tmp/friday_led_tok; touch /tmp/friday_speaking; (/bin/shut_led 1 >/dev/null 2>&1; /bin/shut_led 2 >/dev/null 2>&1 || true); ubus call mibrain text_to_speech '${escapeShellSingleQuote(jsonPayload)}' >/dev/null 2>&1 || /usr/sbin/tts_play.sh '${escapeShellSingleQuote(spokenSeg)}'`;
+        const res = await sshRunner(target, cmd, { timeoutMs: 12_000 });
+        if (res.code !== 0) {
+          throw new Error(res.stderr.trim() || `小爱 SSH TTS 失败 (exit=${res.code})`);
+        }
+        if (i < segments.length - 1 || options?.waitForCompletion) {
+          const outcome = await waitForXiaoaiSegmentPlayback(
+            target,
+            sshRunner,
+            spokenSeg.length,
+            isEpochCancelled,
+            options?.shutdownSignal,
+          );
+          if (outcome === 'completed') {
+            if (i === segments.length - 1) waitedLastSegment = true;
+            if (i === segments.length - 1 && !isEpochCancelled()) {
+              markXiaoaiSpeakingGuard(channel.id, target.id, 350, true);
+            }
+          } else if (outcome === 'unknown' && !isEpochCancelled()) {
+            // Playback status could not be confirmed: preserve remaining estimated speech guard
+            // (do NOT shrink to 350ms), and wait remainingMs before starting any subsequent segment.
+            const remainingMs = Math.max(0, estimatedSpeechMs - (Date.now() - segStartedAt));
+            if (i < segments.length - 1 && remainingMs > 0) {
+              await delay(
+                Math.min(remainingMs, 15_000),
+                undefined,
+                options?.shutdownSignal ? { signal: options.shutdownSignal } : undefined,
+              ).catch(() => {});
+            }
+            if (i === segments.length - 1) {
+              lastEstimatedMs = Math.max(350, remainingMs);
+              markXiaoaiSpeakingGuard(channel.id, target.id, lastEstimatedMs, true);
+            }
+          }
+        } else {
+          markXiaoaiSpeakingGuard(channel.id, target.id, estimatedSpeechMs);
+        }
       }
+      if (isEpochCancelled() || options?.shutdownSignal?.aborted) {
+        notifyCs80Scene({ scene: 'speaking', phase: 'end', tailSec: 0 }, cs80Opts);
+      } else if (waitedLastSegment) {
+        notifyCs80Scene({ scene: 'speaking', phase: 'end', tailSec: 0.35 }, cs80Opts);
+      } else {
+        notifyCs80Scene(
+          { scene: 'speaking', phase: 'pulse', channel: 'xiaoai', holdSec: Math.max(2.2, lastEstimatedMs / 1000), caption: '小爱音箱正在播报回复…' },
+          cs80Opts,
+        );
+      }
+      return { segments, mode: 'ssh' };
+    } catch (err) {
+      notifyCs80Scene({ scene: 'speaking', phase: 'end', tailSec: 0 }, cs80Opts);
+      throw err;
     }
-    return { segments, mode: 'ssh' };
   }
 
   if (channel.accountId && channel.botToken) {
@@ -504,31 +546,51 @@ export async function sendXiaoaiSpeech(
 
     const speechEpoch = getXiaoaiSpeechEpoch(channel.id, targetDeviceId);
     const isEpochCancelled = () => getXiaoaiSpeechEpoch(channel.id, targetDeviceId) !== speechEpoch;
-    for (let i = 0; i < segments.length; i++) {
-      if (isEpochCancelled() || options?.shutdownSignal?.aborted) break;
-      const seg = segments[i]!;
-      const spokenSeg = smoothXiaoaiTtsProsody(seg) || seg;
-      const estimatedSpeechMs = Math.min(18_000, Math.max(1_800, spokenSeg.length * 190 + 700));
-      markXiaoaiSpeakingGuard(channel.id, targetDeviceId, estimatedSpeechMs);
-      await callMinaRemoteUbus(
-        minaBase,
-        resolved.session,
-        targetDeviceId,
-        'mibrain',
-        'text_to_speech',
-        JSON.stringify({ text: spokenSeg, save: 0 }),
-        fetchFn,
-        options?.shutdownSignal,
-      );
-      if (i < segments.length - 1 && !isEpochCancelled() && !options?.shutdownSignal?.aborted) {
-        await delay(
-          estimatedSpeechMs,
-          undefined,
-          options?.shutdownSignal ? { signal: options.shutdownSignal } : undefined,
-        ).catch(() => {});
+    const estHoldSec = estimateTotalSpeechSec(segments);
+    notifyCs80Scene(
+      { scene: 'speaking', phase: 'start', channel: 'xiaoai', holdSec: estHoldSec, caption: '小爱音箱正在播报回复…' },
+      cs80Opts,
+    );
+    let lastCloudMs = 2_500;
+    try {
+      for (let i = 0; i < segments.length; i++) {
+        if (isEpochCancelled() || options?.shutdownSignal?.aborted) break;
+        const seg = segments[i]!;
+        const spokenSeg = smoothXiaoaiTtsProsody(seg) || seg;
+        const estimatedSpeechMs = Math.min(18_000, Math.max(1_800, spokenSeg.length * 190 + 700));
+        lastCloudMs = estimatedSpeechMs;
+        markXiaoaiSpeakingGuard(channel.id, targetDeviceId, estimatedSpeechMs);
+        await callMinaRemoteUbus(
+          minaBase,
+          resolved.session,
+          targetDeviceId,
+          'mibrain',
+          'text_to_speech',
+          JSON.stringify({ text: spokenSeg, save: 0 }),
+          fetchFn,
+          options?.shutdownSignal,
+        );
+        if (i < segments.length - 1 && !isEpochCancelled() && !options?.shutdownSignal?.aborted) {
+          await delay(
+            estimatedSpeechMs,
+            undefined,
+            options?.shutdownSignal ? { signal: options.shutdownSignal } : undefined,
+          ).catch(() => {});
+        }
       }
+      if (isEpochCancelled() || options?.shutdownSignal?.aborted) {
+        notifyCs80Scene({ scene: 'speaking', phase: 'end', tailSec: 0 }, cs80Opts);
+      } else {
+        notifyCs80Scene(
+          { scene: 'speaking', phase: 'pulse', channel: 'xiaoai', holdSec: Math.max(2.2, lastCloudMs / 1000), caption: '小爱音箱正在播报回复…' },
+          cs80Opts,
+        );
+      }
+      return { segments, mode: 'cloud' };
+    } catch (err) {
+      notifyCs80Scene({ scene: 'speaking', phase: 'end', tailSec: 0 }, cs80Opts);
+      throw err;
     }
-    return { segments, mode: 'cloud' };
   }
 
   throw new Error('小爱音箱通道未配置发送方式（需要 SSH 地址、webhookUrl 或小米云账号凭证）');

@@ -42,6 +42,39 @@ CTL_WAKE = 3
 CTL_STATE = 4
 CTL_HELLO = 5
 
+SCENE_STATES = (
+    "speaking",
+    "sending_msg",
+    "printing",
+    "operating_xiaoai",
+    "operating_tv",
+    "managing_laifen",
+    "weighing_scale",
+)
+DEVICE_SCENES = (
+    "printing",
+    "operating_xiaoai",
+    "operating_tv",
+    "managing_laifen",
+    "weighing_scale",
+)
+
+
+def _is_pid_alive(pid: Any) -> bool:
+    try:
+        p = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if p <= 0:
+        return False
+    try:
+        os.kill(p, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
 BIN_QDC1 = SCRIPT_DIR / "bin" / "qdc1"
 RULES_FILE = SCRIPT_DIR / "99-cs80.rules"
 
@@ -435,6 +468,20 @@ class FaceDaemon:
         self._voice_state: Optional[str] = None
         self._voice_caption: str = ""
         self._voice_until: float = 0.0
+        self._voice_followup: bool = False
+        self._scene_state: Optional[str] = None
+        self._scene_channel: str = ""
+        self._scene_caption: str = ""
+        self._scene_until: float = 0.0
+        self._scene_priority: int = 0
+        self._scene_is_preview: bool = False
+        self._live_file_scene: Optional[str] = None
+        self._live_file_caption: str = ""
+        self._live_file_cache: Dict[str, Tuple[int, Optional[Dict[str, Any]]]] = {}
+        self._inbound_source: Optional[str] = None
+        self._inbound_text: Optional[str] = None
+        self._inbound_until: float = 0.0
+        self._inbound_baseline_sig: Tuple[str, int] = ("", 0)
         self._last_page_rotate_at: float = time.monotonic()
 
         self._last_hud_key: Optional[Any] = None
@@ -497,16 +544,147 @@ class FaceDaemon:
                 self._wake_event.set()
             self._widget_refresh_event.wait(timeout=2.0)
 
+    def _apply_scene(
+        self,
+        scene: str,
+        *,
+        now: float,
+        hold_sec: float,
+        channel: str = "",
+        caption: str = "",
+        force: bool = False,
+        is_preview: bool = False,
+    ) -> None:
+        norm = scene.strip().lower()
+        ch = channel.strip().lower()
+        if norm == "sending_wechat":
+            norm = "sending_msg"
+            ch = ch or "wechat"
+        elif norm == "sending_telegram":
+            norm = "sending_msg"
+            ch = ch or "telegram"
+        if norm not in SCENE_STATES:
+            return
+        prio = 2 if norm in DEVICE_SCENES else 1
+        if not force and self._scene_state and now < self._scene_until and self._scene_priority > prio:
+            return
+        self._scene_state = norm
+        self._scene_priority = prio
+        self._scene_channel = ch
+        self._scene_caption = caption.strip()
+        self._scene_until = now + max(0.2, float(hold_sec))
+        self._scene_is_preview = is_preview
+
+    def _clear_scene(
+        self,
+        scene: Optional[str] = None,
+        *,
+        now: float,
+        tail_sec: float = 0.0,
+    ) -> None:
+        if scene and self._scene_state != scene:
+            return
+        if tail_sec > 0.0 and self._scene_state:
+            self._scene_until = now + tail_sec
+            return
+        self._scene_state = None
+        self._scene_channel = ""
+        self._scene_caption = ""
+        self._scene_until = 0.0
+        self._scene_priority = 0
+        self._scene_is_preview = False
+
+    def _read_cached_plugin_json(self, path: Path) -> Optional[Dict[str, Any]]:
+        key = str(path)
+        try:
+            st = path.stat()
+        except OSError:
+            self._live_file_cache.pop(key, None)
+            return None
+        cached = self._live_file_cache.get(key)
+        if cached and cached[0] == st.st_mtime_ns:
+            return cached[1]
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            raw = None
+        parsed = raw if isinstance(raw, dict) else None
+        self._live_file_cache[key] = (st.st_mtime_ns, parsed)
+        return parsed
+
+    def _poll_plugin_live_scenes(self) -> Tuple[Optional[str], str, Optional[str]]:
+        plugins_dir = self.friday.home / "plugins"
+        now_ms = time.time() * 1000.0
+
+        def _is_live_entry(raw: Optional[Dict[str, Any]], phases: Tuple[str, ...]) -> Optional[str]:
+            if not raw:
+                return None
+            phase = str(raw.get("phase") or "").strip().lower()
+            if phase not in phases:
+                return None
+            pid = raw.get("pid")
+            if pid is not None:
+                return phase if _is_pid_alive(pid) else None
+            updated_ms = float(raw.get("updatedAt") or raw.get("startedAt") or 0.0)
+            return phase if (updated_ms > 0.0 and (now_ms - updated_ms) < 10_000.0) else None
+
+        hs_raw = self._read_cached_plugin_json(plugins_dir / "health-scale" / "live-session.json")
+        hs_phase = _is_live_entry(hs_raw, ("scanning", "connecting", "measuring"))
+        if hs_phase:
+            caps = {
+                "scanning": "沃莱 A1 扫描等待中 · 请赤脚上秤…",
+                "connecting": "已发现沃莱 A1 · 正在建立蓝牙连接…",
+                "measuring": "沃莱 A1 正在测量体重与体脂…",
+            }
+            return ("weighing_scale", caps.get(hs_phase, "沃莱 A1 测试模式 · 请赤脚上秤测量…"), None)
+
+        lf_raw = self._read_cached_plugin_json(plugins_dir / "laifen" / "live-session.json")
+        lf_phase = _is_live_entry(lf_raw, ("scanning", "connecting", "monitoring"))
+        if lf_phase:
+            caps = {
+                "scanning": "正在蓝牙扫描徕芬电动牙刷…",
+                "connecting": "正在连接徕芬电动牙刷…",
+                "monitoring": "徕芬牙刷刷牙实时监听中…",
+            }
+            return ("managing_laifen", caps.get(lf_phase, "正在蓝牙同步与管理徕芬牙刷…"), None)
+
+        watch_raw = self._read_cached_plugin_json(plugins_dir / "laifen" / "watch-state.json")
+        watch_phase = _is_live_entry(watch_raw, ("syncing", "brushing", "connecting"))
+        if watch_phase:
+            cap = "检测到正在刷牙 · 实时记录中…" if watch_phase == "brushing" else "徕芬牙刷自动唤醒同步中…"
+            return ("managing_laifen", cap, None)
+
+        hs_done_phase = str((hs_raw or {}).get("phase") or "").strip().lower() if hs_raw else ""
+        return (None, "", hs_done_phase)
+
     def _resolve_active_state(self, now: float, snap: FridaySnapshot) -> str:
-        if self._voice_state and now < self._voice_until:
-            return self._voice_state
         if self._voice_state and now >= self._voice_until:
             self._voice_state = None
             self._voice_caption = ""
-        if self._transient_state and now < self._transient_until:
-            return self._transient_state
+            self._voice_followup = False
+        if self._scene_state and now >= self._scene_until:
+            self._scene_state = None
+            self._scene_channel = ""
+            self._scene_caption = ""
+            self._scene_priority = 0
+            self._scene_is_preview = False
         if self._transient_state and now >= self._transient_until:
             self._transient_state = None
+
+        if self._voice_state == "listening" and not self._voice_followup:
+            return "listening"
+        if self._scene_state and self._scene_priority >= 2:
+            return self._scene_state
+        if self._live_file_scene:
+            return self._live_file_scene
+        if self._voice_state:
+            return self._voice_state
+        if self._scene_state:
+            return self._scene_state
+        if snap.active_scene:
+            return snap.active_scene
+        if self._transient_state:
+            return self._transient_state
         return snap.bot_state
 
     def _sound_worker(self) -> None:
@@ -532,27 +710,48 @@ class FaceDaemon:
             snap = self.friday.poll()
             now = time.monotonic()
             need_wake = False
+            live_scene, live_cap, hs_done_phase = self._poll_plugin_live_scenes()
             with self._lock:
                 prev = self._last_snapshot
                 self._last_snapshot = snap
+                prev_live_scene = self._live_file_scene
+                prev_live_cap = self._live_file_caption
+                if prev_live_scene and live_scene != prev_live_scene:
+                    if self._scene_state == prev_live_scene and not self._scene_is_preview:
+                        tail = 1.2 if (prev_live_scene == "weighing_scale" and hs_done_phase == "completed") else 0.0
+                        self._clear_scene(prev_live_scene, now=now, tail_sec=tail)
+                    need_wake = True
+                self._live_file_scene = live_scene
+                self._live_file_caption = live_cap
+                if live_scene != prev_live_scene or live_cap != prev_live_cap:
+                    need_wake = True
                 if snap.transient_state:
                     self._transient_state = snap.transient_state
                     self._transient_until = now + 2.5
                     if snap.transient_poke:
                         self.animator.trigger_poke(snap.transient_poke, 1)
                     need_wake = True
+                if snap.transient_scene:
+                    self._apply_scene(
+                        snap.transient_scene,
+                        now=now,
+                        hold_sec=3.6,
+                        channel=snap.transient_scene_channel,
+                        force=False,
+                    )
+                    need_wake = True
 
                 active_state = self._resolve_active_state(now, snap)
-                sub_phase = "awake" if active_state in ("listening", "thinking") else snap.sub_phase
+                sub_phase = "awake" if active_state in ("listening", "thinking", *SCENE_STATES) else snap.sub_phase
                 if self.animator.set_state(
                     active_state,
                     sub_phase=sub_phase,
                     worker_count=snap.worker_count,
                 ):
                     need_wake = True
-                if snap.auto_expr and self.animator.override_until <= 0.0:
+                if snap.auto_expr and active_state in ("idle", "streaming", "finished") and self.animator.override_until <= 0.0:
                     self.animator.set_expression(snap.auto_expr, hold_sec=0.0, now_wall=now)
-                elif not snap.auto_expr and self.animator.override_until <= 0.0:
+                elif self.animator.override_until <= 0.0:
                     self.animator.set_expression("auto", hold_sec=0.0, now_wall=now)
 
                 if prev.hud != snap.hud:
@@ -574,10 +773,26 @@ class FaceDaemon:
         meta = snap_hud.headline_meta
         source = snap_hud.headline_source
         text = snap_hud.headline_text
+        headline_incoming = snap_hud.headline_incoming
+        if self._inbound_text:
+            if (
+                now >= self._inbound_until
+                or snap_hud.headline_incoming
+                or self._last_snapshot.reply_sig != self._inbound_baseline_sig
+            ):
+                self._inbound_text = None
+                self._inbound_source = None
+            else:
+                source = self._inbound_source or "来信"
+                meta = f"F.R.I.D.A.Y. · {source}"
+                text = self._inbound_text
+                headline_incoming = True
+
         if self._banner_text and now < self._banner_until:
             meta = self._banner_meta or "F.R.I.D.A.Y. · 互动"
             source = "互动提醒"
             text = self._banner_text
+            headline_incoming = False
         elif self._banner_text and now >= self._banner_until:
             self._banner_text = None
             self._banner_meta = None
@@ -585,6 +800,14 @@ class FaceDaemon:
         voice_cap = snap_hud.voice_caption
         if self._voice_state == "listening" and now < self._voice_until and self._voice_caption:
             voice_cap = self._voice_caption
+
+        scene_channel = self._scene_channel if (self._scene_state and now < self._scene_until) else ""
+        if self._live_file_scene and not self._scene_is_preview and (not self._scene_state or self._scene_state == self._live_file_scene):
+            scene_caption = self._live_file_caption
+        elif self._scene_state and now < self._scene_until:
+            scene_caption = self._scene_caption
+        else:
+            scene_caption = ""
 
         pages = layout.get("pages") or []
         page_cnt = max(1, len(pages))
@@ -614,6 +837,9 @@ class FaceDaemon:
             marquee_speed=int(layout.get("marqueeSpeed") or 2),
             layout_rev=self.layout_store.revision,
             data_rev=data_rev,
+            headline_incoming=headline_incoming,
+            scene_channel=scene_channel,
+            scene_caption=scene_caption,
         )
 
     def _render_loop(self) -> None:
@@ -627,7 +853,7 @@ class FaceDaemon:
             pending_patch: Optional[bytes] = None
             with self._lock:
                 active_state = self._resolve_active_state(now, self._last_snapshot)
-                sub_phase = "awake" if active_state in ("listening", "thinking") else self._last_snapshot.sub_phase
+                sub_phase = "awake" if active_state in ("listening", "thinking", *SCENE_STATES) else self._last_snapshot.sub_phase
                 self.animator.set_state(
                     active_state,
                     sub_phase=sub_phase,
@@ -738,7 +964,7 @@ class FaceDaemon:
     def handle_control(self, body: Dict[str, Any]) -> Dict[str, Any]:
         action = str(body.get("action") or "").strip().lower()
         if not action:
-            for candidate in ("voice", "layout", "express", "sound", "screen"):
+            for candidate in ("voice", "scene", "inbound", "layout", "express", "sound", "screen"):
                 if candidate in body:
                     action = candidate
                     body = dict(body[candidate]) if isinstance(body[candidate], dict) else {}
@@ -753,6 +979,9 @@ class FaceDaemon:
             with self._lock:
                 if phase == "listening":
                     self._voice_state = "listening"
+                    self._voice_followup = fu
+                    if not fu:
+                        self._clear_scene(now=now)
                     if fu:
                         self._voice_caption = f"连续对话倾听 · {spk}" if spk else "连续对话倾听中 · 请继续说话"
                     elif kw and spk:
@@ -763,30 +992,88 @@ class FaceDaemon:
                         self._voice_caption = "正在倾听语音指令…"
                     self._voice_until = now + 15.0
                     self._last_page_rotate_at = now
+                    active_state = self._resolve_active_state(now, self._last_snapshot)
                     self.animator.set_state(
-                        "listening",
+                        active_state,
                         sub_phase="awake",
                         worker_count=self._last_snapshot.worker_count,
                     )
                 elif phase == "transcribing":
                     self._voice_state = "thinking"
+                    self._voice_followup = False
                     self._voice_caption = ""
                     self._voice_until = now + 8.0
+                    active_state = self._resolve_active_state(now, self._last_snapshot)
                     self.animator.set_state(
-                        "thinking",
+                        active_state,
                         sub_phase="awake",
                         worker_count=self._last_snapshot.worker_count,
                     )
                 else:
                     self._voice_state = None
+                    self._voice_followup = False
                     self._voice_caption = ""
+                    active_state = self._resolve_active_state(now, self._last_snapshot)
                     self.animator.set_state(
-                        self._last_snapshot.bot_state,
-                        sub_phase=self._last_snapshot.sub_phase,
+                        active_state,
+                        sub_phase="awake" if active_state in ("listening", "thinking", *SCENE_STATES) else self._last_snapshot.sub_phase,
                         worker_count=self._last_snapshot.worker_count,
                     )
             self._wake_event.set()
             return {"ok": True, "action": "voice", "phase": phase}
+
+        if action == "scene":
+            phase = str(body.get("phase") or "start").strip().lower()
+            scene = str(body.get("scene") or "").strip().lower()
+            channel = str(body.get("channel") or "").strip().lower()
+            caption = str(body.get("caption") or "").strip()
+            raw_hold = body.get("holdSec")
+            hold_sec = float(raw_hold) if raw_hold is not None else (18.0 if phase == "start" else 3.8)
+            raw_tail = body.get("tailSec")
+            tail_sec = float(raw_tail) if raw_tail is not None else 0.0
+            force = bool(body.get("force"))
+            with self._lock:
+                if phase == "end":
+                    self._clear_scene(scene or None, now=now, tail_sec=tail_sec)
+                else:
+                    self._apply_scene(
+                        scene,
+                        now=now,
+                        hold_sec=hold_sec,
+                        channel=channel,
+                        caption=caption,
+                        force=force,
+                    )
+                active_state = self._resolve_active_state(now, self._last_snapshot)
+                self.animator.set_state(
+                    active_state,
+                    sub_phase="awake" if active_state in ("listening", "thinking", *SCENE_STATES) else self._last_snapshot.sub_phase,
+                    worker_count=self._last_snapshot.worker_count,
+                )
+            self._wake_event.set()
+            return {"ok": True, "action": "scene", "scene": scene, "phase": phase, "botState": active_state}
+
+        if action == "inbound":
+            raw_ch = str(body.get("channel") or "local").strip().upper()
+            ch_map = {
+                "WECHAT": "微信来信",
+                "TELEGRAM": "电报来信",
+                "XIAOAI": "小爱语音",
+                "DINGTALK": "钉钉来信",
+                "LOCAL": "控制台提问",
+                "WEB": "控制台提问",
+            }
+            src_label = str(body.get("source") or "").strip() or f"{ch_map.get(raw_ch, '来信')} · {time.strftime('%H:%M')}"
+            txt = str(body.get("text") or "").strip()
+            hold_sec = float(body.get("holdSec") or 30.0)
+            with self._lock:
+                if txt:
+                    self._inbound_source = src_label
+                    self._inbound_text = txt
+                    self._inbound_until = now + max(1.0, hold_sec)
+                    self._inbound_baseline_sig = self._last_snapshot.reply_sig
+            self._wake_event.set()
+            return {"ok": True, "action": "inbound", "source": src_label}
 
         if action == "layout":
             updated, grid_changed, added_kinds = self.layout_store.apply_patch(body)
@@ -843,14 +1130,42 @@ class FaceDaemon:
 
         if action == "express":
             expr = body.get("expr")
+            scene_arg = str(body.get("scene") or "").strip().lower()
+            channel = str(body.get("channel") or "").strip().lower()
+            caption = str(body.get("caption") or "").strip()
             poke = body.get("poke")
             turns = int(body.get("turns") or 2)
             text = body.get("text")
             title = body.get("title")
-            hold_sec = float(body.get("holdSec") or 12.0)
+            raw_hold = body.get("holdSec")
+            hold_sec = float(raw_hold) if raw_hold is not None else 12.0
+            expr_norm = str(expr or "").strip().lower()
+            if not scene_arg and expr_norm in (*SCENE_STATES, "sending_wechat", "sending_telegram"):
+                scene_arg = expr_norm
+                expr = None
             with self._lock:
-                if expr:
+                if expr_norm == "auto":
+                    self._clear_scene(now=now)
+                    self.animator.set_expression("auto", hold_sec=0.0, now_wall=now)
+                elif expr:
                     self.animator.set_expression(str(expr), hold_sec=hold_sec, now_wall=now)
+                if scene_arg:
+                    self._apply_scene(
+                        scene_arg,
+                        now=now,
+                        hold_sec=hold_sec,
+                        channel=channel,
+                        caption=caption,
+                        force=True,
+                        is_preview=True,
+                    )
+                    self.animator.set_expression("auto", hold_sec=0.0, now_wall=now)
+                active_state = self._resolve_active_state(now, self._last_snapshot)
+                self.animator.set_state(
+                    active_state,
+                    sub_phase="awake" if active_state in ("listening", "thinking", *SCENE_STATES) else self._last_snapshot.sub_phase,
+                    worker_count=self._last_snapshot.worker_count,
+                )
                 if poke:
                     self.animator.trigger_poke(str(poke), turns=turns)
                 if text:
@@ -858,7 +1173,7 @@ class FaceDaemon:
                     self._banner_meta = str(title or "F.R.I.D.A.Y. · 表情互动")
                     self._banner_until = now + hold_sec
             self._wake_event.set()
-            return {"ok": True, "action": "express", "expr": expr, "poke": poke}
+            return {"ok": True, "action": "express", "expr": expr, "scene": scene_arg or None, "poke": poke}
 
         if action == "sound":
             out: Dict[str, Any] = {"ok": True, "action": "sound"}

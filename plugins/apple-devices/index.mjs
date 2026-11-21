@@ -23,6 +23,11 @@ import {
   startAppleLogin,
   verify2faCode,
 } from './icloud-client.mjs';
+import {
+  resolveSystemAmapKey,
+  reverseGeocodeWithCache,
+  wgs84ToGcj02,
+} from '../_shared/amap-geo.mjs';
 import { handleAppleVoiceFastpath } from './fastpath.mjs';
 
 export const ACTIONS = [
@@ -40,6 +45,7 @@ export const ACTIONS = [
 
 const DEFAULT_CONFIG = {
   region: /** @type {'cn' | 'global'} */ ('cn'),
+  includeFamily: true,
   cacheTtlSec: 300,
   minRefreshIntervalSec: 30,
   minBatteryPct: 25,
@@ -173,6 +179,7 @@ function normalizeWatchDevices(rawList) {
  * @param {string} configPath
  * @returns {{
  *   region: 'cn' | 'global';
+ *   includeFamily: boolean;
  *   cacheTtlSec: number;
  *   minRefreshIntervalSec: number;
  *   minBatteryPct: number;
@@ -185,6 +192,7 @@ function loadPluginConfig(configPath) {
   const raw = readConfig(configPath, DEFAULT_CONFIG);
   return {
     region: normalizeRegion(raw.region),
+    includeFamily: raw.includeFamily === undefined ? DEFAULT_CONFIG.includeFamily : Boolean(raw.includeFamily),
     cacheTtlSec: clampInt(raw.cacheTtlSec, 0, 86_400) ?? DEFAULT_CONFIG.cacheTtlSec,
     minRefreshIntervalSec: clampInt(raw.minRefreshIntervalSec, 5, 3600) ?? DEFAULT_CONFIG.minRefreshIntervalSec,
     minBatteryPct: clampInt(raw.minBatteryPct, 5, 90) ?? DEFAULT_CONFIG.minBatteryPct,
@@ -192,6 +200,18 @@ function loadPluginConfig(configPath) {
     customAliases: normalizeAliases(raw.customAliases),
     places: normalizePlaces(raw.places),
   };
+}
+
+/**
+ * Format human-readable Chinese device reachability state.
+ * @param {any} dev
+ * @returns {string}
+ */
+function deviceStatusLabel(dev) {
+  if (dev?.online || dev?.deviceStatus === 'online') return '在线';
+  if (dev?.deviceStatus === 'pending') return dev?.isLocating ? '唤醒同步中' : '待机';
+  if (dev?.deviceStatus === 'offline') return '离线休眠';
+  return '离线';
 }
 
 /**
@@ -203,9 +223,12 @@ function loadPluginConfig(configPath) {
 function sanitizeDeviceForOutput(dev, places, options = {}) {
   let place = null;
   if (dev?.location && typeof dev.location.latitude === 'number' && typeof dev.location.longitude === 'number') {
+    const gcj = wgs84ToGcj02(dev.location.latitude, dev.location.longitude);
     let best = /** @type {{ name: string; distanceMeters: number; radiusMeters: number; inside: boolean } | null} */ (null);
     for (const [placeName, cfg] of Object.entries(places)) {
-      const distanceMeters = haversineMeters(dev.location.latitude, dev.location.longitude, cfg.lat, cfg.lng);
+      const distWgs = haversineMeters(dev.location.latitude, dev.location.longitude, cfg.lat, cfg.lng);
+      const distGcj = gcj.inChina ? haversineMeters(gcj.lat, gcj.lon, cfg.lat, cfg.lng) : distWgs;
+      const distanceMeters = Math.min(distWgs, distGcj);
       const candidate = {
         name: placeName,
         distanceMeters,
@@ -227,14 +250,20 @@ function sanitizeDeviceForOutput(dev, places, options = {}) {
           positionType: dev.location.positionType ?? null,
           timestamp: dev.location.timestamp ?? null,
           isOld: Boolean(dev.location.isOld),
+          address: dev.location.address ?? null,
+          shortAddress: dev.location.shortAddress ?? null,
         }
       : {
           latitude: dev.location.latitude,
           longitude: dev.location.longitude,
+          gcjLat: dev.location.gcjLat ?? null,
+          gcjLon: dev.location.gcjLon ?? null,
           horizontalAccuracy: dev.location.horizontalAccuracy ?? null,
           positionType: dev.location.positionType ?? null,
           timestamp: dev.location.timestamp ?? null,
           isOld: Boolean(dev.location.isOld),
+          address: dev.location.address ?? null,
+          shortAddress: dev.location.shortAddress ?? null,
         };
   }
 
@@ -246,12 +275,17 @@ function sanitizeDeviceForOutput(dev, places, options = {}) {
     category: String(dev.category),
     online: Boolean(dev.online),
     deviceStatus: String(dev.deviceStatus),
+    deviceStatusLabel: deviceStatusLabel(dev),
     batteryPercent: typeof dev.batteryPercent === 'number' ? dev.batteryPercent : null,
     batteryStatus: String(dev.batteryStatus ?? 'Unknown'),
     batteryStatusLabel: BATTERY_STATUS_LABELS[/** @type {keyof typeof BATTERY_STATUS_LABELS} */ (dev.batteryStatus)] ?? '未知',
+    batteryIsCached: Boolean(dev.batteryIsCached),
+    batteryUpdatedAt: typeof dev.batteryUpdatedAt === 'number' ? dev.batteryUpdatedAt : null,
     lowPowerMode: Boolean(dev.lowPowerMode),
     lostModeCapable: Boolean(dev.lostModeCapable),
     isLocating: Boolean(dev.isLocating),
+    soundCapable: dev.soundCapable !== false,
+    isFamily: Boolean(dev.isFamily),
     location,
     place,
   };
@@ -325,16 +359,31 @@ function formatDevicesSummaryText(devices) {
   if (!devices.length) return '已登录，但名下未发现支持查找的 Apple 设备。';
   return devices
     .map(d => {
-      const bat = typeof d.batteryPercent === 'number' ? `${d.batteryPercent}% (${d.batteryStatusLabel})` : '电量未知';
-      const online = d.online ? '在线' : '离线';
-      const placeStr = d.place ? (d.place.inside ? ` · 在${d.place.name}` : ` · 距${d.place.name}${d.place.distanceMeters}m`) : '';
-      return `• ${d.name} [${d.model}]：${bat} · ${online}${placeStr}`;
+      const bat = typeof d.batteryPercent === 'number'
+        ? `${d.batteryPercent}% (${d.batteryStatusLabel}${d.batteryIsCached ? '·休眠前' : ''})`
+        : '电量未知';
+      const statusText = d.deviceStatusLabel || (d.online ? '在线' : '离线');
+      const familyTag = d.isFamily ? ' [家人共享]' : '';
+      const shortAddr = d.location?.shortAddress || d.location?.address || '';
+      const distText = d.place
+        ? (d.place.distanceMeters >= 1000 ? `${(d.place.distanceMeters / 1000).toFixed(1)}km` : `${d.place.distanceMeters}m`)
+        : '';
+      let placeStr = '';
+      if (d.place?.inside) {
+        placeStr = ` · 在${d.place.name}${shortAddr ? ` (${shortAddr})` : ''}`;
+      } else if (shortAddr) {
+        placeStr = ` · ${shortAddr}${d.place ? ` (距${d.place.name}${distText})` : ''}`;
+      } else if (d.place) {
+        placeStr = ` · 距${d.place.name}${distText}`;
+      }
+      return `• ${d.name}${familyTag} [${d.model}]：${bat} · ${statusText}${placeStr}`;
     })
     .join('\n');
 }
 
 /**
  * Resolve a target device entry by ID, alias, exact/partial name, or category noun.
+ * Prefers personal devices over family-shared devices when matching by category.
  * @param {Array<{ rawId: string; device: Record<string, any> }>} entries
  * @param {string} rawQuery
  * @param {Record<string, string>} customAliases
@@ -344,8 +393,10 @@ function resolveTargetEntry(entries, rawQuery, customAliases) {
   const trimmed = String(rawQuery ?? '').trim();
   if (!trimmed) {
     if (entries.length === 0) return {};
+    const ownIphone = entries.find(e => !e.device.isFamily && e.device.category === 'iphone');
+    const ownAny = entries.find(e => !e.device.isFamily);
     const primaryIphone = entries.find(e => e.device.category === 'iphone');
-    return { entry: primaryIphone ?? entries[0] };
+    return { entry: ownIphone ?? ownAny ?? primaryIphone ?? entries[0] };
   }
 
   const lowerTrimmed = trimmed.toLowerCase();
@@ -367,12 +418,16 @@ function resolveTargetEntry(entries, rawQuery, customAliases) {
   if (exact.length === 1) return { entry: exact[0] };
   if (exact.length > 1) return { ambiguous: exact.map(e => e.device) };
 
-  // 2. Category match (`手机`, `iPad`, `手表`, `Mac`, `AirPods`)
+  // 2. Category match (`手机`, `iPad`, `手表`, `Mac`, `AirPods`), preferring personal over family-shared
   for (const { re, category } of CATEGORY_PATTERNS) {
     if (re.test(resolvedQuery)) {
       const byCat = entries.filter(e => e.device.category === category);
       if (byCat.length === 1) return { entry: byCat[0] };
-      if (byCat.length > 1) return { ambiguous: byCat.map(e => e.device) };
+      if (byCat.length > 1) {
+        const ownByCat = byCat.filter(e => !e.device.isFamily);
+        if (ownByCat.length === 1) return { entry: ownByCat[0] };
+        return { ambiguous: (ownByCat.length > 1 ? ownByCat : byCat).map(e => e.device) };
+      }
     }
   }
 
@@ -398,18 +453,171 @@ function saveSession(sessionPath, session) {
 }
 
 /**
+ * Whether session's cached FMiP family flag differs from current config.
+ * @param {Record<string, any> | null} session
+ * @param {boolean} includeFamily
+ * @returns {boolean}
+ */
+function hasFamilyModeChanged(session, includeFamily) {
+  if (!session) return false;
+  const want = Boolean(includeFamily);
+  if (session.fmipIncludeFamily !== undefined) {
+    return Boolean(session.fmipIncludeFamily) !== want;
+  }
+  return want && Boolean(session.fmipServerContext);
+}
+
+/**
+ * Determine whether a cached device snapshot is still settling (`isLocating`) or completely unset.
+ * @param {Array<{ rawId: string; device: Record<string, any> }> | undefined} entries
+ * @returns {boolean}
+ */
+function isCacheIncomplete(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return true;
+  if (entries.some(e => Boolean(e?.device?.isLocating))) return true;
+  return entries.every(e => !e?.device?.online && typeof e?.device?.batteryPercent !== 'number');
+}
+
+/**
+ * Preserve last known battery & location for devices that report `Unknown` while asleep/in case.
+ * @param {Array<{ rawId: string; device: Record<string, any> }>} liveEntries
+ * @param {Array<{ rawId: string; device: Record<string, any> }> | undefined} prevEntries
+ * @param {number} stampedAt
+ * @param {number | null | undefined} prevFetchedAt
+ */
+function mergeEntriesWithPreviousCache(liveEntries, prevEntries, stampedAt, prevFetchedAt) {
+  /** @type {Map<string, Record<string, any>>} */
+  const byRawId = new Map();
+  /** @type {Map<string, Record<string, any>>} */
+  const byRedactedId = new Map();
+  for (const item of Array.isArray(prevEntries) ? prevEntries : []) {
+    if (item?.rawId && item?.device) byRawId.set(String(item.rawId), item.device);
+    if (item?.device?.id) byRedactedId.set(String(item.device.id), item.device);
+  }
+  return liveEntries.map(entry => {
+    const liveDev = { ...entry.device };
+    const prevDev = (entry.rawId && byRawId.get(String(entry.rawId))) || byRedactedId.get(String(liveDev.id));
+    if (typeof liveDev.batteryPercent === 'number') {
+      liveDev.batteryIsCached = false;
+      liveDev.batteryUpdatedAt = stampedAt;
+    } else if (prevDev && typeof prevDev.batteryPercent === 'number') {
+      liveDev.batteryPercent = prevDev.batteryPercent;
+      liveDev.batteryStatus = prevDev.batteryStatus ?? 'Unknown';
+      liveDev.batteryIsCached = true;
+      liveDev.batteryUpdatedAt = typeof prevDev.batteryUpdatedAt === 'number'
+        ? prevDev.batteryUpdatedAt
+        : (typeof prevFetchedAt === 'number' && prevFetchedAt > 0 ? prevFetchedAt : null);
+    } else {
+      liveDev.batteryIsCached = false;
+      liveDev.batteryUpdatedAt = null;
+    }
+    if (!liveDev.location && prevDev?.location) {
+      liveDev.location = { ...prevDev.location, isOld: true };
+    } else if (
+      liveDev.location
+      && prevDev?.location
+      && typeof liveDev.location.latitude === 'number'
+      && typeof prevDev.location.latitude === 'number'
+      && Math.abs(liveDev.location.latitude - prevDev.location.latitude) < 1e-4
+      && Math.abs(liveDev.location.longitude - prevDev.location.longitude) < 1e-4
+      && prevDev.location.shortAddress
+      && !liveDev.location.shortAddress
+    ) {
+      liveDev.location = {
+        ...liveDev.location,
+        gcjLat: prevDev.location.gcjLat ?? null,
+        gcjLon: prevDev.location.gcjLon ?? null,
+        address: prevDev.location.address ?? null,
+        shortAddress: prevDev.location.shortAddress ?? null,
+      };
+    }
+    return { rawId: entry.rawId, device: liveDev };
+  });
+}
+
+/**
+ * Enrich cached/live Apple device entries with GCJ-02 coords & shared AMap Chinese street/POI names.
+ * Mutates a shallow copy of entries when new addresses are resolved.
+ * @param {Array<{ rawId: string; device: Record<string, any> }>} entries
+ * @param {{
+ *   homeDir: string;
+ *   env?: Record<string, string | undefined>;
+ *   nowFn: () => number;
+ *   amapRequester?: (url: string) => Promise<{ status: number; body: Buffer | string }>;
+ *   amapUrl?: string;
+ * }} opts
+ * @returns {Promise<{ entries: Array<{ rawId: string; device: Record<string, any> }>; changed: boolean; configured: boolean }>}
+ */
+async function enrichDeviceEntriesGeo(entries, opts) {
+  const { key: amapKey } = resolveSystemAmapKey({ homeDir: opts.homeDir, env: opts.env });
+  const configured = Boolean(amapKey);
+  if (!configured || !Array.isArray(entries) || entries.length === 0) {
+    return { entries, changed: false, configured };
+  }
+
+  let changed = false;
+  const nowMs = opts.nowFn();
+  const nextEntries = [];
+
+  for (const entry of entries) {
+    const dev = entry?.device;
+    const loc = dev?.location;
+    if (
+      loc
+      && typeof loc.latitude === 'number'
+      && typeof loc.longitude === 'number'
+      && (!loc.shortAddress || !loc.address)
+    ) {
+      const geo = await reverseGeocodeWithCache({
+        homeDir: opts.homeDir,
+        env: opts.env,
+        lat: loc.latitude,
+        lon: loc.longitude,
+        coordSys: 'wgs84',
+        nowMs,
+        requester: opts.amapRequester,
+        amapUrl: opts.amapUrl,
+      });
+      if (geo.valid && (geo.address || geo.gcjLat !== loc.gcjLat)) {
+        changed = true;
+        nextEntries.push({
+          rawId: entry.rawId,
+          device: {
+            ...dev,
+            location: {
+              ...loc,
+              gcjLat: geo.gcjLat,
+              gcjLon: geo.gcjLon,
+              ...(geo.address ? { address: geo.address, shortAddress: geo.shortAddress || geo.address } : {}),
+            },
+          },
+        });
+        continue;
+      }
+    }
+    nextEntries.push(entry);
+  }
+
+  return { entries: nextEntries, changed, configured };
+}
+
+/**
  * Fetch devices from cache or live Apple FMiP API honoring anti-drain cache & cooldown.
  * @param {{
  *   paths: import('../_shared/types.d.ts').PluginPaths;
  *   config: ReturnType<typeof loadPluginConfig>;
  *   refresh: boolean;
+ *   locatePollDelayMs?: number;
  *   fetchFn: typeof fetch;
  *   nowFn: () => number;
  *   signal?: AbortSignal;
+ *   env?: Record<string, string | undefined>;
+ *   amapRequester?: (url: string) => Promise<{ status: number; body: Buffer | string }>;
+ *   amapUrl?: string;
  * }} opts
  */
 async function getDevicesWithCache(opts) {
-  const { paths, config, refresh, fetchFn, nowFn, signal } = opts;
+  const { paths, config, refresh, locatePollDelayMs, fetchFn, nowFn, signal, env, amapRequester, amapUrl } = opts;
   const session = loadSession(paths.sessionPath);
   if (!session || session.state !== 'authenticated') {
     const auth = buildPublicAuthSummary(session, config);
@@ -424,50 +632,84 @@ async function getDevicesWithCache(opts) {
   const cache = loadDeviceCache(paths.cachePath);
   const now = nowFn();
   const cacheAgeMs = cache && cache.fetchedAt > 0 ? Math.max(0, now - cache.fetchedAt) : Infinity;
+  const familyChanged = hasFamilyModeChanged(session, config.includeFamily);
+  const incompleteCache = isCacheIncomplete(cache?.entries);
 
-  if (!refresh && cache && cache.entries.length > 0 && cacheAgeMs <= config.cacheTtlSec * 1000) {
-    return {
+  const finalizeCachedEntries = async (rawEntries, extra) => {
+    const enriched = await enrichDeviceEntriesGeo(rawEntries, {
+      homeDir: paths.homeDir,
+      env,
+      nowFn,
+      amapRequester,
+      amapUrl,
+    });
+    if (enriched.changed && cache) {
+      await withFileLock(paths.cachePath, () => writeJsonAtomic(paths.cachePath, {
+        fetchedAt: cache.fetchedAt,
+        serverTimestamp: cache.serverTimestamp,
+        entries: enriched.entries,
+      }, { mode: 0o600 }));
+    }
+    return { ...extra, entries: enriched.entries, geoConfigured: enriched.configured };
+  };
+
+  if (!refresh && !familyChanged && cache && cache.entries.length > 0 && !incompleteCache && cacheAgeMs <= config.cacheTtlSec * 1000) {
+    return await finalizeCachedEntries(cache.entries, {
       ok: true,
       auth: buildPublicAuthSummary(session, config),
-      entries: cache.entries,
       fetchedAt: cache.fetchedAt,
       fromCache: true,
       cooldownActive: false,
       cooldownRemainingSec: 0,
-    };
+    });
   }
 
-  if (refresh && cache && cache.entries.length > 0 && cacheAgeMs < config.minRefreshIntervalSec * 1000) {
+  const allowBypassCooldown = familyChanged || (incompleteCache && cacheAgeMs >= 3_000);
+  if (refresh && !allowBypassCooldown && cache && cache.entries.length > 0 && cacheAgeMs < config.minRefreshIntervalSec * 1000) {
     const remainingSec = Math.ceil((config.minRefreshIntervalSec * 1000 - cacheAgeMs) / 1000);
-    return {
+    return await finalizeCachedEntries(cache.entries, {
       ok: true,
       auth: buildPublicAuthSummary(session, config),
-      entries: cache.entries,
       fetchedAt: cache.fetchedAt,
       fromCache: true,
       cooldownActive: true,
       cooldownRemainingSec: remainingSec,
-    };
+    });
   }
 
   try {
-    const live = await fetchFindMyDevices({ session, fetchFn, signal });
+    const live = await fetchFindMyDevices({
+      session,
+      includeFamily: config.includeFamily,
+      locatePollDelayMs,
+      fetchFn,
+      signal,
+    });
     const stampedAt = nowFn();
+    const mergedEntries = mergeEntriesWithPreviousCache(live.entries, cache?.entries, stampedAt, cache?.fetchedAt);
+    const enriched = await enrichDeviceEntriesGeo(mergedEntries, {
+      homeDir: paths.homeDir,
+      env,
+      nowFn,
+      amapRequester,
+      amapUrl,
+    });
     const cacheObj = {
       fetchedAt: stampedAt,
       serverTimestamp: live.serverTimestamp,
-      entries: live.entries,
+      entries: enriched.entries,
     };
     await withFileLock(paths.sessionPath, () => saveSession(paths.sessionPath, session));
     await withFileLock(paths.cachePath, () => writeJsonAtomic(paths.cachePath, cacheObj, { mode: 0o600 }));
     return {
       ok: true,
       auth: buildPublicAuthSummary(session, config),
-      entries: live.entries,
+      entries: enriched.entries,
       fetchedAt: stampedAt,
       fromCache: false,
       cooldownActive: false,
       cooldownRemainingSec: 0,
+      geoConfigured: enriched.configured,
     };
   } catch (err) {
     if (err instanceof AppleClientError && err.code === 'AUTH_EXPIRED') {
@@ -484,6 +726,7 @@ async function getDevicesWithCache(opts) {
       fetchedAt: cache?.fetchedAt ?? null,
       fromCache: true,
       cooldownActive: false,
+      geoConfigured: Boolean(resolveSystemAmapKey({ homeDir: paths.homeDir, env }).key),
     };
   }
 }
@@ -492,7 +735,14 @@ async function getDevicesWithCache(opts) {
  * Main plugin entry point for `apple-devices`.
  * @param {string} [action]
  * @param {Record<string, unknown>} [args]
- * @param {import('../_shared/types.d.ts').PluginExecutionContext & { fetchFn?: typeof fetch }} [deps]
+ * @param {import('../_shared/types.d.ts').PluginExecutionContext & {
+ *   fetchFn?: typeof fetch;
+ *   locatePollDelayMs?: number;
+ *   amapRequester?: (url: string) => Promise<{ status: number; body: Buffer | string }>;
+ *   httpRequester?: (url: string) => Promise<{ status: number; body: Buffer | string }>;
+ *   amapUrl?: string;
+ *   hosts?: { amap?: string };
+ * }} [deps]
  * @returns {Promise<import('../_shared/types.d.ts').PluginActionResult>}
  */
 export async function runAction(action = 'status', args = {}, deps = {}) {
@@ -504,7 +754,19 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
 
   const fetchFn = typeof deps?.fetchFn === 'function' ? deps.fetchFn : fetch;
   const nowFn = typeof deps?.nowFn === 'function' ? deps.nowFn : Date.now;
+  const locatePollDelayMs = typeof deps?.locatePollDelayMs === 'number' ? deps.locatePollDelayMs : undefined;
   const signal = deps?.signal;
+  const env = deps?.env;
+  const amapRequester = /** @type {((url: string) => Promise<{ status: number; body: Buffer | string }>) | undefined} */ (
+    typeof deps?.amapRequester === 'function'
+      ? deps.amapRequester
+      : (typeof deps?.httpRequester === 'function' ? deps.httpRequester : undefined)
+  );
+  const amapHost = deps?.hosts && typeof deps.hosts.amap === 'string' ? deps.hosts.amap : undefined;
+  const amapUrl = typeof deps?.amapUrl === 'string'
+    ? deps.amapUrl
+    : (amapHost ? `${amapHost.replace(/\/$/, '')}/v3/geocode/regeo` : undefined);
+  const geoConfigured = Boolean(resolveSystemAmapKey({ homeDir: paths.homeDir, env }).key);
   const cleanAction = String(action || 'status').trim().toLowerCase();
 
   if (cleanAction === 'config') {
@@ -512,6 +774,7 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
       const current = loadPluginConfig(paths.configPath);
       const hasMutation =
         args.region !== undefined
+        || args.includeFamily !== undefined
         || args.cacheTtlSec !== undefined
         || args.minRefreshIntervalSec !== undefined
         || args.minBatteryPct !== undefined
@@ -522,6 +785,7 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
 
       const next = {
         region: args.region !== undefined ? normalizeRegion(args.region) : current.region,
+        includeFamily: args.includeFamily !== undefined ? Boolean(args.includeFamily) : current.includeFamily,
         cacheTtlSec: args.cacheTtlSec !== undefined ? (clampInt(args.cacheTtlSec, 0, 86_400) ?? current.cacheTtlSec) : current.cacheTtlSec,
         minRefreshIntervalSec: args.minRefreshIntervalSec !== undefined
           ? (clampInt(args.minRefreshIntervalSec, 5, 3600) ?? current.minRefreshIntervalSec)
@@ -540,8 +804,8 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
       ok: true,
       notify: true,
       title: '🍎 Apple 设备插件配置',
-      message: `区域：${updated.region === 'cn' ? '中国大陆 (icloud.com.cn)' : '国际区 (icloud.com)'} · 缓存 ${updated.cacheTtlSec}s · 最小刷新冷却 ${updated.minRefreshIntervalSec}s · 低电量阈值 ${updated.minBatteryPct}% · 地点围栏 ${Object.keys(updated.places).length} 个`,
-      data: { config: updated },
+      message: `区域：${updated.region === 'cn' ? '中国大陆 (icloud.com.cn)' : '国际区 (icloud.com)'} · 家人共享${updated.includeFamily ? '开启' : '关闭'} · 缓存 ${updated.cacheTtlSec}s · 最小刷新冷却 ${updated.minRefreshIntervalSec}s · 低电量阈值 ${updated.minBatteryPct}% · 地点围栏 ${Object.keys(updated.places).length} 个`,
+      data: { config: updated, geoConfigured },
     };
   }
 
@@ -615,15 +879,29 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
       let devices = /** @type {Array<Record<string, any>>} */ ([]);
       let fetchedAt = /** @type {number | null} */ (null);
       try {
-        const live = await fetchFindMyDevices({ session, fetchFn, signal });
+        const live = await fetchFindMyDevices({
+          session,
+          includeFamily: config.includeFamily,
+          locatePollDelayMs,
+          fetchFn,
+          signal,
+        });
         fetchedAt = nowFn();
+        const mergedEntries = mergeEntriesWithPreviousCache(live.entries, undefined, fetchedAt, null);
+        const enriched = await enrichDeviceEntriesGeo(mergedEntries, {
+          homeDir: paths.homeDir,
+          env,
+          nowFn,
+          amapRequester,
+          amapUrl,
+        });
         await withFileLock(paths.sessionPath, () => saveSession(paths.sessionPath, session));
         await withFileLock(paths.cachePath, () => writeJsonAtomic(paths.cachePath, {
           fetchedAt,
           serverTimestamp: live.serverTimestamp,
-          entries: live.entries,
+          entries: enriched.entries,
         }, { mode: 0o600 }));
-        devices = live.entries.map(e => sanitizeDeviceForOutput(e.device, config.places));
+        devices = enriched.entries.map(e => sanitizeDeviceForOutput(e.device, config.places));
       } catch {
         // Login still succeeded even if initial FMiP pull hits a transient error
       }
@@ -632,7 +910,7 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
         notify: true,
         title: '✅ Apple ID 登录成功',
         message: `已通过信任票据免码登录 ${auth.appleId}（${region === 'cn' ? '国区' : '国际区'}），共发现 ${devices.length} 台设备。`,
-        data: { ...auth, requires2fa: false, fetchedAt, devices },
+        data: { ...auth, requires2fa: false, fetchedAt, devices, geoConfigured },
       };
     } catch (err) {
       return {
@@ -703,15 +981,29 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
       let devices = /** @type {Array<Record<string, any>>} */ ([]);
       let fetchedAt = /** @type {number | null} */ (null);
       try {
-        const live = await fetchFindMyDevices({ session, fetchFn, signal });
+        const live = await fetchFindMyDevices({
+          session,
+          includeFamily: config.includeFamily,
+          locatePollDelayMs,
+          fetchFn,
+          signal,
+        });
         fetchedAt = nowFn();
+        const mergedEntries = mergeEntriesWithPreviousCache(live.entries, undefined, fetchedAt, null);
+        const enriched = await enrichDeviceEntriesGeo(mergedEntries, {
+          homeDir: paths.homeDir,
+          env,
+          nowFn,
+          amapRequester,
+          amapUrl,
+        });
         await withFileLock(paths.sessionPath, () => saveSession(paths.sessionPath, session));
         await withFileLock(paths.cachePath, () => writeJsonAtomic(paths.cachePath, {
           fetchedAt,
           serverTimestamp: live.serverTimestamp,
-          entries: live.entries,
+          entries: enriched.entries,
         }, { mode: 0o600 }));
-        devices = live.entries.map(e => sanitizeDeviceForOutput(e.device, config.places));
+        devices = enriched.entries.map(e => sanitizeDeviceForOutput(e.device, config.places));
       } catch {
         // Ignore transient initial device pull errors
       }
@@ -722,7 +1014,7 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
         message: bypass2fa
           ? `已使用单因素查找直通通道绑定 ${auth.appleId}，共发现 ${devices.length} 台设备（仅限查找/电量/响铃，不含长期信任票据）。`
           : `已完成 ${auth.appleId} 长期受信任会话绑定，共发现 ${devices.length} 台设备。`,
-        data: { ...auth, fetchedAt, devices },
+        data: { ...auth, fetchedAt, devices, geoConfigured },
       };
     } catch (err) {
       return {
@@ -741,9 +1033,13 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
         paths,
         config,
         refresh: true,
+        locatePollDelayMs,
         fetchFn,
         nowFn,
         signal,
+        env,
+        amapRequester,
+        amapUrl,
       });
       const devices = refreshed.entries.map(e => sanitizeDeviceForOutput(e.device, config.places));
       const cacheAgeSec = refreshed.fetchedAt ? Math.max(0, Math.round((nowFn() - refreshed.fetchedAt) / 1000)) : null;
@@ -760,15 +1056,80 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
           cacheAgeSec,
           fromCache: refreshed.fromCache,
           cooldownActive: refreshed.cooldownActive,
+          cooldownRemainingSec: refreshed.cooldownRemainingSec ?? 0,
           devices,
           config,
+          geoConfigured: refreshed.geoConfigured ?? geoConfigured,
         },
       };
     }
     const session = loadSession(paths.sessionPath);
     const cache = loadDeviceCache(paths.cachePath);
+    const cacheAgeMs = cache && cache.fetchedAt > 0 ? Math.max(0, nowFn() - cache.fetchedAt) : Infinity;
+    const needAutoSync = args.cacheOnly !== true
+      && session?.state === 'authenticated'
+      && (
+        hasFamilyModeChanged(session, config.includeFamily)
+        || !cache
+        || isCacheIncomplete(cache.entries)
+        || cacheAgeMs > config.cacheTtlSec * 1000
+      );
+    if (needAutoSync) {
+      const synced = await getDevicesWithCache({
+        paths,
+        config,
+        refresh: false,
+        locatePollDelayMs,
+        fetchFn,
+        nowFn,
+        signal,
+        env,
+        amapRequester,
+        amapUrl,
+      });
+      const devices = synced.entries.map(e => sanitizeDeviceForOutput(e.device, config.places));
+      const cacheAgeSec = synced.fetchedAt ? Math.max(0, Math.round((nowFn() - synced.fetchedAt) / 1000)) : null;
+      return {
+        ok: synced.ok,
+        notify: true,
+        title: synced.ok ? '🍎 Apple 设备状态' : '🍎 Apple 设备未就绪',
+        message: synced.ok
+          ? formatDevicesSummaryText(devices)
+          : (synced.message || '同步 Apple 设备失败'),
+        data: {
+          ...synced.auth,
+          fetchedAt: synced.fetchedAt,
+          cacheAgeSec,
+          fromCache: synced.fromCache,
+          cooldownActive: synced.cooldownActive,
+          cooldownRemainingSec: synced.cooldownRemainingSec ?? 0,
+          devices,
+          config,
+          geoConfigured: synced.geoConfigured ?? geoConfigured,
+        },
+      };
+    }
+
+    let cacheEntries = cache?.entries ?? [];
+    if (cacheEntries.length > 0 && args.cacheOnly !== true) {
+      const enriched = await enrichDeviceEntriesGeo(cacheEntries, {
+        homeDir: paths.homeDir,
+        env,
+        nowFn,
+        amapRequester,
+        amapUrl,
+      });
+      cacheEntries = enriched.entries;
+      if (enriched.changed && cache) {
+        await withFileLock(paths.cachePath, () => writeJsonAtomic(paths.cachePath, {
+          fetchedAt: cache.fetchedAt,
+          serverTimestamp: cache.serverTimestamp,
+          entries: cacheEntries,
+        }, { mode: 0o600 }));
+      }
+    }
     const auth = buildPublicAuthSummary(session, config);
-    const devices = (cache?.entries ?? []).map(e => sanitizeDeviceForOutput(e.device, config.places));
+    const devices = cacheEntries.map(e => sanitizeDeviceForOutput(e.device, config.places));
     const fetchedAt = cache?.fetchedAt && cache.fetchedAt > 0 ? cache.fetchedAt : null;
     const cacheAgeSec = fetchedAt ? Math.max(0, Math.round((nowFn() - fetchedAt) / 1000)) : null;
 
@@ -796,6 +1157,7 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
         fromCache: true,
         devices,
         config,
+        geoConfigured,
       },
     };
   }
@@ -805,9 +1167,13 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
       paths,
       config,
       refresh: args.refresh === true,
+      locatePollDelayMs,
       fetchFn,
       nowFn,
       signal,
+      env,
+      amapRequester,
+      amapUrl,
     });
     if (!res.ok) {
       return {
@@ -815,7 +1181,7 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
         notify: true,
         title: '获取 Apple 设备失败',
         message: res.message || '获取 Apple 设备失败',
-        data: { ...res.auth, errorCode: res.errorCode },
+        data: { ...res.auth, errorCode: res.errorCode, geoConfigured: res.geoConfigured ?? geoConfigured },
       };
     }
     const devices = res.entries.map(e => sanitizeDeviceForOutput(e.device, config.places));
@@ -838,6 +1204,8 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
         cooldownActive: res.cooldownActive,
         cooldownRemainingSec: res.cooldownRemainingSec,
         devices,
+        config,
+        geoConfigured: res.geoConfigured ?? geoConfigured,
       },
     };
   }
@@ -847,9 +1215,13 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
       paths,
       config,
       refresh: args.refresh === true,
+      locatePollDelayMs,
       fetchFn,
       nowFn,
       signal,
+      env,
+      amapRequester,
+      amapUrl,
     });
     if (!res.ok) {
       return {
@@ -857,7 +1229,7 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
         notify: true,
         title: '定位 Apple 设备失败',
         message: res.message || '定位失败',
-        data: { ...res.auth, errorCode: res.errorCode },
+        data: { ...res.auth, errorCode: res.errorCode, geoConfigured: res.geoConfigured ?? geoConfigured },
       };
     }
     const query = String(args.device ?? args.id ?? args.name ?? args.query ?? '').trim();
@@ -869,7 +1241,7 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
         notify: true,
         title: '匹配到多台设备',
         message: `“${query}”匹配到多台 Apple 设备，请指定具体设备名称：${candidates.map(c => `${c.name} (${c.id})`).join('、')}`,
-        data: { candidates },
+        data: { candidates, geoConfigured: res.geoConfigured ?? geoConfigured },
       };
     }
     if (!match.entry) {
@@ -881,19 +1253,27 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
       };
     }
     const dev = sanitizeDeviceForOutput(match.entry.device, config.places, { redactCoords: args.redactCoords === true });
-    const batText = typeof dev.batteryPercent === 'number' ? `${dev.batteryPercent}% (${dev.batteryStatusLabel})` : '电量未知';
+    const batText = typeof dev.batteryPercent === 'number'
+      ? `${dev.batteryPercent}% (${dev.batteryStatusLabel}${dev.batteryIsCached ? '·休眠前' : ''})`
+      : '电量未知';
+    const addrText = dev.location?.shortAddress || dev.location?.address || '';
     const placeText = dev.place
-      ? (dev.place.inside ? `在「${dev.place.name}」附近（约 ${dev.place.distanceMeters}m）` : `距「${dev.place.name}」约 ${dev.place.distanceMeters}m`)
-      : (dev.location ? `坐标 (${dev.location.latitude ?? '**'}, ${dev.location.longitude ?? '**'})，精度 ${dev.location.horizontalAccuracy ?? '未知'}m` : '暂无定位数据');
+      ? (dev.place.inside
+        ? `在「${dev.place.name}」附近（约 ${dev.place.distanceMeters}m${addrText ? ` · ${addrText}` : ''}）`
+        : `${addrText ? `${addrText} · ` : ''}距「${dev.place.name}」约 ${dev.place.distanceMeters}m`)
+      : (dev.location
+        ? `${addrText ? `${addrText}（` : ''}${typeof dev.location.latitude === 'number' && typeof dev.location.longitude === 'number' ? `坐标 (${dev.location.latitude}, ${dev.location.longitude})，` : ''}精度 ${dev.location.horizontalAccuracy ?? '未知'}m${addrText ? '）' : ''}`
+        : '暂无定位数据');
     return {
       ok: true,
       notify: true,
       title: `📍 ${dev.name}`,
-      message: `${dev.name} [${dev.model}]：电量 ${batText} · ${dev.online ? '在线' : '离线'} · ${placeText}`,
+      message: `${dev.name} [${dev.model}]：电量 ${batText} · ${dev.deviceStatusLabel} · ${placeText}`,
       data: {
         device: dev,
         fetchedAt: res.fetchedAt,
         fromCache: res.fromCache,
+        geoConfigured: res.geoConfigured ?? geoConfigured,
       },
     };
   }
@@ -912,9 +1292,13 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
       paths,
       config,
       refresh: false,
+      locatePollDelayMs,
       fetchFn,
       nowFn,
       signal,
+      env,
+      amapRequester,
+      amapUrl,
     });
     if (!res.ok) {
       return {
@@ -977,11 +1361,14 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
         signal,
       });
       await withFileLock(paths.sessionPath, () => saveSession(paths.sessionPath, session));
+      const statusMsg = targetDev.online
+        ? `已向 ${targetDev.name} 发送 Find My 响铃指令，设备将以最大音量播放查找提示音。`
+        : `已向 ${targetDev.name} 发送 Find My 响铃指令（设备当前处于${targetDev.deviceStatusLabel}状态，苹果服务器将在其唤醒联网时立即响铃）。`;
       return {
         ok: true,
         notify: true,
         title: `🔔 已触发 ${targetDev.name} 响铃`,
-        message: `已向 ${targetDev.name} 发送 Find My 响铃指令，设备将以最大音量播放查找提示音。`,
+        message: statusMsg,
         data: { dryRun: false, device: targetDev, subject },
       };
     } catch (err) {
@@ -1001,9 +1388,13 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
       paths,
       config,
       refresh: true,
+      locatePollDelayMs,
       fetchFn,
       nowFn,
       signal,
+      env,
+      amapRequester,
+      amapUrl,
     });
     if (!res.ok) {
       return {
@@ -1016,19 +1407,25 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
     }
     const allDevices = res.entries.map(e => sanitizeDeviceForOutput(e.device, config.places));
     const watchList = config.watchDevices.map(w => w.toLowerCase());
-    const monitored = allDevices.filter(d => {
-      if (watchList.length === 0) {
-        return d.category === 'iphone' || d.category === 'ipad' || d.category === 'watch';
-      }
-      return watchList.some(w =>
-        d.id.toLowerCase() === w
-        || d.name.toLowerCase().includes(w)
-        || d.category.toLowerCase() === w,
+    let monitored;
+    if (watchList.length === 0) {
+      const ownMonitored = allDevices.filter(d => !d.isFamily && (d.category === 'iphone' || d.category === 'ipad' || d.category === 'watch'));
+      monitored = ownMonitored.length > 0
+        ? ownMonitored
+        : allDevices.filter(d => d.category === 'iphone' || d.category === 'ipad' || d.category === 'watch');
+    } else {
+      monitored = allDevices.filter(d =>
+        watchList.some(w =>
+          d.id.toLowerCase() === w
+          || d.name.toLowerCase().includes(w)
+          || d.category.toLowerCase() === w,
+        ),
       );
-    });
+    }
 
     const lowBatteryDevices = monitored.filter(d =>
       typeof d.batteryPercent === 'number'
+      && !d.batteryIsCached
       && d.batteryPercent < config.minBatteryPct
       && d.batteryStatus !== 'Charging'
       && d.batteryStatus !== 'Charged',

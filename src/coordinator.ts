@@ -8,6 +8,7 @@ import { inferModelTier, isRetryableModelError, type AgentFactory, type AgentPor
 import { publicData } from './conversation.js';
 import { Executor } from './executor.js';
 import { readSnapshot, snapshot, type InputFile } from './files.js';
+import { classifyBashCommandCs80Scene, notifyCs80Scene, type Cs80SceneId } from './cs80-scene.js';
 import { ImGateway } from './im.js';
 import { ModelHub, type ModelHubConfigureInput } from './model-hub.js';
 import {
@@ -1752,6 +1753,22 @@ export class Coordinator {
     const restoreCheckpoint = canRestore
       ? { sessionFile: savedCheckpoint!.sessionFile!, leafId: savedCheckpoint!.leafId! }
       : undefined;
+    const activeToolScenes = new Map<string, { scene: Cs80SceneId; caption: string }>();
+    const extractBashCmd = (data: unknown): string => {
+      if (typeof data === 'string') {
+        try {
+          const parsed = JSON.parse(data) as { command?: unknown };
+          if (typeof parsed?.command === 'string') return parsed.command;
+        } catch {
+          return data;
+        }
+      }
+      if (data && typeof data === 'object' && !Array.isArray(data)) {
+        const cmd = (data as { command?: unknown }).command;
+        if (typeof cmd === 'string') return cmd;
+      }
+      return '';
+    };
     const worker = await this.factory.create(
       'worker',
       run.id,
@@ -1820,7 +1837,31 @@ export class Coordinator {
             if (event.interrupted) this.stop(task.id, '本机工具超时或中断，副作用结果未经确认；工作暂停，不会自动重放', 'paused');
           }
         },
-        onEvent: event => run.trace?.observe(event),
+        onEvent: event => {
+          if (event.kind === 'tool_start' && event.toolName === 'bash' && event.id) {
+            const matched = classifyBashCommandCs80Scene(extractBashCmd(event.data));
+            if (matched) {
+              activeToolScenes.set(event.id, matched);
+              notifyCs80Scene({
+                scene: matched.scene,
+                phase: 'start',
+                holdSec: 30,
+                caption: matched.caption,
+              });
+            }
+          } else if (event.kind === 'tool_end' && event.id) {
+            const active = activeToolScenes.get(event.id);
+            if (active) {
+              activeToolScenes.delete(event.id);
+              notifyCs80Scene(
+                event.error
+                  ? { scene: active.scene, phase: 'end', tailSec: 0 }
+                  : { scene: active.scene, phase: 'pulse', holdSec: 4.0, caption: active.caption },
+              );
+            }
+          }
+          run.trace?.observe(event);
+        },
       },
     );
     run.worker = worker;

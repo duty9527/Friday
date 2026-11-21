@@ -1,6 +1,16 @@
 #!/usr/bin/env node
 import { randomBytes } from 'node:crypto';
-import { appendFileSync, chmodSync, lstatSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  chmodSync,
+  existsSync,
+  lstatSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
@@ -15,6 +25,11 @@ import {
   writeConfig,
   writeJsonAtomic,
 } from '../_shared/config-store.mjs';
+import {
+  resolveSystemAmapKey,
+  reverseGeocodeWithCache,
+  saveSystemGeoConfig,
+} from '../_shared/amap-geo.mjs';
 import {
   createNinebotClient,
   isSessionTokenValid,
@@ -208,9 +223,13 @@ function resolveEffectiveBackend(config, session, env, overrideBackend) {
  * @param {Record<string, string | undefined>} env
  * @param {number} nowMs
  */
-function redactConfig(config, session, env, nowMs) {
+function redactConfig(config, session, env, nowMs, homeDir) {
   const officialKey = String(config.deviceServiceKey || env?.NINEBOT_DEVICESERVICE_KEY || '').trim();
-  const amapKey = String(config.amapKey || env?.AMAP_KEY || '').trim();
+  const { key: amapKey, source: amapKeySource } = resolveSystemAmapKey({
+    homeDir,
+    env,
+    fallbackKey: config.amapKey,
+  });
   return {
     backend: config.backend,
     effectiveBackend: resolveEffectiveBackend(config, session, env),
@@ -226,6 +245,7 @@ function redactConfig(config, session, env, nowMs) {
     hasBusinessUid: Boolean(session && typeof session.businessUid === 'string' && session.businessUid),
     hasDeviceServiceKey: Boolean(officialKey),
     hasAmapKey: Boolean(amapKey),
+    amapKeySource,
     lowBatteryThreshold: config.lowBatteryThreshold,
     minRangeKm: config.minRangeKm,
     idleRemindDays: config.idleRemindDays,
@@ -497,6 +517,9 @@ function summarizeCachedTrips(db, sn, nowMs, monthFilter, limit = 10) {
   };
 }
 
+const MAX_VEHICLE_IMAGE_BYTES = 512 * 1024;
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
 /**
  * @param {string} sessionPath
  * @returns {Record<string, any>}
@@ -521,6 +544,143 @@ async function saveSessionLocked(sessionPath, session) {
   await withFileLock(sessionPath, () => {
     writeJsonAtomic(sessionPath, session, { mode: 0o600 });
   });
+}
+
+/**
+ * Atomically write verified binary PNG bytes inside pluginDataDir with 0600 permissions.
+ * @param {string} targetPath
+ * @param {Buffer} bytes
+ */
+function writeBinaryFileAtomic(targetPath, bytes) {
+  const tmpPath = `${targetPath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`;
+  try {
+    writeFileSync(tmpPath, bytes, { mode: 0o600 });
+    try {
+      chmodSync(tmpPath, 0o600);
+    } catch {
+      // Ignore chmod errors on unsupported filesystems
+    }
+    renameSync(tmpPath, targetPath);
+  } catch (err) {
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // Ignore cleanup failure
+    }
+    throw err;
+  }
+}
+
+/**
+ * Read a local cached PNG as a CSP-safe `data:image/png;base64,...` URI.
+ * Rejects symlinks, oversized files, and non-PNG magic bytes.
+ * @param {string} filePath
+ * @returns {string | null}
+ */
+function readPngAsDataUrl(filePath) {
+  try {
+    const st = lstatSync(filePath);
+    if (!st.isFile() || st.isSymbolicLink() || st.size < 64 || st.size > MAX_VEHICLE_IMAGE_BYTES) {
+      return null;
+    }
+    const buf = readFileSync(filePath);
+    if (buf.length < 64 || buf.length > MAX_VEHICLE_IMAGE_BYTES || !buf.subarray(0, 8).equals(PNG_MAGIC)) {
+      return null;
+    }
+    return `data:image/png;base64,${buf.toString('base64')}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cache dark/light official scooter PNG renders locally (best-effort, non-fatal).
+ * @param {string} pluginDataDir
+ * @param {ReturnType<typeof createNinebotClient>} client
+ * @param {string} sn
+ * @param {string} darkUrl
+ * @param {string} lightUrl
+ * @param {number} nowMs
+ */
+async function syncVehicleImagesCache(pluginDataDir, client, sn, darkUrl, lightUrl, nowMs) {
+  const cleanSn = String(sn || '').trim();
+  const cleanDark = String(darkUrl || '').trim();
+  const cleanLight = String(lightUrl || '').trim();
+  if (!cleanSn || (!cleanDark && !cleanLight)) return;
+
+  try {
+    ensurePrivateDir(pluginDataDir);
+    const metaPath = join(pluginDataDir, 'vehicle-images-meta.json');
+    const darkPath = join(pluginDataDir, 'vehicle-dark.png');
+    const lightPath = join(pluginDataDir, 'vehicle-light.png');
+    const meta = readJsonSafe(metaPath, /** @type {Record<string, any>} */ ({}));
+
+    const needDark = Boolean(cleanDark) && (meta.sn !== cleanSn || meta.darkUrl !== cleanDark || !existsSync(darkPath));
+    const needLight = Boolean(cleanLight) && (meta.sn !== cleanSn || meta.lightUrl !== cleanLight || !existsSync(lightPath));
+    if (!needDark && !needLight) return;
+
+    /** @type {Map<string, Buffer | null>} */
+    const downloaded = new Map();
+    const fetchOnce = async (url) => {
+      if (!url) return null;
+      if (downloaded.has(url)) return downloaded.get(url) ?? null;
+      const bytes = await client.fetchVehicleImagePng(url);
+      downloaded.set(url, bytes);
+      return bytes;
+    };
+
+    let nextDarkUrl = meta.sn === cleanSn && existsSync(darkPath) ? String(meta.darkUrl || '') : '';
+    let nextLightUrl = meta.sn === cleanSn && existsSync(lightPath) ? String(meta.lightUrl || '') : '';
+
+    if (needDark) {
+      const bytes = await fetchOnce(cleanDark);
+      if (bytes) {
+        writeBinaryFileAtomic(darkPath, bytes);
+        nextDarkUrl = cleanDark;
+      }
+    }
+    if (needLight) {
+      const bytes = await fetchOnce(cleanLight);
+      if (bytes) {
+        writeBinaryFileAtomic(lightPath, bytes);
+        nextLightUrl = cleanLight;
+      }
+    }
+
+    if (nextDarkUrl || nextLightUrl) {
+      writeJsonAtomic(
+        metaPath,
+        {
+          sn: cleanSn,
+          darkUrl: nextDarkUrl,
+          lightUrl: nextLightUrl,
+          updatedAt: nowMs,
+        },
+        { mode: 0o600 },
+      );
+    }
+  } catch {
+    // Non-fatal: official CDN failures never block telemetry updates
+  }
+}
+
+/**
+ * Read locally cached PNG data URLs for the specified vehicle SN.
+ * @param {string} pluginDataDir
+ * @param {string} sn
+ * @returns {{ darkDataUrl: string | null; lightDataUrl: string | null }}
+ */
+function readVehicleImageDataUrls(pluginDataDir, sn) {
+  const cleanSn = String(sn || '').trim();
+  const metaPath = join(pluginDataDir, 'vehicle-images-meta.json');
+  const meta = readJsonSafe(metaPath, /** @type {Record<string, any>} */ ({}));
+  if (cleanSn && meta.sn && meta.sn !== cleanSn) {
+    return { darkDataUrl: null, lightDataUrl: null };
+  }
+  return {
+    darkDataUrl: readPngAsDataUrl(join(pluginDataDir, 'vehicle-dark.png')),
+    lightDataUrl: readPngAsDataUrl(join(pluginDataDir, 'vehicle-light.png')),
+  };
 }
 
 /**
@@ -599,10 +759,10 @@ function formatSnapshotSummary(s) {
   const chargeStr = s.charging
     ? `充电中${s.chargingPowerW ? ` (${s.chargingPowerW}W)` : ''}${s.remainChargeTime ? ` · 预计 ${s.remainChargeTime}` : ''}`
     : '未充电';
-  const lockStr = s.locked === true ? '已锁车' : s.locked === false ? '未锁车' : '锁状态未知';
-  const pwrStr = s.powerOn ? '已开机' : '已关机';
+  const lockStr = s.locked === true ? '已上锁' : s.locked === false ? '未锁车' : '锁状态未知';
+  const pwrStr = s.powerOn ? '电门开启' : '电门已关';
 
-  const lines = [`🛵 ${name}（${s.sn}）`];
+  const lines = [`🛵 ${name}${s.color ? ` · ${s.color}` : ''}（${s.sn}）`];
   const powerMetrics = [`电量 ${batt}`, `预估续航 ${rangeStr}`];
   if (s.voltageV !== null && s.voltageV !== undefined) powerMetrics.push(`电压 ${s.voltageV}V`);
   if (s.temperatureC !== null && s.temperatureC !== undefined) powerMetrics.push(`温度 ${s.temperatureC}℃`);
@@ -1176,9 +1336,54 @@ export async function runAction(action, args = {}, deps = {}) {
       );
     }
 
-    const amapKey = String(config.amapKey || env?.AMAP_KEY || '').trim();
-    snapshot = await enrichLocationWithGeo(db, snapshot, client, amapKey, nowMs);
+    const { key: amapKey } = resolveSystemAmapKey({
+      homeDir: paths.homeDir,
+      env,
+      fallbackKey: config.amapKey,
+    });
+    if (deps?.httpRequester || deps?.hosts?.amap) {
+      snapshot = await enrichLocationWithGeo(db, snapshot, client, amapKey, nowMs);
+    } else if (
+      snapshot.location?.valid
+      && !snapshot.location.address
+      && amapKey
+      && Number.isFinite(snapshot.location.gcjLat)
+      && Number.isFinite(snapshot.location.gcjLon)
+    ) {
+      const geo = await reverseGeocodeWithCache({
+        homeDir: paths.homeDir,
+        env,
+        lat: snapshot.location.gcjLat,
+        lon: snapshot.location.gcjLon,
+        coordSys: 'gcj02',
+        fallbackKey: config.amapKey,
+        nowMs,
+      });
+      if (geo.address) {
+        snapshot.location = {
+          ...snapshot.location,
+          address: geo.address,
+          shortAddress: geo.shortAddress || geo.address,
+          source: geo.source || 'amap',
+        };
+      }
+    }
     insertSnapshot(db, snapshot);
+
+    if (snapshot.locked === true && !snapshot.powerOn) {
+      db.prepare(
+        "UPDATE alert_state SET active=0, last_value='LOCKED' WHERE sn=? AND alert_key='unlocked_warning' AND active=1",
+      ).run(sn);
+    }
+
+    await syncVehicleImagesCache(
+      paths.pluginDataDir,
+      client,
+      sn,
+      String(snapshot.darkImageUrl || ''),
+      String(snapshot.lightImageUrl || ''),
+      nowMs,
+    );
 
     return { snapshot, prevSnapshotRow, backend };
   }
@@ -1241,9 +1446,16 @@ export async function runAction(action, args = {}, deps = {}) {
           session = { deviceId: session.deviceId };
           await saveSessionLocked(paths.sessionPath, session);
         }
+        if (typeof safeArgs.amapKey === 'string' && safeArgs.amapKey.trim()) {
+          await saveSystemGeoConfig({
+            homeDir: paths.homeDir,
+            env,
+            amapKey: safeArgs.amapKey.trim(),
+          });
+        }
       }
 
-      const redacted = redactConfig(config, session, env, nowMs);
+      const redacted = redactConfig(config, session, env, nowMs, paths.homeDir);
       return {
         ok: true,
         notify: false,
@@ -1318,6 +1530,16 @@ export async function runAction(action, args = {}, deps = {}) {
       });
 
       const selected = vehicles.find(v => v.sn === config.defaultSn) || autoVehicle || vehicles[0] || null;
+      if (selected) {
+        await syncVehicleImagesCache(
+          paths.pluginDataDir,
+          client,
+          String(selected.sn),
+          String(selected.darkImageUrl || ''),
+          String(selected.lightImageUrl || ''),
+          nowMs,
+        );
+      }
       const isMainAccount = selected ? selected.isSharedAccount === false : false;
       const tips = isMainAccount
         ? '\n⚠️ 检测到当前账号为车主主账号，建议改用《九号出行》App 的「用车人/家庭子账号」（仅开位置与骑行记录权限），避免挤掉手机端登录并实现账号级只读隔离。'
@@ -1331,7 +1553,7 @@ export async function runAction(action, args = {}, deps = {}) {
           ? `已登录账号 ${maskUsername(username)}，发现 ${vehicles.length} 台车辆${selected ? `，当前默认车辆：${selected.name} (${selected.sn})` : ''}。${tips}`
           : `已登录账号 ${maskUsername(username)}，暂未发现绑定车辆，请检查 App 车辆绑定或子账号授权。`,
         data: {
-          config: redactConfig(config, session, env, nowMs),
+          config: redactConfig(config, session, env, nowMs, paths.homeDir),
           vehicles,
         },
       };
@@ -1370,6 +1592,14 @@ export async function runAction(action, args = {}, deps = {}) {
           });
           writeConfig(paths.configPath, config);
         });
+        await syncVehicleImagesCache(
+          paths.pluginDataDir,
+          client,
+          String(matched.sn),
+          String(matched.darkImageUrl || ''),
+          String(matched.lightImageUrl || ''),
+          nowMs,
+        );
       }
 
       const lines = vehicles.length
@@ -1572,10 +1802,17 @@ export async function runAction(action, args = {}, deps = {}) {
       }
 
       const sn = String(safeArgs.sn ?? latestSnapshot?.sn ?? config.defaultSn ?? '').trim();
+      const vehiclesList = Array.isArray(session.vehicles) ? session.vehicles : [];
       if (!latestSnapshot && sn) {
         const row = getLatestSnapshotRow(db, sn);
         if (row && typeof row.payload_json === 'string') {
           latestSnapshot = JSON.parse(String(row.payload_json));
+        }
+      }
+      if (latestSnapshot && !latestSnapshot.color && sn) {
+        const matchedVeh = vehiclesList.find(v => v?.sn === sn);
+        if (matchedVeh?.color) {
+          latestSnapshot = { ...latestSnapshot, color: String(matchedVeh.color) };
         }
       }
 
@@ -1597,7 +1834,8 @@ export async function runAction(action, args = {}, deps = {}) {
             lastValue: r.last_value,
           }))
         : [];
-      const redactedCfg = redactConfig(config, session, env, nowMs);
+      const redactedCfg = redactConfig(config, session, env, nowMs, paths.homeDir);
+      const vehicleImages = readVehicleImageDataUrls(paths.pluginDataDir, sn);
 
       return {
         ok: true,
@@ -1608,8 +1846,9 @@ export async function runAction(action, args = {}, deps = {}) {
           : '尚未采集到九号电摩数据，请先执行 login 与 status。',
         data: {
           configured: redactedCfg.hasSession || redactedCfg.hasDeviceServiceKey || (redactedCfg.hasPassword && Boolean(redactedCfg.usernameMasked)),
-          vehicles: Array.isArray(session.vehicles) ? session.vehicles : [],
+          vehicles: vehiclesList,
           snapshot: latestSnapshot,
+          vehicleImages,
           history,
           tripSummary,
           activeAlerts,
@@ -1715,7 +1954,7 @@ export async function handleVoiceFastpath(request, context = {}) {
     const statusData = /** @type {Record<string, any>} */ (res.data || {});
     const s = /** @type {Record<string, any>} */ (statusData.snapshot || {});
     const lockText = s.locked === true ? '已经上锁' : s.locked === false ? '目前没有锁车，注意检查' : '锁车状态暂时未知';
-    const powerText = s.powerOn ? '电门还开着' : '已关机';
+    const powerText = s.powerOn ? '电门还开着' : '电门已关';
     const locText = s.location?.shortAddress || s.location?.address
       ? `停在${s.location.shortAddress || s.location.address}`
       : s.location?.valid

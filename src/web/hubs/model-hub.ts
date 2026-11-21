@@ -135,7 +135,7 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
 
   function renderModalPoolSelection(prov: ModelProviderView) {
     const selected = new Set((prov.selectedModels ?? []).map(item => item.id));
-    modalAuthPoolSummary.textContent = `Worker 模型池：已勾选 ${selected.size} 款（保留模型原生思考等级，由 Jev 动态决策）`;
+    modalAuthPoolSummary.textContent = `Worker 模型池：已勾选 ${selected.size} 款`;
     const ids = [...new Set([...prov.models.map(m => m.id), ...selected])];
     const frag = document.createDocumentFragment();
     for (const id of ids) {
@@ -186,7 +186,7 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
     const currentProv = providers.find(p => p.id === activeAuthProviderTab);
     if (!currentProv) return;
     const isDisabled = currentProv.enabled === false;
-    modalAuthProviderTitle.textContent = `${currentProv.name} (${currentProv.id})`;
+    modalAuthProviderTitle.textContent = currentProv.name;
     modalAuthStatusBadge.textContent = providerStatusText(currentProv);
     modalAuthStatusBadge.className = `hub-badge ${isDisabled ? 'badge-slate' : (currentProv.configured ? 'badge-green' : 'badge-amber')}`;
     modalAuthToggleBtn.textContent = isDisabled ? '▶️ 启用提供方' : '🚫 禁用提供方';
@@ -587,7 +587,7 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
       const badgeClass = isDisabled ? 'badge-slate' : (prov.configured ? 'badge-green' : 'badge-slate');
       titleGroup.append(
         node('span', badgeLabel, `hub-badge ${badgeClass}`),
-        node('strong', `${prov.name} (${prov.id})`, 'hub-card-title'),
+        node('strong', prov.name, 'hub-card-title'),
       );
       head.append(titleGroup);
       const actions = node('div', '', 'timer-actions');

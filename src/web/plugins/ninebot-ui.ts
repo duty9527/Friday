@@ -1,6 +1,6 @@
-import { element, isEditingWithin, kpiCard, node } from '../shared/dom.js';
+import { element, isEditingWithin, node } from '../shared/dom.js';
 import { errorText, timestamp } from '../shared/format.js';
-import { api } from '../state.js';
+import { api, hooks } from '../state.js';
 
 export interface NinebotUiOptions {
   isVisible: () => boolean;
@@ -27,10 +27,12 @@ interface NinebotSnapshot {
   sn: string;
   name: string;
   modelName: string;
+  color?: string;
   backend: 'account' | 'official';
   businessLine: 'motor' | 'ebike' | 'official';
   capturedAt: number;
   battery: number | null;
+  batteryPresent?: boolean;
   auxBattery: number | null;
   voltageV: number | null;
   temperatureC: number | null;
@@ -45,6 +47,10 @@ interface NinebotSnapshot {
   odometerKm: number | null;
   powerOn: boolean;
   locked: boolean | null;
+  gsmSignal?: number | null;
+  gnssSignal?: number | null;
+  gnssTimeSec?: number | null;
+  locDelaySec?: number | null;
   smartServiceExpired: boolean;
   isSharedAccount: boolean;
   location: NinebotLocation;
@@ -96,7 +102,13 @@ interface NinebotVehicleItem {
   sn: string;
   name: string;
   modelName?: string;
+  color?: string;
   businessLine?: string;
+}
+
+interface NinebotVehicleImages {
+  darkDataUrl: string | null;
+  lightDataUrl: string | null;
 }
 
 interface NinebotActiveAlert {
@@ -120,6 +132,7 @@ interface NinebotRedactedConfig {
   hasBusinessUid: boolean;
   hasDeviceServiceKey: boolean;
   hasAmapKey: boolean;
+  amapKeySource?: string;
   lowBatteryThreshold: number;
   minRangeKm: number;
   idleRemindDays: number;
@@ -131,6 +144,7 @@ interface NinebotDashboardPayload {
   configured: boolean;
   vehicles?: NinebotVehicleItem[];
   snapshot: NinebotSnapshot | null;
+  vehicleImages?: NinebotVehicleImages;
   history: NinebotHistoryPoint[];
   tripSummary: NinebotTripSummary | null;
   activeAlerts: NinebotActiveAlert[];
@@ -167,6 +181,31 @@ function formatDurationZh(sec: number): string {
   return m > 0 ? `${h}小时${m}分钟` : `${h}小时`;
 }
 
+function formatRelativeDelay(locDelaySec: number | null | undefined, gnssTimeSec: number | null | undefined): string {
+  const sec = locDelaySec !== null && locDelaySec !== undefined && Number.isFinite(locDelaySec) && locDelaySec >= 0
+    ? locDelaySec
+    : (gnssTimeSec !== null && gnssTimeSec !== undefined && gnssTimeSec > 0
+        ? Math.max(0, Math.round(Date.now() / 1000 - gnssTimeSec))
+        : null);
+  if (sec === null) return '';
+  if (sec < 60) return '刚刚更新';
+  const mins = Math.round(sec / 60);
+  if (mins < 60) return `${mins} 分钟前更新`;
+  const hrs = Math.round(mins / 60);
+  return `${hrs} 小时前更新`;
+}
+
+function dockCell(label: string, value: string, sub: string, tone: 'ok' | 'warn' | 'charging' | 'muted' | 'default' = 'default'): HTMLElement {
+  const cell = node('div', '', 'ninebot-dock-cell');
+  cell.dataset.tone = tone;
+  cell.append(
+    node('span', label, 'ninebot-dock-label'),
+    node('strong', value, 'ninebot-dock-value'),
+    node('span', sub, 'ninebot-dock-sub'),
+  );
+  return cell;
+}
+
 export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
   const panelEl = element<HTMLElement>('plugin-panel-ninebot');
   const topBadge = element<HTMLElement>('ninebot-top-badge');
@@ -176,11 +215,29 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
   const patrolBtn = element<HTMLButtonElement>('ninebot-patrol-btn');
   const tripsSyncBtn = element<HTMLButtonElement>('ninebot-trips-sync-btn');
   const refreshBtn = element<HTMLButtonElement>('ninebot-refresh-btn');
-  const kpiGrid = element<HTMLElement>('ninebot-kpi-grid');
+
+  const cockpitCard = element<HTMLElement>('ninebot-cockpit-card');
+  const vehicleTitleEl = element<HTMLElement>('ninebot-vehicle-title');
+  const modelPillEl = element<HTMLElement>('ninebot-model-pill');
+  const rolePillEl = element<HTMLElement>('ninebot-role-pill');
+  const signalPillEl = element<HTMLElement>('ninebot-signal-pill');
+  const stateTextEl = element<HTMLElement>('ninebot-state-text');
+  const rangeValEl = element<HTMLElement>('ninebot-range-val');
+  const socValEl = element<HTMLElement>('ninebot-soc-val');
+  const energyBarEl = element<HTMLElement>('ninebot-energy-bar');
+  const rangeSubEl = element<HTMLElement>('ninebot-range-sub');
+  const vehicleImgEl = element<HTMLImageElement>('ninebot-vehicle-img');
+  const rawFallbackEl = document.getElementById('ninebot-vehicle-fallback');
+  if (!rawFallbackEl) {
+    throw new Error('Missing interface element: ninebot-vehicle-fallback');
+  }
+  const vehicleFallbackEl: Element = rawFallbackEl;
+  const statusDockEl = element<HTMLElement>('ninebot-status-dock');
 
   const guardBadgeEl = element<HTMLElement>('ninebot-guard-badge');
   const locationTextEl = element<HTMLElement>('ninebot-location-text');
   const updatedMetaEl = element<HTMLElement>('ninebot-updated-meta');
+  const guardChecksEl = element<HTMLElement>('ninebot-guard-checks');
   const alertsBoxEl = element<HTMLElement>('ninebot-alerts-box');
 
   const trendPillsEl = element<HTMLElement>('ninebot-trend-pills');
@@ -200,12 +257,14 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
   const cfgIdleDaysInput = element<HTMLInputElement>('ninebot-cfg-idle-days');
   const cfgCooldownInput = element<HTMLInputElement>('ninebot-cfg-cooldown');
   const cfgUnlockedCheck = element<HTMLInputElement>('ninebot-cfg-unlocked');
-  const cfgAmapInput = element<HTMLInputElement>('ninebot-cfg-amap');
+  const geoStatusHintEl = element<HTMLElement>('ninebot-geo-status-hint');
+  const openGeoBtn = element<HTMLButtonElement>('ninebot-open-geo-btn');
   const cfgDsKeyInput = element<HTMLInputElement>('ninebot-cfg-dskey');
   const cfgSaveBtn = element<HTMLButtonElement>('ninebot-cfg-save-btn');
 
   const monthInput = element<HTMLInputElement>('ninebot-month-input');
   const tripsSubtitleEl = element<HTMLElement>('ninebot-trips-subtitle');
+  const tripKpisEl = element<HTMLElement>('ninebot-trip-kpis');
   const tripsListEl = element<HTMLElement>('ninebot-trips-list');
 
   let active = false;
@@ -214,6 +273,7 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
   let trendMetric: TrendMetricKey = 'battery';
   let latestData: NinebotDashboardPayload | undefined;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
+  let themeObserver: MutationObserver | undefined;
 
   function setBanner(text: string, isError = false): void {
     statusBanner.textContent = text;
@@ -248,17 +308,26 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
     const curSn = data.config.defaultSn || data.snapshot?.sn || '';
     const optionsList: Array<{ sn: string; label: string }> = [];
     const seen = new Set<string>();
+    const nameCounts = new Map<string, number>();
+    for (const v of vehicles) {
+      if (v?.name) {
+        nameCounts.set(v.name, (nameCounts.get(v.name) ?? 0) + 1);
+      }
+    }
 
     for (const v of vehicles) {
       if (!v?.sn || seen.has(v.sn)) continue;
       seen.add(v.sn);
       const tag = v.businessLine === 'motor' ? '电摩' : v.businessLine === 'ebike' ? '电自' : '官方';
-      optionsList.push({ sn: v.sn, label: `${v.name || v.sn} (${v.sn}) · ${tag}` });
+      const baseLabel = v.name
+        ? ((nameCounts.get(v.name) ?? 0) > 1 ? `${v.name} · ${v.sn.slice(-4)}` : v.name)
+        : v.sn;
+      optionsList.push({ sn: v.sn, label: `${baseLabel} · ${tag}` });
     }
     if (curSn && !seen.has(curSn)) {
       optionsList.unshift({
         sn: curSn,
-        label: `${data.config.deviceName || data.snapshot?.name || curSn} (${curSn})`,
+        label: data.config.deviceName || data.snapshot?.name || '九号座驾',
       });
     }
 
@@ -280,83 +349,176 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
     vehicleSelect.disabled = false;
   }
 
-  function renderKpis(data: NinebotDashboardPayload): void {
+  function renderEnergySegments(battery: number | null): void {
+    const segCount = 20;
+    const filledCount = battery !== null ? Math.max(0, Math.min(segCount, Math.round((battery / 100) * segCount))) : 0;
+    if (energyBarEl.childElementCount !== segCount) {
+      const segs: HTMLElement[] = [];
+      for (let i = 0; i < segCount; i++) {
+        segs.push(node('span', '', 'ninebot-energy-seg'));
+      }
+      energyBarEl.replaceChildren(...segs);
+    }
+    const children = energyBarEl.children;
+    for (let i = 0; i < children.length; i++) {
+      children[i]!.classList.toggle('is-filled', i < filledCount);
+    }
+    energyBarEl.setAttribute('aria-label', battery !== null ? `动力电池电量 ${battery}%` : '动力电池电量待同步');
+  }
+
+  function renderScooterShowroom(imgs: NinebotVehicleImages | undefined): void {
+    const isIndustrial = document.documentElement.dataset.theme === 'industrial';
+    const candidate = isIndustrial
+      ? (imgs?.lightDataUrl || imgs?.darkDataUrl || null)
+      : (imgs?.darkDataUrl || imgs?.lightDataUrl || null);
+    const validPng = typeof candidate === 'string' && candidate.startsWith('data:image/png;base64,') ? candidate : null;
+    if (validPng) {
+      if (vehicleImgEl.getAttribute('src') !== validPng) {
+        vehicleImgEl.src = validPng;
+      }
+      vehicleImgEl.hidden = false;
+      vehicleFallbackEl.setAttribute('hidden', '');
+    } else {
+      vehicleImgEl.hidden = true;
+      vehicleImgEl.removeAttribute('src');
+      vehicleFallbackEl.removeAttribute('hidden');
+    }
+  }
+
+  function renderCockpit(data: NinebotDashboardPayload): void {
     const snap = data.snapshot;
     const cfg = data.config;
+    renderScooterShowroom(data.vehicleImages);
+
     if (!snap) {
-      kpiGrid.replaceChildren(
-        kpiCard('主电池电量', '—', data.configured ? '点击「实时同步车况」拉取' : '请先在下方登录九号子账号'),
-        kpiCard('72V BMS 遥测', '—', '电压与温度待采集'),
-        kpiCard('预估精准续航', '—', '总里程待采集'),
-        kpiCard('充电与锁车安防', '未同步', `低电量阈值 ${cfg.lowBatteryThreshold}%`),
+      cockpitCard.dataset.tone = 'muted';
+      vehicleTitleEl.textContent = cfg.deviceName || '九号座驾';
+      modelPillEl.textContent = data.configured ? '待同步车况' : '未绑定车辆';
+      rolePillEl.textContent = '纯只读守护';
+      signalPillEl.textContent = '📡 等待云盒回传';
+      stateTextEl.textContent = data.configured ? '点击右上角「同步车况」拉取实车数据' : '请先在下方展开并绑定九号子账号';
+      rangeValEl.textContent = '—';
+      socValEl.textContent = '—%';
+      renderEnergySegments(null);
+      rangeSubEl.textContent = `低电量阈值 ${cfg.lowBatteryThreshold}% · 续航预警 ${cfg.minRangeKm} km`;
+      statusDockEl.replaceChildren(
+        dockCell('设防锁车', '待同步', '等待首次采集', 'muted'),
+        dockCell('电门状态', '待同步', 'ACC 状态未知', 'muted'),
+        dockCell('72V 动力电芯', '— V · — ℃', 'BMS 待采集', 'muted'),
+        dockCell('云盒与备电', '—%', '信号待同步', 'muted'),
       );
       return;
     }
 
-    const battText = snap.battery !== null ? `${snap.battery}%` : '—';
-    const battTone: 'default' | 'accent' | 'positive' | 'warning' =
-      snap.battery !== null && snap.battery <= cfg.lowBatteryThreshold && !snap.charging
-        ? 'warning'
-        : snap.charging || (snap.battery !== null && snap.battery >= 50)
-          ? 'positive'
-          : 'default';
-    const battSub = [
-      snap.auxBattery !== null ? `通信备电 ${snap.auxBattery}%` : '',
-      snap.businessLine === 'motor' ? 'steeldust 电摩网关' : snap.businessLine === 'ebike' ? 'ebike 网关' : '官方 DeviceService',
-    ].filter(Boolean).join(' · ');
+    const batt = snap.battery;
+    const lowBatt = batt !== null && batt <= cfg.lowBatteryThreshold && !snap.charging;
+    const critBatt = batt !== null && batt <= 20 && !snap.charging;
+    const tone: 'ok' | 'charging' | 'warn' | 'amber' = snap.charging
+      ? 'charging'
+      : snap.locked === false || snap.powerOn || critBatt
+        ? 'warn'
+        : lowBatt
+          ? 'amber'
+          : 'ok';
+    cockpitCard.dataset.tone = tone;
 
-    const voltText = snap.voltageV !== null ? `${snap.voltageV} V` : '—';
+    vehicleTitleEl.textContent = snap.name || '九号座驾';
+    const modelParts = [snap.modelName, snap.color].filter(Boolean);
+    modelPillEl.textContent = modelParts.length
+      ? modelParts.join(' · ')
+      : (snap.businessLine === 'motor' ? '智能电摩' : '智能电自');
+    rolePillEl.textContent = snap.isSharedAccount ? '家庭只读子账号' : '车主账号（只读守护）';
+
+    const sigParts: string[] = [];
+    if (snap.gsmSignal !== null && snap.gsmSignal !== undefined) sigParts.push(`GSM ${snap.gsmSignal}`);
+    if (snap.gnssSignal !== null && snap.gnssSignal !== undefined) sigParts.push(`GPS ${snap.gnssSignal}`);
+    const delayHint = formatRelativeDelay(snap.locDelaySec, snap.gnssTimeSec);
+    signalPillEl.textContent = `📡 ${sigParts.length ? sigParts.join(' · ') : (snap.businessLine === 'motor' ? '电摩网关在线' : '云盒在线')}${delayHint ? ` · ${delayHint}` : ''}`;
+
+    if (snap.charging) {
+      stateTextEl.textContent = `⚡ 正在充电${snap.chargingPowerW ? ` (${snap.chargingPowerW}W)` : ''}${snap.remainChargeTime ? ` · 约 ${snap.remainChargeTime} 充满` : ''}`;
+    } else if (snap.locked === false) {
+      stateTextEl.textContent = '🔓 车辆未上锁 · 请及时检查停放安全';
+    } else if (snap.powerOn) {
+      stateTextEl.textContent = '🔑 电门处于开启状态 (ACC ON)';
+    } else if (lowBatt && snap.locked === true) {
+      stateTextEl.textContent = `🔒 已设防上锁 · 🪫 低电量待补能 (${batt}%)`;
+    } else if (snap.locked === true) {
+      stateTextEl.textContent = '🔒 已设防上锁 · 电门已关';
+    } else {
+      stateTextEl.textContent = lowBatt ? `🪫 低电量待补能 (${batt}%)` : '🛵 驻车待命中 · 电门已关';
+    }
+
+    rangeValEl.textContent = snap.effectiveRangeKm !== null ? String(snap.effectiveRangeKm) : '—';
+    socValEl.textContent = batt !== null ? `${batt}%` : '—%';
+    renderEnergySegments(batt);
+
+    const subBits: string[] = [];
+    if (snap.estimateMileageKm !== null && snap.estimateMileageKm !== snap.effectiveRangeKm) {
+      subBits.push(`工况预估 ${snap.estimateMileageKm} km`);
+    }
+    if (snap.odometerKm !== null) {
+      subBits.push(`总里程 ${snap.odometerKm} km`);
+    }
+    subBits.push(snap.businessLine === 'motor' ? 'steeldust 电摩专线' : snap.businessLine === 'ebike' ? 'ebike 兼容网关' : '官方接口');
+    rangeSubEl.textContent = subBits.join(' · ');
+
+    const lockDockTone = snap.locked === false ? 'warn' : snap.locked === true ? 'ok' : 'muted';
+    const lockDockVal = snap.locked === true ? '🔒 已上锁' : snap.locked === false ? '🔓 未上锁' : '待机未知';
+    const lockDockSub = snap.locked === true ? '电子设防正常' : snap.locked === false ? '请尽快锁车设防' : '等待锁态回传';
+
+    const pwrDockTone = snap.powerOn ? 'warn' : 'ok';
+    const pwrDockVal = snap.powerOn ? '🔑 电门开启' : '🔑 电门已关';
+    const pwrDockSub = snap.powerOn ? 'ACC 通电状态' : 'ACC OFF 已断电';
+
+    const bmsTone = snap.charging ? 'charging' : lowBatt ? 'warn' : 'ok';
+    const bmsVal = [
+      snap.voltageV !== null ? `${snap.voltageV} V` : '— V',
+      snap.temperatureC !== null ? `${snap.temperatureC} ℃` : '— ℃',
+    ].join(' · ');
     const bmsSub = [
-      snap.temperatureC !== null ? `温度 ${snap.temperatureC} ℃` : '温度 —',
-      snap.cycles !== null ? `循环 ${snap.cycles} 次` : '',
+      snap.batteryPresent === false ? '主电池未在位' : `主电 ${batt !== null ? `${batt}%` : '—'}`,
+      snap.cycles !== null ? `循环 ${snap.cycles} 次` : (snap.chargingPowerW ? `${snap.chargingPowerW}W` : ''),
     ].filter(Boolean).join(' · ');
 
-    const rangeText = snap.effectiveRangeKm !== null ? `${snap.effectiveRangeKm} km` : '—';
-    const rangeSub = snap.odometerKm !== null ? `总里程 ${snap.odometerKm} km` : '总里程 —';
+    const auxVal = snap.auxBattery !== null ? `备电 ${snap.auxBattery}%` : '云盒在线';
+    const auxSub = sigParts.length ? sigParts.join(' · ') : timestamp(snap.capturedAt);
 
-    const secValue = snap.charging
-      ? `⚡ 充电中${snap.chargingPowerW ? ` (${snap.chargingPowerW}W)` : ''}`
-      : snap.locked === true
-        ? '🔒 已上锁'
-        : snap.locked === false
-          ? '🔓 未锁车'
-          : '待机中';
-    const secTone: 'default' | 'accent' | 'positive' | 'warning' =
-      !snap.charging && (snap.powerOn || snap.locked === false)
-        ? 'warning'
-        : snap.charging || snap.locked === true
-          ? 'positive'
-          : 'default';
-    const secSub = snap.charging
-      ? (snap.remainChargeTime ? `预计剩余 ${snap.remainChargeTime}` : '正在补能中')
-      : (snap.powerOn ? '电门处于开启状态' : '车辆已关机');
-
-    kpiGrid.replaceChildren(
-      kpiCard('主电池电量', battText, battSub, battTone),
-      kpiCard('72V BMS 遥测', voltText, bmsSub, 'accent'),
-      kpiCard('预估精准续航', rangeText, rangeSub, 'default'),
-      kpiCard('充电与锁车安防', secValue, secSub, secTone),
+    statusDockEl.replaceChildren(
+      dockCell('设防锁车', lockDockVal, lockDockSub, lockDockTone),
+      dockCell('电门状态', pwrDockVal, pwrDockSub, pwrDockTone),
+      dockCell('72V 动力电芯', bmsVal, bmsSub, bmsTone),
+      dockCell('云盒与备电', auxVal, auxSub, 'default'),
     );
   }
 
   function renderGuardAndLocation(data: NinebotDashboardPayload): void {
     const snap = data.snapshot;
+    const cfg = data.config;
     const alerts = data.activeAlerts ?? [];
 
     if (!snap) {
       guardBadgeEl.textContent = data.configured ? '待同步' : '未绑定';
       guardBadgeEl.className = 'hub-badge badge-slate';
       locationTextEl.textContent = data.configured
-        ? '已配置凭据，点击右上角「🔄 实时同步车况」获取最新位置与状态。'
+        ? '已配置凭据，点击右上角「🔄 同步车况」获取最新位置与状态。'
         : '尚未绑定九号账号，请展开下方「九号账号登录绑定」配置子账号。';
       updatedMetaEl.textContent = '';
+      guardChecksEl.replaceChildren();
       alertsBoxEl.replaceChildren(node('p', '暂无守护巡检记录。', 'meta'));
       return;
     }
 
-    const hasRisk = alerts.length > 0 || (!snap.charging && (snap.powerOn || snap.locked === false)) || snap.smartServiceExpired;
-    guardBadgeEl.textContent = hasRisk ? `异常关注 (${alerts.length || 1})` : snap.charging ? '充电守护中' : '停放正常';
-    guardBadgeEl.className = `hub-badge ${hasRisk ? 'badge-red' : snap.charging ? 'badge-amber' : 'badge-green'}`;
+    const hasSecRisk = !snap.charging && (snap.powerOn || snap.locked === false);
+    const hasLowRisk = alerts.length > 0 || (snap.battery !== null && snap.battery <= cfg.lowBatteryThreshold && !snap.charging) || snap.smartServiceExpired;
+    guardBadgeEl.textContent = hasSecRisk
+      ? '安全关注'
+      : alerts.length > 0
+        ? `守护提醒 (${alerts.length})`
+        : snap.charging
+          ? '充电守护中'
+          : '停放安全';
+    guardBadgeEl.className = `hub-badge ${hasSecRisk ? 'badge-red' : hasLowRisk || snap.charging ? 'badge-amber' : 'badge-green'}`;
 
     if (snap.location?.address) {
       locationTextEl.textContent = `📍 ${snap.location.address}`;
@@ -366,11 +528,28 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
       locationTextEl.textContent = '📍 暂无有效 GPS 定位';
     }
 
-    const shareTag = snap.isSharedAccount ? '家庭只读子账号' : '车主账号';
-    updatedMetaEl.textContent = `${snap.name || snap.sn} (${snap.sn}) · ${shareTag} · 最近采集 ${timestamp(snap.capturedAt)}`;
+    const delayText = formatRelativeDelay(snap.locDelaySec, snap.gnssTimeSec);
+    updatedMetaEl.textContent = [
+      `最近同步 ${timestamp(snap.capturedAt)}`,
+      delayText ? `GNSS ${delayText}` : '',
+    ].filter(Boolean).join(' · ');
+
+    const checks: HTMLElement[] = [
+      node('span', snap.locked === true ? '✓ 锁车设防正常' : '⚠ 未锁车风险', `hub-badge ${snap.locked === true ? 'badge-green' : 'badge-red'}`),
+      node('span', snap.powerOn ? '⚠ 电门开启' : '✓ 电门已关闭', `hub-badge ${snap.powerOn ? 'badge-red' : 'badge-green'}`),
+      node(
+        'span',
+        snap.battery !== null && snap.battery <= cfg.lowBatteryThreshold && !snap.charging
+          ? `🪫 低于 ${cfg.lowBatteryThreshold}% 补能线`
+          : `✓ 电量高于 ${cfg.lowBatteryThreshold}%`,
+        `hub-badge ${snap.battery !== null && snap.battery <= cfg.lowBatteryThreshold && !snap.charging ? 'badge-amber' : 'badge-teal'}`,
+      ),
+      node('span', snap.smartServiceExpired ? '⚠ 云盒服务到期' : '✓ 智能服务有效', `hub-badge ${snap.smartServiceExpired ? 'badge-red' : 'badge-slate'}`),
+    ];
+    guardChecksEl.replaceChildren(...checks);
 
     if (!alerts.length) {
-      alertsBoxEl.replaceChildren(node('div', '✅ 当前无激活告警，电量与停车安防正常。', 'ninebot-alert-item is-ok'));
+      alertsBoxEl.replaceChildren(node('div', '✅ 当前无激活告警，驻车锁车与后台巡检守护正常。', 'ninebot-alert-item is-ok'));
       return;
     }
 
@@ -430,11 +609,11 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
 
     const isIndustrial = document.documentElement.dataset.theme === 'industrial';
     const strokeColor = trendMetric === 'battery'
-      ? (isIndustrial ? '#22c55e' : '#10b981')
-      : (isIndustrial ? '#ff6b1a' : '#38bdf8');
+      ? (isIndustrial ? '#15803d' : '#3ecf4c')
+      : (isIndustrial ? '#ff6b1a' : '#22d3ee');
     const fillRgb = trendMetric === 'battery'
-      ? '16, 185, 129'
-      : (isIndustrial ? '255, 107, 26' : '56, 189, 248');
+      ? '62, 207, 76'
+      : (isIndustrial ? '255, 107, 26' : '34, 211, 238');
 
     const vals = points.map(p => p.val);
     const minRaw = Math.min(...vals);
@@ -517,8 +696,11 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
           : `⚠️ 账号 ${cfg.usernameMasked || ''} 会话已过期，下次同步将自动续期`)
       : cfg.hasDeviceServiceKey
         ? '✅ 已配置官方 DeviceService Key'
-        : '尚未绑定九号账号，建议先在 App 建立「用车人/家庭只读子账号」并设置登录密码。';
+        : '尚未绑定九号账号';
     loginStatusHintEl.textContent = credStatus;
+    geoStatusHintEl.textContent = cfg.hasAmapKey
+      ? '🗺️ 高德逆地理：已就绪'
+      : '🗺️ 高德逆地理：未配置';
 
     if (draftDirty || isEditingWithin(panelEl)) {
       return;
@@ -531,20 +713,40 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
     cfgIdleDaysInput.value = String(cfg.idleRemindDays);
     cfgCooldownInput.value = String(cfg.alertCooldownHours);
     cfgUnlockedCheck.checked = Boolean(cfg.checkUnlocked);
-    cfgAmapInput.placeholder = cfg.hasAmapKey ? '已配置高德 Key（留空保持不变）' : '可选：输入高德 Web 服务 Key';
     cfgDsKeyInput.placeholder = cfg.hasDeviceServiceKey ? '已配置官方 Key（留空保持不变）' : '可选：输入 NINEBOT_DEVICESERVICE_KEY';
+  }
+
+  function tripKpiTile(label: string, value: string, sub: string): HTMLElement {
+    const box = node('div', '', 'ninebot-trip-kpi-card');
+    box.append(
+      node('span', label, 'ninebot-trip-kpi-label'),
+      node('strong', value, 'ninebot-trip-kpi-val'),
+      node('span', sub, 'ninebot-trip-kpi-sub'),
+    );
+    return box;
   }
 
   function renderTrips(data: NinebotDashboardPayload): void {
     const summary = data.tripSummary;
     if (!summary || !summary.trips.length) {
-      tripsSubtitleEl.textContent = '暂无本地骑行行程缓存（点击「🛣️ 同步本月行程」拉取）。';
+      tripsSubtitleEl.textContent = '暂无本地骑行行程缓存（点击「🛣️ 同步行程」拉取）。';
+      tripKpisEl.replaceChildren(
+        tripKpiTile('今日骑行', '0 km', '0 次'),
+        tripKpiTile('当月累计', '0 km', '0 次 · 0分钟'),
+        tripKpiTile('极速表现', '— km/h', '均速 — km/h'),
+      );
       tripsListEl.replaceChildren(node('p', '暂无骑行记录。', 'empty'));
       return;
     }
 
     tripsSubtitleEl.textContent =
-      `累计 ${summary.tripCount} 次 · ${summary.totalDistanceKm} km（今日 ${summary.todayCount} 次 ${summary.todayDistanceKm} km · 近 7 日 ${summary.sevenDayDistanceKm} km）· 极速 ${summary.maxSpeedKmh} km/h · 均速 ${summary.overallAvgSpeedKmh} km/h`;
+      `近 7 日 ${summary.sevenDayCount} 次共 ${summary.sevenDayDistanceKm} km · 总耗时 ${formatDurationZh(summary.totalDurationSec)}`;
+
+    tripKpisEl.replaceChildren(
+      tripKpiTile('今日骑行', `${summary.todayDistanceKm} km`, `${summary.todayCount} 次骑行`),
+      tripKpiTile('当月累计', `${summary.totalDistanceKm} km`, `${summary.tripCount} 次 · 耗时 ${formatDurationZh(summary.totalDurationSec)}`),
+      tripKpiTile('极速与均速', `${summary.maxSpeedKmh} km/h`, `均速 ${summary.overallAvgSpeedKmh} km/h`),
+    );
 
     const frag = document.createDocumentFragment();
     for (const t of summary.trips) {
@@ -573,7 +775,7 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
     latestData = data;
     updateTopBadge(data);
     renderVehicleSelector(data);
-    renderKpis(data);
+    renderCockpit(data);
     renderGuardAndLocation(data);
     renderTrendChart(data);
     renderFormsFromConfig(data.config);
@@ -669,7 +871,6 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
     cfgIdleDaysInput,
     cfgCooldownInput,
     cfgUnlockedCheck,
-    cfgAmapInput,
     cfgDsKeyInput,
   ]) {
     inputEl.addEventListener('input', () => { draftDirty = true; });
@@ -707,8 +908,12 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
     });
   });
 
+  openGeoBtn.addEventListener('click', () => {
+    hooks.openSystemHubModal?.('services', 'amap');
+  });
+
   cfgSaveBtn.addEventListener('click', () => {
-    void runBusyAction('正在保存九号守护阈值与地图配置…', async () => {
+    void runBusyAction('正在保存九号守护配置…', async () => {
       const args: Record<string, unknown> = {
         preferredLine: cfgLineSelect.value === 'ebike' ? 'ebike' : 'motor',
         lowBatteryThreshold: Number(cfgLowBattInput.value) || 30,
@@ -717,19 +922,22 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
         alertCooldownHours: Number(cfgCooldownInput.value) || 12,
         checkUnlocked: cfgUnlockedCheck.checked,
       };
-      const amap = cfgAmapInput.value.trim();
       const dsKey = cfgDsKeyInput.value.trim();
-      if (amap) args.amapKey = amap;
       if (dsKey) args.deviceServiceKey = dsKey;
       const res = await callPlugin('config', args);
       setBanner(res.message || (res.ok ? '配置已保存' : '保存失败'), !res.ok);
       if (res.ok) {
-        cfgAmapInput.value = '';
         cfgDsKeyInput.value = '';
         draftDirty = false;
       }
       await refreshDashboard();
     });
+  });
+
+  window.addEventListener('resize', () => {
+    if (active && options.isVisible() && latestData) {
+      renderTrendChart(latestData);
+    }
   });
 
   return {
@@ -743,6 +951,14 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
           void refreshDashboard();
         }
       }, 15_000);
+      themeObserver?.disconnect();
+      themeObserver = new MutationObserver(() => {
+        if (active && latestData) {
+          renderScooterShowroom(latestData.vehicleImages);
+          renderTrendChart(latestData);
+        }
+      });
+      themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
     },
     deactivate() {
       active = false;
@@ -750,6 +966,8 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
         clearInterval(pollTimer);
         pollTimer = undefined;
       }
+      themeObserver?.disconnect();
+      themeObserver = undefined;
     },
     async refreshBadge() {
       try {

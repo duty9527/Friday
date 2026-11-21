@@ -536,6 +536,7 @@ export async function startWeb(options: StartWebOptions): Promise<{ url: string;
           case '/api/plugins': command = { command: 'plugin-list' }; break;
           case '/api/im-channels': command = { command: 'im-list' }; break;
           case '/api/models': command = { command: 'model-hub' }; break;
+          case '/api/geo-config': command = { command: 'geo-status' }; break;
           case '/api/usage': {
             let tzOffsetMin: number | undefined;
             if (search.has('tzOffsetMin')) {
@@ -575,6 +576,7 @@ export async function startWeb(options: StartWebOptions): Promise<{ url: string;
           '/api/im-telegram-quick': 'im-telegram-quick', '/api/im-telegram-sync': 'im-telegram-sync-commands',
           '/api/voice-remove': 'voice-remove', '/api/voice-clear': 'voice-clear', '/api/voice-config': 'voice-config',
           '/api/model-configure': 'model-configure', '/api/model-probe': 'model-probe', '/api/model-fetch': 'model-fetch',
+          '/api/geo-config': 'geo-configure', '/api/geo-probe': 'geo-probe',
           '/api/usage-prefs': 'model-usage-prefs',
         };
         const command = Object.hasOwn(commands, url.pathname) ? commands[url.pathname] : undefined;

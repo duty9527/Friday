@@ -978,6 +978,31 @@ def _haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> int
     return int(round(2.0 * r * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))))
 
 
+def _wgs84_to_gcj02(lat: float, lon: float) -> Tuple[float, float]:
+    """Convert WGS-84 coordinates into GCJ-02 inside Mainland China; return unchanged outside China."""
+    if (lat == 0.0 and lon == 0.0) or not (72.004 < lon < 137.8347 and 0.8293 < lat < 55.8271):
+        return (round(lat, 6), round(lon, 6))
+    a = 6378245.0
+    ee = 0.00669342162296594323
+    x = lon - 105.0
+    y = lat - 35.0
+    d_lat = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * math.sqrt(abs(x))
+    d_lat += ((20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0) / 3.0
+    d_lat += ((20.0 * math.sin(y * math.pi) + 40.0 * math.sin((y / 3.0) * math.pi)) * 2.0) / 3.0
+    d_lat += ((160.0 * math.sin((y / 12.0) * math.pi) + 320.0 * math.sin((y * math.pi) / 30.0)) * 2.0) / 3.0
+    d_lon = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * math.sqrt(abs(x))
+    d_lon += ((20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0) / 3.0
+    d_lon += ((20.0 * math.sin(x * math.pi) + 40.0 * math.sin((x / 3.0) * math.pi)) * 2.0) / 3.0
+    d_lon += ((150.0 * math.sin((x / 12.0) * math.pi) + 300.0 * math.sin((x / 30.0) * math.pi)) * 2.0) / 3.0
+    rad_lat = (lat / 180.0) * math.pi
+    magic = math.sin(rad_lat)
+    magic = 1.0 - ee * magic * magic
+    sqrt_magic = math.sqrt(magic)
+    d_lat = (d_lat * 180.0) / (((a * (1.0 - ee)) / (magic * sqrt_magic)) * math.pi)
+    d_lon = (d_lon * 180.0) / ((a / sqrt_magic) * math.cos(rad_lat) * math.pi)
+    return (round(lat + d_lat, 6), round(lon + d_lon, 6))
+
+
 def _normalize_tv_app_name(app_name: Any, package_name: Any, *, online: bool) -> str:
     pkg = str(package_name or "").strip()
     raw_app = str(app_name or "").strip()
@@ -1204,7 +1229,8 @@ class WidgetDataHub:
 
         if "ninebot" in by_kind:
             db_path = self.home / "plugins" / "ninebot" / "ninebot.sqlite"
-            m_changed = self._file_mtime_changed("ninebot:db", db_path)
+            img_path = self.home / "plugins" / "ninebot" / "vehicle-dark.png"
+            m_changed = self._file_mtime_changed("ninebot:db", db_path) or self._file_mtime_changed("ninebot:img", img_path)
             if self._should_poll("ninebot", 180.0, now_mono, force=force, mtime_changed=m_changed):
                 self._collect_ninebot(db_path, connected=connected)
 
@@ -1986,14 +2012,46 @@ class WidgetDataHub:
         cap_ms = float(snap.get("capturedAt") or 0.0)
         updated_hm = time.strftime("%H:%M", time.localtime(cap_ms / 1000.0)) if cap_ms > 0 else ""
 
+        color_str = str(snap.get("color") or "").strip()[:10]
+        model_name = str(snap.get("modelName") or "").strip()[:16]
+        precise_km = snap.get("preciseEstimateMileageKm")
+        estimate_km = snap.get("estimateMileageKm")
+        gsm_sig = snap.get("gsmSignal")
+        gnss_sig = snap.get("gnssSignal")
+
+        image_path = ""
+        image_mtime_ns = 0
+        img_file = nb_dir / "vehicle-dark.png"
+        try:
+            if img_file.is_file() and not img_file.is_symlink():
+                st = img_file.stat()
+                if 64 <= st.st_size <= 512 * 1024:
+                    image_path = str(img_file)
+                    image_mtime_ns = int(st.st_mtime_ns)
+        except OSError:
+            image_path = ""
+            image_mtime_ns = 0
+
         batt_str = f"{batt_num}%" if batt_num is not None else "--%"
         range_str = f"续航 {float(range_km):.1f}km" if range_km is not None else "续航 --"
-        lock_str = "充电中" if charging else ("未锁车" if (power_on or locked is False) else ("已锁" if locked is True else "待机"))
+        if charging:
+            lock_str = "充电中"
+        elif locked is False:
+            lock_str = "未上锁"
+        elif power_on:
+            lock_str = "电门开启"
+        elif locked is True:
+            lock_str = "已上锁"
+        else:
+            lock_str = "待机"
+
         self._store_widget(
             "ninebot",
             {
                 "ok": True,
                 "name": str(snap.get("name") or "九号电摩")[:16],
+                "modelName": model_name,
+                "color": color_str,
                 "battery": batt_num,
                 "auxBattery": int(round(float(aux_batt))) if aux_batt is not None else None,
                 "voltageV": round(float(volt), 1) if volt is not None else None,
@@ -2002,9 +2060,15 @@ class WidgetDataHub:
                 "chargingPowerW": int(round(float(charge_w))) if charge_w is not None else None,
                 "remainChargeTime": remain_t,
                 "rangeKm": round(float(range_km), 1) if range_km is not None else None,
+                "preciseRangeKm": round(float(precise_km), 1) if precise_km is not None else None,
+                "estimateRangeKm": round(float(estimate_km), 1) if estimate_km is not None else None,
                 "odometerKm": round(float(odo_km), 1) if odo_km is not None else None,
                 "powerOn": power_on,
                 "locked": locked,
+                "gsmSignal": int(gsm_sig) if gsm_sig is not None else None,
+                "gnssSignal": int(gnss_sig) if gnss_sig is not None else None,
+                "imagePath": image_path,
+                "imageMtimeNs": image_mtime_ns,
                 "address": addr[:34],
                 "todayKm": round(today_km, 1),
                 "monthKm": round(month_km, 1),
@@ -2422,9 +2486,19 @@ class WidgetDataHub:
                             dev_obj = dict(entry["device"])
                             loc = dev_obj.get("location")
                             best_place: Optional[Dict[str, Any]] = None
+                            if isinstance(loc, dict):
+                                short_fb = str(loc.get("shortAddress") or loc.get("address") or "").strip()
+                                if short_fb:
+                                    dev_obj["_shortAddr"] = short_fb
                             if isinstance(loc, dict) and isinstance(loc.get("latitude"), (int, float)) and isinstance(loc.get("longitude"), (int, float)):
                                 lat = float(loc["latitude"])
                                 lon = float(loc["longitude"])
+                                gcj_lat_raw = loc.get("gcjLat")
+                                gcj_lon_raw = loc.get("gcjLon")
+                                if isinstance(gcj_lat_raw, (int, float)) and isinstance(gcj_lon_raw, (int, float)):
+                                    gcj_lat, gcj_lon = float(gcj_lat_raw), float(gcj_lon_raw)
+                                else:
+                                    gcj_lat, gcj_lon = _wgs84_to_gcj02(lat, lon)
                                 for pname, pcfg in places_cfg.items():
                                     if not isinstance(pcfg, dict):
                                         continue
@@ -2433,7 +2507,10 @@ class WidgetDataHub:
                                     if not isinstance(plat, (int, float)) or not isinstance(plng, (int, float)):
                                         continue
                                     radius = int(pcfg.get("radiusMeters") or pcfg.get("radius") or 250)
-                                    dist = _haversine_meters(lat, lon, float(plat), float(plng))
+                                    dist = min(
+                                        _haversine_meters(lat, lon, float(plat), float(plng)),
+                                        _haversine_meters(gcj_lat, gcj_lon, float(plat), float(plng)),
+                                    )
                                     cand = {"name": str(pname), "distanceMeters": dist, "inside": dist <= radius}
                                     if (
                                         best_place is None
@@ -2481,18 +2558,24 @@ class WidgetDataHub:
             if batt is not None and batt < min_batt_pct and b_status not in ("Charging", "Charged"):
                 low_cnt += 1
 
+            loc_d = d.get("location") if isinstance(d.get("location"), dict) else {}
+            short_addr = str(loc_d.get("shortAddress") or loc_d.get("address") or d.get("_shortAddr") or "").strip()
             place_str = ""
             place_obj = d.get("place")
             if isinstance(place_obj, dict) and place_obj.get("name"):
                 pname = str(place_obj["name"]).strip()[:10]
                 if place_obj.get("inside"):
                     place_str = pname if pname.startswith("在") else f"在{pname}"
+                elif short_addr:
+                    place_str = short_addr[:16]
                 else:
                     dist = place_obj.get("distanceMeters")
                     if isinstance(dist, (int, float)):
                         place_str = f"距{pname}{int(round(dist))}m" if dist < 1000 else f"距{pname}{dist / 1000.0:.1f}km"
                     else:
                         place_str = f"距{pname}"
+            elif short_addr:
+                place_str = short_addr[:16]
 
             dev_item = {
                 "name": str(d.get("name") or d.get("displayName") or cat_label)[:16],

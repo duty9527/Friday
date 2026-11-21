@@ -194,13 +194,20 @@ export async function handleAppleVoiceFastpath(request, context, runAction) {
   }
 
   const place = dev.place;
+  const addr = dev.location?.shortAddress || dev.location?.address || '';
   let locSpeech;
   if (place?.inside) {
-    locSpeech = `${dev.name}目前在${place.name}附近`;
+    locSpeech = addr
+      ? `${dev.name}目前在${place.name}附近（${addr}）`
+      : `${dev.name}目前在${place.name}附近`;
   } else if (place) {
-    locSpeech = `${dev.name}当前不在${place.name}，距离约${place.distanceMeters}米`;
+    locSpeech = addr
+      ? `${dev.name}目前在${addr}，距离${place.name}约${place.distanceMeters}米`
+      : `${dev.name}当前不在${place.name}，距离约${place.distanceMeters}米`;
   } else if (dev.location) {
-    locSpeech = `${dev.name}已获取最近定位（精度约${dev.location.horizontalAccuracy ?? '未知'}米）`;
+    locSpeech = addr
+      ? `${dev.name}目前在${addr}附近（精度约${dev.location.horizontalAccuracy ?? '未知'}米）`
+      : `${dev.name}已获取最近定位（精度约${dev.location.horizontalAccuracy ?? '未知'}米）`;
   } else {
     locSpeech = `${dev.name}暂无可用定位坐标`;
   }

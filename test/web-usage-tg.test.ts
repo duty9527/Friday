@@ -53,8 +53,11 @@ test('Web usage and Telegram UI files strictly adhere to CSP and zero inline sty
   const indexHtml = await readFile(join(webRoot, 'index.html'), 'utf8');
   const usageHubTs = await readFile(join(webRoot, 'hubs', 'usage-hub.ts'), 'utf8');
   const systemHubTs = await readFile(join(webRoot, 'hubs', 'system-hub.ts'), 'utf8');
+  const servicesHubTs = await readFile(join(webRoot, 'hubs', 'services-hub.ts'), 'utf8');
   const timerPluginHubTs = await readFile(join(webRoot, 'hubs', 'timer-plugin-hub.ts'), 'utf8');
   const imVoiceHubTs = await readFile(join(webRoot, 'hubs', 'im-voice-hub.ts'), 'utf8');
+  const appleUiTs = await readFile(join(webRoot, 'plugins', 'apple-devices-ui.ts'), 'utf8');
+  const ninebotUiTs = await readFile(join(webRoot, 'plugins', 'ninebot-ui.ts'), 'utf8');
   const clientTs = await readFile(join(webRoot, 'client.ts'), 'utf8');
   const styleCss = await readFile(join(webRoot, 'style.css'), 'utf8');
 
@@ -64,8 +67,12 @@ test('Web usage and Telegram UI files strictly adhere to CSP and zero inline sty
   assert.match(indexHtml, /id="system-hub-modal"/);
   assert.match(indexHtml, /id="system-tab-models"/);
   assert.match(indexHtml, /id="system-tab-usage"/);
+  assert.match(indexHtml, /id="system-tab-services"/);
   assert.match(indexHtml, /id="system-panel-models"/);
   assert.match(indexHtml, /id="system-panel-usage"/);
+  assert.match(indexHtml, /id="system-panel-services"/);
+  assert.match(indexHtml, /id="geo-amap-key-input"/);
+  assert.doesNotMatch(indexHtml, /id="ninebot-cfg-amap"/, 'AMap key input must live in System Base');
   assert.match(indexHtml, /id="model-top-badge"/);
   assert.match(indexHtml, /id="usage-top-badge"/);
   assert.match(indexHtml, /id="open-mindmap-trace"/);
@@ -84,8 +91,11 @@ test('Web usage and Telegram UI files strictly adhere to CSP and zero inline sty
   for (const [name, src] of [
     ['usage-hub.ts', usageHubTs],
     ['system-hub.ts', systemHubTs],
+    ['services-hub.ts', servicesHubTs],
     ['timer-plugin-hub.ts', timerPluginHubTs],
     ['im-voice-hub.ts', imVoiceHubTs],
+    ['apple-devices-ui.ts', appleUiTs],
+    ['ninebot-ui.ts', ninebotUiTs],
     ['client.ts', clientTs],
   ] as const) {
     assert.doesNotMatch(src, /\.style\./, `${name} must not mutate element.style`);
@@ -101,6 +111,9 @@ test('Web usage and Telegram UI files strictly adhere to CSP and zero inline sty
     '.usage-share-progress',
     '.usage-period-card',
     '.usage-actor-card',
+    '.usage-cache-chip-hit',
+    '.usage-cache-chip-savings',
+    '.usage-cache-chip-surcharge',
   ]) {
     assert.ok(styleCss.includes(selector), `style.css must define ${selector}`);
   }
@@ -186,6 +199,10 @@ test('Web /api/view, /api/usage (day/week/month + tzOffsetMin), and /api/usage-p
     assert.ok(afterView.usageToday);
     assert.equal(afterView.usageToday.calls, 2);
     assert.equal(afterView.usageToday.totalTokens, 5200);
+    assert.equal(afterView.usageToday.cacheReadTokens, 700);
+    assert.equal(afterView.usageToday.cacheWriteTokens, 0);
+    assert.ok(afterView.usageToday.cacheHitRate > 0);
+    assert.ok(afterView.usageToday.cacheSavingsUsd > 0);
     assert.ok(Math.abs(afterView.usageToday.costUsd - 0.022575) < 1e-6);
     assert.ok(Math.abs(afterView.usageToday.costCny - 0.022575 * 7.25) < 1e-5);
 
@@ -198,9 +215,17 @@ test('Web /api/view, /api/usage (day/week/month + tzOffsetMin), and /api/usage-p
     assert.equal(dayReport.totals.successCalls, 2);
     assert.equal(dayReport.totals.failedCalls, 0);
     assert.equal(dayReport.totals.totalTokens, 5200);
+    assert.ok(Math.abs(dayReport.totals.cacheHitRate - 700 / 3700) < 1e-5);
+    assert.ok(dayReport.totals.cacheSavingsUsd > 0);
+    assert.ok(Math.abs(dayReport.totals.cacheSavingsCny - dayReport.totals.cacheSavingsUsd * 7.25) < 1e-6);
     assert.equal(dayReport.byModel.length, 2);
     assert.equal(dayReport.byModel[0]?.model, 'claude-sonnet-4');
+    assert.equal(dayReport.byModel[0]?.unitCacheReadUsdPer1M, 0.3);
+    assert.equal(dayReport.byModel[0]?.unitCacheWriteUsdPer1M, 3.75);
     assert.equal(dayReport.byModel[1]?.model, 'deepseek-chat');
+    assert.equal(dayReport.byModel[1]?.unitCacheReadUsdPer1M, 0.07);
+    assert.equal(dayReport.byModel[1]?.unitCacheWriteUsdPer1M, 0.27);
+    assert.equal(dayReport.buckets.reduce((s, b) => s + b.cacheReadTokens, 0), 700);
     assert.equal(dayReport.byActor.worker?.calls, 1);
     assert.equal(dayReport.byActor.router?.calls, 1);
 
@@ -396,5 +421,60 @@ test('Web /api/im-telegram-quick and /api/im-telegram-sync connect and sync comm
   } finally {
     await f.close();
     await new Promise<void>(resolve => mockTgServer.close(() => resolve()));
+  }
+});
+
+test('System Base /api/geo-config and /api/geo-probe save, mask, clear, and validate safely', { timeout: 15_000 }, async () => {
+  const f = await createWebFixture();
+  try {
+    const initial = await (await fetch(`${f.base}/api/geo-config`, { headers: f.headers })).json() as {
+      configured: boolean;
+      source: string;
+      maskedKey: string;
+      cacheEntries: number;
+    };
+    assert.equal(initial.configured, false);
+    assert.equal(initial.source, 'none');
+    assert.equal(initial.cacheEntries, 0);
+
+    const saved = await (await fetch(`${f.base}/api/geo-config`, {
+      method: 'POST',
+      headers: f.headers,
+      body: JSON.stringify({ amapKey: 'my_secret_amap_key_9876' }),
+    })).json() as {
+      configured: boolean;
+      source: string;
+      maskedKey: string;
+    };
+    assert.equal(saved.configured, true);
+    assert.equal(saved.source, 'system');
+    assert.equal(saved.maskedKey, 'my_s****9876');
+    assert.equal(JSON.stringify(saved).includes('my_secret_amap_key_9876'), false, 'plaintext API key must never leak');
+    assert.equal(JSON.stringify(saved).includes(f.home), false, 'homeDir path must never leak');
+
+    const cleared = await (await fetch(`${f.base}/api/geo-config`, {
+      method: 'POST',
+      headers: f.headers,
+      body: JSON.stringify({ clearAmapKey: true }),
+    })).json() as {
+      configured: boolean;
+      source: string;
+      maskedKey: string;
+    };
+    assert.equal(cleared.configured, false);
+    assert.equal(cleared.source, 'none');
+
+    const emptyProbe = await (await fetch(`${f.base}/api/geo-probe`, {
+      method: 'POST',
+      headers: f.headers,
+      body: JSON.stringify({}),
+    })).json() as {
+      ok: boolean;
+      message: string;
+    };
+    assert.equal(emptyProbe.ok, false);
+    assert.match(emptyProbe.message, /请先输入或保存/);
+  } finally {
+    await f.close();
   }
 });

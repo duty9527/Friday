@@ -664,7 +664,8 @@ test('proactive patrol handles low battery cooldown, 10% drop re-alert, charge-c
   let state = {
     battery: 82,
     charging: 0,
-    pwr: 0,
+    pwr: 1,
+    acc: 0,
     lock: 1,
     rangeKm: 75.0,
     trips: [] as Array<Record<string, unknown>>,
@@ -731,7 +732,8 @@ test('proactive patrol handles low battery cooldown, 10% drop re-alert, charge-c
           estimate_mileage: state.rangeKm,
           precise_estimate_mileage: state.rangeKm,
           pwr: state.pwr,
-          loc: { lat: '0', lon: '0', lock: state.lock },
+          battery_exist: 1,
+          loc: { lat: '0', lon: '0', acc: state.acc, lock: state.lock },
         },
       };
     } else if (u.pathname === '/vehicle/vehicle/vehicle-info') {
@@ -746,7 +748,7 @@ test('proactive patrol handles low battery cooldown, 10% drop re-alert, charge-c
         },
       };
     } else if (u.pathname === '/vehicle/vehicle/vehicle-status') {
-      payload = { code: 1, data: { gsm_signal: 4 } };
+      payload = { code: 1, data: { power_status: state.acc, gsm_signal: 4 } };
     } else if (u.pathname === '/app-api/travel/v6/travel-list2') {
       payload = { code: 1, data: { duration: 600, ec: 100, list: state.trips } };
     }
@@ -764,11 +766,15 @@ test('proactive patrol handles low battery cooldown, 10% drop re-alert, charge-c
   try {
     await plugin.runAction('login', { username: '13800138001', password: 'pw' }, deps);
 
-    // 1) Healthy state -> silent (notify: false)
+    // 1) Healthy state (M-series battery online pwr: 1 while acc: 0, lock: 1) -> silent, locked, powered off
     const healthy = await plugin.runAction('patrol', {}, deps);
     assert.equal(healthy.ok, true);
     assert.equal(healthy.notify, false);
-    assert.equal((healthy.data as Record<string, any>).triggered, false);
+    const hData = healthy.data as Record<string, any>;
+    assert.equal(hData.triggered, false);
+    assert.equal(hData.snapshot.locked, true);
+    assert.equal(hData.snapshot.powerOn, false);
+    assert.equal(hData.snapshot.batteryPresent, true);
 
     // 2) Low battery (24%) + low range (12km) -> notify: true
     state.battery = 24;
@@ -820,7 +826,7 @@ test('proactive patrol handles low battery cooldown, 10% drop re-alert, charge-c
     // 7) Unlocked / powered-on parked warning
     nowMs += 3600_000;
     state.battery = 80;
-    state.pwr = 1;
+    state.acc = 1;
     state.lock = 0;
     const unlockedRes = await plugin.runAction('patrol', {}, deps);
     assert.equal(unlockedRes.notify, true);
@@ -828,7 +834,7 @@ test('proactive patrol handles low battery cooldown, 10% drop re-alert, charge-c
 
     // Lock again -> resets active flag
     nowMs += 3600_000;
-    state.pwr = 0;
+    state.acc = 0;
     state.lock = 1;
     assert.equal((await plugin.runAction('patrol', {}, deps)).notify, false);
 
@@ -1210,6 +1216,162 @@ test('passport resultCode envelope, missing accessTokenValidity, and redacted er
     assert.equal(logText.includes('tok-live-no-expiry'), false);
     assert.equal(logText.includes(dataDir), false);
     assert.equal(logText.includes(home), false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('M95C lock/power_status semantics, indexed desktop unwrap, sanitizeNinebotImageUrl & 0600 PNG caching', async () => {
+  const c = await loadCryptoModule();
+  const plugin = await loadPluginModule();
+  const clientMod = await import('../plugins/ninebot/client.mjs') as { sanitizeNinebotImageUrl(u: unknown): string | null };
+
+  assert.equal(
+    clientMod.sanitizeNinebotImageUrl('https://oms-oss-public.ninebot.com/device-config/M95C_green_2_dark.png?nbchecksignv1=abc=='),
+    'https://oms-oss-public.ninebot.com/device-config/M95C_green_2_dark.png?nbchecksignv1=abc==',
+  );
+  assert.equal(clientMod.sanitizeNinebotImageUrl('http://oms-oss-public.ninebot.com/a.png'), null);
+  assert.equal(clientMod.sanitizeNinebotImageUrl('https://evil.example/M95C.png'), null);
+  assert.equal(clientMod.sanitizeNinebotImageUrl('https://oms-oss-public.ninebot.com/../secret.png'), null);
+  assert.equal(clientMod.sanitizeNinebotImageUrl('https://oms-oss-public.ninebot.com/M95C.jpg'), null);
+
+  const home = mkdtempSync(join(tmpdir(), 'ninebot-img-test-'));
+  const dataDir = join(home, 'plugins', 'ninebot');
+  const { publicKey, privateKey } = generateKeyPairSync('rsa', { modulusLength: 1024 });
+  const pubPem = publicKey.export({ type: 'spki', format: 'pem' }).toString();
+  const privPem = privateKey.export({ type: 'pkcs1', format: 'pem' }).toString();
+  const nowMs = 1_795_241_800_000;
+
+  const fakePng = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    Buffer.alloc(96, 0x42),
+  ]);
+  const darkUrl = 'https://oms-oss-public.ninebot.com/device-config/M95C_green_2_dark.png?nbchecksignv1=ZGFyaw==';
+  const lightUrl = 'https://oms-oss-public.ninebot.com/device-config/M95C_green_2_light.png?nbchecksignv1=bGlnaHQ=';
+
+  const requester = async (req: { method?: string; url: string; body?: string }) => {
+    const u = new URL(req.url);
+    if (req.method === 'GET' && u.hostname === 'oms-oss-public.ninebot.com') {
+      return { status: 200, headers: { 'content-type': 'image/png' }, body: fakePng };
+    }
+    if (u.pathname === '/v6/user/login') {
+      return {
+        status: 200,
+        headers: {},
+        body: Buffer.from(
+          JSON.stringify({
+            resultCode: '00000',
+            data: {
+              uuid: 'u-m95c',
+              access_token: 'tok-m95c',
+              refresh_token: 'ref-m95c',
+              accessTokenValidity: String(nowMs + 86400_000),
+            },
+          }),
+        ),
+      };
+    }
+    const body = JSON.parse(req.body || '{}') as { d: string; k: string };
+    const aesKey = privateDecrypt({ key: privPem, padding: cryptoConstants.RSA_PKCS1_PADDING }, Buffer.from(body.k, 'base64'));
+    const wrapper = JSON.parse(c.aesCbcDecrypt(aesKey, Buffer.from(body.d, 'base64')).toString('utf8')) as Record<string, string>;
+    const respKey = c.deriveKey(wrapper.keyDataOne!, wrapper.keyDataTwo!, wrapper.keyDataThree!, wrapper.keyDataFour!);
+
+    let payload: Record<string, unknown> = { code: 1, data: {} };
+    if (u.pathname === '/user/user/login') payload = { code: 0, data: { uid: '88776655' } };
+    else if (u.pathname === '/vehicle/binding/my-vehicle') {
+      payload = u.hostname.includes('steeldust')
+        ? {
+            code: 1,
+            data: [{
+              wnumber: 'M95C-LOCK-01',
+              ble_name: '小9',
+              vehicle_name_zh: '九号电动M95C',
+              color: '英伦绿',
+              v6_dark_img_url: darkUrl,
+              v6_light_img_url: lightUrl,
+              is_common_user: 1,
+            }],
+          }
+        : { code: 1, data: [] };
+    } else if (u.pathname === '/vehicle/vehicle/desktop-component') {
+      // Simulate indexed object `{"0": {...}}` returned with pwr=1 & acc=0 & lock=1
+      payload = {
+        code: 1,
+        data: {
+          '0': {
+            sn: 'M95C-LOCK-01',
+            ble_name: '小9',
+            dump_energy: '12',
+            battery_exist: 1,
+            pwr: 1,
+            charging: 0,
+            precise_estimate_mileage: 11.5,
+            estimate_mileage: 16.4,
+            v6_dark_img_url: darkUrl,
+            v6_light_img_url: lightUrl,
+            loc: { lat: '34.181928', lon: '108.823510', acc: 0, lock: 1 },
+          },
+        },
+      };
+    } else if (u.pathname === '/vehicle/vehicle/vehicle-info') {
+      payload = { code: 1, data: { total_mileage: 16529.8, pwr: '1', gnss_time: Math.floor(nowMs / 1000) } };
+    } else if (u.pathname === '/v6/vehicle/battery-info') {
+      payload = {
+        code: 1,
+        data: {
+          electricity: 12,
+          battery_main: { electricity: '100' },
+          battery_list: [{ bms_volt: '71.3', bat_temp: '12', electricity: '12' }],
+        },
+      };
+    } else if (u.pathname === '/vehicle/vehicle/vehicle-status') {
+      payload = {
+        code: 1,
+        data: {
+          power_status: 0,
+          SQ: { GSM: 23, GNSS: 33, loc_delay_seconds: 120 },
+        },
+      };
+    }
+
+    const respWrapper = JSON.stringify({ data: c.androidB64(JSON.stringify(payload)), platform: 2, timeStamp: Math.floor(nowMs / 1000) });
+    return {
+      status: 200,
+      headers: {},
+      body: Buffer.from(JSON.stringify({ r: c.aesCbcEncrypt(respKey, Buffer.from(respWrapper, 'utf8')).toString('base64') })),
+    };
+  };
+
+  const deps = { homeDir: home, dataDir, nowFn: () => nowMs, httpRequester: requester, rsaPublicKeyPem: pubPem };
+  try {
+    const loginRes = await plugin.runAction('login', { username: '13800138999', password: 'pw' }, deps);
+    assert.equal(loginRes.ok, true);
+
+    const patrolRes = await plugin.runAction('patrol', {}, deps);
+    assert.equal(patrolRes.ok, true);
+    const pData = patrolRes.data as Record<string, any>;
+    assert.equal(pData.snapshot.locked, true);
+    assert.equal(pData.snapshot.powerOn, false);
+    assert.equal(pData.snapshot.batteryPresent, true);
+    assert.equal(pData.snapshot.color, '英伦绿');
+    assert.equal(pData.snapshot.gsmSignal, 23);
+    assert.equal(pData.snapshot.gnssSignal, 33);
+    assert.equal(pData.snapshot.effectiveRangeKm, 11.5);
+    assert.equal(pData.alerts.some((a: any) => a.key === 'low_battery'), true);
+    assert.equal(pData.alerts.some((a: any) => a.key === 'unlocked_warning'), false);
+
+    assert.equal(existsSync(join(dataDir, 'vehicle-dark.png')), true);
+    assert.equal(existsSync(join(dataDir, 'vehicle-light.png')), true);
+    assert.equal(statSync(join(dataDir, 'vehicle-dark.png')).mode & 0o777, 0o600);
+    assert.equal(statSync(join(dataDir, 'vehicle-light.png')).mode & 0o777, 0o600);
+
+    const dash = await plugin.runAction('dashboard', {}, deps);
+    assert.equal(dash.ok, true);
+    const dData = dash.data as Record<string, any>;
+    assert.match(String(dData.vehicleImages?.darkDataUrl), /^data:image\/png;base64,/);
+    assert.match(String(dData.vehicleImages?.lightDataUrl), /^data:image\/png;base64,/);
+    assert.equal(JSON.stringify(dData).includes(dataDir), false, 'dashboard must not expose host filesystem paths');
+    assert.equal(dData.activeAlerts.some((a: any) => a.key === 'unlocked_warning'), false);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

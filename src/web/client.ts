@@ -397,6 +397,7 @@ Object.assign(hooks, {
   loadTrace: tracePanel.loadTrace,
   loadWork: tracePanel.loadWork,
   openPluginHubModal: timerPluginHub.openPluginModal,
+  openSystemHubModal: systemHub.openModal,
   closeAllHubModals,
 });
 

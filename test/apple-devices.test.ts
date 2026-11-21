@@ -8,6 +8,7 @@ import {
   createMockSrpServerSession,
   createSrpClientEphemeral,
 } from '../plugins/apple-devices/icloud-srp.mjs';
+import { saveSystemGeoConfig, wgs84ToGcj02 } from '../plugins/_shared/amap-geo.mjs';
 import { runAction as runAppleAction, maskAppleId } from '../plugins/apple-devices/index.mjs';
 import { listPluginsSync, runPlugin, tryPluginVoiceFastpath } from '../src/plugin.js';
 import { serve } from '../src/server.js';
@@ -38,6 +39,11 @@ interface MockAppleServerOptions {
   return409ValidOn2fa?: boolean;
   expireFirstFmipWith450?: boolean;
   devices?: Array<Record<string, unknown>>;
+  fmipResponder?: (path: '/initClient' | '/refreshClient', body: any, fmipCallIdx: number) => {
+    content: Array<Record<string, unknown>>;
+    userInfo?: Record<string, unknown>;
+    serverContext?: Record<string, unknown>;
+  };
 }
 
 function createMockAppleFetch(opts: MockAppleServerOptions) {
@@ -52,6 +58,7 @@ function createMockAppleFetch(opts: MockAppleServerOptions) {
   let lastInitA = '';
   let currentDevices = opts.devices ?? [];
   let expiredOnce = false;
+  let fmipCallIdx = 0;
 
   const calls: Array<{ method: string; url: string; headers: Record<string, string>; body: any }> = [];
 
@@ -201,10 +208,18 @@ function createMockAppleFetch(opts: MockAppleServerOptions) {
       }
       assert.equal(parsed.searchParams.get('dsid'), '123456789');
       assert.ok((reqHeaders.cookie ?? '').includes('X-APPLE-WEBAUTH-TOKEN=TOKEN_SECRET_COOKIE'));
+      const subPath = parsed.pathname.endsWith('/initClient') ? '/initClient' : '/refreshClient';
+      const custom = opts.fmipResponder ? opts.fmipResponder(subPath, reqBody, fmipCallIdx++) : undefined;
       return makeMockResponse(200, {
         statusCode: '200',
-        serverContext: { serverTimestamp: 1_760_000_000_000, theftLoss: { info: 'strip-me' } },
-        content: currentDevices,
+        serverContext: {
+          serverTimestamp: 1_760_000_000_000,
+          callbackIntervalInMS: 2000,
+          theftLoss: { info: 'strip-me' },
+          ...(custom?.serverContext ?? {}),
+        },
+        ...(custom?.userInfo ? { userInfo: custom.userInfo } : {}),
+        content: custom?.content ?? currentDevices,
       });
     }
 
@@ -769,6 +784,9 @@ test('7. Web console lazy-loads apple-devices-ui.js, renders panel cleanly, and 
     const html = await (await fetch(base)).text();
     assert.match(html, /id="plugin-tab-apple-devices"/);
     assert.match(html, /id="plugin-panel-apple-devices"/);
+    assert.match(html, /id="apple-cfg-include-family"/);
+    assert.match(html, /id="apple-geo-status-hint"/);
+    assert.match(html, /id="apple-open-geo-btn"/);
     assert.doesNotMatch(html, /\sstyle="/i);
 
     const clientJs = await (await fetch(`${base}/client.js`)).text();
@@ -779,6 +797,7 @@ test('7. Web console lazy-loads apple-devices-ui.js, renders panel cleanly, and 
     assert.match(appleUiResp.headers.get('content-type') ?? '', /javascript/);
     const appleUiJs = await appleUiResp.text();
     assert.match(appleUiJs, /initAppleDevicesUi/);
+    assert.match(appleUiJs, /cacheOnly:\s*true/);
     assert.doesNotMatch(appleUiJs, /\.style\./);
     assert.doesNotMatch(appleUiJs, /\.innerHTML\b/);
 
@@ -796,5 +815,340 @@ test('7. Web console lazy-loads apple-devices-ui.js, renders panel cleanly, and 
     await web.close();
     await daemon.close();
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('8. Wake-settling 203->200 poll, cached battery preservation on sleep, pending cooldown bypass, and family sharing default', async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'friday-apple-wake-'));
+  let now = 1_760_000_000_000;
+  try {
+    let phase: 'settling' | 'sleeping' = 'settling';
+    let expectedFmly = true;
+    const personalPending = {
+      id: 'RAW-OWN-IPHONE',
+      name: '我的主手机',
+      deviceDisplayName: 'iPhone 17 Pro',
+      rawDeviceModel: 'iPhone18,4',
+      deviceClass: 'iPhone',
+      deviceStatus: '203',
+      batteryLevel: 0,
+      batteryStatus: 'Unknown',
+      isLocating: true,
+      features: { SND: true, LOC: true },
+    };
+    const personalSettled = {
+      ...personalPending,
+      deviceStatus: '200',
+      batteryLevel: 0.62,
+      batteryStatus: 'Charging',
+      isLocating: false,
+      location: { latitude: 31.2304, longitude: 121.4737, horizontalAccuracy: 10, positionType: 'GPS', timeStamp: now },
+    };
+    const familySettled = {
+      id: 'RAW-FMLY-IPHONE',
+      name: '家人 iPhone',
+      deviceDisplayName: 'iPhone 16',
+      rawDeviceModel: 'iPhone17,2',
+      deviceClass: 'iPhone',
+      deviceStatus: '200',
+      batteryLevel: 0.14,
+      batteryStatus: 'NotCharging',
+      isLocating: false,
+      fmlyShare: true,
+      features: { SND: true, LOC: true },
+    };
+
+    let refreshAttemptsThisCycle = 0;
+    const mock = createMockAppleFetch({
+      appleId: 'wake@icloud.com',
+      password: 'Password123!',
+      require2fa: false,
+      fmipResponder: (path, body) => {
+        assert.equal(body.clientContext.fmly, expectedFmly);
+        if (phase === 'sleeping') {
+          return {
+            content: [{ ...personalPending, isLocating: false }, familySettled],
+          };
+        }
+        if (path === '/initClient') {
+          refreshAttemptsThisCycle = 0;
+          return {
+            userInfo: { hasMembers: true, membersInfo: { m1: { deviceFetchStatus: 'LOADING' } } },
+            content: [personalPending],
+          };
+        }
+        refreshAttemptsThisCycle += 1;
+        if (refreshAttemptsThisCycle === 1) {
+          // Immediate refresh still reports 203/LOADING
+          return {
+            userInfo: { hasMembers: true, membersInfo: { m1: { deviceFetchStatus: 'LOADING' } } },
+            content: [personalPending],
+          };
+        }
+        // Poll 1 after wake settling returns settled 200 personal + family devices
+        return {
+          userInfo: { hasMembers: true, membersInfo: { m1: { deviceFetchStatus: 'DONE' } } },
+          content: [personalSettled, familySettled],
+        };
+      },
+    });
+
+    await runAppleAction('config', { minBatteryPct: 25, minRefreshIntervalSec: 30 }, { dataDir, nowFn: () => now });
+    const loginRes = await runAppleAction('auth-login', {
+      appleId: 'wake@icloud.com',
+      password: 'Password123!',
+    }, { dataDir, fetchFn: mock.fetchFn, nowFn: () => now, locatePollDelayMs: 5 });
+
+    assert.equal(loginRes.ok, true);
+    assert.equal(loginRes.data.devices.length, 2, 'default includeFamily=true must include family-shared devices');
+    const own = loginRes.data.devices.find((d: any) => !d.isFamily);
+    const fmly = loginRes.data.devices.find((d: any) => d.isFamily);
+    assert.equal(own.online, true);
+    assert.equal(own.batteryPercent, 62);
+    assert.equal(own.batteryIsCached, false);
+    assert.equal(own.soundCapable, true);
+    assert.equal(fmly.online, true);
+    assert.equal(fmly.batteryPercent, 14);
+    assert.equal(fmly.isFamily, true);
+
+    // Category locate "手机" resolves unambiguously to personal iPhone instead of failing with ambiguous family iPhone
+    const locateOwn = await runAppleAction('locate', { device: '手机' }, { dataDir, fetchFn: mock.fetchFn, nowFn: () => now });
+    assert.equal(locateOwn.ok, true);
+    assert.equal(locateOwn.data.device.name, '我的主手机');
+
+    // play-sound sends fmly: true and works
+    const ringRes = await runAppleAction('play-sound', { device: fmly.id }, { dataDir, fetchFn: mock.fetchFn, nowFn: () => now });
+    assert.equal(ringRes.ok, true);
+    const soundCall = mock.calls.find(c => c.url.includes('/playSound'));
+    assert.equal(soundCall?.body?.clientContext?.fmly, true);
+
+    // Personal device later enters 203 Unknown -> preserves last known 62% battery with batteryIsCached=true
+    now += 40_000;
+    phase = 'sleeping';
+    const sleepRes = await runAppleAction('devices', { refresh: true }, {
+      dataDir,
+      fetchFn: mock.fetchFn,
+      nowFn: () => now,
+      locatePollDelayMs: 5,
+    });
+    assert.equal(sleepRes.ok, true);
+    const sleepingOwn = sleepRes.data.devices.find((d: any) => !d.isFamily);
+    assert.equal(sleepingOwn.online, false);
+    assert.equal(sleepingOwn.deviceStatus, 'pending');
+    assert.equal(sleepingOwn.deviceStatusLabel, '待机');
+    assert.equal(sleepingOwn.batteryPercent, 62);
+    assert.equal(sleepingOwn.batteryIsCached, true);
+
+    // cacheOnly status must perform zero HTTP calls
+    const callCountBeforeCacheOnly = mock.calls.length;
+    now += 600_000; // even far past cacheTtlSec
+    const cacheOnlyRes = await runAppleAction('status', { cacheOnly: true }, {
+      dataDir,
+      fetchFn: mock.fetchFn,
+      nowFn: () => now,
+    });
+    assert.equal(cacheOnlyRes.ok, true);
+    assert.equal(cacheOnlyRes.data.fromCache, true);
+    assert.equal(mock.calls.length, callCountBeforeCacheOnly, 'cacheOnly status must not make network calls');
+
+    // Regular status (without cacheOnly) auto-syncs expired cache and respects includeFamily toggling
+    phase = 'settling';
+    expectedFmly = false;
+    await runAppleAction('config', { includeFamily: false }, { dataDir, nowFn: () => now });
+    const autoSyncRes = await runAppleAction('status', {}, {
+      dataDir,
+      fetchFn: mock.fetchFn,
+      nowFn: () => now,
+      locatePollDelayMs: 5,
+    });
+    assert.equal(autoSyncRes.ok, true);
+    assert.equal(autoSyncRes.data.fromCache, false);
+    assert.equal(mock.calls.at(-1)?.body?.clientContext?.fmly, false);
+    expectedFmly = true;
+
+    // Pending-only cache (all offline & null battery) bypasses 30s cooldown after >= 3s
+    const pendingDir = mkdtempSync(join(tmpdir(), 'friday-apple-pend-'));
+    try {
+      let pNow = 1_760_000_000_000;
+      let pOnline = false;
+      const pMock = createMockAppleFetch({
+        appleId: 'pend@icloud.com',
+        password: 'Password123!',
+        require2fa: false,
+        fmipResponder: () => ({
+          content: [pOnline ? personalSettled : { ...personalPending, isLocating: false }],
+        }),
+      });
+      await runAppleAction('auth-login', { appleId: 'pend@icloud.com', password: 'Password123!' }, {
+        dataDir: pendingDir,
+        fetchFn: pMock.fetchFn,
+        nowFn: () => pNow,
+        locatePollDelayMs: 5,
+      });
+      // Only 5s later (< 30s cooldown): incomplete pending cache still allows manual refresh!
+      pNow += 5_000;
+      pOnline = true;
+      const retryRes = await runAppleAction('devices', { refresh: true }, {
+        dataDir: pendingDir,
+        fetchFn: pMock.fetchFn,
+        nowFn: () => pNow,
+        locatePollDelayMs: 5,
+      });
+      assert.equal(retryRes.data.cooldownActive, false, 'incomplete cache must bypass 30s cooldown');
+      assert.equal(retryRes.data.fromCache, false);
+      assert.equal(retryRes.data.devices[0].online, true);
+      assert.equal(retryRes.data.devices[0].batteryPercent, 62);
+    } finally {
+      rmSync(pendingDir, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('9. System Base AMap regeo converts WGS-84->GCJ-02, shares 22m grid cache, redacts safely, and matches GCJ-02 geofences', async () => {
+  const homeDir = mkdtempSync(join(tmpdir(), 'friday-apple-geo-'));
+  let now = 1_760_100_000_000;
+  try {
+    const savedGeo = await saveSystemGeoConfig({ homeDir, amapKey: 'test_system_amap_key_9988' });
+    assert.equal(savedGeo.configured, true);
+    assert.equal(savedGeo.source, 'system');
+    assert.equal(savedGeo.maskedKey, 'test****9988');
+    const geoCfgMode = statSync(join(homeDir, 'geo-config.json')).mode & 0o777;
+    assert.equal(geoCfgMode, 0o600);
+
+    // Device 1 & Device 2 are ~10m apart (same ~22m grid cell after WGS-84 -> GCJ-02);
+    // Device 3 is in another district matching a user-pasted GCJ-02 home coordinate.
+    const wgsOfficeLat = 31.23041;
+    const wgsOfficeLon = 121.47371;
+    const wgsHomeLat = 31.1955;
+    const wgsHomeLon = 121.4388;
+    const gcjHome = wgs84ToGcj02(wgsHomeLat, wgsHomeLon);
+    assert.equal(gcjHome.inChina, true);
+    assert.ok(Math.abs(gcjHome.lat - wgsHomeLat) > 0.0005 || Math.abs(gcjHome.lon - wgsHomeLon) > 0.0005);
+
+    const amapCalls: string[] = [];
+    const amapRequester = async (url: string) => {
+      amapCalls.push(url);
+      const parsedUrl = new URL(url);
+      assert.equal(parsedUrl.searchParams.get('key'), 'test_system_amap_key_9988');
+      const locParam = parsedUrl.searchParams.get('location') || '';
+      const [lonStr, latStr] = locParam.split(',');
+      const qLon = Number(lonStr);
+      const qLat = Number(latStr);
+      // Verify WGS-84 coordinates were converted to GCJ-02 before calling AMap
+      assert.notEqual(locParam, `${wgsOfficeLon.toFixed(6)},${wgsOfficeLat.toFixed(6)}`);
+      const isHome = Math.abs(qLat - gcjHome.lat) < 0.01;
+      return {
+        status: 200,
+        body: JSON.stringify({
+          status: '1',
+          info: 'OK',
+          regeocode: {
+            formatted_address: isHome
+              ? '上海市徐汇区漕溪北路398号百脑汇'
+              : '上海市黄浦区南京东路街道人民广场200号',
+            addressComponent: {
+              district: isHome ? '徐汇区' : '黄浦区',
+              streetNumber: {
+                street: isHome ? '漕溪北路' : '人民大道',
+                number: isHome ? '398号' : '200号',
+              },
+            },
+            aois: [{ name: isHome ? '徐家汇商圈' : '人民广场' }],
+            pois: [],
+          },
+        }),
+      };
+    };
+
+    const mock = createMockAppleFetch({
+      appleId: 'geo@icloud.com',
+      password: 'Password123!',
+      require2fa: false,
+      devices: [
+        {
+          id: 'DEV-IPHONE-OFFICE',
+          name: 'iPhone 17 Pro',
+          deviceDisplayName: 'iPhone 17 Pro',
+          rawDeviceModel: 'iPhone18,4',
+          deviceClass: 'iPhone',
+          deviceStatus: '200',
+          batteryLevel: 0.88,
+          batteryStatus: 'NotCharging',
+          location: { latitude: wgsOfficeLat, longitude: wgsOfficeLon, horizontalAccuracy: 12, positionType: 'GPS', timeStamp: now },
+          features: { SND: true, LOC: true },
+        },
+        {
+          id: 'DEV-IPAD-OFFICE',
+          name: 'iPad Pro',
+          deviceDisplayName: 'iPad Pro',
+          rawDeviceModel: 'iPad16,3',
+          deviceClass: 'iPad',
+          deviceStatus: '200',
+          batteryLevel: 0.77,
+          batteryStatus: 'NotCharging',
+          location: { latitude: 31.23042, longitude: 121.47372, horizontalAccuracy: 18, positionType: 'Wifi', timeStamp: now },
+          features: { SND: true, LOC: true },
+        },
+        {
+          id: 'DEV-MAC-HOME',
+          name: 'Mac mini',
+          deviceDisplayName: 'Mac mini',
+          rawDeviceModel: 'Mac15,12',
+          deviceClass: 'Mac',
+          deviceStatus: '200',
+          batteryLevel: 1,
+          batteryStatus: 'Charged',
+          location: { latitude: wgsHomeLat, longitude: wgsHomeLon, horizontalAccuracy: 20, positionType: 'Wifi', timeStamp: now },
+          features: { SND: true, LOC: true },
+        },
+      ],
+    });
+
+    // Configure geofence using AMap GCJ-02 coordinates even though Apple returns WGS-84
+    const cfgRes = await runAppleAction('config', {
+      places: { 家: { lat: gcjHome.lat, lng: gcjHome.lon, radiusMeters: 150 } },
+    }, { homeDir, nowFn: () => now });
+    assert.equal(cfgRes.ok, true);
+    assert.equal(cfgRes.data.geoConfigured, true);
+
+    const loginRes = await runAppleAction('auth-login', {
+      appleId: 'geo@icloud.com',
+      password: 'Password123!',
+    }, { homeDir, fetchFn: mock.fetchFn, nowFn: () => now, amapRequester });
+    assert.equal(loginRes.ok, true);
+    assert.equal(loginRes.data.geoConfigured, true);
+
+    // Shared ~22m grid cache means iPhone & iPad at office only triggered 1 AMap request + 1 for Mac at home = 2 total!
+    assert.equal(amapCalls.length, 2);
+
+    const iphone = loginRes.data.devices.find((d: any) => d.name === 'iPhone 17 Pro');
+    const ipad = loginRes.data.devices.find((d: any) => d.name === 'iPad Pro');
+    const mac = loginRes.data.devices.find((d: any) => d.name === 'Mac mini');
+    assert.equal(iphone.location.shortAddress, '黄浦区人民大道200号 · 人民广场');
+    assert.equal(ipad.location.shortAddress, '黄浦区人民大道200号 · 人民广场');
+    assert.equal(mac.place?.name, '家');
+    assert.equal(mac.place?.inside, true);
+    assert.ok((mac.place?.distanceMeters ?? 999) <= 5, `dual-coordinate geofence must match within 5m, got ${mac.place?.distanceMeters}`);
+
+    // locate with redactCoords=true preserves Chinese shortAddress while redacting numeric coordinates
+    const locRedacted = await runAppleAction('locate', { device: 'iPhone', redactCoords: true }, {
+      homeDir,
+      fetchFn: mock.fetchFn,
+      nowFn: () => now,
+      amapRequester,
+    });
+    assert.equal(locRedacted.ok, true);
+    assert.equal(locRedacted.data.device.location.latitude, undefined);
+    assert.equal(locRedacted.data.device.location.longitude, undefined);
+    assert.equal(locRedacted.data.device.location.gcjLat, undefined);
+    assert.equal(locRedacted.data.device.location.gcjLon, undefined);
+    assert.equal(locRedacted.data.device.location.shortAddress, '黄浦区人民大道200号 · 人民广场');
+    assert.match(locRedacted.message ?? '', /人民广场/);
+    assert.equal((locRedacted.message ?? '').includes('undefined'), false);
+    assert.equal(amapCalls.length, 2, 'cached status/locate must reuse shared geo-cache.sqlite without extra AMap requests');
+  } finally {
+    rmSync(homeDir, { recursive: true, force: true });
   }
 });

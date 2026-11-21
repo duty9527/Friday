@@ -1,6 +1,6 @@
 import { button, element, isEditingWithin, kpiCard, node, svgNode } from '../shared/dom.js';
 import { errorText, timestamp } from '../shared/format.js';
-import { api, appState } from '../state.js';
+import { api, appState, hooks } from '../state.js';
 
 export interface AppleDevicesUiOptions {
   isVisible: () => boolean;
@@ -20,8 +20,12 @@ interface ApplePlaceMatch {
 }
 
 interface AppleDeviceLocation {
-  latitude?: number;
-  longitude?: number;
+  latitude?: number | null;
+  longitude?: number | null;
+  gcjLat?: number | null;
+  gcjLon?: number | null;
+  address?: string | null;
+  shortAddress?: string | null;
   horizontalAccuracy: number | null;
   positionType: string | null;
   timestamp: number | null;
@@ -36,18 +40,24 @@ interface AppleDeviceItem {
   category: 'iphone' | 'ipad' | 'mac' | 'watch' | 'airpods' | 'other' | string;
   online: boolean;
   deviceStatus: string;
+  deviceStatusLabel?: string;
   batteryPercent: number | null;
   batteryStatus: string;
   batteryStatusLabel: string;
+  batteryIsCached?: boolean;
+  batteryUpdatedAt?: number | null;
   lowPowerMode: boolean;
   lostModeCapable: boolean;
   isLocating: boolean;
+  soundCapable?: boolean;
+  isFamily?: boolean;
   location: AppleDeviceLocation | null;
   place: ApplePlaceMatch | null;
 }
 
 interface ApplePluginConfig {
   region: 'cn' | 'global';
+  includeFamily?: boolean;
   cacheTtlSec: number;
   minRefreshIntervalSec: number;
   minBatteryPct: number;
@@ -69,6 +79,7 @@ interface ApplePluginStatusData {
   cooldownRemainingSec?: number;
   devices?: AppleDeviceItem[];
   config?: ApplePluginConfig;
+  geoConfigured?: boolean;
 }
 
 interface PluginRunEnvelope {
@@ -213,10 +224,14 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
   const cfgWatch = element<HTMLInputElement>('apple-cfg-watch');
   const cfgAliases = element<HTMLTextAreaElement>('apple-cfg-aliases');
   const cfgPlaces = element<HTMLTextAreaElement>('apple-cfg-places');
+  const cfgIncludeFamily = element<HTMLInputElement>('apple-cfg-include-family');
+  const geoStatusHint = element<HTMLElement>('apple-geo-status-hint');
+  const openGeoBtn = element<HTMLButtonElement>('apple-open-geo-btn');
   const cfgSaveBtn = element<HTMLButtonElement>('apple-cfg-save-btn');
 
   let active = false;
   let busy = false;
+  let ringingId: string | null = null;
   let lastData: ApplePluginStatusData | undefined;
 
   function setStatus(text: string, tone: 'ok' | 'warn' | 'err' = 'ok'): void {
@@ -225,13 +240,50 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
     statusBanner.className = `health-status-banner tone-${tone}`;
   }
 
+  function resolveDeviceBadge(dev: AppleDeviceItem): { text: string; badgeClass: string } {
+    if (dev.online) return { text: '在线', badgeClass: 'hub-badge badge-green' };
+    if (dev.deviceStatus === 'pending' && dev.isLocating) {
+      return { text: '🔄 唤醒同步中', badgeClass: 'hub-badge badge-amber' };
+    }
+    if (dev.deviceStatus === 'pending') {
+      return { text: '待机', badgeClass: 'hub-badge badge-amber' };
+    }
+    if (dev.deviceStatus === 'offline') {
+      return { text: '离线休眠', badgeClass: 'hub-badge badge-slate' };
+    }
+    return { text: dev.deviceStatusLabel || '离线', badgeClass: 'hub-badge badge-slate' };
+  }
+
+  function syncControlStates(): void {
+    const authState = lastData?.authState ?? 'unauthenticated';
+    const blocked = busy || appState.authExpired;
+    refreshBtn.disabled = blocked || authState !== 'authenticated';
+    cachedBtn.disabled = blocked;
+    loginBtn.disabled = blocked;
+    smsBtn.disabled = blocked;
+    bypass2faBtn.disabled = blocked;
+    twoFaVerifyBtn.disabled = blocked;
+    logoutBtn.disabled = blocked;
+    cfgSaveBtn.disabled = blocked;
+    for (const btn of devicesGrid.querySelectorAll<HTMLButtonElement>('button.apple-ring-btn')) {
+      btn.disabled = blocked || authState !== 'authenticated' || btn.dataset.soundCapable === 'false';
+    }
+  }
+
+  function setBusy(next: boolean): void {
+    busy = next;
+    syncControlStates();
+  }
+
   function updateTopBadge(data?: ApplePluginStatusData): void {
     const state = data?.authState ?? 'unauthenticated';
     if (state === 'authenticated') {
       const devices = data?.devices ?? [];
-      const firstIphone = devices.find(d => d.category === 'iphone') ?? devices[0];
-      if (firstIphone && typeof firstIphone.batteryPercent === 'number') {
-        topBadge.textContent = `${firstIphone.batteryPercent}%`;
+      const primaryIphone = devices.find(d => !d.isFamily && d.category === 'iphone')
+        ?? devices.find(d => d.category === 'iphone')
+        ?? devices[0];
+      if (primaryIphone && typeof primaryIphone.batteryPercent === 'number') {
+        topBadge.textContent = `${primaryIphone.batteryPercent}%`;
       } else {
         topBadge.textContent = `${devices.length}`;
       }
@@ -258,8 +310,6 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
     authPill.className = badgeInfo.badgeClass;
 
     logoutBtn.hidden = authState === 'unauthenticated';
-    refreshBtn.disabled = busy || authState !== 'authenticated' || appState.authExpired || !appState.ready;
-    cachedBtn.disabled = busy || appState.authExpired || !appState.ready;
 
     const showLoginFields = authState !== 'authenticated';
     loginForm.hidden = !showLoginFields || authState === 'pending_2fa';
@@ -277,32 +327,34 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
     } else if (authState === 'expired') {
       boundAccountEl.textContent = `账号 ${data.appleId || ''} 会话已过期，请重新登录并完成 2FA 授权`;
     } else {
-      boundAccountEl.textContent = '密码仅在当次计算密码学证明，绝不落盘、不进入聊天上下文';
+      boundAccountEl.textContent = '未绑定';
     }
 
     const devices = data.devices ?? [];
     const minBatteryPct = data.config?.minBatteryPct ?? 25;
     const lowCount = devices.filter(d =>
       typeof d.batteryPercent === 'number'
+      && !d.batteryIsCached
       && d.batteryPercent < minBatteryPct
       && d.batteryStatus !== 'Charging'
       && d.batteryStatus !== 'Charged',
     ).length;
     const onlineCount = devices.filter(d => d.online).length;
+    const pendingCount = devices.filter(d => !d.online && d.deviceStatus === 'pending').length;
     const updatedStr = data.fetchedAt ? timestamp(data.fetchedAt) : '尚无快照';
 
     const kpiFrag = document.createDocumentFragment();
     kpiFrag.append(
       kpiCard('会话状态', authState === 'authenticated' ? '已连接' : authState === 'pending_2fa' ? '待 2FA' : authState === 'expired' ? '已过期' : '未绑定', data.region === 'cn' ? '国区云上贵州' : '国际区', authState === 'authenticated' ? 'positive' : authState === 'expired' ? 'warning' : 'default'),
-      kpiCard('设备总数', `${devices.length}`, `${onlineCount} 台在线`, devices.length > 0 ? 'accent' : 'default'),
+      kpiCard('设备总数', `${devices.length}`, `${onlineCount} 台在线${pendingCount > 0 ? ` · ${pendingCount} 台待机` : ''}`, devices.length > 0 ? 'accent' : 'default'),
       kpiCard('低电量告警', `${lowCount}`, `阈值 < ${minBatteryPct}%`, lowCount > 0 ? 'warning' : 'positive'),
       kpiCard('最近拉取', updatedStr, data.fromCache ? '缓存快照' : '实时直连', 'default'),
     );
     kpiGrid.replaceChildren(kpiFrag);
 
     devicesSubtitle.textContent = devices.length > 0
-      ? `共 ${devices.length} 台设备 · ${data.fromCache ? '防耗电缓存模式' : '刚刚实时唤醒拉取'}`
-      : '完成绑定并刷新后将在这里展示名下设备';
+      ? `共 ${devices.length} 台设备 · ${data.fromCache ? '缓存快照' : '实时直连'}`
+      : '';
 
     if (devices.length === 0) {
       devicesGrid.replaceChildren(node('p', authState === 'authenticated' ? '暂无设备缓存，请点击右上角「🔄 实时刷新」。' : '请先在上方绑定你的 Apple ID。', 'empty'));
@@ -313,10 +365,14 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
         const head = node('div', '', 'hub-card-head');
         const titleGroup = node('div', '', 'hub-card-title-group');
         const icon = CATEGORY_ICONS[dev.category] ?? '🍎';
+        const devBadge = resolveDeviceBadge(dev);
         titleGroup.append(
           node('span', `${icon} ${dev.name}`, 'hub-card-title'),
-          node('span', dev.online ? '在线' : '离线', `hub-badge ${dev.online ? 'badge-green' : 'badge-slate'}`),
+          node('span', devBadge.text, devBadge.badgeClass),
         );
+        if (dev.isFamily) {
+          titleGroup.append(node('span', '家人共享', 'hub-badge badge-slate'));
+        }
         if (dev.lowPowerMode) {
           titleGroup.append(node('span', '低电量模式', 'hub-badge badge-amber'));
         }
@@ -325,45 +381,59 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
 
         const batRow = node('div', '', 'apple-battery-row');
         const batText = typeof dev.batteryPercent === 'number'
-          ? `🔋 ${dev.batteryPercent}% · ${dev.batteryStatusLabel}`
-          : '🔋 暂无电量上报';
+          ? `🔋 ${dev.batteryPercent}% · ${dev.batteryStatusLabel}${dev.batteryIsCached ? '（休眠前记录）' : ''}`
+          : '🔋 暂无电量上报（休眠或关机）';
         batRow.append(
           node('span', batText, 'apple-battery-text'),
           buildBatterySvg(dev.batteryPercent, dev.batteryStatus, minBatteryPct),
         );
         card.append(batRow);
 
+        const addrLabel = dev.location?.shortAddress || dev.location?.address || '';
+        const acc = dev.location && dev.location.horizontalAccuracy !== null ? ` · 精度 ${dev.location.horizontalAccuracy}m` : '';
+        const oldTag = dev.location?.isOld ? '（历史位置）' : '';
         let locText = '📍 暂无位置上报';
         if (dev.place?.inside) {
-          locText = `📍 在「${dev.place.name}」附近（约 ${dev.place.distanceMeters}m）`;
+          locText = `📍 在「${dev.place.name}」附近（约 ${dev.place.distanceMeters}m${addrLabel ? ` · ${addrLabel}` : ''}）`;
         } else if (dev.place) {
-          locText = `📍 距「${dev.place.name}」约 ${dev.place.distanceMeters}m`;
+          locText = addrLabel
+            ? `📍 ${addrLabel}（距「${dev.place.name}」约 ${dev.place.distanceMeters}m）`
+            : `📍 距「${dev.place.name}」约 ${dev.place.distanceMeters}m`;
         } else if (dev.location) {
-          const acc = dev.location.horizontalAccuracy !== null ? ` · 精度 ${dev.location.horizontalAccuracy}m` : '';
-          const oldTag = dev.location.isOld ? '（历史位置）' : '';
-          locText = `📍 ${dev.location.latitude ?? '**'}, ${dev.location.longitude ?? '**'}${acc}${oldTag}`;
+          locText = addrLabel
+            ? `📍 ${addrLabel}${acc}${oldTag}`
+            : `📍 ${dev.location.latitude ?? '**'}, ${dev.location.longitude ?? '**'}${acc}${oldTag}`;
         }
-        card.append(node('div', locText, 'meta apple-location-line'));
+        const locEl = node('div', locText, 'meta apple-location-line');
+        if (dev.location?.address && dev.location.address !== addrLabel) {
+          locEl.title = dev.location.address;
+        }
+        card.append(locEl);
 
         const actionsRow = node('div', '', 'apple-card-actions');
-        const ringBtn = button('🔊 播放提示音', () => {
+        const ringLabel = ringingId === dev.id ? '🔔 发送中…' : '🔊 播放提示音';
+        const ringBtn = button(ringLabel, () => {
           void handlePlaySound(dev);
-        }, 'mini-button');
-        ringBtn.disabled = busy || authState !== 'authenticated';
-        actionsRow.append(
-          node('span', dev.id, 'apple-device-id meta'),
-          ringBtn,
-        );
+        }, 'mini-button apple-ring-btn');
+        ringBtn.dataset.soundCapable = String(dev.soundCapable !== false);
+        actionsRow.append(ringBtn);
         card.append(actionsRow);
         frag.append(card);
       }
       devicesGrid.replaceChildren(frag);
     }
 
+    if (data.geoConfigured === true) {
+      geoStatusHint.textContent = '🗺️ 高德逆地理：已就绪';
+    } else if (data.geoConfigured === false) {
+      geoStatusHint.textContent = '🗺️ 高德逆地理：未配置';
+    }
+
     if (data.config && !isEditingWithin(configDetails)) {
       if (!isEditingWithin(authSection)) {
         regionSelect.value = data.config.region;
       }
+      cfgIncludeFamily.checked = data.config.includeFamily !== false;
       cfgCacheTtl.value = String(data.config.cacheTtlSec);
       cfgCooldown.value = String(data.config.minRefreshIntervalSec);
       cfgMinBattery.value = String(data.config.minBatteryPct);
@@ -371,40 +441,50 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
       cfgAliases.value = formatAliasesTextarea(data.config.customAliases);
       cfgPlaces.value = formatPlacesTextarea(data.config.places);
     }
+
+    syncControlStates();
   }
 
-  async function loadStatus(refresh = false): Promise<void> {
+  async function loadStatus(mode: 'auto' | 'refresh' | 'cache' = 'auto'): Promise<void> {
     if (busy) return;
-    busy = true;
+    setBusy(true);
+    if (mode === 'refresh') {
+      setStatus('正在唤醒苹果设备并同步实时电量与定位（约需 2～5 秒）…', 'warn');
+    }
     try {
-      const action = refresh ? 'devices' : 'status';
-      const res = await runApplePlugin(action, refresh ? { refresh: true } : {});
+      const res = mode === 'refresh'
+        ? await runApplePlugin('devices', { refresh: true })
+        : mode === 'cache'
+          ? await runApplePlugin('status', { cacheOnly: true })
+          : await runApplePlugin('status', {});
+      busy = false;
       if (res.data) {
         render(res.data);
       }
       if (!res.ok) {
         setStatus(res.message || '操作失败', 'err');
-      } else if (refresh) {
+      } else if (mode === 'refresh') {
         const msg = res.data?.cooldownActive
           ? `命中防耗电冷却（${res.data.cooldownRemainingSec}s 后可再次唤醒），已返回最近缓存`
           : '已刷新苹果设备实时状态';
         setStatus(msg, res.data?.cooldownActive ? 'warn' : 'ok');
+      } else if (mode === 'cache') {
+        setStatus('已加载本地缓存快照', 'ok');
       } else {
         setStatus('');
       }
     } catch (err) {
       setStatus(`加载苹果设备状态失败：${errorText(err)}`, 'err');
     } finally {
-      busy = false;
-      if (lastData) {
-        refreshBtn.disabled = lastData.authState !== 'authenticated';
-      }
+      setBusy(false);
     }
   }
 
   async function handlePlaySound(dev: AppleDeviceItem): Promise<void> {
     if (busy) return;
-    busy = true;
+    ringingId = dev.id;
+    setBusy(true);
+    if (lastData) render(lastData);
     setStatus(`正在向 ${dev.name} 发送 Find My 响铃指令…`, 'warn');
     try {
       const res = await runApplePlugin('play-sound', { device: dev.id });
@@ -412,7 +492,10 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
     } catch (err) {
       setStatus(`发送响铃失败：${errorText(err)}`, 'err');
     } finally {
+      ringingId = null;
       busy = false;
+      if (lastData) render(lastData);
+      syncControlStates();
     }
   }
 
@@ -425,11 +508,11 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
       return;
     }
     passwordInput.value = '';
-    busy = true;
-    loginBtn.disabled = true;
+    setBusy(true);
     setStatus('正在通过 SRP-6a 协议连接苹果认证服务器…', 'warn');
     try {
       const res = await runApplePlugin('auth-login', { appleId, password, region });
+      busy = false;
       if (res.data) {
         render(res.data);
       }
@@ -437,26 +520,24 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
     } catch (err) {
       setStatus(`登录失败：${errorText(err)}`, 'err');
     } finally {
-      busy = false;
-      loginBtn.disabled = false;
+      setBusy(false);
     }
   }
 
   async function handleSendSms(): Promise<void> {
     if (busy) return;
-    busy = true;
-    smsBtn.disabled = true;
+    setBusy(true);
     setStatus('正在请求向受信任手机号发送短信验证码…', 'warn');
     try {
       const res = await runApplePlugin('auth-sms', {});
+      busy = false;
       if (res.data) render(res.data);
       if (res.ok) twoFaModeSelect.value = 'sms';
       setStatus(res.message, res.ok ? 'ok' : 'err');
     } catch (err) {
       setStatus(`发送短信验证码失败：${errorText(err)}`, 'err');
     } finally {
-      busy = false;
-      smsBtn.disabled = false;
+      setBusy(false);
     }
   }
 
@@ -468,43 +549,39 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
       return;
     }
     if (busy) return;
-    busy = true;
-    twoFaVerifyBtn.disabled = true;
+    setBusy(true);
     setStatus('正在核验 6 位验证码并建立长期信任会话…', 'warn');
     try {
       const res = await runApplePlugin('auth-verify', { code, mode });
       if (res.ok) twoFaCodeInput.value = '';
+      busy = false;
       if (res.data) render(res.data);
       setStatus(res.message, res.ok ? 'ok' : 'err');
     } catch (err) {
       setStatus(`2FA 验证失败：${errorText(err)}`, 'err');
     } finally {
-      busy = false;
-      twoFaVerifyBtn.disabled = false;
+      setBusy(false);
     }
   }
 
   async function handleLogout(): Promise<void> {
     if (busy) return;
-    busy = true;
-    logoutBtn.disabled = true;
+    setBusy(true);
     try {
       const res = await runApplePlugin('logout', {});
       setStatus(res.message, res.ok ? 'ok' : 'err');
       busy = false;
-      await loadStatus(false);
+      await loadStatus('cache');
     } catch (err) {
       setStatus(`退出失败：${errorText(err)}`, 'err');
     } finally {
-      busy = false;
-      logoutBtn.disabled = false;
+      setBusy(false);
     }
   }
 
   async function handleSaveConfig(): Promise<void> {
     if (busy) return;
-    busy = true;
-    cfgSaveBtn.disabled = true;
+    setBusy(true);
     try {
       const watchDevices = cfgWatch.value
         .split(/[,，\n]/)
@@ -512,6 +589,7 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
         .filter(Boolean);
       const res = await runApplePlugin('config', {
         region: regionSelect.value === 'global' ? 'global' : 'cn',
+        includeFamily: cfgIncludeFamily.checked,
         cacheTtlSec: Number(cfgCacheTtl.value),
         minRefreshIntervalSec: Number(cfgCooldown.value),
         minBatteryPct: Number(cfgMinBattery.value),
@@ -521,46 +599,45 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
       });
       setStatus(res.message, res.ok ? 'ok' : 'err');
       busy = false;
-      await loadStatus(false);
+      await loadStatus('auto');
     } catch (err) {
       setStatus(`保存配置失败：${errorText(err)}`, 'err');
     } finally {
-      busy = false;
-      cfgSaveBtn.disabled = false;
+      setBusy(false);
     }
   }
 
   async function handleBypass2fa(): Promise<void> {
     if (busy) return;
-    busy = true;
-    bypass2faBtn.disabled = true;
+    setBusy(true);
     setStatus('正在尝试 Find My 单因素免码直通通道…', 'warn');
     try {
       const res = await runApplePlugin('auth-verify', { bypass2fa: true });
+      busy = false;
       if (res.data) render(res.data);
       setStatus(res.message, res.ok ? 'ok' : 'err');
     } catch (err) {
       setStatus(`免码直通失败：${errorText(err)}`, 'err');
     } finally {
-      busy = false;
-      bypass2faBtn.disabled = false;
+      setBusy(false);
     }
   }
 
-  refreshBtn.addEventListener('click', () => { void loadStatus(true); });
-  cachedBtn.addEventListener('click', () => { void loadStatus(false); });
+  refreshBtn.addEventListener('click', () => { void loadStatus('refresh'); });
+  cachedBtn.addEventListener('click', () => { void loadStatus('cache'); });
   loginBtn.addEventListener('click', () => { void handleLogin(); });
   smsBtn.addEventListener('click', () => { void handleSendSms(); });
   bypass2faBtn.addEventListener('click', () => { void handleBypass2fa(); });
   twoFaVerifyBtn.addEventListener('click', () => { void handleVerify2fa(); });
   logoutBtn.addEventListener('click', () => { void handleLogout(); });
   cfgSaveBtn.addEventListener('click', () => { void handleSaveConfig(); });
+  openGeoBtn.addEventListener('click', () => { hooks.openSystemHubModal?.('services', 'amap'); });
 
   return {
     activate: () => {
       active = true;
       if (options.isVisible()) {
-        void loadStatus(false);
+        void loadStatus('auto');
       }
     },
     deactivate: () => {
@@ -569,7 +646,7 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
     refreshBadge: async () => {
       if (active) return;
       try {
-        const res = await runApplePlugin('status', {});
+        const res = await runApplePlugin('status', { cacheOnly: true });
         if (res.data) {
           lastData = res.data;
           updateTopBadge(res.data);

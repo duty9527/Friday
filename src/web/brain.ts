@@ -1785,13 +1785,6 @@ export class GoldenBrainStage {
     const statLine = `NEURONS ${this.graph.nodes.length}  ·  SYNAPSES ${this.graph.edges.length}  ·  CORE LOCKED`;
     ctx.fillStyle = 'rgba(245, 158, 11, 0.56)';
     ctx.fillText(statLine, 14, h - 13);
-
-    const hint = '拖拽旋转 · 滚轮缩放 · 点击神经元检视';
-    const hintW = ctx.measureText(hint).width;
-    if (w > 460) {
-      ctx.fillStyle = 'rgba(254, 243, 199, 0.45)';
-      ctx.fillText(hint, w - hintW - 14, h - 13);
-    }
     ctx.restore();
   }
 

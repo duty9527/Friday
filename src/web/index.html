@@ -141,7 +141,6 @@
           <span class="amber-core-dot large" aria-hidden="true"></span>
           <div>
             <h2 id="memory-modal-title">F.R.I.D.A.Y. · 全息神经记忆矩阵</h2>
-            <p class="memory-header-sub">三维琥珀全息皮层 · 核心信条内环与赫布突触扩散网络</p>
           </div>
         </div>
         <button id="memory-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
@@ -366,7 +365,6 @@
                 <span class="hub-badge badge-blue">本机长轮询 · 无需公网 Webhook</span>
               </div>
             </div>
-            <p class="telegram-guide-tip">💡 粘贴从 @BotFather 获取的 Bot Token 即可自动验活、清理冲突 Webhook 并注册常见斜杠命令菜单。</p>
             <div class="telegram-quick-form">
               <label class="telegram-field-token">
                 <span class="meta">Bot Token</span>
@@ -397,7 +395,6 @@
                 <button id="im-voice-clear-btn" class="mini-button danger-btn" type="button" hidden>🧹 清空全部</button>
               </div>
             </div>
-            <p class="voiceprint-guide-tip">💡 声纹录入直接通过语音完成：对小爱音箱说「你好星期五，录入我的声纹」或「你好星期五，帮老婆录入声纹」。</p>
             <div id="im-voice-meta-row" class="hub-badges-row"></div>
             <div id="im-voice-list" class="hub-cards-grid"><p class="empty">暂未录入声纹。</p></div>
           </div>
@@ -491,70 +488,131 @@
     </div>
   </div>
 
-  <!-- 4. 应用与插件宿主弹窗 (M3：目录 + 专属插件看板) -->
+  <!-- 4. 应用与插件宿主弹窗 (M3：侧边栏导航 + 专属看板 + 置底插件目录) -->
   <div id="plugin-hub-backdrop" class="modal-backdrop" hidden>
     <div id="plugin-hub-modal" class="model-modal hub-modal plugin-hub-modal" role="dialog" aria-modal="true" aria-labelledby="plugin-modal-title">
       <div class="model-modal-header plugin-modal-header">
-        <div class="hub-modal-title-block">
-          <h2 id="plugin-modal-title">🔌 应用与插件</h2>
-          <p class="hub-modal-sub">插件能力目录与已安装应用的专属交互看板</p>
-        </div>
-        <div class="hub-modal-header-right">
-          <div id="plugin-surface-tabs" class="hub-surface-tabs" role="tablist" aria-label="应用与插件视图切换">
-            <button id="plugin-tab-catalog" class="hub-surface-tab active" type="button" role="tab" aria-selected="true" aria-controls="plugin-panel-catalog" data-plugin-tab="catalog">
-              <span>📦 插件目录</span>
-              <span id="plugin-catalog-badge" class="hub-pill-badge">0</span>
-            </button>
-            <button id="plugin-tab-health-scale" class="hub-surface-tab" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-health-scale" data-plugin-tab="health-scale" hidden>
-              <span>❤️ 健康管理</span>
-              <span id="health-top-badge" class="hub-pill-badge">—</span>
-            </button>
-            <button id="plugin-tab-fund-tracker" class="hub-surface-tab" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-fund-tracker" data-plugin-tab="fund-tracker" hidden>
-              <span>📈 投资管理</span>
-              <span id="fund-top-badge" class="hub-pill-badge">—</span>
-            </button>
-            <button id="plugin-tab-cs80-face" class="hub-surface-tab" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-cs80-face" data-plugin-tab="cs80-face" hidden>
-              <span>🖥️ CS80 副屏</span>
-              <span id="cs80-top-badge" class="hub-pill-badge">—</span>
-            </button>
-            <button id="plugin-tab-laifen" class="hub-surface-tab" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-laifen" data-plugin-tab="laifen" hidden>
-              <span>🪥 口腔护理</span>
-              <span id="laifen-top-badge" class="hub-pill-badge">—</span>
-            </button>
-            <button id="plugin-tab-ninebot" class="hub-surface-tab" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-ninebot" data-plugin-tab="ninebot" hidden>
-              <span>🛵 九号守护</span>
-              <span id="ninebot-top-badge" class="hub-pill-badge">—</span>
-            </button>
-            <button id="plugin-tab-netlea" class="hub-surface-tab" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-netlea" data-plugin-tab="netlea" hidden>
-              <span>🐠 鱼缸灯光</span>
-              <span id="netlea-top-badge" class="hub-pill-badge">—</span>
-            </button>
-            <button id="plugin-tab-apple-devices" class="hub-surface-tab" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-apple-devices" data-plugin-tab="apple-devices" hidden>
-              <span>🍎 苹果设备</span>
-              <span id="apple-top-badge" class="hub-pill-badge">—</span>
-            </button>
+        <div class="plugin-header-left">
+          <button id="plugin-mobile-nav-btn" class="mini-button plugin-mobile-nav-btn" type="button" aria-expanded="false" aria-controls="plugin-sidebar" aria-label="展开或收起插件侧边栏">
+            <svg class="plugin-ui-svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+            <span id="plugin-mobile-nav-label">插件导航</span>
+          </button>
+          <div class="hub-modal-title-block">
+            <h2 id="plugin-modal-title">应用与插件</h2>
           </div>
+        </div>
+        <div class="plugin-header-right">
           <button id="plugin-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
         </div>
       </div>
-      <div class="model-modal-body plugin-modal-body">
-        <div id="plugin-panel-catalog" class="hub-tab-panel" role="tabpanel" aria-labelledby="plugin-tab-catalog">
-          <div id="plugin-kpi-grid" class="hub-kpi-grid"></div>
-
-          <section class="model-modal-section">
-            <div class="modal-row-head">
-              <h3>已安装应用与扩展</h3>
-              <span id="plugin-list-subtitle" class="meta"></span>
+      <div id="plugin-shell" class="plugin-shell">
+        <div id="plugin-sidebar-scrim" class="plugin-sidebar-scrim" hidden></div>
+        <aside id="plugin-sidebar" class="plugin-sidebar" aria-label="应用与插件侧边栏">
+          <div class="plugin-sidebar-head">
+            <span class="plugin-sidebar-heading">应用导航</span>
+            <button id="plugin-sidebar-toggle" class="plugin-sidebar-toggle" type="button" aria-expanded="true" aria-controls="plugin-sidebar" aria-label="收起侧边栏" title="收起为仅图标模式">
+              <svg class="plugin-ui-svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2.5"/><line x1="9" y1="3" x2="9" y2="21"/><polyline points="15 9 12 12 15 15"/></svg>
+            </button>
+          </div>
+          <div id="plugin-surface-tabs" class="plugin-surface-tabs" role="tablist" aria-orientation="vertical" aria-label="应用与插件视图切换">
+            <div class="plugin-nav-sortable-wrap">
+              <div class="plugin-nav-section-label">
+                <span>专属看板</span>
+              </div>
+              <div id="plugin-nav-sortable" class="plugin-nav-sortable">
+                <button id="plugin-tab-health-scale" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-health-scale" data-plugin-tab="health-scale" draggable="true" title="健康管理" hidden>
+                  <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span>
+                  <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/><path d="M7 11h2.5l1.5-2.5 2 5 1.5-2.5H17"/></svg></span>
+                  <span class="plugin-nav-label">健康管理</span>
+                  <span id="health-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
+                  <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
+                </button>
+                <button id="plugin-tab-fund-tracker" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-fund-tracker" data-plugin-tab="fund-tracker" draggable="true" title="投资管理" hidden>
+                  <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span>
+                  <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/><line x1="3" y1="21" x2="21" y2="21"/></svg></span>
+                  <span class="plugin-nav-label">投资管理</span>
+                  <span id="fund-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
+                  <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
+                </button>
+                <button id="plugin-tab-cs80-face" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-cs80-face" data-plugin-tab="cs80-face" draggable="true" title="CS80 副屏" hidden>
+                  <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span>
+                  <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="14" rx="2.5"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="18" x2="12" y2="21"/><circle cx="9" cy="10" r="1"/><circle cx="15" cy="10" r="1"/><path d="M9.5 13.5c.8.8 1.6 1.2 2.5 1.2s1.7-.4 2.5-1.2"/></svg></span>
+                  <span class="plugin-nav-label">CS80 副屏</span>
+                  <span id="cs80-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
+                  <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
+                </button>
+                <button id="plugin-tab-laifen" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-laifen" data-plugin-tab="laifen" draggable="true" title="口腔护理" hidden>
+                  <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span>
+                  <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v18"/><path d="M9 6h6"/><path d="M9 9h6"/><path d="M5.5 8.5a4 4 0 0 0 0 5"/><path d="M18.5 8.5a4 4 0 0 1 0 5"/><rect x="10" y="13" width="4" height="8" rx="1.5"/></svg></span>
+                  <span class="plugin-nav-label">口腔护理</span>
+                  <span id="laifen-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
+                  <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
+                </button>
+                <button id="plugin-tab-ninebot" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-ninebot" data-plugin-tab="ninebot" draggable="true" title="九号守护" hidden>
+                  <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span>
+                  <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6.5" cy="17.5" r="3"/><circle cx="17.5" cy="17.5" r="3"/><path d="M6.5 14.5 9 9h5l2.5 5.5"/><path d="M14 9 15.5 5H18"/><path d="M9.5 17.5h5"/></svg></span>
+                  <span class="plugin-nav-label">九号守护</span>
+                  <span id="ninebot-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
+                  <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
+                </button>
+                <button id="plugin-tab-netlea" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-netlea" data-plugin-tab="netlea" draggable="true" title="鱼缸灯光" hidden>
+                  <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span>
+                  <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="3"/><path d="M12 2v1.5"/><path d="m5.8 5.2 1.1 1.1"/><path d="m18.2 5.2-1.1 1.1"/><path d="M3 16c1.8-1.4 3.6-1.4 5.4 0 1.8 1.4 3.6 1.4 5.4 0 1.8-1.4 3.6-1.4 5.4 0"/><path d="M3 20c1.8-1.4 3.6-1.4 5.4 0 1.8 1.4 3.6 1.4 5.4 0 1.8-1.4 3.6-1.4 5.4 0"/></svg></span>
+                  <span class="plugin-nav-label">鱼缸灯光</span>
+                  <span id="netlea-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
+                  <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
+                </button>
+                <button id="plugin-tab-apple-devices" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-apple-devices" data-plugin-tab="apple-devices" draggable="true" title="苹果设备" hidden>
+                  <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span>
+                  <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2.5" width="12" height="19" rx="2.5"/><line x1="10.5" y1="18.5" x2="13.5" y2="18.5"/><circle cx="12" cy="10" r="2.2"/><path d="M9.2 7.2a4 4 0 0 1 5.6 0"/></svg></span>
+                  <span class="plugin-nav-label">苹果设备</span>
+                  <span id="apple-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
+                  <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
+                </button>
+              </div>
             </div>
-            <div id="plugins-list" class="hub-cards-grid"><p class="empty">正在读取插件…</p></div>
-          </section>
+            <div class="plugin-sidebar-footer">
+              <button id="plugin-order-reset-btn" class="plugin-order-reset-btn" type="button" title="恢复插件默认展示顺序" hidden>
+                <svg class="plugin-ui-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><polyline points="3 3 3 8 8 8"/></svg>
+                <span class="plugin-nav-label">恢复默认排序</span>
+              </button>
+              <button id="plugin-tab-catalog" class="plugin-nav-item plugin-nav-catalog active" type="button" role="tab" aria-selected="true" aria-controls="plugin-panel-catalog" data-plugin-tab="catalog" title="插件目录">
+                <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></span>
+                <span class="plugin-nav-label">插件目录</span>
+                <span id="plugin-catalog-badge" class="hub-pill-badge plugin-nav-badge">0</span>
+              </button>
+            </div>
+          </div>
+        </aside>
+        <div class="model-modal-body plugin-modal-body plugin-stage">
+        <div id="plugin-panel-catalog" class="hub-tab-panel" role="tabpanel" aria-labelledby="plugin-tab-catalog">
+          <div id="plugin-catalog-home" class="plugin-catalog-home">
+            <div id="plugin-kpi-grid" class="hub-kpi-grid"></div>
+
+            <section class="model-modal-section plugin-catalog-controls" aria-label="筛选与搜索已安装插件">
+              <div class="plugin-catalog-toolbar">
+                <div class="plugin-catalog-search-wrap">
+                  <input id="plugin-catalog-search" class="plugin-catalog-search" type="search" maxlength="120" placeholder="搜索插件名称、功能或指令…" aria-label="搜索已安装插件">
+                </div>
+                <div id="plugin-catalog-filters" class="hub-filter-pills" role="tablist" aria-label="插件分类筛选">
+                  <button class="hub-filter-pill active" type="button" data-catalog-filter="all" aria-selected="true">全部</button>
+                  <button class="hub-filter-pill" type="button" data-catalog-filter="surface" aria-selected="false">专属看板</button>
+                  <button class="hub-filter-pill" type="button" data-catalog-filter="extension" aria-selected="false">系统扩展</button>
+                  <button class="hub-filter-pill" type="button" data-catalog-filter="voice" aria-selected="false">语音直通</button>
+                  <button class="hub-filter-pill" type="button" data-catalog-filter="timer" aria-selected="false">定时巡检</button>
+                </div>
+                <span id="plugin-list-subtitle" class="meta plugin-catalog-subtitle"></span>
+              </div>
+              <div id="plugins-list" class="plugin-catalog-sections"><p class="empty">正在读取插件…</p></div>
+            </section>
+          </div>
+          <div id="plugin-catalog-detail" class="plugin-catalog-detail" hidden></div>
         </div>
 
         <div id="plugin-panel-health-scale" class="hub-tab-panel" role="tabpanel" aria-labelledby="plugin-tab-health-scale" hidden>
           <div class="plugin-surface-bar">
             <div>
               <h3>❤️ 健康管理 · 沃莱 A1 体脂中心</h3>
-              <p class="health-header-sub">AFU-WL-TZ-A1 实时称重、双频生物电阻抗、全身成分分析与多成员健康档案</p>
             </div>
             <div class="health-header-actions">
               <select id="health-profile-select" aria-label="切换成员档案"></select>
@@ -730,7 +788,7 @@
                 </label>
               </div>
               <div class="modal-row-head">
-                <span class="hint">填写阻抗值时采用 Segal 双频 BIA 方程，否则自动按身高/年龄/性别 Deurenberg 公式推算全部体成分。</span>
+                <span></span>
                 <button id="health-manual-add-btn" class="primary" type="button">＋ 写入健康档案</button>
               </div>
             </div>
@@ -741,7 +799,7 @@
           <div class="modal-row-head">
             <div>
               <h3>历史测量明细</h3>
-              <span id="health-records-subtitle" class="meta">共 0 条记录 · 点击任意一行查看全量成分详情</span>
+              <span id="health-records-subtitle" class="meta">共 0 条记录</span>
             </div>
             <div id="health-source-filters" class="hub-filter-pills" role="tablist" aria-label="记录来源筛选">
               <button class="hub-filter-pill active" type="button" data-source="all">全部</button>
@@ -758,7 +816,6 @@
           <div class="plugin-surface-bar">
             <div>
               <h3>📈 投资管理 · 股票与基金持仓监控</h3>
-              <p class="health-header-sub">A 股 / 港股 / 美股 QDII 盘中实时估值、晚间正式净值结算、每日收益曲线与持仓管理</p>
             </div>
             <div class="fund-header-actions">
               <button id="fund-privacy-btn" class="mini-button" type="button">👁 隐藏金额</button>
@@ -890,7 +947,7 @@
                 </label>
               </div>
               <div class="modal-row-head">
-                <span class="hint">A 股股票留空行情代码时自动补全 sh/sz/bj 前缀；修改持仓时直接点击列表中对应行的「编辑」即可回填。</span>
+                <span></span>
                 <div class="modal-btn-group">
                   <button id="fund-form-reset-btn" class="mini-button" type="button">🧹 重置表单</button>
                   <button id="fund-form-save-btn" class="primary" type="button">💾 保存持仓</button>
@@ -905,7 +962,6 @@
           <div class="plugin-surface-bar">
             <div>
               <h3>🖥️ CS80 副屏 · 战术桌面、Bento 卡片与声光控台</h3>
-              <p class="health-header-sub">800×1280 物理副屏实时镜像、全插件动态尺寸卡片编排、单行跑马灯与内置喇叭调音</p>
             </div>
             <div class="fund-header-actions">
               <label class="hub-checkbox-label">
@@ -1004,7 +1060,7 @@
 
                 <div class="cs80-catalog-header">
                   <h4>＋ 添加插件 / 核心数据卡片到当前页</h4>
-                  <span id="cs80-catalog-meta" class="meta">自动发现所有已安装插件与主脑核心数据</span>
+                  <span id="cs80-catalog-meta" class="meta"></span>
                 </div>
                 <div id="cs80-catalog-picker" class="cs80-catalog-grid"></div>
               </div>
@@ -1018,6 +1074,14 @@
                     <span class="meta">触控/状态预览：</span>
                     <div id="cs80-express-btns" class="modal-btn-group">
                       <button class="mini-button" type="button" data-expr="listening" data-poke="nod">🎧 倾听状态</button>
+                      <button class="mini-button" type="button" data-expr="speaking" data-poke="">🔊 小爱说话</button>
+                      <button class="mini-button" type="button" data-expr="sending_msg" data-channel="wechat" data-poke="">✈️ 微信发送</button>
+                      <button class="mini-button" type="button" data-expr="sending_msg" data-channel="telegram" data-poke="">📨 电报发送</button>
+                      <button class="mini-button" type="button" data-expr="printing" data-poke="">🖨️ 操作打印机</button>
+                      <button class="mini-button" type="button" data-expr="operating_xiaoai" data-poke="">🎙️ 操控小爱</button>
+                      <button class="mini-button" type="button" data-expr="operating_tv" data-poke="">📺 操作电视</button>
+                      <button class="mini-button" type="button" data-expr="managing_laifen" data-poke="">🪥 牙刷管理</button>
+                      <button class="mini-button" type="button" data-expr="weighing_scale" data-poke="">⚖️ 体重秤测量</button>
                       <button class="mini-button" type="button" data-expr="happy" data-poke="bounce">😄 开心弹跳</button>
                       <button class="mini-button" type="button" data-expr="inspecting" data-poke="nod">🧐 专注打量</button>
                       <button class="mini-button" type="button" data-expr="surprised" data-poke="spin">🌀 转体惊喜</button>
@@ -1077,7 +1141,6 @@
           <div class="plugin-surface-bar">
             <div>
               <h3>🪥 口腔护理 · 徕芬扫振牙刷中心</h3>
-              <p class="health-header-sub">支持 V1 (LFTB01) 与 V2 Pro (LFTB02) 蓝牙唤醒同步、三维扫振定制、刷牙打卡与刷头寿命管理</p>
             </div>
             <div class="health-header-actions">
               <button id="laifen-scan-btn" class="mini-button" type="button">🔍 扫描设备</button>
@@ -1108,7 +1171,6 @@
             <div class="health-hero-card">
               <div class="modal-row-head">
                 <h4>近 7 日刷牙打卡趋势</h4>
-                <span class="meta">达标自动高亮</span>
               </div>
               <div id="laifen-week-strip" class="laifen-week-strip"></div>
             </div>
@@ -1199,7 +1261,7 @@
                   </label>
                 </div>
                 <div class="modal-row-head">
-                  <span class="hint">修改后仅保存配置；如需即时生效定时或模式，请点击上方「唤醒并写入牙刷」。</span>
+                  <span></span>
                   <button id="laifen-cfg-save-btn" class="primary" type="button">💾 保存配置</button>
                 </div>
               </div>
@@ -1208,7 +1270,6 @@
             <details class="hub-compose-details">
               <summary class="hub-compose-summary">⚠️ 高危操作：电机启停与刷头零位校准</summary>
               <div class="hub-compose-body">
-                <p class="hint">以下指令会直接控制牙刷马达或进入刷头对准校准，请先拿稳牙刷并避免飞溅。</p>
                 <div class="modal-btn-group">
                   <button id="laifen-power-on-btn" class="mini-button danger-btn" type="button">▶ 启动电机</button>
                   <button id="laifen-power-off-btn" class="mini-button" type="button">⏹ 停止电机</button>
@@ -1233,29 +1294,80 @@
         <div id="plugin-panel-ninebot" class="hub-tab-panel" role="tabpanel" aria-labelledby="plugin-tab-ninebot" hidden>
           <div class="plugin-surface-bar">
             <div>
-              <h3>🛵 九号守护 · M 系列智联中心</h3>
-              <p class="health-header-sub">免官方 Key 账号直连（steeldust 电摩优先）：72V BMS 遥测、精准续航、停放位置、极速行程与主动低电/锁车守护（纯只读模式）</p>
+              <h3>🛵 九号守护 · 智能电摩数字座舱</h3>
             </div>
             <div class="health-header-actions">
               <select id="ninebot-vehicle-select" aria-label="切换九号车辆"></select>
-              <button id="ninebot-sync-btn" class="primary" type="button">🔄 实时同步车况</button>
-              <button id="ninebot-patrol-btn" class="mini-button" type="button">🛡️ 立即执行巡检</button>
-              <button id="ninebot-trips-sync-btn" class="mini-button" type="button">🛣️ 同步本月行程</button>
-              <button id="ninebot-refresh-btn" class="mini-button" type="button">↻ 刷新看板</button>
+              <button id="ninebot-sync-btn" class="primary" type="button">🔄 同步车况</button>
+              <button id="ninebot-patrol-btn" class="mini-button" type="button">🛡️ 安全巡检</button>
+              <button id="ninebot-trips-sync-btn" class="mini-button" type="button">🛣️ 同步行程</button>
+              <button id="ninebot-refresh-btn" class="mini-button" type="button">↻ 刷新</button>
             </div>
           </div>
           <p id="ninebot-action-status" class="health-status-banner" hidden></p>
 
-          <div id="ninebot-kpi-grid" class="hub-kpi-grid"></div>
+          <section id="ninebot-cockpit-card" class="ninebot-cockpit-card" data-tone="muted" aria-label="九号座驾数字座舱">
+            <div class="ninebot-cockpit-head">
+              <div class="ninebot-identity-group">
+                <h4 id="ninebot-vehicle-title" class="ninebot-vehicle-title">九号座驾</h4>
+                <span id="ninebot-model-pill" class="ninebot-meta-pill">待绑定车辆</span>
+                <span id="ninebot-role-pill" class="ninebot-meta-pill is-subtle">纯只读守护</span>
+              </div>
+              <span id="ninebot-signal-pill" class="ninebot-signal-pill">📡 待连接云盒</span>
+            </div>
+
+            <div class="ninebot-cockpit-stage">
+              <div class="ninebot-energy-pane">
+                <div id="ninebot-state-pill" class="ninebot-state-pill">
+                  <span class="ninebot-state-dot" aria-hidden="true"></span>
+                  <span id="ninebot-state-text">等待同步实时车况</span>
+                </div>
+                <div class="ninebot-hero-numbers">
+                  <div class="ninebot-primary-metric">
+                    <span id="ninebot-range-val" class="ninebot-giant-num">—</span>
+                    <span class="ninebot-giant-unit">km 精准续航</span>
+                  </div>
+                  <div class="ninebot-soc-badge">
+                    <span id="ninebot-soc-val" class="ninebot-soc-num">—%</span>
+                    <span class="ninebot-soc-lbl">主电池电量</span>
+                  </div>
+                </div>
+                <div id="ninebot-energy-bar" class="ninebot-energy-bar" role="img" aria-label="动力电池电量条"></div>
+                <p id="ninebot-range-sub" class="ninebot-range-sub">预估续航 — km · 总里程 — km</p>
+              </div>
+
+              <div class="ninebot-scooter-stage">
+                <div class="ninebot-stage-glow" aria-hidden="true"></div>
+                <img id="ninebot-vehicle-img" class="ninebot-vehicle-img" alt="九号实车渲染图" hidden>
+                <svg id="ninebot-vehicle-fallback" class="ninebot-vehicle-fallback" viewBox="0 0 260 160" aria-hidden="true">
+                  <ellipse class="nb-svg-shadow" cx="130" cy="142" rx="88" ry="8"></ellipse>
+                  <circle class="nb-svg-wheel" cx="62" cy="118" r="22"></circle>
+                  <circle class="nb-svg-rim" cx="62" cy="118" r="10"></circle>
+                  <circle class="nb-svg-wheel" cx="196" cy="118" r="22"></circle>
+                  <circle class="nb-svg-rim" cx="196" cy="118" r="10"></circle>
+                  <path class="nb-svg-body" d="M68 110 L96 116 L154 116 L186 92 L202 82 L188 70 L144 74 L126 98 L94 98 L82 62 L66 56 L58 68 L74 104 Z"></path>
+                  <path class="nb-svg-trim" d="M138 72 L182 68 L174 58 L142 62 Z"></path>
+                  <path class="nb-svg-trim" d="M68 56 L78 40 L94 38 M78 40 L68 35"></path>
+                  <path class="nb-svg-accent" d="M56 72 L70 70 L73 79 L59 80 Z"></path>
+                  <path class="nb-svg-accent" d="M188 73 L204 74 L199 81 L186 80 Z"></path>
+                  <path class="nb-svg-frame" d="M74 68 L62 118 M168 92 L196 118 M104 116 L146 116"></path>
+                </svg>
+                <div class="ninebot-stage-shadow" aria-hidden="true"></div>
+              </div>
+            </div>
+
+            <div id="ninebot-status-dock" class="ninebot-status-dock" aria-label="车辆四维状态舱"></div>
+          </section>
 
           <section class="model-modal-section ninebot-hero-grid" aria-label="停放位置与电量趋势">
             <div class="health-hero-card">
               <div class="modal-row-head">
-                <h4>停放位置与守护态势</h4>
+                <h4>📍 停放位置与主动守护</h4>
                 <span id="ninebot-guard-badge" class="hub-badge badge-slate">待同步</span>
               </div>
-              <p id="ninebot-location-text" class="hint">尚未获取车辆定位信息。</p>
+              <p id="ninebot-location-text" class="ninebot-location-pin">尚未获取车辆定位信息。</p>
               <p id="ninebot-updated-meta" class="meta"></p>
+              <div id="ninebot-guard-checks" class="ninebot-guard-checks"></div>
               <div id="ninebot-alerts-box" class="ninebot-alerts-list">
                 <p class="meta">暂无守护巡检记录。</p>
               </div>
@@ -1263,10 +1375,10 @@
 
             <div class="health-hero-card">
               <div class="modal-row-head">
-                <h4>电量与续航历史趋势</h4>
+                <h4>📈 电量与续航历史趋势</h4>
                 <div id="ninebot-trend-pills" class="hub-filter-pills" role="group" aria-label="趋势指标切换">
                   <button class="hub-filter-pill active" type="button" data-metric="battery">主电池 %</button>
-                  <button class="hub-filter-pill" type="button" data-metric="range">预估续航 km</button>
+                  <button class="hub-filter-pill" type="button" data-metric="range">精准续航 km</button>
                 </div>
               </div>
               <div class="ninebot-canvas-wrap">
@@ -1276,11 +1388,25 @@
             </div>
           </section>
 
+          <section class="model-modal-section" aria-label="历史骑行轨迹与极速明细">
+            <div class="modal-row-head">
+              <div>
+                <h3>🛣️ 骑行记录与极速统计</h3>
+                <span id="ninebot-trips-subtitle" class="meta">暂无本地骑行行程缓存。</span>
+              </div>
+              <div class="health-header-actions">
+                <input id="ninebot-month-input" class="hub-input mono-input" type="text" placeholder="YYYYMM，留空当月">
+              </div>
+            </div>
+            <div id="ninebot-trip-kpis" class="ninebot-trip-kpis"></div>
+            <div id="ninebot-trips-list" class="ninebot-trips-list"><p class="empty">暂无骑行记录。</p></div>
+          </section>
+
           <section class="model-modal-section" aria-label="账号绑定与守护阈值配置">
             <details class="hub-compose-details">
               <summary class="hub-compose-summary">🔑 九号账号登录绑定（强烈建议使用家庭只读子账号）</summary>
               <div class="hub-compose-body">
-                <p id="ninebot-login-status-hint" class="hint">尚未绑定九号账号，建议先在 App 建立「用车人/家庭只读子账号」并设置登录密码。</p>
+                <p id="ninebot-login-status-hint" class="hint">尚未绑定九号账号</p>
                 <div class="modal-form-grid">
                   <label>子账号手机号
                     <input id="ninebot-login-user" type="text" placeholder="九号子账号手机号" autocomplete="off">
@@ -1321,12 +1447,13 @@
                   <label>告警防抖冷却 (小时)
                     <input id="ninebot-cfg-cooldown" type="number" min="1" max="168" value="12">
                   </label>
-                  <label>高德逆地理 Key（可选）
-                    <input id="ninebot-cfg-amap" type="password" placeholder="可选：输入高德 Web 服务 Key" autocomplete="off">
-                  </label>
                   <label>官方 DeviceService Key（可选）
                     <input id="ninebot-cfg-dskey" type="password" placeholder="可选：输入 NINEBOT_DEVICESERVICE_KEY" autocomplete="off">
                   </label>
+                </div>
+                <div class="modal-row-head">
+                  <span id="ninebot-geo-status-hint" class="hint">🗺️ 高德逆地理：待检测</span>
+                  <button id="ninebot-open-geo-btn" class="mini-button" type="button">⚙️ 前往系统底座配置高德 Key</button>
                 </div>
                 <div class="modal-row-head">
                   <label class="hub-checkbox-label">
@@ -1338,26 +1465,12 @@
               </div>
             </details>
           </section>
-
-          <section class="model-modal-section" aria-label="历史骑行轨迹与极速明细">
-            <div class="modal-row-head">
-              <div>
-                <h3>骑行行程与极速统计</h3>
-                <span id="ninebot-trips-subtitle" class="meta">暂无本地骑行行程缓存。</span>
-              </div>
-              <div class="health-header-actions">
-                <input id="ninebot-month-input" class="hub-input mono-input" type="text" placeholder="YYYYMM，留空当月">
-              </div>
-            </div>
-            <div id="ninebot-trips-list" class="ninebot-trips-list"><p class="empty">暂无骑行记录。</p></div>
-          </section>
         </div>
 
         <div id="plugin-panel-netlea" class="hub-tab-panel" role="tabpanel" aria-labelledby="plugin-tab-netlea" hidden>
           <div class="plugin-surface-bar">
             <div>
               <h3>🐠 鱼缸灯光 · 尼特利蓝牙智控中心</h3>
-              <p class="health-header-sub">SG-X-PRO 本地蓝牙全功能控制：24h 日出日落定时行程、6 大官方养殖预设、12 种原厂光谱、手动恒亮与内置时钟同步</p>
             </div>
             <div class="health-header-actions">
               <button id="netlea-clock-btn" class="mini-button" type="button">⌚ 同步校时</button>
@@ -1519,7 +1632,7 @@
                 </div>
 
                 <div class="modal-row-head">
-                  <span class="hint">修改后需点击上方「🚀 保存并下发行程」才会写入灯具闪存。</span>
+                  <span></span>
                   <div class="modal-btn-group">
                     <button id="netlea-trip-cancel-btn" class="mini-button" type="button">取消</button>
                     <button id="netlea-trip-apply-btn" class="primary" type="button">✓ 保存时段到列表</button>
@@ -1535,7 +1648,6 @@
               <div class="modal-row-head">
                 <div>
                   <h3>🌱 尼特利官方科学养殖预设向导</h3>
-                  <span class="meta">按缸体尺寸与水深自动换算科学功率与光谱阶段，并自动附加平滑日出/日落</span>
                 </div>
               </div>
               <div id="netlea-cultivation-pills" class="hub-filter-pills" role="group" aria-label="养殖方案选择">
@@ -1566,7 +1678,7 @@
               <p id="netlea-preset-meta" class="meta">正在计算科学养殖阶段方案…</p>
               <div id="netlea-preset-preview" class="netlea-trip-list"></div>
               <div class="modal-row-head">
-                <span class="hint">可先导入到「定时行程编辑器」微调时间与星期，或直接一键写入灯具并开启自动运行。</span>
+                <span></span>
                 <div class="modal-btn-group">
                   <button id="netlea-preset-import-btn" class="mini-button" type="button">✏️ 导入行程编辑器微调</button>
                   <button id="netlea-preset-apply-btn" class="primary" type="button">🚀 一键写入此预设行程</button>
@@ -1658,7 +1770,7 @@
                   </label>
                 </div>
                 <div class="modal-row-head">
-                  <span class="hint">临时开/关灯到达设定分钟数后，灯具硬件将自动切换回 24h 日出/日落行程。</span>
+                  <span></span>
                   <button id="netlea-cfg-temp-save-btn" class="primary" type="button">💾 写入灯具默认临时参数</button>
                 </div>
               </div>
@@ -1676,7 +1788,7 @@
                   </label>
                 </div>
                 <div class="modal-row-head">
-                  <span class="hint">绑定指定 MAC 后将仅连接该台灯具；留空则自动匹配信号最强的尼特利设备。</span>
+                  <span></span>
                   <button id="netlea-cfg-save-btn" class="primary" type="button">💾 保存绑定配置</button>
                 </div>
                 <div id="netlea-scan-list" class="netlea-scan-list"></div>
@@ -1689,7 +1801,6 @@
           <div class="plugin-surface-bar">
             <div>
               <h3>🍎 苹果设备 · iCloud Find My 管控中心</h3>
-              <p class="health-header-sub">国区（云上贵州 icloud.com.cn）/ 国际区免密托管会话 · 实时电量、位置围栏、响铃寻物与低电量静默巡航</p>
             </div>
             <div class="health-header-actions">
               <span id="apple-auth-pill" class="hub-badge badge-slate">未绑定</span>
@@ -1703,7 +1814,7 @@
             <div class="apple-auth-card">
               <div class="modal-row-head">
                 <h3>🔐 本地绑定 Apple ID（SRP-6a + 2FA）</h3>
-                <span id="apple-bound-account" class="meta">密码仅在当次计算密码学证明，绝不落盘、不进入聊天上下文</span>
+                <span id="apple-bound-account" class="meta">未绑定</span>
               </div>
               <div id="apple-login-form" class="modal-form-grid">
                 <label>账号区域
@@ -1720,7 +1831,7 @@
                 </label>
               </div>
               <div id="apple-login-actions" class="modal-row-head">
-                <span class="hint apple-security-note">凭证直接通过本机回环接口提交给守护进程，不经过大模型与聊天历史；2FA 通过后约 30～60 天内免密复用。</span>
+                <span></span>
                 <button id="apple-login-btn" class="primary" type="button">🔑 发起登录</button>
               </div>
 
@@ -1729,7 +1840,6 @@
                   <strong>📱 请输入 6 位双重认证验证码</strong>
                   <span id="apple-2fa-phones" class="meta"></span>
                 </div>
-                <p class="hint">提示：网页登录默认不自动弹窗，可点「📩 改发短信验证码」，或在 iPhone「设置 → Apple 账户 → 登录与安全性 → 双重认证 → 获取验证码」手动生成 6 位码填入；也可点「⚡ 免码临时直通」直接启用查找。</p>
                 <div class="modal-form-grid">
                   <label>6 位验证码
                     <input id="apple-2fa-code-input" type="text" inputmode="numeric" maxlength="6" placeholder="例如 123456">
@@ -1758,7 +1868,7 @@
             <div class="modal-row-head">
               <div>
                 <h3>设备列表与实时状态</h3>
-                <span id="apple-devices-subtitle" class="meta">完成绑定后展示名下 iPhone、iPad、Mac、Apple Watch 与 AirPods</span>
+                <span id="apple-devices-subtitle" class="meta"></span>
               </div>
               <button id="apple-cached-btn" class="mini-button" type="button">📦 读取缓存快照</button>
             </div>
@@ -1790,26 +1900,34 @@
                   <label>常用地点围栏（每行一条：地点=纬度,经度,半径米）
                     <textarea id="apple-cfg-places" rows="2" placeholder="家=31.2304,121.4737,250"></textarea>
                   </label>
+                  <label class="wechat-inline-check">
+                    <input id="apple-cfg-include-family" type="checkbox" checked>
+                    <span>包含「家人共享」查找设备（默认开启）</span>
+                  </label>
                 </div>
                 <div class="modal-row-head">
-                  <span class="hint">配置保存在本机私有目录（0600 权限）；开启定时 patrol 巡航时将按上述阈值在低电量且未充电时主动告警。</span>
+                  <span id="apple-geo-status-hint" class="hint">🗺️ 高德逆地理：待检测</span>
+                  <button id="apple-open-geo-btn" class="mini-button" type="button">⚙️ 前往系统底座配置高德 Key</button>
+                </div>
+                <div class="modal-row-head">
+                  <span></span>
                   <button id="apple-cfg-save-btn" class="primary" type="button">💾 保存配置</button>
                 </div>
               </div>
             </details>
           </section>
         </div>
+        </div>
       </div>
     </div>
   </div>
 
-  <!-- 5. 系统底座弹窗 (SYS：模型与提供方 + 用量账本) -->
+  <!-- 5. 系统底座弹窗 (SYS：模型与提供方 + 用量账本 + 位置与地图底座) -->
   <div id="system-hub-backdrop" class="modal-backdrop" hidden>
     <div id="system-hub-modal" class="model-modal hub-modal system-modal" role="dialog" aria-modal="true" aria-labelledby="system-modal-title">
       <div class="model-modal-header system-modal-header">
         <div class="hub-modal-title-block">
           <h2 id="system-modal-title">⚙️ 系统底座</h2>
-          <p class="hub-modal-sub">归机主的基础设施层 · 模型提供方池与全链路用量账本</p>
         </div>
         <div class="hub-modal-header-right">
           <div id="system-hub-tabs" class="hub-surface-tabs" role="tablist" aria-label="系统底座视图切换">
@@ -1820,6 +1938,10 @@
             <button id="system-tab-usage" class="hub-surface-tab" type="button" role="tab" aria-selected="false" aria-controls="system-panel-usage" data-system-tab="usage">
               <span>📊 用量账本</span>
               <span id="usage-top-badge" class="hub-pill-badge">0</span>
+            </button>
+            <button id="system-tab-services" class="hub-surface-tab" type="button" role="tab" aria-selected="false" aria-controls="system-panel-services" data-system-tab="services">
+              <span>🗺️ 位置与地图底座</span>
+              <span id="services-top-badge" class="hub-pill-badge">—</span>
             </button>
           </div>
           <button id="system-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
@@ -1874,7 +1996,6 @@
                   <span id="modal-auth-pool-summary">Worker 模型池：勾选启用的模型并指定等级</span>
                 </summary>
                 <div class="hub-compose-body">
-                  <p class="meta">只有勾选的模型（以及当前 Worker 提供方的三档模型）会进入 F.R.I.D.A.Y. 的 Worker 调度池。</p>
                   <div id="modal-auth-pool-list" class="modal-pool-select-list"></div>
                   <div class="modal-btn-group">
                     <button id="modal-auth-pool-save-btn" class="primary" type="button">💾 保存模型池勾选</button>
@@ -1960,7 +2081,6 @@
           <div class="system-panel-bar">
             <div>
               <h3>📊 模型调用用量与费用账本</h3>
-              <p class="usage-header-sub">按日 / 周 / 月统计全链路模型调用次数、Token 消耗与汇率折算金额</p>
             </div>
             <div class="modal-btn-group">
               <button id="usage-refresh-btn" class="mini-button" type="button">🔄 刷新</button>
@@ -2006,7 +2126,7 @@
         <section class="model-modal-section" aria-label="分时段趋势柱状图">
           <div class="modal-row-head">
             <h3 id="usage-chart-title">分时趋势</h3>
-            <span id="usage-chart-subtitle" class="meta">柱高按消耗金额或 Token 占比绘制 · 悬停查看详情</span>
+            <span id="usage-chart-subtitle" class="meta"></span>
           </div>
           <div id="usage-chart-shell" class="usage-chart-shell"></div>
         </section>
@@ -2014,7 +2134,6 @@
         <section class="model-modal-section" aria-label="近期多周期对比">
           <div class="modal-row-head">
             <h3 id="usage-recent-title">近 7 日对比</h3>
-            <span class="meta">点击任意一期即可切换查看</span>
           </div>
           <div id="usage-recent-grid" class="usage-recent-grid"></div>
         </section>
@@ -2030,10 +2149,46 @@
         <section class="model-modal-section" aria-label="按角色分摊概览">
           <div class="modal-row-head">
             <h3>按角色分摊概览</h3>
-            <span class="meta">覆盖主控、Worker、决策引擎、记忆提炼、做梦与探针</span>
           </div>
           <div id="usage-actors-grid" class="usage-actors-grid"></div>
         </section>
+        </div>
+
+        <div id="system-panel-services" class="hub-tab-panel" role="tabpanel" aria-labelledby="system-tab-services" hidden>
+          <div class="system-panel-bar">
+            <div>
+              <h3>🗺️ 全局位置与逆地理服务底座</h3>
+            </div>
+            <div class="modal-btn-group">
+              <button id="geo-refresh-btn" class="mini-button" type="button">🔄 刷新状态</button>
+            </div>
+          </div>
+
+          <div id="geo-kpi-grid" class="hub-kpi-grid"></div>
+
+          <section class="model-modal-section" aria-label="高德开放平台服务接入">
+            <div class="modal-auth-card">
+              <div class="modal-row-head">
+                <div class="modal-provider-title-group">
+                  <strong class="modal-provider-heading">高德开放平台 · Web 服务 API Key</strong>
+                  <span id="geo-status-badge" class="hub-status-pill">读取中…</span>
+                </div>
+                <button id="geo-clear-btn" class="mini-button" type="button">🗑 清除 Key</button>
+              </div>
+              <label>
+                <span class="meta">高德 Web 服务 API Key（留空保持已存凭据）</span>
+                <input id="geo-amap-key-input" type="password" maxlength="128" placeholder="输入高德「Web服务」API Key（留空保持已存凭据）" autocomplete="off">
+              </label>
+              <div class="modal-row-head">
+                <span></span>
+                <div class="modal-btn-group">
+                  <button id="geo-probe-btn" type="button">⚡ 测试连通性</button>
+                  <button id="geo-save-btn" class="primary" type="button">💾 保存全局 Key</button>
+                </div>
+              </div>
+              <div id="geo-probe-result" class="model-probe-result" hidden></div>
+            </div>
+          </section>
         </div>
       </div>
     </div>

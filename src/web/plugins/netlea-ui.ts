@@ -1085,9 +1085,9 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
 
     const kpiFrag = document.createDocumentFragment();
     kpiFrag.append(
-      kpiCard('运行模式与开关', statusLabel, dev?.name || cfg.targetMac || '未读取', statusTone),
+      kpiCard('运行模式与开关', statusLabel, dev?.name || (cfg.targetMac ? '已绑定设备' : '未读取'), statusTone),
       kpiCard('光谱与功率', chText, sceneSub, st?.on ? 'accent' : 'default'),
-      kpiCard('定时行程 / 信号', `${schedKpi} · ${rssiText}`, dev?.address || '自动发现', typeof dev?.rssi === 'number' && dev.rssi > -75 ? 'positive' : 'default'),
+      kpiCard('定时行程 / 信号', `${schedKpi} · ${rssiText}`, dev ? '已连接发现' : '自动发现', typeof dev?.rssi === 'number' && dev.rssi > -75 ? 'positive' : 'default'),
       kpiCard('灯内时钟 (RTC)', rtcText.length >= 19 ? rtcText.slice(11, 19) : rtcText, payload.updatedAt ? `同步于 ${timestamp(payload.updatedAt)}` : '尚无缓存', 'default'),
     );
     kpiGrid.replaceChildren(kpiFrag);
@@ -1095,7 +1095,6 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
     if (dev || st) {
       const parts = [
         dev?.name ? `设备：${dev.name}` : '',
-        dev?.address ? `MAC：${dev.address}` : '',
         adv?.rtc ? `灯内 RTC：${adv.rtc}` : '',
         payload.tempConfig ? `灯内临时时长：开 ${payload.tempConfig.onMinutes}m / 关 ${payload.tempConfig.offMinutes}m` : '',
         payload.updatedAt ? `缓存时间：${timestamp(payload.updatedAt)}` : '',

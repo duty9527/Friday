@@ -13,10 +13,12 @@ import { requestGeminiDecisions } from '../src/decision.js';
 import { ModelHub } from '../src/model-hub.js';
 import {
   calculateModelCallCost,
+  computeCacheSavingsUsd,
   DEFAULT_USD_TO_CNY_RATE,
   normalizeSdkUsage,
   resolveModelUnitPrice,
 } from '../src/models/pricing.js';
+import { ensureRealProviderCatalog } from '../src/models/catalog.js';
 import { Store } from '../src/store.js';
 
 async function until(predicate: () => boolean | Promise<boolean>, attempts = 400) {
@@ -821,6 +823,331 @@ test('pricing & usage-store: synced fallback snapshot covers latest models and r
       approxEqual(dRow.costUsd, 0.213, 1e-6);
     } finally {
       store2.close();
+    }
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('prompt caching: template leak fix, zero-rate guard, 1h writes, tiered pricing, raw usage normalization & cache reprice migration', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-cache-pricing-'));
+  try {
+    // 1) ensureRealProviderCatalog must NOT inherit cacheRead/cacheWrite from unrelated fictional SDK templates
+    const runtime = await ModelRuntime.create({
+      refreshOnCreate: false,
+      modelsPath: null,
+      authPath: join(home, 'sdk', 'auth.json'),
+    });
+    ensureRealProviderCatalog(runtime);
+
+    const dsChat = runtime.getModel('deepseek', 'deepseek-chat');
+    assert.ok(dsChat);
+    assert.equal(dsChat.cost.cacheRead, 0.07, 'deepseek-chat must use 0.07 cacheRead, not 0.006 from deepseek-flash');
+    assert.equal(dsChat.cost.cacheWrite, 0.27);
+
+    const dsReasoner = runtime.getModel('deepseek', 'deepseek-reasoner');
+    assert.ok(dsReasoner);
+    assert.equal(dsReasoner.cost.cacheRead, 0.14, 'deepseek-reasoner must use 0.14 cacheRead, not 0.006');
+
+    const sonnet4 = runtime.getModel('anthropic', 'claude-sonnet-4-20250514');
+    assert.ok(sonnet4);
+    assert.equal(sonnet4.cost.cacheRead, 0.3, 'claude-sonnet-4 must use 0.3 cacheRead, not 1.0 from claude-fable-5');
+    assert.equal(sonnet4.cost.cacheWrite, 3.75, 'claude-sonnet-4 must use 3.75 cacheWrite, not 12.5');
+
+    const opus4 = runtime.getModel('anthropic', 'claude-opus-4-20250514');
+    assert.ok(opus4);
+    assert.equal(opus4.cost.cacheRead, 1.5);
+    assert.equal(opus4.cost.cacheWrite, 18.75);
+
+    // 2) catalogRate without explicit cache rates falls back to real model cache rates (never 0.25x or $0 on paid models)
+    const sonnetNoCache = resolveModelUnitPrice('anthropic', 'claude-sonnet-4', { costInput: 3, costOutput: 15 });
+    assert.equal(sonnetNoCache.source, 'catalog');
+    assert.equal(sonnetNoCache.cacheReadUsdPer1M, 0.3);
+    assert.equal(sonnetNoCache.cacheWriteUsdPer1M, 3.75);
+
+    const geminiZeroCache = resolveModelUnitPrice('google', 'gemini-2.5-flash', {
+      costInput: 0.3,
+      costOutput: 2.5,
+      costCacheRead: 0,
+      costCacheWrite: 0,
+    });
+    assert.equal(geminiZeroCache.cacheReadUsdPer1M, 0.03, 'paid model cacheRead=0 must never bill as free');
+    assert.equal(geminiZeroCache.cacheWriteUsdPer1M, 0.3, 'paid model cacheWrite=0 must bill at least 1x input');
+
+    const orDeepseek = resolveModelUnitPrice('openrouter', 'deepseek/deepseek-chat');
+    assert.ok(orDeepseek.cacheReadUsdPer1M > 0, 'paid openrouter fallback with tuple cr=0 must not resolve to $0');
+    assert.ok(orDeepseek.cacheWriteUsdPer1M > 0, 'paid openrouter fallback with tuple cw=0 must not resolve to $0');
+
+    // 3) Anthropic 5m vs 1h cache writes (cacheWrite1h = 2x base input) & net cache savings
+    const anthropic1h = calculateModelCallCost({
+      provider: 'anthropic',
+      model: 'claude-sonnet-4',
+      inputTokens: 100_000,
+      outputTokens: 50_000,
+      cacheReadTokens: 200_000,
+      cacheWriteTokens: 100_000,
+      cacheWrite1hTokens: 40_000,
+    });
+    // input: 0.1*3 = 0.30; output: 0.05*15 = 0.75; read: 0.2*0.3 = 0.06
+    // shortWrite (60K): 0.06*3.75 = 0.225; longWrite (40K): 0.04*6.0 = 0.24 => total = 1.575
+    approxEqual(anthropic1h.costUsd, 1.575, 1e-9);
+    approxEqual(anthropic1h.cacheReadCostUsd, 0.06, 1e-9);
+    approxEqual(anthropic1h.cacheWriteCostUsd, 0.465, 1e-9);
+    // Savings: read saves 0.2*(3-0.3)=0.54; shortWrite -0.06*0.75=-0.045; longWrite -0.04*3=-0.12 => +0.375
+    approxEqual(anthropic1h.cacheSavingsUsd, 0.375, 1e-9);
+    assert.equal(anthropic1h.unitCacheReadUsdPer1M, 0.3);
+    assert.equal(anthropic1h.unitCacheWriteUsdPer1M, 3.75);
+
+    // Write-only turn produces negative cache savings (honest net surcharge)
+    const writeOnlySavings = computeCacheSavingsUsd({
+      cacheReadTokens: 0,
+      cacheWriteTokens: 100_000,
+      cacheWrite1hTokens: 0,
+      unitInputUsdPer1M: 3,
+      unitCacheReadUsdPer1M: 0.3,
+      unitCacheWriteUsdPer1M: 3.75,
+    });
+    approxEqual(writeOnlySavings, -0.075, 1e-9);
+
+    // 4) Long-context tiered pricing (e.g. Gemini 2.5 Pro > 200K total prompt tokens)
+    const hub = new ModelHub(
+      home,
+      'offline',
+      { provider: 'google', router: 'gemini-2.5-pro', fast: 'gemini-2.5-flash', balanced: 'gemini-2.5-pro', strong: 'gemini-2.5-pro', available: ['gemini-2.5-pro'] },
+      'google',
+      runtime,
+    );
+    await hub.init({ google: 'mock-google-key' });
+    try {
+      const proRates = hub.getModelCostRates('google', 'gemini-2.5-pro');
+      assert.ok(proRates);
+      assert.equal(proRates.costCacheRead, 0.125);
+      assert.ok(proRates.tiers && proRates.tiers.length > 0, 'ModelHub must expose SDK pricing tiers');
+
+      const belowTier = calculateModelCallCost({
+        provider: 'google',
+        model: 'gemini-2.5-pro',
+        inputTokens: 100_000,
+        outputTokens: 10_000,
+        cacheReadTokens: 50_000, // total prompt = 150K <= 200K
+        catalogRate: proRates,
+      });
+      assert.equal(belowTier.unitInputUsdPer1M, 1.25);
+      assert.equal(belowTier.unitCacheReadUsdPer1M, 0.125);
+      // 0.1*1.25 + 0.01*10 + 0.05*0.125 = 0.125 + 0.1 + 0.00625 = 0.23125
+      approxEqual(belowTier.costUsd, 0.23125, 1e-9);
+
+      const aboveTier = calculateModelCallCost({
+        provider: 'google',
+        model: 'gemini-2.5-pro',
+        inputTokens: 100_000,
+        outputTokens: 10_000,
+        cacheReadTokens: 150_000, // total prompt = 250K > 200K
+        catalogRate: proRates,
+      });
+      assert.equal(aboveTier.unitInputUsdPer1M, 2.5);
+      assert.equal(aboveTier.unitOutputUsdPer1M, 15);
+      assert.equal(aboveTier.unitCacheReadUsdPer1M, 0.25);
+      assert.equal(aboveTier.unitCacheWriteUsdPer1M, 2.5);
+      // 0.1*2.5 + 0.01*15 + 0.15*0.25 = 0.25 + 0.15 + 0.0375 = 0.4375
+      approxEqual(aboveTier.costUsd, 0.4375, 1e-9);
+    } finally {
+      await hub.close();
+    }
+
+    // 5) normalizeSdkUsage: inclusive vs exclusive across all provider raw formats (zero double-counting!)
+    const oaiChat = normalizeSdkUsage({
+      prompt_tokens: 1000,
+      completion_tokens: 200,
+      total_tokens: 1200,
+      prompt_tokens_details: { cached_tokens: 400, cache_write_tokens: 100 },
+      completion_tokens_details: { reasoning_tokens: 50 },
+    });
+    assert.deepEqual(oaiChat, {
+      inputTokens: 500,
+      outputTokens: 200,
+      cacheReadTokens: 400,
+      cacheWriteTokens: 100,
+      reasoningTokens: 50,
+      totalTokens: 1200,
+    });
+
+    const dsRaw = normalizeSdkUsage({
+      prompt_tokens: 1000,
+      prompt_cache_hit_tokens: 600,
+      prompt_cache_miss_tokens: 400,
+      completion_tokens: 100,
+      total_tokens: 1100,
+    });
+    assert.deepEqual(dsRaw, {
+      inputTokens: 400,
+      outputTokens: 100,
+      cacheReadTokens: 600,
+      cacheWriteTokens: 0,
+      reasoningTokens: 0,
+      totalTokens: 1100,
+    });
+
+    const oaiResponses = normalizeSdkUsage({
+      input_tokens: 1000,
+      output_tokens: 150,
+      total_tokens: 1150,
+      input_tokens_details: { cached_tokens: 300 },
+      output_tokens_details: { reasoning_tokens: 40 },
+    });
+    assert.deepEqual(oaiResponses, {
+      inputTokens: 700,
+      outputTokens: 150,
+      cacheReadTokens: 300,
+      cacheWriteTokens: 0,
+      reasoningTokens: 40,
+      totalTokens: 1150,
+    });
+
+    const anthropicRaw = normalizeSdkUsage({
+      input_tokens: 500,
+      output_tokens: 200,
+      cache_read_input_tokens: 400,
+      cache_creation_input_tokens: 150,
+      cache_creation: { ephemeral_5m_input_tokens: 100, ephemeral_1h_input_tokens: 50 },
+    });
+    assert.deepEqual(anthropicRaw, {
+      inputTokens: 500, // EXCLUSIVE: never subtract cacheRead/cacheWrite on Anthropic!
+      outputTokens: 200,
+      cacheReadTokens: 400,
+      cacheWriteTokens: 150,
+      cacheWrite1hTokens: 50,
+      reasoningTokens: 0,
+      totalTokens: 1250,
+    });
+
+    const geminiRaw = normalizeSdkUsage({
+      promptTokenCount: 1000,
+      cachedContentTokenCount: 700,
+      candidatesTokenCount: 100,
+      thoughtsTokenCount: 50,
+      totalTokenCount: 1150,
+    });
+    assert.deepEqual(geminiRaw, {
+      inputTokens: 300,
+      outputTokens: 150, // candidates + thoughts
+      cacheReadTokens: 700,
+      cacheWriteTokens: 0,
+      reasoningTokens: 50,
+      totalTokens: 1150,
+    });
+
+    const decisionRaw = normalizeSdkUsage({
+      total_input_tokens: 300,
+      total_cached_tokens: 120,
+      total_output_tokens: 25,
+      total_tokens: 325,
+    });
+    assert.deepEqual(decisionRaw, {
+      inputTokens: 180,
+      outputTokens: 25,
+      cacheReadTokens: 120,
+      cacheWriteTokens: 0,
+      reasoningTokens: 0,
+      totalTokens: 325,
+    });
+
+    // Verify requestGeminiDecisions extracts total_cached_tokens without double-counting inputTokens
+    const cachedDecServer = createServer(async (req, res) => {
+      for await (const _chunk of req) { /* drain */ }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        answers: { route: { type: 'choice', choice: 'a', confidence: 0.9 } },
+        usage: { total_input_tokens: 400, total_cached_tokens: 150, total_output_tokens: 20, total_tokens: 420 },
+      }));
+    });
+    await new Promise<void>(resolve => cachedDecServer.listen(0, '127.0.0.1', resolve));
+    try {
+      const addr = cachedDecServer.address() as { port: number };
+      const decCached = await requestGeminiDecisions(
+        { apiKey: 'dec-key', baseUrl: `http://127.0.0.1:${addr.port}/v1beta` },
+        'test',
+        { route: { type: 'choice', instructions: 'pick', criteria: { a: 'opt a' } } },
+      );
+      assert.deepEqual(decCached.usage, { inputTokens: 250, cacheReadTokens: 150, totalTokens: 420 });
+      assert.equal(decCached.outputTokens, 20);
+    } finally {
+      cachedDecServer.closeAllConnections();
+      await new Promise<void>(resolve => cachedDecServer.close(() => resolve()));
+    }
+
+    // 6) One-time cache reprice migration repairs catalog/estimated rows & strictly preserves provider-billed rows
+    const storeHome = join(home, 'reprice-cache');
+    await mkdir(storeHome, { recursive: true });
+    const s1 = new Store(storeHome);
+    s1.recover();
+    s1.close();
+
+    const rawDb = new DatabaseSync(join(storeHome, 'state.sqlite'));
+    const now = Date.now();
+    const seedStmt = rawDb.prepare(`
+      INSERT INTO model_usage(
+        id, at, actor, provider, model,
+        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens,
+        cost_usd, unit_input_usd, unit_output_usd, unit_cache_read_usd, unit_cache_write_usd, cost_source, status
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    `);
+    // Catalog row that previously overcharged Anthropic cacheRead at 0.25x ($0.75) instead of 0.1x ($0.30)
+    seedStmt.run('old-cat-1', now, 'worker', 'anthropic', 'claude-sonnet-4', 0, 0, 1_000_000, 0, 0, 1_000_000, 0.75, 3, 15, 0, 0, 'catalog', 'completed');
+    // Estimated row that previously undercharged DeepSeek cacheRead at $0.006 instead of $0.07
+    seedStmt.run('old-est-1', now, 'router', 'deepseek', 'deepseek-chat', 0, 0, 1_000_000, 0, 0, 1_000_000, 0.006, 0.27, 1.1, 0, 0, 'estimated', 'completed');
+    // Provider-billed row MUST NEVER be touched by cache reprice migration
+    seedStmt.run('old-prov-1', now, 'worker', 'openrouter', 'anthropic/claude-sonnet-4', 100_000, 10_000, 900_000, 0, 0, 1_010_000, 0.123456, 3, 15, 0, 0, 'provider', 'completed');
+    rawDb.prepare("DELETE FROM metadata WHERE key='usage_cache_reprice_version'").run();
+    rawDb.close();
+
+    const s2 = new Store(storeHome);
+    s2.recover();
+    try {
+      const checkDb = new DatabaseSync(join(storeHome, 'state.sqlite'));
+      try {
+        const catRow = checkDb.prepare('SELECT cost_usd, unit_cache_read_usd, unit_cache_write_usd, cost_source FROM model_usage WHERE id=?').get('old-cat-1') as {
+          cost_usd: number; unit_cache_read_usd: number; unit_cache_write_usd: number; cost_source: string;
+        };
+        assert.equal(catRow.cost_source, 'catalog');
+        approxEqual(catRow.cost_usd, 0.3, 1e-9);
+        assert.equal(catRow.unit_cache_read_usd, 0.3);
+        assert.equal(catRow.unit_cache_write_usd, 3.75);
+
+        const estRow = checkDb.prepare('SELECT cost_usd, unit_cache_read_usd, unit_cache_write_usd, cost_source FROM model_usage WHERE id=?').get('old-est-1') as {
+          cost_usd: number; unit_cache_read_usd: number; unit_cache_write_usd: number; cost_source: string;
+        };
+        assert.equal(estRow.cost_source, 'estimated');
+        approxEqual(estRow.cost_usd, 0.07, 1e-9);
+        assert.equal(estRow.unit_cache_read_usd, 0.07);
+        assert.equal(estRow.unit_cache_write_usd, 0.27);
+
+        const provRow = checkDb.prepare('SELECT cost_usd, unit_cache_read_usd, unit_cache_write_usd, cost_source FROM model_usage WHERE id=?').get('old-prov-1') as {
+          cost_usd: number; unit_cache_read_usd: number; unit_cache_write_usd: number; cost_source: string;
+        };
+        assert.equal(provRow.cost_source, 'provider');
+        assert.equal(provRow.cost_usd, 0.123456, 'provider-billed row cost_usd must never be modified');
+        assert.equal(provRow.unit_cache_read_usd, 0, 'provider-billed row must remain strictly untouched in SQLite');
+      } finally {
+        checkDb.close();
+      }
+
+      // Aggregation report exposes cacheHitRate, cacheSavingsUsd/Cny, unitCacheRead/Write, and bucket cache tokens
+      const report = s2.queryUsage({ granularity: 'day' });
+      assert.ok(report.totals.cacheHitRate > 0.9);
+      assert.ok(report.totals.cacheSavingsUsd > 0);
+      approxEqual(report.totals.cacheSavingsCny, report.totals.cacheSavingsUsd * report.prefs.usdToCnyRate, 1e-6);
+      const sonnetBreakdown = report.byModel.find(m => m.spec === 'anthropic/claude-sonnet-4');
+      assert.ok(sonnetBreakdown);
+      assert.equal(sonnetBreakdown.unitCacheReadUsdPer1M, 0.3);
+      assert.equal(sonnetBreakdown.unitCacheWriteUsdPer1M, 3.75);
+      approxEqual(sonnetBreakdown.cacheSavingsUsd, 2.7, 1e-9);
+      const activeBucket = report.buckets.find(b => b.calls > 0);
+      assert.ok(activeBucket);
+      assert.equal(activeBucket.cacheReadTokens, 2_900_000);
+      assert.equal(activeBucket.cacheWriteTokens, 0);
+    } finally {
+      s2.close();
     }
   } finally {
     await rm(home, { recursive: true, force: true });

@@ -1956,6 +1956,7 @@ test('XiaoAI TV Remote Mode: zero-LLM deterministic keys, empty/timeout/noise ca
       pushSamples(0, 6400); // > 120ms entry discard + 200ms capture wait
       await until(() => !coordinator.im.getXiaoaiKwsStatus('xiaoai-tv', 'lx06')?.capturing);
       await until(() => offLedCount() > shutLedsBeforeExpiry);
+      await until(() => ttsCommands().some(c => c.includes('已退出电视遥控模式')));
       assert.equal(routerChatCalls, 0);
 
       // 9. Explicit wake word + non-TV query ("你好星期五，今天天气怎么样") exits TV remote mode & routes to Router

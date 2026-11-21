@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
+import { formatInboundMarqueePreview, notifyCs80Inbound, notifyCs80Scene } from '../cs80-scene.js';
 import { resolveEnv } from '../paths.js';
 import { tryPluginVoiceFastpath } from '../plugin.js';
 import { sanitizePublicReply } from '../reply-filter.js';
@@ -450,8 +451,28 @@ export class ImGateway {
     const target = resolveImDeliveryTarget(channel, explicitTarget);
     const resolvedOpts: ImSendOptions = { ...options, target };
     const adapter = this.selectOutboundAdapter(channel, options);
+    const trackSendingScene = channel.platform === 'wechat' || channel.platform === 'telegram';
+    const sendCaption = channel.platform === 'telegram' ? '电报消息发送中…' : '微信消息发送中…';
+    if (trackSendingScene) {
+      notifyCs80Scene({
+        scene: 'sending_msg',
+        phase: 'start',
+        channel: channel.platform,
+        holdSec: 8,
+        caption: sendCaption,
+      });
+    }
     try {
       await adapter.send(channel, text, resolvedOpts);
+      if (trackSendingScene) {
+        notifyCs80Scene({
+          scene: 'sending_msg',
+          phase: 'pulse',
+          channel: channel.platform,
+          holdSec: 3.5,
+          caption: sendCaption,
+        });
+      }
       const latest = this.coordinator.store.getImChannel(channelId);
       latest.outboundCount++;
       latest.lastOutboundAt = Date.now();
@@ -459,6 +480,9 @@ export class ImGateway {
       latest.updatedAt = Date.now();
       this.coordinator.store.saveImChannel(latest);
     } catch (error) {
+      if (trackSendingScene) {
+        notifyCs80Scene({ scene: 'sending_msg', phase: 'end', tailSec: 0 });
+      }
       const latest = this.coordinator.store.getImChannel(channelId);
       latest.lastError = sanitizeImError(error, [latest.botToken, latest.secret]);
       latest.updatedAt = Date.now();
@@ -517,7 +541,26 @@ export class ImGateway {
     name: string,
     options: { target: string; contextToken?: string },
   ): Promise<void> {
-    return this.wechatIlinkAdapter.sendAttachment(channelId, name, options);
+    notifyCs80Scene({
+      scene: 'sending_msg',
+      phase: 'start',
+      channel: 'wechat',
+      holdSec: 10,
+      caption: '微信消息发送中…',
+    });
+    try {
+      await this.wechatIlinkAdapter.sendAttachment(channelId, name, options);
+      notifyCs80Scene({
+        scene: 'sending_msg',
+        phase: 'pulse',
+        channel: 'wechat',
+        holdSec: 3.5,
+        caption: '微信消息发送中…',
+      });
+    } catch (error) {
+      notifyCs80Scene({ scene: 'sending_msg', phase: 'end', tailSec: 0 });
+      throw error;
+    }
   }
 
   async quickConnectTelegram(input: {
@@ -624,11 +667,25 @@ export class ImGateway {
       await mkdir(root, { recursive: true, mode: 0o700 }).catch(() => {});
     }
     const cleanName = fileName.trim();
+    notifyCs80Scene({
+      scene: 'sending_msg',
+      phase: 'start',
+      channel: 'telegram',
+      holdSec: 10,
+      caption: '电报消息发送中…',
+    });
     try {
       const bytes = await readStagedAttachment(root, cleanName);
       await this.telegramAdapter.sendAttachment(channel, bytes, cleanName, {
         ...options,
         target,
+      });
+      notifyCs80Scene({
+        scene: 'sending_msg',
+        phase: 'pulse',
+        channel: 'telegram',
+        holdSec: 3.5,
+        caption: '电报消息发送中…',
       });
       const latest = this.coordinator.store.getImChannel(channelId);
       latest.outboundCount++;
@@ -637,6 +694,7 @@ export class ImGateway {
       latest.updatedAt = Date.now();
       this.coordinator.store.saveImChannel(latest);
     } catch (error) {
+      notifyCs80Scene({ scene: 'sending_msg', phase: 'end', tailSec: 0 });
       const latest = this.coordinator.store.getImChannel(channelId);
       latest.lastError = sanitizeImError(error, [latest.botToken, latest.secret]);
       latest.updatedAt = Date.now();
@@ -682,6 +740,27 @@ export class ImGateway {
     const requestId = createHash('sha256').update(`im:${requestScope}:${inbound.externalId}`).digest('hex');
     const existing = this.coordinator.store.conversation?.byRequest(requestId);
     if (existing) return { ok: true, action: telegramGroup ? 'duplicate' : 'routed_to_chat', messageId: existing.id };
+
+    const firstMediaHint = (() => {
+      const wxItem = inbound.mediaItems?.[0];
+      if (wxItem) {
+        const t = Number(wxItem.type);
+        return t === 2 ? '[图片]' : t === 3 ? '[语音]' : t === 5 ? '[视频]' : '[文件]';
+      }
+      const tgItem = inbound.telegramMedia?.[0];
+      if (tgItem) {
+        return tgItem.kind === 'image' ? '[图片]' : '[文件]';
+      }
+      return undefined;
+    })();
+    const inboundPreview = formatInboundMarqueePreview(
+      inbound.text,
+      Boolean(inbound.mediaItems?.length || inbound.telegramMedia?.length),
+      firstMediaHint,
+    );
+    if (inboundPreview) {
+      notifyCs80Inbound({ channel: channel.platform, text: inboundPreview });
+    }
 
     const authorizedPeer = this.isWechatPeerAuthorized(channel, inbound.senderId);
     const safeReplyWebhook = inbound.replyWebhook && isAllowedReplyWebhook(channel.platform, inbound.replyWebhook, channel)

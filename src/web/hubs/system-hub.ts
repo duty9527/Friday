@@ -2,8 +2,9 @@ import { element } from '../shared/dom.js';
 import { hooks } from '../state.js';
 import { initModelHub } from './model-hub.js';
 import { initUsageHub } from './usage-hub.js';
+import { initServicesHub } from './services-hub.js';
 
-export type SystemHubTab = 'models' | 'usage';
+export type SystemHubTab = 'models' | 'usage' | 'services';
 
 export interface SystemHubController {
   openModal: (tab?: SystemHubTab, focusProviderId?: string) => void;
@@ -20,8 +21,10 @@ export function initSystemHub(): SystemHubController {
   const systemHubTabs = element<HTMLElement>('system-hub-tabs');
   const modelsTabBtn = element<HTMLButtonElement>('system-tab-models');
   const usageTabBtn = element<HTMLButtonElement>('system-tab-usage');
+  const servicesTabBtn = element<HTMLButtonElement>('system-tab-services');
   const modelsPanel = element<HTMLElement>('system-panel-models');
   const usagePanel = element<HTMLElement>('system-panel-usage');
+  const servicesPanel = element<HTMLElement>('system-panel-services');
 
   let activeTab: SystemHubTab = 'models';
   let modelSummary: { ready: boolean; badgeText: string; detailText: string } = {
@@ -35,6 +38,11 @@ export function initSystemHub(): SystemHubController {
     moneyText: '',
     detailText: '今日模型调用 0 次',
   };
+  let servicesSummary: { configured: boolean; badgeText: string; detailText: string } = {
+    configured: false,
+    badgeText: '—',
+    detailText: '位置服务读取中',
+  };
 
   function syncTopBadge(): void {
     if (!modelSummary.ready && usageSummary.calls <= 0) {
@@ -46,7 +54,7 @@ export function initSystemHub(): SystemHubController {
     } else {
       systemTopBadge.textContent = modelSummary.badgeText;
     }
-    openSystemHubTop.title = `系统底座 · ${modelSummary.detailText} · ${usageSummary.detailText}`;
+    openSystemHubTop.title = `系统底座 · ${modelSummary.detailText} · ${usageSummary.detailText} · ${servicesSummary.detailText}`;
   }
 
   const isVisible = (tab: SystemHubTab): boolean =>
@@ -68,15 +76,30 @@ export function initSystemHub(): SystemHubController {
     },
   });
 
+  const servicesHub = initServicesHub({
+    isVisible: () => isVisible('services'),
+    onBadgeChange: summary => {
+      servicesSummary = summary;
+      syncTopBadge();
+    },
+  });
+
   function syncTabAttributes(): void {
     const isModels = activeTab === 'models';
+    const isUsage = activeTab === 'usage';
+    const isServices = activeTab === 'services';
+
     modelsTabBtn.classList.toggle('active', isModels);
     modelsTabBtn.setAttribute('aria-selected', isModels ? 'true' : 'false');
     modelsPanel.hidden = !isModels;
 
-    usageTabBtn.classList.toggle('active', !isModels);
-    usageTabBtn.setAttribute('aria-selected', isModels ? 'false' : 'true');
-    usagePanel.hidden = isModels;
+    usageTabBtn.classList.toggle('active', isUsage);
+    usageTabBtn.setAttribute('aria-selected', isUsage ? 'true' : 'false');
+    usagePanel.hidden = !isUsage;
+
+    servicesTabBtn.classList.toggle('active', isServices);
+    servicesTabBtn.setAttribute('aria-selected', isServices ? 'true' : 'false');
+    servicesPanel.hidden = !isServices;
   }
 
   function switchTab(nextTab: SystemHubTab, focusProviderId?: string): void {
@@ -84,8 +107,10 @@ export function initSystemHub(): SystemHubController {
     syncTabAttributes();
     if (nextTab === 'models') {
       modelHub.activate(focusProviderId);
-    } else {
+    } else if (nextTab === 'usage') {
       usageHub.activate();
+    } else {
+      servicesHub.activate();
     }
   }
 
@@ -102,6 +127,7 @@ export function initSystemHub(): SystemHubController {
   function render(force = false): void {
     modelHub.render(force);
     usageHub.render(force);
+    servicesHub.render(force);
   }
 
   openSystemHubTop.addEventListener('click', () => openModal(activeTab));

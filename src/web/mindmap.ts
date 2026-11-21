@@ -943,9 +943,6 @@ function appendIngressSection(container: HTMLElement, flow: MindmapTaskFlow) {
   const pairs: Array<[string, string | undefined]> = [
     ['来源渠道', flow.ingress.channelLabel],
     ['渠道类型', flow.ingress.sourceKind],
-    ['发送者 ID', flow.ingress.origin?.senderId],
-    ['通道会话 ID', flow.ingress.origin?.conversationId],
-    ['原生会话 ID', flow.sessionId],
     ['归属时机', flow.sessionPersisted ? '⚡ 接收执行期实时落库 (messages/tasks)' : '🗂️ 读取时动态聚合'],
     ['归并原因', flow.sessionLink ? `${flow.sessionLink.label}${flow.sessionLink.detail ? `（${flow.sessionLink.detail}）` : ''}` : '会话首轮消息（新开会话）'],
     ['JEV 判定置信度', flow.sessionLink?.confidence !== undefined ? `${Math.round(flow.sessionLink.confidence * 100)}% (${flow.sessionLink.source})` : undefined],

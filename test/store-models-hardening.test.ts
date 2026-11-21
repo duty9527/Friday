@@ -72,7 +72,7 @@ function makeUserMsg(id: string, text: string, extra: Partial<Omit<ChatMessage, 
 test('SqliteDb: SQLITE_BUSY never leaks transaction depth, migrations bootstrap full schema & pinned column', async () => {
   const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-sqlite-hardening-'));
   try {
-    // 1. Fresh SqliteDb bootstraps metadata & conversation tables + user_version = 2
+    // 1. Fresh SqliteDb bootstraps metadata & conversation tables + user_version = 3
     const db1 = new SqliteDb(home);
     const tables = (db1.db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>)
       .map(r => r.name);
@@ -80,7 +80,11 @@ test('SqliteDb: SQLITE_BUSY never leaks transaction depth, migrations bootstrap 
       assert.ok(tables.includes(req), `table ${req} exists on fresh SqliteDb`);
     }
     const verRow = db1.db.prepare('PRAGMA user_version').get() as { user_version: number };
-    assert.equal(verRow.user_version, 2);
+    assert.equal(verRow.user_version, 3);
+    const usageCols = (db1.db.prepare('PRAGMA table_info(model_usage)').all() as Array<{ name: string }>).map(r => r.name);
+    for (const col of ['cache_write_1h_tokens', 'unit_cache_read_usd', 'unit_cache_write_usd']) {
+      assert.ok(usageCols.includes(col), `model_usage must include ${col}`);
+    }
 
     // 2. Simulate SQLITE_BUSY from another connection holding IMMEDIATE lock
     const contender = new DatabaseSync(join(home, 'state.sqlite'));
@@ -114,6 +118,26 @@ test('SqliteDb: SQLITE_BUSY never leaks transaction depth, migrations bootstrap 
       legacyRaw.exec(`
         CREATE TABLE memories(id TEXT PRIMARY KEY, topic TEXT NOT NULL, cwd TEXT, superseded_by TEXT, updated_at INTEGER NOT NULL, body TEXT NOT NULL);
         CREATE TABLE memory_embeddings(memory_id TEXT PRIMARY KEY, model_id TEXT NOT NULL, dim INTEGER NOT NULL, content_hash TEXT NOT NULL, vector BLOB NOT NULL, updated_at INTEGER NOT NULL);
+        CREATE TABLE model_usage(
+          id TEXT PRIMARY KEY,
+          at INTEGER NOT NULL,
+          actor TEXT NOT NULL,
+          provider TEXT NOT NULL,
+          model TEXT NOT NULL,
+          input_tokens INTEGER NOT NULL DEFAULT 0,
+          output_tokens INTEGER NOT NULL DEFAULT 0,
+          cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+          cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+          reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+          total_tokens INTEGER NOT NULL DEFAULT 0,
+          cost_usd REAL NOT NULL DEFAULT 0,
+          unit_input_usd REAL NOT NULL DEFAULT 0,
+          unit_output_usd REAL NOT NULL DEFAULT 0,
+          cost_source TEXT NOT NULL DEFAULT 'unknown',
+          status TEXT NOT NULL DEFAULT 'completed',
+          task_id TEXT,
+          message_id TEXT
+        );
         INSERT INTO memories(id, topic, cwd, superseded_by, updated_at, body)
         VALUES('m-pin', 'Pinned legacy', NULL, NULL, 1000, '{"id":"m-pin","topic":"Pinned legacy","content":"hello","tags":[],"pinned":true,"createdAt":1000,"updatedAt":1000}');
         PRAGMA user_version = 0;
@@ -123,8 +147,12 @@ test('SqliteDb: SQLITE_BUSY never leaks transaction depth, migrations bootstrap 
       const migrated = new SqliteDb(legacyHome);
       const row = migrated.db.prepare('SELECT pinned FROM memories WHERE id=?').get('m-pin') as { pinned: number };
       assert.equal(row.pinned, 1);
-      const v2 = migrated.db.prepare('PRAGMA user_version').get() as { user_version: number };
-      assert.equal(v2.user_version, 2);
+      const migratedUsageCols = (migrated.db.prepare('PRAGMA table_info(model_usage)').all() as Array<{ name: string }>).map(r => r.name);
+      assert.ok(migratedUsageCols.includes('cache_write_1h_tokens'));
+      assert.ok(migratedUsageCols.includes('unit_cache_read_usd'));
+      assert.ok(migratedUsageCols.includes('unit_cache_write_usd'));
+      const v3 = migrated.db.prepare('PRAGMA user_version').get() as { user_version: number };
+      assert.equal(v3.user_version, 3);
       migrated.close();
     } finally {
       await rm(legacyHome, { recursive: true, force: true });
@@ -580,10 +608,44 @@ test('ModelHub, parseModelSpec, discovery, decision & UsageStore hardening', asy
       }), { status: 200 });
     }) as typeof fetch;
     try {
-      await fetchRemoteModelsFromEndpoint('google', 'AIzaTestSecretKey12345', undefined, []);
+      const googleModels = await fetchRemoteModelsFromEndpoint('google', 'AIzaTestSecretKey12345', undefined, []);
       assert.equal(seenDiscoveryReqs.length, 1);
       assert.ok(!seenDiscoveryReqs[0]!.url.includes('AIzaTestSecretKey12345'), 'Google API key must not appear in URL');
       assert.equal(seenDiscoveryReqs[0]!.headers['x-goog-api-key'], 'AIzaTestSecretKey12345');
+      assert.equal(googleModels[0]?.costCacheRead, 0.03);
+      assert.equal(googleModels[0]?.costCacheWrite, 0.3);
+
+      // OpenRouter /models parses per-token pricing including input_cache_read & input_cache_write
+      globalThis.fetch = (async () => new Response(JSON.stringify({
+        data: [
+          {
+            id: 'anthropic/claude-sonnet-4',
+            name: 'Claude Sonnet 4',
+            pricing: {
+              prompt: '0.000003',
+              completion: '0.000015',
+              input_cache_read: '0.0000003',
+              input_cache_write: '0.00000375',
+            },
+          },
+          {
+            id: 'openrouter/unlisted-dynamic-router',
+            name: 'Dynamic Router',
+            pricing: { prompt: '-1', completion: '-1' },
+          },
+        ],
+      }), { status: 200 })) as typeof fetch;
+      const orModels = await fetchRemoteModelsFromEndpoint('openrouter', 'sk-or-test', undefined, []);
+      const sonnet = orModels.find(m => m.id === 'anthropic/claude-sonnet-4');
+      assert.ok(sonnet);
+      assert.equal(sonnet.costInput, 3);
+      assert.equal(sonnet.costOutput, 15);
+      assert.equal(sonnet.costCacheRead, 0.3);
+      assert.equal(sonnet.costCacheWrite, 3.75);
+      const dynModel = orModels.find(m => m.id === 'openrouter/unlisted-dynamic-router');
+      assert.ok(dynModel);
+      assert.equal(dynModel.costInput, 0);
+      assert.equal(dynModel.costOutput, 0);
     } finally {
       globalThis.fetch = origFetch;
     }

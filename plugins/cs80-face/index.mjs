@@ -142,6 +142,8 @@ export async function runAction(action = 'status', args = {}, context = {}) {
 
     if (name === 'express') {
       const desc = [
+        safeArgs.scene ? `场景=${safeArgs.scene}` : '',
+        safeArgs.channel ? `通道=${safeArgs.channel}` : '',
         safeArgs.expr ? `表情=${safeArgs.expr}` : '',
         safeArgs.poke ? `动作=${safeArgs.poke}` : '',
         safeArgs.text ? `屏幕文字=“${String(safeArgs.text)}”` : '',

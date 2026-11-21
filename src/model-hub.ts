@@ -67,7 +67,11 @@ import {
   type WorkerModelResolutionInput,
 } from './models/catalog.js';
 import { fetchRemoteModelsFromEndpoint } from './models/discovery.js';
-import { resolveModelUnitPrice } from './models/pricing.js';
+import {
+  resolveModelUnitPrice,
+  type CatalogCostRateInput,
+  type ModelCostTier,
+} from './models/pricing.js';
 import {
   accumulateDecisionEraStats,
   formatModelNotInPoolError,
@@ -105,7 +109,12 @@ export class ModelHub {
   private cachedPool: PooledModelEntry[] = [];
   /** 所有已配置且启用的 provider 的完整模型目录（仅用于禁用 provider 时的回退选择，不作为 Worker 模型池） */
   private cachedCatalog: PooledModelEntry[] = [];
-  private cachedCosts = new Map<string, { costInput: number; costOutput: number }>();
+  private cachedCosts = new Map<string, {
+    costInput: number;
+    costOutput: number;
+    costCacheRead?: number;
+    costCacheWrite?: number;
+  }>();
   private usageListener?: (entry: ModelUsageEvent) => void;
   private saveQueue: Promise<void> = Promise.resolve();
   private runtimePromise?: Promise<ModelRuntime>;
@@ -139,7 +148,12 @@ export class ModelHub {
     }
   }
 
-  private emitDecisionUsage(usage: { inputTokens: number; outputTokens?: number; totalTokens: number } | undefined): void {
+  private emitDecisionUsage(usage: {
+    inputTokens: number;
+    outputTokens?: number;
+    cacheReadTokens?: number;
+    totalTokens: number;
+  } | undefined): void {
     if (!usage) return;
     this.emitUsage({
       actor: 'decision',
@@ -153,7 +167,7 @@ export class ModelHub {
   getModelCostRates(
     provider: string,
     model: string,
-  ): { costInput: number; costOutput: number; costCacheRead?: number; costCacheWrite?: number } | undefined {
+  ): CatalogCostRateInput | undefined {
     const knownProviders = this.getKnownProviders();
     const parsed = parseModelSpec(model, {
       fallbackProvider: provider,
@@ -176,38 +190,54 @@ export class ModelHub {
     const hasSdkPositive = (m?: { cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number } }) =>
       Boolean(m?.cost && ((m.cost.input ?? 0) > 0 || (m.cost.output ?? 0) > 0));
 
+    type CostWithTiers = { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; tiers?: readonly ModelCostTier[] };
+    const runtimeCost = runtimeModel?.cost as CostWithTiers | undefined;
+    const pristineCost = pristine?.cost as CostWithTiers | undefined;
+    const tiers = runtimeCost?.tiers?.length
+      ? runtimeCost.tiers
+      : pristineCost?.tiers?.length
+        ? pristineCost.tiers
+        : undefined;
+
     if (hasPositive(cached)) {
-      const cacheReadSource = (runtimeModel?.cost?.cacheRead ?? 0) > 0
-        ? runtimeModel
-        : (pristine?.cost?.cacheRead ?? 0) > 0
-          ? pristine
-          : undefined;
-      const cacheWriteSource = (runtimeModel?.cost?.cacheWrite ?? 0) > 0
-        ? runtimeModel
-        : (pristine?.cost?.cacheWrite ?? 0) > 0
-          ? pristine
-          : undefined;
+      const costCacheRead = (cached!.costCacheRead ?? 0) > 0
+        ? cached!.costCacheRead
+        : (runtimeCost?.cacheRead ?? 0) > 0
+          ? runtimeCost!.cacheRead
+          : (pristineCost?.cacheRead ?? 0) > 0
+            ? pristineCost!.cacheRead
+            : undefined;
+      const costCacheWrite = (cached!.costCacheWrite ?? 0) > 0
+        ? cached!.costCacheWrite
+        : (runtimeCost?.cacheWrite ?? 0) > 0
+          ? runtimeCost!.cacheWrite
+          : (pristineCost?.cacheWrite ?? 0) > 0
+            ? pristineCost!.cacheWrite
+            : undefined;
       return {
         costInput: cached!.costInput,
         costOutput: cached!.costOutput,
-        ...(cacheReadSource?.cost?.cacheRead !== undefined ? { costCacheRead: cacheReadSource.cost.cacheRead } : {}),
-        ...(cacheWriteSource?.cost?.cacheWrite !== undefined ? { costCacheWrite: cacheWriteSource.cost.cacheWrite } : {}),
+        ...(costCacheRead !== undefined ? { costCacheRead } : {}),
+        ...(costCacheWrite !== undefined ? { costCacheWrite } : {}),
+        ...(tiers ? { tiers } : {}),
       };
     }
     if (hasSdkPositive(runtimeModel)) {
       return {
         costInput: runtimeModel!.cost.input,
         costOutput: runtimeModel!.cost.output,
-        costCacheRead: runtimeModel!.cost.cacheRead,
-        costCacheWrite: runtimeModel!.cost.cacheWrite,
+        ...((runtimeCost?.cacheRead ?? 0) > 0 ? { costCacheRead: runtimeCost!.cacheRead } : {}),
+        ...((runtimeCost?.cacheWrite ?? 0) > 0 ? { costCacheWrite: runtimeCost!.cacheWrite } : {}),
+        ...(tiers ? { tiers } : {}),
       };
     }
     if (hasSdkPositive(pristine)) {
       return {
         costInput: pristine!.cost.input,
         costOutput: pristine!.cost.output,
-        costCacheRead: pristine!.cost.cacheRead,
-        costCacheWrite: pristine!.cost.cacheWrite,
+        ...((pristineCost?.cacheRead ?? 0) > 0 ? { costCacheRead: pristineCost!.cacheRead } : {}),
+        ...((pristineCost?.cacheWrite ?? 0) > 0 ? { costCacheWrite: pristineCost!.cacheWrite } : {}),
+        ...(tiers ? { tiers } : {}),
       };
     }
     return undefined;
@@ -475,6 +505,8 @@ export class ModelHub {
               maxTokens: bm.maxTokens ?? 16_384,
               costInput: bm.cost?.input ?? 0,
               costOutput: bm.cost?.output ?? 0,
+              ...((bm.cost?.cacheRead ?? 0) > 0 ? { costCacheRead: bm.cost!.cacheRead } : {}),
+              ...((bm.cost?.cacheWrite ?? 0) > 0 ? { costCacheWrite: bm.cost!.cacheWrite } : {}),
             });
           }
           for (const fm of fallbackModels) {
@@ -498,6 +530,8 @@ export class ModelHub {
               maxTokens: bm?.maxTokens ?? 16_384,
               costInput: bm?.cost?.input ?? 0,
               costOutput: bm?.cost?.output ?? 0,
+              ...((bm?.cost?.cacheRead ?? 0) > 0 ? { costCacheRead: bm!.cost!.cacheRead } : {}),
+              ...((bm?.cost?.cacheWrite ?? 0) > 0 ? { costCacheWrite: bm!.cost!.cacheWrite } : {}),
             });
           }
         }
@@ -524,19 +558,71 @@ export class ModelHub {
                   : undefined);
               const fallbackUnit = !cfg.baseUrl ? resolveModelUnitPrice(providerId, entry.id) : undefined;
               const fallbackKnown = Boolean(fallbackUnit && fallbackUnit.source !== 'unknown');
-              const sdkCacheRead = bm?.cost?.cacheRead && bm.cost.cacheRead > 0
-                ? bm.cost.cacheRead
-                : fallbackKnown ? fallbackUnit!.cacheReadUsdPer1M : 0;
-              const sdkCacheWrite = bm?.cost?.cacheWrite && bm.cost.cacheWrite > 0
-                ? bm.cost.cacheWrite
-                : fallbackKnown ? fallbackUnit!.cacheWriteUsdPer1M : 0;
-              const cost = (entry.costInput > 0 || entry.costOutput > 0)
-                ? { input: entry.costInput, output: entry.costOutput, cacheRead: sdkCacheRead, cacheWrite: sdkCacheWrite }
-                : (!cfg.baseUrl && bm?.cost && (bm.cost.input > 0 || bm.cost.output > 0))
-                  ? bm.cost
-                  : fallbackKnown
-                    ? { input: fallbackUnit!.inputUsdPer1M, output: fallbackUnit!.outputUsdPer1M, cacheRead: sdkCacheRead, cacheWrite: sdkCacheWrite }
-                    : { input: entry.costInput, output: entry.costOutput, cacheRead: 0, cacheWrite: 0 };
+              const bmTiers = !cfg.baseUrl
+                ? (bm?.cost as { tiers?: readonly ModelCostTier[] } | undefined)?.tiers?.map(t => ({
+                    inputTokensAbove: t.inputTokensAbove,
+                    input: t.input,
+                    output: t.output,
+                    cacheRead: t.cacheRead ?? 0,
+                    cacheWrite: t.cacheWrite ?? 0,
+                  }))
+                : undefined;
+              const explicitCr = (entry.costCacheRead ?? 0) > 0
+                ? entry.costCacheRead
+                : (bm?.cost?.cacheRead ?? 0) > 0
+                  ? bm!.cost!.cacheRead
+                  : undefined;
+              const explicitCw = (entry.costCacheWrite ?? 0) > 0
+                ? entry.costCacheWrite
+                : (bm?.cost?.cacheWrite ?? 0) > 0
+                  ? bm!.cost!.cacheWrite
+                  : undefined;
+              let cost: {
+                input: number;
+                output: number;
+                cacheRead: number;
+                cacheWrite: number;
+                tiers?: Array<{ inputTokensAbove: number; input: number; output: number; cacheRead: number; cacheWrite: number }>;
+              };
+              if (entry.costInput > 0 || entry.costOutput > 0) {
+                const resolved = resolveModelUnitPrice(providerId, entry.id, {
+                  costInput: entry.costInput,
+                  costOutput: entry.costOutput,
+                  ...(explicitCr !== undefined ? { costCacheRead: explicitCr } : {}),
+                  ...(explicitCw !== undefined ? { costCacheWrite: explicitCw } : {}),
+                });
+                cost = {
+                  input: resolved.inputUsdPer1M,
+                  output: resolved.outputUsdPer1M,
+                  cacheRead: resolved.cacheReadUsdPer1M,
+                  cacheWrite: resolved.cacheWriteUsdPer1M,
+                  ...(bmTiers?.length ? { tiers: bmTiers } : {}),
+                };
+              } else if (!cfg.baseUrl && bm?.cost && (bm.cost.input > 0 || bm.cost.output > 0)) {
+                const resolved = resolveModelUnitPrice(providerId, entry.id, {
+                  costInput: bm.cost.input,
+                  costOutput: bm.cost.output,
+                  ...((bm.cost.cacheRead ?? 0) > 0 ? { costCacheRead: bm.cost.cacheRead } : {}),
+                  ...((bm.cost.cacheWrite ?? 0) > 0 ? { costCacheWrite: bm.cost.cacheWrite } : {}),
+                });
+                cost = {
+                  input: resolved.inputUsdPer1M,
+                  output: resolved.outputUsdPer1M,
+                  cacheRead: resolved.cacheReadUsdPer1M,
+                  cacheWrite: resolved.cacheWriteUsdPer1M,
+                  ...(bmTiers?.length ? { tiers: bmTiers } : {}),
+                };
+              } else if (fallbackKnown) {
+                cost = {
+                  input: fallbackUnit!.inputUsdPer1M,
+                  output: fallbackUnit!.outputUsdPer1M,
+                  cacheRead: explicitCr ?? fallbackUnit!.cacheReadUsdPer1M,
+                  cacheWrite: explicitCw ?? fallbackUnit!.cacheWriteUsdPer1M,
+                  ...(bmTiers?.length ? { tiers: bmTiers } : {}),
+                };
+              } else {
+                cost = { input: entry.costInput, output: entry.costOutput, cacheRead: 0, cacheWrite: 0 };
+              }
               const maxTokens = (!cfg.baseUrl && bm?.maxTokens && (!entry.maxTokens || (entry.maxTokens === 16_384 && bm.maxTokens > 16_384)))
                 ? bm.maxTokens
                 : (entry.maxTokens || bm?.maxTokens || 16_384);
@@ -763,20 +849,45 @@ export class ModelHub {
           const refOut = ref?.cost?.output ?? 0;
           let costInput = (m.costInput ?? 0) > 0 ? m.costInput : refIn;
           let costOutput = (m.costOutput ?? 0) > 0 ? m.costOutput : refOut;
+          let costCacheRead = (m.costCacheRead ?? 0) > 0
+            ? m.costCacheRead
+            : ((ref?.cost?.cacheRead ?? 0) > 0 ? ref!.cost!.cacheRead : undefined);
+          let costCacheWrite = (m.costCacheWrite ?? 0) > 0
+            ? m.costCacheWrite
+            : ((ref?.cost?.cacheWrite ?? 0) > 0 ? ref!.cost!.cacheWrite : undefined);
           if (costInput <= 0 && costOutput <= 0) {
             const fallback = resolveModelUnitPrice(providerId, m.id);
             if (fallback.source !== 'unknown') {
               costInput = fallback.inputUsdPer1M;
               costOutput = fallback.outputUsdPer1M;
+              costCacheRead = fallback.cacheReadUsdPer1M;
+              costCacheWrite = fallback.cacheWriteUsdPer1M;
             }
+          } else if (costCacheRead === undefined || costCacheWrite === undefined) {
+            const resolved = resolveModelUnitPrice(providerId, m.id, {
+              costInput,
+              costOutput,
+              ...(costCacheRead !== undefined ? { costCacheRead } : {}),
+              ...(costCacheWrite !== undefined ? { costCacheWrite } : {}),
+            });
+            costCacheRead = resolved.cacheReadUsdPer1M;
+            costCacheWrite = resolved.cacheWriteUsdPer1M;
           }
           if (!ref) {
-            return { ...m, costInput, costOutput };
+            return {
+              ...m,
+              costInput,
+              costOutput,
+              ...(costCacheRead !== undefined ? { costCacheRead } : {}),
+              ...(costCacheWrite !== undefined ? { costCacheWrite } : {}),
+            };
           }
           return {
             ...m,
             costInput,
             costOutput,
+            ...(costCacheRead !== undefined ? { costCacheRead } : {}),
+            ...(costCacheWrite !== undefined ? { costCacheWrite } : {}),
             maxTokens: (m.maxTokens && !(m.maxTokens === 16_384 && (ref.maxTokens ?? 0) > 16_384))
               ? m.maxTokens
               : (ref.maxTokens ?? m.maxTokens),
@@ -786,12 +897,25 @@ export class ModelHub {
         ? rawModels.map((m): ModelCatalogEntry => {
             let costInput = m.cost?.input ?? 0;
             let costOutput = m.cost?.output ?? 0;
+            let costCacheRead = (m.cost?.cacheRead ?? 0) > 0 ? m.cost!.cacheRead : undefined;
+            let costCacheWrite = (m.cost?.cacheWrite ?? 0) > 0 ? m.cost!.cacheWrite : undefined;
             if (!persisted?.baseUrl && costInput <= 0 && costOutput <= 0) {
               const fallback = resolveModelUnitPrice(providerId, m.id);
               if (fallback.source !== 'unknown') {
                 costInput = fallback.inputUsdPer1M;
                 costOutput = fallback.outputUsdPer1M;
+                costCacheRead = fallback.cacheReadUsdPer1M;
+                costCacheWrite = fallback.cacheWriteUsdPer1M;
               }
+            } else if ((costInput > 0 || costOutput > 0) && (costCacheRead === undefined || costCacheWrite === undefined)) {
+              const resolved = resolveModelUnitPrice(providerId, m.id, {
+                costInput,
+                costOutput,
+                ...(costCacheRead !== undefined ? { costCacheRead } : {}),
+                ...(costCacheWrite !== undefined ? { costCacheWrite } : {}),
+              });
+              costCacheRead = resolved.cacheReadUsdPer1M;
+              costCacheWrite = resolved.cacheWriteUsdPer1M;
             }
             return {
               id: m.id,
@@ -802,6 +926,8 @@ export class ModelHub {
               maxTokens: m.maxTokens ?? 16_384,
               costInput,
               costOutput,
+              ...(costCacheRead !== undefined ? { costCacheRead } : {}),
+              ...(costCacheWrite !== undefined ? { costCacheWrite } : {}),
             };
           })
         : (FALLBACK_PROVIDER_MODELS[providerId] ?? []);
@@ -824,7 +950,7 @@ export class ModelHub {
 
     const pool: PooledModelEntry[] = [];
     const catalog: PooledModelEntry[] = [];
-    const costs = new Map<string, { costInput: number; costOutput: number }>();
+    const costs = new Map<string, { costInput: number; costOutput: number; costCacheRead?: number; costCacheWrite?: number }>();
     for (const id of providerIds) {
       const featured = FEATURED_PROVIDERS.find(p => p.id === id);
       const catalogProvider = runtime.getProvider(id);
@@ -859,7 +985,12 @@ export class ModelHub {
           ? nativeLevels.filter(lvl => overrideLevels.includes(lvl))
           : nativeLevels;
         const thinkingLevels = filteredLevels.length ? filteredLevels : nativeLevels;
-        costs.set(spec, { costInput: m.costInput ?? 0, costOutput: m.costOutput ?? 0 });
+        costs.set(spec, {
+          costInput: m.costInput ?? 0,
+          costOutput: m.costOutput ?? 0,
+          ...(m.costCacheRead !== undefined ? { costCacheRead: m.costCacheRead } : {}),
+          ...(m.costCacheWrite !== undefined ? { costCacheWrite: m.costCacheWrite } : {}),
+        });
         return {
           spec,
           providerId: id,
@@ -1115,7 +1246,7 @@ export class ModelHub {
     needsQualityGateProb?: number;
     source: DecisionSource;
     attempted: boolean;
-    usage?: { inputTokens: number; outputTokens?: number; totalTokens: number };
+    usage?: { inputTokens: number; outputTokens?: number; cacheReadTokens?: number; totalTokens: number };
     fallbackReason?: string;
   }> {
     const runtime = await this.ensureRuntime();
@@ -1641,8 +1772,8 @@ export class ModelHub {
         cost: runtimeModel?.cost ?? {
           input: fallbackCatalogEntry?.costInput ?? 0,
           output: fallbackCatalogEntry?.costOutput ?? 0,
-          cacheRead: 0,
-          cacheWrite: 0,
+          cacheRead: fallbackCatalogEntry?.costCacheRead ?? 0,
+          cacheWrite: fallbackCatalogEntry?.costCacheWrite ?? 0,
         },
         contextWindow: runtimeModel?.contextWindow ?? fallbackCatalogEntry?.contextWindow ?? 128_000,
         maxTokens: runtimeModel?.maxTokens ?? fallbackCatalogEntry?.maxTokens ?? 16_384,

@@ -505,7 +505,21 @@ test('Web console lazy-loads health-scale UI, serves redacted PluginView metadat
     const html = await (await fetch(f.base)).text();
     assert.match(html, /id="open-plugin-hub-top"/);
     assert.match(html, /id="plugin-hub-modal"/);
+    assert.match(html, /id="plugin-shell"/);
+    assert.match(html, /id="plugin-sidebar"/);
+    assert.match(html, /id="plugin-sidebar-toggle"/);
+    assert.match(html, /id="plugin-nav-sortable"/);
+    assert.match(html, /id="plugin-order-reset-btn"/);
+    assert.match(html, /id="plugin-catalog-search"/);
+    assert.match(html, /id="plugin-catalog-filters"/);
+    assert.match(html, /id="plugin-catalog-home"/);
+    assert.match(html, /id="plugin-catalog-detail"/);
     assert.match(html, /id="plugin-tab-catalog"/);
+    const sortableIdx = html.indexOf('id="plugin-nav-sortable"');
+    const footerIdx = html.indexOf('class="plugin-sidebar-footer"');
+    const catalogTabIdx = html.indexOf('id="plugin-tab-catalog"');
+    assert.ok(sortableIdx > 0 && footerIdx > sortableIdx && catalogTabIdx > footerIdx,
+      'plugin catalog tab must be pinned inside .plugin-sidebar-footer at the bottom of the sidebar');
     assert.match(html, /id="plugin-tab-health-scale"/);
     assert.match(html, /id="plugin-panel-health-scale"/);
     assert.match(html, /id="health-trend-canvas"/);
@@ -565,6 +579,9 @@ test('Web console lazy-loads health-scale UI, serves redacted PluginView metadat
     const appleUiJs = await (await fetch(`${f.base}/plugins/apple-devices-ui.js`)).text();
     assert.match(appleUiJs, /initAppleDevicesUi/);
     assert.doesNotMatch(appleUiJs, /\.style\.|setAttribute\(\s*['"]style['"]/, 'apple-devices-ui must obey strict CSP without inline style mutations');
+    const pluginCatalogJs = await (await fetch(`${f.base}/shared/plugin-catalog.js`)).text();
+    assert.match(pluginCatalogJs, /mergePluginOrder/);
+    assert.doesNotMatch(pluginCatalogJs, /\.style\.|setAttribute\(\s*['"]style['"]|\.innerHTML\b/, 'plugin-catalog.js must obey strict CSP');
 
     const viewRes = await (await fetch(`${f.base}/api/view`, { headers: f.headers })).json() as MainView;
     for (const plugin of viewRes.plugins ?? []) {
@@ -574,6 +591,10 @@ test('Web console lazy-loads health-scale UI, serves redacted PluginView metadat
       assert.equal('dataDir' in rec, false, 'redacted PluginView must not expose dataDir');
       assert.equal('sourceCode' in rec, false, 'redacted PluginView must not expose sourceCode');
     }
+    const healthPluginView = viewRes.plugins?.find(p => p.name === 'health-scale');
+    assert.ok(healthPluginView, 'health-scale must appear in /api/view plugins');
+    assert.deepEqual(healthPluginView.platforms, ['linux']);
+    assert.equal(healthPluginView.isBuiltin, true);
 
     const profileRes = await (await fetch(`${f.base}/api/plugin-run`, {
       method: 'POST',

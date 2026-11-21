@@ -77,6 +77,8 @@ export interface ModelCatalogEntry {
   maxTokens?: number;
   costInput: number;
   costOutput: number;
+  costCacheRead?: number;
+  costCacheWrite?: number;
   /** 模型自身支持的原生思考/推理等级列表 */
   thinkingLevels?: ThinkingLevel[];
 }
@@ -368,6 +370,8 @@ export interface PluginView {
   description: string;
   entry: string;
   enabled?: boolean;
+  platforms?: string[];
+  isBuiltin?: boolean;
   runtime?: PluginRuntimeMode;
   promptHint?: string;
   voiceFastpath?: boolean;
@@ -418,18 +422,27 @@ export interface UsageTotalsView {
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
+  cacheWrite1hTokens: number;
   reasoningTokens: number;
   totalTokens: number;
+  cacheHitRate: number;
   costUsd: number;
   costCny: number;
+  cacheSavingsUsd: number;
+  cacheSavingsCny: number;
 }
 
 export interface UsageTodaySummary {
   date: string; // YYYY-MM-DD
   calls: number;
   totalTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  cacheHitRate: number;
   costUsd: number;
   costCny: number;
+  cacheSavingsUsd: number;
+  cacheSavingsCny: number;
   currency: UsageCurrency;
   usdToCnyRate: number;
 }
@@ -442,6 +455,8 @@ export interface UsageModelBreakdownView extends UsageTotalsView {
   costShare: number;
   unitInputUsdPer1M: number;
   unitOutputUsdPer1M: number;
+  unitCacheReadUsdPer1M: number;
+  unitCacheWriteUsdPer1M: number;
   costSource: UsageCostSource;
   actors: Partial<Record<UsageActor, number>>;
   lastUsedAt: number;
@@ -455,6 +470,8 @@ export interface UsageBucketView {
   calls: number;
   inputTokens: number;
   outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
   totalTokens: number;
   costUsd: number;
   costCny: number;

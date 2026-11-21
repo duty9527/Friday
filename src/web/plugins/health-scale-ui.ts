@@ -654,8 +654,6 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
 
     const kvPairs: Array<[string, string]> = [
       ['设备名称', dev.name || 'AFU-WL-TZ-A1'],
-      ['蓝牙 MAC', dev.mac],
-      ['蓝牙地址', dev.address],
       ['信号强度 RSSI', dev.rssi !== null ? `${dev.rssi} dBm` : '--'],
       ['电池电量', dev.battery !== null ? `${dev.battery}%${dev.charging ? ' (充电中)' : ''}` : '--'],
       ['协议版本 / 子类型', `${dev.protocolVer ?? '--'} / subtype ${dev.deviceSubtype ?? '--'}`],
@@ -942,7 +940,7 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
     const maxSeries = Math.max(...series.map(s => s.value));
     const fmt = (v: number) => healthTrendMetric === 'bmr' || healthTrendMetric === 'impedance' ? Math.round(v).toString() : v.toFixed(2);
     if (focusPt) {
-      healthTrendCaption.textContent = `${metricLabel}（共 ${series.length} 点 · 最低 ${fmt(minSeries)} / 最高 ${fmt(maxSeries)} ${unitLabel}）｜ 焦点：${timestamp(focusPt.rec.measuredAt)} → ${fmt(focusPt.value)} ${unitLabel}（点击数据点可定位明细）`;
+      healthTrendCaption.textContent = `${metricLabel}（共 ${series.length} 点 · 最低 ${fmt(minSeries)} / 最高 ${fmt(maxSeries)} ${unitLabel}）｜ 焦点：${timestamp(focusPt.rec.measuredAt)} → ${fmt(focusPt.value)} ${unitLabel}`;
     }
   }
 
@@ -1063,7 +1061,6 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
 
     const m = inspected.metrics;
     const cells: Array<[string, string]> = [
-      ['测量 ID', inspected.id],
       ['精确时间戳', `${timestamp(inspected.measuredAt)} (${inspected.measuredAt})`],
       ['数据来源 / 稳定位', `${healthSourceLabel(inspected.source).text} · ${inspected.stable ? '已锁定' : '未锁定'}`],
       ['四单位换算', `${inspected.weightKg} kg / ${inspected.weightJin} 斤 / ${inspected.weightLb} lb / ${inspected.weightG} g`],
@@ -1136,7 +1133,9 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
     }
     const all = healthDashboard?.records ?? [];
     const filtered = healthSourceFilter === 'all' ? all : all.filter(r => r.source === healthSourceFilter);
-    healthRecordsSubtitle.textContent = `共 ${filtered.length} 条记录（总 ${all.length} 条）· 点击任意一条查看其全量成分分析与原始数据`;
+    healthRecordsSubtitle.textContent = filtered.length !== all.length
+      ? `共 ${filtered.length} 条记录（总 ${all.length} 条）`
+      : `共 ${filtered.length} 条记录`;
 
     if (filtered.length === 0) {
       healthRecordsList.replaceChildren(node('p', '当前筛选条件下暂无测量记录。', 'empty'));

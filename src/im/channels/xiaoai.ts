@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { notifyCs80Scene as pushCs80Scene, notifyCs80Voice as pushCs80Voice } from '../../cs80-scene.js';
 import type { VoiceFastpathRequest, VoiceFastpathResult } from '../../plugin.js';
 import type { ImChannelConfig } from '../../store.js';
 import type { ChatMessage, MessageOrigin } from '../../view.js';
@@ -58,6 +59,7 @@ interface FastpathSessionEntry {
   state: Record<string, unknown>;
   idleTtlMs: number;
   expiresAt: number;
+  lastCaption?: string;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -86,6 +88,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
   private speakerDepsRef?: XiaoaiDeps;
   private readonly speakerEnroll = new XiaoaiSpeakerEnrollController();
   private readonly fastpathSessions = new BoundedMap<string, FastpathSessionEntry>(128);
+  private readonly fastpathExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly outboundChains = new Map<string, Promise<void>>();
   private readonly prewarmedTargets = new Set<string>();
   private readonly healthMeasureWatches = new Map<string, { sessionId: string; stop: () => void }>();
@@ -106,6 +109,10 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     this.speakerManager = undefined;
     this.speakerDepsRef = undefined;
     this.speakerEnroll.clear();
+    for (const timer of this.fastpathExpiryTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.fastpathExpiryTimers.clear();
     this.fastpathSessions.clear();
     this.outboundChains.clear();
     this.prewarmedTargets.clear();
@@ -122,30 +129,8 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     speakerName?: string;
     followUp?: boolean;
   }): void {
-    if (this.ctx.isClosing() || process.env.CS80_FACE_VOICE_PUSH === '0') return;
-    const explicitTarget = Boolean(
-      process.env.CS80_FACE_URL
-      || process.env.CS80_FACE_PORT
-      || process.env.CS80_FACE_VOICE_PUSH === '1',
-    );
-    if ((process.env.NODE_TEST_CONTEXT || this.deps?.sshRunner) && !explicitTarget) {
-      return;
-    }
-    const rawUrl = process.env.CS80_FACE_URL?.trim();
-    let baseUrl: string;
-    if (rawUrl) {
-      baseUrl = rawUrl.replace(/\/+$/, '');
-    } else {
-      const portNum = Number(process.env.CS80_FACE_PORT ?? '8788');
-      const port = Number.isInteger(portNum) && portNum > 0 && portNum <= 65535 ? portNum : 8788;
-      baseUrl = `http://127.0.0.1:${port}`;
-    }
-    void fetch(`${baseUrl}/api/control`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ action: 'voice', ...payload }),
-      signal: AbortSignal.timeout(250),
-    }).catch(() => {});
+    if (this.ctx.isClosing()) return;
+    pushCs80Voice(payload, { skipWhenMocked: Boolean(this.deps?.sshRunner) });
   }
 
   enterFollowUpCapture(
@@ -161,7 +146,12 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
   ): boolean {
     const entered = this.kwsMonitor?.enterFollowUpCapture(channelId, targetId, options) ?? false;
     if (entered) {
-      this.notifyCs80Voice({ phase: 'listening', keyword: '连续对话', followUp: true });
+      const tvEntry = this.getActiveFastpathSession(channelId, targetId);
+      if (tvEntry?.state.tvRemoteActive) {
+        this.syncCs80TvRemoteScene(tvEntry);
+      } else {
+        this.notifyCs80Voice({ phase: 'listening', keyword: '连续对话', followUp: true });
+      }
     }
     return entered;
   }
@@ -304,7 +294,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
         },
         onWake: async (event) => {
           if (event.reWake) {
-            this.fastpathSessions.delete(`${event.channel.id}:${event.target.id}`);
+            this.clearFastpathSession(event.channel.id, event.target.id);
           }
           this.notifyCs80Voice({
             phase: 'listening',
@@ -324,10 +314,14 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
           });
         },
         onTranscribing: async (event) => {
-          this.notifyCs80Voice({ phase: 'transcribing', keyword: event.keyword });
           if (this.isContinuousFastpathActive(event.channel.id, event.target.id)) {
+            const tvEntry = this.getActiveFastpathSession(event.channel.id, event.target.id);
+            if (tvEntry?.state.tvRemoteActive) {
+              this.syncCs80TvRemoteScene(tvEntry);
+            }
             return;
           }
+          this.notifyCs80Voice({ phase: 'transcribing', keyword: event.keyword });
           await setXiaoaiSpeakerLed(event.target, 'think', this.deps?.sshRunner);
         },
         shouldBypassFollowUpCancel: (channelId, targetId) => {
@@ -454,13 +448,27 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
         || continuous;
 
       if (!hookData?.suppressSpeech) {
-        await this.ctx.sendToChannel(channel.id, cleanBody, {
-          target: targetId,
-          replyToMessageId: route.replyToMessageId,
-          replyWebhook: route.replyWebhook,
-          contextToken: route.contextToken,
-          waitForCompletion: expectFollowUp,
-        });
+        if (continuous) {
+          this.clearFastpathExpiryTimer(`${channel.id}:${targetId}`);
+        }
+        try {
+          await this.ctx.sendToChannel(channel.id, cleanBody, {
+            target: targetId,
+            replyToMessageId: route.replyToMessageId,
+            replyWebhook: route.replyWebhook,
+            contextToken: route.contextToken,
+            waitForCompletion: expectFollowUp,
+          });
+        } catch (err) {
+          if (continuous) {
+            const active = this.fastpathSessions.get(`${channel.id}:${targetId}`);
+            if (active?.state.tvRemoteActive) {
+              active.expiresAt = Date.now() + active.idleTtlMs;
+              this.scheduleFastpathExpiryWatch(channel.id, targetId, active);
+            }
+          }
+          throw err;
+        }
       }
 
       if (this.ctx.isClosing() || this.hasNewerSpeakerUserMessage(msg) || !sshTarget || !this.kwsMonitor) {
@@ -546,7 +554,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
       throw new Error(`未找到音箱目标 ${input.targetId}`);
     }
 
-    this.fastpathSessions.delete(`${channel.id}:${target.id}`);
+    this.clearFastpathSession(channel.id, target.id);
 
     const manager = this.getSpeakerManager();
     const status = manager.getStatus();
@@ -640,8 +648,12 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
   ): void {
     const cleanText = stripXiaoaiDialogDirective(speechText).text;
     if (!cleanText) return;
+    const key = `${channelId}:${targetId}`;
     this.enqueueTargetTask(channelId, targetId, async ({ channel, sshTarget }) => {
       const keepOpen = Boolean(options?.followUpWaitMs || options?.continuous);
+      if (keepOpen) {
+        this.clearFastpathExpiryTimer(key);
+      }
       try {
         await this.ctx.sendToChannel(channel.id, cleanText, {
           target: targetId,
@@ -651,8 +663,14 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
           waitForCompletion: keepOpen,
         });
       } catch (error) {
-        if (!this.ctx.isClosing() && sshTarget && !keepOpen && !this.isContinuousFastpathActive(channelId, sshTarget.id)) {
-          await setXiaoaiSpeakerLed(sshTarget, 'off', this.deps?.sshRunner).catch(() => {});
+        if (!this.ctx.isClosing() && sshTarget) {
+          const active = this.fastpathSessions.get(key);
+          if (active?.state.tvRemoteActive) {
+            active.expiresAt = Date.now() + active.idleTtlMs;
+            this.scheduleFastpathExpiryWatch(channel.id, sshTarget.id, active);
+          } else if (!keepOpen && !this.isContinuousFastpathActive(channelId, sshTarget.id)) {
+            await setXiaoaiSpeakerLed(sshTarget, 'off', this.deps?.sshRunner).catch(() => {});
+          }
         }
         throw error;
       }
@@ -683,12 +701,88 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     });
   }
 
+  private clearFastpathExpiryTimer(key: string): void {
+    const existing = this.fastpathExpiryTimers.get(key);
+    if (existing) {
+      clearTimeout(existing);
+      this.fastpathExpiryTimers.delete(key);
+    }
+  }
+
+  private clearFastpathSession(channelId: string, targetId: string): FastpathSessionEntry | undefined {
+    const key = `${channelId}:${targetId}`;
+    this.clearFastpathExpiryTimer(key);
+    const prev = this.fastpathSessions.get(key);
+    this.fastpathSessions.delete(key);
+    if (prev?.state.tvRemoteActive) {
+      this.syncCs80TvRemoteScene(undefined);
+    }
+    return prev;
+  }
+
+  private syncCs80TvRemoteScene(entry: FastpathSessionEntry | undefined, caption?: string): void {
+    if (this.ctx.isClosing()) return;
+    const opts = { skipWhenMocked: Boolean(this.deps?.sshRunner) };
+    if (entry?.state.tvRemoteActive) {
+      const remainingSec = Math.max(4, Math.ceil((entry.expiresAt - Date.now()) / 1000) + 4);
+      pushCs80Scene(
+        {
+          scene: 'operating_tv',
+          phase: 'start',
+          caption: caption || entry.lastCaption || '电视遥控模式 · 请直接说按键指令',
+          holdSec: remainingSec,
+          force: true,
+        },
+        opts,
+      );
+    } else {
+      pushCs80Scene({ scene: 'operating_tv', phase: 'end', tailSec: 0 }, opts);
+    }
+  }
+
+  private expireFastpathSessionIfNeeded(channelId: string, targetId: string): FastpathSessionEntry | undefined {
+    const key = `${channelId}:${targetId}`;
+    const entry = this.fastpathSessions.get(key);
+    if (!entry) return undefined;
+    if (Date.now() < entry.expiresAt) return undefined;
+    this.fastpathSessions.delete(key);
+    this.clearFastpathExpiryTimer(key);
+    return entry;
+  }
+
+  private announceTvRemoteTimeoutExit(channelId: string, targetId: string): void {
+    this.syncCs80TvRemoteScene(undefined);
+    this.notifyCs80Voice({ phase: 'idle' });
+    if (this.ctx.isClosing()) return;
+    this.enqueueDirectSpeech(channelId, targetId, '已退出电视遥控模式。');
+  }
+
+  private scheduleFastpathExpiryWatch(channelId: string, targetId: string, entry: FastpathSessionEntry): void {
+    const key = `${channelId}:${targetId}`;
+    this.clearFastpathExpiryTimer(key);
+    if (this.ctx.isClosing() || !entry.state.tvRemoteActive) return;
+    const graceMs = Math.min(2_000, Math.max(350, Math.round(entry.idleTtlMs * 0.25)));
+    const delayMs = Math.max(350, entry.expiresAt - Date.now() + graceMs);
+    const timer = setTimeout(() => {
+      if (this.fastpathExpiryTimers.get(key) === timer) {
+        this.fastpathExpiryTimers.delete(key);
+      }
+      const expired = this.expireFastpathSessionIfNeeded(channelId, targetId);
+      if (expired?.state.tvRemoteActive) {
+        this.announceTvRemoteTimeoutExit(channelId, targetId);
+      }
+    }, delayMs);
+    timer.unref?.();
+    this.fastpathExpiryTimers.set(key, timer);
+  }
+
   private getActiveFastpathSession(channelId: string, targetId: string): FastpathSessionEntry | undefined {
     const key = `${channelId}:${targetId}`;
     const entry = this.fastpathSessions.get(key);
     if (!entry) return undefined;
     if (Date.now() >= entry.expiresAt) {
       this.fastpathSessions.delete(key);
+      this.clearFastpathExpiryTimer(key);
       return undefined;
     }
     return entry;
@@ -706,12 +800,17 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     options?: { discardMs?: number; refreshLed?: boolean; allowDuringTranscribe?: boolean },
   ): Promise<boolean> {
     if (this.ctx.isClosing() || !this.kwsMonitor) return false;
+    const expired = this.expireFastpathSessionIfNeeded(channelId, sshTarget.id);
+    if (expired?.state.tvRemoteActive) {
+      this.announceTvRemoteTimeoutExit(channelId, sshTarget.id);
+      return false;
+    }
     const entry = this.getActiveFastpathSession(channelId, sshTarget.id);
     if (!entry || (!entry.state.continuous && !entry.state.tvRemoteActive)) return false;
 
     const remainingMs = entry.expiresAt - Date.now();
     if (remainingMs <= 0) {
-      this.fastpathSessions.delete(`${channelId}:${sshTarget.id}`);
+      this.clearFastpathSession(channelId, sshTarget.id);
       return false;
     }
 
@@ -739,12 +838,12 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     prevEntry: FastpathSessionEntry | undefined,
     result: VoiceFastpathResult,
   ): void {
-    const key = `${channelId}:${targetId}`;
     if (result.clearSessionState) {
-      this.fastpathSessions.delete(key);
+      this.clearFastpathSession(channelId, targetId);
       return;
     }
     if (!result.sessionState) return;
+    const key = `${channelId}:${targetId}`;
     const dataObj = asRecord(result.data);
     const extendTtl = dataObj?.extendTtl !== false;
     const ttlMs = Number(
@@ -757,18 +856,45 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     const expiresAt = !extendTtl && prevEntry
       ? prevEntry.expiresAt
       : Date.now() + resolvedTtlMs;
-    this.fastpathSessions.set(key, {
+    const savedEntry: FastpathSessionEntry = {
       pluginName: result.plugin ?? prevEntry?.pluginName,
       state: result.sessionState,
       idleTtlMs: resolvedTtlMs,
       expiresAt,
-    });
+      ...(prevEntry?.lastCaption && result.action === 'voice_fastpath_ignored'
+        ? { lastCaption: prevEntry.lastCaption }
+        : {}),
+    };
+    this.fastpathSessions.set(key, savedEntry);
+    if (savedEntry.state.tvRemoteActive) {
+      this.scheduleFastpathExpiryWatch(channelId, targetId, savedEntry);
+      const rawSteps = Array.isArray(dataObj?.steps) ? dataObj.steps : [];
+      const stepLabels = rawSteps
+        .map((s) => {
+          const rec = asRecord(s);
+          const lbl = typeof rec?.label === 'string' ? rec.label.trim() : '';
+          const cnt = Number(rec?.count ?? 1);
+          return lbl ? (cnt > 1 ? `${lbl}${cnt}下` : lbl) : '';
+        })
+        .filter(Boolean)
+        .join('、');
+      if (stepLabels) {
+        savedEntry.lastCaption = `电视遥控模式 · 已按${stepLabels}`;
+      }
+      this.syncCs80TvRemoteScene(savedEntry, savedEntry.lastCaption);
+    } else {
+      this.clearFastpathExpiryTimer(key);
+    }
   }
 
   private touchContinuousFastpathSession(channelId: string, targetId: string): void {
     const entry = this.fastpathSessions.get(`${channelId}:${targetId}`);
     if (!entry || (!entry.state.continuous && !entry.state.tvRemoteActive)) return;
     entry.expiresAt = Date.now() + entry.idleTtlMs;
+    if (entry.state.tvRemoteActive) {
+      this.scheduleFastpathExpiryWatch(channelId, targetId, entry);
+      this.syncCs80TvRemoteScene(entry);
+    }
   }
 
   private async runAssistantReplyHook(
@@ -860,7 +986,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
 
     if (!result?.handled) {
       if (wasContinuous && inbound.explicitWake) {
-        this.fastpathSessions.delete(sessionKey);
+        this.clearFastpathSession(channel.id, targetId);
         if (sshTarget) {
           await setXiaoaiSpeakerLed(sshTarget, 'think', this.deps?.sshRunner).catch(() => {});
         }
@@ -877,7 +1003,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
         return { ok: true, action: 'voice_fastpath_ignored' };
       }
       if (prevEntry && !wasContinuous) {
-        this.fastpathSessions.delete(sessionKey);
+        this.clearFastpathSession(channel.id, targetId);
       }
       return undefined;
     }
@@ -932,6 +1058,10 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
 
     const followUpWaitMs = result.followUpWaitMs ?? (isContinuousNow ? DEFAULT_CONTINUOUS_CAPTURE_WAIT_MS : 10_000);
     if (speech) {
+      if (isContinuousNow) {
+        // Pause idle-expiry countdown until entry/response speech finishes playing.
+        this.clearFastpathExpiryTimer(sessionKey);
+      }
       this.enqueueDirectSpeech(channel.id, targetId, speech, {
         followUpWaitMs: followUp ? followUpWaitMs : undefined,
         discardMs: 150,
@@ -1077,6 +1207,10 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
           }
 
           entry.stop();
+          pushCs80Scene(
+            { scene: 'weighing_scale', phase: 'end', tailSec: phase === 'completed' ? 1.2 : 0 },
+            { skipWhenMocked: Boolean(this.deps?.sshRunner) },
+          );
           if (phase === 'superseded' || this.announcedMeasureSessions.has(sessionId)) {
             break;
           }
@@ -1131,8 +1265,13 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     reason: 'cancel' | 'timeout' | 'empty' | 'speaker_rejected' | 'error';
     explicitWake?: boolean;
   }): Promise<void> {
+    const expired = this.expireFastpathSessionIfNeeded(event.channel.id, event.target.id);
+    if (expired?.state.tvRemoteActive) {
+      this.announceTvRemoteTimeoutExit(event.channel.id, event.target.id);
+      return;
+    }
     if ((event.reason === 'cancel' || event.reason === 'timeout') && !this.isContinuousFastpathActive(event.channel.id, event.target.id)) {
-      this.fastpathSessions.delete(`${event.channel.id}:${event.target.id}`);
+      this.clearFastpathSession(event.channel.id, event.target.id);
     }
     if (!this.ctx.isClosing() && this.speakerEnroll.isActive(event.channel.id, event.target.id)) {
       const enrollAction = this.speakerEnroll.handleCaptureTimeoutOrEmpty(
@@ -1167,7 +1306,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     }
     if (!this.ctx.isClosing() && this.isContinuousFastpathActive(event.channel.id, event.target.id)) {
       if (event.explicitWake && event.reason !== 'speaker_rejected') {
-        this.fastpathSessions.delete(`${event.channel.id}:${event.target.id}`);
+        this.clearFastpathSession(event.channel.id, event.target.id);
         this.notifyCs80Voice({ phase: 'listening', keyword: '你好星期五', followUp: false });
         await handleXiaoaiKeywordWake({
           channel: event.channel,
@@ -1358,7 +1497,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
         return { ok: true, action: 'voice_enroll_denied' };
       }
 
-      this.fastpathSessions.delete(`${channel.id}:${targetId}`);
+      this.clearFastpathSession(channel.id, targetId);
 
       const speakerName = (
         cmd.targetName?.trim()

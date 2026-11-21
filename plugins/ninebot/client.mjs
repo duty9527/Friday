@@ -32,8 +32,11 @@ export const VEHICLE_TYPE_TRAVEL = '112';
 
 const DEFAULT_TIMEOUT_MS = 8_000;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+const MAX_VEHICLE_IMAGE_BYTES = 512 * 1024;
 const TOKEN_REFRESH_MARGIN_MS = 60_000;
 const DEFAULT_TOKEN_FALLBACK_TTL_MS = 7 * 86_400_000;
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const ALLOWED_IMAGE_HOSTS = new Set(['oms-oss-public.ninebot.com', 'steeldust-image-cdn.ninebot.com']);
 
 const TRANSIENT_ERROR_RE = /(?:econnreset|etimedout|epipe|econnrefused|ehostunreach|timeout|timed out|socket hang up|reset|eof)/i;
 const AUTH_ERROR_CODES = new Set(['401905', '4102', '4103', '401', '10001', '90001']);
@@ -401,6 +404,87 @@ export function isPassportSuccess(parsed) {
 }
 
 /**
+ * Validate and normalize an official Ninebot PNG render URL.
+ * Permits only `https:` on Ninebot domains pointing to a clean `.png` path.
+ * @param {unknown} rawUrl
+ * @returns {string | null}
+ */
+export function sanitizeNinebotImageUrl(rawUrl) {
+  if (typeof rawUrl !== 'string') return null;
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return null;
+  let u;
+  try {
+    u = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== 'https:') return null;
+  if (u.username || u.password || u.hash) return null;
+  if (u.port && u.port !== '443') return null;
+  const host = u.hostname.toLowerCase();
+  if (!ALLOWED_IMAGE_HOSTS.has(host) && !host.endsWith('.ninebot.com')) return null;
+
+  let decodedPath;
+  try {
+    decodedPath = decodeURIComponent(u.pathname);
+  } catch {
+    return null;
+  }
+  const rawAfterScheme = trimmed.slice(trimmed.indexOf('://') + 3);
+  const slashIdx = rawAfterScheme.indexOf('/');
+  const rawPathPart = slashIdx >= 0 ? rawAfterScheme.slice(slashIdx).split(/[?#]/, 1)[0] || '' : '';
+  let decodedRawPath = rawPathPart;
+  try {
+    decodedRawPath = decodeURIComponent(rawPathPart);
+  } catch {
+    return null;
+  }
+  if (!decodedPath.startsWith('/') || decodedPath.startsWith('//') || decodedPath.includes('\\') || decodedRawPath.includes('\\')) {
+    return null;
+  }
+  for (let i = 0; i < decodedPath.length; i++) {
+    const code = decodedPath.charCodeAt(i);
+    if (code <= 32 || code === 127) return null;
+  }
+  if (
+    decodedPath.split('/').some(seg => seg === '.' || seg === '..') ||
+    decodedRawPath.split('/').some(seg => seg === '.' || seg === '..')
+  ) {
+    return null;
+  }
+  if (!decodedPath.toLowerCase().endsWith('.png')) return null;
+  return u.toString();
+}
+
+/**
+ * Unwrap Ninebot gateway payloads that sometimes wrap the entity inside `[0]` or `{"0": {...}}`.
+ * @param {unknown} raw
+ * @returns {Record<string, any>}
+ */
+function unwrapIndexedPayload(raw) {
+  if (Array.isArray(raw)) {
+    const first = raw[0];
+    return first && typeof first === 'object' && !Array.isArray(first)
+      ? /** @type {Record<string, any>} */ (first)
+      : {};
+  }
+  if (!raw || typeof raw !== 'object') return {};
+  const obj = /** @type {Record<string, any>} */ (raw);
+  if (
+    !('sn' in obj) &&
+    !('dump_energy' in obj) &&
+    !('electricity' in obj) &&
+    obj['0'] &&
+    typeof obj['0'] === 'object' &&
+    !Array.isArray(obj['0'])
+  ) {
+    return /** @type {Record<string, any>} */ (obj['0']);
+  }
+  return obj;
+}
+
+/**
  * Normalize a vehicle list item while stripping sensitive owner/hardware metadata.
  * @param {Record<string, unknown>} item
  * @param {'motor' | 'ebike' | 'official'} businessLine
@@ -423,6 +507,9 @@ export function normalizeVehicleRecord(item, businessLine = 'motor') {
     item.title,
   ) || sn;
   const modelName = pickStr(item.vehicle_name_zh, item.vehicle_name, item.vehicleName, item.modelName) || '';
+  const color = pickStr(item.color) || '';
+  const darkImageUrl = sanitizeNinebotImageUrl(pickStr(item.v6_dark_img_url, item.v6_light_img_url, item.img_url) || '');
+  const lightImageUrl = sanitizeNinebotImageUrl(pickStr(item.v6_light_img_url, item.img_url, item.v6_dark_img_url) || '');
   const totalMileageKm = pickNum(item.total_mileage, item.totalMileage);
   const smartServiceSurplusDays = pickNum(item.smart_service_surplus_days);
   const vehicleType = pickNum(item.vehicle_type, item.vehicleType);
@@ -432,6 +519,9 @@ export function normalizeVehicleRecord(item, businessLine = 'motor') {
     sn,
     name,
     modelName,
+    color,
+    darkImageUrl,
+    lightImageUrl,
     businessLine,
     vehicleType,
     totalMileageKm,
@@ -459,10 +549,10 @@ export function normalizeVehicleRecord(item, businessLine = 'motor') {
  * }} input
  */
 export function normalizeVehicleSnapshot(input) {
-  const desktop = /** @type {Record<string, any>} */ (input.desktop && typeof input.desktop === 'object' ? input.desktop : {});
-  const vehicleInfo = /** @type {Record<string, any>} */ (input.vehicleInfo && typeof input.vehicleInfo === 'object' ? input.vehicleInfo : {});
-  const batteryInfo = /** @type {Record<string, any>} */ (input.batteryInfo && typeof input.batteryInfo === 'object' ? input.batteryInfo : {});
-  const vehicleStatus = /** @type {Record<string, any>} */ (input.vehicleStatus && typeof input.vehicleStatus === 'object' ? input.vehicleStatus : {});
+  const desktop = unwrapIndexedPayload(input.desktop);
+  const vehicleInfo = unwrapIndexedPayload(input.vehicleInfo);
+  const batteryInfo = unwrapIndexedPayload(input.batteryInfo);
+  const vehicleStatus = unwrapIndexedPayload(input.vehicleStatus);
   const official = /** @type {Record<string, any>} */ (input.official && typeof input.official === 'object' ? input.official : {});
   const meta = /** @type {Record<string, any>} */ (input.vehicleMeta && typeof input.vehicleMeta === 'object' ? input.vehicleMeta : {});
 
@@ -526,18 +616,38 @@ export function normalizeVehicleSnapshot(input) {
     estimateMileageKm;
 
   const odometerKm = pickNum(vehicleInfo.total_mileage, meta.totalMileageKm);
-  const powerOn =
-    desktop.pwr === 1 ||
-    desktop.pwr === '1' ||
-    String(official.powerStatus ?? desktop.powerStatus ?? '').toUpperCase() === 'ON';
-
   const locObj = /** @type {Record<string, any>} */ (
     desktop.loc && typeof desktop.loc === 'object'
       ? desktop.loc
-      : official.locationInfo && typeof official.locationInfo === 'object'
-        ? official.locationInfo
-        : {}
+      : vehicleInfo.loc && typeof vehicleInfo.loc === 'object'
+        ? vehicleInfo.loc
+        : official.locationInfo && typeof official.locationInfo === 'object'
+          ? official.locationInfo
+          : {}
   );
+
+  // On M-series, `desktop.pwr` / `vehicleInfo.pwr` reports main-battery presence, NOT ignition ACC state.
+  // True ignition / power state comes from `vehicleStatus.power_status` and `loc.acc`.
+  const psRaw = vehicleStatus.power_status;
+  const accRaw = locObj.acc;
+  const officialPwr = String(official.powerStatus ?? desktop.powerStatus ?? '').trim().toUpperCase();
+  const powerOn =
+    psRaw === 1 || psRaw === '1'
+      ? true
+      : psRaw === 0 || psRaw === '0'
+        ? false
+        : accRaw === 1 || accRaw === '1'
+          ? true
+          : accRaw === 0 || accRaw === '0'
+            ? false
+            : officialPwr === 'ON';
+
+  const batteryPresent =
+    desktop.battery_exist === 1 ||
+    desktop.battery_exist === '1' ||
+    desktop.pwr === 1 ||
+    desktop.pwr === '1' ||
+    battery !== null;
 
   const locked =
     locObj.lock === 1 || locObj.lock === '1'
@@ -548,9 +658,14 @@ export function normalizeVehicleSnapshot(input) {
           ? false
           : null;
 
+  const sq = vehicleStatus.SQ && typeof vehicleStatus.SQ === 'object'
+    ? /** @type {Record<string, any>} */ (vehicleStatus.SQ)
+    : {};
   const barrelLockStatus = pickNum(desktop.barrel_lock_status);
-  const gsmSignal = pickNum(vehicleStatus.gsm_signal, vehicleStatus.gsm, vehicleStatus.signal);
-  const gnssSignal = pickNum(vehicleStatus.gnss_signal, vehicleStatus.gps_signal, vehicleStatus.satellites);
+  const gsmSignal = pickNum(vehicleStatus.gsm_signal, sq.GSM, vehicleStatus.gsm, vehicleStatus.signal);
+  const gnssSignal = pickNum(vehicleStatus.gnss_signal, sq.GNSS, vehicleStatus.gps_signal, vehicleStatus.satellites);
+  const gnssTimeSec = pickNum(vehicleInfo.gnss_time, sq.gnss_time, vehicleInfo.lastupdatetime);
+  const locDelaySec = pickNum(sq.loc_delay_seconds, vehicleStatus.sd_time);
   const smartServiceExpired =
     desktop.is_smart_service_expired === 1 ||
     desktop.is_smart_service_expired === '1' ||
@@ -604,14 +719,26 @@ export function normalizeVehicleSnapshot(input) {
     vehicleInfo.vehicle_name,
   ) || '';
 
+  const color = pickStr(meta.color, vehicleInfo.color, desktop.color) || '';
+  const darkImageUrl = sanitizeNinebotImageUrl(
+    pickStr(desktop.v6_dark_img_url, meta.darkImageUrl, desktop.v6_light_img_url, meta.lightImageUrl, vehicleInfo.img_url) || '',
+  );
+  const lightImageUrl = sanitizeNinebotImageUrl(
+    pickStr(desktop.v6_light_img_url, meta.lightImageUrl, vehicleInfo.img_url, desktop.v6_dark_img_url, meta.darkImageUrl) || '',
+  );
+
   return {
     sn: input.sn,
     name,
     modelName,
+    color,
+    darkImageUrl,
+    lightImageUrl,
     backend: input.backend ?? 'account',
     businessLine: input.businessLine ?? (meta.businessLine || 'motor'),
     capturedAt: input.capturedAt ?? Date.now(),
     battery,
+    batteryPresent,
     auxBattery,
     voltageV,
     temperatureC,
@@ -631,6 +758,8 @@ export function normalizeVehicleSnapshot(input) {
     barrelLockStatus,
     gsmSignal,
     gnssSignal,
+    gnssTimeSec,
+    locDelaySec,
     smartServiceExpired,
     isSharedAccount: isCommonUser,
     location: {
@@ -1069,6 +1198,18 @@ export function createNinebotClient(options = {}) {
         let payload = env.data;
         if (Array.isArray(payload)) {
           payload = payload[0] ?? null;
+        } else if (
+          payload &&
+          typeof payload === 'object' &&
+          !('sn' in payload) &&
+          !('dump_energy' in payload) &&
+          !('electricity' in payload) &&
+          '0' in payload
+        ) {
+          const inner0 = /** @type {Record<string, unknown>} */ (payload)['0'];
+          if (inner0 && typeof inner0 === 'object' && !Array.isArray(inner0)) {
+            payload = inner0;
+          }
         }
         if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
           return {
@@ -1094,7 +1235,10 @@ export function createNinebotClient(options = {}) {
    * @param {{ preferredLine?: string; vehicleMeta?: Record<string, unknown> | null; coordSys?: 'wgs84' | 'gcj02' }} [opts]
    */
   async function fetchVehicleSnapshotAccount(session, sn, opts = {}) {
-    const preferredLine = opts.preferredLine || String(opts.vehicleMeta?.businessLine || 'motor');
+    const metaLine = opts.vehicleMeta?.businessLine === 'motor' || opts.vehicleMeta?.businessLine === 'ebike'
+      ? String(opts.vehicleMeta.businessLine)
+      : undefined;
+    const preferredLine = opts.preferredLine || metaLine || 'motor';
 
     const [desktopRes, infoRes, batteryRes, statusRes] = await Promise.allSettled([
       queryWithGatewayFallback('/vehicle/vehicle/desktop-component', [['sn_str', sn]], session, preferredLine),
@@ -1487,6 +1631,45 @@ export function createNinebotClient(options = {}) {
     }
   }
 
+  /**
+   * Fetch an official Ninebot transparent PNG render after validating the URL allowlist and PNG header.
+   * Never throws on failure — returns `null` when unavailable or invalid.
+   * @param {string | null | undefined} urlStr
+   * @returns {Promise<Buffer | null>}
+   */
+  async function fetchVehicleImagePng(urlStr) {
+    const safeUrl = sanitizeNinebotImageUrl(urlStr);
+    if (!safeUrl) return null;
+    try {
+      const res = await requester({
+        method: 'GET',
+        url: safeUrl,
+        headers: {
+          'User-Agent': USER_AGENT,
+          Accept: 'image/png,image/*;q=0.8',
+        },
+        timeoutMs: DEFAULT_TIMEOUT_MS,
+        signal,
+      });
+      if (res.status !== 200 || !res.body) return null;
+      const rawBody = /** @type {unknown} */ (res.body);
+      const buf = Buffer.isBuffer(rawBody)
+        ? rawBody
+        : rawBody instanceof Uint8Array
+          ? Buffer.from(rawBody)
+          : null;
+      if (!buf || buf.length < 64 || buf.length > MAX_VEHICLE_IMAGE_BYTES) {
+        return null;
+      }
+      if (!buf.subarray(0, 8).equals(PNG_MAGIC)) {
+        return null;
+      }
+      return buf;
+    } catch {
+      return null;
+    }
+  }
+
   return {
     passportLogin,
     passportRefresh,
@@ -1498,5 +1681,6 @@ export function createNinebotClient(options = {}) {
     officialListVehicles,
     officialFetchSnapshot,
     reverseGeocodeAmap,
+    fetchVehicleImagePng,
   };
 }

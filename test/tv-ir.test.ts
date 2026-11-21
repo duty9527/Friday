@@ -308,8 +308,10 @@ test('tv-ir plugin is discovered and executable via host runPlugin (dryRun)', as
 });
 
 test('tv-remote deterministic voice parsers handle entry, directions, counts, combos, homophones, learned keys, exit, and noise', () => {
-  // 1. Entry detection
+  // 1. Entry detection (including 操控/操纵/操作/控制 phrasings)
   assert.deepEqual(parseTvRemoteEntryUtterance('遥控电视模式').matched, true);
+  assert.deepEqual(parseTvRemoteEntryUtterance('电视操纵模式').matched, true);
+  assert.deepEqual(parseTvRemoteEntryUtterance('进入电视操控模式').matched, true);
   assert.deepEqual(parseTvRemoteEntryUtterance('进入遥控电视模式').initialSteps, []);
   assert.equal(parseTvRemoteEntryUtterance('打开电视遥控模式').matched, true);
 
@@ -395,10 +397,15 @@ test('tv-remote deterministic voice parsers handle entry, directions, counts, co
     isAssistantTvRemoteActivation('好，电视已经能直接控制，刚才往下按了一个，红外码发送成功。要试别的键就说。[[END]]'),
     true,
   );
+  assert.equal(
+    isAssistantTvRemoteActivation('老板，电视遥控我已经切到支持模式了。你说“方向”或“确认”，我听你的。'),
+    true,
+  );
+  assert.equal(isAssistantTvRemoteActivation('已退出电视遥控模式。'), false);
   assert.equal(isAssistantTvRemoteActivation('已往下按了一下。 [[END]]'), false);
 
   // 4. Exit vs unrecognized background speech
-  for (const exitPhrase of ['退出', '退出遥控', '退出遥控模式', '好了', '不用了', '退一下吧。', '停', '不控了', '不要了']) {
+  for (const exitPhrase of ['退出', '退出遥控', '退出遥控模式', '退出电视操纵模式', '退出操控模式', '好了', '不用了', '退一下吧。', '停', '不控了', '不要了']) {
     assert.equal(parseTvRemoteInModeUtterance(exitPhrase).kind, 'exit', `Expected exit for "${exitPhrase}"`);
   }
   for (const noise of ['今天天气不错', '这不是我写的字。', '今天晚上吃什么', '网友们好']) {
@@ -528,7 +535,19 @@ test('tv-ir handleVoiceFastpath manages continuous remote mode, noise filtering,
       [{ key: 'down', label: '下', count: 1 }],
     );
     assert.equal(parseTvRemoteEntryPhrase('遥控电视模式').matched, true);
+    assert.equal(parseTvRemoteEntryPhrase('电视操纵模式。').matched, true);
+    assert.equal(parseTvRemoteEntryPhrase('进入电视操控模式').matched, true);
     assert.equal(isPluginTvRemoteActivation('好，电视已经能直接控制，要试别的键就说。[[END]]'), true);
+    assert.equal(isPluginTvRemoteActivation('老板，电视遥控我已经切到支持模式了。你说“方向”或“确认”，我听你的。'), true);
+    assert.equal(isPluginTvRemoteActivation('已退出电视遥控模式。'), false);
+
+    const manipExit = await handleVoiceFastpath({
+      text: '退出电视操纵模式',
+      sessionState: { tvRemoteActive: true },
+    }, ctx);
+    assert.equal(manipExit.handled, true);
+    assert.equal(manipExit.clearSessionState, true);
+    assert.equal(manipExit.speech, '已退出电视遥控模式。');
 
     const replyRes = await handleVoiceFastpath({
       text: '',

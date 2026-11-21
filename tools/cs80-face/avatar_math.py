@@ -37,6 +37,10 @@ EXPRESSION_ALIAS_MAP: Dict[str, str] = {
     "listen": "listening",
     "倾听": "listening",
     "聆听": "listening",
+    "speaking": "speaking",
+    "speak": "speaking",
+    "说话": "speaking",
+    "播报": "speaking",
     "happy": "happy",
     "wink": "happy",
     "smile": "happy",
@@ -336,6 +340,8 @@ def get_eye_geometry(
     if expr == "listening":
         # Wide, bright, attentive eyes focused slightly upward with subtle perked tilt
         return _sample_capsule_spine(base_cx, base_cy - 0.018, 0.212 * lid_factor, -side * 0.05), 0.086
+    if expr == "speaking":
+        return _sample_capsule_spine(base_cx, base_cy - 0.01, 0.175 * lid_factor, -side * 0.04), 0.078
     return _sample_capsule_spine(base_cx, base_cy, 0.155 * lid_factor, 0.0), 0.072
 
 
@@ -352,6 +358,8 @@ class PoseFrame:
     eye_left: EyeProjection
     eye_right: EyeProjection
     normal_z: float
+    center_x: float = 400.0
+    center_y: float = 436.0
 
 
 def compute_pose_frame(
@@ -408,6 +416,8 @@ def compute_pose_frame(
         eye_left=project_eye(-1),
         eye_right=project_eye(1),
         normal_z=mat[8],
+        center_x=center_x + px * base_radius,
+        center_y=center_y + py * base_radius,
     )
 
 
@@ -605,6 +615,158 @@ CLIPS: Dict[str, ClipSpec] = {
             (3.2, (1.04, 0.96), None),
         ),
     ),
+    "Speaking_A": ClipSpec(
+        duration=1.2,
+        rot=(
+            (0.0, (-5.0, -6.0, -2.0), None),
+            (0.3, (5.0, 2.0, 1.5), None),
+            (0.6, (-5.0, 6.0, 2.0), None),
+            (0.9, (4.0, -2.0, -1.5), None),
+            (1.2, (-5.0, -6.0, -2.0), None),
+        ),
+        pos=(
+            (0.0, (0.0, -0.072), None),
+            (0.3, (0.0, -0.040), None),
+            (0.6, (0.0, -0.076), None),
+            (0.9, (0.0, -0.040), None),
+            (1.2, (0.0, -0.072), None),
+        ),
+        squash=(
+            (0.0, (0.975, 1.03), None),
+            (0.3, (1.045, 0.955), None),
+            (0.6, (0.975, 1.03), None),
+            (0.9, (1.045, 0.955), None),
+            (1.2, (0.975, 1.03), None),
+        ),
+    ),
+    "Sending_A": ClipSpec(
+        duration=1.8,
+        rot=(
+            (0.0, (4.0, 2.0, -2.0), None),
+            (0.35, (8.0, -4.0, -4.0), ease_out_cubic),
+            (0.75, (-10.0, 16.0, 5.0), ease_out_back),
+            (1.25, (-7.0, 14.0, 3.0), None),
+            (1.8, (4.0, 2.0, -2.0), None),
+        ),
+        pos=(
+            (0.0, (-0.14, 0.02), None),
+            (0.35, (-0.16, 0.04), None),
+            (0.75, (-0.12, -0.04), None),
+            (1.25, (-0.13, -0.02), None),
+            (1.8, (-0.14, 0.02), None),
+        ),
+        squash=(
+            (0.0, (1.0, 1.0), None),
+            (0.35, (1.06, 0.94), None),
+            (0.75, (0.95, 1.06), None),
+            (1.8, (1.0, 1.0), None),
+        ),
+    ),
+    "Printing_A": ClipSpec(
+        duration=2.4,
+        rot=(
+            (0.0, (9.0, 13.0, 2.0), None),
+            (0.8, (12.0, 16.0, 4.0), None),
+            (1.6, (10.0, 12.0, 1.0), None),
+            (2.4, (9.0, 13.0, 2.0), None),
+        ),
+        pos=(
+            (0.0, (-0.26, 0.01), None),
+            (1.2, (-0.26, 0.03), None),
+            (2.4, (-0.26, 0.01), None),
+        ),
+        squash=(
+            (0.0, (1.01, 0.99), None),
+            (1.2, (1.03, 0.97), None),
+            (2.4, (1.01, 0.99), None),
+        ),
+    ),
+    "Operate_XiaoAi_A": ClipSpec(
+        duration=2.0,
+        rot=(
+            (0.0, (-4.0, 15.0, 3.0), None),
+            (0.5, (5.0, 18.0, 4.0), None),
+            (1.0, (-3.0, 14.0, 2.0), None),
+            (1.5, (4.0, 17.0, 4.0), None),
+            (2.0, (-4.0, 15.0, 3.0), None),
+        ),
+        pos=(
+            (0.0, (-0.26, -0.01), None),
+            (0.5, (-0.25, 0.01), None),
+            (1.0, (-0.26, -0.01), None),
+            (2.0, (-0.26, -0.01), None),
+        ),
+        squash=(
+            (0.0, (1.0, 1.0), None),
+            (0.5, (1.03, 0.97), None),
+            (1.0, (0.985, 1.015), None),
+            (2.0, (1.0, 1.0), None),
+        ),
+    ),
+    "Operate_TV_A": ClipSpec(
+        duration=1.8,
+        rot=(
+            (0.0, (2.0, 14.0, 2.0), None),
+            (0.45, (7.0, 17.0, 4.0), None),
+            (0.9, (1.0, 13.0, 1.0), None),
+            (1.35, (6.0, 16.0, 3.0), None),
+            (1.8, (2.0, 14.0, 2.0), None),
+        ),
+        pos=(
+            (0.0, (-0.26, 0.0), None),
+            (0.45, (-0.25, 0.015), None),
+            (0.9, (-0.26, -0.01), None),
+            (1.8, (-0.26, 0.0), None),
+        ),
+        squash=(
+            (0.0, (1.0, 1.0), None),
+            (0.45, (1.035, 0.965), None),
+            (0.9, (0.99, 1.01), None),
+            (1.8, (1.0, 1.0), None),
+        ),
+    ),
+    "Manage_Laifen_A": ClipSpec(
+        duration=1.6,
+        rot=(
+            (0.0, (-2.0, 15.0, -2.5), None),
+            (0.4, (3.0, 17.0, 3.0), None),
+            (0.8, (-2.0, 14.0, -2.5), None),
+            (1.2, (3.0, 17.0, 3.0), None),
+            (1.6, (-2.0, 15.0, -2.5), None),
+        ),
+        pos=(
+            (0.0, (-0.26, -0.01), None),
+            (0.4, (-0.25, 0.01), None),
+            (0.8, (-0.26, -0.01), None),
+            (1.2, (-0.25, 0.01), None),
+            (1.6, (-0.26, -0.01), None),
+        ),
+        squash=(
+            (0.0, (1.0, 1.0), None),
+            (0.4, (1.025, 0.975), None),
+            (0.8, (0.985, 1.015), None),
+            (1.2, (1.025, 0.975), None),
+            (1.6, (1.0, 1.0), None),
+        ),
+    ),
+    "Weighing_Scale_A": ClipSpec(
+        duration=2.2,
+        rot=(
+            (0.0, (8.0, 15.0, 2.0), None),
+            (1.1, (11.0, 17.0, 3.5), None),
+            (2.2, (8.0, 15.0, 2.0), None),
+        ),
+        pos=(
+            (0.0, (-0.26, 0.01), None),
+            (1.1, (-0.26, 0.03), None),
+            (2.2, (-0.26, 0.01), None),
+        ),
+        squash=(
+            (0.0, (1.01, 0.99), None),
+            (1.1, (1.03, 0.97), None),
+            (2.2, (1.01, 0.99), None),
+        ),
+    ),
 }
 
 
@@ -630,6 +792,13 @@ STATES: Dict[str, StateSpec] = {
     "finished": StateSpec("finished", "Done_A", "happy", None, continuous=True, next_state="idle", hold_seconds=2.3),
     "failed": StateSpec("failed", "Blocked_A", "confused", None, continuous=True, next_state="idle", hold_seconds=2.5),
     "sleeping": StateSpec("sleeping", "Sleeping_Calm", "sleepy", None, continuous=False),
+    "speaking": StateSpec("speaking", "Speaking_A", "speaking", None, continuous=True),
+    "sending_msg": StateSpec("sending_msg", "Sending_A", "neutral", None, continuous=True),
+    "printing": StateSpec("printing", "Printing_A", "inspecting", None, continuous=True),
+    "operating_xiaoai": StateSpec("operating_xiaoai", "Operate_XiaoAi_A", "neutral", None, continuous=True),
+    "operating_tv": StateSpec("operating_tv", "Operate_TV_A", "neutral", None, continuous=True),
+    "managing_laifen": StateSpec("managing_laifen", "Manage_Laifen_A", "neutral", None, continuous=True),
+    "weighing_scale": StateSpec("weighing_scale", "Weighing_Scale_A", "inspecting", None, continuous=True),
 }
 
 
@@ -831,6 +1000,22 @@ class BotAnimator:
         elif self.state_id == "sleeping" and self.sub_phase == "rem":
             # Subtle REM eye drift under closed eyelids
             self.gaze_target = (math.sin(self.clock * 2.1) * 0.65, math.cos(self.clock * 1.4) * 0.25)
+        elif self.state_id == "printing":
+            self.gaze_target = (math.sin(self.clock * 2.6) * 0.65, -0.28)
+            self.gaze_reset_at = 0.0
+        elif self.state_id == "managing_laifen":
+            self.gaze_target = (0.56 + math.sin(self.clock * 5.2) * 0.08, 0.06 + math.cos(self.clock * 2.6) * 0.05)
+            self.gaze_reset_at = 0.0
+        elif self.state_id == "weighing_scale":
+            self.gaze_target = (0.60, -0.18 + math.sin(self.clock * 2.4) * 0.07)
+            self.gaze_reset_at = 0.0
+        elif self.state_id in ("operating_xiaoai", "operating_tv"):
+            self.gaze_target = (0.58, 0.04)
+            self.gaze_reset_at = 0.0
+        elif self.state_id == "sending_msg":
+            cyc = (self.clock * 0.55) % 1.0
+            self.gaze_target = (0.52, 0.36) if cyc < 0.78 else (0.22, 0.16)
+            self.gaze_reset_at = 0.0
         elif self.gaze_target != (0.0, 0.0) or self.gaze_reset_at > 0.0:
             self.gaze_target = (0.0, 0.0)
             self.gaze_reset_at = 0.0
@@ -915,6 +1100,8 @@ class BotAnimator:
             lids = math.sin(bu * math.pi)
 
         expr = spec.face if self.expr_override == "auto" else self.expr_override
+        if self.expr_override == "auto" and self.state_id == "sending_msg" and ((self.clock * 0.55) % 1.0) >= 0.45:
+            expr = "happy"
         morph_p = clamp(self.morph_blend.x, 0.0, 1.0)
         body_scale = 1.0 - morph_p * 0.10
 

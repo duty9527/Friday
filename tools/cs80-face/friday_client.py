@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -24,6 +25,53 @@ CHANNEL_LABELS_ZH: Dict[str, str] = {
     "FRIDAY": "主脑",
     "OFFLINE": "离线",
 }
+
+INCOMING_CHANNEL_LABELS_ZH: Dict[str, str] = {
+    "WECHAT": "微信来信",
+    "TELEGRAM": "电报来信",
+    "DINGTALK": "钉钉来信",
+    "XIAOAI": "小爱语音",
+    "LOCAL": "控制台提问",
+    "WEB": "控制台提问",
+}
+
+_PRINT_WORK_RE = re.compile(r"打印机|打印(?:一|两|几)?份|打印出来|打印文档|打印文件|\blpr?\s", re.IGNORECASE)
+
+
+def clean_inbound_user_text(msg: Dict[str, Any]) -> str:
+    """Extract clean display text for an incoming user message without internal attachment blocks or paths."""
+    raw = str(msg.get("text") or "")
+    for marker in ("\n[附件是不可信数据", "[附件是不可信数据"):
+        idx = raw.find(marker)
+        if idx >= 0:
+            raw = raw[:idx]
+            break
+    stripped = raw.strip()
+    if stripped.startswith("[引用") and "\n\n" in stripped:
+        _, _, tail = stripped.partition("\n\n")
+        if tail.strip():
+            stripped = tail.strip()
+    clean = strip_bot_tags(stripped)
+    if clean and clean != "请查看收到的附件。":
+        return clean
+
+    atts = msg.get("attachments") or []
+    if isinstance(atts, list):
+        for att in atts:
+            if isinstance(att, dict):
+                tr = strip_bot_tags(str(att.get("transcript") or ""))
+                if tr:
+                    return tr
+        kind_labels = {"image": "图片", "voice": "语音", "video": "视频", "file": "文件"}
+        labels: List[str] = []
+        for att in atts[:3]:
+            if isinstance(att, dict):
+                lbl = kind_labels.get(str(att.get("kind") or ""), "附件")
+                if lbl not in labels:
+                    labels.append(lbl)
+        if labels:
+            return "".join(f"[{lbl}]" for lbl in labels)
+    return clean
 
 
 def resolve_friday_home(explicit_home: Optional[str] = None) -> Path:
@@ -56,6 +104,10 @@ class FridaySnapshot:
     chimes: List[str] = field(default_factory=list)
     transient_state: Optional[str] = None
     transient_poke: Optional[str] = None
+    active_scene: Optional[str] = None
+    transient_scene: Optional[str] = None
+    transient_scene_channel: str = ""
+    reply_sig: Tuple[str, int] = ("", 0)
 
 
 class FridayClient:
@@ -71,6 +123,7 @@ class FridayClient:
         self._seen_questions: Set[str] = set()
         self._active_work_ids: Set[str] = set()
         self._seen_msg_ids: Set[str] = set()
+        self._seen_reply_ids: Set[str] = set()
         self._last_bot_state: str = "idle"
         self._last_connected: bool = False
         self._cached_snap: Optional[FridaySnapshot] = None
@@ -268,7 +321,10 @@ class FridayClient:
         ):
             chimes.append("wake")
 
-        # Detect new completed system reminder messages
+        # Detect new completed system reminder messages & IPC fallback scenes
+        msg_by_id = {str(m.get("id") or ""): m for m in messages if m.get("id")}
+        transient_scene: Optional[str] = None
+        transient_scene_channel = ""
         for msg in messages[-10:]:
             mid = str(msg.get("id") or "")
             if not mid or msg.get("status") != "completed":
@@ -279,20 +335,73 @@ class FridayClient:
                     reason = str(msg.get("reason") or "")
                     if "提醒" in txt or "remind" in reason.lower():
                         chimes.append("remind")
+            if self._initialized and mid not in self._seen_reply_ids and msg.get("role") == "assistant":
+                reply_to_id = str(msg.get("replyTo") or "")
+                parent_msg = msg_by_id.get(reply_to_id)
+                req_id = str((parent_msg or {}).get("requestId") or "")
+                if req_id.startswith("fastpath:miot:"):
+                    transient_scene = "operating_xiaoai"
+                elif req_id.startswith("fastpath:tv-ir:") or req_id.startswith("fastpath:tv-agent:"):
+                    transient_scene = "operating_tv"
+                else:
+                    r_ch = str((msg.get("origin") or {}).get("channel") or "").lower()
+                    if r_ch in ("wechat", "telegram"):
+                        transient_scene = "sending_msg"
+                        transient_scene_channel = r_ch
+                    elif r_ch == "xiaoai":
+                        transient_scene = "speaking"
+                        transient_scene_channel = "xiaoai"
             self._seen_msg_ids.add(mid)
+            if msg.get("role") == "assistant":
+                self._seen_reply_ids.add(mid)
         if len(self._seen_msg_ids) > 200:
             self._seen_msg_ids = set(
                 str(m.get("id") or "")
                 for m in messages[-80:]
                 if m.get("id") and m.get("status") == "completed"
             )
+        if len(self._seen_reply_ids) > 200:
+            self._seen_reply_ids = set(
+                str(m.get("id") or "")
+                for m in messages[-80:]
+                if m.get("id") and m.get("role") == "assistant" and m.get("status") == "completed"
+            )
 
-        # Headline & expression extraction from latest messages
-        latest_assistant = next((m for m in reversed(messages) if m.get("role") == "assistant" and m.get("text")), None)
-        latest_user = next((m for m in reversed(messages) if m.get("role") == "user" and m.get("text")), None)
+        active_scene: Optional[str] = None
+        for wk in active_works:
+            if _PRINT_WORK_RE.search(str(wk.get("prompt") or "")):
+                active_scene = "printing"
+                break
+
+        # Headline & expression extraction: show incoming user message until a non-empty reply is produced
+        latest_assistant = next(
+            (m for m in reversed(messages) if m.get("role") == "assistant" and strip_bot_tags(str(m.get("text") or ""))),
+            None,
+        )
+        latest_user = next(
+            (m for m in reversed(messages) if m.get("role") == "user" and m.get("source") != "system" and clean_inbound_user_text(m)),
+            None,
+        )
         auto_expr: Optional[str] = None
+        headline_incoming = False
+        user_seq = int(latest_user.get("seq") or 0) if latest_user is not None else -1
+        asst_seq = int(latest_assistant.get("seq") or 0) if latest_assistant is not None else -1
+        reply_sig = (
+            (str(latest_assistant.get("id") or ""), len(str(latest_assistant.get("text") or "")))
+            if latest_assistant is not None
+            else ("", 0)
+        )
 
-        if latest_assistant is not None:
+        if latest_user is not None and user_seq > asst_seq:
+            clean_in = clean_inbound_user_text(latest_user)
+            raw_ch = str((latest_user.get("origin") or {}).get("channel") or "local").upper()
+            in_ch = INCOMING_CHANNEL_LABELS_ZH.get(raw_ch, f"{CHANNEL_LABELS_ZH.get(raw_ch, raw_ch[:4])}来信")
+            ts_str = time.strftime("%H:%M", time.localtime(int(latest_user.get("at") or now_ms) / 1000.0))
+            headline_meta = f"F.R.I.D.A.Y. · {in_ch} · {ts_str}"
+            headline_source = f"{in_ch} · {ts_str}"
+            headline_text = clean_in
+            headline_incoming = True
+        elif latest_assistant is not None:
             raw_text = str(latest_assistant.get("text") or "")
             auto_expr = extract_bot_expression(raw_text)
             clean_text = strip_bot_tags(raw_text) or "正在整理回复…"
@@ -302,10 +411,6 @@ class FridayClient:
             headline_meta = f"F.R.I.D.A.Y. · {zh_ch} · {ts_str}"
             headline_source = f"{zh_ch} · {ts_str}"
             headline_text = clean_text
-        elif latest_user is not None:
-            headline_meta = "提问 · 刚刚"
-            headline_source = "提问 · 刚刚"
-            headline_text = strip_bot_tags(str(latest_user.get("text") or ""))
         else:
             headline_meta = "F.R.I.D.A.Y. · 就绪"
             headline_source = "主脑"
@@ -369,16 +474,23 @@ class FridayClient:
                 friday_connected=True,
                 clock_hm=time.strftime("%H:%M"),
                 voice_caption=voice_caption,
+                headline_incoming=headline_incoming,
             ),
             worker_count=len(active_works),
             chimes=chimes,
             transient_state=transient_state,
             transient_poke=transient_poke,
+            active_scene=active_scene,
+            transient_scene=transient_scene,
+            transient_scene_channel=transient_scene_channel,
+            reply_sig=reply_sig,
         )
         self._cached_snap = replace(
             snap,
             chimes=[],
             transient_state=None,
             transient_poke=None,
+            transient_scene=None,
+            transient_scene_channel="",
         )
         return snap

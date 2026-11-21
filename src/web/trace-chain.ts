@@ -577,8 +577,8 @@ function resolveTone(status: string, opts?: { shouldSupplement?: boolean; exitCo
   return 'neutral';
 }
 
-function formatSessionNote(link?: SessionTurnLink, sessionId?: string): string | undefined {
-  if (!link) return sessionId ? `会话 ID: ${sessionId}` : undefined;
+function formatSessionNote(link?: SessionTurnLink, _sessionId?: string): string | undefined {
+  if (!link) return undefined;
   const parts = [link.label];
   if (link.detail) parts.push(link.detail);
   if (link.confidence !== undefined) parts.push(`置信度 ${Math.round(link.confidence * 100)}%`);
