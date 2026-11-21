@@ -231,6 +231,7 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
 
   let active = false;
   let busy = false;
+  let statusSeq = 0;
   let ringingId: string | null = null;
   let lastData: ApplePluginStatusData | undefined;
 
@@ -445,8 +446,9 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
     syncControlStates();
   }
 
-  async function loadStatus(mode: 'auto' | 'refresh' | 'cache' = 'auto'): Promise<void> {
-    if (busy) return;
+  async function loadStatus(mode: 'auto' | 'refresh' | 'cache' = 'auto', opts?: { preserveBanner?: boolean }): Promise<void> {
+    if (busy || appState.authExpired) return;
+    const seq = ++statusSeq;
     setBusy(true);
     if (mode === 'refresh') {
       setStatus('正在唤醒苹果设备并同步实时电量与定位（约需 2～5 秒）…', 'warn');
@@ -457,39 +459,48 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
         : mode === 'cache'
           ? await runApplePlugin('status', { cacheOnly: true })
           : await runApplePlugin('status', {});
+      if (seq !== statusSeq || appState.authExpired) return;
       busy = false;
       if (res.data) {
         render(res.data);
       }
-      if (!res.ok) {
-        setStatus(res.message || '操作失败', 'err');
-      } else if (mode === 'refresh') {
-        const msg = res.data?.cooldownActive
-          ? `命中防耗电冷却（${res.data.cooldownRemainingSec}s 后可再次唤醒），已返回最近缓存`
-          : '已刷新苹果设备实时状态';
-        setStatus(msg, res.data?.cooldownActive ? 'warn' : 'ok');
-      } else if (mode === 'cache') {
-        setStatus('已加载本地缓存快照', 'ok');
-      } else {
-        setStatus('');
+      if (!opts?.preserveBanner) {
+        if (!res.ok) {
+          setStatus(res.message || '操作失败', 'err');
+        } else if (mode === 'refresh') {
+          const msg = res.data?.cooldownActive
+            ? `命中防耗电冷却（${res.data.cooldownRemainingSec}s 后可再次唤醒），已返回最近缓存`
+            : '已刷新苹果设备实时状态';
+          setStatus(msg, res.data?.cooldownActive ? 'warn' : 'ok');
+        } else if (mode === 'cache') {
+          setStatus('已加载本地缓存快照', 'ok');
+        } else {
+          setStatus('');
+        }
       }
     } catch (err) {
-      setStatus(`加载苹果设备状态失败：${errorText(err)}`, 'err');
+      if (seq !== statusSeq || appState.authExpired) return;
+      if (!opts?.preserveBanner) {
+        setStatus(`加载苹果设备状态失败：${errorText(err)}`, 'err');
+      }
     } finally {
       setBusy(false);
     }
   }
 
   async function handlePlaySound(dev: AppleDeviceItem): Promise<void> {
-    if (busy) return;
+    if (busy || appState.authExpired) return;
+    const seq = ++statusSeq;
     ringingId = dev.id;
     setBusy(true);
     if (lastData) render(lastData);
     setStatus(`正在向 ${dev.name} 发送 Find My 响铃指令…`, 'warn');
     try {
       const res = await runApplePlugin('play-sound', { device: dev.id });
+      if (seq !== statusSeq || appState.authExpired) return;
       setStatus(res.message || (res.ok ? `已触发 ${dev.name} 响铃` : '响铃失败'), res.ok ? 'ok' : 'err');
     } catch (err) {
+      if (seq !== statusSeq || appState.authExpired) return;
       setStatus(`发送响铃失败：${errorText(err)}`, 'err');
     } finally {
       ringingId = null;
@@ -500,6 +511,7 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
   }
 
   async function handleLogin(): Promise<void> {
+    if (busy || appState.authExpired) return;
     const appleId = appleIdInput.value.trim();
     const password = passwordInput.value;
     const region = regionSelect.value === 'global' ? 'global' : 'cn';
@@ -507,17 +519,20 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
       setStatus('请输入 Apple ID 账号与主密码。', 'warn');
       return;
     }
+    const seq = ++statusSeq;
     passwordInput.value = '';
     setBusy(true);
     setStatus('正在通过 SRP-6a 协议连接苹果认证服务器…', 'warn');
     try {
       const res = await runApplePlugin('auth-login', { appleId, password, region });
+      if (seq !== statusSeq || appState.authExpired) return;
       busy = false;
       if (res.data) {
         render(res.data);
       }
       setStatus(res.message, res.ok ? (res.data?.authState === 'pending_2fa' ? 'warn' : 'ok') : 'err');
     } catch (err) {
+      if (seq !== statusSeq || appState.authExpired) return;
       setStatus(`登录失败：${errorText(err)}`, 'err');
     } finally {
       setBusy(false);
@@ -525,16 +540,19 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
   }
 
   async function handleSendSms(): Promise<void> {
-    if (busy) return;
+    if (busy || appState.authExpired) return;
+    const seq = ++statusSeq;
     setBusy(true);
     setStatus('正在请求向受信任手机号发送短信验证码…', 'warn');
     try {
       const res = await runApplePlugin('auth-sms', {});
+      if (seq !== statusSeq || appState.authExpired) return;
       busy = false;
       if (res.data) render(res.data);
       if (res.ok) twoFaModeSelect.value = 'sms';
       setStatus(res.message, res.ok ? 'ok' : 'err');
     } catch (err) {
+      if (seq !== statusSeq || appState.authExpired) return;
       setStatus(`发送短信验证码失败：${errorText(err)}`, 'err');
     } finally {
       setBusy(false);
@@ -542,22 +560,25 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
   }
 
   async function handleVerify2fa(): Promise<void> {
+    if (busy || appState.authExpired) return;
     const code = twoFaCodeInput.value.trim();
     const mode = twoFaModeSelect.value === 'sms' ? 'sms' : 'trusted_device';
     if (!/^\d{6}$/.test(code)) {
       setStatus('请输入 6 位数字双重认证验证码。', 'warn');
       return;
     }
-    if (busy) return;
+    const seq = ++statusSeq;
     setBusy(true);
     setStatus('正在核验 6 位验证码并建立长期信任会话…', 'warn');
     try {
       const res = await runApplePlugin('auth-verify', { code, mode });
+      if (seq !== statusSeq || appState.authExpired) return;
       if (res.ok) twoFaCodeInput.value = '';
       busy = false;
       if (res.data) render(res.data);
       setStatus(res.message, res.ok ? 'ok' : 'err');
     } catch (err) {
+      if (seq !== statusSeq || appState.authExpired) return;
       setStatus(`2FA 验证失败：${errorText(err)}`, 'err');
     } finally {
       setBusy(false);
@@ -565,14 +586,17 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
   }
 
   async function handleLogout(): Promise<void> {
-    if (busy) return;
+    if (busy || appState.authExpired) return;
+    const seq = ++statusSeq;
     setBusy(true);
     try {
       const res = await runApplePlugin('logout', {});
+      if (seq !== statusSeq || appState.authExpired) return;
       setStatus(res.message, res.ok ? 'ok' : 'err');
       busy = false;
-      await loadStatus('cache');
+      await loadStatus('cache', { preserveBanner: true });
     } catch (err) {
+      if (seq !== statusSeq || appState.authExpired) return;
       setStatus(`退出失败：${errorText(err)}`, 'err');
     } finally {
       setBusy(false);
@@ -580,7 +604,8 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
   }
 
   async function handleSaveConfig(): Promise<void> {
-    if (busy) return;
+    if (busy || appState.authExpired) return;
+    const seq = ++statusSeq;
     setBusy(true);
     try {
       const watchDevices = cfgWatch.value
@@ -597,10 +622,12 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
         customAliases: parseAliasesTextarea(cfgAliases.value),
         places: parsePlacesTextarea(cfgPlaces.value),
       });
+      if (seq !== statusSeq || appState.authExpired) return;
       setStatus(res.message, res.ok ? 'ok' : 'err');
       busy = false;
-      await loadStatus('auto');
+      await loadStatus('auto', { preserveBanner: true });
     } catch (err) {
+      if (seq !== statusSeq || appState.authExpired) return;
       setStatus(`保存配置失败：${errorText(err)}`, 'err');
     } finally {
       setBusy(false);
@@ -608,15 +635,18 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
   }
 
   async function handleBypass2fa(): Promise<void> {
-    if (busy) return;
+    if (busy || appState.authExpired) return;
+    const seq = ++statusSeq;
     setBusy(true);
     setStatus('正在尝试 Find My 单因素免码直通通道…', 'warn');
     try {
       const res = await runApplePlugin('auth-verify', { bypass2fa: true });
+      if (seq !== statusSeq || appState.authExpired) return;
       busy = false;
       if (res.data) render(res.data);
       setStatus(res.message, res.ok ? 'ok' : 'err');
     } catch (err) {
+      if (seq !== statusSeq || appState.authExpired) return;
       setStatus(`免码直通失败：${errorText(err)}`, 'err');
     } finally {
       setBusy(false);
@@ -636,17 +666,21 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
   return {
     activate: () => {
       active = true;
+      syncControlStates();
       if (options.isVisible()) {
         void loadStatus('auto');
       }
     },
     deactivate: () => {
       active = false;
+      syncControlStates();
     },
     refreshBadge: async () => {
-      if (active) return;
+      if (active || appState.authExpired) return;
+      const seq = ++statusSeq;
       try {
         const res = await runApplePlugin('status', { cacheOnly: true });
+        if (active || seq !== statusSeq || appState.authExpired) return;
         if (res.data) {
           lastData = res.data;
           updateTopBadge(res.data);

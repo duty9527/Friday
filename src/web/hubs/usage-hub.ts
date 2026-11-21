@@ -215,6 +215,7 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
     else usageChartTitle.textContent = '本月逐日趋势';
 
     if (!buckets.length) {
+      usageChartSubtitle.textContent = '';
       usageChartShell.replaceChildren(node('p', '当前周期暂无趋势数据。', 'empty hub-empty-state'));
       return;
     }
@@ -505,7 +506,7 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
       const costCny = stats?.costCny ?? 0;
       const card = node('div', '', `usage-actor-card${calls > 0 ? ' has-calls' : ''}`);
       card.append(
-        node('span', ACTOR_LABELS[actor], 'usage-actor-name'),
+        node('span', ACTOR_LABELS[actor] ?? actor, 'usage-actor-name'),
         node('strong', `${formatInt(calls)} 次`, 'usage-actor-calls'),
         node(
           'span',

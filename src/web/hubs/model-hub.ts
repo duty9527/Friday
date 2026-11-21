@@ -59,6 +59,32 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
   let activeAuthProviderTab = 'deepseek';
   let lastModalAuthProvId = '';
   let lastSyncedModalBaseUrl = '';
+  let modalAuthOpSeq = 0;
+  let modalToggleBusy = false;
+  let modalPoolSaveBusy = false;
+  let modalFetchBusy = false;
+  let modalTestBusy = false;
+  let customProvBusy = false;
+  let modalClearBusy = false;
+  let modalRoutingSaveBusy = false;
+  let modalRouterProbeBusy = false;
+
+  function syncAuthActionStates() {
+    const blocked = appState.authExpired || !appState.ready;
+    const hub = appState.view?.modelHub;
+    const currentProv = hub?.providers.find(p => p.id === activeAuthProviderTab);
+    const isDisabled = currentProv?.enabled === false;
+    const hasPoolRows = modalAuthPoolList.querySelectorAll('.modal-pool-select-row').length > 0;
+    modalAuthToggleBtn.disabled = blocked || modalToggleBusy || !currentProv;
+    modalAuthFetchBtn.disabled = blocked || modalFetchBusy || !currentProv || isDisabled;
+    modalAuthTestBtn.disabled = blocked || modalTestBusy || !currentProv || isDisabled;
+    modalAuthSaveTestBtn.disabled = blocked || modalTestBusy;
+    modalAuthClearBtn.disabled = blocked || modalClearBusy;
+    modalAuthPoolSaveBtn.disabled = blocked || modalPoolSaveBusy || !hasPoolRows;
+    customProvSaveBtn.disabled = blocked || customProvBusy;
+    modalSaveRoutingBtn.disabled = blocked || modalRoutingSaveBusy;
+    modalTestRouterBtn.disabled = blocked || modalRouterProbeBusy;
+  }
 
   function providerStatusText(prov: ModelProviderView): string {
     const prefix = prov.enabled === false ? '🚫 已禁用 · ' : '';
@@ -155,12 +181,15 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
     }
     if (!ids.length) frag.append(node('p', '该提供方暂无可选模型，请先接入并拉取模型', 'empty hub-empty-state'));
     modalAuthPoolList.replaceChildren(frag);
-    modalAuthPoolSaveBtn.disabled = appState.authExpired || !appState.ready || !ids.length;
+    syncAuthActionStates();
   }
 
   function renderModalAuthSection() {
     const hub = appState.view?.modelHub;
-    if (!hub) return;
+    if (!hub) {
+      syncAuthActionStates();
+      return;
+    }
     const providers = hub.providers;
     if (!providers.some(p => p.id === activeAuthProviderTab) && providers[0]) {
       activeAuthProviderTab = providers[0].id;
@@ -172,6 +201,7 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
       const tabBtn = button(
         `${statusIcon} ${prov.name} (${prov.models.length})`,
         () => {
+          ++modalAuthOpSeq;
           activeAuthProviderTab = prov.id;
           modalAuthKeyInput.value = '';
           modalAuthProbeResult.hidden = true;
@@ -184,16 +214,16 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
     modalProviderTabs.replaceChildren(tabsFrag);
 
     const currentProv = providers.find(p => p.id === activeAuthProviderTab);
-    if (!currentProv) return;
+    if (!currentProv) {
+      syncAuthActionStates();
+      return;
+    }
     const isDisabled = currentProv.enabled === false;
     modalAuthProviderTitle.textContent = currentProv.name;
     modalAuthStatusBadge.textContent = providerStatusText(currentProv);
     modalAuthStatusBadge.className = `hub-badge ${isDisabled ? 'badge-slate' : (currentProv.configured ? 'badge-green' : 'badge-amber')}`;
     modalAuthToggleBtn.textContent = isDisabled ? '▶️ 启用提供方' : '🚫 禁用提供方';
     modalAuthToggleBtn.className = `mini-button${isDisabled ? '' : ' danger-btn'}`;
-    modalAuthToggleBtn.disabled = appState.authExpired || !appState.ready;
-    modalAuthFetchBtn.disabled = isDisabled || appState.authExpired || !appState.ready;
-    modalAuthTestBtn.disabled = isDisabled || appState.authExpired || !appState.ready;
     const nextBaseUrl = currentProv.baseUrl ?? '';
     if (
       currentProv.id !== lastModalAuthProvId
@@ -232,9 +262,15 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
     targetBox: HTMLElement,
     triggerBtn?: HTMLButtonElement,
     inlineCreds?: { apiKey?: string; baseUrl?: string },
+    shouldRender: () => boolean = () => true,
   ): Promise<ModelProbeResult | undefined> {
     if (!model) return undefined;
-    if (triggerBtn) triggerBtn.disabled = true;
+    if (triggerBtn === modalTestRouterBtn) {
+      modalRouterProbeBusy = true;
+      syncAuthActionStates();
+    } else if (triggerBtn) {
+      triggerBtn.disabled = true;
+    }
     targetBox.hidden = false;
     targetBox.replaceChildren(node('p', `⏳ 正在实测 ${provider}/${model} 连通性与响应延迟…`, 'meta'));
     try {
@@ -245,18 +281,24 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
         ...(inlineCreds?.baseUrl ? { baseUrl: inlineCreds.baseUrl } : {}),
       });
       if (appState.view?.modelHub) appState.view.modelHub.lastProbe = probe;
-      renderProbeInto(targetBox, probe);
+      if (shouldRender()) renderProbeInto(targetBox, probe);
       return probe;
     } catch (error) {
-      targetBox.replaceChildren(node('p', `❌ 探针请求失败：${errorText(error)}`, 'error'));
+      if (shouldRender()) targetBox.replaceChildren(node('p', `❌ 探针请求失败：${errorText(error)}`, 'error'));
       return undefined;
     } finally {
-      if (triggerBtn) triggerBtn.disabled = false;
+      if (triggerBtn === modalTestRouterBtn) {
+        modalRouterProbeBusy = false;
+        syncAuthActionStates();
+      } else if (triggerBtn) {
+        triggerBtn.disabled = appState.authExpired || !appState.ready;
+      }
     }
   }
 
   async function toggleProviderEnabledFromUi(providerId: string, enabled: boolean) {
-    modalAuthToggleBtn.disabled = true;
+    modalToggleBusy = true;
+    syncAuthActionStates();
     try {
       const updated = await api<ModelHubView>('/api/model-configure', { providerId, enabled });
       if (appState.view) {
@@ -272,7 +314,8 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
     } catch (error) {
       hooks.connection(`${enabled ? '启用' : '禁用'}提供方失败：${errorText(error)}`, true);
     } finally {
-      modalAuthToggleBtn.disabled = false;
+      modalToggleBusy = false;
+      syncAuthActionStates();
     }
   }
 
@@ -284,7 +327,8 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
       const id = row.dataset.modelId;
       if (id && checkbox?.checked) selectedModels.push({ id });
     }
-    modalAuthPoolSaveBtn.disabled = true;
+    modalPoolSaveBusy = true;
+    syncAuthActionStates();
     try {
       const updated = await api<ModelHubView>('/api/model-configure', { providerId, selectedModels });
       if (appState.view) {
@@ -297,15 +341,18 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
     } catch (error) {
       hooks.connection(`保存模型池勾选失败：${errorText(error)}`, true);
     } finally {
-      modalAuthPoolSaveBtn.disabled = false;
+      modalPoolSaveBusy = false;
+      syncAuthActionStates();
     }
   }
 
   async function fetchAuthProviderModelsFromModal() {
     const providerId = activeAuthProviderTab;
+    const opSeq = ++modalAuthOpSeq;
     const apiKey = modalAuthKeyInput.value.trim() || undefined;
     const baseUrl = modalAuthBaseurlInput.value.trim() || undefined;
-    modalAuthFetchBtn.disabled = true;
+    modalFetchBusy = true;
+    syncAuthActionStates();
     modalAuthProbeResult.hidden = false;
     modalAuthProbeResult.replaceChildren(node('p', `⏳ 正在请求 ${providerId} 官方 /models 接口拉取真实模型列表…`, 'meta'));
     try {
@@ -321,28 +368,34 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
       render(true);
       renderModalAuthSection();
       syncModalRouterModels();
-      const prov = updated.providers.find(p => p.id === providerId);
-      modalAuthProbeResult.hidden = false;
-      modalAuthProbeResult.replaceChildren(
-        node('p', `✅ 已从 ${prov?.name ?? providerId} 接口实时同步 ${prov?.models.length ?? 0} 款模型并加入 F.R.I.D.A.Y. 调度池`, 'memory-topic'),
-        node('p', `返回模型：${(prov?.models ?? []).slice(0, 12).map(m => m.id).join(', ')}${(prov?.models.length ?? 0) > 12 ? ' …' : ''}`, 'memory-preview'),
-      );
+      if (opSeq === modalAuthOpSeq && activeAuthProviderTab === providerId) {
+        const prov = updated.providers.find(p => p.id === providerId);
+        modalAuthProbeResult.hidden = false;
+        modalAuthProbeResult.replaceChildren(
+          node('p', `✅ 已从 ${prov?.name ?? providerId} 接口实时同步 ${prov?.models.length ?? 0} 款模型并加入 F.R.I.D.A.Y. 调度池`, 'memory-topic'),
+          node('p', `返回模型：${(prov?.models ?? []).slice(0, 12).map(m => m.id).join(', ')}${(prov?.models.length ?? 0) > 12 ? ' …' : ''}`, 'memory-preview'),
+        );
+      }
     } catch (error) {
-      modalAuthProbeResult.hidden = false;
-      modalAuthProbeResult.replaceChildren(node('p', `❌ 拉取模型列表失败：${errorText(error)}`, 'error'));
+      if (opSeq === modalAuthOpSeq && activeAuthProviderTab === providerId) {
+        modalAuthProbeResult.hidden = false;
+        modalAuthProbeResult.replaceChildren(node('p', `❌ 拉取模型列表失败：${errorText(error)}`, 'error'));
+      }
     } finally {
-      modalAuthFetchBtn.disabled = false;
+      modalFetchBusy = false;
+      syncAuthActionStates();
     }
   }
 
   async function testAuthProviderFromModal(saveFirst: boolean) {
     const providerId = activeAuthProviderTab;
+    const opSeq = ++modalAuthOpSeq;
     const apiKey = modalAuthKeyInput.value.trim() || undefined;
     const baseUrl = modalAuthBaseurlInput.value.trim();
     const customModels = modalAuthCustomModelsInput.value.split(/[,，\s]+/).map(m => m.trim()).filter(Boolean);
     const testModel = modalAuthTestModelSelect.value;
-    modalAuthTestBtn.disabled = true;
-    modalAuthSaveTestBtn.disabled = true;
+    modalTestBusy = true;
+    syncAuthActionStates();
     try {
       if (saveFirst) {
         const updated = await api<ModelHubView>('/api/model-configure', {
@@ -355,27 +408,37 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
           appState.view.modelHub = updated;
           appState.view.modelTiers = updated.tiers;
         }
-        modalAuthKeyInput.value = '';
-        modalAuthCustomModelsInput.value = '';
+        if (activeAuthProviderTab === providerId) {
+          modalAuthKeyInput.value = '';
+          modalAuthCustomModelsInput.value = '';
+        }
         render(true);
         renderModalAuthSection();
         populateProviderSelect(modalRouterProviderSelect, updated.providers, updated.routerProvider);
         syncModalRouterModels();
-        if ([...modalAuthTestModelSelect.options].some(o => o.value === testModel)) {
+        if (activeAuthProviderTab === providerId && [...modalAuthTestModelSelect.options].some(o => o.value === testModel)) {
           modalAuthTestModelSelect.value = testModel;
         }
       }
-      await runInlineProbe(providerId, modalAuthTestModelSelect.value || testModel, modalAuthProbeResult, undefined, {
-        apiKey,
-        baseUrl: baseUrl || undefined,
-      });
+      if (opSeq === modalAuthOpSeq && activeAuthProviderTab === providerId) {
+        await runInlineProbe(
+          providerId,
+          modalAuthTestModelSelect.value || testModel,
+          modalAuthProbeResult,
+          undefined,
+          { apiKey, baseUrl: baseUrl || undefined },
+          () => opSeq === modalAuthOpSeq && activeAuthProviderTab === providerId,
+        );
+      }
       await hooks.refreshView();
     } catch (error) {
-      modalAuthProbeResult.hidden = false;
-      modalAuthProbeResult.replaceChildren(node('p', `❌ 保存或测试失败：${errorText(error)}`, 'error'));
+      if (opSeq === modalAuthOpSeq && activeAuthProviderTab === providerId) {
+        modalAuthProbeResult.hidden = false;
+        modalAuthProbeResult.replaceChildren(node('p', `❌ 保存或测试失败：${errorText(error)}`, 'error'));
+      }
     } finally {
-      modalAuthTestBtn.disabled = false;
-      modalAuthSaveTestBtn.disabled = false;
+      modalTestBusy = false;
+      syncAuthActionStates();
     }
   }
 
@@ -389,7 +452,8 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
       hooks.connection('请填写自定义提供方 ID 和 Base URL', true);
       return;
     }
-    customProvSaveBtn.disabled = true;
+    customProvBusy = true;
+    syncAuthActionStates();
     try {
       const updated = await api<ModelHubView>('/api/model-configure', {
         providerId,
@@ -402,6 +466,7 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
         appState.view.modelHub = updated;
         appState.view.modelTiers = updated.tiers;
       }
+      ++modalAuthOpSeq;
       activeAuthProviderTab = providerId;
       customProvIdInput.value = '';
       customProvNameInput.value = '';
@@ -417,13 +482,16 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
     } catch (error) {
       hooks.connection(`添加提供方失败：${errorText(error)}`, true);
     } finally {
-      customProvSaveBtn.disabled = false;
+      customProvBusy = false;
+      syncAuthActionStates();
     }
   }
 
   async function clearAuthProviderFromModal() {
     const providerId = activeAuthProviderTab;
-    modalAuthClearBtn.disabled = true;
+    const opSeq = ++modalAuthOpSeq;
+    modalClearBusy = true;
+    syncAuthActionStates();
     try {
       const updated = await api<ModelHubView>('/api/model-configure', {
         providerId,
@@ -433,23 +501,31 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
         appState.view.modelHub = updated;
         appState.view.modelTiers = updated.tiers;
       }
-      modalAuthKeyInput.value = '';
+      if (activeAuthProviderTab === providerId) {
+        modalAuthKeyInput.value = '';
+      }
       render(true);
       renderModalAuthSection();
-      modalAuthProbeResult.hidden = false;
-      modalAuthProbeResult.replaceChildren(node('p', `已清除提供方 ${providerId} 的已存凭据。`, 'meta'));
+      if (opSeq === modalAuthOpSeq && activeAuthProviderTab === providerId) {
+        modalAuthProbeResult.hidden = false;
+        modalAuthProbeResult.replaceChildren(node('p', `已清除提供方 ${providerId} 的已存凭据。`, 'meta'));
+      }
     } catch (error) {
-      modalAuthProbeResult.hidden = false;
-      modalAuthProbeResult.replaceChildren(node('p', `清除失败：${errorText(error)}`, 'error'));
+      if (opSeq === modalAuthOpSeq && activeAuthProviderTab === providerId) {
+        modalAuthProbeResult.hidden = false;
+        modalAuthProbeResult.replaceChildren(node('p', `清除失败：${errorText(error)}`, 'error'));
+      }
     } finally {
-      modalAuthClearBtn.disabled = false;
+      modalClearBusy = false;
+      syncAuthActionStates();
     }
   }
 
   async function saveModalRoutingFromUi() {
     const routerProvider = modalRouterProviderSelect.value;
     const routerModel = modalRouterModelSelect.value;
-    modalSaveRoutingBtn.disabled = true;
+    modalRoutingSaveBusy = true;
+    syncAuthActionStates();
     try {
       const updated = await api<ModelHubView>('/api/model-configure', {
         routerProvider,
@@ -464,7 +540,8 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
     } catch (error) {
       hooks.connection(`设定 F.R.I.D.A.Y. 主控模型失败：${errorText(error)}`, true);
     } finally {
-      modalSaveRoutingBtn.disabled = false;
+      modalRoutingSaveBusy = false;
+      syncAuthActionStates();
     }
   }
 
@@ -478,6 +555,7 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
         badgeText: '—',
         detailText: '模型提供方未就绪',
       });
+      syncAuthActionStates();
       if (options.isVisible() || force) {
         modelCurrentStatus.replaceChildren();
       }
@@ -494,6 +572,7 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
       badgeText,
       detailText: `主控 ${routerProvider}${routerModel} · 已接入 ${configuredCount} 个提供方 / ${pool.length} 款 Worker 模型`,
     });
+    syncAuthActionStates();
 
     if (!options.isVisible() && !force) {
       return;
@@ -595,6 +674,7 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
         void toggleProviderEnabledFromUi(prov.id, isDisabled);
       }, `mini-button${isDisabled ? '' : ' danger-btn'}`);
       const configBtn = button(prov.configured ? '⚙️ 管理凭据 ↑' : '➕ 接入提供方 ↑', () => {
+        ++modalAuthOpSeq;
         activeAuthProviderTab = prov.id;
         modalAuthKeyInput.value = '';
         modalAuthCustomModelsInput.value = '';
@@ -626,6 +706,7 @@ export function initModelHub(options: ModelHubOptions): ModelHubController {
       hooks.connection('正在读取模型中心数据，请稍候…');
       return;
     }
+    ++modalAuthOpSeq;
     if (focusProviderId) activeAuthProviderTab = focusProviderId;
     modalAuthKeyInput.value = '';
     modalAuthCustomModelsInput.value = '';

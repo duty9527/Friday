@@ -1,6 +1,6 @@
 import { element, isEditingWithin, node } from '../shared/dom.js';
 import { errorText, timestamp } from '../shared/format.js';
-import { api, hooks } from '../state.js';
+import { api, appState, hooks } from '../state.js';
 
 export interface NinebotUiOptions {
   isVisible: () => boolean;
@@ -270,6 +270,8 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
   let active = false;
   let busy = false;
   let draftDirty = false;
+  let dashboardSeq = 0;
+  let badgeSeq = 0;
   let trendMetric: TrendMetricKey = 'battery';
   let latestData: NinebotDashboardPayload | undefined;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
@@ -577,8 +579,8 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
     if (!ctx) return;
 
     const rect = trendCanvas.getBoundingClientRect();
-    const cssW = Math.max(300, Math.round(rect.width || trendCanvas.width || 520));
-    const cssH = Math.max(140, Math.round(rect.height || trendCanvas.height || 156));
+    const cssW = Math.max(300, Math.round(rect.width || trendCanvas.clientWidth || 520));
+    const cssH = Math.max(140, Math.round(rect.height || trendCanvas.clientHeight || 156));
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     if (trendCanvas.width !== cssW * dpr || trendCanvas.height !== cssH * dpr) {
       trendCanvas.width = cssW * dpr;
@@ -783,21 +785,26 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
   }
 
   async function refreshDashboard(): Promise<void> {
+    if (appState.authExpired) return;
+    const seq = ++dashboardSeq;
     try {
       const res = await callPlugin<NinebotDashboardPayload>('dashboard', { limit: 30 });
+      if (seq !== dashboardSeq || appState.authExpired) return;
       if (res.ok && res.data) {
         renderDashboard(res.data);
       } else if (!res.ok) {
         setBanner(res.message || '读取九号电摩看板失败', true);
       }
     } catch (err) {
+      if (seq !== dashboardSeq || appState.authExpired) return;
       setBanner(errorText(err), true);
     }
   }
 
   async function runBusyAction(label: string, fn: () => Promise<void>): Promise<void> {
-    if (busy) return;
+    if (busy || appState.authExpired) return;
     busy = true;
+    ++dashboardSeq;
     setBanner(label);
     try {
       await fn();
@@ -944,10 +951,13 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
     activate() {
       active = true;
       draftDirty = false;
-      void refreshDashboard();
+      ++badgeSeq;
+      if (!appState.authExpired) {
+        void refreshDashboard();
+      }
       if (pollTimer) clearInterval(pollTimer);
       pollTimer = setInterval(() => {
-        if (active && options.isVisible() && !busy && !draftDirty && !isEditingWithin(panelEl)) {
+        if (active && options.isVisible() && !appState.authExpired && !busy && !draftDirty && !isEditingWithin(panelEl)) {
           void refreshDashboard();
         }
       }, 15_000);
@@ -970,8 +980,11 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
       themeObserver = undefined;
     },
     async refreshBadge() {
+      if (active || appState.authExpired) return;
+      const seq = ++badgeSeq;
       try {
         const res = await callPlugin<NinebotDashboardPayload>('dashboard', { limit: 1 });
+        if (active || seq !== badgeSeq || appState.authExpired) return;
         if (res.ok && res.data) updateTopBadge(res.data);
       } catch {
         // Ignore badge refresh error

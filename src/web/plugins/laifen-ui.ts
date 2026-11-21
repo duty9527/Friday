@@ -1,6 +1,6 @@
 import { button, element, isEditingWithin, kpiCard, node } from '../shared/dom.js';
 import { errorText, timestamp } from '../shared/format.js';
-import { api } from '../state.js';
+import { api, appState } from '../state.js';
 
 export interface LaifenUiOptions {
   isVisible: () => boolean;
@@ -248,6 +248,8 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
   let draftDirty = false;
   let busy = false;
   let bleOpInFlight = false;
+  let dashboardSeq = 0;
+  let badgeSeq = 0;
 
   // Dynamic strict-CSP UI elements injected into existing plugin panel
   const watchRow = node('div', '', 'modal-row-head');
@@ -607,8 +609,9 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
         left.append(titleLine, node('div', subText, 'meta'));
 
         const delBtn = button('删除', async () => {
-          if (busy) return;
+          if (busy || appState.authExpired) return;
           busy = true;
+          ++dashboardSeq;
           try {
             const res = await callPlugin<LaifenDashboardPayload & { dashboard?: LaifenDashboardPayload }>('session-delete', { id: s.id });
             if (!res.ok) {
@@ -632,21 +635,26 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
   }
 
   async function refreshDashboard(): Promise<void> {
+    if (appState.authExpired) return;
+    const seq = ++dashboardSeq;
     try {
       const res = await callPlugin<LaifenDashboardPayload>('dashboard', { limit: 30 });
+      if (seq !== dashboardSeq || appState.authExpired) return;
       if (res.ok && res.data) {
         renderDashboard(res.data);
       } else if (!res.ok) {
         setBanner(res.message || '读取口腔护理看板失败', true);
       }
     } catch (err) {
+      if (seq !== dashboardSeq || appState.authExpired) return;
       setBanner(errorText(err), true);
     }
   }
 
   async function runBusyAction(label: string, fn: () => Promise<void>): Promise<void> {
-    if (busy) return;
+    if (busy || appState.authExpired) return;
     busy = true;
+    ++dashboardSeq;
     setBanner(label);
     try {
       await fn();
@@ -726,6 +734,11 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
       draftDirty = true;
     });
   }
+  for (const cfgInput of [cfgMacInput, cfgPrefixInput, cfgLifespanInput, cfgGoalInput]) {
+    cfgInput.addEventListener('input', () => {
+      draftDirty = true;
+    });
+  }
 
   refreshBtn.addEventListener('click', () => {
     draftDirty = false;
@@ -768,19 +781,21 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
   });
 
   monitorStopBtn.addEventListener('click', () => {
+    if (appState.authExpired) return;
     // Allow cancelling even while sync/set/power is waiting in runBleOpWithProgress
     monitorStopBtn.disabled = true;
     setBanner('正在停止蓝牙等待…');
     void callPlugin('monitor-stop', {})
       .then(async res => {
+        if (appState.authExpired) return;
         setBanner(res.message || (res.ok ? '已停止等待' : '停止失败'), !res.ok);
         if (!bleOpInFlight) await refreshDashboard();
       })
       .catch(err => {
-        setBanner(errorText(err), true);
+        if (!appState.authExpired) setBanner(errorText(err), true);
       })
       .finally(() => {
-        monitorStopBtn.disabled = false;
+        monitorStopBtn.disabled = appState.authExpired;
       });
   });
 
@@ -852,10 +867,13 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
     activate() {
       active = true;
       draftDirty = false;
-      void refreshDashboard();
+      ++badgeSeq;
+      if (!appState.authExpired) {
+        void refreshDashboard();
+      }
       if (pollTimer) clearInterval(pollTimer);
       pollTimer = setInterval(() => {
-        if (active && options.isVisible() && !busy && !isEditingWithin(panelEl)) {
+        if (active && options.isVisible() && !appState.authExpired && !busy && !isEditingWithin(panelEl)) {
           void refreshDashboard();
         }
       }, 4000);
@@ -869,11 +887,16 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
       }
     },
     async refreshBadge() {
+      if (active || appState.authExpired) return;
+      const seq = ++badgeSeq;
       try {
         const res = await callPlugin<LaifenDashboardPayload>('status', {});
+        if (active || seq !== badgeSeq || appState.authExpired) return;
         if (res.ok && res.data) updateTopBadge(res.data);
       } catch {
-        topBadge.textContent = '—';
+        if (!active && seq === badgeSeq && !appState.authExpired) {
+          topBadge.textContent = '—';
+        }
       }
     },
   };

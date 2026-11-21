@@ -272,7 +272,9 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
   const healthRecordsList = element<HTMLElement>('health-records-list');
 
   const healthRecordDeleteArmed = new Map<string, number>();
+  const healthRecordDeleteTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const healthProfileDeleteArmed = new Map<string, number>();
+  const healthProfileDeleteTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   let healthDashboard: HealthDashboardData | null = null;
   let healthUnit: 'kg' | 'jin' = 'kg';
@@ -286,6 +288,46 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
   let healthLastSessionPhase = '';
   let healthHoveredPointIdx: number | null = null;
   let healthPlottedPoints: HealthTrendPoint[] = [];
+  let healthChartCssW = 900;
+  let healthChartCssH = 220;
+
+  function clearArmedDeleteEntry(
+    armedMap: Map<string, number>,
+    timerMap: Map<string, ReturnType<typeof setTimeout>>,
+    id: string,
+  ) {
+    armedMap.delete(id);
+    const timer = timerMap.get(id);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timerMap.delete(id);
+    }
+  }
+
+  function armDeleteEntry(
+    armedMap: Map<string, number>,
+    timerMap: Map<string, ReturnType<typeof setTimeout>>,
+    id: string,
+    onExpire: () => void,
+  ) {
+    clearArmedDeleteEntry(armedMap, timerMap, id);
+    armedMap.set(id, Date.now());
+    const timer = setTimeout(() => {
+      armedMap.delete(id);
+      timerMap.delete(id);
+      if (options.isVisible()) onExpire();
+    }, 5000);
+    timerMap.set(id, timer);
+  }
+
+  function clearAllHealthDeleteArms() {
+    for (const timer of healthRecordDeleteTimers.values()) clearTimeout(timer);
+    healthRecordDeleteTimers.clear();
+    healthRecordDeleteArmed.clear();
+    for (const timer of healthProfileDeleteTimers.values()) clearTimeout(timer);
+    healthProfileDeleteTimers.clear();
+    healthProfileDeleteArmed.clear();
+  }
 
   function stopHealthMeasurePoll() {
     if (healthPollTimer !== undefined) {
@@ -490,6 +532,7 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
         }
       }
     } catch (err) {
+      if (seq !== dashboardFetchSeq || appState.authExpired) return;
       setHealthActionStatus(`轮询测量状态失败：${errorText(err)}`, 'warn');
       scheduleHealthMeasurePoll(1500);
     }
@@ -761,8 +804,10 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
     if (!ctx) return;
 
     const rect = canvas.getBoundingClientRect();
-    const cssW = Math.max(320, Math.round(rect.width || canvas.width || 900));
-    const cssH = Math.max(180, Math.round(rect.height || canvas.height || 220));
+    const cssW = Math.max(320, Math.round(rect.width || canvas.clientWidth || 900));
+    const cssH = Math.max(180, Math.round(rect.height || canvas.clientHeight || 220));
+    healthChartCssW = cssW;
+    healthChartCssH = cssH;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     if (canvas.width !== cssW * dpr || canvas.height !== cssH * dpr) {
       canvas.width = cssW * dpr;
@@ -1112,12 +1157,14 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
         const armedAt = healthProfileDeleteArmed.get(p.id) ?? 0;
         const isArmed = now - armedAt < 5000;
         const delBtn = button(isArmed ? '确认删成员' : '删除', () => {
-          if (!isArmed) {
-            healthProfileDeleteArmed.set(p.id, Date.now());
+          const currentlyArmed = Date.now() - (healthProfileDeleteArmed.get(p.id) ?? 0) < 5000;
+          if (!currentlyArmed) {
+            armDeleteEntry(healthProfileDeleteArmed, healthProfileDeleteTimers, p.id, renderHealthProfilesBar);
             renderHealthProfilesBar();
             return;
           }
-          healthProfileDeleteArmed.delete(p.id);
+          clearArmedDeleteEntry(healthProfileDeleteArmed, healthProfileDeleteTimers, p.id);
+          renderHealthProfilesBar();
           void deleteHealthProfileFromUi(p.id);
         }, 'mini-button danger-btn');
         chip.append(delBtn);
@@ -1179,12 +1226,14 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
       const armedAt = healthRecordDeleteArmed.get(rec.id) ?? 0;
       const isArmed = now - armedAt < 5000;
       const delBtn = button(isArmed ? '确认删除' : '删除', () => {
-        if (!isArmed) {
-          healthRecordDeleteArmed.set(rec.id, Date.now());
+        const currentlyArmed = Date.now() - (healthRecordDeleteArmed.get(rec.id) ?? 0) < 5000;
+        if (!currentlyArmed) {
+          armDeleteEntry(healthRecordDeleteArmed, healthRecordDeleteTimers, rec.id, renderHealthRecordsList);
           renderHealthRecordsList();
           return;
         }
-        healthRecordDeleteArmed.delete(rec.id);
+        clearArmedDeleteEntry(healthRecordDeleteArmed, healthRecordDeleteTimers, rec.id);
+        renderHealthRecordsList();
         void deleteHealthRecordFromUi(rec.id);
       }, 'mini-button danger-btn');
       delBtn.addEventListener('click', e => e.stopPropagation());
@@ -1223,16 +1272,19 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
     healthBusy = true;
     healthMeasureStartBtn.disabled = true;
     setHealthActionStatus('正在唤醒蓝牙适配器和沃莱 A1，请赤脚站上体脂秤…', '');
+    ++dashboardFetchSeq;
     try {
       const args: Record<string, unknown> = { timeoutSec: 45 };
       if (healthDashboard.activeProfileId) args.profileId = healthDashboard.activeProfileId;
       if (healthDashboard.device?.mac) args.targetMac = healthDashboard.device.mac;
       const res = await runHealthPlugin<{ session: HealthLiveSession }>('measure-start', args);
+      if (appState.authExpired) return;
       if (!res.ok) {
         setHealthActionStatus(res.message || '启动蓝牙测量失败', 'err');
         return;
       }
       if (res.data?.session && healthDashboard) {
+        ++dashboardFetchSeq;
         healthDashboard = { ...healthDashboard, liveSession: res.data.session };
         healthLastSessionPhase = res.data.session.phase;
         renderHealthHero(getInspectedHealthRecord());
@@ -1240,7 +1292,7 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
       setHealthActionStatus(res.message || '已启动实时测量，请赤脚上秤并保持静止。', 'ok');
       scheduleHealthMeasurePoll(650);
     } catch (err) {
-      setHealthActionStatus(`启动上秤测量失败：${errorText(err)}`, 'err');
+      if (!appState.authExpired) setHealthActionStatus(`启动上秤测量失败：${errorText(err)}`, 'err');
     } finally {
       healthBusy = false;
       renderHealthHero(getInspectedHealthRecord());
@@ -1248,44 +1300,51 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
   }
 
   async function stopHealthMeasureFromUi() {
+    if (appState.authExpired) return;
     stopHealthMeasurePoll();
+    ++dashboardFetchSeq;
     healthMeasureStopBtn.disabled = true;
     try {
       const args: Record<string, unknown> = {};
       if (healthDashboard?.activeProfileId) args.profileId = healthDashboard.activeProfileId;
       const res = await runHealthPlugin<{ session: HealthLiveSession | null }>('measure-stop', args);
+      if (appState.authExpired) return;
       if (healthDashboard && res.data) {
+        ++dashboardFetchSeq;
         healthDashboard = { ...healthDashboard, liveSession: res.data.session };
       }
       setHealthActionStatus(res.message || '已停止当前测量会话', '');
       await refreshHealthDashboard();
     } catch (err) {
-      setHealthActionStatus(`停止测量失败：${errorText(err)}`, 'err');
+      if (!appState.authExpired) setHealthActionStatus(`停止测量失败：${errorText(err)}`, 'err');
     } finally {
-      healthMeasureStopBtn.disabled = false;
+      healthMeasureStopBtn.disabled = appState.authExpired;
     }
   }
 
   async function scanHealthScaleFromUi() {
-    if (healthBusy) return;
+    if (healthBusy || appState.authExpired) return;
     healthBusy = true;
+    ++dashboardFetchSeq;
     healthScanBtn.disabled = true;
     healthScanBtn.textContent = '📡 扫描中…';
     setHealthActionStatus('正在通过 BlueZ 扫描附近沃莱 A1 (AFU-WL*) 体脂秤…', '');
     try {
       const res = await runHealthPlugin<{ device: HealthDevice | null; cached?: boolean }>('scan', { timeoutSec: 4 });
+      if (appState.authExpired) return;
       setHealthActionStatus(res.message, res.ok && res.data?.device ? 'ok' : 'warn');
       await refreshHealthDashboard({ quiet: true });
     } catch (err) {
-      setHealthActionStatus(`蓝牙扫描失败：${errorText(err)}`, 'err');
+      if (!appState.authExpired) setHealthActionStatus(`蓝牙扫描失败：${errorText(err)}`, 'err');
     } finally {
       healthBusy = false;
-      healthScanBtn.disabled = false;
+      healthScanBtn.disabled = appState.authExpired;
       healthScanBtn.textContent = '📡 扫描体脂秤';
     }
   }
 
   async function saveHealthProfileFromUi() {
+    if (appState.authExpired) return;
     const name = healthProfileName.value.trim();
     if (!name) {
       setHealthActionStatus('请填写成员昵称', 'warn');
@@ -1312,6 +1371,7 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
       return;
     }
 
+    ++dashboardFetchSeq;
     healthProfileSaveBtn.disabled = true;
     try {
       const args: Record<string, unknown> = {
@@ -1326,39 +1386,46 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
       const editId = healthProfileId.value.trim();
       if (editId) args.id = editId;
       const res = await runHealthPlugin<HealthDashboardData>('profile-save', args);
+      if (appState.authExpired) return;
       if (!res.ok || !res.data) {
         setHealthActionStatus(res.message || '保存档案失败', 'err');
         return;
       }
+      ++dashboardFetchSeq;
       healthUnit = res.data.activeProfile?.unit === 'jin' ? 'jin' : 'kg';
       if (res.data.activeProfile) syncHealthProfileForm(res.data.activeProfile);
       applyHealthDashboard(res.data);
       setHealthActionStatus(res.message, 'ok');
     } catch (err) {
-      setHealthActionStatus(`保存档案失败：${errorText(err)}`, 'err');
+      if (!appState.authExpired) setHealthActionStatus(`保存档案失败：${errorText(err)}`, 'err');
     } finally {
-      healthProfileSaveBtn.disabled = false;
+      healthProfileSaveBtn.disabled = appState.authExpired;
     }
   }
 
   async function deleteHealthProfileFromUi(id: string) {
+    if (appState.authExpired) return;
+    ++dashboardFetchSeq;
     try {
       const res = await runHealthPlugin<HealthDashboardData>('profile-delete', { id });
+      if (appState.authExpired) return;
       if (!res.ok || !res.data) {
         setHealthActionStatus(res.message || '删除成员档案失败', 'err');
         return;
       }
+      ++dashboardFetchSeq;
       healthInspectedRecordId = null;
       if (res.data.activeProfile) syncHealthProfileForm(res.data.activeProfile);
       else resetHealthProfileForm();
       applyHealthDashboard(res.data);
       setHealthActionStatus(res.message, 'ok');
     } catch (err) {
-      setHealthActionStatus(`删除成员档案失败：${errorText(err)}`, 'err');
+      if (!appState.authExpired) setHealthActionStatus(`删除成员档案失败：${errorText(err)}`, 'err');
     }
   }
 
   async function addManualHealthRecordFromUi() {
+    if (appState.authExpired) return;
     if (!healthDashboard?.activeProfile) {
       setHealthActionStatus('请先创建并保存成员档案后再补录记录。', 'warn');
       healthProfileDetails.open = true;
@@ -1371,6 +1438,7 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
       healthManualWeight.focus();
       return;
     }
+    ++dashboardFetchSeq;
     healthManualAddBtn.disabled = true;
     try {
       const args: Record<string, unknown> = {
@@ -1395,10 +1463,12 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
       }
 
       const res = await runHealthPlugin<HealthDashboardData>('record-add', args);
+      if (appState.authExpired) return;
       if (!res.ok || !res.data) {
         setHealthActionStatus(res.message || '补录记录失败', 'err');
         return;
       }
+      ++dashboardFetchSeq;
       healthManualWeight.value = '';
       healthManualImpedance.value = '';
       healthManualHr.value = '';
@@ -1408,34 +1478,40 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
       applyHealthDashboard(res.data);
       setHealthActionStatus(res.message, 'ok');
     } catch (err) {
-      setHealthActionStatus(`补录失败：${errorText(err)}`, 'err');
+      if (!appState.authExpired) setHealthActionStatus(`补录失败：${errorText(err)}`, 'err');
     } finally {
-      healthManualAddBtn.disabled = false;
+      healthManualAddBtn.disabled = appState.authExpired;
     }
   }
 
   async function deleteHealthRecordFromUi(id: string) {
+    if (appState.authExpired) return;
+    ++dashboardFetchSeq;
     try {
       const args: Record<string, unknown> = { id };
       if (healthDashboard?.activeProfileId) args.profileId = healthDashboard.activeProfileId;
       const res = await runHealthPlugin<HealthDashboardData>('record-delete', args);
+      if (appState.authExpired) return;
       if (!res.ok || !res.data) {
         setHealthActionStatus(res.message || '删除记录失败', 'err');
         return;
       }
+      ++dashboardFetchSeq;
       if (healthInspectedRecordId === id) healthInspectedRecordId = null;
       applyHealthDashboard(res.data);
       setHealthActionStatus(res.message, 'ok');
     } catch (err) {
-      setHealthActionStatus(`删除记录失败：${errorText(err)}`, 'err');
+      if (!appState.authExpired) setHealthActionStatus(`删除记录失败：${errorText(err)}`, 'err');
     }
   }
 
   function handleHealthCanvasPointer(event: MouseEvent, selectPoint: boolean) {
     if (!healthPlottedPoints.length) return;
     const rect = healthTrendCanvas.getBoundingClientRect();
-    const px = event.clientX - rect.left;
-    const py = event.clientY - rect.top;
+    const scaleX = rect.width > 0 ? healthChartCssW / rect.width : 1;
+    const scaleY = rect.height > 0 ? healthChartCssH / rect.height : 1;
+    const px = (event.clientX - rect.left) * scaleX;
+    const py = (event.clientY - rect.top) * scaleY;
     let bestIdx: number | null = null;
     let bestDist = 28;
     for (let i = 0; i < healthPlottedPoints.length; i++) {
@@ -1464,17 +1540,24 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
 
   function activate() {
     setHealthActionStatus();
+    healthScanBtn.disabled = appState.authExpired;
+    healthMeasureStopBtn.disabled = appState.authExpired;
+    healthProfileSaveBtn.disabled = appState.authExpired;
+    healthManualAddBtn.disabled = appState.authExpired;
     if (healthDashboard) {
       renderHealthModal();
       window.requestAnimationFrame(() => {
         if (options.isVisible()) renderHealthTrendChart();
       });
     }
-    void refreshHealthDashboard();
+    if (!appState.authExpired) {
+      void refreshHealthDashboard();
+    }
   }
 
   function deactivate() {
     stopHealthMeasurePoll();
+    clearAllHealthDeleteArms();
   }
 
   healthRefreshBtn.addEventListener('click', () => void refreshHealthDashboard());

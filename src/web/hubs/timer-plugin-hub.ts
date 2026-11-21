@@ -202,6 +202,7 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
   let detailInitialAction: string | undefined;
   let suppressClickUntil = 0;
   let resizeDispatchTimer: ReturnType<typeof setTimeout> | undefined;
+  let resetNavDragState = () => {};
 
   function resolveEffectiveCollapsed(): boolean {
     if (isMobileViewport()) return false;
@@ -532,7 +533,7 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
     } catch (error) {
       hooks.connection(`创建定时器失败：${errorText(error)}`, true);
     } finally {
-      timerSaveBtn.disabled = false;
+      timerSaveBtn.disabled = appState.authExpired || !appState.ready;
     }
   }
 
@@ -552,6 +553,7 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
     const fatigueCount = timers.filter(t => Boolean(t.fatiguePaused) || t.lastRunStatus === 'fatigue_paused').length;
     const missedTotal = timers.reduce((sum, t) => sum + (t.missedRuns ?? 0), 0);
     timerTopBadge.textContent = timers.length ? `${activeCount}/${timers.length}` : '0';
+    timerSaveBtn.disabled = appState.authExpired || !appState.ready;
 
     if (timerHubBackdrop.hidden && !force) {
       return;
@@ -1122,7 +1124,7 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
               } catch (err) {
                 overviewRunBox.replaceChildren(node('p', `❌ 执行失败：${errorText(err)}`, 'error'));
               } finally {
-                quickRunBtn.disabled = false;
+                quickRunBtn.disabled = appState.authExpired || !appState.ready;
                 quickRunBtn.textContent = '▶ 运行';
               }
             })();
@@ -1255,7 +1257,7 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
           } catch (err) {
             runResultBox.replaceChildren(node('p', `❌ 执行失败：${errorText(err)}`, 'error'));
           } finally {
-            runBtn.disabled = false;
+            runBtn.disabled = !isEnabled || appState.authExpired || !appState.ready;
             runBtn.textContent = '▶ 立即运行该动作';
           }
         })();
@@ -1326,6 +1328,11 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
     if (detailPluginName) {
       if (force) {
         renderPluginDetail();
+      } else if (appState.authExpired || !appState.ready) {
+        for (const btn of pluginCatalogDetail.querySelectorAll<HTMLButtonElement>('button')) {
+          if (btn.textContent?.includes('返回') || btn.dataset.subTab) continue;
+          btn.disabled = true;
+        }
       }
       return;
     }
@@ -1464,6 +1471,11 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
 
   function closePluginModal() {
     tabSwitchSeq++;
+    if (resizeDispatchTimer !== undefined) {
+      clearTimeout(resizeDispatchTimer);
+      resizeDispatchTimer = undefined;
+    }
+    resetNavDragState();
     deactivateActiveSurface();
     setMobileNavOpen(false);
     pluginHubBackdrop.hidden = true;
@@ -1480,7 +1492,12 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
       if (!enabled) {
         surfaceBadgeSynced.delete(entry.reg.pluginName);
         if (activePluginTab === entry.reg.pluginName) {
-          switchPluginTab('catalog');
+          if (pluginHubBackdrop.hidden) {
+            deactivateActiveSurface();
+            activePluginTab = 'catalog';
+          } else {
+            switchPluginTab('catalog');
+          }
         }
         continue;
       }
@@ -1588,6 +1605,14 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
   let touchDragName: string | undefined;
   let touchDragPointerId: number | undefined;
 
+  resetNavDragState = () => {
+    dndDraggedName = undefined;
+    dndTargetName = undefined;
+    touchDragName = undefined;
+    touchDragPointerId = undefined;
+    clearDndClasses();
+  };
+
   pluginNavSortable.addEventListener('pointerdown', event => {
     if (event.pointerType !== 'touch' && event.pointerType !== 'pen') return;
     const grip = (event.target as HTMLElement | null)?.closest<HTMLElement>('.plugin-nav-grip');
@@ -1610,8 +1635,10 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
   pluginNavSortable.addEventListener('pointermove', event => {
     if (!touchDragName || event.pointerId !== touchDragPointerId) return;
     event.preventDefault();
-    const hit = document.elementFromPoint(event.clientX, event.clientY)
-      ?.closest<HTMLButtonElement>('.plugin-nav-item[data-plugin-tab]');
+    const hit = typeof document.elementFromPoint === 'function'
+      ? document.elementFromPoint(event.clientX, event.clientY)
+          ?.closest<HTMLButtonElement>('.plugin-nav-item[data-plugin-tab]')
+      : undefined;
     const targetName = hit?.dataset.pluginTab;
     if (!hit || !targetName || targetName === touchDragName || !pluginNavSortable.contains(hit)) {
       setDndDropMarker(undefined, 'before');
@@ -1762,6 +1789,13 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
         setMobileNavOpen(false);
       }
       applySidebarCollapsed(resolveEffectiveCollapsed());
+    });
+    window.addEventListener('pagehide', () => {
+      if (resizeDispatchTimer !== undefined) {
+        clearTimeout(resizeDispatchTimer);
+        resizeDispatchTimer = undefined;
+      }
+      prefsSync.close();
     });
   }
 

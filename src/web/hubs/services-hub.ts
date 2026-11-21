@@ -39,6 +39,7 @@ export function initServicesHub(options: ServicesHubOptions): ServicesHubControl
 
   let busy = false;
   let loaded = false;
+  let statusSeq = 0;
   let lastStatus: SystemGeoStatusView | undefined;
 
   function renderProbeResult(res?: AmapProbeResultView): void {
@@ -91,7 +92,7 @@ export function initServicesHub(options: ServicesHubOptions): ServicesHubControl
 
   function setBusy(next: boolean): void {
     busy = next;
-    const dis = busy || appState.authExpired;
+    const dis = busy || appState.authExpired || !appState.ready;
     refreshBtn.disabled = dis;
     probeBtn.disabled = dis;
     saveBtn.disabled = dis;
@@ -100,10 +101,13 @@ export function initServicesHub(options: ServicesHubOptions): ServicesHubControl
 
   async function refreshStatus(showErrors = false): Promise<void> {
     if (!appState.ready || appState.authExpired) return;
+    const seq = ++statusSeq;
     try {
       const status = await api<SystemGeoStatusView>('/api/geo-config');
+      if (seq !== statusSeq || appState.authExpired) return;
       renderStatus(status);
     } catch (err) {
+      if (seq !== statusSeq) return;
       if (showErrors || options.isVisible()) {
         renderProbeResult({ ok: false, message: `读取位置底座配置失败：${errorText(err)}` });
       }
@@ -135,14 +139,20 @@ export function initServicesHub(options: ServicesHubOptions): ServicesHubControl
       return;
     }
     setBusy(true);
+    let savedOk = false;
     try {
       const saved = await api<SystemGeoStatusView>('/api/geo-config', { amapKey: rawKey });
+      statusSeq++;
+      savedOk = true;
       keyInputEl.value = '';
       renderStatus(saved);
       const probeRes = await api<AmapProbeResultView>('/api/geo-probe', {});
       renderProbeResult(probeRes);
     } catch (err) {
-      renderProbeResult({ ok: false, message: `保存失败：${errorText(err)}` });
+      renderProbeResult({
+        ok: false,
+        message: `${savedOk ? 'Key 已保存，但连通性测试失败' : '保存失败'}：${errorText(err)}`,
+      });
     } finally {
       setBusy(false);
     }
@@ -153,6 +163,7 @@ export function initServicesHub(options: ServicesHubOptions): ServicesHubControl
     setBusy(true);
     try {
       const saved = await api<SystemGeoStatusView>('/api/geo-config', { clearAmapKey: true });
+      statusSeq++;
       keyInputEl.value = '';
       renderStatus(saved);
       renderProbeResult({ ok: true, message: '已清除系统底座保存的高德 API Key。' });
@@ -181,7 +192,8 @@ export function initServicesHub(options: ServicesHubOptions): ServicesHubControl
       void refreshStatus(true);
     },
     render(force = false) {
-      if (appState.ready && (!loaded || force)) {
+      setBusy(busy);
+      if (appState.ready && !appState.authExpired && (!loaded || force)) {
         void refreshStatus(false);
       }
     },

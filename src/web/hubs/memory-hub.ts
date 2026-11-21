@@ -44,6 +44,8 @@ export function initMemoryHub(): MemoryHubController {
   let fullMemoriesCache: MemoryCard[] | undefined;
   let fullMemoriesSig: string | undefined;
   let fullMemoriesBusy = false;
+  let memorySaving = false;
+  let searchSeq = 0;
   let memoryFilterMode: 'all' | 'pinned' | 'synapse' = 'all';
   let editingMemoryId: string | undefined;
   let searchMatchedMemoryIds: Set<string> | undefined;
@@ -106,6 +108,7 @@ export function initMemoryHub(): MemoryHubController {
     fullMemoriesBusy = true;
     try {
       const list = await api<MemoryCard[]>('/api/memories');
+      if (appState.authExpired || !appState.ready) return;
       if (Array.isArray(list)) {
         fullMemoriesCache = list;
         fullMemoriesSig = sig;
@@ -123,7 +126,8 @@ export function initMemoryHub(): MemoryHubController {
     const content = memoryContentInput.value.trim();
     const tags = memoryTagsInput.value.split(/[,，\s]+/).map(t => t.trim()).filter(Boolean);
     const pinned = memoryPinnedInput.checked;
-    if (!topic || !content) return;
+    if (!topic || !content || memorySaving || appState.authExpired || !appState.ready) return;
+    memorySaving = true;
     memorySaveBtn.disabled = true;
     try {
       await api<MemoryCard>('/api/memory-save', {
@@ -140,7 +144,8 @@ export function initMemoryHub(): MemoryHubController {
     } catch (error) {
       hooks.connection(`保存记忆失败：${errorText(error)}`, true);
     } finally {
-      memorySaveBtn.disabled = false;
+      memorySaving = false;
+      memorySaveBtn.disabled = appState.authExpired || !appState.ready;
     }
   }
 
@@ -288,6 +293,9 @@ export function initMemoryHub(): MemoryHubController {
     const baseItems = fullMemoriesCache ?? directory?.items ?? [];
     const total = directory?.totalActive ?? baseItems.length;
     memoryTopBadge.textContent = String(total);
+    const blocked = appState.authExpired || !appState.ready;
+    memorySaveBtn.disabled = blocked || memorySaving;
+    memorySearchBtn.disabled = blocked;
 
     if (memoryHubBackdrop.hidden && !force) {
       return;
@@ -375,7 +383,7 @@ export function initMemoryHub(): MemoryHubController {
         const synBox = node('div', '', 'hub-synapse-box');
         synBox.append(node('span', `⚡ 突触连接 (${item.synapses.length})：`, 'hub-synapse-label'));
         for (const syn of item.synapses.slice(0, 6)) {
-          const targetTitle = syn.targetTopic ?? fullMemoriesCache?.find(m => m.id === syn.targetId)?.topic ?? '关联记忆';
+          const targetTitle = syn.targetTopic ?? baseItems.find(m => m.id === syn.targetId)?.topic ?? '关联记忆';
           const relText = synapseRelationNames[syn.relation] ?? syn.relation;
           const chip = button(
             `🔗 ${targetTitle} · ${Math.round(syn.weight * 100)}% (${relText})`,
@@ -405,18 +413,22 @@ export function initMemoryHub(): MemoryHubController {
     const query = memorySearchInput.value.trim();
     const scope = memorySearchScope.value || 'all';
     if (!query) {
+      ++searchSeq;
       searchMatchedMemoryIds = undefined;
       memorySearchResults.hidden = true;
       memorySearchResults.replaceChildren();
       render();
       return;
     }
+    if (appState.authExpired || !appState.ready) return;
+    const seq = ++searchSeq;
     memorySearchResults.hidden = false;
     memorySearchResults.replaceChildren(node('p', '⏳ 正在执行全息图谱检索与 1-Hop 突触扩散激活…', 'meta'));
     try {
       const res = await api<{ hits?: ContextSearchHit[] } | ContextSearchHit[]>(
         `/api/memories?${new URLSearchParams({ query, scope })}`,
       );
+      if (seq !== searchSeq) return;
       const hits = Array.isArray(res) ? res : (res.hits ?? []);
       const matchedIds = hits
         .filter(h => h.kind === 'memory')
@@ -432,6 +444,7 @@ export function initMemoryHub(): MemoryHubController {
       header.append(
         node('strong', `🔍 联想检索命中 ${hits.length} 条结果`, 'hub-card-title'),
         button('✕ 清空检索', () => {
+          ++searchSeq;
           memorySearchInput.value = '';
           searchMatchedMemoryIds = undefined;
           memorySearchResults.hidden = true;
@@ -485,6 +498,7 @@ export function initMemoryHub(): MemoryHubController {
       frag.append(listWrap);
       memorySearchResults.replaceChildren(frag);
     } catch (error) {
+      if (seq !== searchSeq) return;
       memorySearchResults.replaceChildren(node('p', `搜索失败：${errorText(error)}`, 'error'));
     }
   }

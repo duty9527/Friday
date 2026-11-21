@@ -79,6 +79,12 @@ export function initImVoiceHub(): ImVoiceHubController {
 
   let wechatQrPollTimer: ReturnType<typeof setInterval> | undefined;
   let wechatAutoHideTimer: ReturnType<typeof setTimeout> | undefined;
+  let wechatQrOpSeq = 0;
+  let wechatQrStartSeq = 0;
+  let wechatQrStartPending = 0;
+  let wechatQrVerifyBusy = false;
+  let imSaving = false;
+  const activeCopyTimers = new Set<ReturnType<typeof setTimeout>>();
   let activeWechatQrChannelId: string | undefined;
   let activeWechatQrSessionId: string | undefined;
   let activeWechatQrContent: string | undefined;
@@ -90,6 +96,26 @@ export function initImVoiceHub(): ImVoiceHubController {
   let voiceBusy = false;
   let armedVoiceDeleteKey: string | undefined;
   let armedVoiceDeleteTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function clearCopyTimers() {
+    for (const timer of activeCopyTimers) {
+      clearTimeout(timer);
+    }
+    activeCopyTimers.clear();
+  }
+
+  function copyWithFeedback(btn: HTMLButtonElement, text: string, defaultLabel: string) {
+    const promise = navigator.clipboard?.writeText(text);
+    if (!promise) return;
+    void promise.then(() => {
+      btn.textContent = '✅ 已复制';
+      const timer = setTimeout(() => {
+        activeCopyTimers.delete(timer);
+        btn.textContent = defaultLabel;
+      }, 1800);
+      activeCopyTimers.add(timer);
+    }).catch(() => {});
+  }
 
   function clearArmedVoiceDelete() {
     if (armedVoiceDeleteTimer) {
@@ -118,6 +144,7 @@ export function initImVoiceHub(): ImVoiceHubController {
   }
 
   function stopWechatQrPoll() {
+    ++wechatQrOpSeq;
     if (wechatQrPollTimer) {
       clearInterval(wechatQrPollTimer);
       wechatQrPollTimer = undefined;
@@ -137,6 +164,8 @@ export function initImVoiceHub(): ImVoiceHubController {
     imWechatQrCopy.hidden = true;
     imWechatQrOpen.hidden = true;
     imWechatQrBox.hidden = true;
+    imWechatQrRefresh.disabled = appState.authExpired || !appState.ready;
+    imWechatQrVerifyBtn.disabled = appState.authExpired || !appState.ready;
   }
 
   function applyWechatQrVisuals(session: WechatQrLoginSession) {
@@ -207,11 +236,17 @@ export function initImVoiceHub(): ImVoiceHubController {
 
   function startWechatQrStatusLoop(sessionId: string) {
     stopWechatQrPoll();
+    if (appState.authExpired || !appState.ready || imHubBackdrop.hidden || imWechatQrBox.hidden) return;
+    const opSeq = wechatQrOpSeq;
     let pollingBusy = false;
     let consecutiveErrors = 0;
     const pollStartedAt = Date.now();
     wechatQrPollTimer = setInterval(() => {
       if (pollingBusy) return;
+      if (opSeq !== wechatQrOpSeq || appState.authExpired || imHubBackdrop.hidden || imWechatQrBox.hidden) {
+        stopWechatQrPoll();
+        return;
+      }
       if (Date.now() - pollStartedAt > WECHAT_QR_MAX_POLL_MS) {
         stopWechatQrPoll();
         imWechatQrStatus.textContent = '⚠️ 二维码轮询已超时，请点击「🔄 刷新二维码」重新获取。';
@@ -221,9 +256,11 @@ export function initImVoiceHub(): ImVoiceHubController {
       void (async () => {
         try {
           const current = await api<WechatQrLoginSession>('/api/im-wechat-qr-status', { sessionId });
+          if (opSeq !== wechatQrOpSeq || appState.authExpired || imHubBackdrop.hidden || imWechatQrBox.hidden) return;
           consecutiveErrors = 0;
           handleWechatQrPollResult(current);
         } catch (error) {
+          if (opSeq !== wechatQrOpSeq || appState.authExpired || imHubBackdrop.hidden || imWechatQrBox.hidden) return;
           consecutiveErrors += 1;
           if (consecutiveErrors >= WECHAT_QR_MAX_ERRORS) {
             stopWechatQrPoll();
@@ -237,34 +274,43 @@ export function initImVoiceHub(): ImVoiceHubController {
   }
 
   async function submitWechatVerifyCodeFromUi() {
-    if (!activeWechatQrSessionId) return;
+    if (!activeWechatQrSessionId || appState.authExpired || !appState.ready) return;
+    const sessionId = activeWechatQrSessionId;
+    const opSeq = wechatQrOpSeq;
     const verifyCode = imWechatQrVerifyInput.value.trim();
     if (!verifyCode) {
       imWechatQrVerifyInput.focus();
       return;
     }
+    wechatQrVerifyBusy = true;
     imWechatQrVerifyBtn.disabled = true;
     imWechatQrStatus.textContent = '⏳ 正在提交验证码…';
     try {
       const current = await api<WechatQrLoginSession>('/api/im-wechat-qr-status', {
-        sessionId: activeWechatQrSessionId,
+        sessionId,
         verifyCode,
       });
+      if (opSeq !== wechatQrOpSeq || appState.authExpired || imHubBackdrop.hidden || imWechatQrBox.hidden) return;
       imWechatQrVerifyInput.value = '';
       if (!handleWechatQrPollResult(current)) {
         imWechatQrVerifyRow.hidden = true;
         imWechatQrStatus.textContent = '⏳ 验证码已提交，等待微信确认登录…';
-        startWechatQrStatusLoop(activeWechatQrSessionId);
+        startWechatQrStatusLoop(sessionId);
       }
     } catch (error) {
+      if (opSeq !== wechatQrOpSeq || appState.authExpired || imHubBackdrop.hidden || imWechatQrBox.hidden) return;
       imWechatQrStatus.textContent = `❌ 提交验证码失败：${errorText(error)}`;
     } finally {
-      imWechatQrVerifyBtn.disabled = false;
+      wechatQrVerifyBusy = false;
+      imWechatQrVerifyBtn.disabled = appState.authExpired || !appState.ready;
     }
   }
 
   async function startWechatQrFromUi(channelId?: string, channelName?: string, newAccount = false) {
+    if (appState.authExpired || !appState.ready) return;
     stopWechatQrPoll();
+    const opSeq = wechatQrOpSeq;
+    const startSeq = ++wechatQrStartSeq;
     activeWechatQrChannelId = channelId;
     activeWechatQrNewAccount = newAccount;
     activeWechatQrSessionId = undefined;
@@ -281,6 +327,7 @@ export function initImVoiceHub(): ImVoiceHubController {
         ? '新增微信账号扫码绑定'
         : '微信扫码绑定 F.R.I.D.A.Y.';
     imWechatQrStatus.textContent = '⏳ 正在向腾讯 iLink 申请微信登录二维码…';
+    ++wechatQrStartPending;
     imWechatQrRefresh.disabled = true;
     try {
       const session = await api<WechatQrLoginSession>('/api/im-wechat-qr-start', {
@@ -288,6 +335,7 @@ export function initImVoiceHub(): ImVoiceHubController {
         ...(channelName ? { name: channelName } : {}),
         ...(newAccount ? { newAccount: true } : {}),
       });
+      if (opSeq !== wechatQrOpSeq || appState.authExpired || imHubBackdrop.hidden || imWechatQrBox.hidden) return;
       if (!SAFE_DATA_IMAGE_RE.test(session.qrSvgDataUrl)) {
         imWechatQrImg.removeAttribute('src');
         imWechatQrStatus.textContent = '❌ 二维码格式不受支持，已阻止加载，请稍后重试。';
@@ -298,11 +346,16 @@ export function initImVoiceHub(): ImVoiceHubController {
       applyWechatQrVisuals(session);
       imWechatQrStatus.textContent = '📱 请使用手机微信扫描左侧二维码绑定 F.R.I.D.A.Y.…';
       await hooks.refreshView();
+      if (opSeq !== wechatQrOpSeq || appState.authExpired || imHubBackdrop.hidden || imWechatQrBox.hidden) return;
       startWechatQrStatusLoop(session.sessionId);
     } catch (error) {
+      if (opSeq !== wechatQrOpSeq || appState.authExpired || imHubBackdrop.hidden || imWechatQrBox.hidden) return;
       imWechatQrStatus.textContent = `获取二维码失败：${errorText(error)}`;
     } finally {
-      imWechatQrRefresh.disabled = false;
+      wechatQrStartPending = Math.max(0, wechatQrStartPending - 1);
+      if (startSeq === wechatQrStartSeq) {
+        imWechatQrRefresh.disabled = appState.authExpired || !appState.ready || wechatQrStartPending > 0;
+      }
     }
   }
 
@@ -511,6 +564,8 @@ export function initImVoiceHub(): ImVoiceHubController {
     const quietEnabled = imQuietEnabledInput.checked;
     const quietStart = imQuietStartInput.value.trim() || '23:00';
     const quietEnd = imQuietEndInput.value.trim() || '07:00';
+    if (imSaving || appState.authExpired || !appState.ready) return;
+    imSaving = true;
     imSaveBtn.disabled = true;
     try {
       await api<ImChannelView>('/api/im-save', {
@@ -535,7 +590,8 @@ export function initImVoiceHub(): ImVoiceHubController {
     } catch (error) {
       hooks.connection(`保存 IM 通道失败：${errorText(error)}`, true);
     } finally {
-      imSaveBtn.disabled = false;
+      imSaving = false;
+      imSaveBtn.disabled = appState.authExpired || !appState.ready;
     }
   }
 
@@ -661,8 +717,11 @@ export function initImVoiceHub(): ImVoiceHubController {
     }
 
     const controlsDisabled = appState.authExpired || !appState.ready;
+    imSaveBtn.disabled = controlsDisabled || imSaving;
     imWechatQrBtn.disabled = controlsDisabled;
     imWechatQrNewBtn.disabled = controlsDisabled;
+    imWechatQrRefresh.disabled = controlsDisabled || wechatQrStartPending > 0;
+    imWechatQrVerifyBtn.disabled = controlsDisabled || wechatQrVerifyBusy;
     imTgTokenInput.disabled = controlsDisabled || tgQuickBusy;
     imTgAllowInput.disabled = controlsDisabled || tgQuickBusy;
     imTgQuickBtn.disabled = controlsDisabled || tgQuickBusy;
@@ -765,20 +824,14 @@ export function initImVoiceHub(): ImVoiceHubController {
         } else {
           endpointBox.append(node('code', `回调 Webhook: ${webhookPath}`, 'hub-endpoint-code'));
           const copyBtn = button('📋 复制地址', () => {
-            void navigator.clipboard?.writeText(webhookPath).then(() => {
-              copyBtn.textContent = '✅ 已复制';
-              setTimeout(() => { copyBtn.textContent = '📋 复制地址'; }, 1800);
-            });
+            copyWithFeedback(copyBtn, webhookPath, '📋 复制地址');
           }, 'mini-button');
           endpointBox.append(copyBtn);
         }
       } else {
         endpointBox.append(node('code', `回调 Webhook: ${webhookPath}`, 'hub-endpoint-code'));
         const copyBtn = button('📋 复制地址', () => {
-          void navigator.clipboard?.writeText(webhookPath).then(() => {
-            copyBtn.textContent = '✅ 已复制';
-            setTimeout(() => { copyBtn.textContent = '📋 复制地址'; }, 1800);
-          });
+          copyWithFeedback(copyBtn, webhookPath, '📋 复制地址');
         }, 'mini-button');
         endpointBox.append(copyBtn);
       }
@@ -849,6 +902,7 @@ export function initImVoiceHub(): ImVoiceHubController {
   function closeModal() {
     stopWechatQrPoll();
     clearArmedVoiceDelete();
+    clearCopyTimers();
     imHubBackdrop.hidden = true;
   }
 
@@ -878,10 +932,7 @@ export function initImVoiceHub(): ImVoiceHubController {
   });
   imWechatQrCopy.addEventListener('click', () => {
     if (!activeWechatQrContent) return;
-    void navigator.clipboard?.writeText(activeWechatQrContent).then(() => {
-      imWechatQrCopy.textContent = '✅ 已复制';
-      setTimeout(() => { imWechatQrCopy.textContent = '🔗 复制链接'; }, 1800);
-    });
+    copyWithFeedback(imWechatQrCopy, activeWechatQrContent, '🔗 复制链接');
   });
   imWechatQrVerifyBtn.addEventListener('click', () => { void submitWechatVerifyCodeFromUi(); });
   imWechatQrVerifyInput.addEventListener('keydown', (event: KeyboardEvent) => {
@@ -896,6 +947,14 @@ export function initImVoiceHub(): ImVoiceHubController {
   imVoiceClearBtn.addEventListener('click', () => {
     if (armVoiceDelete('__all__')) void clearVoiceprintsFromUi();
   });
+
+  if (typeof window !== 'undefined') {
+    window.addEventListener('pagehide', () => {
+      stopWechatQrPoll();
+      clearArmedVoiceDelete();
+      clearCopyTimers();
+    });
+  }
 
   return {
     openModal,

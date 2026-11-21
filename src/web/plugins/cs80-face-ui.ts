@@ -341,12 +341,46 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
   const quietSaveBtn = element<HTMLButtonElement>('cs80-quiet-save-btn');
   const chimeBtnsEl = element<HTMLElement>('cs80-chime-btns');
 
+  const SAFE_PREVIEW_DATA_URL_RE = /^data:image\/(?:png|jpeg|webp);base64,/i;
   let active = false;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
+  let expressRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   let latestData: Cs80DashboardPayload | undefined;
   let draftLayout: Cs80LayoutConfig | undefined;
   let dirty = false;
-  let busy = false;
+  let weatherCityDirty = false;
+  let busyDepth = 0;
+  let layoutSeq = 0;
+  let layoutEditRev = 0;
+  let badgeSeq = 0;
+
+  function markLayoutDirty(): void {
+    dirty = true;
+    ++layoutEditRev;
+  }
+
+  async function runFaceAction(errPrefix: string, fn: () => Promise<void>): Promise<void> {
+    if (appState.authExpired) return;
+    try {
+      await fn();
+    } catch (err) {
+      if (!appState.authExpired) {
+        setBanner(`${errPrefix}：${errorText(err)}`, true);
+      }
+    }
+  }
+
+  function scheduleExpressRefresh(delayMs: number): void {
+    if (expressRefreshTimer !== undefined) {
+      clearTimeout(expressRefreshTimer);
+    }
+    expressRefreshTimer = setTimeout(() => {
+      expressRefreshTimer = undefined;
+      if (active && options.isVisible() && !appState.authExpired) {
+        void refreshDashboard();
+      }
+    }, delayMs);
+  }
 
   function setBanner(text: string, isError = false): void {
     statusBanner.textContent = text;
@@ -465,7 +499,9 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
       if ([...pageRotateSelect.options].some(o => o.value === rotStr)) {
         pageRotateSelect.value = rotStr;
       }
-      weatherCityInput.value = draftLayout.weatherCity || '上海';
+      if (!weatherCityDirty) {
+        weatherCityInput.value = draftLayout.weatherCity || '上海';
+      }
       taskOverlayCheck.checked = draftLayout.autoTaskOverlay;
     }
   }
@@ -523,7 +559,7 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
       for (const sz of CARD_SIZES) {
         const sb = button(sz.replace('x', '×'), () => {
           card.size = sz;
-          dirty = true;
+          markLayoutDirty();
           renderPageTabsAndEditor();
           void syncLayoutToDaemon({ pages: draftLayout!.pages, activePage: draftLayout!.activePage });
         }, `cs80-size-btn${card.size === sz ? ' active' : ''}`);
@@ -535,7 +571,7 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
         if (idx <= 0) return;
         const arr = curPage.cards;
         [arr[idx - 1], arr[idx]] = [arr[idx]!, arr[idx - 1]!];
-        dirty = true;
+        markLayoutDirty();
         renderPageTabsAndEditor();
         void syncLayoutToDaemon({ pages: draftLayout!.pages, activePage: draftLayout!.activePage });
       }, 'mini-button');
@@ -544,14 +580,14 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
         if (idx >= curPage.cards.length - 1) return;
         const arr = curPage.cards;
         [arr[idx], arr[idx + 1]] = [arr[idx + 1]!, arr[idx]!];
-        dirty = true;
+        markLayoutDirty();
         renderPageTabsAndEditor();
         void syncLayoutToDaemon({ pages: draftLayout!.pages, activePage: draftLayout!.activePage });
       }, 'mini-button');
       downBtn.disabled = idx === curPage.cards.length - 1;
       const delBtn = button('✕', () => {
         curPage.cards.splice(idx, 1);
-        dirty = true;
+        markLayoutDirty();
         renderPageTabsAndEditor();
         void syncLayoutToDaemon({ pages: draftLayout!.pages, activePage: draftLayout!.activePage });
       }, 'mini-button danger-btn');
@@ -576,7 +612,7 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
         actionSel.value = card.action || cat?.defaultAction || acts[0]!;
         actionSel.addEventListener('change', () => {
           card.action = actionSel.value;
-          dirty = true;
+          markLayoutDirty();
           updateSyncBadge();
           void syncLayoutToDaemon({ pages: draftLayout!.pages, refreshWidgets: true });
         });
@@ -592,7 +628,7 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
         ttlSel.value = String(card.ttlSec ?? 120);
         ttlSel.addEventListener('change', () => {
           card.ttlSec = Number(ttlSel.value);
-          dirty = true;
+          markLayoutDirty();
           updateSyncBadge();
           void syncLayoutToDaemon({ pages: draftLayout!.pages, refreshWidgets: true });
         });
@@ -644,7 +680,7 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
           ...(item.category === 'custom_plugin' ? { title: item.title, ttlSec: 120 } : {}),
         };
         page.cards.push(newCard);
-        dirty = true;
+        markLayoutDirty();
         renderPageTabsAndEditor();
         void syncLayoutToDaemon({ pages: draftLayout.pages, activePage: draftLayout.activePage, refreshWidgets: true });
       }, 'mini-button');
@@ -658,12 +694,13 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
 
   function applyDashboardPayload(payload: Cs80DashboardPayload): void {
     latestData = payload;
+    ++badgeSeq;
     if (!dirty && payload.layout) {
       draftLayout = cloneLayout(payload.layout);
     } else if (!draftLayout && payload.layout) {
       draftLayout = cloneLayout(payload.layout);
     }
-    if (payload.previewDataUrl) {
+    if (payload.previewDataUrl && SAFE_PREVIEW_DATA_URL_RE.test(payload.previewDataUrl)) {
       livePreviewImg.src = payload.previewDataUrl;
       livePreviewImg.hidden = false;
       previewEmpty.hidden = true;
@@ -675,24 +712,31 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
   }
 
   async function refreshDashboard(): Promise<void> {
-    if (busy) return;
+    if (busyDepth > 0 || appState.authExpired) return;
+    const seq = ++layoutSeq;
+    const startEditRev = layoutEditRev;
     try {
       const res = await callPlugin<Cs80DashboardPayload>('dashboard', { includePreview: true });
+      if (seq !== layoutSeq || busyDepth > 0 || appState.authExpired) return;
       if (res.ok && res.data) {
         setBanner('');
+        if (layoutEditRev !== startEditRev) dirty = true;
         applyDashboardPayload(res.data);
       } else {
         updateTopBadge(res.data?.status);
         setBanner(res.message || 'CS80 守护进程尚未响应，请确认 friday-face.service 已启动。', true);
       }
     } catch (err) {
+      if (seq !== layoutSeq || appState.authExpired) return;
       setBanner(`读取 CS80 副屏数据失败：${errorText(err)}`, true);
     }
   }
 
   async function syncLayoutToDaemon(patch?: Record<string, unknown>): Promise<void> {
-    if (!draftLayout) return;
-    busy = true;
+    if (!draftLayout || appState.authExpired) return;
+    const seq = ++layoutSeq;
+    const startEditRev = layoutEditRev;
+    busyDepth++;
     try {
       const payload = patch
         ? { ...patch, includePreview: true }
@@ -709,25 +753,33 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
             includePreview: true,
           };
       const res = await callPlugin<{ ok?: boolean; layout?: Cs80LayoutConfig; previewDataUrl?: string }>('layout', payload);
+      if (appState.authExpired) return;
       if (res.ok && res.data?.layout) {
-        draftLayout = cloneLayout(res.data.layout);
-        dirty = false;
-        updateSyncBadge();
-        if (res.data.previewDataUrl) {
+        if (seq === layoutSeq && layoutEditRev === startEditRev) {
+          draftLayout = cloneLayout(res.data.layout);
+          dirty = false;
+          if (!patch) weatherCityDirty = false;
+          updateSyncBadge();
+        }
+        if (seq === layoutSeq && res.data.previewDataUrl && SAFE_PREVIEW_DATA_URL_RE.test(res.data.previewDataUrl)) {
           livePreviewImg.src = res.data.previewDataUrl;
           livePreviewImg.hidden = false;
           previewEmpty.hidden = true;
         }
-        renderGlobalControls();
-        renderPageTabsAndEditor();
+        if (seq === layoutSeq) {
+          renderGlobalControls();
+          renderPageTabsAndEditor();
+        }
         setBanner('');
       } else {
         setBanner(res.message || '同步副屏布局失败', true);
       }
     } catch (err) {
-      setBanner(`同步副屏布局失败：${errorText(err)}`, true);
+      if (!appState.authExpired) {
+        setBanner(`同步副屏布局失败：${errorText(err)}`, true);
+      }
     } finally {
-      busy = false;
+      busyDepth = Math.max(0, busyDepth - 1);
     }
   }
 
@@ -742,21 +794,42 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
     void syncLayoutToDaemon();
   });
 
-  forceFullBtn.addEventListener('click', async () => {
-    await callPlugin('screen', { refresh: true });
-    await refreshDashboard();
+  weatherCityInput.addEventListener('input', () => {
+    if (!draftLayout) return;
+    weatherCityDirty = true;
+    draftLayout.weatherCity = weatherCityInput.value.trim() || '上海';
+    markLayoutDirty();
+    updateSyncBadge();
   });
 
-  standbyBtn.addEventListener('click', async () => {
-    const curStandby = Boolean(latestData?.status?.standby);
-    await callPlugin('screen', { standby: !curStandby });
-    await refreshDashboard();
+  forceFullBtn.addEventListener('click', () => {
+    void runFaceAction('全量刷新副屏失败', async () => {
+      await callPlugin('screen', { refresh: true });
+      await refreshDashboard();
+    });
   });
 
-  resetLayoutBtn.addEventListener('click', async () => {
-    dirty = false;
-    await callPlugin('layout', { reset: true, refreshWidgets: true, includePreview: true });
-    await refreshDashboard();
+  standbyBtn.addEventListener('click', () => {
+    void runFaceAction('切换待机状态失败', async () => {
+      const curStandby = Boolean(latestData?.status?.standby);
+      await callPlugin('screen', { standby: !curStandby });
+      await refreshDashboard();
+    });
+  });
+
+  resetLayoutBtn.addEventListener('click', () => {
+    void runFaceAction('恢复默认布局失败', async () => {
+      ++layoutSeq;
+      const res = await callPlugin('layout', { reset: true, refreshWidgets: true, includePreview: true });
+      if (!res.ok) {
+        setBanner(res.message || '恢复默认布局失败', true);
+        return;
+      }
+      dirty = false;
+      weatherCityDirty = false;
+      ++layoutEditRev;
+      await refreshDashboard();
+    });
   });
 
   gridRowsPills.addEventListener('click', ev => {
@@ -764,7 +837,7 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
     if (!btn || !draftLayout) return;
     const rows = Number(btn.dataset.gridRows) === 3 ? 3 : 2;
     draftLayout.gridRows = rows;
-    dirty = true;
+    markLayoutDirty();
     renderGlobalControls();
     renderPageTabsAndEditor();
     void syncLayoutToDaemon({ gridRows: rows });
@@ -773,7 +846,7 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
   marqueeModeSelect.addEventListener('change', () => {
     if (!draftLayout) return;
     draftLayout.marqueeMode = marqueeModeSelect.value as Cs80LayoutConfig['marqueeMode'];
-    dirty = true;
+    markLayoutDirty();
     void syncLayoutToDaemon({ marqueeMode: draftLayout.marqueeMode });
   });
 
@@ -781,21 +854,21 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
     if (!draftLayout) return;
     const spd = Math.max(1, Math.min(3, Number(marqueeSpeedSelect.value) || 2)) as 1 | 2 | 3;
     draftLayout.marqueeSpeed = spd;
-    dirty = true;
+    markLayoutDirty();
     void syncLayoutToDaemon({ marqueeSpeed: spd });
   });
 
   pageRotateSelect.addEventListener('change', () => {
     if (!draftLayout) return;
     draftLayout.pageRotateSec = Number(pageRotateSelect.value) || 0;
-    dirty = true;
+    markLayoutDirty();
     void syncLayoutToDaemon({ pageRotateSec: draftLayout.pageRotateSec });
   });
 
   taskOverlayCheck.addEventListener('change', () => {
     if (!draftLayout) return;
     draftLayout.autoTaskOverlay = taskOverlayCheck.checked;
-    dirty = true;
+    markLayoutDirty();
     void syncLayoutToDaemon({ autoTaskOverlay: draftLayout.autoTaskOverlay });
   });
 
@@ -812,7 +885,7 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
       cards: [],
     });
     draftLayout.activePage = draftLayout.pages.length - 1;
-    dirty = true;
+    markLayoutDirty();
     renderPageTabsAndEditor();
     void syncLayoutToDaemon({ pages: draftLayout.pages, activePage: draftLayout.activePage });
   });
@@ -823,7 +896,7 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
     const next = window.prompt('请输入当前卡片页名称：', pg.name);
     if (!next || !next.trim()) return;
     pg.name = next.trim().slice(0, 24);
-    dirty = true;
+    markLayoutDirty();
     renderPageTabsAndEditor();
     void syncLayoutToDaemon({ pages: draftLayout.pages });
   });
@@ -832,81 +905,94 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
     if (!draftLayout || draftLayout.pages.length <= 1) return;
     draftLayout.pages.splice(draftLayout.activePage, 1);
     draftLayout.activePage = Math.max(0, Math.min(draftLayout.pages.length - 1, draftLayout.activePage));
-    dirty = true;
+    markLayoutDirty();
     renderPageTabsAndEditor();
     void syncLayoutToDaemon({ pages: draftLayout.pages, activePage: draftLayout.activePage });
   });
 
-  expressBtnsEl.addEventListener('click', async ev => {
+  expressBtnsEl.addEventListener('click', ev => {
     const btn = (ev.target as HTMLElement).closest<HTMLButtonElement>('button[data-expr]');
     if (!btn) return;
     const expr = btn.dataset.expr || 'auto';
     const poke = btn.dataset.poke || undefined;
     const channel = btn.dataset.channel || undefined;
-    await callPlugin('express', {
-      expr,
-      ...(poke ? { poke } : {}),
-      ...(channel ? { channel } : {}),
-      holdSec: expr === 'auto' ? 0 : 8,
+    void runFaceAction('发送表情控制失败', async () => {
+      await callPlugin('express', {
+        expr,
+        ...(poke ? { poke } : {}),
+        ...(channel ? { channel } : {}),
+        holdSec: expr === 'auto' ? 0 : 8,
+      });
+      scheduleExpressRefresh(220);
     });
-    setTimeout(() => {
-      if (options.isVisible()) void refreshDashboard();
-    }, 220);
   });
 
-  bannerSendBtn.addEventListener('click', async () => {
+  bannerSendBtn.addEventListener('click', () => {
     const text = bannerInput.value.trim();
     if (!text) return;
-    await callPlugin('express', { text, title: '控制台 · 互动消息', holdSec: 14 });
-    bannerInput.value = '';
-    setTimeout(() => {
-      if (options.isVisible()) void refreshDashboard();
-    }, 180);
+    void runFaceAction('发送横幅消息失败', async () => {
+      await callPlugin('express', { text, title: '控制台 · 互动消息', holdSec: 14 });
+      bannerInput.value = '';
+      scheduleExpressRefresh(180);
+    });
   });
 
-  brightnessPillsEl.addEventListener('click', async ev => {
+  brightnessPillsEl.addEventListener('click', ev => {
     const btn = (ev.target as HTMLElement).closest<HTMLButtonElement>('button[data-brightness]');
     if (!btn) return;
     const val = Number(btn.dataset.brightness) || 100;
-    await callPlugin('screen', { brightness: val });
-    await refreshDashboard();
-  });
-
-  volumeSelect.addEventListener('change', async () => {
-    await callPlugin('sound', { volume: Number(volumeSelect.value) });
-    await refreshDashboard();
-  });
-
-  muteBtn.addEventListener('click', async () => {
-    const nextMute = !(latestData?.status?.speaker?.muted ?? false);
-    await callPlugin('sound', { muted: nextMute });
-    await refreshDashboard();
-  });
-
-  quietSaveBtn.addEventListener('click', async () => {
-    await callPlugin('sound', {
-      volume: Number(volumeSelect.value),
-      quietHours: quietHoursInput.value.trim(),
+    void runFaceAction('调节屏幕亮度失败', async () => {
+      await callPlugin('screen', { brightness: val });
+      await refreshDashboard();
     });
-    await refreshDashboard();
   });
 
-  chimeBtnsEl.addEventListener('click', async ev => {
+  volumeSelect.addEventListener('change', () => {
+    void runFaceAction('调节喇叭音量失败', async () => {
+      await callPlugin('sound', { volume: Number(volumeSelect.value) });
+      await refreshDashboard();
+    });
+  });
+
+  muteBtn.addEventListener('click', () => {
+    void runFaceAction('切换静音状态失败', async () => {
+      const nextMute = !(latestData?.status?.speaker?.muted ?? false);
+      await callPlugin('sound', { muted: nextMute });
+      await refreshDashboard();
+    });
+  });
+
+  quietSaveBtn.addEventListener('click', () => {
+    void runFaceAction('保存夜间免打扰时段失败', async () => {
+      await callPlugin('sound', {
+        volume: Number(volumeSelect.value),
+        quietHours: quietHoursInput.value.trim(),
+      });
+      await refreshDashboard();
+    });
+  });
+
+  chimeBtnsEl.addEventListener('click', ev => {
     const btn = (ev.target as HTMLElement).closest<HTMLButtonElement>('button[data-chime]');
     if (!btn) return;
     const chime = btn.dataset.chime || 'wake';
-    const res = await callPlugin('sound', { chime, force: true });
-    if (!res.ok) setBanner(res.message || '喇叭试音失败', true);
+    void runFaceAction('喇叭试音失败', async () => {
+      const res = await callPlugin('sound', { chime, force: true });
+      if (!res.ok) setBanner(res.message || '喇叭试音失败', true);
+    });
   });
 
   return {
     activate() {
       active = true;
       dirty = false;
-      void refreshDashboard();
+      weatherCityDirty = false;
+      if (!appState.authExpired) {
+        void refreshDashboard();
+      }
       if (pollTimer) clearInterval(pollTimer);
       pollTimer = setInterval(() => {
-        if (active && options.isVisible() && autoPreviewCheck.checked && !isEditingWithin(panelEl)) {
+        if (active && options.isVisible() && !appState.authExpired && autoPreviewCheck.checked && !isEditingWithin(panelEl)) {
           void refreshDashboard();
         }
       }, 3500);
@@ -917,13 +1003,22 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
         clearInterval(pollTimer);
         pollTimer = undefined;
       }
+      if (expressRefreshTimer !== undefined) {
+        clearTimeout(expressRefreshTimer);
+        expressRefreshTimer = undefined;
+      }
     },
     async refreshBadge() {
+      if (active || appState.authExpired) return;
+      const seq = ++badgeSeq;
       try {
         const res = await callPlugin<Cs80StatusData>('status');
+        if (active || seq !== badgeSeq || appState.authExpired) return;
         if (res.data) updateTopBadge(res.data);
       } catch {
-        topBadge.textContent = '—';
+        if (!active && seq === badgeSeq && !appState.authExpired) {
+          topBadge.textContent = '—';
+        }
       }
     },
   };

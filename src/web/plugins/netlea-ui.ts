@@ -609,6 +609,9 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
 
   let active = false;
   let busy = false;
+  let dashboardSeq = 0;
+  let badgeSeq = 0;
+  let previewSeq = 0;
   let activeView: 'schedule' | 'preset' | 'manual' = 'schedule';
   let lastPayload: NetleaDashboardPayload | null = null;
   let catalog: NetleaCatalog | null = null;
@@ -761,6 +764,8 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
         if (editingTripIndex === i) {
           tripEditor.hidden = true;
           editingTripIndex = -1;
+        } else if (editingTripIndex > i) {
+          editingTripIndex--;
         }
         renderTripList();
       }, 'mini-button danger-btn');
@@ -875,6 +880,11 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
   }
 
   async function refreshCultivationPreview(): Promise<void> {
+    if (presetDebounce) {
+      clearTimeout(presetDebounce);
+      presetDebounce = null;
+    }
+    const seq = ++previewSeq;
     const start = parseHm(presetStartInput.value, 9, 0);
     const lengthCm = clampInt(Number(tankLInput.value), 10, 300);
     const widthCm = clampInt(Number(tankWInput.value), 10, 200);
@@ -897,6 +907,7 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
           previewOnly: true,
         },
       });
+      if (seq !== previewSeq || appState.authExpired) return;
       if (!res.ok || !res.data?.schedule) return;
       previewedSchedule = res.data.schedule;
       const sched = previewedSchedule;
@@ -1005,10 +1016,7 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
       }, 'hub-filter-pill');
       const rmBtn = button('✕', () => {
         const next = presets.filter((_, i) => i !== idx);
-        void (async () => {
-          const res = await runNetlea('config', { savedCustomPresets: next });
-          if (res?.ok) await refreshAfterMutation(false);
-        })();
+        void runNetleaAndRefresh('config', { savedCustomPresets: next }, { forceInputs: false });
       }, 'mini-button');
       frag.append(btn, rmBtn);
     });
@@ -1125,7 +1133,8 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
       const shownChannels = st && st.on ? st.channels : cfg.defaultChannels;
       syncSliderInputs(shownChannels);
       if (st?.matchedScene) {
-        selectedSeries = String(st.matchedScene.model) as '0' | '1' | '2';
+        const modelStr = String(st.matchedScene.model);
+        selectedSeries = modelStr === '0' || modelStr === '1' || modelStr === '2' ? modelStr : 'custom';
         selectedSceneCode = st.matchedScene.modeCode;
         selectedSceneGear = st.matchedScene.gear;
       } else if (st) {
@@ -1142,6 +1151,7 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
       tankWInput.value = String(cfg.tankSize?.widthCm ?? 30);
       tankHInput.value = String(cfg.tankSize?.heightCm ?? 36);
     }
+    ++badgeSeq;
     renderSavedCustomSlots(cfg.savedCustomPresets || []);
     refreshSpectrumPreview();
     if (!previewedSchedule && !viewPreset.hidden) {
@@ -1152,10 +1162,12 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
   async function runNetlea(
     action: string,
     args: Record<string, unknown> = {},
-    opts: { silent?: boolean } = {},
+    opts: { silent?: boolean; pendingBanner?: string } = {},
   ): Promise<NetleaPluginResponse<Record<string, unknown>> | null> {
-    if (busy) return null;
+    if (busy || appState.authExpired || !appState.ready) return null;
     setBusyState(true);
+    ++dashboardSeq;
+    if (opts.pendingBanner) setBanner(opts.pendingBanner, 'warn');
     try {
       const res = await api<NetleaPluginResponse<Record<string, unknown>>>('/api/plugin-run', {
         plugin: 'netlea',
@@ -1182,21 +1194,75 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
     const res = await runNetlea(
       'dashboard',
       refresh ? { refresh: true } : {},
-      { silent: !refresh },
+      {
+        silent: !refresh,
+        ...(refresh ? { pendingBanner: '正在单次短连接读取实时状态、临时设置与灯内行程…' } : {}),
+      },
     );
-    if (res?.ok && res.data) {
+    if (!appState.authExpired && res?.ok && res.data) {
       renderDashboard(res.data as unknown as NetleaDashboardPayload, forceInputs);
     }
   }
 
   async function refreshAfterMutation(forceInputs = true): Promise<void> {
-    const dashRes = await api<NetleaPluginResponse<NetleaDashboardPayload>>('/api/plugin-run', {
-      plugin: 'netlea',
-      action: 'dashboard',
-      args: {},
-    });
-    if (dashRes.ok && dashRes.data) {
-      renderDashboard(dashRes.data, forceInputs);
+    if (appState.authExpired) return;
+    const seq = ++dashboardSeq;
+    try {
+      const dashRes = await api<NetleaPluginResponse<NetleaDashboardPayload>>('/api/plugin-run', {
+        plugin: 'netlea',
+        action: 'dashboard',
+        args: {},
+      });
+      if (seq !== dashboardSeq || appState.authExpired) return;
+      if (dashRes.ok && dashRes.data) {
+        renderDashboard(dashRes.data, forceInputs);
+      } else if (!dashRes.ok) {
+        setBanner(dashRes.message || '刷新鱼缸灯看板失败', 'err');
+      }
+    } catch (err) {
+      if (seq === dashboardSeq && !appState.authExpired) {
+        setBanner(`刷新状态失败：${errorText(err)}`, 'err');
+      }
+    }
+  }
+
+  async function runNetleaAndRefresh(
+    action: string,
+    args: Record<string, unknown> = {},
+    opts: {
+      pendingBanner?: string;
+      forceInputs?: boolean;
+      onSuccess?: (res: NetleaPluginResponse<Record<string, unknown>>) => Promise<void> | void;
+    } = {},
+  ): Promise<void> {
+    if (busy || appState.authExpired || !appState.ready) return;
+    setBusyState(true);
+    ++dashboardSeq;
+    if (opts.pendingBanner) setBanner(opts.pendingBanner, 'warn');
+    try {
+      const res = await api<NetleaPluginResponse<Record<string, unknown>>>('/api/plugin-run', {
+        plugin: 'netlea',
+        action,
+        args,
+      });
+      if (appState.authExpired) return;
+      if (!res.ok) {
+        setBanner(res.message || '执行失败', 'err');
+        return;
+      }
+      if (res.message) {
+        setBanner(res.message, 'ok');
+      }
+      if (opts.onSuccess) {
+        await opts.onSuccess(res);
+      }
+      await refreshAfterMutation(opts.forceInputs ?? true);
+    } catch (err) {
+      if (!appState.authExpired) {
+        setBanner(`操作失败：${errorText(err)}`, 'err');
+      }
+    } finally {
+      setBusyState(false);
     }
   }
 
@@ -1215,11 +1281,9 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
         node('div', `${dev.address} · RSSI ${dev.rssi ?? '--'} dBm${adv}`, 'meta'),
       );
       const bindBtn = button('设为绑定 MAC', () => {
+        if (busy || appState.authExpired || !appState.ready) return;
         cfgMacInput.value = dev.address;
-        void (async () => {
-          const res = await runNetlea('config', { targetMac: dev.address });
-          if (res?.ok) await refreshAfterMutation(true);
-        })();
+        void runNetleaAndRefresh('config', { targetMac: dev.address });
       }, 'mini-button');
       row.append(info, bindBtn);
       frag.append(row);
@@ -1229,17 +1293,17 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
 
   // Event wiring: Top bar & quick controls
   clockBtn.addEventListener('click', () => {
-    setBanner('正在通过蓝牙将主机时钟同步写入鱼缸灯 RTC…', 'warn');
-    void (async () => {
-      const res = await runNetlea('clock', {});
-      if (res?.ok) await refreshAfterMutation(false);
-    })();
+    void runNetleaAndRefresh('clock', {}, {
+      pendingBanner: '正在通过蓝牙将主机时钟同步写入鱼缸灯 RTC…',
+      forceInputs: false,
+    });
   });
 
   scanBtn.addEventListener('click', () => {
     void (async () => {
-      setBanner('正在扫描尼特利鱼缸灯蓝牙广播…', 'warn');
-      const res = await runNetlea('scan', { timeoutSec: 5 });
+      const res = await runNetlea('scan', { timeoutSec: 5 }, {
+        pendingBanner: '正在扫描尼特利鱼缸灯蓝牙广播…',
+      });
       if (res?.ok && res.data) {
         const devices = Array.isArray(res.data.devices) ? (res.data.devices as NetleaDeviceView[]) : [];
         renderScanResults(devices);
@@ -1251,7 +1315,7 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
   });
 
   syncBtn.addEventListener('click', () => {
-    setBanner('正在单次短连接读取实时状态、临时设置与灯内行程…', 'warn');
+    if (busy || appState.authExpired || !appState.ready) return;
     schedDirty = false;
     void loadDashboard(true, true);
   });
@@ -1262,28 +1326,22 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
 
   onBtn.addEventListener('click', () => {
     const durationMinutes = clampInt(Number(tempMinInput.value), 1, 300);
-    setBanner(`正在发送 ${durationMinutes} 分钟临时开灯指令…`, 'warn');
-    void (async () => {
-      const res = await runNetlea('on', { durationMinutes });
-      if (res?.ok) await refreshAfterMutation(true);
-    })();
+    void runNetleaAndRefresh('on', { durationMinutes }, {
+      pendingBanner: `正在发送 ${durationMinutes} 分钟临时开灯指令…`,
+    });
   });
 
   offBtn.addEventListener('click', () => {
     const durationMinutes = clampInt(Number(tempMinInput.value), 1, 300);
-    setBanner(`正在发送 ${durationMinutes} 分钟临时关灯指令…`, 'warn');
-    void (async () => {
-      const res = await runNetlea('off', { durationMinutes });
-      if (res?.ok) await refreshAfterMutation(true);
-    })();
+    void runNetleaAndRefresh('off', { durationMinutes }, {
+      pendingBanner: `正在发送 ${durationMinutes} 分钟临时关灯指令…`,
+    });
   });
 
   resumeBtn.addEventListener('click', () => {
-    setBanner('正在切换回 24h 自动行程…', 'warn');
-    void (async () => {
-      const res = await runNetlea('resume', {});
-      if (res?.ok) await refreshAfterMutation(true);
-    })();
+    void runNetleaAndRefresh('resume', {}, {
+      pendingBanner: '正在切换回 24h 自动行程…',
+    });
   });
 
   brightnessRange.addEventListener('input', () => {
@@ -1293,11 +1351,9 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
   brightnessBtn.addEventListener('click', () => {
     const brightness = clampInt(Number(brightnessRange.value), 1, 100);
     const durationMinutes = clampInt(Number(tempMinInput.value), 1, 300);
-    setBanner(`正在按默认光谱 ${brightness}% 亮度临时开启…`, 'warn');
-    void (async () => {
-      const res = await runNetlea('on', { brightness, durationMinutes });
-      if (res?.ok) await refreshAfterMutation(true);
-    })();
+    void runNetleaAndRefresh('on', { brightness, durationMinutes }, {
+      pendingBanner: `正在按默认光谱 ${brightness}% 亮度临时开启…`,
+    });
   });
 
   // Event wiring: Workspace sub-tabs
@@ -1333,21 +1389,22 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
   });
 
   schedReadBtn.addEventListener('click', () => {
-    setBanner('正在从灯具闪存回读 24h 定时行程…', 'warn');
-    void (async () => {
-      const res = await runNetlea('schedule', { op: 'get' });
-      if (res?.ok && res.data?.schedule) {
-        const sc = res.data.schedule as NetleaSchedule;
-        draftTrips = (sc.trips || []).map(t => ({ ...t, dayList: [...t.dayList] }));
-        draftSunrise = clampInt(sc.sunriseMinutes ?? 0, 0, 300);
-        draftSunset = clampInt(sc.sunsetMinutes ?? 0, 0, 300);
-        draftTravelModel = sc.travelModel ?? 0;
-        sunriseInput.value = String(draftSunrise);
-        sunsetInput.value = String(draftSunset);
-        markSchedDirty(false);
-        await refreshAfterMutation(false);
-      }
-    })();
+    void runNetleaAndRefresh('schedule', { op: 'get' }, {
+      pendingBanner: '正在从灯具闪存回读 24h 定时行程…',
+      forceInputs: false,
+      onSuccess: res => {
+        if (res.data?.schedule) {
+          const sc = res.data.schedule as NetleaSchedule;
+          draftTrips = (sc.trips || []).map(t => ({ ...t, dayList: [...t.dayList] }));
+          draftSunrise = clampInt(sc.sunriseMinutes ?? 0, 0, 300);
+          draftSunset = clampInt(sc.sunsetMinutes ?? 0, 0, 300);
+          draftTravelModel = sc.travelModel ?? 0;
+          sunriseInput.value = String(draftSunrise);
+          sunsetInput.value = String(draftSunset);
+          markSchedDirty(false);
+        }
+      },
+    });
   });
 
   tripNewBtn.addEventListener('click', () => {
@@ -1359,6 +1416,7 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
   });
 
   schedClearBtn.addEventListener('click', () => {
+    if (busy || appState.authExpired || !appState.ready) return;
     if (!clearArmed) {
       clearArmed = true;
       schedClearBtn.classList.add('is-armed');
@@ -1367,48 +1425,52 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
       if (clearArmTimer) clearTimeout(clearArmTimer);
       clearArmTimer = setTimeout(() => {
         clearArmed = false;
+        clearArmTimer = null;
         schedClearBtn.classList.remove('is-armed');
         schedClearBtn.textContent = '🧹 清空灯内行程';
       }, 5000);
       return;
     }
     clearArmed = false;
-    if (clearArmTimer) clearTimeout(clearArmTimer);
+    if (clearArmTimer) {
+      clearTimeout(clearArmTimer);
+      clearArmTimer = null;
+    }
     schedClearBtn.classList.remove('is-armed');
     schedClearBtn.textContent = '🧹 清空灯内行程';
-    setBanner('正在清空灯内全部定时行程…', 'warn');
-    void (async () => {
-      const res = await runNetlea('schedule', { op: 'clear' });
-      if (res?.ok) {
+    void runNetleaAndRefresh('schedule', { op: 'clear' }, {
+      pendingBanner: '正在清空灯内全部定时行程…',
+      forceInputs: false,
+      onSuccess: () => {
         draftTrips = [];
         markSchedDirty(false);
         tripEditor.hidden = true;
-        await refreshAfterMutation(false);
-      }
-    })();
+        editingTripIndex = -1;
+      },
+    });
   });
 
   schedSaveBtn.addEventListener('click', () => {
+    if (busy || appState.authExpired || !appState.ready) return;
     if (draftTrips.length === 0) {
       setBanner('当前列表没有时段；如需彻底关闭定时请点击「清空灯内行程」。', 'err');
       return;
     }
     const sunriseMinutes = clampInt(Number(sunriseInput.value), 0, 300);
     const sunsetMinutes = clampInt(Number(sunsetInput.value), 0, 300);
-    setBanner('正在向灯具写入并激活 24h 日出日落行程…', 'warn');
-    void (async () => {
-      const res = await runNetlea('schedule', {
-        op: 'set',
-        travelModel: draftTravelModel,
-        sunriseMinutes,
-        sunsetMinutes,
-        trips: draftTrips,
-      });
-      if (res?.ok) {
+    void runNetleaAndRefresh('schedule', {
+      op: 'set',
+      travelModel: draftTravelModel,
+      sunriseMinutes,
+      sunsetMinutes,
+      trips: draftTrips,
+    }, {
+      pendingBanner: '正在向灯具写入并激活 24h 日出日落行程…',
+      forceInputs: false,
+      onSuccess: () => {
         markSchedDirty(false);
-        await refreshAfterMutation(false);
-      }
-    })();
+      },
+    });
   });
 
   // Event wiring: Trip editor
@@ -1524,6 +1586,7 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
   const schedulePresetPreview = () => {
     if (presetDebounce) clearTimeout(presetDebounce);
     presetDebounce = setTimeout(() => {
+      presetDebounce = null;
       void refreshCultivationPreview();
     }, 120);
   };
@@ -1545,7 +1608,7 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
 
   presetImportBtn.addEventListener('click', () => {
     void (async () => {
-      if (!previewedSchedule) await refreshCultivationPreview();
+      if (presetDebounce !== null || !previewedSchedule) await refreshCultivationPreview();
       if (!previewedSchedule) return;
       draftTrips = previewedSchedule.trips.map(t => ({ ...t, dayList: [...t.dayList] }));
       draftSunrise = previewedSchedule.sunriseMinutes;
@@ -1563,25 +1626,24 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
   presetApplyBtn.addEventListener('click', () => {
     const start = parseHm(presetStartInput.value, 9, 0);
     const fade = clampInt(Number(presetFadeInput.value), 0, 300);
-    setBanner('正在按缸体尺寸计算预设并写入灯具闪存…', 'warn');
-    void (async () => {
-      const res = await runNetlea('schedule', {
-        op: 'preset',
-        preset: selectedPresetId,
-        lengthCm: clampInt(Number(tankLInput.value), 10, 300),
-        widthCm: clampInt(Number(tankWInput.value), 10, 200),
-        heightCm: clampInt(Number(tankHInput.value), 10, 200),
-        startHour: start.h,
-        startMinute: start.m,
-        sunriseMinutes: fade,
-        sunsetMinutes: fade,
-      });
-      if (res?.ok) {
-        schedDirty = false;
-        await refreshAfterMutation(false);
+    void runNetleaAndRefresh('schedule', {
+      op: 'preset',
+      preset: selectedPresetId,
+      lengthCm: clampInt(Number(tankLInput.value), 10, 300),
+      widthCm: clampInt(Number(tankWInput.value), 10, 200),
+      heightCm: clampInt(Number(tankHInput.value), 10, 200),
+      startHour: start.h,
+      startMinute: start.m,
+      sunriseMinutes: fade,
+      sunsetMinutes: fade,
+    }, {
+      pendingBanner: '正在按缸体尺寸计算预设并写入灯具闪存…',
+      forceInputs: false,
+      onSuccess: () => {
+        markSchedDirty(false);
         switchWorkspaceView('schedule');
-      }
-    })();
+      },
+    });
   });
 
   // Event wiring: View 3 - Manual Workbench & Config
@@ -1614,6 +1676,7 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
   }
 
   saveSlotBtn.addEventListener('click', () => {
+    if (busy || appState.authExpired || !appState.ready) return;
     const existing = lastPayload?.config.savedCustomPresets || [];
     if (existing.length >= 6) {
       setBanner('最多保存 6 个自定义光谱收藏槽，请先删除不需要的收藏。', 'err');
@@ -1621,10 +1684,7 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
     }
     const ch = readCustomSliderChannels();
     const next = [...existing, { name: `方案 ${existing.length + 1}`, ...ch }];
-    void (async () => {
-      const res = await runNetlea('config', { savedCustomPresets: next });
-      if (res?.ok) await refreshAfterMutation(false);
-    })();
+    void runNetleaAndRefresh('config', { savedCustomPresets: next }, { forceInputs: false });
   });
 
   function buildSpectrumActionArgs(): Record<string, unknown> {
@@ -1636,85 +1696,85 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
 
   applyTempBtn.addEventListener('click', () => {
     const durationMinutes = clampInt(Number(tempMinInput.value), 1, 300);
-    setBanner(`正在以当前光谱临时开灯（${durationMinutes} 分钟后恢复行程）…`, 'warn');
-    void (async () => {
-      const res = await runNetlea('on', { ...buildSpectrumActionArgs(), durationMinutes });
-      if (res?.ok) await refreshAfterMutation(true);
-    })();
+    void runNetleaAndRefresh('on', { ...buildSpectrumActionArgs(), durationMinutes }, {
+      pendingBanner: `正在以当前光谱临时开灯（${durationMinutes} 分钟后恢复行程）…`,
+    });
   });
 
   applyManualBtn.addEventListener('click', () => {
-    setBanner('正在切换为手动恒亮模式（常亮不随定时变化）…', 'warn');
-    void (async () => {
-      const res = await runNetlea('mode', { mode: 'manual', on: true, ...buildSpectrumActionArgs() });
-      if (res?.ok) await refreshAfterMutation(true);
-    })();
+    void runNetleaAndRefresh('mode', { mode: 'manual', on: true, ...buildSpectrumActionArgs() }, {
+      pendingBanner: '正在切换为手动恒亮模式（常亮不随定时变化）…',
+    });
   });
 
   manualOffBtn.addEventListener('click', () => {
-    setBanner('正在发送手动恒定关灯指令…', 'warn');
-    void (async () => {
-      const res = await runNetlea('mode', { mode: 'manual', on: false });
-      if (res?.ok) await refreshAfterMutation(true);
-    })();
+    void runNetleaAndRefresh('mode', { mode: 'manual', on: false }, {
+      pendingBanner: '正在发送手动恒定关灯指令…',
+    });
   });
 
   saveDefaultBtn.addEventListener('click', () => {
     const defaultChannels = readCustomSliderChannels();
-    void (async () => {
-      const res = await runNetlea('config', { defaultChannels });
-      if (res?.ok) await refreshAfterMutation(true);
-    })();
+    void runNetleaAndRefresh('config', { defaultChannels });
   });
 
   cfgTempSaveBtn.addEventListener('click', () => {
     const onMinutes = clampInt(Number(cfgOnMinInput.value), 1, 300);
     const offMinutes = clampInt(Number(cfgOffMinInput.value), 1, 300);
-    setBanner('正在将默认临时开关灯分钟数写入灯具 (0x1A)…', 'warn');
-    void (async () => {
-      const res = await runNetlea('mode', {
-        mode: 'temp-config',
-        onMinutes,
-        offMinutes,
-        ...buildSpectrumActionArgs(),
-      });
-      if (res?.ok) await refreshAfterMutation(true);
-    })();
+    void runNetleaAndRefresh('mode', {
+      mode: 'temp-config',
+      onMinutes,
+      offMinutes,
+      ...buildSpectrumActionArgs(),
+    }, {
+      pendingBanner: '正在将默认临时开关灯分钟数写入灯具 (0x1A)…',
+    });
   });
 
   cfgSaveBtn.addEventListener('click', () => {
     const targetMac = cfgMacInput.value.trim();
     const namePrefix = cfgPrefixInput.value.trim() || 'SG-';
-    void (async () => {
-      const res = await runNetlea('config', { targetMac, namePrefix });
-      if (res?.ok) await refreshAfterMutation(true);
-    })();
+    void runNetleaAndRefresh('config', { targetMac, namePrefix });
   });
 
   return {
     activate() {
       active = true;
+      ++badgeSeq;
       setBusyState(false);
-      void loadDashboard(false, false);
+      if (!appState.authExpired && appState.ready) {
+        void loadDashboard(false, false);
+      }
     },
     deactivate() {
       active = false;
+      if (presetDebounce) {
+        clearTimeout(presetDebounce);
+        presetDebounce = null;
+      }
+      if (clearArmTimer) {
+        clearTimeout(clearArmTimer);
+        clearArmTimer = null;
+      }
+      clearArmed = false;
+      schedClearBtn.classList.remove('is-armed');
+      schedClearBtn.textContent = '🧹 清空灯内行程';
+      setBusyState(false);
     },
     async refreshBadge() {
+      if (active || appState.authExpired || !appState.ready) return;
+      const seq = ++badgeSeq;
       try {
         const res = await api<NetleaPluginResponse<NetleaDashboardPayload>>('/api/plugin-run', {
           plugin: 'netlea',
           action: 'dashboard',
           args: {},
         });
+        if (active || seq !== badgeSeq || appState.authExpired) return;
         if (res.ok && res.data) {
-          if (active && options.isVisible()) {
-            renderDashboard(res.data, false);
-          } else {
-            lastPayload = res.data;
-            if (res.data.catalog) catalog = res.data.catalog;
-            updateBadge(res.data);
-          }
+          lastPayload = res.data;
+          if (res.data.catalog) catalog = res.data.catalog;
+          updateBadge(res.data);
         }
       } catch {
         // Ignore transient badge sync errors

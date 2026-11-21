@@ -242,6 +242,7 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
   const fundFormSaveBtn = element<HTMLButtonElement>('fund-form-save-btn');
 
   const deleteArmed = new Map<string, number>();
+  const deleteArmedTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   let dashboard: FundDashboardData | null = null;
   let lastDataMode: 'cached' | 'live' | 'settle' = 'cached';
@@ -252,8 +253,32 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
   let typeFilter: FundTypeFilterKey = 'all';
   let hoveredPointIdx: number | null = null;
   let plottedPoints: ChartPoint[] = [];
+  let lastChartCssW = 900;
+  let lastChartCssH = 220;
   let busy = false;
   let requestSeq = 0;
+
+  function clearHoldingDeleteArm(code: string) {
+    deleteArmed.delete(code);
+    const timer = deleteArmedTimers.get(code);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      deleteArmedTimers.delete(code);
+    }
+  }
+
+  function armHoldingDelete(code: string) {
+    clearHoldingDeleteArm(code);
+    deleteArmed.set(code, Date.now());
+    const timer = setTimeout(() => {
+      deleteArmed.delete(code);
+      deleteArmedTimers.delete(code);
+      if (options.isVisible() && dashboard) {
+        renderHoldingsList();
+      }
+    }, 5000);
+    deleteArmedTimers.set(code, timer);
+  }
 
   function setActionStatus(text = '', tone: '' | 'ok' | 'warn' | 'err' = '') {
     if (!text) {
@@ -447,8 +472,10 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
     if (!ctx) return;
 
     const rect = canvas.getBoundingClientRect();
-    const cssW = Math.max(320, Math.round(rect.width || canvas.width || 900));
-    const cssH = Math.max(180, Math.round(rect.height || canvas.height || 220));
+    const cssW = Math.max(320, Math.round(rect.width || canvas.clientWidth || 900));
+    const cssH = Math.max(180, Math.round(rect.height || canvas.clientHeight || 220));
+    lastChartCssW = cssW;
+    lastChartCssH = cssH;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     if (canvas.width !== cssW * dpr || canvas.height !== cssH * dpr) {
       canvas.width = cssW * dpr;
@@ -781,12 +808,14 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
       const armedAt = deleteArmed.get(row.code) ?? 0;
       const isArmed = now - armedAt < 5000;
       const delBtn = button(isArmed ? '确认删除' : '🗑️ 删除', () => {
-        if (!isArmed) {
-          deleteArmed.set(row.code, Date.now());
+        const currentlyArmed = Date.now() - (deleteArmed.get(row.code) ?? 0) < 5000;
+        if (!currentlyArmed) {
+          armHoldingDelete(row.code);
           renderHoldingsList();
           return;
         }
-        deleteArmed.delete(row.code);
+        clearHoldingDeleteArm(row.code);
+        renderHoldingsList();
         void deleteHoldingFromUi(row.code);
       }, 'mini-button danger-btn');
 
@@ -811,6 +840,7 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
     quiet?: boolean;
     dataMode?: 'cached' | 'live' | 'settle';
   } = {}) {
+    if (appState.authExpired) return;
     const seq = ++requestSeq;
     const isRefresh = Boolean(opts.refresh);
     const mode = opts.mode === 'settle' ? 'settle' : 'status';
@@ -825,7 +855,7 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
         refresh: isRefresh,
         mode,
       });
-      if (seq !== requestSeq && !isRefresh) {
+      if (seq !== requestSeq || appState.authExpired) {
         return;
       }
       if (!res.ok || !res.data) {
@@ -842,14 +872,14 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
         }
       }
     } catch (err) {
-      if (!opts.quiet && options.isVisible()) {
+      if (seq === requestSeq && !opts.quiet && options.isVisible() && !appState.authExpired) {
         setActionStatus(`加载投资看板失败：${errorText(err)}`, 'err');
       }
     }
   }
 
   async function triggerManualRefresh(mode: 'status' | 'settle') {
-    if (busy) return;
+    if (busy || appState.authExpired) return;
     busy = true;
     fundRefreshBtn.disabled = true;
     fundSettleBtn.disabled = true;
@@ -862,14 +892,15 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
       });
     } finally {
       busy = false;
-      fundRefreshBtn.disabled = false;
-      fundSettleBtn.disabled = false;
+      fundRefreshBtn.disabled = appState.authExpired;
+      fundSettleBtn.disabled = appState.authExpired;
     }
   }
 
   async function deleteHoldingFromUi(code: string) {
-    if (busy) return;
+    if (busy || appState.authExpired) return;
     busy = true;
+    ++requestSeq;
     try {
       const res = await runFundPlugin('remove-holding', { code });
       if (!res.ok) {
@@ -998,15 +1029,17 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
       setActionStatus(`保存持仓失败：${errorText(err)}`, 'err');
     } finally {
       busy = false;
-      fundFormSaveBtn.disabled = false;
+      fundFormSaveBtn.disabled = appState.authExpired;
     }
   }
 
   function handleCanvasHover(event: MouseEvent) {
     if (!plottedPoints.length) return;
     const rect = fundTrendCanvas.getBoundingClientRect();
-    const px = event.clientX - rect.left;
-    const py = event.clientY - rect.top;
+    const scaleX = rect.width > 0 ? lastChartCssW / rect.width : 1;
+    const scaleY = rect.height > 0 ? lastChartCssH / rect.height : 1;
+    const px = (event.clientX - rect.left) * scaleX;
+    const py = (event.clientY - rect.top) * scaleY;
     let bestIdx: number | null = null;
     let bestDist = 28;
     for (let i = 0; i < plottedPoints.length; i++) {
@@ -1026,6 +1059,10 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
 
   function activate() {
     setActionStatus();
+    fundRefreshBtn.disabled = appState.authExpired;
+    fundSettleBtn.disabled = appState.authExpired;
+    fundFormSaveBtn.disabled = appState.authExpired;
+    if (appState.authExpired) return;
     if (dashboard) {
       renderModal();
       window.requestAnimationFrame(() => {
@@ -1043,6 +1080,10 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
   }
 
   function deactivate() {
+    for (const timer of deleteArmedTimers.values()) {
+      clearTimeout(timer);
+    }
+    deleteArmedTimers.clear();
     deleteArmed.clear();
   }
 

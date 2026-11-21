@@ -191,7 +191,9 @@ export function initNotebookHub(): NotebookHubController {
   let noteBaseUpdatedAt: number | undefined;
   let pendingRemoteNote: NoteItem | undefined;
   let noteSaving = false;
-  let noteFlushRequested = false;
+  let activeSavePromise: Promise<boolean> | undefined;
+  let noteEditRev = 0;
+  let editorContextSeq = 0;
   let autoSaveTimer: ReturnType<typeof setTimeout> | undefined;
   let searchDebounceTimer: ReturnType<typeof setTimeout> | undefined;
   let noteLoadToken = 0;
@@ -303,6 +305,7 @@ export function initNotebookHub(): NotebookHubController {
   }
 
   function populateNoteEditor(note: NoteItem, options?: { mode?: NoteViewMode }): void {
+    ++editorContextSeq;
     suppressingInputSync = true;
     try {
       selectedNoteId = note.id;
@@ -333,6 +336,7 @@ export function initNotebookHub(): NotebookHubController {
   }
 
   function startNewNoteDraft(): void {
+    ++editorContextSeq;
     if (autoSaveTimer) {
       clearTimeout(autoSaveTimer);
       autoSaveTimer = undefined;
@@ -364,6 +368,11 @@ export function initNotebookHub(): NotebookHubController {
   }
 
   function clearNoteWorkspace(): void {
+    ++editorContextSeq;
+    if (autoSaveTimer) {
+      clearTimeout(autoSaveTimer);
+      autoSaveTimer = undefined;
+    }
     selectedNoteId = undefined;
     isNewDraft = false;
     noteDirty = false;
@@ -386,13 +395,19 @@ export function initNotebookHub(): NotebookHubController {
     if (noteFilterTag) {
       chips.push(button('✕ 清除标签', () => {
         noteFilterTag = '';
-        void loadNotes(true);
+        void (async () => {
+          if (noteDirty && !pendingRemoteNote) await flushPendingSave();
+          await loadNotes(true);
+        })();
       }, 'hub-filter-pill'));
     }
     for (const item of noteTags.slice(0, 12)) {
       const btn = button(`#${item.tag} (${item.count})`, () => {
         noteFilterTag = noteFilterTag.toLowerCase() === item.tag.toLowerCase() ? '' : item.tag;
-        void loadNotes(true);
+        void (async () => {
+          if (noteDirty && !pendingRemoteNote) await flushPendingSave();
+          await loadNotes(true);
+        })();
       }, `hub-filter-pill${noteFilterTag.toLowerCase() === item.tag.toLowerCase() ? ' active' : ''}`);
       chips.push(btn);
     }
@@ -453,6 +468,8 @@ export function initNotebookHub(): NotebookHubController {
     if (noteDirty && !pendingRemoteNote) {
       await flushPendingSave();
       if (pendingRemoteNote) return;
+    } else if (activeSavePromise) {
+      await activeSavePromise;
     }
     const found = notes.find(item => item.id === id);
     if (!found) return;
@@ -504,10 +521,13 @@ export function initNotebookHub(): NotebookHubController {
           clearNoteWorkspace();
         }
       }
-      if ((selectFallback || !selectedNoteId) && notes.length > 0) {
+      const preserveEditor = Boolean(
+        selectedNoteId && (noteDirty || pendingRemoteNote || isEditingWithin(noteWorkspaceEl)),
+      );
+      if ((selectFallback || !selectedNoteId) && notes.length > 0 && !preserveEditor) {
         populateNoteEditor(notes[0]!, { mode: 'preview' });
         renderNotesList();
-      } else if (!selectedNoteId) {
+      } else if (!selectedNoteId && !preserveEditor) {
         clearNoteWorkspace();
       }
     } catch (err) {
@@ -521,109 +541,133 @@ export function initNotebookHub(): NotebookHubController {
       clearTimeout(autoSaveTimer);
       autoSaveTimer = undefined;
     }
+    while (activeSavePromise) {
+      const prevOk = await activeSavePromise;
+      if (!forceOverwrite && !noteDirty) return prevOk;
+    }
     if (!appState.ready || appState.authExpired) return false;
     if (!isNewDraft && !selectedNoteId) return false;
     if (pendingRemoteNote && !forceOverwrite) return false;
 
+    const ctxSeq = editorContextSeq;
+    const targetId = selectedNoteId;
+    const savedEditRev = noteEditRev;
     const title = noteTitleInput.value;
     const content = noteContentInput.value;
     const tags = parseTagsText(noteTagsInput.value);
 
     // Avoid persisting a completely empty brand-new draft automatically
-    if (isNewDraft && !selectedNoteId && !title.trim() && !content.trim()) {
+    if (isNewDraft && !targetId && !title.trim() && !content.trim()) {
       noteDirty = false;
       return true;
     }
 
-    if (noteSaving) {
-      noteFlushRequested = true;
-      return false;
-    }
+    const runSave = async (): Promise<boolean> => {
+      noteSaving = true;
+      setSaveStatus('保存中…', 'amber');
+      try {
+        const payload: Record<string, unknown> = {
+          ...(targetId ? { id: targetId } : {}),
+          title,
+          content,
+          tags,
+          author: 'user',
+          updatedBy: 'user',
+          ...(!forceOverwrite && targetId && noteBaseUpdatedAt !== undefined ? { expectedUpdatedAt: noteBaseUpdatedAt } : {}),
+        };
+        const res = await api<{ note: NoteItem; summary: NotebookSummaryView }>('/api/note-save', payload);
+        const saved = res.note;
 
-    noteSaving = true;
-    setSaveStatus('保存中…', 'amber');
-    try {
-      const payload: Record<string, unknown> = {
-        ...(selectedNoteId ? { id: selectedNoteId } : {}),
-        title,
-        content,
-        tags,
-        author: 'user',
-        updatedBy: 'user',
-        ...(!forceOverwrite && selectedNoteId && noteBaseUpdatedAt !== undefined ? { expectedUpdatedAt: noteBaseUpdatedAt } : {}),
-      };
-      const res = await api<{ note: NoteItem; summary: NotebookSummaryView }>('/api/note-save', payload);
-      const saved = res.note;
-      selectedNoteId = saved.id;
-      isNewDraft = false;
-      noteDirty = false;
-      noteBaseUpdatedAt = saved.updatedAt;
-      pendingRemoteNote = undefined;
-      updateConflictBanner();
+        const idx = notes.findIndex(item => item.id === saved.id);
+        if (idx >= 0) notes[idx] = saved;
+        else notes.unshift(saved);
+        notes.sort((a, b) => (a.pinned !== b.pinned ? (a.pinned ? -1 : 1) : b.updatedAt - a.updatedAt));
 
-      if (suppressingInputSync === false) {
-        if (!noteTitleInput.value.trim()) noteTitleInput.value = saved.title;
-      }
-      const authorLabel = saved.author === 'friday' ? 'F.R.I.D.A.Y. 创建' : '你创建';
-      const promotedSuffix = saved.promotedMemoryId ? ' · 已关联全息记忆' : '';
-      noteMetaInfoEl.textContent = `${authorLabel} · 更新于 ${timestamp(saved.updatedAt)}${promotedSuffix}`;
-      syncWorkspaceButtons(saved);
-
-      const idx = notes.findIndex(item => item.id === saved.id);
-      if (idx >= 0) notes[idx] = saved;
-      else notes.unshift(saved);
-      notes.sort((a, b) => (a.pinned !== b.pinned ? (a.pinned ? -1 : 1) : b.updatedAt - a.updatedAt));
-
-      if (res.summary) {
-        applySummaryBadges(res.summary);
-        loadedNotesSig = summarySignature(res.summary);
-      }
-      if (!noteQuery.trim() && !noteFilterPinnedOnly && !noteFilterTag.trim()) {
-        const counts = new Map<string, { tag: string; count: number }>();
-        for (const item of notes) {
-          for (const tag of item.tags) {
-            const key = tag.toLowerCase();
-            const cur = counts.get(key);
-            if (cur) cur.count++;
-            else counts.set(key, { tag, count: 1 });
-          }
+        if (res.summary) {
+          applySummaryBadges(res.summary);
+          loadedNotesSig = summarySignature(res.summary);
         }
-        noteTags = [...counts.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag));
-        renderNoteTagChips();
-      }
-      setSaveStatus('已保存', 'green');
-      renderNotesList();
-      broadcastSync('notes');
-      void hooks.refreshView();
-      return true;
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 409 && selectedNoteId) {
-        try {
-          pendingRemoteNote = await api<NoteItem>(`/api/note?id=${encodeURIComponent(selectedNoteId)}`);
+        if (!noteQuery.trim() && !noteFilterPinnedOnly && !noteFilterTag.trim()) {
+          const counts = new Map<string, { tag: string; count: number }>();
+          for (const item of notes) {
+            for (const tag of item.tags) {
+              const key = tag.toLowerCase();
+              const cur = counts.get(key);
+              if (cur) cur.count++;
+              else counts.set(key, { tag, count: 1 });
+            }
+          }
+          noteTags = [...counts.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag));
+          renderNoteTagChips();
+        }
+
+        if (ctxSeq === editorContextSeq) {
+          selectedNoteId = saved.id;
+          isNewDraft = false;
+          noteBaseUpdatedAt = saved.updatedAt;
+          pendingRemoteNote = undefined;
           updateConflictBanner();
-          setSaveStatus('冲突待处理', 'amber');
-        } catch {
-          setSaveStatus('保存冲突，请刷新重试', 'red');
+
+          if (noteEditRev === savedEditRev) {
+            noteDirty = false;
+            if (suppressingInputSync === false && !noteTitleInput.value.trim()) {
+              noteTitleInput.value = saved.title;
+            }
+            setSaveStatus('已保存', 'green');
+          } else {
+            noteDirty = true;
+            setSaveStatus('未保存…', 'amber');
+          }
+          const authorLabel = saved.author === 'friday' ? 'F.R.I.D.A.Y. 创建' : '你创建';
+          const promotedSuffix = saved.promotedMemoryId ? ' · 已关联全息记忆' : '';
+          noteMetaInfoEl.textContent = `${authorLabel} · 更新于 ${timestamp(saved.updatedAt)}${promotedSuffix}`;
+          syncWorkspaceButtons(saved);
+        }
+
+        renderNotesList();
+        broadcastSync('notes');
+        void hooks.refreshView();
+        return true;
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 409 && targetId) {
+          if (ctxSeq === editorContextSeq) {
+            try {
+              const latest = await api<NoteItem>(`/api/note?id=${encodeURIComponent(targetId)}`);
+              if (ctxSeq === editorContextSeq) {
+                pendingRemoteNote = latest;
+                updateConflictBanner();
+                setSaveStatus('冲突待处理', 'amber');
+              }
+            } catch {
+              if (ctxSeq === editorContextSeq) {
+                setSaveStatus('保存冲突，请刷新重试', 'red');
+              }
+            }
+          }
+          return false;
+        }
+        if (ctxSeq === editorContextSeq) {
+          setSaveStatus(`保存失败：${errorText(err)}`, 'red');
         }
         return false;
+      } finally {
+        noteSaving = false;
+        activeSavePromise = undefined;
       }
-      setSaveStatus(`保存失败：${errorText(err)}`, 'red');
-      return false;
-    } finally {
-      noteSaving = false;
-      if (noteFlushRequested) {
-        noteFlushRequested = false;
-        if (noteDirty && !pendingRemoteNote) {
-          void saveCurrentNote(false);
-        }
-      }
-    }
+    };
+
+    const promise = runSave();
+    activeSavePromise = promise;
+    return await promise;
   }
 
   async function flushPendingSave(): Promise<void> {
     if (autoSaveTimer) {
       clearTimeout(autoSaveTimer);
       autoSaveTimer = undefined;
+    }
+    while (activeSavePromise) {
+      await activeSavePromise;
     }
     if (noteDirty && !pendingRemoteNote) {
       await saveCurrentNote(false);
@@ -632,6 +676,7 @@ export function initNotebookHub(): NotebookHubController {
 
   function markNoteDirty(): void {
     if (suppressingInputSync) return;
+    ++noteEditRev;
     noteDirty = true;
     setSaveStatus('未保存…', 'amber');
     if (noteMode !== 'edit') renderNotePreview();
@@ -724,11 +769,17 @@ export function initNotebookHub(): NotebookHubController {
     diaryEmptyStateEl.hidden = true;
     diaryReaderEl.hidden = false;
 
-    diaryAvatarSlot.replaceChildren(createStaticBotSvg({ size: 52, expr: entry.mood, interactivePoke: true }));
+    diaryAvatarSlot.replaceChildren(
+      createStaticBotSvg({
+        size: 52,
+        expr: entry.mood in BOT_EXPRESSION_META ? entry.mood : 'calm',
+        interactivePoke: true,
+      }),
+    );
     diaryDateDisplay.textContent = entry.date;
     diaryTitleDisplay.textContent = entry.title;
 
-    const moodMeta = BOT_EXPRESSION_META[entry.mood];
+    const moodMeta = BOT_EXPRESSION_META[entry.mood] ?? BOT_EXPRESSION_META.calm;
     const moodBadge = node('span', `${moodMeta.plainEmoji} ${moodMeta.label}`, 'hub-status-pill badge-amber');
     const sourceBadge = node('span', DIARY_SOURCE_LABELS[entry.source] ?? entry.source, 'hub-status-pill badge-slate');
     const timeEl = node('span', `写于 ${timestamp(entry.updatedAt)}`, 'meta');
@@ -772,7 +823,7 @@ export function initNotebookHub(): NotebookHubController {
       left.append(node('span', entry.date, 'diary-date-chip'));
       left.append(node('strong', entry.title, 'notebook-list-title'));
       head.append(left);
-      const moodMeta = BOT_EXPRESSION_META[entry.mood];
+      const moodMeta = BOT_EXPRESSION_META[entry.mood] ?? BOT_EXPRESSION_META.calm;
       head.append(node('span', moodMeta.plainEmoji, 'diary-mood-emoji'));
 
       const preview = node('p', compactPreview(entry.content), 'notebook-list-preview');
@@ -875,7 +926,15 @@ export function initNotebookHub(): NotebookHubController {
 
   function closeModal(): void {
     if (notebookHubBackdrop.hidden) return;
-    if (noteDirty && !pendingRemoteNote) {
+    if (searchDebounceTimer) {
+      clearTimeout(searchDebounceTimer);
+      searchDebounceTimer = undefined;
+    }
+    if (diarySearchTimer) {
+      clearTimeout(diarySearchTimer);
+      diarySearchTimer = undefined;
+    }
+    if ((noteDirty && !pendingRemoteNote) || activeSavePromise) {
       void flushPendingSave();
     }
     clearDeleteArming();
@@ -890,7 +949,14 @@ export function initNotebookHub(): NotebookHubController {
     const sigChanged = nextSig !== lastSummarySig;
     lastSummarySig = nextSig;
 
-    if (notebookHubBackdrop.hidden || !appState.ready || appState.authExpired) return;
+    if (!appState.ready || appState.authExpired) {
+      const currentNote = selectedNoteId ? notes.find(item => item.id === selectedNoteId) : undefined;
+      syncWorkspaceButtons(currentNote);
+      diaryPromoteBtn.disabled = true;
+      diaryDeleteBtn.disabled = true;
+      return;
+    }
+    if (notebookHubBackdrop.hidden) return;
     if (activeTab === 'notes' && (force || sigChanged || !notesLoaded || loadedNotesSig !== nextSig)) {
       void loadNotes(false);
     } else if (activeTab === 'diary' && (force || sigChanged || !diaryLoaded || loadedDiarySig !== nextSig)) {
@@ -910,7 +976,7 @@ export function initNotebookHub(): NotebookHubController {
 
   noteNewBtn.addEventListener('click', () => {
     void (async () => {
-      if (noteDirty && !pendingRemoteNote) await flushPendingSave();
+      if ((noteDirty && !pendingRemoteNote) || activeSavePromise) await flushPendingSave();
       startNewNoteDraft();
     })();
   });
@@ -921,19 +987,28 @@ export function initNotebookHub(): NotebookHubController {
     if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
     searchDebounceTimer = setTimeout(() => {
       searchDebounceTimer = undefined;
-      void loadNotes(true);
+      void (async () => {
+        if ((noteDirty && !pendingRemoteNote) || activeSavePromise) await flushPendingSave();
+        await loadNotes(true);
+      })();
     }, 220);
   });
 
   noteFilterAllBtn.addEventListener('click', () => {
     if (!noteFilterPinnedOnly) return;
     noteFilterPinnedOnly = false;
-    void loadNotes(true);
+    void (async () => {
+      if ((noteDirty && !pendingRemoteNote) || activeSavePromise) await flushPendingSave();
+      await loadNotes(true);
+    })();
   });
   noteFilterPinnedBtn.addEventListener('click', () => {
     if (noteFilterPinnedOnly) return;
     noteFilterPinnedOnly = true;
-    void loadNotes(true);
+    void (async () => {
+      if ((noteDirty && !pendingRemoteNote) || activeSavePromise) await flushPendingSave();
+      await loadNotes(true);
+    })();
   });
 
   noteModePreviewBtn.addEventListener('click', () => { noteMode = 'preview'; syncNoteModeUI(); });
@@ -978,10 +1053,11 @@ export function initNotebookHub(): NotebookHubController {
   });
 
   notePinBtn.addEventListener('click', () => {
-    if (!selectedNoteId) return;
+    if (!selectedNoteId || !appState.ready || appState.authExpired) return;
     const targetId = selectedNoteId;
     void (async () => {
-      if (noteDirty && !pendingRemoteNote) await flushPendingSave();
+      if ((noteDirty && !pendingRemoteNote) || activeSavePromise) await flushPendingSave();
+      if (!appState.ready || appState.authExpired) return;
       const current = notes.find(item => item.id === targetId);
       if (!current) return;
       try {
@@ -989,7 +1065,6 @@ export function initNotebookHub(): NotebookHubController {
           id: current.id,
           pinned: !current.pinned,
         });
-        noteBaseUpdatedAt = res.note.updatedAt;
         const idx = notes.findIndex(item => item.id === res.note.id);
         if (idx >= 0) notes[idx] = res.note;
         notes.sort((a, b) => (a.pinned !== b.pinned ? (a.pinned ? -1 : 1) : b.updatedAt - a.updatedAt));
@@ -997,42 +1072,52 @@ export function initNotebookHub(): NotebookHubController {
           applySummaryBadges(res.summary);
           loadedNotesSig = summarySignature(res.summary);
         }
-        syncWorkspaceButtons(res.note);
+        if (selectedNoteId === res.note.id) {
+          noteBaseUpdatedAt = res.note.updatedAt;
+          syncWorkspaceButtons(res.note);
+        }
         renderNotesList();
         broadcastSync('notes');
         void hooks.refreshView();
       } catch (err) {
-        setSaveStatus(`置顶失败：${errorText(err)}`, 'red');
+        if (selectedNoteId === targetId) {
+          setSaveStatus(`置顶失败：${errorText(err)}`, 'red');
+        }
       }
     })();
   });
 
   notePromoteBtn.addEventListener('click', () => {
-    if (!selectedNoteId) return;
+    if (!selectedNoteId || !appState.ready || appState.authExpired) return;
     const targetId = selectedNoteId;
     void (async () => {
-      if (noteDirty && !pendingRemoteNote) await flushPendingSave();
-      setSaveStatus('转存记忆中…', 'amber');
+      if ((noteDirty && !pendingRemoteNote) || activeSavePromise) await flushPendingSave();
+      if (!appState.ready || appState.authExpired) return;
+      if (selectedNoteId === targetId) setSaveStatus('转存记忆中…', 'amber');
       try {
         const res = await api<{ note: NoteItem; summary: NotebookSummaryView }>('/api/note-promote-memory', { id: targetId });
         const idx = notes.findIndex(item => item.id === res.note.id);
         if (idx >= 0) notes[idx] = res.note;
-        if (selectedNoteId === res.note.id && !noteDirty) {
-          populateNoteEditor(res.note);
-        } else {
-          noteBaseUpdatedAt = res.note.updatedAt;
-          syncWorkspaceButtons(res.note);
-        }
         if (res.summary) {
           applySummaryBadges(res.summary);
           loadedNotesSig = summarySignature(res.summary);
         }
-        setSaveStatus('✓ 已转存至全息记忆', 'green');
+        if (selectedNoteId === res.note.id) {
+          if (!noteDirty) {
+            populateNoteEditor(res.note);
+          } else {
+            noteBaseUpdatedAt = res.note.updatedAt;
+            syncWorkspaceButtons(res.note);
+          }
+          setSaveStatus('✓ 已转存至全息记忆', 'green');
+        }
         renderNotesList();
         broadcastSync('notes');
         void hooks.refreshView();
       } catch (err) {
-        setSaveStatus(`转存失败：${errorText(err)}`, 'red');
+        if (selectedNoteId === targetId) {
+          setSaveStatus(`转存失败：${errorText(err)}`, 'red');
+        }
       }
     })();
   });
@@ -1066,16 +1151,19 @@ export function initNotebookHub(): NotebookHubController {
           applySummaryBadges(res.summary);
           loadedNotesSig = summarySignature(res.summary);
         }
-        clearNoteWorkspace();
-        renderNotesList();
-        if (notes.length > 0) {
-          populateNoteEditor(notes[0]!, { mode: 'preview' });
-          renderNotesList();
+        if (selectedNoteId === deleteId) {
+          clearNoteWorkspace();
+          if (notes.length > 0) {
+            populateNoteEditor(notes[0]!, { mode: 'preview' });
+          }
         }
+        renderNotesList();
         broadcastSync('notes');
         void hooks.refreshView();
       } catch (err) {
-        setSaveStatus(`删除失败：${errorText(err)}`, 'red');
+        if (selectedNoteId === deleteId) {
+          setSaveStatus(`删除失败：${errorText(err)}`, 'red');
+        }
       }
     })();
   });
@@ -1090,7 +1178,7 @@ export function initNotebookHub(): NotebookHubController {
   });
 
   diaryPromoteBtn.addEventListener('click', () => {
-    if (!selectedDiaryId) return;
+    if (!selectedDiaryId || !appState.ready || appState.authExpired) return;
     const targetId = selectedDiaryId;
     diaryPromoteBtn.disabled = true;
     diaryPromoteBtn.textContent = '转存中…';
@@ -1103,13 +1191,17 @@ export function initNotebookHub(): NotebookHubController {
           applySummaryBadges(res.summary);
           loadedDiarySig = summarySignature(res.summary);
         }
-        renderDiaryReader(res.entry);
+        if (selectedDiaryId === res.entry.id) {
+          renderDiaryReader(res.entry);
+          diaryPromoteBtn.textContent = '✓ 已转存记忆';
+        }
         renderDiaryList();
-        diaryPromoteBtn.textContent = '✓ 已转存记忆';
         broadcastSync('diary');
         void hooks.refreshView();
       } catch (err) {
-        diaryPromoteBtn.textContent = `转存失败：${errorText(err)}`;
+        if (selectedDiaryId === targetId) {
+          diaryPromoteBtn.textContent = `转存失败：${errorText(err)}`;
+        }
       } finally {
         diaryPromoteBtn.disabled = !appState.ready || appState.authExpired;
       }
@@ -1137,12 +1229,16 @@ export function initNotebookHub(): NotebookHubController {
           applySummaryBadges(res.summary);
           loadedDiarySig = summarySignature(res.summary);
         }
-        renderDiaryReader(diaryEntries[0]);
+        if (selectedDiaryId === targetId) {
+          renderDiaryReader(diaryEntries[0]);
+        }
         renderDiaryList();
         broadcastSync('diary');
         void hooks.refreshView();
       } catch {
-        diaryDeleteBtn.textContent = '删除失败';
+        if (selectedDiaryId === targetId) {
+          diaryDeleteBtn.textContent = '删除失败';
+        }
       }
     })();
   });
@@ -1161,6 +1257,26 @@ export function initNotebookHub(): NotebookHubController {
       if (document.hidden || notebookHubBackdrop.hidden || !appState.ready || appState.authExpired) return;
       if (activeTab === 'notes') void loadNotes(false);
       else void loadDiary(false);
+    });
+  }
+
+  if (typeof window !== 'undefined') {
+    window.addEventListener('pagehide', () => {
+      if (autoSaveTimer) {
+        clearTimeout(autoSaveTimer);
+        autoSaveTimer = undefined;
+      }
+      if (searchDebounceTimer) {
+        clearTimeout(searchDebounceTimer);
+        searchDebounceTimer = undefined;
+      }
+      if (diarySearchTimer) {
+        clearTimeout(diarySearchTimer);
+        diarySearchTimer = undefined;
+      }
+      clearDeleteArming();
+      clearDiaryDeleteArming();
+      syncChannel?.close();
     });
   }
 
