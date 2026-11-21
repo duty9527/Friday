@@ -7,7 +7,7 @@ import { resolveEnv } from '../paths.js';
 import { text } from '../protocol.js';
 import type { SemanticEmbedder } from '../semantic.js';
 import type { DreamMaterial, Store, Task } from '../store.js';
-import type { ChatMessage, ModelTier, ThinkingLevel } from '../view.js';
+import type { ChatMessage, ModelTier, SubconsciousStatusView, ThinkingLevel } from '../view.js';
 import { parseStringArray, toolInput } from './router-tools.js';
 
 export interface SleepDriveInput {
@@ -143,7 +143,8 @@ export class SubconsciousController {
   private dreamRetryAfter = 0;
   private lastHomeostasisAt = 0;
   private nextLatencyMs?: number;
-  private dreamRun?: { controller: AbortController; promise: Promise<void>; startedAt: number };
+  private dreamRun?: { controller: AbortController; promise: Promise<void>; startedAt: number; phase: 'nrem' | 'rem' };
+  private readonly activeDreamPromises = new Set<Promise<void>>();
   private readonly pendingDistillTaskIds: string[] = [];
   private readonly queuedDistillTaskSet = new Set<string>();
   private distillRun?: { kind: 'task' | 'chat'; controller: AbortController; promise: Promise<void> };
@@ -177,11 +178,26 @@ export class SubconsciousController {
     this.distillFailureStreak = 0;
     this.nextLatencyMs = this.sampleLatencyMs();
     if (this.dreamRun) {
-      this.dreamRun.controller.abort(new Error(reason));
+      const run = this.dreamRun;
+      this.dreamRun = undefined;
+      run.controller.abort(new Error(reason));
     }
     if (this.distillRun?.kind === 'chat') {
       this.distillRun.controller.abort(new Error(reason));
     }
+  }
+
+  status(): SubconsciousStatusView {
+    const now = this.now();
+    const state = this.host.store.subconsciousState();
+    const active = this.dreamRun;
+    return {
+      sleeping: Boolean(active),
+      phase: active ? active.phase : 'awake',
+      ...(active ? { startedAt: active.startedAt } : {}),
+      idleMs: Math.max(0, now - this.lastActivityAt),
+      lastWakeAt: state.lastWakeAt,
+    };
   }
 
   touchChatActivity(): void {
@@ -410,10 +426,14 @@ export class SubconsciousController {
     const enterRem = this.rand() < drive.remProb;
     const controller = new AbortController();
     const startedAt = now;
+    const run = { controller, promise: Promise.resolve(), startedAt, phase: 'nrem' as 'nrem' | 'rem' };
+    this.dreamRun = run;
     const promise = this.runSleepCycle(controller, enterRem, material).finally(() => {
-      if (this.dreamRun?.controller === controller) this.dreamRun = undefined;
+      this.activeDreamPromises.delete(promise);
+      if (this.dreamRun === run) this.dreamRun = undefined;
     });
-    this.dreamRun = { controller, promise, startedAt };
+    run.promise = promise;
+    this.activeDreamPromises.add(promise);
   }
 
   private async runSleepCycle(
@@ -448,6 +468,7 @@ export class SubconsciousController {
       }
 
       // Phase 2 (REM Associative Dreaming with motor sleep paralysis: read-only filesystem + internal plasticity)
+      if (this.dreamRun?.controller === controller) this.dreamRun.phase = 'rem';
       let dreamCwd = process.cwd();
       for (const candidate of material.candidateCwds) {
         try {
@@ -595,12 +616,16 @@ export class SubconsciousController {
   }
 
   abortAll(reason = 'Service shutdown'): void {
-    this.dreamRun?.controller.abort(new Error(reason));
+    if (this.dreamRun) {
+      const run = this.dreamRun;
+      this.dreamRun = undefined;
+      run.controller.abort(new Error(reason));
+    }
     this.distillRun?.controller.abort(new Error(reason));
   }
 
   async awaitSettled(): Promise<void> {
-    await this.dreamRun?.promise.catch(() => {});
+    await Promise.all([...this.activeDreamPromises].map(p => p.catch(() => {})));
     await this.distillRun?.promise.catch(() => {});
   }
 }

@@ -489,6 +489,25 @@ export interface UsageReportView {
   recentPeriods: UsagePeriodSummaryView[];
 }
 
+export type SubconsciousPhase = 'awake' | 'nrem' | 'rem';
+
+export interface SubconsciousStatusView {
+  sleeping: boolean;
+  phase: SubconsciousPhase;
+  startedAt?: number;
+  idleMs: number;
+  lastWakeAt: number;
+}
+
+export interface VoiceListeningView {
+  active: boolean;
+  capturing: boolean;
+  transcribing: boolean;
+  keyword?: string;
+  followUp?: boolean;
+  updatedAt: number;
+}
+
 export interface MainView {
   mode: 'real' | 'offline'; health: { status: string; executorAvailable: boolean };
   messages: MessagePage; works: WorkView[]; cursor: number;
@@ -500,4 +519,6 @@ export interface MainView {
   imChannels?: ImChannelView[];
   voiceprint?: VoiceprintStatusView;
   usageToday?: UsageTodaySummary;
+  subconscious?: SubconsciousStatusView;
+  voiceListening?: VoiceListeningView;
 }

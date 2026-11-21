@@ -507,6 +507,15 @@ test('Web console lazy-loads health-scale UI, serves redacted PluginView metadat
     assert.match(html, /id="plugin-tab-fund-tracker"/);
     assert.match(html, /id="plugin-panel-fund-tracker"/);
     assert.match(html, /id="fund-trend-canvas"/);
+    assert.match(html, /id="plugin-tab-cs80-face"/);
+    assert.match(html, /id="plugin-panel-cs80-face"/);
+    assert.match(html, /id="cs80-live-preview"/);
+    assert.match(html, /id="plugin-tab-laifen"/);
+    assert.match(html, /id="plugin-panel-laifen"/);
+    assert.match(html, /id="laifen-kpi-grid"/);
+    assert.match(html, /id="plugin-tab-ninebot"/);
+    assert.match(html, /id="plugin-panel-ninebot"/);
+    assert.match(html, /id="ninebot-trend-canvas"/);
     assert.doesNotMatch(html, /id="open-health-hub-top"/, 'health surface must live inside M3 plugin hub');
     assert.doesNotMatch(html, /id="open-fund-hub-top"/, 'fund surface must live inside M3 plugin hub');
     assert.doesNotMatch(html, /\sstyle="/i);
@@ -517,11 +526,23 @@ test('Web console lazy-loads health-scale UI, serves redacted PluginView metadat
     assert.match(clientJs, /import\(\s*['"]\.\/plugins\/health-scale-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load health-scale-ui.js');
     assert.doesNotMatch(clientJs, /healthDashboard/, 'health-scale dashboard logic must not be eagerly bundled into client.js');
     assert.match(clientJs, /import\(\s*['"]\.\/plugins\/fund-tracker-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load fund-tracker-ui.js');
+    assert.match(clientJs, /import\(\s*['"]\.\/plugins\/cs80-face-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load cs80-face-ui.js');
+    assert.match(clientJs, /import\(\s*['"]\.\/plugins\/laifen-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load laifen-ui.js');
+    assert.match(clientJs, /import\(\s*['"]\.\/plugins\/ninebot-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load ninebot-ui.js');
 
     const healthUiJs = await (await fetch(`${f.base}/plugins/health-scale-ui.js`)).text();
     assert.match(healthUiJs, /initHealthScaleUi/);
     const fundUiJs = await (await fetch(`${f.base}/plugins/fund-tracker-ui.js`)).text();
     assert.match(fundUiJs, /initFundTrackerUi/);
+    const cs80UiJs = await (await fetch(`${f.base}/plugins/cs80-face-ui.js`)).text();
+    assert.match(cs80UiJs, /initCs80FaceUi/);
+    assert.doesNotMatch(cs80UiJs, /\.style\.|setAttribute\(\s*['"]style['"]/, 'cs80-face-ui must obey strict CSP without inline style mutations');
+    const laifenUiJs = await (await fetch(`${f.base}/plugins/laifen-ui.js`)).text();
+    assert.match(laifenUiJs, /initLaifenUi/);
+    assert.doesNotMatch(laifenUiJs, /\.style\.|setAttribute\(\s*['"]style['"]/, 'laifen-ui must obey strict CSP without inline style mutations');
+    const ninebotUiJs = await (await fetch(`${f.base}/plugins/ninebot-ui.js`)).text();
+    assert.match(ninebotUiJs, /initNinebotUi/);
+    assert.doesNotMatch(ninebotUiJs, /\.style\.|setAttribute\(\s*['"]style['"]/, 'ninebot-ui must obey strict CSP without inline style mutations');
 
     const viewRes = await (await fetch(`${f.base}/api/view`, { headers: f.headers })).json() as MainView;
     for (const plugin of viewRes.plugins ?? []) {

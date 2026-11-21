@@ -116,6 +116,38 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     return this.kwsMonitor?.getStatus(channelId, targetId);
   }
 
+  private notifyCs80Voice(payload: {
+    phase: 'listening' | 'transcribing' | 'idle';
+    keyword?: string;
+    speakerName?: string;
+    followUp?: boolean;
+  }): void {
+    if (this.ctx.isClosing() || process.env.CS80_FACE_VOICE_PUSH === '0') return;
+    const explicitTarget = Boolean(
+      process.env.CS80_FACE_URL
+      || process.env.CS80_FACE_PORT
+      || process.env.CS80_FACE_VOICE_PUSH === '1',
+    );
+    if ((process.env.NODE_TEST_CONTEXT || this.deps?.sshRunner) && !explicitTarget) {
+      return;
+    }
+    const rawUrl = process.env.CS80_FACE_URL?.trim();
+    let baseUrl: string;
+    if (rawUrl) {
+      baseUrl = rawUrl.replace(/\/+$/, '');
+    } else {
+      const portNum = Number(process.env.CS80_FACE_PORT ?? '8788');
+      const port = Number.isInteger(portNum) && portNum > 0 && portNum <= 65535 ? portNum : 8788;
+      baseUrl = `http://127.0.0.1:${port}`;
+    }
+    void fetch(`${baseUrl}/api/control`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'voice', ...payload }),
+      signal: AbortSignal.timeout(250),
+    }).catch(() => {});
+  }
+
   enterFollowUpCapture(
     channelId: string,
     targetId: string,
@@ -127,7 +159,11 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
       allowDuringTranscribe?: boolean;
     },
   ): boolean {
-    return this.kwsMonitor?.enterFollowUpCapture(channelId, targetId, options) ?? false;
+    const entered = this.kwsMonitor?.enterFollowUpCapture(channelId, targetId, options) ?? false;
+    if (entered) {
+      this.notifyCs80Voice({ phase: 'listening', keyword: '连续对话', followUp: true });
+    }
+    return entered;
   }
 
   async send(channel: ImChannelConfig, text: string, options?: ImSendOptions): Promise<void> {
@@ -249,18 +285,20 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
               thresholdOverride: opts.speakerThreshold,
             });
           },
-          verifyUtterance: ({ channel, samples, sampleRate }) => {
+          verifyUtterance: ({ channel, samples, sampleRate, wakeVerified }) => {
             const opts = parseXiaoaiApiOptions(channel.apiBase);
             return this.getSpeakerManager().verifyAndTrimUtterance(samples, sampleRate, {
               speakerVerify: opts.speakerVerify,
               thresholdOverride: opts.speakerThreshold,
+              ...(wakeVerified ? { wakeVerified: true } : {}),
             });
           },
-          verifyUtteranceAsync: ({ channel, samples, sampleRate }) => {
+          verifyUtteranceAsync: ({ channel, samples, sampleRate, wakeVerified }) => {
             const opts = parseXiaoaiApiOptions(channel.apiBase);
             return this.getSpeakerManager().verifyAndTrimUtteranceAsync(samples, sampleRate, {
               speakerVerify: opts.speakerVerify,
               thresholdOverride: opts.speakerThreshold,
+              ...(wakeVerified ? { wakeVerified: true } : {}),
             });
           },
         },
@@ -268,6 +306,12 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
           if (event.reWake) {
             this.fastpathSessions.delete(`${event.channel.id}:${event.target.id}`);
           }
+          this.notifyCs80Voice({
+            phase: 'listening',
+            keyword: event.keyword,
+            speakerName: event.speaker?.name,
+            followUp: false,
+          });
           return handleXiaoaiKeywordWake({
             channel: event.channel,
             target: event.target,
@@ -280,6 +324,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
           });
         },
         onTranscribing: async (event) => {
+          this.notifyCs80Voice({ phase: 'transcribing', keyword: event.keyword });
           if (this.isContinuousFastpathActive(event.channel.id, event.target.id)) {
             return;
           }
@@ -293,6 +338,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
           await this.handleKwsCaptureCancel(event);
         },
         onUtterance: async (event) => {
+          this.notifyCs80Voice({ phase: 'idle' });
           if (this.ctx.isClosing()) return;
           try {
             const latest = this.ctx.coordinator.store.getImChannel(event.channel.id);
@@ -430,7 +476,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
           allowDuringTranscribe: true,
         });
       } else if (expectFollowUp) {
-        const entered = this.kwsMonitor.enterFollowUpCapture(channel.id, sshTarget.id, {
+        const entered = this.enterFollowUpCapture(channel.id, sshTarget.id, {
           waitMs: hookResult?.followUpWaitMs ?? 8_000,
           discardMs: 150,
           allowDuringTranscribe: true,
@@ -621,7 +667,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
           allowDuringTranscribe: true,
         });
       } else if (options?.followUpWaitMs && this.kwsMonitor) {
-        const entered = this.kwsMonitor.enterFollowUpCapture(channel.id, sshTarget.id, {
+        const entered = this.enterFollowUpCapture(channel.id, sshTarget.id, {
           waitMs: options.followUpWaitMs,
           discardMs: options.discardMs ?? 120,
           endSilenceMs: options.endSilenceMs,
@@ -673,7 +719,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     const waitMs = Math.max(200, Math.min(configuredWaitMs, remainingMs));
     const endSilenceMs = Math.min(this.deps?.kwsEndSilenceMs ?? 280, 280);
     const maxUtteranceMs = Number(entry.state.maxUtteranceMs ?? DEFAULT_CONTINUOUS_MAX_UTTERANCE_MS);
-    const entered = this.kwsMonitor.enterFollowUpCapture(channelId, sshTarget.id, {
+    const entered = this.enterFollowUpCapture(channelId, sshTarget.id, {
       waitMs,
       discardMs: options?.discardMs ?? 0,
       endSilenceMs,
@@ -905,7 +951,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
           allowDuringTranscribe: true,
         });
       } else if (this.kwsMonitor) {
-        const entered = this.kwsMonitor.enterFollowUpCapture(channel.id, sshTarget.id, {
+        const entered = this.enterFollowUpCapture(channel.id, sshTarget.id, {
           waitMs: followUpWaitMs,
           discardMs: 0,
           allowDuringTranscribe: true,
@@ -1097,13 +1143,14 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
       if (enrollAction.action === 'rearm') {
         const enrollWaitMs = this.deps?.speakerEnrollWaitMs ?? 15_000;
         if (enrollAction.speakHint) {
+          this.notifyCs80Voice({ phase: 'idle' });
           this.enqueueDirectSpeech(event.channel.id, event.target.id, enrollAction.speakHint, {
             followUpWaitMs: enrollWaitMs,
             discardMs: 120,
           });
           return;
         }
-        const entered = this.kwsMonitor?.enterFollowUpCapture(event.channel.id, event.target.id, {
+        const entered = this.enterFollowUpCapture(event.channel.id, event.target.id, {
           waitMs: enrollWaitMs,
           discardMs: 0,
           allowDuringTranscribe: true,
@@ -1113,6 +1160,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
           return;
         }
       } else if (enrollAction.action === 'cancelled') {
+        this.notifyCs80Voice({ phase: 'idle' });
         this.enqueueDirectSpeech(event.channel.id, event.target.id, enrollAction.prompt);
         return;
       }
@@ -1120,6 +1168,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     if (!this.ctx.isClosing() && this.isContinuousFastpathActive(event.channel.id, event.target.id)) {
       if (event.explicitWake && event.reason !== 'speaker_rejected') {
         this.fastpathSessions.delete(`${event.channel.id}:${event.target.id}`);
+        this.notifyCs80Voice({ phase: 'listening', keyword: '你好星期五', followUp: false });
         await handleXiaoaiKeywordWake({
           channel: event.channel,
           target: event.target,
@@ -1127,7 +1176,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
           chime: true,
           sshRunner: this.deps?.sshRunner,
         });
-        this.kwsMonitor?.enterFollowUpCapture(event.channel.id, event.target.id, {
+        this.enterFollowUpCapture(event.channel.id, event.target.id, {
           waitMs: this.deps?.kwsMaxWaitSpeechMs ?? 4_500,
           discardMs: this.deps?.kwsChimeDiscardMs ?? 320,
         });
@@ -1140,6 +1189,7 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
       });
       if (armed) return;
     }
+    this.notifyCs80Voice({ phase: 'idle' });
     await setXiaoaiSpeakerLed(event.target, 'off', this.deps?.sshRunner);
   }
 

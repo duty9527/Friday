@@ -1,0 +1,2 @@
+# Lakala CS80 (Quectel EC600U 2c7c:0901) — QDC1 usbfs access (Manjaro/Arch wheel + uaccess)
+SUBSYSTEM=="usb", ATTR{idVendor}=="2c7c", ATTR{idProduct}=="0901", MODE="0660", GROUP="wheel", TAG+="uaccess"

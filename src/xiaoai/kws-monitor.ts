@@ -181,6 +181,7 @@ export interface XiaoaiKwsSpeakerGate {
     keyword: string;
     samples: Float32Array;
     sampleRate: number;
+    wakeVerified?: boolean;
   }) => {
     matched: boolean;
     speaker?: XiaoaiMatchedSpeaker;
@@ -195,6 +196,7 @@ export interface XiaoaiKwsSpeakerGate {
     keyword: string;
     samples: Float32Array;
     sampleRate: number;
+    wakeVerified?: boolean;
   }) => Promise<{
     matched: boolean;
     speaker?: XiaoaiMatchedSpeaker;
@@ -897,7 +899,7 @@ function defaultVadFactory(config: { vadModelPath: string; speechRmsThreshold: n
       if (noiseRms <= 0) noiseRms = updateAmbientNoiseRms(0, rawRms);
       const vadActive = vad.isDetected();
       // Enforce a minimum RMS floor so thermal room hiss (~0.0003) never latches Silero VAD
-      const minSpeechRms = Math.max(0.0011, computeForegroundSpeechGate(noiseRms, wakeRefRms));
+      const minSpeechRms = Math.max(0.00095, computeForegroundSpeechGate(noiseRms, wakeRefRms));
       const lowGateFactor = vadActive ? 0.52 : 0.75;
       if (rawRms < minSpeechRms * lowGateFactor) {
         if (vadActive || trailingZeroFlushedSamples < trailingSilenceFlushSamples) {
@@ -2154,12 +2156,20 @@ export class XiaoaiKwsMonitor {
     worker.utteranceSamples = 0;
     worker.captureMaxRms = 0;
 
+    const resetTwoStepVad = () => {
+      worker.vad?.reset();
+      const twoStepWakeRefRms = worker.lastSpeechRms > 0
+        ? Math.min(worker.lastSpeechRms, Math.max(0.0045, worker.ambientRms * 8))
+        : 0;
+      worker.vad?.markWake?.(twoStepWakeRefRms);
+    };
+
     if (!apiOptions.kwsChime) {
       worker.lastWakeAt = Date.now();
       worker.mode = 'capturing';
       this.resetLiveCaptureTracking(worker, false);
       worker.chimeDiscardSamples = 0;
-      worker.vad?.reset();
+      resetTwoStepVad();
       void this.invokeWake(worker, keyword, false, meta).catch((error) => {
         this.options.onError?.(worker.channel.id, error);
       });
@@ -2184,7 +2194,7 @@ export class XiaoaiKwsMonitor {
         worker.mode = 'capturing';
         this.resetLiveCaptureTracking(worker, false);
         worker.chimeDiscardSamples = msToSamples(this.chimeDiscardMs);
-        worker.vad?.reset();
+        resetTwoStepVad();
       })
       .catch((error) => {
         this.options.onError?.(worker.channel.id, error);
@@ -2422,12 +2432,14 @@ export class XiaoaiKwsMonitor {
     checkSamples: Float32Array,
   ): Promise<void> {
     try {
+      const wakeVerified = !worker.isFollowUpCapture && Boolean(worker.activeWakeSpeaker);
       const gateParams = {
         channel: worker.channel,
         target: worker.target,
         keyword: worker.activeKeyword,
         samples: checkSamples,
         sampleRate: SAMPLE_RATE,
+        ...(wakeVerified ? { wakeVerified: true } : {}),
       };
       const liveCheck = await (gate.verifyUtteranceAsync
         ? gate.verifyUtteranceAsync(gateParams)
@@ -2521,12 +2533,14 @@ export class XiaoaiKwsMonitor {
       const gate = this.options.speakerGate;
       const gateBypassed = gate?.isBypassed?.(worker.channel.id, worker.target.id) ?? false;
       if (gate && !gateBypassed && gate.isActive(worker.channel, worker.target)) {
+        const wakeVerified = Boolean(!captureMeta?.isFollowUp && captureMeta?.wakeSpeaker);
         const gateParams = {
           channel: worker.channel,
           target: worker.target,
           keyword,
           samples: audioForAsr,
           sampleRate: SAMPLE_RATE,
+          ...(wakeVerified ? { wakeVerified: true } : {}),
         };
         const verdict = await (gate.verifyUtteranceAsync
           ? gate.verifyUtteranceAsync(gateParams)

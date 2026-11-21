@@ -26,6 +26,9 @@ const imHubBackdrop = element<HTMLElement>('im-hub-backdrop');
 const systemHubBackdrop = element<HTMLElement>('system-hub-backdrop');
 const healthSurfacePanel = element<HTMLElement>('plugin-panel-health-scale');
 const fundSurfacePanel = element<HTMLElement>('plugin-panel-fund-tracker');
+const cs80SurfacePanel = element<HTMLElement>('plugin-panel-cs80-face');
+const laifenSurfacePanel = element<HTMLElement>('plugin-panel-laifen');
+const ninebotSurfacePanel = element<HTMLElement>('plugin-panel-ninebot');
 const messagesEl = element('messages');
 const worksEl = element('works');
 const companionEl = element('companion-avatar');
@@ -81,6 +84,9 @@ function syncCompanionState(): void {
     staleConnection,
     sending: appState.sending,
     draftTyping: chatPanel.isDraftTyping(),
+    voiceListening: Boolean(appState.view?.voiceListening?.capturing && !appState.view?.voiceListening?.transcribing),
+    voiceTranscribing: Boolean(appState.view?.voiceListening?.transcribing),
+    subconsciousSleeping: Boolean(appState.view?.subconscious?.sleeping),
     messages: appState.messages.values(),
     works: appState.view?.works ?? [],
   });
@@ -154,6 +160,39 @@ const pluginSurfaces: PluginSurfaceRegistration[] = [
     load: () => import('./plugins/fund-tracker-ui.js').then(mod =>
       mod.initFundTrackerUi({
         isVisible: () => !pluginHubBackdrop.hidden && !fundSurfacePanel.hidden,
+      })),
+  },
+  {
+    pluginName: 'cs80-face',
+    tabId: 'plugin-tab-cs80-face',
+    panelId: 'plugin-panel-cs80-face',
+    label: 'CS80 副屏',
+    messageTrigger: /CS80|cs80-face|副屏|Bento/,
+    load: () => import('./plugins/cs80-face-ui.js').then(mod =>
+      mod.initCs80FaceUi({
+        isVisible: () => !pluginHubBackdrop.hidden && !cs80SurfacePanel.hidden,
+      })),
+  },
+  {
+    pluginName: 'laifen',
+    tabId: 'plugin-tab-laifen',
+    panelId: 'plugin-panel-laifen',
+    label: '口腔护理',
+    messageTrigger: /牙刷|徕芬|莱芬|刷头|口腔护理|laifen/,
+    load: () => import('./plugins/laifen-ui.js').then(mod =>
+      mod.initLaifenUi({
+        isVisible: () => !pluginHubBackdrop.hidden && !laifenSurfacePanel.hidden,
+      })),
+  },
+  {
+    pluginName: 'ninebot',
+    tabId: 'plugin-tab-ninebot',
+    panelId: 'plugin-panel-ninebot',
+    label: '九号守护',
+    messageTrigger: /九号|电摩|电动车|小电驴|ninebot/,
+    load: () => import('./plugins/ninebot-ui.js').then(mod =>
+      mod.initNinebotUi({
+        isVisible: () => !pluginHubBackdrop.hidden && !ninebotSurfacePanel.hidden,
       })),
   },
 ];

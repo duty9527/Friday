@@ -791,6 +791,9 @@ export function deriveFridayBotState(input: {
   staleConnection: boolean;
   sending: boolean;
   draftTyping: boolean;
+  voiceListening?: boolean;
+  voiceTranscribing?: boolean;
+  subconsciousSleeping?: boolean;
   messages: Iterable<{
     role: 'user' | 'assistant';
     status: string;
@@ -799,6 +802,8 @@ export function deriveFridayBotState(input: {
   works: ReadonlyArray<{ status: string; pendingQuestion?: unknown }>;
 }): BotStateId {
   if (input.authExpired || !input.ready) return 'sleeping';
+  if (input.voiceListening) return 'listening';
+  if (input.voiceTranscribing) return 'thinking';
 
   let hasStreaming = false;
   let hasSearching = false;
@@ -836,6 +841,7 @@ export function deriveFridayBotState(input: {
   if (input.sending) return 'thinking';
   if (input.draftTyping) return 'listening';
   if (input.staleConnection) return 'waiting';
+  if (input.subconsciousSleeping) return 'sleeping';
   return 'idle';
 }
 

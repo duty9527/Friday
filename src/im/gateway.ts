@@ -80,6 +80,19 @@ function isTransientImError(error: unknown): boolean {
   return true;
 }
 
+function formatXiaoaiSystemInterruptedSpeech(bodyText: string): string {
+  if (/已达到活跃执行时限/.test(bodyText)) {
+    return '老板，刚才的后台任务达到执行时限已暂停，可在网页或微信中继续处理。';
+  }
+  if (/后台工作已取消/.test(bodyText)) {
+    return '老板，后台任务已取消。';
+  }
+  if (/后台工作暂停/.test(bodyText)) {
+    return '老板，刚才的后台任务已暂停，详情可在网页或微信查看。';
+  }
+  return bodyText.replace(/[：；]+/g, '，');
+}
+
 /**
  * Multi-platform IM gateway orchestrating inbound normalization, outbound delivery,
  * typing indicators, pollers, and platform-specific channel adapters.
@@ -1058,7 +1071,7 @@ export class ImGateway {
     msg: ChatMessage,
     priorAttempts = 0,
   ): Promise<'delivered' | 'skipped' | 'retry'> {
-    if (msg.origin?.channel === 'xiaoai' && msg.status === 'interrupted') {
+    if (msg.origin?.channel === 'xiaoai' && msg.status === 'interrupted' && msg.source !== 'system') {
       this.seenMessageVersions.set(msg.id, msg.version);
       this.outboundRetryQueue.delete(msg.id);
       return 'skipped';
@@ -1114,7 +1127,10 @@ export class ImGateway {
     }
 
     if (route.channel === 'xiaoai') {
-      this.xiaoaiAdapter.enqueueOutbound(ch.id, msg, bodyText, route);
+      const spokenText = msg.source === 'system' && msg.status === 'interrupted'
+        ? formatXiaoaiSystemInterruptedSpeech(bodyText)
+        : bodyText;
+      this.xiaoaiAdapter.enqueueOutbound(ch.id, msg, spokenText, route);
       this.seenMessageVersions.set(msg.id, msg.version);
       this.outboundRetryQueue.delete(msg.id);
       return 'delivered';

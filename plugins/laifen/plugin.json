@@ -1,0 +1,128 @@
+{
+  "name": "laifen",
+  "title": "徕芬扫振电动牙刷与口腔护理",
+  "runtime": "in-process",
+  "voiceFastpath": true,
+  "platforms": [
+    "linux"
+  ],
+  "promptHint": "管理徕芬蓝牙电动牙刷：查询电量/档位/刷头寿命与打卡统计（status/dashboard）、扫描绑定（scan/config）、唤醒同步状态（sync）、修改档位/三维力度扫幅扫速/预设/定时/30秒提醒/高频/飞行模式（set）、电机启停与刷头校准（power）、刷牙实时监听（monitor-start/status/stop）、补录记录（session-add/delete）及重置刷头寿命（brushhead-reset）。",
+  "description": "连接徕芬扫振电动牙刷（支持 V1 LFTB01-* 与 V2 Pro LFTB02-* 协议），提供蓝牙唤醒同步、1~4 档位与振动/扫幅/扫速三维自定义、场景预设、刷牙定时与提醒/飞行锁定控制、电机启停与校准、刷牙过程监听打卡及刷头更换寿命管理；设备 MAC 与目标参数由 <pluginDataDir>/config.json 加载。",
+  "entry": "index.mjs",
+  "actions": [
+    "dashboard",
+    "status",
+    "config",
+    "scan",
+    "sync",
+    "set",
+    "power",
+    "monitor-start",
+    "monitor-status",
+    "monitor-stop",
+    "watch-start",
+    "watch-stop",
+    "pending-clear",
+    "session-add",
+    "session-delete",
+    "brushhead-reset"
+  ],
+  "actionSpecs": [
+    {
+      "name": "dashboard",
+      "label": "口腔护理看板全量数据",
+      "description": "纯本地读取当前牙刷状态快照、1~4 档位参数、电量记录、今日打卡与连续达标天数、近 7 日统计、刷头剩余寿命及实时监听状态。",
+      "defaultArgs": { "limit": 30 }
+    },
+    {
+      "name": "status",
+      "label": "查询牙刷状态摘要",
+      "description": "返回最新已知电量、当前档位、三维扫振参数、定时设置、刷头寿命与今日打卡次数；传入 live=true 时会开启蓝牙唤醒窗口实时同步。",
+      "defaultArgs": { "live": false }
+    },
+    {
+      "name": "config",
+      "label": "配置牙刷 MAC 与护理目标",
+      "description": "读取或更新 config.json 中的 targetMac、namePrefix、brushHeadLifespanDays（默认 90 天）、dailyGoalCount（默认 2 次）与 targetDurationSec。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "scan",
+      "label": "扫描周围徕芬牙刷",
+      "description": "通过 BlueZ 扫描唤醒中的 LFTB* / Laifen* 蓝牙牙刷（自动过滤无关家电）；传 bind=true 时自动绑定信号最强的设备 MAC。",
+      "defaultArgs": { "timeoutSec": 5, "bind": false }
+    },
+    {
+      "name": "sync",
+      "label": "唤醒并实时同步牙刷",
+      "description": "开启蓝牙唤醒窗口（默认 25 秒），拿起牙刷亮灯即自动连接读取电量、档位与全档位参数并落库。",
+      "defaultArgs": { "timeoutSec": 25 }
+    },
+    {
+      "name": "set",
+      "label": "设置档位、参数与功能开关",
+      "description": "支持按 preset（gentle/daily/strong/whitening）或组合参数（mode 1~4、strength、range、speed、durationSec、highFrequency、reminder30s、airplaneMode 及 V2 Pro 专属开关）写入牙刷并回读校验。",
+      "defaultArgs": { "mode": 1, "timeoutSec": 25 }
+    },
+    {
+      "name": "power",
+      "label": "电机启停与刷头校准",
+      "description": "独立安全通道：控制电机启停（on: true/false）或刷头归位校准（calibration: 'limp' | 'calibrate'），与常规参数修改隔离防止误启动飞溅。",
+      "defaultArgs": { "on": false, "timeoutSec": 25 }
+    },
+    {
+      "name": "monitor-start",
+      "label": "启动刷牙实时监听",
+      "description": "启动后台 BLE 监听守护会话（默认 180 秒），捕捉本次刷牙运行时长、档位、过压告警与耗电变化，结束后自动计入打卡记录。",
+      "defaultArgs": { "timeoutSec": 180 }
+    },
+    {
+      "name": "monitor-status",
+      "label": "查询刷牙监听进度",
+      "description": "查询后台刷牙监听会话状态，并在监听完成时自动归档刷牙记录到 SQLite。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "monitor-stop",
+      "label": "停止刷牙监听",
+      "description": "安全终止后台刷牙监听进程并释放蓝牙连接，若已捕获有效刷牙数据则自动落库。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "watch-start",
+      "label": "开启后台自动唤醒同步",
+      "description": "启用并启动低占空比蓝牙唤醒守护进程（autoWakeSync），拿起牙刷亮灯即自动同步电量、下发暂存参数，并在刷牙结束后自动打卡（会主动向体脂秤与手动操作礼让蓝牙适配器）。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "watch-stop",
+      "label": "关闭后台自动唤醒同步",
+      "description": "关闭 autoWakeSync 并停止后台自动唤醒监听守护进程，释放蓝牙适配器。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "pending-clear",
+      "label": "清空待写入暂存参数",
+      "description": "清除 pending-patch.json 中尚未同步到牙刷的离线档位与开关设定。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "session-add",
+      "label": "手动补录刷牙打卡",
+      "description": "手动记录一次刷牙打卡（可选 durationSec、mode、brushedAt、note），用于未携带蓝牙时补全连续达标记录。",
+      "defaultArgs": { "durationSec": 180, "note": "手动打卡" }
+    },
+    {
+      "name": "session-delete",
+      "label": "删除刷牙打卡记录",
+      "description": "按记录 ID 删除误触或测试产生的刷牙记录。",
+      "defaultArgs": { "id": "session-id" }
+    },
+    {
+      "name": "brushhead-reset",
+      "label": "重置刷头更换周期",
+      "description": "记录刚刚更换新刷头，重置 90 天刷头寿命与使用次数计数。",
+      "defaultArgs": {}
+    }
+  ]
+}

@@ -1,0 +1,47 @@
+{
+  "name": "cs80-face",
+  "title": "CS80 实体副屏化身与喇叭",
+  "runtime": "in-process",
+  "promptHint": "CS80副屏表情/卡片/喇叭亮度",
+  "description": "连接本地 CS80 伴侣守护进程（127.0.0.1:8788），实时控制 F.R.I.D.A.Y. 实体脸部表情、Bento 插件卡片编排、屏幕亮度待机以及内置喇叭提示音。",
+  "entry": "index.mjs",
+  "actions": ["status", "dashboard", "layout", "express", "sound", "screen"],
+  "actionSpecs": [
+    {
+      "name": "status",
+      "label": "查询 CS80 副屏与喇叭状态",
+      "description": "查看 CS80 设备连接状态、USB 速率、当前表情/睡眠阶段、屏幕亮度与喇叭音量/静音状态。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "dashboard",
+      "label": "Web 副屏配置与预览数据",
+      "description": "获取 CS80 状态、多页 Bento 卡片布局、全部已发现插件卡片目录与实时 PNG 画面预览。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "layout",
+      "label": "更新 CS80 卡片编排与跑马灯",
+      "description": "设置 Bento 网格密度（2x2 或 2x3）、多页卡片/尺寸（1x1/2x1/1x2/2x2）、跑马灯滚动模式与页签轮播周期。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "express",
+      "label": "触发副屏表情与动作",
+      "description": "临时切换 F.R.I.D.A.Y. 的脸部表情（neutral/listening/happy/calm/surprised/inspecting/squinted/sleepy/confused/sad）、触发交互动画（poke: bounce/nod/spin）或在跑马灯上展示醒目提示。",
+      "defaultArgs": { "expr": "happy", "poke": "bounce", "holdSec": 10 }
+    },
+    {
+      "name": "sound",
+      "label": "CS80 喇叭播报与提示音",
+      "description": "通过 CS80 内置喇叭播放预设提示音（boot/wake/ask_boss/done/alert/remind）或本地音频文件，支持调节音量（0..100）、静音开关、停止播放以及附带屏幕提醒。",
+      "defaultArgs": { "chime": "remind" }
+    },
+    {
+      "name": "screen",
+      "label": "调节屏幕亮度与待机",
+      "description": "调节 CS80 屏幕亮度（5..100，设为 100 时关闭软件 PWM 完全防闪）、切换待机/唤醒或强制刷新整帧。",
+      "defaultArgs": { "brightness": 100 }
+    }
+  ]
+}

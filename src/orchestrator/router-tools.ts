@@ -94,9 +94,10 @@ export function compactRouterChatWorks(knownWorks: Task[], maxSettledLimit = 3) 
     .map(task => {
       const active = isActive(task);
       const {
-        id, prompt, status, revision, mode, reason, report, files,
+        id, prompt, status, revision, mode, reason, report, partialReport, files,
         originMessageId, execution, cwd, profile, workerModel, modelTier, thinkingLevel, pendingQuestion,
       } = task;
+      const previewSource = report ?? partialReport;
       return {
         execution: execution ?? 'snapshot',
         cwd,
@@ -106,7 +107,7 @@ export function compactRouterChatWorks(knownWorks: Task[], maxSettledLimit = 3) 
         revision,
         mode,
         reason,
-        ...(active && report ? { reportPreview: report.slice(0, 300) } : {}),
+        ...(active && previewSource ? { reportPreview: previewSource.slice(0, 300) } : {}),
         fileCount: files.length,
         originMessageId,
         ...(profile ? { profile } : {}),
@@ -233,7 +234,7 @@ export function buildVoiceTurnHint(
     : '(4) 即时控制或状态查询优先直接调用匹配的 run_plugin，并在闭合确认后加 [[END]]，仅需追问确认时加 [[LISTEN]]。';
   const switchClause = allowedPlugins
     ? '1句话报核心结论'
-    : '1句话报核心结论并询问切换到文字端，或按要求调用 switch_channel';
+    : '1句话报核心结论并询问切换到文字端，或按要求调用 switch_channel（若用户已要求或你承诺结果发微信/Telegram，必须在调用 start_work 前同回合先调 switch_channel 绑定目标通道）';
   return {
     voiceModeConstraint:
       `当前直连语音音箱TTS外放：(1) 普通回复与任务派发确认必须极致简短口语（<=25字）；(2) 期待用户继续说话/确认/追问时结尾必须加 [[LISTEN]]，严禁同时使用 [[END]]；本轮彻底结束时才以“。”结尾并加 [[END]]（控制标记必须紧贴写成双层方括号 [[END]] 或 [[LISTEN]]，严禁写成单括号 [END] 或带空格 [ [END] ]）；(3) 长篇内容或复杂报告严禁在音箱朗读，${switchClause}；${pluginClause}`,
@@ -744,6 +745,7 @@ export function createRouterTools(
         mode: task.mode,
         reason: task.reason,
         report: task.report,
+        ...(task.partialReport ? { partialReport: task.partialReport } : {}),
         execution: task.execution ?? 'snapshot',
         cwd: task.cwd,
         paths: task.paths,

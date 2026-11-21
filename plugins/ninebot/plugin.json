@@ -1,0 +1,69 @@
+{
+  "name": "ninebot",
+  "title": "九号守护",
+  "runtime": "in-process",
+  "voiceFastpath": true,
+  "promptHint": "查询九号电摩/电动车实时电量、续航、充电功率、停放位置与锁状态（status/dashboard），查询骑行轨迹里程与最高速统计（trips），执行低电量/未锁车/充满电主动巡检提醒（patrol/charge-check），以及登录绑定九号子账号或配置提醒阈值（login/vehicles/config）。纯只读模式，不含任何远程控车操作。",
+  "description": "免官方 API Key 接入九号电摩 M 系列及电动自行车（优先走 steeldust 电摩网关，兼容 ebike 与官方 DeviceService Key）：支持实时车况、BMS 电压温度、充电功率、GPS 位置（可选高德逆地理编码）、历史行程与最高速/均速统计，以及低电量/充满电/未锁车/久置亏电主动巡检提醒。严格只读，不含任何远程控车指令；账号会话以 0600 权限保存在 <pluginDataDir>/session.json。",
+  "entry": "index.mjs",
+  "actions": [
+    "status",
+    "patrol",
+    "charge-check",
+    "trips",
+    "vehicles",
+    "login",
+    "config",
+    "dashboard"
+  ],
+  "actionSpecs": [
+    {
+      "name": "status",
+      "label": "查询实时车况",
+      "description": "获取九号电摩当前主电池电量、72V BMS 电压/温度、充电状态与功率、预估/精准续航、总里程、锁车状态与停放位置（传 offline:true 仅读取本地最近快照）。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "patrol",
+      "label": "智能安全与补能巡检",
+      "description": "适合定时任务调用（如每晚 21:00）：检查低电量、低续航、充满停充、未锁车/未关电门、久置亏电与智能服务到期；无异常时静默跳过（notify:false），触发告警时推送提醒（支持冷却防骚扰，传 force:true 强制输出）。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "charge-check",
+      "label": "补能与低电量提醒检查",
+      "description": "patrol 巡检的补能侧重别名：定时核查电量是否低于阈值且未在充电，或充电是否刚完成（>=95%/100% 一次性提醒）。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "trips",
+      "label": "查询骑行行程与极速统计",
+      "description": "查询指定月份（默认当月 YYYYMM）骑行列表、今日里程、近 7 日里程、最高速、平均速与耗电统计；传 detailId 可查看单次行程详情，传 offline:true 仅读本地 SQLite 缓存。",
+      "defaultArgs": { "limit": 10 }
+    },
+    {
+      "name": "vehicles",
+      "label": "查看并绑定账号下车辆",
+      "description": "列出当前九号账号下绑定的所有电摩/电动自行车，并可通过 selectSn 或 selectName 切换默认监测车辆。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "login",
+      "label": "登录绑定九号账号",
+      "description": "使用九号出行账号（强烈建议在 App 建立的「用车人/家庭只读子账号」）与登录密码登录并缓存会话；自动拉取车辆列表并在单车或 M 系列时自动设为默认车辆。",
+      "defaultArgs": { "username": "", "password": "", "areaCode": "86" }
+    },
+    {
+      "name": "config",
+      "label": "查看或更新守护配置",
+      "description": "读取或更新脱敏配置：默认车辆（defaultSn/deviceName）、车型线路（preferredLine: motor/ebike）、低电量阈值（lowBatteryThreshold）、低续航阈值（minRangeKm）、久置天数（idleRemindDays）、提醒冷却小时（alertCooldownHours）、未锁车检查（checkUnlocked）、可选高德 amapKey 或官方 deviceServiceKey。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "dashboard",
+      "label": "电摩看板汇总数据",
+      "description": "默认快速读取本地 SQLite 最新车况、电量变化历史、近期行程统计与当前激活告警（传 refresh:true 可实时联网刷新）。",
+      "defaultArgs": { "limit": 20 }
+    }
+  ]
+}

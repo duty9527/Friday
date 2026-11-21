@@ -23,3 +23,14 @@ coverage/
 *.apk
 *.idsig
 keystore.pass
+tools/cs80-face/bin/
+plugins/*/config.json
+plugins/*/session.json
+plugins/*/*.sqlite*
+plugins/*/*.db
+plugins/*/live-*.json
+plugins/*/hub-cache.json
+plugins/*/watch-*.json
+plugins/*/pending-*.json
+plugins/*/devices-cache.json
+plugins/*/last-state.json

@@ -1,0 +1,17 @@
+[Unit]
+Description=F.R.I.D.A.Y. CS80 Companion Face & Speaker Daemon
+After=friday.service
+Wants=friday.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/project/Friday
+Environment=PATH=%h/.npm-global/bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin
+ExecStartPre=/bin/bash %h/project/Friday/tools/cs80-face/build.sh
+ExecStart=/usr/bin/python3 -u %h/project/Friday/tools/cs80-face/daemon.py --port 8788
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

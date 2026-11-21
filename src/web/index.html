@@ -513,6 +513,18 @@
               <span>📈 投资管理</span>
               <span id="fund-top-badge" class="hub-pill-badge">—</span>
             </button>
+            <button id="plugin-tab-cs80-face" class="hub-surface-tab" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-cs80-face" data-plugin-tab="cs80-face" hidden>
+              <span>🖥️ CS80 副屏</span>
+              <span id="cs80-top-badge" class="hub-pill-badge">—</span>
+            </button>
+            <button id="plugin-tab-laifen" class="hub-surface-tab" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-laifen" data-plugin-tab="laifen" hidden>
+              <span>🪥 口腔护理</span>
+              <span id="laifen-top-badge" class="hub-pill-badge">—</span>
+            </button>
+            <button id="plugin-tab-ninebot" class="hub-surface-tab" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-ninebot" data-plugin-tab="ninebot" hidden>
+              <span>🛵 九号守护</span>
+              <span id="ninebot-top-badge" class="hub-pill-badge">—</span>
+            </button>
           </div>
           <button id="plugin-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
         </div>
@@ -879,6 +891,458 @@
             </div>
           </details>
         </section>
+        </div>
+
+        <div id="plugin-panel-cs80-face" class="hub-tab-panel" role="tabpanel" aria-labelledby="plugin-tab-cs80-face" hidden>
+          <div class="plugin-surface-bar">
+            <div>
+              <h3>🖥️ CS80 副屏 · 战术桌面、Bento 卡片与声光控台</h3>
+              <p class="health-header-sub">800×1280 物理副屏实时镜像、全插件动态尺寸卡片编排、单行跑马灯与内置喇叭调音</p>
+            </div>
+            <div class="fund-header-actions">
+              <label class="hub-checkbox-label">
+                <input id="cs80-auto-preview" type="checkbox" checked>
+                <span>自动刷新镜像</span>
+              </label>
+              <button id="cs80-refresh-btn" class="mini-button" type="button">🔄 刷新预览</button>
+              <button id="cs80-save-layout-btn" class="primary" type="button">💾 保存并同步副屏</button>
+            </div>
+          </div>
+          <p id="cs80-action-status" class="health-status-banner" hidden></p>
+
+          <div id="cs80-kpi-grid" class="hub-kpi-grid"></div>
+
+          <section class="cs80-studio-grid" aria-label="CS80 实时预览与卡片编排工作室">
+            <div class="cs80-preview-column">
+              <div class="cs80-preview-card">
+                <div class="modal-row-head">
+                  <h3>物理副屏实时镜像</h3>
+                  <span id="cs80-device-pill" class="hub-badge badge-slate">检测中</span>
+                </div>
+                <div class="cs80-preview-frame">
+                  <img id="cs80-live-preview" class="cs80-preview-img" alt="CS80 副屏实时渲染预览" hidden />
+                  <p id="cs80-preview-empty" class="empty">正在读取 CS80 守护进程实时画面…</p>
+                </div>
+                <div class="modal-btn-group cs80-preview-actions">
+                  <button id="cs80-force-full-btn" class="mini-button" type="button">⚡ 强制全帧同步</button>
+                  <button id="cs80-standby-btn" class="mini-button" type="button">🌙 待机息屏</button>
+                  <button id="cs80-reset-layout-btn" class="mini-button" type="button">🧹 恢复默认布局</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="cs80-config-column">
+              <div class="cs80-section-card">
+                <div class="modal-row-head">
+                  <h3>1. 画布密度与跑马灯设置</h3>
+                  <span id="cs80-sync-badge" class="hub-badge badge-amber">已同步</span>
+                </div>
+                <div class="modal-form-grid cs80-global-grid">
+                  <div>
+                    <span class="meta">底栏网格密度</span>
+                    <div id="cs80-grid-rows-pills" class="hub-filter-pills" role="group" aria-label="底栏网格密度">
+                      <button class="hub-filter-pill active" type="button" data-grid-rows="2">2×2 标准大脸 (4格)</button>
+                      <button class="hub-filter-pill" type="button" data-grid-rows="3">2×3 扩展六格 (6格)</button>
+                    </div>
+                  </div>
+                  <label>
+                    <span class="meta">单行跑马灯模式</span>
+                    <select id="cs80-marquee-mode" aria-label="单行跑马灯模式">
+                      <option value="auto_pause">智能滚动 2 圈后静止（推荐防闪）</option>
+                      <option value="continuous">超长文本持续慢速循环</option>
+                      <option value="static">单行静止（超长省略号）</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span class="meta">跑马灯滚动速度</span>
+                    <select id="cs80-marquee-speed" aria-label="跑马灯滚动速度">
+                      <option value="1">柔和慢速</option>
+                      <option value="2">标准均衡</option>
+                      <option value="3">快速浏览</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span class="meta">多页卡片自动轮播</span>
+                    <select id="cs80-page-rotate" aria-label="多页自动轮播间隔">
+                      <option value="0">固定在当前页（不自动切换）</option>
+                      <option value="15">每 15 秒轮播一页</option>
+                      <option value="20">每 20 秒轮播一页</option>
+                      <option value="30">每 30 秒轮播一页</option>
+                      <option value="60">每 60 秒轮播一页</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span class="meta">天气卡片城市名</span>
+                    <input id="cs80-weather-city" type="text" maxlength="24" placeholder="如：上海">
+                  </label>
+                  <label class="hub-checkbox-label cs80-overlay-check">
+                    <input id="cs80-task-overlay" type="checkbox" checked>
+                    <span>Worker 执行或请示时自动优先展示任务卡片</span>
+                  </label>
+                </div>
+              </div>
+
+              <div class="cs80-section-card">
+                <div class="modal-row-head">
+                  <h3>2. 多页签 Bento 卡片动态编排</h3>
+                  <div class="modal-btn-group">
+                    <button id="cs80-page-add-btn" class="mini-button" type="button">＋ 新增页</button>
+                    <button id="cs80-page-rename-btn" class="mini-button" type="button">✏️ 重命名</button>
+                    <button id="cs80-page-del-btn" class="mini-button danger-btn" type="button">🗑 删当前页</button>
+                  </div>
+                </div>
+                <div id="cs80-page-tabs" class="hub-filter-pills cs80-page-tabs" role="tablist" aria-label="CS80 卡片页签"></div>
+                <div id="cs80-bento-editor" class="cs80-bento-editor" aria-label="当前页二维卡片排布预览"></div>
+
+                <div class="cs80-catalog-header">
+                  <h4>＋ 添加插件 / 核心数据卡片到当前页</h4>
+                  <span id="cs80-catalog-meta" class="meta">自动发现所有已安装插件与主脑核心数据</span>
+                </div>
+                <div id="cs80-catalog-picker" class="cs80-catalog-grid"></div>
+              </div>
+
+              <div class="cs80-section-card">
+                <div class="modal-row-head">
+                  <h3>3. 表情互动、亮度防闪与内置喇叭</h3>
+                </div>
+                <div class="cs80-controls-stack">
+                  <div class="cs80-ctrl-row">
+                    <span class="meta">触控/状态预览：</span>
+                    <div id="cs80-express-btns" class="modal-btn-group">
+                      <button class="mini-button" type="button" data-expr="listening" data-poke="nod">🎧 倾听状态</button>
+                      <button class="mini-button" type="button" data-expr="happy" data-poke="bounce">😄 开心弹跳</button>
+                      <button class="mini-button" type="button" data-expr="inspecting" data-poke="nod">🧐 专注打量</button>
+                      <button class="mini-button" type="button" data-expr="surprised" data-poke="spin">🌀 转体惊喜</button>
+                      <button class="mini-button" type="button" data-expr="auto" data-poke="">🤖 恢复自动</button>
+                    </div>
+                  </div>
+                  <div class="cs80-ctrl-row">
+                    <input id="cs80-banner-input" type="text" maxlength="120" placeholder="发送一条临时互动文字到副屏跑马灯（可选）" aria-label="副屏互动文字">
+                    <button id="cs80-banner-send-btn" class="mini-button" type="button">📢 投送跑马灯</button>
+                  </div>
+                  <div class="cs80-ctrl-row">
+                    <span class="meta">屏幕亮度：</span>
+                    <div id="cs80-brightness-pills" class="hub-filter-pills" role="group" aria-label="屏幕亮度预设">
+                      <button class="hub-filter-pill active" type="button" data-brightness="100">100% 零频闪</button>
+                      <button class="hub-filter-pill" type="button" data-brightness="80">80%</button>
+                      <button class="hub-filter-pill" type="button" data-brightness="60">60%</button>
+                      <button class="hub-filter-pill" type="button" data-brightness="35">35%</button>
+                      <button class="hub-filter-pill" type="button" data-brightness="15">15%</button>
+                    </div>
+                  </div>
+                  <div class="cs80-ctrl-row">
+                    <label>
+                      <span class="meta">喇叭音量 (%)</span>
+                      <select id="cs80-volume-select" aria-label="CS80 内置喇叭音量">
+                        <option value="100">100%</option>
+                        <option value="85">85%</option>
+                        <option value="65">65%</option>
+                        <option value="45">45%</option>
+                        <option value="25">25%</option>
+                        <option value="0">0%</option>
+                      </select>
+                    </label>
+                    <button id="cs80-mute-btn" class="mini-button" type="button">🔇 静音切换</button>
+                    <label>
+                      <span class="meta">夜间免打扰</span>
+                      <input id="cs80-quiet-hours" type="text" maxlength="20" placeholder="如：23:00-07:30">
+                    </label>
+                    <button id="cs80-quiet-save-btn" class="mini-button" type="button">应用音箱</button>
+                  </div>
+                  <div class="cs80-ctrl-row">
+                    <span class="meta">内置喇叭试音：</span>
+                    <div id="cs80-chime-btns" class="modal-btn-group">
+                      <button class="mini-button" type="button" data-chime="wake">🔔 wake</button>
+                      <button class="mini-button" type="button" data-chime="ask_boss">⚡ ask_boss</button>
+                      <button class="mini-button" type="button" data-chime="done">✨ done</button>
+                      <button class="mini-button" type="button" data-chime="remind">⏰ remind</button>
+                      <button class="mini-button" type="button" data-chime="alert">🚨 alert</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <div id="plugin-panel-laifen" class="hub-tab-panel" role="tabpanel" aria-labelledby="plugin-tab-laifen" hidden>
+          <div class="plugin-surface-bar">
+            <div>
+              <h3>🪥 口腔护理 · 徕芬扫振牙刷中心</h3>
+              <p class="health-header-sub">支持 V1 (LFTB01) 与 V2 Pro (LFTB02) 蓝牙唤醒同步、三维扫振定制、刷牙打卡与刷头寿命管理</p>
+            </div>
+            <div class="health-header-actions">
+              <button id="laifen-scan-btn" class="mini-button" type="button">🔍 扫描设备</button>
+              <button id="laifen-sync-btn" class="primary" type="button">🔄 唤醒同步</button>
+              <button id="laifen-refresh-btn" class="mini-button" type="button">↻ 刷新看板</button>
+            </div>
+          </div>
+          <p id="laifen-action-status" class="health-status-banner" hidden></p>
+
+          <div id="laifen-kpi-grid" class="hub-kpi-grid"></div>
+
+          <section class="model-modal-section laifen-hero-grid" aria-label="实时监听与打卡控制">
+            <div class="health-hero-card">
+              <div class="modal-row-head">
+                <h4>蓝牙状态与刷牙监听</h4>
+                <span id="laifen-live-phase" class="hub-badge badge-slate">待机中</span>
+              </div>
+              <p id="laifen-device-meta" class="meta">尚未同步设备状态</p>
+              <p id="laifen-live-message" class="hint">点击「启动刷牙监听」或直接点击「唤醒同步」读取最新电量与档位配置。</p>
+              <div class="modal-btn-group">
+                <button id="laifen-monitor-start-btn" class="primary" type="button">🎙️ 启动刷牙监听</button>
+                <button id="laifen-monitor-stop-btn" class="mini-button danger-btn" type="button" hidden>⏹ 停止监听</button>
+                <button id="laifen-checkin-btn" class="mini-button" type="button">＋ 手动打卡一次</button>
+                <button id="laifen-brushhead-reset-btn" class="mini-button" type="button">🪥 重置刷头寿命</button>
+              </div>
+            </div>
+
+            <div class="health-hero-card">
+              <div class="modal-row-head">
+                <h4>近 7 日刷牙打卡趋势</h4>
+                <span class="meta">达标自动高亮</span>
+              </div>
+              <div id="laifen-week-strip" class="laifen-week-strip"></div>
+            </div>
+          </section>
+
+          <section class="model-modal-section" aria-label="档位与三维扫振参数调节">
+            <div class="modal-row-head">
+              <h3>档位模式、三维扫振与功能开关</h3>
+              <button id="laifen-apply-btn" class="primary" type="button">⚡ 唤醒并写入牙刷</button>
+            </div>
+            <div class="laifen-control-stack">
+              <div class="laifen-pill-row">
+                <span class="meta">运行档位：</span>
+                <div id="laifen-mode-pills" class="hub-filter-pills" role="group" aria-label="牙刷档位">
+                  <button class="hub-filter-pill active" type="button" data-mode="1">Mode 1</button>
+                  <button class="hub-filter-pill" type="button" data-mode="2">Mode 2</button>
+                  <button class="hub-filter-pill" type="button" data-mode="3">Mode 3</button>
+                  <button class="hub-filter-pill" type="button" data-mode="4">Mode 4 (高频)</button>
+                </div>
+              </div>
+              <div class="laifen-pill-row">
+                <span class="meta">快捷预设：</span>
+                <div id="laifen-preset-pills" class="hub-filter-pills" role="group" aria-label="快捷刷牙预设"></div>
+              </div>
+
+              <div class="laifen-sliders-grid">
+                <label class="laifen-slider-item">
+                  <span class="laifen-slider-head"><span>振动强度</span><strong id="laifen-strength-val">5</strong></span>
+                  <input id="laifen-strength" type="range" min="1" max="10" step="1" value="5">
+                </label>
+                <label class="laifen-slider-item">
+                  <span class="laifen-slider-head"><span>扫动幅度</span><strong id="laifen-range-val">5</strong></span>
+                  <input id="laifen-range" type="range" min="1" max="10" step="1" value="5">
+                </label>
+                <label class="laifen-slider-item">
+                  <span class="laifen-slider-head"><span>扫动速度</span><strong id="laifen-speed-val">5</strong></span>
+                  <input id="laifen-speed" type="range" min="1" max="10" step="1" value="5">
+                </label>
+                <label class="laifen-slider-item">
+                  <span class="laifen-slider-head"><span>刷牙定时</span><strong id="laifen-duration-val">180s (3 分钟)</strong></span>
+                  <input id="laifen-duration" type="range" min="60" max="300" step="30" value="180">
+                </label>
+              </div>
+
+              <div class="laifen-toggles-row">
+                <label class="hub-checkbox-label"><input id="laifen-hf-check" type="checkbox"> <span>开启高频模式 (Mode 4)</span></label>
+                <label class="hub-checkbox-label"><input id="laifen-reminder-check" type="checkbox"> <span>30 秒换区提醒</span></label>
+                <label class="hub-checkbox-label"><input id="laifen-airplane-check" type="checkbox"> <span>飞行锁定模式</span></label>
+              </div>
+
+              <div id="laifen-v2pro-group" class="laifen-v2pro-box" hidden>
+                <span class="meta">Wave Pro (V2 Pro) 专属开关：</span>
+                <div class="laifen-toggles-row">
+                  <label class="hub-checkbox-label"><input id="laifen-deepclean-check" type="checkbox"> <span>深度清洁</span></label>
+                  <label class="hub-checkbox-label"><input id="laifen-antisplash-check" type="checkbox"> <span>防飞溅</span></label>
+                  <label class="hub-checkbox-label"><input id="laifen-rampup-check" type="checkbox"> <span>3 秒渐强缓启</span></label>
+                  <label class="hub-checkbox-label"><input id="laifen-bristle-check" type="checkbox"> <span>刷毛保护</span></label>
+                  <label class="hub-checkbox-label"><input id="laifen-wake-check" type="checkbox"> <span>拿起唤醒提醒</span></label>
+                  <label>
+                    <span class="meta">过压灵敏度</span>
+                    <select id="laifen-overpressure-select">
+                      <option value="Light">Light（轻敏）</option>
+                      <option value="Medium">Medium（适中）</option>
+                      <option value="Hard">Hard（较重）</option>
+                    </select>
+                  </label>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="model-modal-section" aria-label="设备绑定与安全操作">
+            <details class="hub-compose-details">
+              <summary class="hub-compose-summary">⚙️ 设备 MAC 绑定、刷头周期与目标设置</summary>
+              <div class="hub-compose-body">
+                <div class="modal-form-grid">
+                  <label>绑定蓝牙 MAC（留空自动匹配）
+                    <input id="laifen-cfg-mac" type="text" placeholder="如：C0:00:00:AA:BB:CC">
+                  </label>
+                  <label>广播名称前缀
+                    <input id="laifen-cfg-prefix" type="text" placeholder="LFTB">
+                  </label>
+                  <label>刷头更换周期（天）
+                    <input id="laifen-cfg-lifespan" type="number" min="15" max="365" value="90">
+                  </label>
+                  <label>每日目标刷牙次数
+                    <input id="laifen-cfg-goal" type="number" min="1" max="6" value="2">
+                  </label>
+                </div>
+                <div class="modal-row-head">
+                  <span class="hint">修改后仅保存配置；如需即时生效定时或模式，请点击上方「唤醒并写入牙刷」。</span>
+                  <button id="laifen-cfg-save-btn" class="primary" type="button">💾 保存配置</button>
+                </div>
+              </div>
+            </details>
+
+            <details class="hub-compose-details">
+              <summary class="hub-compose-summary">⚠️ 高危操作：电机启停与刷头零位校准</summary>
+              <div class="hub-compose-body">
+                <p class="hint">以下指令会直接控制牙刷马达或进入刷头对准校准，请先拿稳牙刷并避免飞溅。</p>
+                <div class="modal-btn-group">
+                  <button id="laifen-power-on-btn" class="mini-button danger-btn" type="button">▶ 启动电机</button>
+                  <button id="laifen-power-off-btn" class="mini-button" type="button">⏹ 停止电机</button>
+                  <button id="laifen-cal-limp-btn" class="mini-button" type="button">🔓 刷头松弛对准</button>
+                  <button id="laifen-cal-align-btn" class="mini-button" type="button">🎯 确认零位校准</button>
+                </div>
+              </div>
+            </details>
+          </section>
+
+          <section class="model-modal-section" aria-label="历史刷牙打卡明细">
+            <div class="modal-row-head">
+              <div>
+                <h3>刷牙打卡记录</h3>
+                <span id="laifen-sessions-subtitle" class="meta">共 0 条记录</span>
+              </div>
+            </div>
+            <div id="laifen-sessions-list" class="laifen-sessions-list"><p class="empty">暂无刷牙打卡记录。</p></div>
+          </section>
+        </div>
+
+        <div id="plugin-panel-ninebot" class="hub-tab-panel" role="tabpanel" aria-labelledby="plugin-tab-ninebot" hidden>
+          <div class="plugin-surface-bar">
+            <div>
+              <h3>🛵 九号守护 · M 系列智联中心</h3>
+              <p class="health-header-sub">免官方 Key 账号直连（steeldust 电摩优先）：72V BMS 遥测、精准续航、停放位置、极速行程与主动低电/锁车守护（纯只读模式）</p>
+            </div>
+            <div class="health-header-actions">
+              <select id="ninebot-vehicle-select" aria-label="切换九号车辆"></select>
+              <button id="ninebot-sync-btn" class="primary" type="button">🔄 实时同步车况</button>
+              <button id="ninebot-patrol-btn" class="mini-button" type="button">🛡️ 立即执行巡检</button>
+              <button id="ninebot-trips-sync-btn" class="mini-button" type="button">🛣️ 同步本月行程</button>
+              <button id="ninebot-refresh-btn" class="mini-button" type="button">↻ 刷新看板</button>
+            </div>
+          </div>
+          <p id="ninebot-action-status" class="health-status-banner" hidden></p>
+
+          <div id="ninebot-kpi-grid" class="hub-kpi-grid"></div>
+
+          <section class="model-modal-section ninebot-hero-grid" aria-label="停放位置与电量趋势">
+            <div class="health-hero-card">
+              <div class="modal-row-head">
+                <h4>停放位置与守护态势</h4>
+                <span id="ninebot-guard-badge" class="hub-badge badge-slate">待同步</span>
+              </div>
+              <p id="ninebot-location-text" class="hint">尚未获取车辆定位信息。</p>
+              <p id="ninebot-updated-meta" class="meta"></p>
+              <div id="ninebot-alerts-box" class="ninebot-alerts-list">
+                <p class="meta">暂无守护巡检记录。</p>
+              </div>
+            </div>
+
+            <div class="health-hero-card">
+              <div class="modal-row-head">
+                <h4>电量与续航历史趋势</h4>
+                <div id="ninebot-trend-pills" class="hub-filter-pills" role="group" aria-label="趋势指标切换">
+                  <button class="hub-filter-pill active" type="button" data-metric="battery">主电池 %</button>
+                  <button class="hub-filter-pill" type="button" data-metric="range">预估续航 km</button>
+                </div>
+              </div>
+              <div class="ninebot-canvas-wrap">
+                <canvas id="ninebot-trend-canvas" class="ninebot-trend-canvas" width="520" height="156"></canvas>
+              </div>
+              <p id="ninebot-trend-caption" class="meta">暂无历史快照点。</p>
+            </div>
+          </section>
+
+          <section class="model-modal-section" aria-label="账号绑定与守护阈值配置">
+            <details class="hub-compose-details">
+              <summary class="hub-compose-summary">🔑 九号账号登录绑定（强烈建议使用家庭只读子账号）</summary>
+              <div class="hub-compose-body">
+                <p id="ninebot-login-status-hint" class="hint">尚未绑定九号账号，建议先在 App 建立「用车人/家庭只读子账号」并设置登录密码。</p>
+                <div class="modal-form-grid">
+                  <label>子账号手机号
+                    <input id="ninebot-login-user" type="text" placeholder="九号子账号手机号" autocomplete="off">
+                  </label>
+                  <label>登录密码
+                    <input id="ninebot-login-pass" type="password" placeholder="App 内设置的登录密码" autocomplete="new-password">
+                  </label>
+                  <label>区号
+                    <input id="ninebot-login-area" type="text" value="86">
+                  </label>
+                </div>
+                <div class="modal-row-head">
+                  <button id="ninebot-clear-creds-btn" class="mini-button danger-btn" type="button">🗑 清除已存凭据</button>
+                  <button id="ninebot-login-btn" class="primary" type="button">🔑 登录并绑定车辆</button>
+                </div>
+              </div>
+            </details>
+
+            <details class="hub-compose-details">
+              <summary class="hub-compose-summary">🛡️ 主动巡检阈值与高德逆地理设置</summary>
+              <div class="hub-compose-body">
+                <div class="modal-form-grid">
+                  <label>默认车型网关
+                    <select id="ninebot-cfg-line">
+                      <option value="motor">电摩优先 (M / N / E 系列)</option>
+                      <option value="ebike">电自优先 (F / Mz / C 系列)</option>
+                    </select>
+                  </label>
+                  <label>低电量提醒阈值 (%)
+                    <input id="ninebot-cfg-low-batt" type="number" min="5" max="90" value="30">
+                  </label>
+                  <label>低续航提醒阈值 (km)
+                    <input id="ninebot-cfg-min-range" type="number" min="0" max="150" value="15">
+                  </label>
+                  <label>久置低电提醒天数
+                    <input id="ninebot-cfg-idle-days" type="number" min="0" max="60" value="7">
+                  </label>
+                  <label>告警防抖冷却 (小时)
+                    <input id="ninebot-cfg-cooldown" type="number" min="1" max="168" value="12">
+                  </label>
+                  <label>高德逆地理 Key（可选）
+                    <input id="ninebot-cfg-amap" type="password" placeholder="可选：输入高德 Web 服务 Key" autocomplete="off">
+                  </label>
+                  <label>官方 DeviceService Key（可选）
+                    <input id="ninebot-cfg-dskey" type="password" placeholder="可选：输入 NINEBOT_DEVICESERVICE_KEY" autocomplete="off">
+                  </label>
+                </div>
+                <div class="modal-row-head">
+                  <label class="hub-checkbox-label">
+                    <input id="ninebot-cfg-unlocked" type="checkbox" checked>
+                    <span>巡检时检查未锁车 / 电门未关状态</span>
+                  </label>
+                  <button id="ninebot-cfg-save-btn" class="primary" type="button">💾 保存守护配置</button>
+                </div>
+              </div>
+            </details>
+          </section>
+
+          <section class="model-modal-section" aria-label="历史骑行轨迹与极速明细">
+            <div class="modal-row-head">
+              <div>
+                <h3>骑行行程与极速统计</h3>
+                <span id="ninebot-trips-subtitle" class="meta">暂无本地骑行行程缓存。</span>
+              </div>
+              <div class="health-header-actions">
+                <input id="ninebot-month-input" class="hub-input mono-input" type="text" placeholder="YYYYMM，留空当月">
+              </div>
+            </div>
+            <div id="ninebot-trips-list" class="ninebot-trips-list"><p class="empty">暂无骑行记录。</p></div>
+          </section>
         </div>
       </div>
     </div>

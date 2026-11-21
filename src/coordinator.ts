@@ -691,6 +691,23 @@ export class Coordinator {
         modelReady: vp.modelReady,
         profiles: vp.profiles,
       },
+      subconscious: this.subconscious.status(),
+      ...(() => {
+        const kws = this.im.getXiaoaiKwsStatus();
+        if (!kws?.active) return {};
+        const activeWorker = kws.workers.find(w => w.capturing || w.transcribing) ?? kws.workers[0];
+        const transcribing = kws.workers.some(w => w.transcribing);
+        return {
+          voiceListening: {
+            active: kws.active,
+            capturing: kws.capturing,
+            transcribing,
+            ...(activeWorker?.activeKeyword ? { keyword: activeWorker.activeKeyword } : {}),
+            ...(activeWorker?.isFollowUpCapture ? { followUp: true } : {}),
+            updatedAt: Date.now(),
+          },
+        };
+      })(),
       works: recent.map(({ id, prompt, status, mode, createdAt, activeMs, limitMs, reason, sessionId, originMessageId, parentTaskId, cwd, execution, profile, workerModel, modelTier, thinkingLevel, decisionSource, skipQualityGate, qualityGate, pendingQuestion, initiator, timerId }) => {
         const concurrentTaskIds = execution === 'native' && ['queued', 'running'].includes(status) ? this.concurrentTasksInCwd(cwd, id) : undefined;
         return {
@@ -1862,7 +1879,7 @@ export class Coordinator {
             resumed: true,
             ...(priorFollowups.length ? { priorFollowups } : {}),
             ...(priorOperations.length ? { priorOperations } : {}),
-            ...(task.report ? { priorReport: task.report } : {}),
+            ...((task.report ?? task.partialReport) ? { priorReport: task.report ?? task.partialReport } : {}),
           }
         : {}),
       priorWork: prior
@@ -1878,6 +1895,13 @@ export class Coordinator {
     };
 
     const followupTexts: string[] = priorFollowups.map(ev => ev.text.trim()).filter(Boolean);
+    const persistPartialReport = (candidate: string) => {
+      if (candidate.trim() && !parseWorkerQuestion(candidate)) {
+        const partialTask = this.store.get(task.id);
+        partialTask.partialReport = candidate;
+        this.store.save(partialTask);
+      }
+    };
     try {
       while (this.valid(run)) {
         const events = this.store.takeEvents(task.id);
@@ -1940,6 +1964,7 @@ export class Coordinator {
         }
         this.store.finishEvents(events);
         if (this.store.hasPending(task.id)) {
+          persistPartialReport(report);
           const pendingAttachments = run.pendingFollowupAttachments?.splice(0) ?? [];
           input = { kind: 'FOLLOWUP', ...(pendingAttachments.length ? { attachments: pendingAttachments } : {}) };
           continue;
@@ -2195,6 +2220,7 @@ export class Coordinator {
           return;
         }
         if (delivered === undefined) {
+          persistPartialReport(report);
           const pendingAttachments = run.pendingFollowupAttachments?.splice(0) ?? [];
           input = { kind: 'FOLLOWUP', ...(pendingAttachments.length ? { attachments: pendingAttachments } : {}) };
           continue;
@@ -2237,9 +2263,16 @@ export class Coordinator {
     if (!['queued', 'running'].includes(task.status)) {
       throw new Error('Follow-ups require a queued or running task; submit a new task for terminal/paused results');
     }
-    this.store.addEvent(requestId, id, text);
+    const added = this.store.addEvent(requestId, id, text);
+    if (added && task.limitMs >= 60_000 && task.limitMs < 1_200_000) {
+      const latest = this.store.get(id);
+      if (['queued', 'running'].includes(latest.status)) {
+        latest.limitMs = Math.min(1_200_000, latest.limitMs + 300_000);
+        this.store.save(latest);
+      }
+    }
     this.runs.get(id)?.wakeFollowup?.();
-    return task;
+    return this.store.get(id);
   }
 
   stop(id: string, reason = '已请求取消，等待在途操作结算', status: 'paused' | 'cancelled' | 'failed' = 'cancelled'): Task {

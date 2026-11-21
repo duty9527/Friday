@@ -19,6 +19,7 @@ export interface Task {
   limitMs: number;
   activeMs: number;
   report?: string;
+  partialReport?: string;
   reason?: string;
   sessionFile?: string;
   sessionId?: string;
@@ -264,6 +265,7 @@ export class TaskStore {
       task.status = status;
       task.reason = reason;
       if (['completed', 'failed', 'cancelled'].includes(status)) delete task.pendingQuestion;
+      if (status === 'completed') delete task.partialReport;
       if (report !== undefined) task.report = report;
       else if (status !== 'completed') delete task.report;
       this.save(task);

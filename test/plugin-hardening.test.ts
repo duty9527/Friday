@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { listPluginsSync, listPluginViews, runPlugin } from '../src/plugin.js';
 import { runAction as runHealthScaleAction } from '../plugins/health-scale/index.mjs';
+import { runAction as runLaifenAction } from '../plugins/laifen/index.mjs';
 import { runAction as runFundTrackerAction } from '../plugins/fund-tracker/index.mjs';
 import { executeTvAgentAction, resolveDecisionCredentials } from '../plugins/tv-agent/index.mjs';
 import { executeTvIrAction } from '../plugins/tv-ir/index.mjs';
@@ -25,17 +26,26 @@ test('health-scale manifest and PluginView dynamically disable on darwin and ena
     const darwinHealthView = darwinViews.find(p => p.name === 'health-scale');
     assert.ok(darwinHealthView);
     assert.equal(darwinHealthView.enabled, false);
+    const darwinLaifenView = darwinViews.find(p => p.name === 'laifen');
+    assert.ok(darwinLaifenView);
+    assert.equal(darwinLaifenView.enabled, false, 'laifen must be disabled on darwin');
 
     // Subsequent call with platform: 'linux' must not be poisoned by MANIFEST_CACHE
     const linuxManifests = listPluginsSync(home, { platform: 'linux' });
     const linuxHealth = linuxManifests.find(p => p.name === 'health-scale');
     assert.ok(linuxHealth);
     assert.equal(linuxHealth.enabled, true, 'health-scale must be enabled on linux');
+    const linuxLaifen = linuxManifests.find(p => p.name === 'laifen');
+    assert.ok(linuxLaifen);
+    assert.equal(linuxLaifen.enabled, true, 'laifen must be enabled on linux');
 
     const linuxViews = listPluginViews(home, { platform: 'linux' });
     const linuxHealthView = linuxViews.find(p => p.name === 'health-scale');
     assert.ok(linuxHealthView);
     assert.equal(linuxHealthView.enabled, true);
+    const linuxLaifenView = linuxViews.find(p => p.name === 'laifen');
+    assert.ok(linuxLaifenView);
+    assert.equal(linuxLaifenView.enabled, true);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -78,6 +88,41 @@ test('health-scale rejects BLE actions on non-linux without stubs, ignores args.
     // 4. Recreating DB after deletion still initializes schema properly despite INITIALIZED_DB_PATHS cache
     rmSync(join(safeDataDir, 'health.db'), { force: true });
     const dashAfterDelete = await runHealthScaleAction('dashboard', {}, { dataDir: safeDataDir });
+    assert.equal(dashAfterDelete.ok, true);
+  } finally {
+    rmSync(safeDataDir, { recursive: true, force: true });
+    rmSync(rogueDataDir, { recursive: true, force: true });
+  }
+});
+
+test('laifen rejects BLE actions on non-linux without stubs, ignores args.dataDir override, and redacts configPath', async () => {
+  const safeDataDir = mkdtempSync(join(tmpdir(), 'friday-laifen-safe-'));
+  const rogueDataDir = mkdtempSync(join(tmpdir(), 'friday-laifen-rogue-'));
+  try {
+    const cfgRes = await runLaifenAction(
+      'config',
+      { dataDir: rogueDataDir, targetMac: 'C0:00:00:AA:BB:CC', namePrefix: 'LFTB' },
+      { dataDir: safeDataDir, nowFn: () => 1_700_000_000_000 },
+    );
+    assert.equal(cfgRes.ok, true);
+    assert.equal(existsSync(join(safeDataDir, 'laifen.db')), true, 'laifen.db must be created in deps.dataDir');
+    assert.equal(existsSync(join(rogueDataDir, 'laifen.db')), false, 'args.dataDir must never redirect laifen.db');
+    assert.equal(existsSync(join(rogueDataDir, 'config.json')), false, 'args.dataDir must never redirect config.json');
+
+    const cfgData = (cfgRes as { data?: Record<string, unknown> }).data!;
+    assert.equal('configPath' in cfgData, false, 'laifen config data must not expose configPath');
+    assert.equal(String(cfgRes.message).includes(safeDataDir), false, 'laifen config message must not leak host path');
+
+    if (process.platform !== 'linux') {
+      for (const bleAction of ['scan', 'sync', 'set', 'power', 'monitor-start', 'monitor-stop'] as const) {
+        const res = await runLaifenAction(bleAction, {}, { dataDir: safeDataDir });
+        assert.equal(res.ok, false, `${bleAction} should return ok: false on ${process.platform}`);
+        assert.equal(res.notify, true);
+      }
+    }
+
+    rmSync(join(safeDataDir, 'laifen.db'), { force: true });
+    const dashAfterDelete = await runLaifenAction('dashboard', {}, { dataDir: safeDataDir });
     assert.equal(dashAfterDelete.ok, true);
   } finally {
     rmSync(safeDataDir, { recursive: true, force: true });

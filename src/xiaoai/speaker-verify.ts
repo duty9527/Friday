@@ -1075,8 +1075,8 @@ export class XiaoaiSpeakerManager {
     const isBareWake = keyword.trim() === '星期五';
     const isUltraShortWake = wakeAudio.length <= Math.round(sampleRate * 0.95);
     const wakeThreshold = isBareWake
-      ? Math.max(0.26, baseThreshold - (isUltraShortWake ? 0.17 : 0.14))
-      : Math.max(0.24, baseThreshold - 0.13);
+      ? Math.max(0.25, baseThreshold - (isUltraShortWake ? 0.19 : 0.15))
+      : Math.max(0.24, baseThreshold - 0.15);
     return this.matchSamples(wakeAudio, sampleRate, {
       speakerVerify: opts?.speakerVerify,
       thresholdOverride: wakeThreshold,
@@ -1088,7 +1088,7 @@ export class XiaoaiSpeakerManager {
     threshold: number,
     samples: Float32Array,
     sampleRate: number,
-    opts?: { speakerVerify?: boolean; thresholdOverride?: number },
+    opts?: { speakerVerify?: boolean; thresholdOverride?: number; wakeVerified?: boolean },
   ): XiaoaiSpeakerUtteranceCheck | undefined {
     if (!this.isVerificationActive(opts)) {
       return { matched: true, score: 1, threshold, samples, trimmed: false };
@@ -1096,14 +1096,23 @@ export class XiaoaiSpeakerManager {
 
     const longClipThreshold = Math.round(sampleRate * 2.2);
     if (samples.length <= longClipThreshold) {
-      // Short wake+command clips ("星期五，关闭空气炸锅") carry little speech, so genuine
-      // members score a bit lower than on long clips. Relax slightly unless the caller
-      // explicitly pinned a threshold; non-members (~0.03-0.25) are still rejected.
-      const isShortClip = samples.length <= Math.round(sampleRate * 2.0);
-      const effectiveThreshold = isShortClip && opts?.thresholdOverride === undefined
-        ? Math.max(0.32, threshold - 0.04)
-        : threshold;
-      const evalSamples = isShortClip ? trimShortUtteranceSilence(samples, sampleRate) : samples;
+      // Trim leading/trailing room silence first so a 2.01s-2.20s buffer with ~1s of
+      // actual voiced speech gets short-clip relief, while solid >2.0s speech keeps full threshold.
+      const trimmedEval = trimShortUtteranceSilence(samples, sampleRate);
+      const isShortClip = trimmedEval.length <= Math.round(sampleRate * 2.0);
+      const evalSamples = isShortClip ? trimmedEval : samples;
+      let effectiveThreshold = threshold;
+      if (isShortClip && opts?.thresholdOverride === undefined) {
+        const isUltraShort = evalSamples.length <= Math.round(sampleRate * 1.25);
+        if (opts?.wakeVerified) {
+          const relief = evalSamples.length <= Math.round(sampleRate * 1.45) ? 0.15 : 0.09;
+          effectiveThreshold = Math.max(0.29, threshold - relief);
+        } else if (isUltraShort) {
+          effectiveThreshold = Math.max(0.32, threshold - 0.09);
+        } else {
+          effectiveThreshold = Math.max(0.32, threshold - 0.04);
+        }
+      }
       const res = this.matchSamples(evalSamples, sampleRate, {
         speakerVerify: opts?.speakerVerify,
         thresholdOverride: effectiveThreshold,
@@ -1131,7 +1140,7 @@ export class XiaoaiSpeakerManager {
   verifyAndTrimUtterance(
     samples: Float32Array,
     sampleRate = SPEAKER_SAMPLE_RATE,
-    opts?: { speakerVerify?: boolean; thresholdOverride?: number },
+    opts?: { speakerVerify?: boolean; thresholdOverride?: number; wakeVerified?: boolean },
   ): XiaoaiSpeakerUtteranceCheck {
     const data = this.loadRegistry();
     const threshold = clampThreshold(opts?.thresholdOverride ?? data.threshold, data.threshold);
@@ -1150,7 +1159,7 @@ export class XiaoaiSpeakerManager {
     const { winLen, earlyLimit, starts } = buildUtteranceWindowPlan(samples.length, sampleRate);
     const anchorWindowThreshold = opts?.thresholdOverride !== undefined
       ? threshold
-      : Math.max(0.32, threshold - 0.06);
+      : Math.max(opts?.wakeVerified ? 0.30 : 0.32, threshold - (opts?.wakeVerified ? 0.10 : 0.06));
     let anchorProfile: XiaoaiSpeakerProfile | undefined;
     let anchorStartIdx = -1;
     let bestAnchorScore = 0;
@@ -1234,7 +1243,7 @@ export class XiaoaiSpeakerManager {
   async verifyAndTrimUtteranceAsync(
     samples: Float32Array,
     sampleRate = SPEAKER_SAMPLE_RATE,
-    opts?: { speakerVerify?: boolean; thresholdOverride?: number },
+    opts?: { speakerVerify?: boolean; thresholdOverride?: number; wakeVerified?: boolean },
   ): Promise<XiaoaiSpeakerUtteranceCheck> {
     const data = this.loadRegistry();
     const threshold = clampThreshold(opts?.thresholdOverride ?? data.threshold, data.threshold);
@@ -1256,7 +1265,7 @@ export class XiaoaiSpeakerManager {
     const { winLen, earlyLimit, starts } = buildUtteranceWindowPlan(samples.length, sampleRate);
     const anchorWindowThreshold = opts?.thresholdOverride !== undefined
       ? threshold
-      : Math.max(0.32, threshold - 0.06);
+      : Math.max(opts?.wakeVerified ? 0.30 : 0.32, threshold - (opts?.wakeVerified ? 0.10 : 0.06));
     let anchorProfile: XiaoaiSpeakerProfile | undefined;
     let anchorStartIdx = -1;
     let bestAnchorScore = 0;
