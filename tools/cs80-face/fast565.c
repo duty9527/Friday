@@ -12,6 +12,7 @@
  * into CS80 BGR565 little-endian pixels.
  */
 void bgra_to_bgr565(const uint8_t *bgra, uint16_t *out, size_t pixels) {
+  if (!bgra || !out) return;
   for (size_t i = 0; i < pixels; i++) {
     uint32_t b = bgra[i * 4u + 0u];
     uint32_t g = bgra[i * 4u + 1u];
@@ -24,6 +25,7 @@ void bgra_to_bgr565(const uint8_t *bgra, uint16_t *out, size_t pixels) {
  * Convert CS80 BGR565 little-endian pixels back into tightly packed RGB24.
  */
 void bgr565_to_rgb24(const uint16_t *in565, uint8_t *rgb, size_t pixels) {
+  if (!in565 || !rgb) return;
   for (size_t i = 0; i < pixels; i++) {
     uint16_t px = in565[i];
     uint8_t b5 = (uint8_t)((px >> 11) & 0x1Fu);
@@ -48,6 +50,8 @@ uint32_t diff_tiles_32x16(
     uint32_t height,
     uint8_t *out_tiles,
     uint32_t max_tiles) {
+  if (!prev || !curr || width < TILE_W || height < TILE_H) return 0;
+  if (max_tiles > 0 && !out_tiles) return max_tiles + 1u;
   uint32_t dirty = 0;
   for (uint32_t ty = 0; ty + TILE_H <= height; ty += TILE_H) {
     for (uint32_t tx = 0; tx + TILE_W <= width; tx += TILE_W) {

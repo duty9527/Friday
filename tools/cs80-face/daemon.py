@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -18,7 +20,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -122,6 +124,32 @@ def build_udev_hint() -> str:
     )
 
 
+def _parse_finite_float(val: Any, default: float, name: str = "value") -> float:
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        raise ValueError(f"invalid-{name}")
+    f = float(val)
+    if not math.isfinite(f):
+        raise ValueError(f"invalid-{name}")
+    return f
+
+
+def _parse_int(val: Any, default: Optional[int] = None, name: str = "value") -> int:
+    if val is None:
+        if default is not None:
+            return default
+        raise ValueError(f"invalid-{name}")
+    if isinstance(val, bool):
+        raise ValueError(f"invalid-{name}")
+    if isinstance(val, int):
+        return val
+    f = float(val)
+    if not math.isfinite(f):
+        raise ValueError(f"invalid-{name}")
+    return int(round(f))
+
+
 class SidecarBridge:
     """Thread-safe subprocess wrapper around qdc1 (or --mock-sidecar)."""
 
@@ -140,7 +168,9 @@ class SidecarBridge:
 
         self._proc: Optional[subprocess.Popen[bytes]] = None
         self._write_lock = threading.Lock()
+        self._ctl_lock = threading.Lock()
         self._cond = threading.Condition()
+        self._stop_event = threading.Event()
         self._stop = False
 
         self.state = "disconnected"  # disconnected | permission_denied | connecting | up | no_sidecar
@@ -159,10 +189,11 @@ class SidecarBridge:
         self.device_edges: Optional[int] = None
 
         self._audio_n: int = 0
+        self._audio_seq: int = 0
         self._last_audio_ev: Optional[Dict[str, Any]] = None
         self._last_ctl_ev: Optional[Dict[str, Any]] = None
         self._ctl_seq: int = 0
-        self._mock_commands: List[Dict[str, Any]] = []
+        self._mock_commands: Deque[Dict[str, Any]] = deque(maxlen=120)
         self._thread = threading.Thread(target=self._run_loop, name="qdc1-supervisor", daemon=True)
 
     def start(self) -> None:
@@ -170,6 +201,7 @@ class SidecarBridge:
 
     def stop(self) -> None:
         self._stop = True
+        self._stop_event.set()
         proc = self._proc
         if proc is not None and proc.poll() is None:
             try:
@@ -208,7 +240,8 @@ class SidecarBridge:
             },
         }
         if self.mock:
-            out["mockCommands"] = list(self._mock_commands[-40:])
+            with self._cond:
+                out["mockCommands"] = list(self._mock_commands)[-40:]
         return out
 
     def _run_loop(self) -> None:
@@ -222,18 +255,18 @@ class SidecarBridge:
                     self.state = "disconnected"
                     self.udev_hint = None
                     self.last_error = "CS80 USB device (2c7c:0901) not detected"
-                    time.sleep(2.5)
+                    self._stop_event.wait(timeout=2.5)
                     continue
                 if not usb.get("accessible") and os.geteuid() != 0:
                     self.state = "permission_denied"
                     self.udev_hint = build_udev_hint()
                     self.last_error = f"Permission denied on {self.dev_path}; install udev rule"
-                    time.sleep(3.0)
+                    self._stop_event.wait(timeout=3.0)
                     continue
                 if not BIN_QDC1.is_file():
                     self.state = "no_sidecar"
                     self.last_error = f"Missing binary {BIN_QDC1}"
-                    time.sleep(5.0)
+                    self._stop_event.wait(timeout=5.0)
                     continue
                 cmd = [str(BIN_QDC1)]
             else:
@@ -246,6 +279,10 @@ class SidecarBridge:
             self.udev_hint = None
             self.state = "connecting"
             self.last_error = None
+            with self._cond:
+                self._audio_n = 0
+                self._last_audio_ev = None
+                self._last_ctl_ev = None
             try:
                 proc = subprocess.Popen(
                     cmd,
@@ -257,7 +294,7 @@ class SidecarBridge:
             except Exception as exc:
                 self.state = "disconnected"
                 self.last_error = str(exc)
-                time.sleep(backoff)
+                self._stop_event.wait(timeout=backoff)
                 backoff = min(5.0, backoff * 1.5)
                 continue
 
@@ -281,20 +318,29 @@ class SidecarBridge:
             err_thread = threading.Thread(target=read_stderr, daemon=True)
             err_thread.start()
 
-            assert proc.stdout is not None
-            for raw in proc.stdout:
-                line = raw.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except ValueError:
-                    continue
-                self._handle_event(ev)
+            rc = 0
+            try:
+                assert proc.stdout is not None
+                for raw in proc.stdout:
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except ValueError:
+                        continue
+                    self._handle_event(ev)
+                rc = proc.wait()
+                err_thread.join(timeout=1.0)
+            finally:
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except OSError:
+                            pass
+                self._proc = None
 
-            rc = proc.wait()
-            err_thread.join(timeout=1.0)
-            self._proc = None
             if self._stop:
                 break
             was_up = self.state == "up"
@@ -307,21 +353,25 @@ class SidecarBridge:
                 self._cond.notify_all()
             if was_up:
                 backoff = 1.5
-            time.sleep(backoff)
+            self._stop_event.wait(timeout=backoff)
             backoff = min(5.0, backoff * 1.4)
 
     def _handle_event(self, ev: Dict[str, Any]) -> None:
         kind = ev.get("event")
         if self.mock and kind == "mock-cmd":
-            self._mock_commands.append(ev)
-            if len(self._mock_commands) > 120:
-                self._mock_commands.pop(0)
+            with self._cond:
+                self._mock_commands.append(ev)
             return
         if kind == "ready":
-            self.block_size = int(ev.get("block") or 0)
-            self.session += 1
-            self.state = "up"
-            self.last_error = None
+            with self._cond:
+                self.block_size = int(ev.get("block") or 0)
+                self._audio_n = 0
+                self._last_audio_ev = None
+                self._last_ctl_ev = None
+                self.session += 1
+                self.state = "up"
+                self.last_error = None
+                self._cond.notify_all()
             if self._on_ready:
                 self._on_ready()
         elif kind == "features":
@@ -348,7 +398,8 @@ class SidecarBridge:
                 self._cond.notify_all()
         elif kind in ("audio", "audio-data", "pcm"):
             with self._cond:
-                self._audio_n = max(self._audio_n, int(ev.get("n") or 0))
+                self._audio_seq += 1
+                self._audio_n = int(ev.get("n") or 0)
                 self._last_audio_ev = ev
                 self._cond.notify_all()
 
@@ -361,7 +412,7 @@ class SidecarBridge:
                 proc.stdin.write(data)
                 proc.stdin.flush()
                 return True
-            except OSError:
+            except (OSError, ValueError):
                 return False
 
     def send_full_bgr565(self, frame_bytes: bytes) -> bool:
@@ -373,24 +424,27 @@ class SidecarBridge:
         return self._write_raw(b"\x02" + payload)
 
     def send_ctl(self, cmd: int, arg: int = 0, wait_sec: float = 2.0) -> Dict[str, Any]:
-        with self._cond:
-            seq0 = self._ctl_seq
-        if not self._write_raw(bytes((0x03, cmd & 0xFF, arg & 0xFF))):
-            return {"ok": False, "err": "device-down"}
-        deadline = time.monotonic() + wait_sec
-        with self._cond:
-            while self._ctl_seq <= seq0:
-                rem = deadline - time.monotonic()
-                if rem <= 0 or not self.is_up():
-                    return {"ok": False, "err": "timeout"}
-                self._cond.wait(timeout=rem)
-            return dict(self._last_ctl_ev or {"ok": True})
+        with self._ctl_lock:
+            with self._cond:
+                seq0 = self._ctl_seq
+                session0 = self.session
+            if not self._write_raw(bytes((0x03, cmd & 0xFF, arg & 0xFF))):
+                return {"ok": False, "err": "device-down"}
+            deadline = time.monotonic() + wait_sec
+            with self._cond:
+                while self._ctl_seq <= seq0:
+                    rem = deadline - time.monotonic()
+                    if rem <= 0 or self.session != session0 or not self.is_up():
+                        return {"ok": False, "err": "timeout"}
+                    self._cond.wait(timeout=rem)
+                return dict(self._last_ctl_ev or {"ok": True})
 
     def send_audio_cmd(
         self, sub: int, offset: int = 0, raw: int = 0, payload: bytes = b"", timeout: float = 15.0
     ) -> Dict[str, Any]:
         with self._cond:
-            n0 = self._audio_n
+            seq0 = self._audio_seq
+            session0 = self.session
         msg = b"\x05" + bytes((sub & 0xFF, 0, 0, 0)) + struct.pack("<III", len(payload), offset & 0xFFFFFFFF, raw & 0xFFFFFFFF) + payload
         if not self._write_raw(msg):
             return {"ok": False, "err": "device-down"}
@@ -398,16 +452,22 @@ class SidecarBridge:
         with self._cond:
             while True:
                 ev = self._last_audio_ev
-                if ev is not None and int(ev.get("n") or 0) > n0 and ev.get("event") == "audio" and int(ev.get("sub", -1)) == sub:
+                if (
+                    ev is not None
+                    and self._audio_seq > seq0
+                    and ev.get("event") == "audio"
+                    and int(ev.get("sub", -1)) == sub
+                ):
                     return dict(ev)
                 rem = deadline - time.monotonic()
-                if rem <= 0 or not self.is_up():
+                if rem <= 0 or self.session != session0 or not self.is_up():
                     return {"ok": False, "err": "timeout"}
                 self._cond.wait(timeout=rem)
 
     def send_audio_block(self, offset: int, chunk: bytes, timeout: float = 5.0) -> Dict[str, Any]:
         with self._cond:
-            n0 = self._audio_n
+            seq0 = self._audio_seq
+            session0 = self.session
         msg = b"\x06" + struct.pack("<II", offset & 0xFFFFFFFF, len(chunk)) + chunk
         if not self._write_raw(msg):
             return {"ok": False, "err": "device-down"}
@@ -417,13 +477,13 @@ class SidecarBridge:
                 ev = self._last_audio_ev
                 if (
                     ev is not None
-                    and int(ev.get("n") or 0) > n0
+                    and self._audio_seq > seq0
                     and ev.get("event") == "audio-data"
-                    and int(ev.get("offset", -1)) == offset
+                    and (int(ev.get("offset", -1)) == offset or ev.get("ok") == 0)
                 ):
                     return dict(ev)
                 rem = deadline - time.monotonic()
-                if rem <= 0 or not self.is_up():
+                if rem <= 0 or self.session != session0 or not self.is_up():
                     return {"ok": False, "err": "timeout"}
                 self._cond.wait(timeout=rem)
 
@@ -625,7 +685,10 @@ class FaceDaemon:
             pid = raw.get("pid")
             if pid is not None:
                 return phase if _is_pid_alive(pid) else None
-            updated_ms = float(raw.get("updatedAt") or raw.get("startedAt") or 0.0)
+            try:
+                updated_ms = float(raw.get("updatedAt") or raw.get("startedAt") or 0.0)
+            except (TypeError, ValueError):
+                return None
             return phase if (updated_ms > 0.0 and (now_ms - updated_ms) < 10_000.0) else None
 
         hs_raw = self._read_cached_plugin_json(plugins_dir / "health-scale" / "live-session.json")
@@ -693,78 +756,86 @@ class FaceDaemon:
                 kind, args = self._sound_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-            if kind == "ready":
-                self.sidecar.send_ctl(CTL_BRIGHTNESS, self._brightness)
-                self.sidecar.send_ctl(CTL_STATE, 0)
-                self.speaker.on_sidecar_ready()
-                self.speaker.play_chime("boot", force=False, sleeping=False)
-            elif kind == "chime":
-                self.speaker.play_chime(
-                    str(args.get("name")),
-                    force=bool(args.get("force", False)),
-                    sleeping=bool(args.get("sleeping", False)),
-                )
+            try:
+                if kind == "ready":
+                    with self._lock:
+                        brightness = self._brightness
+                    self.sidecar.send_ctl(CTL_BRIGHTNESS, brightness)
+                    self.sidecar.send_ctl(CTL_STATE, 0)
+                    self.speaker.on_sidecar_ready()
+                    self.speaker.play_chime("boot", force=False, sleeping=False)
+                elif kind == "chime":
+                    self.speaker.play_chime(
+                        str(args.get("name")),
+                        force=bool(args.get("force", False)),
+                        sleeping=bool(args.get("sleeping", False)),
+                    )
+            except Exception as exc:
+                print(f"[cs80-sound] error: {exc}", file=sys.stderr, flush=True)
 
     def _friday_poll_loop(self) -> None:
         while not self._stop:
-            snap = self.friday.poll()
-            now = time.monotonic()
-            need_wake = False
-            live_scene, live_cap, hs_done_phase = self._poll_plugin_live_scenes()
-            with self._lock:
-                prev = self._last_snapshot
-                self._last_snapshot = snap
-                prev_live_scene = self._live_file_scene
-                prev_live_cap = self._live_file_caption
-                if prev_live_scene and live_scene != prev_live_scene:
-                    if self._scene_state == prev_live_scene and not self._scene_is_preview:
-                        tail = 1.2 if (prev_live_scene == "weighing_scale" and hs_done_phase == "completed") else 0.0
-                        self._clear_scene(prev_live_scene, now=now, tail_sec=tail)
-                    need_wake = True
-                self._live_file_scene = live_scene
-                self._live_file_caption = live_cap
-                if live_scene != prev_live_scene or live_cap != prev_live_cap:
-                    need_wake = True
-                if snap.transient_state:
-                    self._transient_state = snap.transient_state
-                    self._transient_until = now + 2.5
-                    if snap.transient_poke:
-                        self.animator.trigger_poke(snap.transient_poke, 1)
-                    need_wake = True
-                if snap.transient_scene:
-                    self._apply_scene(
-                        snap.transient_scene,
-                        now=now,
-                        hold_sec=3.6,
-                        channel=snap.transient_scene_channel,
-                        force=False,
+            try:
+                snap = self.friday.poll()
+                now = time.monotonic()
+                need_wake = False
+                live_scene, live_cap, hs_done_phase = self._poll_plugin_live_scenes()
+                with self._lock:
+                    prev = self._last_snapshot
+                    self._last_snapshot = snap
+                    prev_live_scene = self._live_file_scene
+                    prev_live_cap = self._live_file_caption
+                    if prev_live_scene and live_scene != prev_live_scene:
+                        if self._scene_state == prev_live_scene and not self._scene_is_preview:
+                            tail = 1.2 if (prev_live_scene == "weighing_scale" and hs_done_phase == "completed") else 0.0
+                            self._clear_scene(prev_live_scene, now=now, tail_sec=tail)
+                        need_wake = True
+                    self._live_file_scene = live_scene
+                    self._live_file_caption = live_cap
+                    if live_scene != prev_live_scene or live_cap != prev_live_cap:
+                        need_wake = True
+                    if snap.transient_state:
+                        self._transient_state = snap.transient_state
+                        self._transient_until = now + 2.5
+                        if snap.transient_poke:
+                            self.animator.trigger_poke(snap.transient_poke, 1)
+                        need_wake = True
+                    if snap.transient_scene:
+                        self._apply_scene(
+                            snap.transient_scene,
+                            now=now,
+                            hold_sec=3.6,
+                            channel=snap.transient_scene_channel,
+                            force=False,
+                        )
+                        need_wake = True
+
+                    active_state = self._resolve_active_state(now, snap)
+                    sub_phase = "awake" if active_state in ("listening", "thinking", *SCENE_STATES) else snap.sub_phase
+                    if self.animator.set_state(
+                        active_state,
+                        sub_phase=sub_phase,
+                        worker_count=snap.worker_count,
+                    ):
+                        need_wake = True
+                    if snap.auto_expr and active_state in ("idle", "streaming", "finished") and self.animator.override_until <= 0.0:
+                        self.animator.set_expression(snap.auto_expr, hold_sec=0.0, now_wall=now)
+                    elif self.animator.override_until <= 0.0:
+                        self.animator.set_expression("auto", hold_sec=0.0, now_wall=now)
+
+                    if prev.hud != snap.hud:
+                        need_wake = True
+
+                for chime in snap.chimes:
+                    self._sound_queue.put(
+                        ("chime", {"name": chime, "force": False, "sleeping": snap.bot_state == "sleeping"})
                     )
-                    need_wake = True
 
-                active_state = self._resolve_active_state(now, snap)
-                sub_phase = "awake" if active_state in ("listening", "thinking", *SCENE_STATES) else snap.sub_phase
-                if self.animator.set_state(
-                    active_state,
-                    sub_phase=sub_phase,
-                    worker_count=snap.worker_count,
-                ):
-                    need_wake = True
-                if snap.auto_expr and active_state in ("idle", "streaming", "finished") and self.animator.override_until <= 0.0:
-                    self.animator.set_expression(snap.auto_expr, hold_sec=0.0, now_wall=now)
-                elif self.animator.override_until <= 0.0:
-                    self.animator.set_expression("auto", hold_sec=0.0, now_wall=now)
-
-                if prev.hud != snap.hud:
-                    need_wake = True
-
-            for chime in snap.chimes:
-                self._sound_queue.put(
-                    ("chime", {"name": chime, "force": False, "sleeping": snap.bot_state == "sleeping"})
-                )
-
-            if need_wake:
-                self._wake_event.set()
-                self._widget_refresh_event.set()
+                if need_wake:
+                    self._wake_event.set()
+                    self._widget_refresh_event.set()
+            except Exception as exc:
+                print(f"[friday-poll] error: {exc}", file=sys.stderr, flush=True)
             time.sleep(0.40)
 
     def _effective_hud(self, now: float, layout: Dict[str, Any], data_rev: int) -> HudState:
@@ -814,6 +885,7 @@ class FaceDaemon:
         active_pg = max(0, min(page_cnt - 1, int(layout.get("activePage") or 0)))
         page_name = str(pages[active_pg].get("name") or "") if pages else ""
 
+        spk_cfg = self.speaker.get_config_snapshot()
         return HudState(
             headline_meta=meta,
             headline_source=source,
@@ -823,8 +895,8 @@ class FaceDaemon:
             channels=snap_hud.channels,
             memory_count=snap_hud.memory_count,
             today_calls=snap_hud.today_calls,
-            speaker_volume=self.speaker.config.volume,
-            speaker_muted=self.speaker.config.muted,
+            speaker_volume=spk_cfg["volume"],
+            speaker_muted=spk_cfg["muted"],
             friday_connected=snap_hud.friday_connected,
             clock_hm=clock_hm,
             voice_caption=voice_cap,
@@ -851,112 +923,132 @@ class FaceDaemon:
 
             pending_full: Optional[bytes] = None
             pending_patch: Optional[bytes] = None
-            with self._lock:
-                active_state = self._resolve_active_state(now, self._last_snapshot)
-                sub_phase = "awake" if active_state in ("listening", "thinking", *SCENE_STATES) else self._last_snapshot.sub_phase
-                self.animator.set_state(
-                    active_state,
-                    sub_phase=sub_phase,
-                    worker_count=self._last_snapshot.worker_count,
-                )
-
-                layout = self.layout_store.get()
-                pages = layout.get("pages") or []
-                rotate_sec = int(layout.get("pageRotateSec") or 0)
-                preempted = bool(layout.get("autoTaskOverlay", True)) and (
-                    bool(self._last_snapshot.hud.ask_boss_question) or bool(self._last_snapshot.hud.workers)
-                )
-                if len(pages) > 1 and rotate_sec > 0 and not preempted and active_state != "listening":
-                    if now - self._last_page_rotate_at >= rotate_sec:
-                        self.layout_store.step_rotation(1)
-                        self._last_page_rotate_at = now
-                        layout = self.layout_store.get()
-                else:
-                    if active_state == "listening" or preempted:
-                        self._last_page_rotate_at = now
-
-                data_rev, widget_data = self.widget_hub.snapshot_all()
-                hud = self._effective_hud(now, layout, data_rev)
-                geo = stage_geometry_for_rows(hud.grid_rows)
-
-                # Step animator and marquee together
-                self.renderer.sync_marquee_metrics(hud)
-                marquee_moved = self.renderer.marquee.step(dt)
-                face_snap = self.animator.step(
-                    dt,
-                    now_wall=now,
-                    center_x=geo["face_cx"],
-                    center_y=geo["face_cy"],
-                    base_radius=geo["face_r"],
-                )
-
-                hud_changed = (hud != self._last_hud_key) or (hud.clock_hm != self._last_clock_hm)
-                sidecar_up = self.sidecar.is_up()
-                session = self.sidecar.session
-                if session != self._last_session_seen:
-                    self._last_session_seen = session
-                    self._full_needed = True
-
-                should_draw = (
-                    (not face_snap.settled)
-                    or marquee_moved
-                    or hud_changed
-                    or self._full_needed
-                    or self._render_seq == 0
-                )
-
-                if should_draw:
-                    active_cards = pages[hud.active_page].get("cards") or [] if pages else []
-                    placed_cards, _ = pack_bento_page(
-                        active_cards,
-                        grid_rows=hud.grid_rows,
-                        x0=36.0,
-                        y0=geo["grid_y"],
-                        total_w=728.0,
-                        total_h=geo["grid_h"],
-                        gap=geo["gap"],
+            frame_session = 0
+            delay = 0.5
+            try:
+                with self._lock:
+                    active_state = self._resolve_active_state(now, self._last_snapshot)
+                    sub_phase = "awake" if active_state in ("listening", "thinking", *SCENE_STATES) else self._last_snapshot.sub_phase
+                    self.animator.set_state(
+                        active_state,
+                        sub_phase=sub_phase,
+                        worker_count=self._last_snapshot.worker_count,
                     )
-                    full_bytes, patch_info = self.renderer.render_frame(
-                        face_snap,
-                        hud,
-                        placed_cards=placed_cards,
-                        widget_data=widget_data,
+
+                    layout = self.layout_store.get()
+                    pages = layout.get("pages") or []
+                    rotate_sec = int(layout.get("pageRotateSec") or 0)
+                    preempted = bool(layout.get("autoTaskOverlay", True)) and (
+                        bool(self._last_snapshot.hud.ask_boss_question) or bool(self._last_snapshot.hud.workers)
                     )
-                    self._render_seq += 1
-                    self._last_hud_key = hud
-                    self._last_clock_hm = hud.clock_hm
-                    push_full = self._full_needed or patch_info is None
-                    if sidecar_up and not self._standby:
-                        if push_full:
-                            pending_full = full_bytes
-                        elif patch_info is not None and patch_info[0] > 0:
-                            pending_patch = patch_info[1]
-                        elif patch_info is not None and patch_info[0] == 0:
-                            self._full_needed = False
+                    if len(pages) > 1 and rotate_sec > 0 and not preempted and active_state != "listening":
+                        if now - self._last_page_rotate_at >= rotate_sec:
+                            self.layout_store.step_rotation(1)
+                            self._last_page_rotate_at = now
+                            layout = self.layout_store.get()
+                    else:
+                        if active_state == "listening" or preempted:
+                            self._last_page_rotate_at = now
 
-                delay = self.animator.next_wakeup_delay(now_wall=now)
-                m_delay = self.renderer.marquee.next_wakeup_delay()
-                if m_delay is not None:
-                    delay = min(delay, m_delay)
-                if len(pages) > 1 and rotate_sec > 0 and not preempted and active_state != "listening":
-                    delay = min(delay, max(0.2, (self._last_page_rotate_at + rotate_sec) - now))
-                sec_in_min = time.localtime().tm_sec
-                delay = min(delay, max(0.2, 60.2 - sec_in_min))
+                    data_rev, widget_data = self.widget_hub.snapshot_all()
+                    hud = self._effective_hud(now, layout, data_rev)
+                    geo = stage_geometry_for_rows(hud.grid_rows)
 
-            # Write to sidecar outside self._lock so HTTP/poll threads never block on USB writes
-            if pending_full is not None:
-                if self.sidecar.send_full_bgr565(pending_full):
-                    with self._lock:
-                        self._full_needed = False
-                else:
-                    with self._lock:
+                    # Step animator and marquee together
+                    self.renderer.sync_marquee_metrics(hud)
+                    marquee_moved = self.renderer.marquee.step(dt)
+                    face_snap = self.animator.step(
+                        dt,
+                        now_wall=now,
+                        center_x=geo["face_cx"],
+                        center_y=geo["face_cy"],
+                        base_radius=geo["face_r"],
+                    )
+
+                    hud_changed = (hud != self._last_hud_key) or (hud.clock_hm != self._last_clock_hm)
+                    sidecar_up = self.sidecar.is_up()
+                    session = self.sidecar.session
+                    frame_session = session
+                    if session != self._last_session_seen:
+                        self._last_session_seen = session
                         self._full_needed = True
-                        self.renderer.invalidate_prev()
-            elif pending_patch is not None:
-                if not self.sidecar.send_patch(pending_patch):
-                    with self._lock:
-                        self._full_needed = True
-                        self.renderer.invalidate_prev()
+
+                    should_draw = (
+                        (not face_snap.settled)
+                        or marquee_moved
+                        or hud_changed
+                        or self._full_needed
+                        or self._render_seq == 0
+                    )
+
+                    if should_draw:
+                        active_cards = pages[hud.active_page].get("cards") or [] if pages else []
+                        placed_cards, _ = pack_bento_page(
+                            active_cards,
+                            grid_rows=hud.grid_rows,
+                            x0=36.0,
+                            y0=geo["grid_y"],
+                            total_w=728.0,
+                            total_h=geo["grid_h"],
+                            gap=geo["gap"],
+                        )
+                        full_bytes, patch_info = self.renderer.render_frame(
+                            face_snap,
+                            hud,
+                            placed_cards=placed_cards,
+                            widget_data=widget_data,
+                        )
+                        self._render_seq += 1
+                        self._last_hud_key = hud
+                        self._last_clock_hm = hud.clock_hm
+                        push_full = self._full_needed or patch_info is None
+                        if sidecar_up and not self._standby:
+                            if push_full:
+                                pending_full = full_bytes
+                            elif patch_info is not None and patch_info[0] > 0:
+                                pending_patch = patch_info[1]
+                            elif patch_info is not None and patch_info[0] == 0:
+                                self._full_needed = False
+
+                    delay = self.animator.next_wakeup_delay(now_wall=now)
+                    m_delay = self.renderer.marquee.next_wakeup_delay()
+                    if m_delay is not None:
+                        delay = min(delay, m_delay)
+                    if len(pages) > 1 and rotate_sec > 0 and not preempted and active_state != "listening":
+                        delay = min(delay, max(0.2, (self._last_page_rotate_at + rotate_sec) - now))
+                    for active, deadline in (
+                        (bool(self._banner_text), self._banner_until),
+                        (bool(self._inbound_text), self._inbound_until),
+                        (bool(self._voice_state), self._voice_until),
+                        (bool(self._scene_state), self._scene_until),
+                        (bool(self._transient_state), self._transient_until),
+                    ):
+                        if active and deadline > 0.0:
+                            delay = min(delay, max(0.05, deadline - now))
+                    sec_in_min = time.localtime().tm_sec
+                    delay = min(delay, max(0.2, 60.2 - sec_in_min))
+
+                # Write to sidecar outside self._lock so HTTP/poll threads never block on USB writes
+                if pending_full is not None:
+                    if self.sidecar.send_full_bgr565(pending_full):
+                        with self._lock:
+                            if self.sidecar.session == frame_session:
+                                self._full_needed = False
+                            else:
+                                self._full_needed = True
+                                self.renderer.invalidate_prev()
+                    else:
+                        with self._lock:
+                            self._full_needed = True
+                            self.renderer.invalidate_prev()
+                elif pending_patch is not None:
+                    if not self.sidecar.send_patch(pending_patch):
+                        with self._lock:
+                            self._full_needed = True
+                            self.renderer.invalidate_prev()
+            except Exception as exc:
+                print(f"[cs80-render] error: {exc}", file=sys.stderr, flush=True)
+                delay = 0.4
 
             self._wake_event.wait(timeout=delay)
             self._wake_event.clear()
@@ -1027,10 +1119,11 @@ class FaceDaemon:
             scene = str(body.get("scene") or "").strip().lower()
             channel = str(body.get("channel") or "").strip().lower()
             caption = str(body.get("caption") or "").strip()
-            raw_hold = body.get("holdSec")
-            hold_sec = float(raw_hold) if raw_hold is not None else (18.0 if phase == "start" else 3.8)
-            raw_tail = body.get("tailSec")
-            tail_sec = float(raw_tail) if raw_tail is not None else 0.0
+            try:
+                hold_sec = _parse_finite_float(body.get("holdSec"), 18.0 if phase == "start" else 3.8, "holdSec")
+                tail_sec = _parse_finite_float(body.get("tailSec"), 0.0, "tailSec")
+            except ValueError as exc:
+                return {"ok": False, "err": str(exc)}
             force = bool(body.get("force"))
             with self._lock:
                 if phase == "end":
@@ -1065,7 +1158,10 @@ class FaceDaemon:
             }
             src_label = str(body.get("source") or "").strip() or f"{ch_map.get(raw_ch, '来信')} · {time.strftime('%H:%M')}"
             txt = str(body.get("text") or "").strip()
-            hold_sec = float(body.get("holdSec") or 30.0)
+            try:
+                hold_sec = _parse_finite_float(body.get("holdSec"), 30.0, "holdSec")
+            except ValueError as exc:
+                return {"ok": False, "err": str(exc)}
             with self._lock:
                 if txt:
                     self._inbound_source = src_label
@@ -1110,6 +1206,7 @@ class FaceDaemon:
                         hud,
                         placed_cards=placed_cards,
                         widget_data=widget_data,
+                        update_prev=False,
                     )
                     self._render_seq += 1
                     self._last_hud_key = None
@@ -1134,11 +1231,13 @@ class FaceDaemon:
             channel = str(body.get("channel") or "").strip().lower()
             caption = str(body.get("caption") or "").strip()
             poke = body.get("poke")
-            turns = int(body.get("turns") or 2)
+            try:
+                turns = _parse_int(body.get("turns"), 2, "turns")
+                hold_sec = _parse_finite_float(body.get("holdSec"), 12.0, "holdSec")
+            except ValueError as exc:
+                return {"ok": False, "err": str(exc)}
             text = body.get("text")
             title = body.get("title")
-            raw_hold = body.get("holdSec")
-            hold_sec = float(raw_hold) if raw_hold is not None else 12.0
             expr_norm = str(expr or "").strip().lower()
             if not scene_arg and expr_norm in (*SCENE_STATES, "sending_wechat", "sending_telegram"):
                 scene_arg = expr_norm
@@ -1177,8 +1276,12 @@ class FaceDaemon:
 
         if action == "sound":
             out: Dict[str, Any] = {"ok": True, "action": "sound"}
+            try:
+                hold_sec = _parse_finite_float(body.get("holdSec"), 15.0, "holdSec") if body.get("text") else 15.0
+                vol_val = _parse_int(body.get("volume"), None, "volume") if body.get("volume") is not None else None
+            except ValueError as exc:
+                return {"ok": False, "err": str(exc)}
             if body.get("text"):
-                hold_sec = float(body.get("holdSec") or 15.0)
                 with self._lock:
                     self._banner_text = str(body["text"])
                     self._banner_meta = str(body.get("title") or "F.R.I.D.A.Y. · 提醒")
@@ -1186,8 +1289,8 @@ class FaceDaemon:
                     self.animator.trigger_poke("bounce", 1)
                 self._wake_event.set()
 
-            if body.get("volume") is not None:
-                out["volume"] = self.speaker.set_volume(int(body["volume"]))
+            if vol_val is not None:
+                out["volume"] = self.speaker.set_volume(vol_val)
                 self._wake_event.set()
             if body.get("muted") is not None:
                 out["muted"] = self.speaker.set_muted(bool(body["muted"]))
@@ -1202,10 +1305,12 @@ class FaceDaemon:
                 out["ok"] = bool(res.get("ok"))
             elif body.get("chime"):
                 force = True if body.get("force") is None else bool(body["force"])
+                with self._lock:
+                    is_sleeping = self._last_snapshot.bot_state == "sleeping"
                 res = self.speaker.play_chime(
                     str(body["chime"]),
                     force=force,
-                    sleeping=self._last_snapshot.bot_state == "sleeping",
+                    sleeping=is_sleeping,
                 )
                 out["play"] = res
                 out["ok"] = bool(res.get("ok"))
@@ -1214,8 +1319,13 @@ class FaceDaemon:
         if action == "screen":
             out = {"ok": True, "action": "screen"}
             if body.get("brightness") is not None:
-                val = max(5, min(100, (int(body["brightness"]) // 5) * 5))
-                self._brightness = val
+                try:
+                    raw_bri = _parse_int(body.get("brightness"), None, "brightness")
+                except ValueError as exc:
+                    return {"ok": False, "err": str(exc)}
+                val = max(5, min(100, (raw_bri // 5) * 5))
+                with self._lock:
+                    self._brightness = val
                 if self.sidecar.is_up():
                     out["brightness"] = self.sidecar.send_ctl(CTL_BRIGHTNESS, val)
                     self.sidecar.send_ctl(CTL_STATE, 0)
@@ -1223,7 +1333,8 @@ class FaceDaemon:
                     out["brightness"] = {"ok": True, "deferred": True, "value": val}
             if body.get("standby") is not None:
                 standby = bool(body["standby"])
-                self._standby = standby
+                with self._lock:
+                    self._standby = standby
                 if self.sidecar.is_up():
                     out["standby"] = self.sidecar.send_ctl(CTL_SLEEP if standby else CTL_WAKE, 0)
                 if not standby:
@@ -1264,11 +1375,7 @@ class FaceDaemon:
             "workerCount": snap.worker_count,
             "standby": standby,
             "brightness": brightness,
-            "speaker": {
-                "volume": self.speaker.config.volume,
-                "muted": self.speaker.config.muted,
-                "quietHours": self.speaker.config.quiet_hours,
-            },
+            "speaker": self.speaker.get_config_snapshot(),
             "gridRows": layout.get("gridRows", 2),
             "activePage": layout.get("activePage", 0),
             "pageCount": len(layout.get("pages") or []),
@@ -1329,6 +1436,7 @@ class FaceDaemon:
                     hud,
                     placed_cards=placed_cards,
                     widget_data=widget_data,
+                    update_prev=False,
                 )
                 self._render_seq = 1
             if self._cached_png[0] != self._render_seq:
@@ -1393,7 +1501,15 @@ def make_http_server(daemon: FaceDaemon, host: str, port: int) -> ThreadingHTTPS
             if path != "/api/control":
                 self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "err": "not-found"})
                 return
-            length = int(self.headers.get("Content-Length") or 0)
+            raw_len = self.headers.get("Content-Length") or "0"
+            try:
+                length = int(raw_len)
+            except (TypeError, ValueError):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "err": "invalid-content-length"})
+                return
+            if length < 0:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "err": "invalid-content-length"})
+                return
             if length > 262144:
                 self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"ok": False, "err": "too-large"})
                 return
@@ -1736,9 +1852,18 @@ def main() -> int:
     actual_port = server.server_address[1]
     daemon.start()
 
+    shutting_down = threading.Event()
+
     def handle_sig(_sig: int, _frame: Any) -> None:
-        daemon.stop()
-        threading.Thread(target=server.shutdown, daemon=True).start()
+        if shutting_down.is_set():
+            return
+        shutting_down.set()
+
+        def _shutdown() -> None:
+            daemon.stop()
+            server.shutdown()
+
+        threading.Thread(target=_shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, handle_sig)
     signal.signal(signal.SIGINT, handle_sig)

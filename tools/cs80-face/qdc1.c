@@ -45,18 +45,28 @@ static double wall_ms(void) {
   return (double)c.QuadPart * 1000.0 / (double)freq.QuadPart;
 }
 #else
+#include <errno.h>
 #include <poll.h>
 #include <sys/time.h>
 #include <unistd.h>
 #ifdef __linux__
 #include <dirent.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <linux/usbdevice_fs.h>
 #endif
 static int wait_stdin(int ms) { struct pollfd p = {0, POLLIN, 0}; return poll(&p, 1, ms) > 0; }
-static double wall_ms(void) { struct timeval t; gettimeofday(&t, 0); return t.tv_sec*1e3 + t.tv_usec/1e3; }
+static double wall_ms(void) {
+#ifdef CLOCK_MONOTONIC
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+  }
+#endif
+  struct timeval t;
+  gettimeofday(&t, 0);
+  return t.tv_sec * 1e3 + t.tv_usec / 1e3;
+}
 #endif
 
 #if !defined(_WIN32) && !defined(__linux__)
@@ -74,6 +84,7 @@ static double wall_ms(void) { struct timeval t; gettimeofday(&t, 0); return t.tv
 #define FRAME_BYTES (WIDTH * HEIGHT * 2u)
 #define FRAME_RGB (WIDTH * HEIGHT * 3u)
 #define BLOCK_BYTES 512000u
+#define TX_BUF_BYTES (32u + (size_t)LZ4_COMPRESSBOUND(BLOCK_BYTES))
 #define TILE_W 32u
 #define TILE_H 16u
 #define TILE_BYTES (TILE_W * TILE_H * 2u)
@@ -164,6 +175,7 @@ typedef struct link_s {
   uint8_t pipe_out, pipe_in;
 #endif
   uint8_t *tx;
+  size_t tx_cap;
   uint32_t seq;
 } link_t;
 
@@ -230,12 +242,14 @@ static int open_link(link_t *l, int iface_number) {
   l->iface = iface_number;
   l->ep_out = getenv("CS80_EP_OUT") ? (uint8_t)strtoul(getenv("CS80_EP_OUT"), NULL, 0) : 0x08;
   l->ep_in = getenv("CS80_EP_IN") ? (uint8_t)strtoul(getenv("CS80_EP_IN"), NULL, 0) : 0x8b;
-  l->tx = malloc(32 + BLOCK_BYTES);
+  l->tx_cap = TX_BUF_BYTES;
+  l->tx = malloc(l->tx_cap);
   if (!l->tx) {
     unsigned i = (unsigned)iface_number;
     ioctl(fd, USBDEVFS_RELEASEINTERFACE, &i);
     close(fd);
     l->fd = -1;
+    l->tx_cap = 0;
     return -4;
   }
   tlog("cs80: %s if%d ep_out=0x%02x ep_in=0x%02x\n", path, iface_number, l->ep_out, l->ep_in);
@@ -257,6 +271,7 @@ static void close_link(link_t *l) {
   }
   free(l->tx);
   l->tx = NULL;
+  l->tx_cap = 0;
 }
 
 static int raw_write(link_t *l, const void *buf, uint32_t len) {
@@ -305,13 +320,19 @@ static int open_link(link_t *l, int iface_number) {
   SInt32 score = 0;
   IOUSBDeviceInterface **dev = NULL;
   int rc = -2;
-  if (IOCreatePlugInInterfaceForService(dev_service, kIOUSBDeviceUserClientTypeID, kIOCFPlugInInterfaceID, &plug, &score))
+  if (IOCreatePlugInInterfaceForService(dev_service, kIOUSBDeviceUserClientTypeID, kIOCFPlugInInterfaceID, &plug, &score)) {
+    IOObjectRelease(dev_service);
     return -2;
+  }
   (*plug)->QueryInterface(plug, CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID), (LPVOID *)&dev);
   (*plug)->Release(plug);
-  if (!dev) return -2;
+  if (!dev) {
+    IOObjectRelease(dev_service);
+    return -2;
+  }
   if ((*dev)->USBDeviceOpen(dev) != kIOReturnSuccess) {
     (*dev)->Release(dev);
+    IOObjectRelease(dev_service);
     return -3;
   }
   (*dev)->SetConfiguration(dev, 1);
@@ -368,8 +389,14 @@ static int open_link(link_t *l, int iface_number) {
   (*dev)->Release(dev);
   IOObjectRelease(dev_service);
   if (rc) return rc;
-  l->tx = malloc(32 + BLOCK_BYTES);
-  return l->tx ? 0 : -4;
+  l->tx_cap = TX_BUF_BYTES;
+  l->tx = malloc(l->tx_cap);
+  if (!l->tx) {
+    l->tx_cap = 0;
+    close_link(l);
+    return -4;
+  }
+  return 0;
 }
 
 static void close_link(link_t *l) {
@@ -380,6 +407,7 @@ static void close_link(link_t *l) {
   }
   free(l->tx);
   l->tx = NULL;
+  l->tx_cap = 0;
 }
 
 static int raw_write(link_t *l, const void *buf, uint32_t len) {
@@ -399,22 +427,22 @@ static int open_link(link_t *l, int iface_number) {
   (void)iface_number;
   const char *com = (arg_com && arg_com[0]) ? arg_com : getenv("CS80_COM");
   char path[64];
+  l->port = INVALID_HANDLE_VALUE;
   if (com && com[0]) {
     snprintf(path, sizeof path, "\\\\.\\%s", com);
+    l->port = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    if (l->port == INVALID_HANDLE_VALUE) return -1;
   } else {
     for (int i = 3; i < 64; i++) { /* 找第一个能打开的 COM 口 */
       snprintf(path, sizeof path, "\\\\.\\COM%d", i);
       HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
       if (h != INVALID_HANDLE_VALUE) {
         l->port = h;
-        l->tx = malloc(32 + BLOCK_BYTES);
-        return l->tx ? 0 : -4;
+        break;
       }
     }
-    return -1;
+    if (l->port == INVALID_HANDLE_VALUE) return -1;
   }
-  l->port = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
-  if (l->port == INVALID_HANDLE_VALUE) return -1;
   DCB dcb;
   memset(&dcb, 0, sizeof dcb);
   dcb.DCBlength = sizeof dcb;
@@ -429,8 +457,15 @@ static int open_link(link_t *l, int iface_number) {
   COMMTIMEOUTS to = {50, 0, 2000, 2, 2000};
   SetCommTimeouts(l->port, &to);
   PurgeComm(l->port, PURGE_RXCLEAR | PURGE_TXCLEAR);
-  l->tx = malloc(32 + BLOCK_BYTES);
-  return l->tx ? 0 : -4;
+  l->tx_cap = TX_BUF_BYTES;
+  l->tx = malloc(l->tx_cap);
+  if (!l->tx) {
+    l->tx_cap = 0;
+    CloseHandle(l->port);
+    l->port = NULL;
+    return -4;
+  }
+  return 0;
 }
 
 static void close_link(link_t *l) {
@@ -438,6 +473,7 @@ static void close_link(link_t *l) {
   l->port = NULL;
   free(l->tx);
   l->tx = NULL;
+  l->tx_cap = 0;
 }
 
 static int raw_write(link_t *l, const void *buf, uint32_t len) {
@@ -466,6 +502,11 @@ static int raw_read(link_t *l, void *buf, uint32_t *len, int timeout_ms) {
 
 static double now_ms(void) { return wall_ms(); }
 
+static uint32_t elapsed_ms(double t0) {
+  double d = now_ms() - t0;
+  return d > 0.0 ? (uint32_t)d : 0u;
+}
+
 static void sleep_ms(int ms) {
 #ifdef _WIN32
   Sleep((DWORD)ms);
@@ -492,6 +533,7 @@ static int raw_write_all(link_t *l, const void *buf, uint32_t len) {
 
 static int send_cmd(link_t *l, uint8_t kind, uint16_t flags, uint32_t offset, uint32_t raw, const void *payload,
                     uint32_t len) {
+  if (!l->tx || l->tx_cap < 32u || (size_t)len > l->tx_cap - 32u) return -1;
   uint8_t *h = l->tx;
   l->seq++;
   memset(h, 0, 32);
@@ -530,6 +572,7 @@ static int wait_ack(link_t *l, uint32_t seq, int tries) {
   static size_t have;
   /* 不要把 have 清零：上一次可能在 800 ms 内只读到半条 ACK（USB 会把 56 B 拆成
    * 32+24 两次短包），丢掉它就得再等一整个超时。中间的不匹配字节会在下面被滑动跳过。 */
+  memset(reply_body, 0, sizeof reply_body);
   uint8_t buf[256];
   for (int i = 0; i < tries && !stop; i++) {
     uint32_t len = sizeof buf;
@@ -610,10 +653,13 @@ static void remember_bad(uint32_t h) {
 static int push_full_once(link_t *l, int raw_mode, uint32_t *wire, uint32_t *ms) {
   static char *comp;
   static int cap;
-  if (!cap) {
+  if (!comp) {
     cap = LZ4_compressBound(BLOCK_BYTES);
-    comp = malloc(cap);
-    if (!comp) return -1;
+    comp = malloc((size_t)cap);
+    if (!comp) {
+      cap = 0;
+      return -1;
+    }
   }
   double t0 = now_ms();
   uint32_t h = xxh32(fbuf, FRAME_BYTES);
@@ -624,22 +670,32 @@ static int push_full_once(link_t *l, int raw_mode, uint32_t *wire, uint32_t *ms)
     uint32_t n = FRAME_BYTES - off < BLOCK_BYTES ? FRAME_BYTES - off : BLOCK_BYTES;
     const void *payload;
     uint32_t clen;
-    if (!raw_mode && block_is_bad(xxh32((const uint8_t *)fbuf + off, n))) raw_mode = 1; /* 这块以前挂过 */
-    if (raw_mode) {
+    int blk_raw = raw_mode;
+    if (!blk_raw && block_is_bad(xxh32((const uint8_t *)fbuf + off, n))) {
+      raw_mode = 1; /* 这块以前挂过 */
+      blk_raw = 1;
+    }
+    if (blk_raw) {
       payload = (const uint8_t *)fbuf + off;  /* 裸像素：固件 flags=0 直接收 */
       clen = n;
     } else {
       int c = LZ4_compress_default((const char *)fbuf + off, comp, (int)n, cap);
-      if (c <= 0) return -1;
-      payload = comp;
-      clen = (uint32_t)c;
+      if (c <= 0 || (uint32_t)c >= n || (uint32_t)c > BLOCK_BYTES) {
+        /* 不可压缩块回退到裸像素发送，避免超过固件 512000 字节上限被丢弃 */
+        blk_raw = 1;
+        payload = (const uint8_t *)fbuf + off;
+        clen = n;
+      } else {
+        payload = comp;
+        clen = (uint32_t)c;
+      }
     }
-    if (send_cmd(l, QD_DATA, raw_mode ? 0 : 1, off, n, payload, clen)) return -1;
+    if (send_cmd(l, QD_DATA, blk_raw ? 0 : 1, off, n, payload, clen)) return -1;
     if (wait_ack(l, l->seq, 3) || reply_body[0]) {
       /* 失败时把这块的大小打出来：块序号 / 未压缩 / 实际发出 / 设备状态码 */
       tlog("cs80: data fail block=%u raw=%u clen=%u status=%u mode=%s\n",
-              off / BLOCK_BYTES, n, clen, reply_body[0], raw_mode ? "raw" : "lz4");
-      if (!raw_mode) {
+              off / BLOCK_BYTES, n, clen, reply_body[0], blk_raw ? "raw" : "lz4");
+      if (!blk_raw) {
         remember_bad(xxh32((const uint8_t *)fbuf + off, n));
         lz4_bad_until = now_ms() + 120000;
       }
@@ -652,7 +708,7 @@ static int push_full_once(link_t *l, int raw_mode, uint32_t *wire, uint32_t *ms)
   fbuf_hash = h;
   fbuf_valid = 1;
   *wire = sent + 32;
-  *ms = (uint32_t)(now_ms() - t0);
+  *ms = elapsed_ms(t0);
   return 0;
 }
 
@@ -678,6 +734,16 @@ static int push_full(link_t *l, uint32_t *wire, uint32_t *ms) {
   return -1;
 }
 
+static void rollback_patch_fbuf(const uint8_t *tiles, const uint8_t *bak, uint32_t count) {
+  for (uint32_t i = count; i-- > 0;) {
+    const uint8_t *t = tiles + i * TILE_MSG;
+    uint16_t x = (uint16_t)(t[0] | t[1] << 8), y = (uint16_t)(t[2] | t[3] << 8);
+    for (uint32_t row = 0; row < TILE_H; row++)
+      memcpy((uint8_t *)fbuf + ((y + row) * WIDTH + x) * 2u, bak + i * TILE_BYTES + row * TILE_W * 2u,
+             TILE_W * 2u);
+  }
+}
+
 /* 局部：tile 列表 → 应用到影子 → PATCH(offset=旧哈希) */
 static int push_patch(link_t *l, const uint8_t *tiles, uint32_t count, uint32_t *wire, uint32_t *ms) {
   static uint8_t *raw;
@@ -688,12 +754,26 @@ static int push_patch(link_t *l, const uint8_t *tiles, uint32_t count, uint32_t 
   uint32_t raw_len = 8 + count * (TILE_BYTES + 8);
   if (count == 0) return 1;
   if (count > MAX_TILES) return -2;
-  if (!cap) {
+  for (uint32_t i = 0; i < count; i++) {
+    const uint8_t *t = tiles + i * TILE_MSG;
+    uint16_t x = (uint16_t)(t[0] | t[1] << 8), y = (uint16_t)(t[2] | t[3] << 8);
+    if ((x & 31u) || (y & 15u) || x >= WIDTH || y >= HEIGHT) return -4;
+  }
+  if (!raw || !comp || !bak) {
     cap = LZ4_compressBound(BLOCK_BYTES);
     raw = malloc(BLOCK_BYTES);
-    comp = malloc(cap);
+    comp = malloc((size_t)cap);
     bak = malloc((size_t)MAX_TILES * TILE_BYTES);
-    if (!raw || !comp || !bak) return -3;
+    if (!raw || !comp || !bak) {
+      free(raw);
+      free(comp);
+      free(bak);
+      raw = NULL;
+      comp = NULL;
+      bak = NULL;
+      cap = 0;
+      return -3;
+    }
   }
   if (debug) fprintf(stderr, "patch: count=%u fbuf_valid=%d hash=%#x\n", count, fbuf_valid, fbuf_hash);
   wr32(raw, 0); /* target 哈希稍后填 */
@@ -701,7 +781,6 @@ static int push_patch(link_t *l, const uint8_t *tiles, uint32_t count, uint32_t 
   for (uint32_t i = 0; i < count; i++) {
     const uint8_t *t = tiles + i * TILE_MSG;
     uint16_t x = (uint16_t)(t[0] | t[1] << 8), y = (uint16_t)(t[2] | t[3] << 8);
-    if ((x & 31u) || (y & 15u) || x >= WIDTH || y >= HEIGHT) return -4;
     out[0] = t[0];
     out[1] = t[1];
     out[2] = t[2];
@@ -724,7 +803,10 @@ static int push_patch(link_t *l, const uint8_t *tiles, uint32_t count, uint32_t 
   wr32(raw + 4, count);
   double t0 = now_ms();
   int clen = LZ4_compress_default((const char *)raw, comp, (int)raw_len, cap);
-  if (clen <= 0) return -5;
+  if (clen <= 0 || (uint32_t)clen > BLOCK_BYTES) {
+    rollback_patch_fbuf(tiles, bak, count);
+    return -5;
+  }
   /* status=8 是设备接收超时。以前偶发的原因是一次写正好 512 整数倍（ZLP 接收 bug），
    * send_cmd 已拆包；这里保留一次原地重试兜底（base 哈希没变，设备也没应用）。 */
   int rc = -7, attempt = 0;
@@ -743,7 +825,7 @@ static int push_patch(link_t *l, const uint8_t *tiles, uint32_t count, uint32_t 
     tlog("cs80: patch retry %d (status=%u tiles=%u)\n", attempt + 1, reply_body[0], count);
   }
   *wire = (uint32_t)clen + 32;
-  *ms = (uint32_t)(now_ms() - t0);
+  *ms = elapsed_ms(t0);
   if (*ms > 500)  /* 设备偶尔 2~3 s 才回 ACK：留证据（4=base 哈希不对，8=接收超时） */
     tlog("cs80: slow patch ack %ums status=%u tiles=%u clen=%d rx=%u dec=%u draw=%u heap=%u\n", *ms,
          reply_body[0], count, clen, reply_body[1], reply_body[2], reply_body[3], reply_body[4]);
@@ -759,13 +841,7 @@ static int push_patch(link_t *l, const uint8_t *tiles, uint32_t count, uint32_t 
   }
   /* 失败：把刚才写进影子的 tile 回滚，保持 fbuf_valid=1。
    * 这样浏览器保留 prev 后重试同一块 patch 即可，不必每失败一次就推 2 MB 整帧。 */
-  for (uint32_t i = 0; i < count; i++) {
-    const uint8_t *t = tiles + i * TILE_MSG;
-    uint16_t x = (uint16_t)(t[0] | t[1] << 8), y = (uint16_t)(t[2] | t[3] << 8);
-    for (uint32_t row = 0; row < TILE_H; row++)
-      memcpy((uint8_t *)fbuf + ((y + row) * WIDTH + x) * 2u, bak + i * TILE_BYTES + row * TILE_W * 2u,
-             TILE_W * 2u);
-  }
+  rollback_patch_fbuf(tiles, bak, count);
   return -7;
 }
 
@@ -784,7 +860,7 @@ static void audio_reply(uint8_t sub, const char *err, double t0) {
     json("{\"event\":\"audio\",\"n\":%u,\"sub\":%u,\"ok\":%d,\"status\":%u,\"rx\":%u,\"dec\":%u,"
          "\"draw\":%u,\"detail\":%u,\"ms\":%u}",
          ++audio_n, sub, reply_body[0] == 0, reply_body[0], reply_body[1], reply_body[2], reply_body[3],
-         reply_body[5], (uint32_t)(now_ms() - t0));
+         reply_body[5], elapsed_ms(t0));
 }
 
 static int audio_cmd(link_t *l, uint8_t sub, uint32_t offset, uint32_t raw, const void *payload, uint32_t len) {
@@ -807,7 +883,7 @@ static int audio_data(link_t *l, uint32_t offset, const uint8_t *payload, uint32
   }
   json("{\"event\":\"audio-data\",\"n\":%u,\"ok\":%d,\"status\":%u,\"offset\":%u,\"sent\":%u,\"detail\":%u,\"ms\":%u}",
        ++audio_n, reply_body[0] == 0, reply_body[0], offset, len, reply_body[5],
-       (uint32_t)(now_ms() - t0));
+       elapsed_ms(t0));
   return reply_body[0] ? -2 : 0;
 }
 
@@ -819,7 +895,7 @@ static int audio_pcm(link_t *l, const uint8_t *payload, uint32_t len) {
     return -1;
   }
   json("{\"event\":\"pcm\",\"n\":%u,\"ok\":%d,\"status\":%u,\"detail\":%u,\"ms\":%u}", ++audio_n,
-       reply_body[0] == 0, reply_body[0], reply_body[5], (uint32_t)(now_ms() - t0));
+       reply_body[0] == 0, reply_body[0], reply_body[5], elapsed_ms(t0));
   return reply_body[0] ? -2 : 0;
 }
 
@@ -829,6 +905,9 @@ static int read_exact(void *buf, size_t len) {
     /* Windows 的 _read 返回 int、POSIX 的 read 返回 ssize_t；
        这里单次长度最大是一帧 2 MB，用 int 接两边都能编。 */
     int n = (int)read(0, p, (unsigned)len);
+#ifndef _WIN32
+    if (n < 0 && errno == EINTR && !stop) continue;
+#endif
     if (n <= 0) return -1;
     p += n;
     len -= (size_t)n;
@@ -908,7 +987,13 @@ int main(int argc, char **argv) {
   g_link = &l;
   fbuf = malloc(FRAME_BYTES);
   uint8_t *rgb = malloc(FRAME_RGB);
-  if (!fbuf || !rgb) return 1;
+  if (!fbuf || !rgb) {
+    free(fbuf);
+    free(rgb);
+    fbuf = NULL;
+    close_link(&l);
+    return 1;
+  }
   signal(SIGINT, on_signal);
 #ifndef _WIN32
   signal(SIGPIPE, SIG_IGN);
@@ -932,9 +1017,13 @@ int main(int argc, char **argv) {
   }
   if (!handshook) link_lost("no-ack-hello");
   json("{\"event\":\"ready\",\"block\":%u,\"status\":%u}", reply_body[5], reply_body[0]);
-  send_cmd(&l, QD_HELLO, 2, 0, 0, NULL, 0);
-  if (!wait_ack(&l, l.seq, 20)) json("{\"event\":\"features\",\"bits\":%u}", reply_body[5]);
+  if (send_cmd(&l, QD_HELLO, 2, 0, 0, NULL, 0) == 0 && !wait_ack(&l, l.seq, 20))
+    json("{\"event\":\"features\",\"bits\":%u}", reply_body[5]);
 
+  static uint8_t *tiles;
+  static uint8_t *abuf;
+  static uint8_t *dbuf;
+  static uint8_t *pbuf;
   while (!stop) {
     if (!wait_stdin(1500)) {
       /* 固件 5 s 收不到主机命令就自己画「等待连接」页 → 空闲保活 */
@@ -952,7 +1041,7 @@ int main(int argc, char **argv) {
       uint32_t wire = 0, ms = 0;
       int r = push_full(&l, &wire, &ms);
       json("{\"event\":\"frame\",\"ok\":%d,\"wire\":%u,\"ms\":%u,\"convert_ms\":%u}", r == 0, wire, ms,
-           (uint32_t)(now_ms() - t0));
+           elapsed_ms(t0));
     } else if (type == 0x04) { /* 屏保整帧：已经是 BGR565，省掉一次转换 */
       if (read_exact(fbuf, FRAME_BYTES)) break;
       uint32_t wire = 0, ms = 0;
@@ -965,8 +1054,8 @@ int main(int argc, char **argv) {
         json("{\"event\":\"patch\",\"ok\":0,\"err\":\"too-many-tiles\"}");
         break;
       }
-      static uint8_t *tiles;
       if (!tiles) tiles = malloc((size_t)MAX_TILES * TILE_MSG);
+      if (!tiles) break;
       if (read_exact(tiles, (size_t)count * TILE_MSG)) break;
       uint32_t wire = 0, ms = 0;
       int r = push_patch(&l, tiles, count, &wire, &ms);
@@ -1010,8 +1099,8 @@ int main(int argc, char **argv) {
         json("{\"event\":\"audio\",\"sub\":%u,\"ok\":0,\"err\":\"too-large\"}", sub);
         break;
       }
-      static uint8_t *abuf;
       if (!abuf) abuf = malloc(AUDIO_CHUNK);
+      if (!abuf) break;
       if (len && read_exact(abuf, len)) break;
       audio_cmd(&l, sub, offset, raw, len ? abuf : NULL, len);
     } else if (type == 0x06) { /* MP3 上传块（type 8） */
@@ -1022,8 +1111,8 @@ int main(int argc, char **argv) {
         json("{\"event\":\"audio-data\",\"ok\":0,\"err\":\"bad-length\"}");
         break;
       }
-      static uint8_t *dbuf;
       if (!dbuf) dbuf = malloc(AUDIO_CHUNK);
+      if (!dbuf) break;
       if (read_exact(dbuf, len)) break;
       audio_data(&l, offset, dbuf, len);
     } else if (type == 0x07) { /* 实时 PCM（type 9） */
@@ -1033,8 +1122,8 @@ int main(int argc, char **argv) {
         json("{\"event\":\"pcm\",\"ok\":0,\"err\":\"bad-length\"}");
         break;
       }
-      static uint8_t *pbuf;
       if (!pbuf) pbuf = malloc(AUDIO_CHUNK);
+      if (!pbuf) break;
       if (read_exact(pbuf, len)) break;
       audio_pcm(&l, pbuf, len);
     } else {
@@ -1043,6 +1132,10 @@ int main(int argc, char **argv) {
     }
   }
   close_link(&l);
+  free(tiles);
+  free(abuf);
+  free(dbuf);
+  free(pbuf);
   free(fbuf);
   free(rgb);
   json("{\"event\":\"exit\"}");

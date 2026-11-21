@@ -60,8 +60,8 @@ function shouldSuppressCs80Push(options?: Cs80PushOptions): boolean {
     return true;
   }
   const explicitTarget = Boolean(
-    process.env.CS80_FACE_URL
-    || process.env.CS80_FACE_PORT
+    process.env.CS80_FACE_URL?.trim()
+    || process.env.CS80_FACE_PORT?.trim()
     || process.env.CS80_FACE_VOICE_PUSH === '1'
     || process.env.CS80_FACE_PUSH === '1',
   );
@@ -78,6 +78,9 @@ export function postCs80Control(payload: Record<string, unknown>, options?: Cs80
   try {
     url = new URL(`${resolveCs80BaseUrl()}/api/control`);
   } catch {
+    return;
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     return;
   }
   const body = JSON.stringify(payload);

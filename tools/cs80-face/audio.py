@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import io
 import json
 import math
+import os
 from pathlib import Path
 import shutil
 import struct
@@ -141,13 +143,13 @@ def _synthesize_wav_bytes(notes: Sequence[Tuple[float, float, float, float]], sa
         v = int(clamped * 32767.0)
         struct.pack_into("<hh", pcm, i * 4, v, v)
 
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
-        with wave.open(tmp.name, "wb") as wf:
-            wf.setnchannels(2)
-            wf.setsampwidth(2)
-            wf.setframerate(sample_rate)
-            wf.writeframes(bytes(pcm))
-        return Path(tmp.name).read_bytes()
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(bytes(pcm))
+    return buf.getvalue()
 
 
 def audio_to_mp3(data: bytes, name: str = "") -> Tuple[bytes, Dict[str, Any]]:
@@ -194,9 +196,15 @@ def ensure_chime_mp3(name: str, sounds_dir: Path) -> Path:
         return mp3_path
     wav_bytes = _synthesize_wav_bytes(CHIME_SPECS[name])
     mp3_bytes, _ = audio_to_mp3(wav_bytes, name=f"{name}.wav")
-    tmp_path = sounds_dir / f".tmp-{name}.mp3"
-    tmp_path.write_bytes(mp3_bytes)
-    tmp_path.replace(mp3_path)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".tmp-{name}-", suffix=".mp3", dir=str(sounds_dir))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fp:
+            fp.write(mp3_bytes)
+        tmp_path.replace(mp3_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
     return mp3_path
 
 
@@ -254,6 +262,8 @@ class SpeakerController:
     def _load_config(self) -> SpeakerConfig:
         try:
             raw = json.loads(self.config_path.read_text("utf-8"))
+            if not isinstance(raw, dict):
+                return SpeakerConfig()
             vol = max(0, min(100, int(raw.get("volume", 65))))
             muted = bool(raw.get("muted", False))
             qh = str(raw.get("quiet_hours", "23:30-07:30"))
@@ -261,9 +271,17 @@ class SpeakerController:
         except (OSError, ValueError, TypeError):
             return SpeakerConfig()
 
+    def get_config_snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "volume": self.config.volume,
+                "muted": self.config.muted,
+                "quietHours": self.config.quiet_hours,
+            }
+
     def _save_config(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        tmp = self.data_dir / ".tmp-config.json"
+        tmp = self.data_dir / f".tmp-config.{os.getpid()}.json"
         tmp.write_text(
             json.dumps(
                 {
@@ -380,11 +398,14 @@ class SpeakerController:
         if name not in CHIME_SPECS:
             return {"ok": False, "err": f"unknown-chime:{name}"}
         if not force:
-            if self.config.muted:
+            with self._lock:
+                muted = self.config.muted
+                quiet_hours = self.config.quiet_hours
+            if muted:
                 return {"ok": True, "skipped": "muted"}
             if sleeping:
                 return {"ok": True, "skipped": "sleeping"}
-            if parse_quiet_hours(self.config.quiet_hours, now_dt=now_dt):
+            if parse_quiet_hours(quiet_hours, now_dt=now_dt):
                 return {"ok": True, "skipped": "quiet-hours"}
         try:
             mp3_path = ensure_chime_mp3(name, self.sounds_dir)
@@ -392,6 +413,8 @@ class SpeakerController:
             return {"ok": False, "err": str(exc)}
         key = str(mp3_path)
         with self._lock:
+            if not force and self.config.muted:
+                return {"ok": True, "skipped": "muted"}
             cached = self._cache.get(key)
             if cached is None:
                 data = mp3_path.read_bytes()
@@ -405,7 +428,13 @@ class SpeakerController:
         p = Path(file_path).expanduser()
         if not p.is_file():
             return {"ok": False, "err": f"file-not-found:{file_path}"}
-        raw = p.read_bytes()
+        try:
+            st = p.stat()
+            if st.st_size > 64 * 1024 * 1024:
+                return {"ok": False, "err": "input-too-large"}
+            raw = p.read_bytes()
+        except OSError as exc:
+            return {"ok": False, "err": str(exc)}
         if len(raw) > 64 * 1024 * 1024:
             return {"ok": False, "err": "input-too-large"}
         try:

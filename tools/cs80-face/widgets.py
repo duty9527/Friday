@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import math
 import os
@@ -432,6 +433,10 @@ def pack_bento_page(
         pw = col_w * ew + gap * (ew - 1)
         ph = row_h * eh + gap * (eh - 1)
         plugin_name = str(card.get("plugin") or (kind[7:] if kind.startswith("plugin:") else ""))
+        try:
+            ttl_raw = int(card.get("ttlSec") or 120)
+        except (TypeError, ValueError):
+            ttl_raw = 120
         placed.append(
             PlacedCard(
                 card_id=str(card.get("id") or f"card-{idx + 1}"),
@@ -449,7 +454,7 @@ def pack_bento_page(
                 title=str(card.get("title") or ""),
                 plugin=plugin_name,
                 action=str(card.get("action") or ""),
-                ttl_sec=max(15, min(3600, int(card.get("ttlSec") or 120))),
+                ttl_sec=max(15, min(3600, ttl_raw)),
             )
         )
 
@@ -565,11 +570,13 @@ class LayoutStore:
         active_page = max(0, min(len(pages) - 1, active_page))
         weather_city = str(merged.get("weatherCity") or "上海").strip()[:24] or "上海"
         try:
-            weather_lat = max(-85.0, min(85.0, float(merged.get("weatherLat") or 31.23)))
+            lat_f = float(merged.get("weatherLat") if merged.get("weatherLat") is not None else 31.23)
+            weather_lat = max(-85.0, min(85.0, lat_f)) if math.isfinite(lat_f) else 31.23
         except (TypeError, ValueError):
             weather_lat = 31.23
         try:
-            weather_lon = max(-180.0, min(180.0, float(merged.get("weatherLon") or 121.47)))
+            lon_f = float(merged.get("weatherLon") if merged.get("weatherLon") is not None else 121.47)
+            weather_lon = max(-180.0, min(180.0, lon_f)) if math.isfinite(lon_f) else 121.47
         except (TypeError, ValueError):
             weather_lon = 121.47
 
@@ -1000,8 +1007,23 @@ def _is_pid_alive(pid: Any) -> bool:
     try:
         os.kill(p, 0)
         return True
+    except PermissionError:
+        return True
     except OSError:
         return False
+
+
+def _connect_ro_sqlite(db_path: Path) -> sqlite3.Connection:
+    return sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=1.0)
+
+
+def _coerce_int(val: Any, default: int) -> int:
+    if isinstance(val, bool) or val is None:
+        return default
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
 
 
 def _haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> int:
@@ -1616,16 +1638,15 @@ class WidgetDataHub:
         # 2) Direct read-only SQLite fallback if RPC unavailable
         if summary is None and db_path.is_file():
             try:
-                con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
-                con.row_factory = sqlite3.Row
-                cur = con.cursor()
-                h_rows = cur.execute(
-                    "SELECT code, name, cost, shares, last_nav, last_nav_date FROM holdings ORDER BY cost DESC LIMIT 12"
-                ).fetchall()
-                s_rows = cur.execute(
-                    "SELECT date, total_cost, total_asset, daily_pnl, total_pnl, created_at FROM snapshots ORDER BY created_at DESC LIMIT 24"
-                ).fetchall()
-                con.close()
+                with contextlib.closing(_connect_ro_sqlite(db_path)) as con:
+                    con.row_factory = sqlite3.Row
+                    cur = con.cursor()
+                    h_rows = cur.execute(
+                        "SELECT code, name, cost, shares, last_nav, last_nav_date FROM holdings ORDER BY cost DESC LIMIT 12"
+                    ).fetchall()
+                    s_rows = cur.execute(
+                        "SELECT date, total_cost, total_asset, daily_pnl, total_pnl, created_at FROM snapshots ORDER BY created_at DESC LIMIT 24"
+                    ).fetchall()
                 total_cost = sum(float(r["cost"] or 0.0) for r in h_rows)
                 total_asset = sum(float(r["shares"] or 0.0) * float(r["last_nav"] or 0.0) for r in h_rows)
                 if s_rows:
@@ -1676,9 +1697,8 @@ class WidgetDataHub:
                     has_holdings = False
         if not has_holdings and db_path.is_file():
             try:
-                con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
-                cnt_row = con.execute("SELECT COUNT(*) FROM holdings").fetchone()
-                con.close()
+                with contextlib.closing(_connect_ro_sqlite(db_path)) as con:
+                    cnt_row = con.execute("SELECT COUNT(*) FROM holdings").fetchone()
                 has_holdings = bool(cnt_row and int(cnt_row[0] or 0) > 0)
             except Exception:
                 pass
@@ -1784,18 +1804,17 @@ class WidgetDataHub:
 
         if dash is None and db_path.is_file():
             try:
-                con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
-                con.row_factory = sqlite3.Row
-                cur = con.cursor()
-                prof = cur.execute("SELECT id, name FROM profiles ORDER BY is_default DESC, updated_at DESC LIMIT 1").fetchone()
-                if prof:
-                    rows = cur.execute(
-                        "SELECT weight_kg, heart_rate, measured_at FROM measurements WHERE profile_id = ? ORDER BY measured_at DESC LIMIT 14",
-                        (prof["id"],),
-                    ).fetchall()
-                else:
-                    rows = []
-                con.close()
+                with contextlib.closing(_connect_ro_sqlite(db_path)) as con:
+                    con.row_factory = sqlite3.Row
+                    cur = con.cursor()
+                    prof = cur.execute("SELECT id, name FROM profiles ORDER BY is_default DESC, updated_at DESC LIMIT 1").fetchone()
+                    if prof:
+                        rows = cur.execute(
+                            "SELECT weight_kg, heart_rate, measured_at FROM measurements WHERE profile_id = ? ORDER BY measured_at DESC LIMIT 14",
+                            (prof["id"],),
+                        ).fetchall()
+                    else:
+                        rows = []
                 if rows:
                     latest_w = float(rows[0]["weight_kg"] or 0.0)
                     prev_w = float(rows[1]["weight_kg"] or latest_w) if len(rows) > 1 else latest_w
@@ -2037,19 +2056,18 @@ class WidgetDataHub:
 
         if dash is None and db_path.is_file():
             try:
-                con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
-                con.row_factory = sqlite3.Row
-                cur = con.cursor()
-                s_rows = cur.execute(
-                    "SELECT captured_at, battery, aux_battery, voltage_v, temp_c, charging, charging_power_w, effective_range_km, odometer_km, power_on, locked, gcj_lat, gcj_lon, address, payload_json FROM snapshots ORDER BY captured_at DESC, id DESC LIMIT 16"
-                ).fetchall()
-                t_rows = cur.execute(
-                    "SELECT end_time, distance_km, max_speed_kmh FROM trips ORDER BY end_time DESC LIMIT 40"
-                ).fetchall()
-                a_rows = cur.execute(
-                    "SELECT alert_key FROM alert_state WHERE active = 1"
-                ).fetchall()
-                con.close()
+                with contextlib.closing(_connect_ro_sqlite(db_path)) as con:
+                    con.row_factory = sqlite3.Row
+                    cur = con.cursor()
+                    s_rows = cur.execute(
+                        "SELECT captured_at, battery, aux_battery, voltage_v, temp_c, charging, charging_power_w, effective_range_km, odometer_km, power_on, locked, gcj_lat, gcj_lon, address, payload_json FROM snapshots ORDER BY captured_at DESC, id DESC LIMIT 16"
+                    ).fetchall()
+                    t_rows = cur.execute(
+                        "SELECT end_time, distance_km, max_speed_kmh FROM trips ORDER BY end_time DESC LIMIT 40"
+                    ).fetchall()
+                    a_rows = cur.execute(
+                        "SELECT alert_key FROM alert_state WHERE active = 1"
+                    ).fetchall()
                 if s_rows:
                     latest_payload: Dict[str, Any] = {}
                     try:
@@ -2282,8 +2300,8 @@ class WidgetDataHub:
                 except Exception:
                     cfg = {}
 
-            daily_goal = max(1, min(6, int(cfg.get("dailyGoalCount") or 2)))
-            lifespan_days = max(15, min(365, int(cfg.get("brushHeadLifespanDays") or 90)))
+            daily_goal = max(1, min(6, _coerce_int(cfg.get("dailyGoalCount"), 2) or 2))
+            lifespan_days = max(15, min(365, _coerce_int(cfg.get("brushHeadLifespanDays"), 90) or 90))
             replaced_at_raw = cfg.get("brushHeadReplacedAt")
             replaced_at = int(replaced_at_raw) if isinstance(replaced_at_raw, (int, float)) and replaced_at_raw > 0 else None
 
@@ -2291,51 +2309,52 @@ class WidgetDataHub:
             session_times: List[int] = []
             if db_path.is_file():
                 try:
-                    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
-                    con.row_factory = sqlite3.Row
-                    cur = con.cursor()
-                    row = cur.execute(
-                        "SELECT name, battery_pct, active_mode, modes_json, duration_sec, status, updated_at, last_synced_at "
-                        "FROM device_state ORDER BY CASE WHEN id = 'primary' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1"
-                    ).fetchone()
-                    if row is not None:
-                        try:
-                            modes = json.loads(str(row["modes_json"] or "{}"))
-                        except Exception:
-                            modes = {}
-                        if not isinstance(modes, dict):
-                            modes = {}
-                        active_mode = row["active_mode"] if row["active_mode"] is not None else 1
-                        slot = modes.get(str(active_mode)) or modes.get("1") or {}
-                        if not isinstance(slot, dict):
-                            slot = {}
-                        dev_fb = {
-                            "name": str(row["name"] or ""),
-                            "batteryPct": row["battery_pct"],
-                            "activeMode": active_mode,
-                            "activeStrength": slot.get("strength"),
-                            "activeRange": slot.get("range"),
-                            "activeSpeed": slot.get("speed"),
-                            "durationSec": row["duration_sec"],
-                            "status": str(row["status"] or "Idle"),
-                            "updatedAt": row["updated_at"],
-                            "lastSyncedAt": row["last_synced_at"],
-                        }
-                    s_rows = cur.execute("SELECT brushed_at FROM brush_sessions ORDER BY brushed_at DESC").fetchall()
-                    session_times = [int(r["brushed_at"]) for r in s_rows if r["brushed_at"] is not None]
-                    con.close()
+                    with contextlib.closing(_connect_ro_sqlite(db_path)) as con:
+                        con.row_factory = sqlite3.Row
+                        cur = con.cursor()
+                        row = cur.execute(
+                            "SELECT name, battery_pct, active_mode, modes_json, duration_sec, status, updated_at, last_synced_at "
+                            "FROM device_state ORDER BY CASE WHEN id = 'primary' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1"
+                        ).fetchone()
+                        if row is not None:
+                            try:
+                                modes = json.loads(str(row["modes_json"] or "{}"))
+                            except Exception:
+                                modes = {}
+                            if not isinstance(modes, dict):
+                                modes = {}
+                            active_mode = row["active_mode"] if row["active_mode"] is not None else 1
+                            slot = modes.get(str(active_mode)) or modes.get("1") or {}
+                            if not isinstance(slot, dict):
+                                slot = {}
+                            dev_fb = {
+                                "name": str(row["name"] or ""),
+                                "batteryPct": row["battery_pct"],
+                                "activeMode": active_mode,
+                                "activeStrength": slot.get("strength"),
+                                "activeRange": slot.get("range"),
+                                "activeSpeed": slot.get("speed"),
+                                "durationSec": row["duration_sec"],
+                                "status": str(row["status"] or "Idle"),
+                                "updatedAt": row["updated_at"],
+                                "lastSyncedAt": row["last_synced_at"],
+                            }
+                        s_rows = cur.execute("SELECT brushed_at FROM brush_sessions ORDER BY brushed_at DESC").fetchall()
+                        session_times = [int(r["brushed_at"]) for r in s_rows if r["brushed_at"] is not None]
                 except Exception:
                     dev_fb = None
                     session_times = []
 
-            now_ms = int(time.time() * 1000.0)
+            now_dt = datetime.now()
+            now_ms = int(now_dt.timestamp() * 1000.0)
+            today_date = now_dt.date()
             by_day: Dict[str, int] = {}
             for ts_ms in session_times:
-                day_key = time.strftime("%Y-%m-%d", time.localtime(ts_ms / 1000.0))
+                day_key = datetime.fromtimestamp(ts_ms / 1000.0).strftime("%Y-%m-%d")
                 by_day[day_key] = by_day.get(day_key, 0) + 1
 
             def _day_key_offset(delta_days: int) -> str:
-                return time.strftime("%Y-%m-%d", time.localtime(time.time() + delta_days * 86400.0))
+                return (today_date + timedelta(days=delta_days)).isoformat()
 
             today_key = _day_key_offset(0)
             yesterday_key = _day_key_offset(-1)
@@ -2408,11 +2427,11 @@ class WidgetDataHub:
         cfg_d = dash.get("config") if isinstance(dash, dict) and isinstance(dash.get("config"), dict) else {}
 
         watching = bool(watch_st.get("running")) or str(live_sess.get("phase") or "") in ("scanning", "connecting", "monitoring")
-        today_count = int(stats.get("todayCount") if stats.get("todayCount") is not None else ((dash or {}).get("todayCount") or 0))
-        daily_goal = int(stats.get("dailyGoalCount") or cfg_d.get("dailyGoalCount") or 2)
-        streak_days = int(stats.get("streakDays") if stats.get("streakDays") is not None else ((dash or {}).get("streakDays") or 0))
+        today_count = _coerce_int(stats.get("todayCount") if stats.get("todayCount") is not None else (dash or {}).get("todayCount"), 0)
+        daily_goal = max(1, _coerce_int(stats.get("dailyGoalCount") or cfg_d.get("dailyGoalCount"), 2) or 2)
+        streak_days = _coerce_int(stats.get("streakDays") if stats.get("streakDays") is not None else (dash or {}).get("streakDays"), 0)
         raw_days_left = bh.get("daysLeft") if bh.get("daysLeft") is not None else (dash or {}).get("brushHeadDaysLeft")
-        brush_days_left = int(raw_days_left) if raw_days_left is not None else None
+        brush_days_left = _coerce_int(raw_days_left, 0) if raw_days_left is not None else None
         raw_brush_pct = bh.get("percentLeft")
         if raw_brush_pct is not None:
             brush_pct = round(max(0.0, min(100.0, float(raw_brush_pct))), 1)
@@ -2786,7 +2805,7 @@ class WidgetDataHub:
                 pass
 
         cfg_d = data.get("config") if isinstance(data.get("config"), dict) else {}
-        min_batt_pct = int(cfg_d.get("minBatteryPct") or 25)
+        min_batt_pct = _coerce_int(cfg_d.get("minBatteryPct"), 25) or 25
         updated_hm = time.strftime("%H:%M", time.localtime(fetched_ms / 1000.0)) if fetched_ms > 0 else ""
 
         raw_devs = [d for d in (data.get("devices") or []) if isinstance(d, dict)]
@@ -2960,8 +2979,8 @@ class WidgetDataHub:
                 pass
         tx_ready = bool(data.get("txReady", False))
         rx_ready = bool(data.get("rxReady", False))
-        preset_cnt = int(data.get("presetCount") or 12)
-        learned_cnt = int(data.get("learnedCount") if data.get("learnedCount") is not None else learned_cnt)
+        preset_cnt = _coerce_int(data.get("presetCount"), 12) or 12
+        learned_cnt = _coerce_int(data.get("learnedCount"), learned_cnt) if data.get("learnedCount") is not None else learned_cnt
         subline = "支持电源 · 音量 · 方向导航" + (f" · 已学 {learned_cnt} 键" if learned_cnt > 0 else "")
         self._store_widget(
             "tv-ir",

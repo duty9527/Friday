@@ -144,6 +144,7 @@ class FridayClient:
             sock.connect(str(self.sock_path))
             sock.sendall(encoded)
             chunks: List[bytes] = []
+            total_bytes = 0
             while True:
                 data = sock.recv(65536)
                 if not data:
@@ -152,6 +153,9 @@ class FridayClient:
                 if nl != -1:
                     chunks.append(data[:nl])
                     break
+                total_bytes += len(data)
+                if total_bytes > 16 * 1024 * 1024:
+                    raise RuntimeError("IPC response exceeded 16 MiB limit")
                 chunks.append(data)
         raw = b"".join(chunks).decode("utf-8", errors="replace").strip()
         if not raw:
@@ -175,16 +179,21 @@ class FridayClient:
                 if isinstance(upd, dict):
                     head = int(upd.get("head") or 0)
                     events = upd.get("events") or []
-                    if events or head > self._cursor:
+                    if head < self._cursor:
+                        self._cursor = head
                         need_view = True
-                    self._cursor = max(self._cursor, int(upd.get("cursor") or 0), head)
+                    else:
+                        if events or head > self._cursor:
+                            need_view = True
+                        self._cursor = max(self._cursor, int(upd.get("cursor") or 0), head)
 
             if need_view:
                 view = self._rpc({"command": "view"}, timeout=3.0)
                 if isinstance(view, dict):
                     self._last_view = view
                     self._last_view_at = mono
-                    self._cursor = max(self._cursor, int(view.get("cursor") or 0))
+                    view_cursor = int(view.get("cursor") or 0)
+                    self._cursor = view_cursor if not self._last_connected else max(self._cursor, view_cursor)
             elif self._cached_snap is not None and not self._active_work_ids:
                 now_hm = time.strftime("%H:%M")
                 if self._cached_snap.hud.clock_hm != now_hm:

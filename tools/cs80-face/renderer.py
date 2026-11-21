@@ -1228,6 +1228,7 @@ class FaceRenderer:
         *,
         placed_cards: Sequence[PlacedCard] = (),
         widget_data: Optional[Dict[str, Dict[str, Any]]] = None,
+        update_prev: bool = True,
     ) -> Tuple[bytes, Optional[Tuple[int, bytes]]]:
         """Render frame and return (full_bgr565_bytes, optional (dirty_count, patch_payload_without_type))."""
         self.sync_marquee_metrics(hud)
@@ -1248,9 +1249,14 @@ class FaceRenderer:
                 patch_info = (dirty, payload)
             else:
                 patch_info = None
-            off0 = by0 * WIDTH * 2
-            off1 = by1 * WIDTH * 2
-            self._prev565[off0:off1] = self._curr565[off0:off1]
+            if update_prev:
+                off0 = by0 * WIDTH * 2
+                off1 = by1 * WIDTH * 2
+                self._prev565[off0:off1] = self._curr565[off0:off1]
+                self._has_prev = True
+            else:
+                # Preview-only render did not sync to device; force full composite on next device push.
+                self._last_composite_rows = 0
         else:
             self.fast.bgra_to_bgr565(self._bgra, self._curr565)
             patch_info = None
@@ -1263,8 +1269,11 @@ class FaceRenderer:
                     patch_info = (dirty, payload)
                 else:
                     patch_info = None
-            self._prev565[:] = self._curr565
-        self._has_prev = True
+            if update_prev:
+                self._prev565[:] = self._curr565
+                self._has_prev = True
+            else:
+                self._last_composite_rows = 0
         return bytes(self._curr565), patch_info
 
     def current_png_bytes(self) -> bytes:
@@ -3876,13 +3885,18 @@ class FaceRenderer:
             dot_col=COL_EMERALD,
         )
         x, y, w, h = card.x, card.y, card.w, card.h
-        mem_val = f"{mem:.0f}% ({d.get('memUsedGb', 0):.1f}/{d.get('memTotalGb', 0):.1f}G)"
+        mem_used = float(d.get("memUsedGb") or 0.0)
+        mem_total = float(d.get("memTotalGb") or 0.0)
+        disk_free = float(d.get("diskFreeGb") or 0.0)
+        uptime_h = float(d.get("uptimeH") or 0.0)
+        timer_cnt = int(d.get("timerCount") or 0)
+        mem_val = f"{mem:.0f}% ({mem_used:.1f}/{mem_total:.1f}G)"
         if card.w_span == 1 and w < 370:
-            mem_val = f"{mem:.0f}% ({d.get('memUsedGb', 0):.1f}G)"
+            mem_val = f"{mem:.0f}% ({mem_used:.1f}G)"
         bars = [
             ("处理器", f"{cpu:.0f}%", cpu / 100.0, COL_EMERALD if cpu < 70 else COL_AMBER_BRIGHT),
             ("运行内存", mem_val, mem / 100.0, COL_AMBER_BRIGHT if mem < 82 else COL_RED),
-            ("存储空间", f"{disk:.0f}% (余 {d.get('diskFreeGb', 0):.0f}G)", disk / 100.0, COL_AMBER),
+            ("存储空间", f"{disk:.0f}% (余 {disk_free:.0f}G)", disk / 100.0, COL_AMBER),
         ]
         if card.w_span == 2 and card.h_span == 1:
             col_w = (w - 48.0) * 0.5
@@ -3909,7 +3923,7 @@ class FaceRenderer:
             ctx.set_font_size(14.0 if compact else 15.0)
             ctx.set_source_rgb(*COL_AMBER_BRIGHT)
             ctx.move_to(x + 16.0, y + h - 14.0)
-            nt = str(d.get("nextTimer") or f"已运行 {d.get('uptimeH', 0):.0f} 小时 · 定时 {d.get('timerCount', 0)}")
+            nt = str(d.get("nextTimer") or f"已运行 {uptime_h:.0f} 小时 · 定时 {timer_cnt}")
             ctx.show_text(_fit_single_line_cairo(ctx, nt, w - 32.0))
 
     def _draw_bar_row(
@@ -4121,7 +4135,7 @@ class FaceRenderer:
             for i in range(n_nodes)
         ]
         for a, b, wt in edges:
-            if a < len(pts) and b < len(pts):
+            if 0 <= a < len(pts) and 0 <= b < len(pts):
                 ctx.new_path()
                 ctx.move_to(pts[a][0], pts[a][1])
                 ctx.line_to(pts[b][0], pts[b][1])

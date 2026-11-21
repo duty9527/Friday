@@ -108,7 +108,7 @@ export async function runAction(action = 'status', args = {}, context = {}) {
         timeoutMs: 8000,
       });
       return {
-        ok: Boolean(dash?.ok ?? true),
+        ok: Boolean(dash && typeof dash === 'object' && (dash.ok ?? true)),
         notify: false,
         title: 'CS80 副屏配置面板数据',
         message: `CS80 状态=${dash?.status?.device ?? 'unknown'} · 页数=${dash?.layout?.pages?.length ?? 1}`,
@@ -116,7 +116,7 @@ export async function runAction(action = 'status', args = {}, context = {}) {
       };
     }
 
-    const payload = { action: name, ...safeArgs };
+    const payload = { ...safeArgs, action: name };
     const timeoutMs = name === 'sound' ? 30_000 : 10_000;
     const res = await callDaemon(baseUrl, '/api/control', {
       method: 'POST',

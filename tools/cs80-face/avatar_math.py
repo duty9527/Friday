@@ -857,6 +857,7 @@ class BotAnimator:
         self.blink_elapsed: float = -1.0
         self.poke_anim: Optional[PokeAnim] = None
         self._dirty: bool = True
+        self._settled: bool = False
 
     def set_state(
         self,
@@ -887,6 +888,7 @@ class BotAnimator:
             changed = True
         if changed:
             self._dirty = True
+            self._settled = False
         return changed
 
     def set_expression(self, expr: str, hold_sec: float = 0.0, now_wall: Optional[float] = None) -> None:
@@ -894,6 +896,7 @@ class BotAnimator:
         if self.expr_override != norm:
             self.expr_override = norm
             self._dirty = True
+            self._settled = False
         if norm != "auto" and hold_sec > 0.0:
             self.override_until = (now_wall if now_wall is not None else self.clock) + hold_sec
         else:
@@ -903,6 +906,7 @@ class BotAnimator:
         self.blink_elapsed = 0.0
         self.blink_timer = 3.2 + self._rng.random() * 2.6
         self._dirty = True
+        self._settled = False
 
     def trigger_poke(self, kind: str = "bounce", turns: int = 2) -> None:
         kind = kind if kind in ("bounce", "nod", "spin") else "bounce"
@@ -912,6 +916,7 @@ class BotAnimator:
         if kind != "spin":
             self.blink_elapsed = 0.0
         self._dirty = True
+        self._settled = False
 
     def next_wakeup_delay(self, now_wall: Optional[float] = None) -> float:
         """Maximum seconds daemon can sleep before the next blink, look, or override expiry."""
@@ -923,7 +928,7 @@ class BotAnimator:
             or self.poke_anim is not None
             or self.blink_elapsed >= 0.0
         )
-        if is_continuous or self._dirty:
+        if is_continuous or self._dirty or not self._settled:
             return 0.105
         delays = [2.0]
         if self.state_id != "sleeping":
@@ -1142,6 +1147,7 @@ class BotAnimator:
             and springs_settled
         )
         self._dirty = False
+        self._settled = settled
 
         return FaceSnapshot(
             state_id=self.state_id,
