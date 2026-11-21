@@ -87,6 +87,32 @@ function formatMessageText(msg: ChatMessage): string {
   return msg.reason || `(${msg.status})`;
 }
 
+export async function pollTuiUpdatesOnce(
+  home: string,
+  cursor: number,
+  deduper: TuiMessageDeduper,
+  onMessage: (msg: ChatMessage) => void,
+  isClosed = () => false,
+): Promise<number> {
+  const batch = await request(home, { command: 'updates', after: cursor }) as { events: TraceEvent[]; cursor: number };
+  if (!batch.events.length) return cursor;
+  const ids = [...new Set(batch.events.filter(e => e.type === 'message').map(e => e.messageId).filter((id): id is string => Boolean(id)))];
+  for (const id of ids) {
+    if (isClosed()) return cursor;
+    let msg: ChatMessage;
+    try {
+      msg = await request(home, { command: 'message', messageId: id }) as ChatMessage;
+    } catch (error) {
+      // Transient replies (e.g. silent handoffs/suppressed timer failures) may be deleted after emitting journal events.
+      if (error instanceof Error && /Message not found/i.test(error.message)) continue;
+      throw error;
+    }
+    if (!deduper.shouldPrintPolled(msg)) continue;
+    onMessage(msg);
+  }
+  return batch.cursor;
+}
+
 export async function startTui(home: string): Promise<void> {
   const initial = await request(home, { command: 'view' }) as MainView;
   let cursor = initial.cursor;
@@ -113,20 +139,19 @@ export async function startTui(home: string): Promise<void> {
     if (closed || pollInFlight) return;
     pollInFlight = true;
     try {
-      const batch = await request(home, { command: 'updates', after: cursor }) as { events: TraceEvent[]; cursor: number };
-      if (!batch.events.length) return;
-      const ids = [...new Set(batch.events.filter(e => e.type === 'message').map(e => e.messageId).filter((id): id is string => Boolean(id)))];
-      for (const id of ids) {
-        if (closed) return;
-        const msg = await request(home, { command: 'message', messageId: id }) as ChatMessage;
-        if (!deduper.shouldPrintPolled(msg)) continue;
-        const label = msg.role === 'user'
-          ? formatUserSpeaker(msg, true)
-          : msg.source === 'system' ? '\x1b[33m系统\x1b[0m' : '\x1b[32mF.R.I.D.A.Y.\x1b[0m';
-        process.stdout.write(`\r\x1b[K[${label}] ${formatMessageText(msg)}\n`);
-        if (!closed) rl.prompt(true);
-      }
-      cursor = batch.cursor;
+      cursor = await pollTuiUpdatesOnce(
+        home,
+        cursor,
+        deduper,
+        msg => {
+          const label = msg.role === 'user'
+            ? formatUserSpeaker(msg, true)
+            : msg.source === 'system' ? '\x1b[33m系统\x1b[0m' : '\x1b[32mF.R.I.D.A.Y.\x1b[0m';
+          process.stdout.write(`\r\x1b[K[${label}] ${formatMessageText(msg)}\n`);
+          if (!closed) rl.prompt(true);
+        },
+        () => closed,
+      );
     } catch {
       /* Transient poll error */
     } finally {

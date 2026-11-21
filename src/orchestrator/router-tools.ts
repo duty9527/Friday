@@ -1244,8 +1244,13 @@ export function createRouterTools(
         pluginArgs.action = inferredArgAction;
       }
       const turn = host.getTurn();
-      const signal = turn?.chatContext?.attemptController?.signal ?? turn?.chatContext?.controller.signal;
-      const result = await runPlugin(host.home, pluginName, subAction, pluginArgs, undefined, { signal });
+      const signal = turn?.chatContext?.attemptController?.signal
+        ?? turn?.chatContext?.controller.signal
+        ?? turn?.reportChatContext?.controller.signal;
+      const result = await runPlugin(host.home, pluginName, subAction, pluginArgs, undefined, {
+        signal,
+        ...(allowedPlugins ? { allowedPlugins } : {}),
+      });
       return JSON.stringify(compactPluginResultForRouter(result, subAction, pluginArgs));
     },
   }, {

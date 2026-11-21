@@ -31,6 +31,7 @@ export interface Run {
   userStopped?: boolean;
   deliveryOrigin?: MessageOrigin;
   replyController?: AbortController;
+  replyDeliveryAborted?: boolean;
   attachments?: AttachmentView[];
   pendingFollowupAttachments?: AttachmentView[];
 }

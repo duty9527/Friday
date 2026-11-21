@@ -96,6 +96,8 @@ async function stopChildProcess(child: ChildProcess | undefined, timeoutMs: numb
  */
 export function createManagedServeRestarter(options: ManagedServeOptions): ManagedServeRestarter {
   let managedChild: ChildProcess | undefined;
+  let detached = false;
+  const pendingStops = new Set<Promise<void>>();
   const startupTimeoutMs = options.startupTimeoutMs ?? 15_000;
   const shutdownTimeoutMs = options.shutdownTimeoutMs ?? 5_000;
 
@@ -103,9 +105,13 @@ export function createManagedServeRestarter(options: ManagedServeOptions): Manag
     const child = managedChild;
     managedChild = undefined;
     await stopChildProcess(child, shutdownTimeoutMs);
+    if (pendingStops.size > 0) {
+      await Promise.allSettled([...pendingStops]);
+    }
   };
 
   const restartService = async () => {
+    detached = false;
     if (options.systemdUnit) {
       await execFileAsync('systemctl', ['--user', 'restart', options.systemdUnit], {
         timeout: startupTimeoutMs,
@@ -159,10 +165,12 @@ export function createManagedServeRestarter(options: ManagedServeOptions): Manag
     await new Promise<void>((resolve, reject) => {
       let settled = false;
       let stdout = '';
+      const noopError = () => {};
       const cleanup = () => {
         clearTimeout(timeoutTimer);
         clearInterval(pollTimer);
         child.off('exit', onExit);
+        child.on('error', noopError);
         child.off('error', onError);
         child.stdout?.off('data', onStdout);
         child.stderr?.off('data', onStderr);
@@ -171,6 +179,10 @@ export function createManagedServeRestarter(options: ManagedServeOptions): Manag
         if (settled) return;
         settled = true;
         cleanup();
+        if (!error && !detached) {
+          child.stdout?.resume();
+          child.stderr?.resume();
+        }
         if (error) reject(error);
         else resolve();
       };
@@ -221,7 +233,9 @@ export function createManagedServeRestarter(options: ManagedServeOptions): Manag
       pollTimer.unref();
 
       const timeoutTimer = setTimeout(() => {
-        void stopChildProcess(child, shutdownTimeoutMs);
+        const stopTask = stopChildProcess(child, shutdownTimeoutMs)
+          .finally(() => pendingStops.delete(stopTask));
+        pendingStops.add(stopTask);
         if (managedChild === child) managedChild = undefined;
         done(new Error(`Managed serve did not become ready within ${startupTimeoutMs}ms`));
       }, startupTimeoutMs);
@@ -230,6 +244,7 @@ export function createManagedServeRestarter(options: ManagedServeOptions): Manag
   };
 
   const detach = () => {
+    detached = true;
     const child = managedChild;
     managedChild = undefined;
     if (!child) return;

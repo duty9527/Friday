@@ -377,6 +377,7 @@ interface InProcessPluginModule {
 }
 
 const IN_PROCESS_MODULE_CACHE = new Map<string, { mtimeNs: bigint; promise: Promise<InProcessPluginModule> }>();
+const FAILED_IN_PROCESS_MODULES = new Set<string>();
 
 function loadInProcessPluginModule(entryPath: string): Promise<InProcessPluginModule> {
   const mtimeNs = statBigIntSafe(entryPath)?.mtimeNs ?? 0n;
@@ -385,13 +386,21 @@ function loadInProcessPluginModule(entryPath: string): Promise<InProcessPluginMo
     return existing.promise;
   }
   const baseHref = pathToFileURL(entryPath).href;
-  const spec = existing ? `${baseHref}?mtime=${mtimeNs.toString()}` : baseHref;
+  const spec = (existing || FAILED_IN_PROCESS_MODULES.has(entryPath))
+    ? `${baseHref}?mtime=${mtimeNs.toString()}`
+    : baseHref;
   const promise = import(spec) as Promise<InProcessPluginModule>;
-  promise.catch(() => {
-    if (IN_PROCESS_MODULE_CACHE.get(entryPath)?.promise === promise) {
-      IN_PROCESS_MODULE_CACHE.delete(entryPath);
-    }
-  });
+  promise.then(
+    () => {
+      FAILED_IN_PROCESS_MODULES.delete(entryPath);
+    },
+    () => {
+      FAILED_IN_PROCESS_MODULES.add(entryPath);
+      if (IN_PROCESS_MODULE_CACHE.get(entryPath)?.promise === promise) {
+        IN_PROCESS_MODULE_CACHE.delete(entryPath);
+      }
+    },
+  );
   IN_PROCESS_MODULE_CACHE.set(entryPath, { mtimeNs, promise });
   return promise;
 }

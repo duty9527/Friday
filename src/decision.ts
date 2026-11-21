@@ -265,14 +265,15 @@ export async function requestGeminiDecisions(
   const cacheReadTokens = Number.isFinite(rawCached) && rawCached > 0 ? Math.round(rawCached) : 0;
   const inputTokens = Math.max(0, (Number.isFinite(rawInput) && rawInput > 0 ? Math.round(rawInput) : 0) - cacheReadTokens);
   const rawTotal = Number(payload.usage.total_tokens ?? 0);
+  const safeTotal = Number.isFinite(rawTotal) && rawTotal > 0 ? Math.round(rawTotal) : 0;
   const rawOut = payload.usage.total_output_tokens;
   const outputTokens = typeof rawOut === 'number' && Number.isFinite(rawOut)
     ? Math.max(0, rawOut)
-    : Math.max(0, rawTotal - inputTokens - cacheReadTokens);
+    : Math.max(0, safeTotal - inputTokens - cacheReadTokens);
   const usage = {
     inputTokens,
     ...(cacheReadTokens > 0 ? { cacheReadTokens } : {}),
-    totalTokens: rawTotal > 0 ? rawTotal : inputTokens + cacheReadTokens + outputTokens,
+    totalTokens: safeTotal > 0 ? safeTotal : inputTokens + cacheReadTokens + outputTokens,
   };
   return { answers: payload.answers, usage, outputTokens };
 }

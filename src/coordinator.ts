@@ -897,30 +897,25 @@ export class Coordinator {
     };
     this.chatRuns.set(message.id, context);
 
+    const settleAbortedBeforeStart = (): boolean => {
+      if (!context.controller.signal.aborted && !this.closing) return false;
+      context.settled = true;
+      chat.update(message.id, { status: 'interrupted', reason: 'F.R.I.D.A.Y. 处理前已停止；不会自动重发。' });
+      if (context.replyId) {
+        chat.update(context.replyId, { status: 'interrupted', reason: 'F.R.I.D.A.Y. 回复未完成；已保留公开输出和真实错误轨迹，不自动重放。' });
+      }
+      this.notifyOutbound();
+      return true;
+    };
+
     const pending = (async () => {
       for (;;) {
         await waitForChatCoalesceLoop(context, o => this.hasInboundHold(o), () => this.closing);
-        if (context.controller.signal.aborted || this.closing) {
-          context.settled = true;
-          chat.update(message.id, { status: 'interrupted', reason: 'F.R.I.D.A.Y. 处理前已停止；不会自动重发。' });
-          if (context.replyId) {
-            chat.update(context.replyId, { status: 'interrupted', reason: 'F.R.I.D.A.Y. 回复未完成；已保留公开输出和真实错误轨迹，不自动重放。' });
-          }
-          this.notifyOutbound();
-          return;
-        }
+        if (settleAbortedBeforeStart()) return;
         let retryCoalesce = false;
         await this.enqueueRouter('interactive', async () => {
           for (;;) {
-            if (context.controller.signal.aborted || this.closing) {
-              context.settled = true;
-              chat.update(message.id, { status: 'interrupted', reason: 'F.R.I.D.A.Y. 处理前已停止；不会自动重发。' });
-              if (context.replyId) {
-                chat.update(context.replyId, { status: 'interrupted', reason: 'F.R.I.D.A.Y. 回复未完成；已保留公开输出和真实错误轨迹，不自动重放。' });
-              }
-              this.notifyOutbound();
-              return;
-            }
+            if (settleAbortedBeforeStart()) return;
             if (!context.hasSideEffectTool && (Date.now() < context.coalesceUntil || this.hasInboundHold(context.message.origin))) {
               retryCoalesce = true;
               return;
@@ -943,6 +938,7 @@ export class Coordinator {
               this.semantic,
               { skipAiContinuity },
             );
+            if (settleAbortedBeforeStart()) return;
             if (attemptVersion === 0
               || currentMessage.sessionId !== resolvedSession.sessionId
               || JSON.stringify(currentMessage.sessionLink ?? null) !== JSON.stringify(resolvedSession.sessionLink ?? null)) {
@@ -961,6 +957,7 @@ export class Coordinator {
                   .hits
                   .filter(hit => hit.score >= 46 && !(hit.kind === 'message' && hit.messageId === message.id))
               : [];
+            if (settleAbortedBeforeStart()) return;
             const subconscious = isMemberSpeaker ? undefined : this.store.peekSubconsciousForChat(this.subconscious.now());
             context.revisions = new Map(knownWorks.map(task => [task.id, task.revision]));
 
@@ -1035,6 +1032,7 @@ export class Coordinator {
             context.attemptController = attemptController;
             const onUserAbort = () => attemptController.abort(context.controller.signal.reason);
             context.controller.signal.addEventListener('abort', onUserAbort, { once: true });
+            if (context.controller.signal.aborted) onUserAbort();
             const preTurnLeafId = isMemberSpeaker ? undefined : this.router?.leafId;
             let memberRouter: AgentPort | undefined;
 
@@ -1131,6 +1129,9 @@ export class Coordinator {
                 });
               }
 
+              if (context.controller.signal.aborted || this.closing) {
+                throw context.controller.signal.reason ?? new Error('Service is shutting down');
+              }
               resetChatContextClock(context);
               this.activeChatContext = context;
               const result = await this.turnStorage.run(turn, () => trace.run(activeRouter, payload, attemptController.signal));
@@ -1172,7 +1173,7 @@ export class Coordinator {
                 this.router?.rewind?.(preTurnLeafId);
               }
               context.settled = true;
-              const status = context.controller.signal.aborted ? 'interrupted' : 'failed';
+              const status = (context.controller.signal.aborted || this.closing) ? 'interrupted' : 'failed';
               const detail = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').trim();
               const failReason = status === 'interrupted'
                 ? 'F.R.I.D.A.Y. 回复未完成；已保留公开输出和真实错误轨迹，不自动重放。'
@@ -1209,6 +1210,9 @@ export class Coordinator {
           const status = isAbortOrShutdown ? 'interrupted' : 'failed';
           const detail = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').trim();
           const msgRecord = chat.get(message.id);
+          if (msgRecord.routing?.status === 'processing') {
+            chat.routeState(message.id, status);
+          }
           if (msgRecord.status === 'queued' || msgRecord.status === 'processing') {
             chat.update(message.id, {
               status,
@@ -1412,7 +1416,7 @@ export class Coordinator {
       });
       if (!handled) return false;
     } catch (routerError) {
-      if (run.replyId && run.replyController?.signal.aborted && !run.controller.signal.aborted) {
+      if (run.replyId && run.replyDeliveryAborted && !run.controller.signal.aborted) {
         this.store.conversation.update(run.replyId, { status: 'interrupted', reason: '已停止播报失败说明。' });
         run.replyId = undefined;
         this.notifyOutbound();
@@ -1651,6 +1655,15 @@ export class Coordinator {
       });
     } catch (error) {
       await rm(join(this.home, 'tasks', id), { recursive: true, force: true });
+      if (!(error instanceof SourceChangedError)) {
+        const existing = this.store.byRequest(requestId);
+        if (existing) {
+          if (existing.fingerprint !== fingerprint) {
+            throw new Error('Request ID already used with different task parameters');
+          }
+          return existing;
+        }
+      }
       throw error;
     }
 
@@ -2065,7 +2078,7 @@ export class Coordinator {
               return false;
             }, 'interactive');
           } catch (qErr) {
-            if (run.replyId && run.replyController?.signal.aborted && !run.controller.signal.aborted) {
+            if (run.replyId && run.replyDeliveryAborted && !run.controller.signal.aborted) {
               this.store.conversation.update(run.replyId, {
                 status: 'interrupted',
                 reason: '已停止请示播报；后台工作已暂停等待您的指令。',
@@ -2075,6 +2088,14 @@ export class Coordinator {
             } else if (!this.valid(run)) {
               return;
             } else {
+              if (run.replyId) {
+                this.store.conversation.update(run.replyId, {
+                  status: 'failed',
+                  reason: `请示播报失败；任务已等待老板拍板：${asked.question}`,
+                });
+                run.replyId = undefined;
+                this.notifyOutbound();
+              }
               console.warn(`[friday] WORKER_QUESTION delivery warning for ${task.id}:`, qErr instanceof Error ? qErr.message : String(qErr));
             }
           }
@@ -2244,7 +2265,7 @@ export class Coordinator {
           });
         } catch (reportErr) {
           if (!this.valid(run)) return;
-          if (run.replyController?.signal.aborted) {
+          if (run.replyDeliveryAborted) {
             reportDeliveryStopped = true;
             if (run.replyId) {
               this.store.conversation.update(run.replyId, { status: 'interrupted', reason: '已停止汇总播报；后台任务完整报告已保留。' });
@@ -2584,6 +2605,7 @@ export class Coordinator {
     if (router) {
       turn = createRouterTurnScope({ ...turnInit, routerTrace: trace });
       if (routerTaskReply) {
+        run.replyDeliveryAborted = false;
         replyController = new AbortController();
         run.replyController = replyController;
         turn.activeReportTask = task;
@@ -2636,6 +2658,9 @@ export class Coordinator {
       return router ? this.publicText(result) : result;
     } finally {
       if (router) {
+        if (replyController) {
+          run.replyDeliveryAborted = Boolean(replyController.signal.aborted && !run.controller.signal.aborted);
+        }
         if (run.replyController === replyController) run.replyController = undefined;
       } else {
         run.trace = undefined;

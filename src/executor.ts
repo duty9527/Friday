@@ -74,14 +74,24 @@ export class Executor {
           entry.resolve(message);
         }
       });
-      this.child.once('error', error => { clearTimeout(timer); this.dead = true; reject(error); });
-      this.child.once('exit', () => {
-        clearTimeout(timer); this.dead = true; reject(new Error('Executor exited'));
+      const settlePendingAsUnknown = () => {
         for (const [id, entry] of this.pending) {
           const op: Operation = { ...JSON.parse(entry.fingerprint).op, id, status: 'unknown', error: 'Executor disconnected; no automatic replay' };
           this.update(op); entry.resolve(op);
         }
         this.pending.clear();
+      };
+      this.child.once('error', error => {
+        clearTimeout(timer);
+        this.dead = true;
+        reject(error);
+        settlePendingAsUnknown();
+      });
+      this.child.once('exit', () => {
+        clearTimeout(timer);
+        this.dead = true;
+        reject(new Error('Executor exited'));
+        settlePendingAsUnknown();
       });
     });
     this.ready.catch(() => {});
@@ -119,11 +129,34 @@ export class Executor {
     if (!this.dead && this.child.connected) this.child.send({ type: 'stop', id }, () => {});
   }
   async close() {
-    if (this.dead) return;
+    if (this.dead || this.child.exitCode !== null || this.child.signalCode !== null) return;
     await new Promise<void>(resolve => {
-      const kill = setTimeout(() => this.child.kill('SIGKILL'), 1000);
-      this.child.once('exit', () => { clearTimeout(kill); resolve(); });
-      if (this.child.connected) this.child.disconnect();
+      let finished = false;
+      const done = () => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(kill);
+        clearTimeout(forceResolve);
+        resolve();
+      };
+      let forceResolve: NodeJS.Timeout | undefined;
+      const kill = setTimeout(() => {
+        try {
+          if (!this.child.pid || !this.child.kill('SIGKILL')) {
+            done();
+            return;
+          }
+        } catch {
+          done();
+          return;
+        }
+        forceResolve = setTimeout(done, 1000);
+        forceResolve.unref();
+      }, 1000);
+      this.child.once('exit', done);
+      if (this.child.connected) {
+        try { this.child.disconnect(); } catch {}
+      }
     });
   }
 }

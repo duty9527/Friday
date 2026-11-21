@@ -630,10 +630,18 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
       if (!handledSockets.has(socket)) socket.destroy();
     }
     if (inFlightRequests.size > 0) {
-      await Promise.race([
-        Promise.allSettled([...inFlightRequests]),
-        new Promise<void>(resolve => setTimeout(resolve, 5_000)),
-      ]);
+      let drainTimer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          Promise.allSettled([...inFlightRequests]),
+          new Promise<void>(resolve => {
+            drainTimer = setTimeout(resolve, 5_000);
+            drainTimer.unref?.();
+          }),
+        ]);
+      } finally {
+        clearTimeout(drainTimer);
+      }
     }
     for (const socket of connections) socket.destroy();
     await coordinator?.close();

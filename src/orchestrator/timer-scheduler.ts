@@ -518,31 +518,36 @@ export class TimerScheduler {
         }
         if (res.notify) {
           const { origin, fallbackNote } = this.resolveTriggerOriginWithFallback(timer);
-          const deliveredText = fallbackNote ? `${res.message}\n\n> ℹ️ ${fallbackNote}` : res.message;
+          const rawDelivered = fallbackNote ? `${res.message}\n\n> ℹ️ ${fallbackNote}` : res.message;
+          const deliveredText = rawDelivered.length > 65_536 ? `${rawDelivered.slice(0, 65_535)}…` : rawDelivered;
           const timerMsgId = randomUUID();
           const timerSessionId = formatFlowSessionId(timerMsgId);
-          const userMsg = this.host.store.conversation.create({
-            id: timerMsgId,
-            role: 'user',
-            source: 'system',
-            origin,
-            sessionId: timerSessionId,
-            text: `[定时触发 · ${timer.name}] ${timer.instruction}`,
-            status: 'completed',
-            paths: [],
-            mode: this.host.mode,
-          });
-          this.host.store.conversation.create({
-            id: randomUUID(),
-            replyTo: userMsg.id,
-            role: 'assistant',
-            source: 'system',
-            origin,
-            sessionId: timerSessionId,
-            text: deliveredText,
-            status: 'completed',
-            paths: [],
-            mode: this.host.mode,
+          const rawPromptText = `[定时触发 · ${timer.name}] ${timer.instruction}`;
+          const promptText = rawPromptText.length > 65_536 ? `${rawPromptText.slice(0, 65_535)}…` : rawPromptText;
+          this.host.store.transaction(() => {
+            const userMsg = this.host.store.conversation.create({
+              id: timerMsgId,
+              role: 'user',
+              source: 'system',
+              origin,
+              sessionId: timerSessionId,
+              text: promptText,
+              status: 'completed',
+              paths: [],
+              mode: this.host.mode,
+            });
+            this.host.store.conversation.create({
+              id: randomUUID(),
+              replyTo: userMsg.id,
+              role: 'assistant',
+              source: 'system',
+              origin,
+              sessionId: timerSessionId,
+              text: deliveredText,
+              status: 'completed',
+              paths: [],
+              mode: this.host.mode,
+            });
           });
           this.host.store.notice('system', 'timer_plugin_completed', `定时插件「${timer.name}」(${pluginName}/${pluginAction}) 已执行并推送通知`);
           this.host.notifyOutbound();
@@ -569,7 +574,10 @@ export class TimerScheduler {
       return;
     }
 
-    if (this.submittingTaskTimers.has(timer.id)) return;
+    if (this.submittingTaskTimers.has(timer.id)) {
+      this.host.store.saveTimer(timer);
+      return;
+    }
     const fireSlot = plannedRunAt ?? now;
     const { origin } = this.resolveTriggerOriginWithFallback(timer);
     const timerMsgId = randomUUID();
@@ -604,6 +612,12 @@ export class TimerScheduler {
       },
     ).then(task => {
       if (this.host.isClosing()) return;
+      const latestTaskStatus = (() => {
+        try { return this.host.store.get(task.id).status; } catch { return undefined; }
+      })();
+      if (!latestTaskStatus || !['queued', 'running', 'paused', 'waiting_approval'].includes(latestTaskStatus)) {
+        return;
+      }
       const current = this.host.store.listTimers().find(item => item.id === timer.id);
       if (current) {
         this.host.store.saveTimer({ ...current, activeTaskId: task.id });

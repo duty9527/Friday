@@ -586,8 +586,8 @@ export class SdkAgent implements AgentPort {
       if (current && fallback.provider === current.provider && fallback.id === current.id) throw error;
       if (this.session.messages.slice(startCount).some(message => message.role === 'toolResult')) throw error;
       this.rewind(startLeaf);
-      await this.session.setModel(fallback);
       try {
+        await this.session.setModel(fallback);
         return await this.promptOnce(text, signal);
       } finally {
         if (restoreTarget) {
@@ -607,6 +607,7 @@ export class SdkAgent implements AgentPort {
     this.activeTurnAssistants = [];
     try {
       const input = await messageImages(text, this.session.model?.input.includes('image') ?? false);
+      signal.throwIfAborted();
       await this.session.prompt(`HOST_EVENT\n${input.text}`, { images: input.images });
       if (abortPromise) await abortPromise;
       signal.throwIfAborted();
@@ -850,7 +851,19 @@ export async function realFactory(home: string, config: {
     const ids = [...new Set([...runtime.getModels(provider).map(m => m.id), ...preIds])];
     runtime.registerProvider(provider, {
       baseUrl: effectiveConfigBaseUrl, api: 'openai-completions', ...(effectiveConfigApiKey ? { apiKey: effectiveConfigApiKey } : {}),
-      models: ids.map(id => ({ id, name: id, reasoning: false, input: inferModelInput(id, provider), cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128_000, maxTokens: 8192 })),
+      models: ids.map(id => {
+        const existing = runtime.getModel(provider, id);
+        return {
+          id,
+          name: existing?.name ?? id,
+          reasoning: existing?.reasoning ?? false,
+          input: existing?.input ?? inferModelInput(id, provider),
+          cost: existing?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: existing?.contextWindow ?? 128_000,
+          maxTokens: existing?.maxTokens ?? 8192,
+          ...(existing && 'compat' in existing && existing.compat ? { compat: existing.compat } : {}),
+        };
+      }),
     });
   }
 
