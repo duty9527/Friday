@@ -1,6 +1,6 @@
 import { button, element, isEditingWithin, kpiCard, node } from '../shared/dom.js';
 import { errorText } from '../shared/format.js';
-import { api } from '../state.js';
+import { api, appState } from '../state.js';
 
 export interface Cs80FaceUiOptions {
   isVisible: () => boolean;
@@ -109,6 +109,127 @@ interface PluginRunResponse<T = unknown> {
 }
 
 const CARD_SIZES: readonly CardSize[] = ['1x1', '2x1', '1x2', '2x2'];
+
+const DEVICE_STATE_LABELS: Record<string, string> = {
+  disconnected: '未连接',
+  connecting: '连接中',
+  permission_denied: '缺少权限',
+  no_sidecar: '缺少驱动',
+  up: '在线运行',
+};
+
+const BOT_STATE_LABELS: Record<string, string> = {
+  idle: '待机守候',
+  listening: '正在倾听',
+  thinking: '思考推演',
+  searching: '记忆检索',
+  streaming: '正在回复',
+  working: '协同执行',
+  waiting: '等待指示',
+  finished: '执行完成',
+  failed: '执行受阻',
+  sleeping: '静默休眠',
+};
+
+const SUB_PHASE_LABELS: Record<string, string> = {
+  awake: '清醒',
+  nrem: '浅休眠',
+  rem: '梦境整理',
+};
+
+const EXPRESSION_LABELS: Record<string, string> = {
+  auto: '自动表情',
+  happy: '开心',
+  listening: '专注倾听',
+  inspecting: '打量',
+  surprised: '惊喜',
+  calm: '平静',
+  sleepy: '困倦',
+  neutral: '默认',
+  squinted: '专注眯眼',
+  confused: '疑惑',
+  sad: '失落',
+};
+
+const CARD_ACTION_LABELS: Record<string, string> = {
+  status: '实时状态',
+  dashboard: '看板概览',
+  devices: '设备列表',
+  scan: '扫描发现',
+  patrol: '安全巡检',
+  remind: '准点提醒',
+  noon: '午间估值',
+  settle: '晚间结算',
+  trips: '骑行行程',
+  vehicles: '车辆列表',
+  'charge-check': '电量巡检',
+  locate: '设备定位',
+  'play-sound': '响铃寻物',
+  sync: '唤醒同步',
+  config: '参数配置',
+  on: '临时开灯',
+  off: '临时关灯',
+  resume: '恢复行程',
+  keys: '支持按键',
+  tree: '界面结构',
+  screenshot: '屏幕截图',
+  get: '查询状态',
+  set: '调节设置',
+  command: '语音指令',
+  action: '调用动作',
+  cook: '烹饪控制',
+  power: '电源控制',
+  volume: '音量控制',
+  cast: '投屏控制',
+  open_app: '打开应用',
+  act: '界面动作',
+  navigate: '智能导航',
+  press: '发送按键',
+  sequence: '按键序列',
+  learn: '红外学习',
+  init: '初始化',
+  login: '账号登录',
+  logout: '退出登录',
+  'measure-start': '开始测量',
+  'measure-status': '测量进度',
+  'measure-stop': '停止测量',
+  'monitor-start': '开始监听',
+  'monitor-status': '监听进度',
+  'monitor-stop': '停止监听',
+  'watch-start': '开启守护',
+  'watch-stop': '关闭守护',
+  'brushhead-reset': '重置刷头',
+};
+
+function localizeDeviceState(state?: string): string {
+  const key = (state ?? '').trim().toLowerCase();
+  if (!key) return '未连接';
+  return DEVICE_STATE_LABELS[key] ?? state ?? '未连接';
+}
+
+function localizeBotState(state?: string): string {
+  const key = (state ?? 'idle').trim().toLowerCase();
+  return BOT_STATE_LABELS[key] ?? state ?? '待机守候';
+}
+
+function localizeSubPhase(phase?: string): string {
+  const key = (phase ?? 'awake').trim().toLowerCase();
+  return SUB_PHASE_LABELS[key] ?? phase ?? '清醒';
+}
+
+function localizeExpression(expr?: string): string {
+  const key = (expr ?? 'auto').trim().toLowerCase();
+  return EXPRESSION_LABELS[key] ?? expr ?? '自动表情';
+}
+
+function localizeCardAction(actionName: string, pluginName?: string): string {
+  if (pluginName) {
+    const plugin = appState.view?.plugins?.find(p => p.name === pluginName);
+    const specLabel = plugin?.actionSpecs?.find(s => s.name === actionName)?.label;
+    if (specLabel) return specLabel;
+  }
+  return CARD_ACTION_LABELS[actionName] ?? actionName;
+}
 
 function cloneLayout(src: Cs80LayoutConfig): Cs80LayoutConfig {
   return JSON.parse(JSON.stringify(src)) as Cs80LayoutConfig;
@@ -265,7 +386,13 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
     const up = st.device === 'up';
     devicePill.textContent = up
       ? (st.standby ? '待机息屏中' : `USB ${st.usbSpeed ?? 480} Mbps 在线`)
-      : (st.device === 'permission_denied' ? '缺少 udev 权限' : '守护进程已就绪 / 未接入屏幕');
+      : (st.device === 'permission_denied'
+        ? '缺少 udev 权限'
+        : st.device === 'no_sidecar'
+          ? '缺少本地驱动'
+          : st.device === 'connecting'
+            ? '正在连接副屏'
+            : '守护进程已就绪 / 未接入屏幕');
     devicePill.className = `hub-badge ${up ? (st.standby ? 'badge-amber' : 'badge-green') : 'badge-slate'}`;
     standbyBtn.textContent = st.standby ? '☀️ 唤醒副屏' : '🌙 待机息屏';
 
@@ -275,14 +402,14 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
     kpiGrid.replaceChildren(
       kpiCard(
         'CS80 屏幕连接',
-        up ? (st.standby ? '待机' : '在线绘制') : String(st.device || '未知'),
-        up ? `USB ${st.usbSpeed ?? 480} Mbps · patch ${stats.patchMs ?? 0}ms` : (st.lastError || '请插入 CS80 USB'),
+        up ? (st.standby ? '待机息屏' : '在线运行') : localizeDeviceState(st.device),
+        up ? `USB ${st.usbSpeed ?? 480} Mbps · 局部刷新 ${stats.patchMs ?? 0}ms` : (st.lastError || '请插入 CS80 USB'),
         up ? 'positive' : 'warning',
       ),
       kpiCard(
         'F.R.I.D.A.Y. 状态',
-        String(st.botState || 'idle').toUpperCase(),
-        `阶段 ${st.subPhase || 'awake'} · 表情 ${st.expression || 'auto'}`,
+        localizeBotState(st.botState),
+        `阶段 ${localizeSubPhase(st.subPhase)} · 表情 ${localizeExpression(st.expression)}`,
         'accent',
       ),
       kpiCard(
@@ -423,11 +550,12 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
         const optsRow = node('div', '', 'cs80-custom-opts');
         const actionSel = document.createElement('select');
         actionSel.setAttribute('aria-label', `${titleText} 触发动作`);
+        const pluginName = card.plugin || (card.kind.startsWith('plugin:') ? card.kind.slice('plugin:'.length) : undefined);
         const acts = cat?.actions?.length ? cat.actions : ['status', 'dashboard'];
         for (const a of acts) {
           const opt = document.createElement('option');
           opt.value = a;
-          opt.textContent = `动作: ${a}`;
+          opt.textContent = `动作: ${localizeCardAction(a, pluginName)}`;
           actionSel.append(opt);
         }
         actionSel.value = card.action || cat?.defaultAction || acts[0]!;
@@ -443,7 +571,7 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
         for (const sec of [30, 60, 120, 300, 600]) {
           const opt = document.createElement('option');
           opt.value = String(sec);
-          opt.textContent = `每 ${sec}s`;
+          opt.textContent = `每 ${sec} 秒`;
           ttlSel.append(opt);
         }
         ttlSel.value = String(card.ttlSec ?? 120);
@@ -470,10 +598,19 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
     for (const item of catalog) {
       const card = node('div', '', 'cs80-catalog-item');
       const head = node('div', '', 'cs80-editor-card-head');
-      const catLabel = item.category === 'core' ? '核心' : item.category === 'custom_plugin' ? '自定义插件' : '官方插件';
+      const catLabel = item.category === 'core'
+        ? '核心状态'
+        : item.category === 'custom_plugin'
+          ? '扩展插件'
+          : '内置插件';
+      const catTone = item.category === 'core'
+        ? 'badge-slate'
+        : item.category === 'custom_plugin'
+          ? 'badge-purple'
+          : 'badge-teal';
       head.append(
         node('span', item.title, 'cs80-catalog-title'),
-        node('span', catLabel, `hub-badge ${item.category === 'custom_plugin' ? 'badge-amber' : 'badge-slate'}`),
+        node('span', catLabel, `hub-badge ${catTone}`),
       );
       const sub = node('div', item.subtitle || item.kind, 'cs80-catalog-sub');
       const addBtn = button('＋ 添加到此页', () => {
@@ -704,7 +841,7 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
   bannerSendBtn.addEventListener('click', async () => {
     const text = bannerInput.value.trim();
     if (!text) return;
-    await callPlugin('express', { text, title: 'WEB · 互动消息', holdSec: 14 });
+    await callPlugin('express', { text, title: '控制台 · 互动消息', holdSec: 14 });
     bannerInput.value = '';
     setTimeout(() => {
       if (options.isVisible()) void refreshDashboard();

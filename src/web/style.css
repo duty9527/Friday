@@ -7097,8 +7097,22 @@ html[data-theme="industrial"] .fund-holding-row:hover {
 .cs80-global-grid {
   align-items:end;
 }
+.cs80-global-grid label:not(.hub-checkbox-label) {
+  display:flex;
+  flex-direction:column;
+  gap:5px;
+  margin-bottom:0;
+}
+#cs80-grid-rows-pills {
+  margin-top:5px;
+}
+.cs80-global-grid label.hub-checkbox-label,
 .cs80-overlay-check {
+  flex-direction:row;
+  align-items:center;
+  gap:8px;
   padding-top:6px;
+  align-self:center;
 }
 .cs80-page-tabs {
   flex-wrap:wrap;
@@ -7186,8 +7200,10 @@ html[data-theme="industrial"] .fund-holding-row:hover {
   flex-wrap:wrap;
 }
 .cs80-size-btn {
-  padding:2px 6px;
+  min-height:22px;
+  padding:2px 7px;
   font-size:11px;
+  line-height:1.3;
   border-radius:5px;
   border:1px solid var(--border);
   background:var(--surface);
@@ -7204,6 +7220,10 @@ html[data-theme="industrial"] .fund-holding-row:hover {
   display:flex;
   gap:4px;
 }
+.cs80-editor-card .mini-button {
+  min-height:22px;
+  padding:1px 7px;
+}
 .cs80-custom-opts {
   display:grid;
   grid-template-columns:1fr 1fr;
@@ -7211,14 +7231,16 @@ html[data-theme="industrial"] .fund-holding-row:hover {
 }
 .cs80-custom-opts select,
 .cs80-custom-opts input {
+  min-height:26px;
   font-size:12px;
-  padding:3px 6px;
+  padding:2px 6px;
 }
 .cs80-catalog-header {
   display:flex;
   align-items:center;
   justify-content:space-between;
   gap:8px;
+  flex-wrap:wrap;
   margin-top:4px;
 }
 .cs80-catalog-header h4 {
@@ -7261,8 +7283,41 @@ html[data-theme="industrial"] .fund-holding-row:hover {
   align-items:center;
   gap:8px;
 }
+.cs80-ctrl-row label {
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  margin-bottom:0;
+}
+.cs80-ctrl-row .meta {
+  white-space:nowrap;
+  flex-shrink:0;
+}
+.cs80-ctrl-row select {
+  width:auto;
+  min-width:84px;
+  min-height:30px;
+}
 .cs80-ctrl-row input[type="text"] {
   flex:1 1 200px;
+  min-height:30px;
+}
+html[data-theme="industrial"] .cs80-preview-card,
+html[data-theme="industrial"] .cs80-section-card {
+  border-radius:10px;
+  background:var(--surface);
+}
+html[data-theme="industrial"] .cs80-bento-editor {
+  border-radius:8px;
+  background:var(--raised);
+}
+html[data-theme="industrial"] .cs80-editor-card {
+  border-radius:8px;
+  border-color:var(--border);
+  background:var(--surface);
+}
+html[data-theme="industrial"] .cs80-catalog-item {
+  border-radius:8px;
 }
 @media (max-width: 960px) {
   .cs80-studio-grid {
@@ -7311,6 +7366,17 @@ html[data-theme="industrial"] .fund-holding-row:hover {
   flex-wrap:wrap;
   align-items:center;
   gap:14px;
+}
+.laifen-toggles-row > label:not(.hub-checkbox-label) {
+  display:inline-flex;
+  align-items:center;
+  gap:8px;
+  margin-bottom:0;
+}
+.laifen-toggles-row select {
+  width:auto;
+  min-width:110px;
+  min-height:28px;
 }
 .laifen-v2pro-box {
   display:flex;
@@ -7510,5 +7576,167 @@ html[data-theme="industrial"] .fund-holding-row:hover {
   .netlea-hero-grid,
   .netlea-sliders-grid {
     grid-template-columns:minmax(0, 1fr);
+  }
+}
+
+/* ============================================================================
+   Plugin Directory App Cards & Folded Developer Drawer
+   ============================================================================ */
+#plugins-list.hub-cards-grid {
+  display:grid;
+  grid-template-columns:repeat(auto-fit, minmax(min(430px, 100%), 1fr));
+  gap:14px;
+  align-items:stretch;
+}
+#plugins-list > .hub-empty-state {
+  grid-column:1 / -1;
+}
+.plugin-card {
+  gap:12px;
+  padding:16px 18px;
+}
+.plugin-card:has(.plugin-dev-drawer[open]) {
+  grid-column:1 / -1;
+}
+.plugin-card:has(.plugin-dev-drawer[open]):hover {
+  transform:none;
+}
+.plugin-card-head {
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:10px 12px;
+  flex-wrap:nowrap;
+}
+@media (max-width: 520px) {
+  .plugin-card-head {
+    flex-wrap:wrap;
+  }
+}
+.plugin-card-head-main {
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+  flex:1 1 auto;
+  min-width:0;
+}
+.plugin-card-head .hub-card-title-group {
+  flex:0 0 auto;
+}
+.plugin-card-title {
+  font-size:14.5px;
+  line-height:1.4;
+}
+.plugin-open-btn {
+  min-height:30px;
+  padding:4px 14px;
+  font-size:12.5px;
+  font-weight:600;
+  border-radius:999px;
+  flex-shrink:0;
+}
+html[data-theme="industrial"] .plugin-open-btn {
+  border-radius:6px;
+}
+.plugin-card-desc {
+  margin:0;
+  font-size:13px;
+  line-height:1.6;
+  color:var(--muted);
+}
+.plugin-cap-row {
+  display:flex;
+  align-items:center;
+  flex-wrap:wrap;
+  gap:6px;
+}
+.plugin-cap-chip {
+  display:inline-flex;
+  align-items:center;
+  padding:3px 9px;
+  border-radius:8px;
+  background:var(--raised);
+  border:1px solid var(--border);
+  color:var(--text);
+  font-size:11.5px;
+  font-weight:500;
+  line-height:1.35;
+}
+.plugin-cap-chip.is-overflow {
+  background:var(--accent-soft);
+  border-color:var(--warn-bd);
+  color:var(--accent-fg);
+  font-weight:600;
+}
+html[data-theme="industrial"] .plugin-cap-chip {
+  border-radius:6px;
+}
+.plugin-timer-row {
+  padding-top:2px;
+}
+.hub-accordion {
+  border:1px solid var(--rule);
+  border-radius:10px;
+  background:var(--raised);
+  overflow:hidden;
+}
+html[data-theme="industrial"] .hub-accordion {
+  border-radius:7px;
+  border-color:var(--border);
+}
+.plugin-dev-drawer {
+  margin-top:auto;
+}
+.hub-accordion-summary {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:8px;
+  padding:8px 12px;
+  font-size:12px;
+  font-weight:600;
+  color:var(--muted);
+  user-select:none;
+  transition:background-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
+}
+.hub-accordion-summary::after {
+  content:'▸';
+  font-size:11px;
+  color:var(--muted);
+  transition:transform var(--dur-fast) var(--ease-out);
+}
+.hub-accordion[open] > .hub-accordion-summary::after {
+  transform:rotate(90deg);
+}
+.hub-accordion-summary:hover {
+  background:var(--hover-surface);
+  color:var(--text);
+}
+.hub-accordion[open] > .hub-accordion-summary {
+  color:var(--text);
+  border-bottom:1px solid var(--rule);
+}
+.plugin-dev-drawer-body {
+  padding:12px;
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+}
+.plugin-dev-drawer-body > .hub-form-card,
+.plugin-dev-drawer-body > .hub-code-block {
+  background:var(--surface);
+}
+.plugin-dev-subdrawer > pre.hub-code-block {
+  margin:0;
+  border:0;
+  border-radius:0;
+  max-height:360px;
+  overflow:auto;
+}
+@media (max-width: 640px) {
+  #plugins-list.hub-cards-grid {
+    grid-template-columns:minmax(0, 1fr);
+  }
+  .plugin-card {
+    padding:14px;
   }
 }

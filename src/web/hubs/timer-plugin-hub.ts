@@ -37,6 +37,33 @@ export interface TimerPluginHubController {
   }) => void;
 }
 
+const PLUGIN_ACTION_FALLBACK_LABELS: Record<string, string> = {
+  status: '实时状态',
+  dashboard: '看板概览',
+  patrol: '安全巡检',
+  remind: '准点提醒',
+  noon: '午间估值',
+  settle: '晚间结算',
+  devices: '设备列表',
+  scan: '扫描发现',
+  locate: '设备定位',
+  'play-sound': '响铃寻物',
+  trips: '骑行行程',
+  vehicles: '车辆列表',
+  'charge-check': '电量巡检',
+  sync: '唤醒同步',
+  config: '参数配置',
+  on: '临时开灯',
+  off: '临时关灯',
+  resume: '恢复行程',
+};
+
+function resolvePluginActionLabel(specs: readonly PluginActionSpec[], actionName: string): string {
+  const matched = specs.find(spec => spec.name === actionName);
+  if (matched?.label) return matched.label;
+  return PLUGIN_ACTION_FALLBACK_LABELS[actionName] ?? actionName;
+}
+
 function hasActivePluginUiState(container: HTMLElement): boolean {
   if (isEditingWithin(container)) return true;
   if (container.querySelector('details[open]')) return true;
@@ -474,6 +501,9 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
     const timers = appState.view?.timers ?? [];
     const totalActions = plugins.reduce((sum, p) => sum + (p.actions?.length ?? 0), 0);
     const boundTimersCount = timers.filter(t => Boolean(t.plugin)).length;
+    const activeBoundTimersCount = timers.filter(t => Boolean(t.plugin) && t.enabled).length;
+    const enabledCount = plugins.filter(p => p.enabled !== false).length;
+    const surfaceCount = plugins.filter(p => p.enabled !== false && surfaceByName.has(p.name)).length;
     const countText = String(plugins.length);
     pluginTopBadge.textContent = countText;
     pluginCatalogBadge.textContent = countText;
@@ -484,12 +514,27 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
 
     const kpiFrag = document.createDocumentFragment();
     kpiFrag.append(
-      kpiCard('已加载插件', `${plugins.length}`, '', plugins.length > 0 ? 'positive' : 'default'),
-      kpiCard('可执行动作 (Actions)', `${totalActions}`, '', totalActions > 0 ? 'accent' : 'default'),
-      kpiCard('绑定定时任务', `${boundTimersCount}`, '', boundTimersCount > 0 ? 'positive' : 'default'),
+      kpiCard(
+        '已安装插件',
+        `${plugins.length}`,
+        plugins.length ? `已启用 ${enabledCount} 个 · ${surfaceCount} 个专属看板` : '',
+        plugins.length > 0 ? 'positive' : 'default',
+      ),
+      kpiCard(
+        '支持能力数',
+        `${totalActions}`,
+        totalActions > 0 ? '可在对话或副屏中直接调用' : '',
+        totalActions > 0 ? 'accent' : 'default',
+      ),
+      kpiCard(
+        '自动化巡检',
+        `${boundTimersCount}`,
+        boundTimersCount > 0 ? `运行中 ${activeBoundTimersCount} 项` : '暂未绑定定时巡检',
+        boundTimersCount > 0 ? 'positive' : 'default',
+      ),
     );
     pluginKpiGrid.replaceChildren(kpiFrag);
-    pluginListSubtitle.textContent = plugins.length ? `共 ${plugins.length} 个脚本插件` : '暂无插件';
+    pluginListSubtitle.textContent = plugins.length ? `共 ${plugins.length} 个已安装插件` : '暂无插件';
 
     // Do not wipe edited runner inputs, open accordions, or probe output during SSE background updates.
     if (!force && hasActivePluginUiState(pluginsList)) return;
@@ -497,31 +542,82 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
     const contents = document.createDocumentFragment();
     for (const plugin of plugins) {
       const isFocused = focusedPluginName === plugin.name;
-      const card = node('article', '', `hub-entity-card plugin-card${isFocused ? ' is-active' : ''}`);
+      const isEnabled = plugin.enabled !== false;
+      const surfaceEntry = surfaceByName.get(plugin.name);
+      const card = node(
+        'article',
+        '',
+        `hub-entity-card plugin-card${isFocused ? ' is-active' : ''}${!isEnabled ? ' is-paused' : ''}`,
+      );
       card.dataset.pluginName = plugin.name;
 
-      const head = node('div', '', 'hub-card-head');
+      const head = node('div', '', 'hub-card-head plugin-card-head');
+      const headerMain = node('div', '', 'plugin-card-head-main');
       const titleGroup = node('div', '', 'hub-card-title-group');
       titleGroup.append(
-        node('span', '🔌 脚本插件', 'hub-badge badge-purple'),
-        node('strong', `${plugin.title} (${plugin.name})`, 'hub-card-title'),
-        node('span', `${plugin.actions.length} 个动作`, 'hub-badge badge-teal'),
+        surfaceEntry
+          ? node('span', '专属看板', 'hub-badge badge-teal')
+          : node('span', '系统扩展', 'hub-badge badge-purple'),
+        node('span', `${plugin.actions.length} 项能力`, 'hub-meta-chip'),
       );
-      if (plugin.enabled === false) {
-        titleGroup.append(node('span', '⏸ 当前平台/配置已禁用', 'hub-badge badge-slate'));
+      if (!isEnabled) {
+        titleGroup.append(node('span', '已禁用', 'hub-badge badge-slate'));
       }
-      head.append(titleGroup);
-      const surfaceEntry = surfaceByName.get(plugin.name);
-      if (surfaceEntry && plugin.enabled !== false) {
-        const openSurfaceBtn = button(`📊 打开${surfaceEntry.reg.label}`, () => {
+      headerMain.append(
+        titleGroup,
+        node('strong', plugin.title || plugin.name, 'hub-card-title plugin-card-title'),
+      );
+      head.append(headerMain);
+      if (surfaceEntry && isEnabled) {
+        const openSurfaceBtn = button(`打开${surfaceEntry.reg.label}`, () => {
           switchPluginTab(plugin.name);
-        }, 'mini-button');
+        }, 'primary plugin-open-btn');
         openSurfaceBtn.disabled = appState.authExpired || !appState.ready;
         head.append(openSurfaceBtn);
       }
       card.append(head);
 
-      card.append(node('p', plugin.description, 'hub-card-body-text'));
+      card.append(node('p', plugin.description, 'hub-card-body-text plugin-card-desc'));
+
+      const specs: PluginActionSpec[] = plugin.actionSpecs?.length
+        ? plugin.actionSpecs
+        : plugin.actions.map(a => ({ name: a }));
+
+      if (specs.length) {
+        const capRow = node('div', '', 'plugin-cap-row');
+        for (const spec of specs.slice(0, 6)) {
+          const capLabel = spec.label || resolvePluginActionLabel(specs, spec.name);
+          const capChip = node('span', capLabel, 'plugin-cap-chip');
+          if (spec.description) capChip.title = spec.description;
+          capRow.append(capChip);
+        }
+        if (specs.length > 6) {
+          capRow.append(node('span', `+${specs.length - 6}`, 'plugin-cap-chip is-overflow'));
+        }
+        card.append(capRow);
+      }
+
+      const boundTimers = timers.filter(t => t.plugin === plugin.name);
+      if (boundTimers.length) {
+        const timerRow = node('div', '', 'hub-badges-row plugin-timer-row');
+        timerRow.append(node('span', `⏰ 关联巡检 (${boundTimers.length})`, 'hub-meta-chip'));
+        for (const bt of boundTimers) {
+          const actLabel = resolvePluginActionLabel(specs, bt.pluginAction ?? 'status');
+          const scheduleLabel = bt.dailyAt ? `每日 ${bt.dailyAt}` : formatIntervalText(bt.intervalMs);
+          timerRow.append(node(
+            'span',
+            `${bt.name} · ${scheduleLabel} · ${actLabel}${bt.deliverChannelId ? ` → ${bt.deliverChannelId}` : ''}`,
+            `hub-badge ${bt.enabled ? 'badge-green' : 'badge-slate'}`,
+          ));
+        }
+        card.append(timerRow);
+      }
+
+      const devDrawer = node('details', '', 'hub-accordion plugin-dev-drawer') as HTMLDetailsElement;
+      if (isFocused && expandFocusedPluginSource) devDrawer.open = true;
+      devDrawer.append(node('summary', '🛠️ 开发者调试、运行参数与源码', 'hub-accordion-summary'));
+
+      const devBody = node('div', '', 'plugin-dev-drawer-body');
 
       const pathBox = node('div', '', 'hub-code-block');
       pathBox.append(
@@ -536,32 +632,14 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
           'div',
           plugin.dataDir
             ? `💾 专属数据目录 (FRIDAY_PLUGIN_DATA_DIR): ${plugin.dataDir}`
-            : `💾 数据隔离模式: FRIDAY_PLUGIN_DATA_DIR (~/.friday/plugins/${plugin.name}/data)`,
+            : `💾 数据隔离目录: FRIDAY_PLUGIN_DATA_DIR (~/.friday/plugins/${plugin.name}/data)`,
           'meta',
         ),
       );
-      card.append(pathBox);
-
-      const boundTimers = timers.filter(t => t.plugin === plugin.name);
-      if (boundTimers.length) {
-        const timerRow = node('div', '', 'hub-badges-row');
-        timerRow.append(node('span', `⏰ 关联定时任务 (${boundTimers.length})：`, 'hub-meta-chip'));
-        for (const bt of boundTimers) {
-          timerRow.append(node(
-            'span',
-            `${bt.name} · ${bt.dailyAt ? `每日 ${bt.dailyAt}` : formatIntervalText(bt.intervalMs)} · action=${bt.pluginAction ?? 'status'}${bt.deliverChannelId ? ` → ${bt.deliverChannelId}` : ''}`,
-            `hub-badge ${bt.enabled ? 'badge-green' : 'badge-slate'}`,
-          ));
-        }
-        card.append(timerRow);
-      }
-
-      const specs: PluginActionSpec[] = plugin.actionSpecs?.length
-        ? plugin.actionSpecs
-        : plugin.actions.map(a => ({ name: a }));
+      devBody.append(pathBox);
 
       const runnerWrap = node('div', '', 'hub-form-card');
-      runnerWrap.append(node('strong', '⚙️ 动作参数规范 (Action Specs) 与在线调试执行', 'hub-card-title'));
+      runnerWrap.append(node('strong', '⚙️ 动作与参数调试', 'hub-card-title'));
 
       const actionSelect = node('select', '', 'hub-input') as HTMLSelectElement;
       for (const spec of specs) {
@@ -608,16 +686,16 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
         if (spec.description) {
           specCard.append(node('div', spec.description, 'meta'));
         }
-        specCard.append(node('div', `默认/示例参数 (argv[3] JSON): ${JSON.stringify(spec.defaultArgs ?? {})}`, 'meta'));
+        specCard.append(node('div', `默认参数 JSON: ${JSON.stringify(spec.defaultArgs ?? {})}`, 'meta'));
         specsList.append(specCard);
       }
       runnerWrap.append(specsList);
 
       const controlsRow = node('div', '', 'hub-form-grid');
       const actField = node('label', '', 'hub-field');
-      actField.append(node('span', '选择执行动作 (argv[2])'), actionSelect);
+      actField.append(node('span', '选择调试动作'), actionSelect);
       const argsField = node('label', '', 'hub-field hub-field-wide');
-      argsField.append(node('span', '执行参数 JSON (argv[3])'), argsInput);
+      argsField.append(node('span', '调试参数 (JSON 对象)'), argsInput);
       controlsRow.append(actField, argsField);
       runnerWrap.append(controlsRow);
 
@@ -676,12 +754,12 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
             });
             const resFrag = document.createDocumentFragment();
             resFrag.append(
-              node('strong', `${res.ok ? '✅ 执行成功' : '❌ 执行返回 ok=false'} · action=${res.action} · notify=${String(res.notify)}`),
+              node('strong', `${res.ok ? '✅ 执行成功' : '❌ 执行返回失败'} · 动作=${res.action} · 通知=${res.notify ? '是' : '否'}`),
               node('pre', res.message),
             );
             if (res.data !== undefined) {
               const dataDetails = node('details');
-              dataDetails.append(node('summary', '查看返回结构化数据 (result.data)'), node('pre', json(res.data)));
+              dataDetails.append(node('summary', '查看返回结构化数据'), node('pre', json(res.data)));
               resFrag.append(dataDetails);
             }
             runResultBox.replaceChildren(resFrag);
@@ -692,32 +770,35 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
             runBtn.textContent = '▶️ 立即运行该动作';
           }
         })();
-      }, 'primary-button');
+      }, 'primary mini-button');
       runBtn.disabled = appState.authExpired || !appState.ready;
       runActionsRow.append(runBtn);
       runnerWrap.append(runActionsRow, runResultBox);
-      card.append(runnerWrap);
+      devBody.append(runnerWrap);
 
       if (plugin.sourceCode) {
-        const codeDetails = node('details', '', 'hub-accordion');
+        const codeDetails = node('details', '', 'hub-accordion plugin-dev-subdrawer') as HTMLDetailsElement;
         if (isFocused && expandFocusedPluginSource) codeDetails.open = true;
         const lineCount = plugin.sourceCode.split('\n').length;
         codeDetails.append(
           node('summary', `📄 查看具体执行代码 (${plugin.entry} · ${lineCount} 行)`, 'hub-accordion-summary'),
           node('pre', plugin.sourceCode, 'hub-code-block'),
         );
-        card.append(codeDetails);
+        devBody.append(codeDetails);
       }
 
       if (plugin.manifestJson) {
-        const manifestDetails = node('details', '', 'hub-accordion');
+        const manifestDetails = node('details', '', 'hub-accordion plugin-dev-subdrawer') as HTMLDetailsElement;
         if (isFocused && expandFocusedPluginSource && !plugin.sourceCode) manifestDetails.open = true;
         manifestDetails.append(
           node('summary', '📋 查看插件清单配置 (plugin.json)', 'hub-accordion-summary'),
           node('pre', plugin.manifestJson, 'hub-code-block'),
         );
-        card.append(manifestDetails);
+        devBody.append(manifestDetails);
       }
+
+      devDrawer.append(devBody);
+      card.append(devDrawer);
 
       contents.append(card);
     }
