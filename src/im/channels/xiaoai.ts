@@ -472,6 +472,13 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
       }
 
       if (this.ctx.isClosing() || this.hasNewerSpeakerUserMessage(msg) || !sshTarget || !this.kwsMonitor) {
+        if (!this.ctx.isClosing() && continuous) {
+          const active = this.fastpathSessions.get(`${channel.id}:${targetId}`);
+          if (active?.state.tvRemoteActive) {
+            active.expiresAt = Date.now() + active.idleTtlMs;
+            this.scheduleFastpathExpiryWatch(channel.id, targetId, active);
+          }
+        }
         return;
       }
       if (hookResult?.followUp) {
@@ -674,7 +681,16 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
         }
         throw error;
       }
-      if (this.ctx.isClosing() || !sshTarget) return;
+      if (this.ctx.isClosing() || !sshTarget) {
+        if (!this.ctx.isClosing() && keepOpen) {
+          const active = this.fastpathSessions.get(key);
+          if (active?.state.tvRemoteActive) {
+            active.expiresAt = Date.now() + active.idleTtlMs;
+            this.scheduleFastpathExpiryWatch(channel.id, targetId, active);
+          }
+        }
+        return;
+      }
       if (options?.continuous) {
         this.touchContinuousFastpathSession(channel.id, sshTarget.id);
       }
@@ -1253,6 +1269,8 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
           this.enqueueDirectSpeech(channelId, targetId, speech);
           break;
         }
+      } catch (err) {
+        console.warn(`[xiaoai-health-watch] ${channelId}/${targetId}: ${err instanceof Error ? err.message : String(err)}`);
       } finally {
         entry.stop();
       }
@@ -1444,17 +1462,24 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
         };
       }
       if (stepRes.outcome === 'ready_to_save') {
-        const saved = manager.enrollEmbeddings({
-          name: stepRes.session.speakerName,
-          role: stepRes.session.role,
-          mode: stepRes.session.mode,
-          embeddings: stepRes.embeddings,
-        });
-        const status = manager.getStatus();
-        const doneMsg = `已保存${saved.name}的声纹，当前共有${status.profiles.length}个已录入声纹。`;
-        this.speakerEnroll.completeSession(stepRes.session.sessionId, saved.id, doneMsg);
-        this.enqueueDirectSpeech(channel.id, targetId, doneMsg);
-        return { ok: true, action: 'voice_enroll_completed' };
+        try {
+          const saved = manager.enrollEmbeddings({
+            name: stepRes.session.speakerName,
+            role: stepRes.session.role,
+            mode: stepRes.session.mode,
+            embeddings: stepRes.embeddings,
+          });
+          const status = manager.getStatus();
+          const doneMsg = `已保存${saved.name}的声纹，当前共有${status.profiles.length}个已录入声纹。`;
+          this.speakerEnroll.completeSession(stepRes.session.sessionId, saved.id, doneMsg);
+          this.enqueueDirectSpeech(channel.id, targetId, doneMsg);
+          return { ok: true, action: 'voice_enroll_completed' };
+        } catch (error) {
+          const errMsg = error instanceof Error ? error.message : '声纹保存失败';
+          this.speakerEnroll.failSession(stepRes.session.sessionId, errMsg);
+          this.enqueueDirectSpeech(channel.id, targetId, '声纹保存失败，请稍后重试。');
+          return { ok: false, action: 'voice_enroll_failed' };
+        }
       }
     }
 

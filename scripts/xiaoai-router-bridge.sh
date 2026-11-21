@@ -146,15 +146,18 @@ PY
   fi
   if command -v nc >/dev/null 2>&1; then
     clean_mac=$(printf '%s' "$mac" | tr -d ':-' | tr 'a-f' 'A-F')
+    case "$clean_mac" in
+      ''|*[!0-9A-F]*) return 1 ;;
+    esac
     if [ "${#clean_mac}" -eq 12 ]; then
-      b1=$(printf '%s' "$clean_mac" | cut -c1-2)
-      b2=$(printf '%s' "$clean_mac" | cut -c3-4)
-      b3=$(printf '%s' "$clean_mac" | cut -c5-6)
-      b4=$(printf '%s' "$clean_mac" | cut -c7-8)
-      b5=$(printf '%s' "$clean_mac" | cut -c9-10)
-      b6=$(printf '%s' "$clean_mac" | cut -c11-12)
-      seq_bytes="\\x${b1}\\x${b2}\\x${b3}\\x${b4}\\x${b5}\\x${b6}"
-      magic='\\xff\\xff\\xff\\xff\\xff\\xff'
+      b1=$(printf '%03o' "0x$(printf '%s' "$clean_mac" | cut -c1-2)")
+      b2=$(printf '%03o' "0x$(printf '%s' "$clean_mac" | cut -c3-4)")
+      b3=$(printf '%03o' "0x$(printf '%s' "$clean_mac" | cut -c5-6)")
+      b4=$(printf '%03o' "0x$(printf '%s' "$clean_mac" | cut -c7-8)")
+      b5=$(printf '%03o' "0x$(printf '%s' "$clean_mac" | cut -c9-10)")
+      b6=$(printf '%03o' "0x$(printf '%s' "$clean_mac" | cut -c11-12)")
+      seq_bytes="\\${b1}\\${b2}\\${b3}\\${b4}\\${b5}\\${b6}"
+      magic='\377\377\377\377\377\377'
       i=0
       while [ "$i" -lt 16 ]; do
         magic="${magic}${seq_bytes}"
@@ -287,7 +290,7 @@ matches_prefix() {
     return 0
   fi
   lower_cleaned=$(printf '%s' "$cleaned" | tr '[:upper:]' '[:lower:]')
-  old_ifs="$IFS"
+  prefix_old_ifs="$IFS"
   IFS=','
   for p in $TRIGGER_PREFIX; do
     p_trim=$(printf '%s' "$p" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
@@ -295,12 +298,12 @@ matches_prefix() {
     lower_p=$(printf '%s' "$p_trim" | tr '[:upper:]' '[:lower:]')
     case "$lower_cleaned" in
       "$lower_p"*)
-        IFS="$old_ifs"
+        IFS="$prefix_old_ifs"
         return 0
         ;;
     esac
   done
-  IFS="$old_ifs"
+  IFS="$prefix_old_ifs"
   return 1
 }
 
@@ -431,7 +434,7 @@ poll_log_once() {
   [ -n "$new_lines" ] || return 0
 
   line_idx=0
-  old_ifs="$IFS"
+  poll_old_ifs="$IFS"
   IFS='
 '
   for line in $new_lines; do
@@ -450,7 +453,7 @@ poll_log_once() {
       fi
     fi
   done
-  IFS="$old_ifs"
+  IFS="$poll_old_ifs"
 }
 
 if [ "${FRIDAY_BRIDGE_LIB_ONLY:-0}" != "1" ]; then

@@ -223,7 +223,7 @@ export class ImGateway {
     });
     if (this.watchTimer) clearInterval(this.watchTimer);
     this.watchTimer = setInterval(() => {
-      void this.flushOutboundUpdates();
+      this.triggerBackgroundOutboundFlush();
     }, OUTBOUND_FALLBACK_POLL_MS);
     this.watchTimer.unref();
     this.syncPollers();
@@ -473,20 +473,28 @@ export class ImGateway {
           caption: sendCaption,
         });
       }
-      const latest = this.coordinator.store.getImChannel(channelId);
-      latest.outboundCount++;
-      latest.lastOutboundAt = Date.now();
-      latest.lastError = undefined;
-      latest.updatedAt = Date.now();
-      this.coordinator.store.saveImChannel(latest);
+      try {
+        const latest = this.coordinator.store.getImChannel(channelId);
+        latest.outboundCount++;
+        latest.lastOutboundAt = Date.now();
+        latest.lastError = undefined;
+        latest.updatedAt = Date.now();
+        this.coordinator.store.saveImChannel(latest);
+      } catch {
+        /* channel may have been removed while send was in flight */
+      }
     } catch (error) {
       if (trackSendingScene) {
         notifyCs80Scene({ scene: 'sending_msg', phase: 'end', tailSec: 0 });
       }
-      const latest = this.coordinator.store.getImChannel(channelId);
-      latest.lastError = sanitizeImError(error, [latest.botToken, latest.secret]);
-      latest.updatedAt = Date.now();
-      this.coordinator.store.saveImChannel(latest);
+      try {
+        const latest = this.coordinator.store.getImChannel(channelId);
+        latest.lastError = sanitizeImError(error, [latest.botToken, latest.secret]);
+        latest.updatedAt = Date.now();
+        this.coordinator.store.saveImChannel(latest);
+      } catch {
+        /* channel may have been removed while send was in flight */
+      }
       throw error;
     }
   }
@@ -687,18 +695,26 @@ export class ImGateway {
         holdSec: 3.5,
         caption: '电报消息发送中…',
       });
-      const latest = this.coordinator.store.getImChannel(channelId);
-      latest.outboundCount++;
-      latest.lastOutboundAt = Date.now();
-      latest.lastError = undefined;
-      latest.updatedAt = Date.now();
-      this.coordinator.store.saveImChannel(latest);
+      try {
+        const latest = this.coordinator.store.getImChannel(channelId);
+        latest.outboundCount++;
+        latest.lastOutboundAt = Date.now();
+        latest.lastError = undefined;
+        latest.updatedAt = Date.now();
+        this.coordinator.store.saveImChannel(latest);
+      } catch {
+        /* channel may have been removed while send was in flight */
+      }
     } catch (error) {
       notifyCs80Scene({ scene: 'sending_msg', phase: 'end', tailSec: 0 });
-      const latest = this.coordinator.store.getImChannel(channelId);
-      latest.lastError = sanitizeImError(error, [latest.botToken, latest.secret]);
-      latest.updatedAt = Date.now();
-      this.coordinator.store.saveImChannel(latest);
+      try {
+        const latest = this.coordinator.store.getImChannel(channelId);
+        latest.lastError = sanitizeImError(error, [latest.botToken, latest.secret]);
+        latest.updatedAt = Date.now();
+        this.coordinator.store.saveImChannel(latest);
+      } catch {
+        /* channel may have been removed while send was in flight */
+      }
       throw error;
     }
   }
@@ -1398,7 +1414,7 @@ export class ImGateway {
       this.flushingOutbound = false;
       if (this.pendingOutboundFlush && !this.closing) {
         this.pendingOutboundFlush = false;
-        void this.flushOutboundUpdates();
+        this.triggerBackgroundOutboundFlush();
       }
     }
   }
@@ -1535,12 +1551,20 @@ export class ImGateway {
     }
   }
 
+  private triggerBackgroundOutboundFlush(): void {
+    void this.flushOutboundUpdates().catch((err) => {
+      if (!this.closing) {
+        console.warn(`[im-gateway] outbound flush failed: ${sanitizeImError(err)}`);
+      }
+    });
+  }
+
   private scheduleOutboundFlush(): void {
     if (this.closing || this.outboundFlushScheduled) return;
     this.outboundFlushScheduled = true;
     queueMicrotask(() => {
       this.outboundFlushScheduled = false;
-      void this.flushOutboundUpdates();
+      this.triggerBackgroundOutboundFlush();
     });
   }
 

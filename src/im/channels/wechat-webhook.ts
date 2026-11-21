@@ -59,7 +59,7 @@ export class WechatWebhookAdapter implements ImChannelAdapter {
       throw new Error('拒绝向未授权的微信回调地址发送消息');
     }
     const configuredUrl = channel.webhookUrl?.trim()
-      ?? (channel.apiBase ? `${channel.apiBase.replace(/\/$/, '')}/send` : undefined);
+      || (channel.apiBase?.trim() ? `${channel.apiBase.trim().replace(/\/$/, '')}/send` : undefined);
     const url = requestedReplyWebhook || configuredUrl;
     if (!url) {
       throw new Error('微信通道缺少扫码绑定凭证(botToken)或 webhookUrl');
@@ -145,8 +145,8 @@ export class WechatWebhookAdapter implements ImChannelAdapter {
     let inbound: ImInboundMessage | undefined;
     if (trimmed.startsWith('<')) {
       const content = (extractXmlTag(trimmed, 'Content') ?? '').trim();
-      const fromUser = (extractXmlTag(trimmed, 'FromUserName') ?? 'wechat-user').trim();
-      const msgId = (extractXmlTag(trimmed, 'MsgId') ?? randomUUID()).trim();
+      const fromUser = extractXmlTag(trimmed, 'FromUserName')?.trim() || 'wechat-user';
+      const msgId = extractXmlTag(trimmed, 'MsgId')?.trim() || randomUUID();
       if (content) {
         inbound = { channelId: channel.id, externalId: msgId, senderId: fromUser, target: fromUser, text: content };
       }
@@ -167,10 +167,10 @@ export class WechatWebhookAdapter implements ImChannelAdapter {
           ?? payload.Content
           ?? '',
         ).trim();
-        const senderId = String(payload.from ?? payload.senderId ?? payload.FromUserName ?? 'wechat-user').trim();
+        const senderId = String(payload.from ?? payload.senderId ?? payload.FromUserName ?? '').trim() || 'wechat-user';
         const senderName = typeof payload.senderName === 'string' ? payload.senderName.trim() : undefined;
-        const externalId = String(payload.msgId ?? payload.MsgId ?? payload.id ?? randomUUID());
-        const target = String(payload.chatId ?? payload.roomId ?? senderId);
+        const externalId = String(payload.msgId ?? payload.MsgId ?? payload.id ?? '').trim() || randomUUID();
+        const target = String(payload.chatId ?? payload.roomId ?? '').trim() || senderId;
         const rawReplyWebhook = typeof payload.replyWebhook === 'string'
           ? payload.replyWebhook.trim()
           : typeof payload.sessionWebhook === 'string' ? payload.sessionWebhook.trim() : undefined;

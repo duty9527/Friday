@@ -279,16 +279,20 @@ const mediaTaskWaiters: Array<() => void> = [];
 
 /** Process-wide FIFO concurrency limiter for inbound/outbound IM attachment transfers. */
 export async function runBoundedMediaTask<T>(fn: () => Promise<T>): Promise<T> {
-  if (activeMediaTasks >= MAX_CONCURRENT_MEDIA_TASKS) {
+  if (activeMediaTasks < MAX_CONCURRENT_MEDIA_TASKS) {
+    activeMediaTasks++;
+  } else {
     await new Promise<void>(resolve => mediaTaskWaiters.push(resolve));
   }
-  activeMediaTasks++;
   try {
     return await fn();
   } finally {
-    activeMediaTasks--;
     const next = mediaTaskWaiters.shift();
-    next?.();
+    if (next) {
+      next();
+    } else {
+      activeMediaTasks = Math.max(0, activeMediaTasks - 1);
+    }
   }
 }
 
@@ -324,7 +328,7 @@ export function isPrivateOrLocalHostname(hostname: string): boolean {
   if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) {
     return true;
   }
-  if (host === '::1' || host === '::' || host.startsWith('fe80:') || host.startsWith('fc') || host.startsWith('fd')) {
+  if (host === '::1' || host === '::' || /^fe[89ab][0-9a-f]:/.test(host) || host.startsWith('fc') || host.startsWith('fd') || host.startsWith('ff')) {
     return true;
   }
   const v4 = host.startsWith('::ffff:') ? host.slice('::ffff:'.length) : host;

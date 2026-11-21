@@ -754,6 +754,8 @@ export class XiaoaiSpeakerManager {
       return this.extractor;
     }
     this.extractor?.free?.();
+    this.extractor = undefined;
+    this.extractorModelPath = undefined;
     const factory = this.options.extractorFactory ?? defaultSpeakerExtractorFactory;
     this.extractor = factory({ modelPath });
     this.extractorModelPath = modelPath;

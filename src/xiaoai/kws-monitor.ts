@@ -2347,7 +2347,11 @@ export class XiaoaiKwsMonitor {
           while (spotter.isReady(worker.kwsStream)) {
             spotter.decode(worker.kwsStream);
             const reWakeKeyword = spotter.getResult(worker.kwsStream).trim();
-            if (reWakeKeyword && !isXiaoaiSpeakingSelfEcho(worker.channel.id, worker.target.id, reWakeKeyword)) {
+            if (reWakeKeyword) {
+              if (isXiaoaiSpeakingSelfEcho(worker.channel.id, worker.target.id, reWakeKeyword)) {
+                spotter.reset(worker.kwsStream);
+                break;
+              }
               const gateRes = this.evaluateWakeSpeakerGate(worker, reWakeKeyword);
               if (!gateRes.matched) {
                 spotter.reset(worker.kwsStream);
@@ -2662,6 +2666,9 @@ export class XiaoaiKwsMonitor {
         this.options.onError?.(worker.channel.id, error);
         this.cancelSpeakerLed(worker, keyword, 'error');
       }
+    } catch (error) {
+      this.options.onError?.(worker.channel.id, error);
+      this.cancelSpeakerLed(worker, keyword, 'error');
     } finally {
       worker.transcribingCount = Math.max(0, worker.transcribingCount - 1);
     }

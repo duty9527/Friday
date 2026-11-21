@@ -65,11 +65,16 @@ const WECHAT_QR_MAX_REFRESH = 3;
 const WECHAT_CHUNK_GAP_MS = 150;
 
 interface InternalWechatQrSession extends WechatQrLoginSession {
+  seq: number;
   apiBase: string;
   createdAt: number;
   allowedSenders?: string[];
   pendingVerifyCode?: string;
   inFlightPromise?: Promise<void>;
+}
+
+function isActiveQrStatus(status: WechatQrLoginSession['status']): boolean {
+  return status === 'wait' || status === 'scaned' || status === 'verify_code';
 }
 
 interface WechatTypingTicketEntry {
@@ -235,6 +240,7 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
   readonly platform = 'wechat' as const;
 
   private readonly qrSessions = new BoundedMap<string, InternalWechatQrSession>(64);
+  private nextQrSessionSeq = 0;
   private readonly typingTickets = new BoundedMap<string, WechatTypingTicketEntry>(256);
   private readonly typingSessions = new Map<string, WechatTypingSession>();
   private readonly startedPollBindings = new Map<string, { apiBase: string; botToken: string }>();
@@ -752,6 +758,7 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
     const sessionId = randomUUID();
 
     const session: InternalWechatQrSession = {
+      seq: ++this.nextQrSessionSeq,
       sessionId,
       channelId,
       channelName,
@@ -784,7 +791,13 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
     if (!session) {
       for (const candidate of this.qrSessions.values()) {
         if (candidate.channelId === sessionIdOrChannelId || candidate.qrcode === sessionIdOrChannelId) {
-          session = candidate;
+          if (
+            !session
+            || (isActiveQrStatus(candidate.status) && !isActiveQrStatus(session.status))
+            || (isActiveQrStatus(candidate.status) === isActiveQrStatus(session.status) && candidate.seq > session.seq)
+          ) {
+            session = candidate;
+          }
         }
       }
     }
@@ -817,13 +830,18 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
       });
     }
 
-    await Promise.race([
-      session.inFlightPromise,
-      new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, 400);
-        timer.unref();
-      }),
-    ]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        session.inFlightPromise,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, 400);
+          timer.unref();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
 
     return this.toPublicQrSession(session);
   }
@@ -879,12 +897,16 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
       } else if (rawStatus === 'scaned_but_redirect') {
         const redirectHost = typeof data.redirect_host === 'string' ? data.redirect_host.trim() : '';
         if (redirectHost && !/[\\/@\s?#]/.test(redirectHost)) {
-          const currentUrl = new URL(session.apiBase);
-          const candidateUrl = new URL(`${currentUrl.protocol}//${redirectHost}`);
-          const currentPrivate = isPrivateOrLocalHostname(currentUrl.hostname);
-          const nextPrivate = isPrivateOrLocalHostname(candidateUrl.hostname);
-          if (!nextPrivate || currentPrivate) {
-            session.apiBase = candidateUrl.origin;
+          try {
+            const currentUrl = new URL(session.apiBase);
+            const candidateUrl = new URL(`${currentUrl.protocol}//${redirectHost}`);
+            const currentPrivate = isPrivateOrLocalHostname(currentUrl.hostname);
+            const nextPrivate = isPrivateOrLocalHostname(candidateUrl.hostname);
+            if (!nextPrivate || currentPrivate) {
+              session.apiBase = candidateUrl.origin;
+            }
+          } catch {
+            /* ignore malformed redirect_host */
           }
         }
         session.status = 'scaned';
@@ -1047,10 +1069,9 @@ export class WechatIlinkAdapter implements ImChannelAdapter {
 
   syncTypingForMissingMessage(messageId: string, releases: Array<{ channelId: string; target: string; ref: string }>): void {
     const ref = `msg:${messageId}`;
-    for (const [key, session] of this.typingSessions.entries()) {
+    for (const session of this.typingSessions.values()) {
       if (session.activeRefs.has(ref)) {
-        const [chId, target] = key.split('\0');
-        if (chId && target) releases.push({ channelId: chId, target, ref });
+        releases.push({ channelId: session.channelId, target: session.userId, ref });
       }
     }
   }

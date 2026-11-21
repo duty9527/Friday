@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { lookup as dnsLookup } from 'node:dns/promises';
 import { constants, existsSync } from 'node:fs';
-import { chmod, lstat, mkdir, open, readFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, open, readFile, rm } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { isIP } from 'node:net';
 import { cpus, homedir } from 'node:os';
@@ -475,6 +475,7 @@ export async function extractWechatVideoFrames(params: {
       { timeoutMs: 20_000, signal: params.signal },
     );
     if (res.exitCode !== 0) {
+      await rm(targetPng, { force: true }).catch(() => {});
       lastError = res.errorCode ?? (res.stderr.trim() || 'frame decode failed');
       continue;
     }
@@ -483,6 +484,8 @@ export async function extractWechatVideoFrames(params: {
       if (stat.isFile() && !stat.isSymbolicLink() && stat.size > 0 && stat.size <= MAX_DOCUMENT_FILE_BYTES) {
         await chmod(targetPng, 0o600).catch(() => {});
         frames.push({ path: targetPng, atSeconds: at, bytes: stat.size });
+      } else {
+        await rm(targetPng, { force: true }).catch(() => {});
       }
     } catch {
       lastError = 'frame file missing';
@@ -630,7 +633,7 @@ export function isPrivateOrLocalIp(rawIp: string): boolean {
     return isPrivateOrLocalIp(ip.slice('::ffff:'.length));
   }
   if (ip === '::' || ip === '::1') return true;
-  if (ip.startsWith('fe80:') || ip.startsWith('fe90:') || ip.startsWith('fea0:') || ip.startsWith('feb0:')) return true;
+  if (/^fe[89ab][0-9a-f]:/.test(ip)) return true;
   if (ip.startsWith('fc') || ip.startsWith('fd') || ip.startsWith('ff')) return true;
   return false;
 }

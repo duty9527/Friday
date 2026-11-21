@@ -105,10 +105,10 @@ export class DingtalkChannelAdapter implements ImChannelAdapter {
     const content = String(textObj?.content ?? payload.content ?? '').trim();
     let inbound: ImInboundMessage | undefined;
     if (content) {
-      const senderId = String(payload.senderStaffId ?? payload.senderId ?? 'dingtalk-user').trim();
+      const senderId = String(payload.senderStaffId ?? payload.senderId ?? '').trim() || 'dingtalk-user';
       const senderName = typeof payload.senderNick === 'string' ? payload.senderNick.trim() : undefined;
-      const externalId = String(payload.msgId ?? randomUUID());
-      const target = String(payload.conversationId ?? senderId);
+      const externalId = String(payload.msgId ?? '').trim() || randomUUID();
+      const target = String(payload.conversationId ?? '').trim() || senderId;
       inbound = { channelId: channel.id, externalId, senderId, senderName, target, text: content, replyWebhook: rawSessionWebhook };
     }
     return finalizeWebhookInbound(this.ctx, inbound);

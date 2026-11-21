@@ -445,10 +445,18 @@ export async function sendXiaoaiSpeech(
     const runtimeKey = xiaoaiRuntimeKey(channel.id, target.id);
     const pendingWake = xiaoaiPendingWakes.get(runtimeKey);
     if (pendingWake) {
-      await Promise.race([
-        pendingWake,
-        delay(1_500, undefined, options?.shutdownSignal ? { signal: options.shutdownSignal } : undefined).catch(() => {}),
-      ]);
+      const wakeWaitController = new AbortController();
+      const wakeSignal = options?.shutdownSignal
+        ? AbortSignal.any([wakeWaitController.signal, options.shutdownSignal])
+        : wakeWaitController.signal;
+      try {
+        await Promise.race([
+          pendingWake,
+          delay(1_500, undefined, { signal: wakeSignal }).catch(() => {}),
+        ]);
+      } finally {
+        wakeWaitController.abort();
+      }
     }
     const speechEpoch = getXiaoaiSpeechEpoch(channel.id, target.id);
     const isEpochCancelled = () => getXiaoaiSpeechEpoch(channel.id, target.id) !== speechEpoch;
