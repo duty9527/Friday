@@ -209,15 +209,44 @@ export function parseStringArray(value: unknown, label: string, maxItems = 16, m
 }
 
 export function buildRunPluginDescription(home: string, allowedPlugins?: ReadonlySet<string>): string {
+  const MAX_DESC_LEN = 960;
+  const TARGET_LEN = 920;
+  const prefix = 'List or run local Node script plugins. Input JSON {action?: "list"|"run", plugin?, pluginAction?, args?}. ';
   const plugins = listPluginViews(home)
     .filter(p => p.enabled !== false && (!allowedPlugins || allowedPlugins.has(p.name)));
-  const pluginList = plugins.length
-    ? `Available plugins: ${plugins.map(p => {
-        const detail = p.promptHint?.trim() || (p.actions.length ? p.actions.join(', ') : p.description.trim());
-        return `"${p.name}"${detail ? ` (${detail})` : ''}`;
-      }).join('; ')}.`
-    : 'Call {action:"list"} to inspect available plugins under plugins/ or <home>/plugins/.';
-  return `List or run local Node script plugins. Input JSON {action?: "list"|"run", plugin?, pluginAction?, args?}. ${pluginList}`;
+  if (!plugins.length) {
+    return `${prefix}Call {action:"list"} to inspect available plugins under plugins/ or <home>/plugins/.`;
+  }
+
+  const fixedOverhead = prefix.length
+    + 'Available plugins: '.length
+    + 1
+    + plugins.reduce((sum, p, idx) => sum + p.name.length + 5 + (idx > 0 ? 2 : 0), 0);
+  const maxDetailLen = Math.max(12, Math.floor((TARGET_LEN - fixedOverhead) / plugins.length));
+
+  const formatEntry = (name: string, detail: string): string => `"${name}"${detail ? ` (${detail})` : ''}`;
+  const entries = plugins.map(p => {
+    const rawDetail = p.promptHint?.trim() || (p.actions.length ? p.actions.join(', ') : p.description.trim());
+    const detail = rawDetail.length > maxDetailLen ? `${rawDetail.slice(0, maxDetailLen - 1)}…` : rawDetail;
+    return formatEntry(p.name, detail);
+  });
+  let desc = `${prefix}Available plugins: ${entries.join('; ')}.`;
+  if (desc.length <= MAX_DESC_LEN) return desc;
+
+  const compactEntries = plugins.map(p => formatEntry(p.name, (p.title || p.name).trim()));
+  desc = `${prefix}Available plugins: ${compactEntries.join('; ')}.`;
+  if (desc.length <= MAX_DESC_LEN) return desc;
+
+  const tail = 'Call {action:"list"} for details.';
+  const kept: string[] = [];
+  for (const entry of compactEntries) {
+    const candidate = `${prefix}Available plugins: ${[...kept, entry].join('; ')}; ${tail}`;
+    if (candidate.length > MAX_DESC_LEN) break;
+    kept.push(entry);
+  }
+  return kept.length
+    ? `${prefix}Available plugins: ${kept.join('; ')}; ${tail}`
+    : `${prefix}${tail}`;
 }
 
 export function buildVoiceTurnHint(

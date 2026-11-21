@@ -161,7 +161,7 @@ test('3. One-shot countdown reminders (once + delayMs) fire once via 0-token sys
   const coordinator = new Coordinator(home, offlineFactory(10));
   try {
     await coordinator.ready();
-    coordinator.chat('rem-1', '提醒：1秒后 检查灰度发布监控面板');
+    coordinator.chat('rem-1', '提醒：5秒后 检查灰度发布监控面板');
 
     await until(() => coordinator.store.listTimers().length === 1);
     const created = coordinator.store.listTimers()[0]!;
@@ -170,11 +170,11 @@ test('3. One-shot countdown reminders (once + delayMs) fire once via 0-token sys
     assert.equal(created.pluginAction, 'remind');
     assert.equal(created.enabled, true);
 
-    // Wait for the 1s one-shot reminder to fire and auto-disable
+    // Wait for the 5s one-shot reminder to fire and auto-disable
     await until(() => {
       const t = coordinator.store.getTimer(created.id);
       return t.enabled === false && Boolean(t.lastRunAt);
-    }, 250, 20);
+    }, 450, 20);
 
     // Wait until the plugin async delivery posts the reminder message to the main conversation
     await until(() => {

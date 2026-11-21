@@ -3,7 +3,7 @@
   "title": "九号守护",
   "runtime": "in-process",
   "voiceFastpath": true,
-  "promptHint": "查询九号电摩/电动车实时电量、续航、充电功率、停放位置与锁状态（status/dashboard），查询骑行轨迹里程与最高速统计（trips），执行低电量/未锁车/充满电主动巡检提醒（patrol/charge-check），以及登录绑定九号子账号或配置提醒阈值（login/vehicles/config）。纯只读模式，不含任何远程控车操作。",
+  "promptHint": "只读查询九号电动车电量、续航、充电功率、停放位置、锁车状态与骑行里程（status/dashboard/trips/patrol）。",
   "description": "免官方 API Key 接入九号电摩 M 系列及电动自行车（优先走 steeldust 电摩网关，兼容 ebike 与官方 DeviceService Key）：支持实时车况、BMS 电压温度、充电功率、GPS 位置（可选高德逆地理编码）、历史行程与最高速/均速统计，以及低电量/充满电/未锁车/久置亏电主动巡检提醒。严格只读，不含任何远程控车指令；账号会话以 0600 权限保存在 <pluginDataDir>/session.json。",
   "entry": "index.mjs",
   "actions": [

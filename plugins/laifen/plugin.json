@@ -6,7 +6,7 @@
   "platforms": [
     "linux"
   ],
-  "promptHint": "管理徕芬蓝牙电动牙刷：查询电量/档位/刷头寿命与打卡统计（status/dashboard）、扫描绑定（scan/config）、唤醒同步状态（sync）、修改档位/三维力度扫幅扫速/预设/定时/30秒提醒/高频/飞行模式（set）、电机启停与刷头校准（power）、刷牙实时监听（monitor-start/status/stop）、补录记录（session-add/delete）及重置刷头寿命（brushhead-reset）。",
+  "promptHint": "管理徕芬蓝牙牙刷：电量/档位/刷头寿命与打卡（status/dashboard）、唤醒同步（sync）、三维扫振调节（set）与实时监听。",
   "description": "连接徕芬扫振电动牙刷（支持 V1 LFTB01-* 与 V2 Pro LFTB02-* 协议），提供蓝牙唤醒同步、1~4 档位与振动/扫幅/扫速三维自定义、场景预设、刷牙定时与提醒/飞行锁定控制、电机启停与校准、刷牙过程监听打卡及刷头更换寿命管理；设备 MAC 与目标参数由 <pluginDataDir>/config.json 加载。",
   "entry": "index.mjs",
   "actions": [

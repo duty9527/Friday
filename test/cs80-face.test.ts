@@ -393,6 +393,7 @@ class _Surf:
     def write_to_png(self, buf): buf.write(b"\\x89PNG\\r\\n\\x1a\\nfakepng")
 
 class _Ctx:
+    shown_texts = []
     def __init__(self, surf): self._surf = surf
     def save(self): pass
     def restore(self): pass
@@ -419,7 +420,8 @@ class _Ctx:
     def set_line_join(self, j): pass
     def select_font_face(self, *a): pass
     def set_font_size(self, s): pass
-    def show_text(self, s): pass
+    def show_text(self, s):
+        _Ctx.shown_texts.append(str(s or ""))
     def text_extents(self, s): return _Extents(str(s or ""))
 
 fake_cairo = types.ModuleType("cairo")
@@ -497,7 +499,10 @@ r_fb.fast.bgra_to_bgr565(r_fb._bgra, r_fb._curr565)
 dirty = r_fb.fast.diff_tiles(r_fb._prev565, r_fb._curr565, r_fb._tiles_buf, 160)
 assert dirty <= 160, f"marquee step dirtied {dirty} tiles > 160"
 
-# 3. LayoutStore, Bento packer & custom plugin discovery
+# 3. LayoutStore, Bento packer, all-15-builtin + custom plugin catalog & telemetry collectors
+import sqlite3, time as _time
+from widgets import WidgetDataHub, _extract_scalars
+
 home = Path(${JSON.stringify(tmpHome)})
 ls = LayoutStore(home / "plugins" / "cs80-face")
 cfg, grid_changed, added = ls.apply_patch({
@@ -515,60 +520,233 @@ cfg, grid_changed, added = ls.apply_patch({
 })
 assert grid_changed and cfg["gridRows"] == 3 and "fund-tracker" in cfg["pages"][0]["cards"][0]["kind"]
 catalog = discover_widget_catalog(home, repo_plugins_dir=Path(${JSON.stringify(join(REPO_ROOT, 'plugins'))}))
-assert any(item["kind"] == "plugin:demo-custom" for item in catalog), "missing custom plugin in catalog"
-assert any(item["kind"] == "ninebot" for item in catalog), "missing ninebot widget in catalog"
+expected_builtin_kinds = {
+    "fund-tracker", "health-scale", "miot", "ninebot", "laifen", "netlea", "apple-devices",
+    "tv-agent", "tv-ir", "system-pulse", "memory", "timers", "usage", "weather", "workers",
+}
+catalog_kinds = {item["kind"] for item in catalog}
+assert expected_builtin_kinds.issubset(catalog_kinds), f"missing builtin kinds: {expected_builtin_kinds - catalog_kinds}"
+assert "plugin:demo-custom" in catalog_kinds, "missing custom plugin in catalog"
 
-# 4. FakeCairo smoke render across ALL card kinds & sizes & listening state
+# 3b. Verify _extract_scalars & _collect_custom_plugin strip internal noise keys and translate without action=status
+noise_payload = {
+    "pid": 4242,
+    "updatedAt": 1700000000000,
+    "fromCache": True,
+    "refreshed": False,
+    "targetMac": "AA:BB:CC:DD:EE:FF",
+    "configPath": "/tmp/secret-config.json",
+    "batteryPct": 86,
+    "todayCount": 2,
+    "streakDays": 5,
+    "temperature": 24.5,
+    "status": "running",
+}
+scalars = _extract_scalars(noise_payload)
+scalar_labels = [k for k, _ in scalars]
+for blocked in ("pid", "updatedAt", "fromCache", "refreshed", "targetMac", "configPath"):
+    assert all(blocked.lower() not in lbl.lower() for lbl in scalar_labels), (blocked, scalars)
+assert ("电量", "86%") in scalars, scalars
+assert ("今日次数", "2次") in scalars, scalars
+assert ("连续打卡", "5天") in scalars, scalars
+assert ("状态", "运行中") in scalars, scalars
+
+def _mock_rpc(req, timeout):
+    plug = req.get("plugin")
+    if plug == "demo-custom":
+        return {"ok": True, "title": "自定义测试", "message": "", "data": dict(noise_payload)}
+    if plug == "laifen":
+        return {
+            "ok": True,
+            "data": {
+                "device": {"name": "LFTB", "batteryPct": 90, "activeMode": 3, "activeStrength": 12, "activeRange": 9, "activeSpeed": 7, "durationSec": 120, "lastSyncedAt": int(_time.time() * 1000)},
+                "stats": {"todayCount": 2, "dailyGoalCount": 2, "streakDays": 9, "totalSessions": 18, "last7Days": [{"count": 2}] * 7, "brushHead": {"daysLeft": 72, "percentLeft": 80.0}},
+                "watchStatus": {"running": False},
+                "config": {"dailyGoalCount": 2},
+            },
+        }
+    if plug == "netlea":
+        return {
+            "ok": True,
+            "data": {
+                "updatedAt": int(_time.time() * 1000),
+                "device": {"name": "尼特利水草灯"},
+                "state": {"on": True, "channels": {"red": 69, "green": 54, "white": 98, "blue": 54, "fan": 2}, "master": {"lampMode": 0, "stateType": 1}},
+                "config": {"defaultChannels": {"red": 69, "green": 54, "white": 98, "blue": 54}},
+            },
+        }
+    if plug == "apple-devices":
+        return {
+            "ok": True,
+            "data": {
+                "authState": "authenticated",
+                "fetchedAt": int(_time.time() * 1000),
+                "devices": [{"name": "iPhone 16 Pro", "category": "iphone", "batteryPercent": 82, "batteryStatus": "NotCharging", "online": True, "place": {"name": "家", "inside": True}}],
+                "config": {"minBatteryPct": 25},
+            },
+        }
+    return {"ok": True, "data": {}}
+
+hub = WidgetDataHub(home, _mock_rpc, ls, disable_network=True)
+hub._collect_custom_plugin("plugin:demo-custom#dc", {"id": "dc", "kind": "plugin:demo-custom", "plugin": "demo-custom", "action": "status", "title": "自定义测试"}, connected=True)
+custom_w = hub.get_widget("plugin:demo-custom", "dc")
+assert custom_w["ok"] is True
+assert ("电量", "86%") in custom_w["kpis"] and ("今日次数", "2次") in custom_w["kpis"], custom_w
+custom_text = json.dumps(custom_w["kpis"], ensure_ascii=False) + " " + custom_w["headline"] + " " + custom_w["subline"] + " " + custom_w["message"]
+for forbidden in ("pid", "updatedAt", "fromCache", "refreshed", "targetMac", "configPath", "action=status"):
+    assert forbidden not in custom_text, (forbidden, custom_text)
+hub._collect_custom_plugin("plugin:demo-custom#dc2", {"id": "dc2", "kind": "plugin:demo-custom", "plugin": "demo-custom", "action": "status", "title": "自定义测试"}, connected=False)
+custom_off = hub.get_widget("plugin:demo-custom", "dc2")
+assert "action=status" not in (custom_off["headline"] + " " + custom_off["subline"] + " " + custom_off["message"])
+
+# 3c. Verify laifen, netlea, apple-devices collectors (local fallback & RPC) without exposing raw GPS coords
+laifen_dir = home / "plugins" / "laifen"
+laifen_dir.mkdir(parents=True, exist_ok=True)
+(laifen_dir / "config.json").write_text(json.dumps({"dailyGoalCount": 2, "brushHeadLifespanDays": 90}), encoding="utf-8")
+laifen_db = laifen_dir / "laifen.db"
+now_ms = int(_time.time() * 1000)
+con_lf = sqlite3.connect(str(laifen_db))
+con_lf.execute("CREATE TABLE device_state (id TEXT PRIMARY KEY, name TEXT, battery_pct INTEGER, active_mode INTEGER, modes_json TEXT, duration_sec INTEGER, status TEXT, updated_at INTEGER, last_synced_at INTEGER)")
+con_lf.execute("CREATE TABLE brush_sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, brushed_at INTEGER)")
+con_lf.execute("INSERT INTO device_state VALUES ('primary', 'LFTB', 84, 2, ?, 120, 'Idle', ?, ?)", (json.dumps({"2": {"strength": 10, "range": 8, "speed": 6}}), now_ms, now_ms))
+con_lf.execute("INSERT INTO brush_sessions (brushed_at) VALUES (?)", (now_ms - 60000,))
+con_lf.execute("INSERT INTO brush_sessions (brushed_at) VALUES (?)", (now_ms - 30000,))
+con_lf.commit()
+con_lf.close()
+hub._collect_laifen(laifen_db, connected=False)
+lf_w = hub.get_widget("laifen")
+assert lf_w["ok"] is True and lf_w["battery"] == 84 and lf_w["modeLabel"] == "日常清洁" and lf_w["todayCount"] == 2 and len(lf_w["weekCounts"]) == 7, lf_w
+assert "84%" in lf_w["headline"] and "今日 2/2 次" in lf_w["subline"], lf_w
+
+netlea_dir = home / "plugins" / "netlea"
+netlea_dir.mkdir(parents=True, exist_ok=True)
+(netlea_dir / "config.json").write_text(json.dumps({"defaultChannels": {"red": 69, "green": 54, "white": 98, "blue": 54}}), encoding="utf-8")
+netlea_state = netlea_dir / "last-state.json"
+netlea_state.write_text(json.dumps({
+    "updatedAt": now_ms,
+    "device": {"name": "尼特利水草灯"},
+    "state": {"on": True, "channels": {"red": 69, "green": 54, "white": 98, "blue": 54, "fan": 2}, "master": {"lampMode": 0, "stateType": 1}},
+}), encoding="utf-8")
+hub._collect_netlea(netlea_state, connected=False)
+nl_w = hub.get_widget("netlea")
+assert nl_w["ok"] is True and nl_w["on"] is True and nl_w["brightness"] == 100 and nl_w["modeLabel"] == "自动行程" and nl_w["fan"] == 2, nl_w
+assert "开启" in nl_w["headline"] and "自动行程" in nl_w["subline"], nl_w
+
+apple_dir = home / "plugins" / "apple-devices"
+apple_dir.mkdir(parents=True, exist_ok=True)
+(apple_dir / "session.json").write_text(json.dumps({"state": "authenticated"}), encoding="utf-8")
+(apple_dir / "config.json").write_text(json.dumps({"minBatteryPct": 25, "places": {"家": {"lat": 31.2304, "lng": 121.4737, "radiusMeters": 300}}}), encoding="utf-8")
+apple_cache = apple_dir / "devices-cache.json"
+apple_cache.write_text(json.dumps({
+    "fetchedAt": now_ms,
+    "entries": [
+        {"device": {"name": "iPhone 16 Pro", "category": "iphone", "batteryPercent": 85, "batteryStatus": "NotCharging", "online": True, "location": {"latitude": 31.2305, "longitude": 121.4738}}},
+        {"device": {"name": "AirPods Pro", "category": "airpods", "batteryPercent": 15, "batteryStatus": "NotCharging", "online": True, "location": {"latitude": 31.2988, "longitude": 121.5299}}},
+    ],
+}), encoding="utf-8")
+hub._collect_apple_devices(apple_cache, connected=False)
+ap_w = hub.get_widget("apple-devices")
+assert ap_w["ok"] is True and ap_w["total"] == 2 and ap_w["online"] == 2 and ap_w["lowCount"] == 1, ap_w
+assert ap_w["devices"][0]["catLabel"] == "手机" and ap_w["devices"][0]["place"] == "在家", ap_w
+ap_dump = json.dumps(ap_w, ensure_ascii=False)
+for raw_geo in ("latitude", "longitude", "31.2305", "121.4738", "31.2988", "121.5299"):
+    assert raw_geo not in ap_dump, (raw_geo, ap_dump)
+for dev in ap_w["devices"]:
+    assert not any(k in dev for k in ("location", "lat", "lon", "lng")), dev
+
+# Also verify connected RPC path for laifen, netlea, apple-devices
+hub._collect_laifen(laifen_db, connected=True)
+assert hub.get_widget("laifen")["battery"] == 90
+hub._collect_netlea(netlea_state, connected=True)
+assert hub.get_widget("netlea")["brightness"] == 100
+hub._collect_apple_devices(apple_cache, connected=True)
+assert hub.get_widget("apple-devices")["online"] == 1
+
+# 4. FakeCairo smoke render across ALL 15 built-in cards + plugin:demo-custom, all 4 sizes, both grid_rows, and Chinese HUD checks
 rmod.cairo = fake_cairo
 try:
+    _Ctx.shown_texts.clear()
     r_fc = rmod.FaceRenderer()
     anim.set_state("listening")
     lsnap = anim.step(0.08, center_x=400.0, center_y=272.0, base_radius=132.0)
-    all_kinds = [
-        ("fund-tracker", "2x2"), ("health-scale", "1x2"), ("miot", "1x1"), ("ninebot", "2x1"), ("ninebot", "1x2"), ("system-pulse", "2x1"),
-        ("tv-agent", "1x1"), ("tv-ir", "1x1"), ("memory", "2x1"), ("timers", "1x1"),
-        ("usage", "1x1"), ("weather", "1x1"), ("workers", "1x1"), ("plugin:demo-custom", "1x1"),
-    ]
+    all_kinds = sorted(expected_builtin_kinds) + ["plugin:demo-custom"]
+    all_sizes = ("1x1", "2x1", "1x2", "2x2")
     sample_data = {
         "fund-tracker": {"ok": True, "dailyPct": 1.25, "dailyPnl": 600, "totalPnl": 3200, "totalPnlPct": 8.4, "holdingCount": 3, "subline": "今日 +600", "spark": [100, 120, 115, 140], "holdings": [{"code": "000300", "name": "沪深300", "changePct": 1.25}]},
         "health-scale": {"ok": True, "weightKg": 68.2, "diffKg": -0.2, "bodyFat": 17.5, "musclePct": 44.1, "bmi": 22.0, "score": 89, "waterPct": 58.0, "visceral": 6, "spark": [68.9, 68.5, 68.2]},
-        "miot": {"ok": True, "online": 4, "total": 5, "onCount": 2, "devices": [{"name": "灯", "room": "客厅", "online": True, "on": True}]},
+        "miot": {"ok": True, "online": 4, "total": 5, "onCount": 2, "rooms": 3, "envTemp": 24.6, "envHum": 52, "devices": [{"name": "灯", "room": "客厅", "online": True, "on": True}]},
         "ninebot": {"ok": True, "name": "九号M95C", "battery": 80, "auxBattery": 93, "voltageV": 75.3, "tempC": 26.0, "charging": True, "chargingPowerW": 310, "remainChargeTime": "1h20m", "rangeKm": 99.6, "odometerKm": 1234.5, "powerOn": False, "locked": True, "address": "科技路1号", "monthKm": 88.2, "maxSpeedKmh": 68.0, "alertCount": 0, "updatedHm": "01:45", "spark": [90, 84, 78, 80]},
+        "laifen": {"ok": True, "empty": False, "name": "徕芬声波牙刷", "battery": 84, "mode": 2, "modeLabel": "日常清洁", "todayCount": 2, "dailyGoal": 2, "streakDays": 12, "brushDaysLeft": 64, "brushPct": 71.1, "strength": 10, "range": 8, "speed": 6, "durationSec": 120, "watching": False, "weekCounts": [2, 1, 2, 2, 2, 1, 2], "updatedHm": "08:15"},
+        "netlea": {"ok": True, "empty": False, "name": "尼特利水草灯", "on": True, "modeLabel": "自动行程", "brightness": 78, "red": 68, "green": 52, "white": 92, "blue": 48, "fan": 2, "updatedHm": "12:30"},
+        "apple-devices": {"ok": True, "empty": False, "authState": "authenticated", "total": 3, "online": 2, "lowCount": 1, "devices": [{"name": "iPhone 16 Pro", "catLabel": "手机", "battery": 82, "charging": False, "online": True, "place": "在家中"}, {"name": "AirPods Pro", "catLabel": "耳机", "battery": 15, "charging": False, "online": True, "place": "距公司1km"}], "updatedHm": "12:40"},
         "system-pulse": {"ok": True, "cpuPct": 12.0, "memPct": 42.0, "memUsedGb": 3.1, "memTotalGb": 7.6, "diskPct": 50.0, "diskFreeGb": 100.0, "load1": 0.35, "nextTimer": "巡检 12:00"},
-        "tv-agent": {"ok": True, "online": True, "appName": "B站", "volume": 24, "muted": False, "dlnaOk": True, "agentOk": True},
-        "tv-ir": {"ok": True, "txReady": True, "headline": "红外就绪", "subline": "预设 12 键"},
+        "tv-agent": {"ok": True, "online": True, "appName": "哔哩哔哩", "volume": 24, "muted": False, "dlnaOk": True, "agentOk": True},
+        "tv-ir": {"ok": True, "txReady": True, "learnedCount": 4, "headline": "全向红外就绪", "subline": "预设 12 键"},
         "memory": {"ok": True, "totalActive": 20, "pinnedCount": 4, "nodeCount": 6, "edges": [(0, 1, 0.8), (1, 2, 0.5)], "topics": ["CS80"]},
-        "timers": {"ok": True, "enabled": 1, "total": 2, "rows": [{"name": "午间估值", "nextHm": "12:00"}]},
+        "timers": {"ok": True, "enabled": 1, "total": 2, "rows": [{"name": "午间估值", "nextHm": "12:00", "goal": True}]},
         "usage": {"ok": True, "calls": 18, "tokStr": "12.4k", "costCny": 1.25, "costUsd": 0.17},
-        "weather": {"ok": True, "city": "上海", "temp": 22.0, "desc": "晴", "subline": "湿度 55%"},
+        "weather": {"ok": True, "city": "上海", "temp": 22.0, "feelsLike": 21.0, "tempMax": 25.0, "tempMin": 16.0, "humidity": 55, "wcode": 1, "desc": "晴", "windDesc": "轻风"},
         "workers": {"ok": True, "count": 1, "rows": [{"profile": "coding", "prompt": "测试", "elapsedSec": 8}]},
-        "plugin:demo-custom#dc": {"ok": True, "plugin": "demo-custom", "action": "status", "title": "测试", "kpis": [("状态", "正常"), ("延迟", "2ms")]},
+        "plugin:demo-custom#dc": {"ok": True, "plugin": "demo-custom", "action": "status", "title": "测试扩展", "kpis": [("电量", "86%"), ("今日次数", "2次"), ("状态", "运行中")]},
     }
     for rows in (2, 3):
         geo = rmod.stage_geometry_for_rows(rows)
-        for kind, sz in all_kinds:
-            cid = "dc" if kind.startswith("plugin:") else "c0"
-            cards, ov = pack_bento_page(
-                [{"id": cid, "kind": kind, "size": sz}],
-                grid_rows=rows,
-                x0=36.0,
-                y0=geo["grid_y"],
-                total_w=728.0,
-                total_h=geo["grid_h"],
-                gap=geo["gap"],
-            )
-            assert ov == 0 and len(cards) == 1, (rows, kind, sz, ov)
-            hud_fc = rmod.HudState(
-                grid_rows=rows,
-                headline_source="XIAOAI",
-                headline_text="A" * 90,
-                voice_caption='已唤醒 "星期五"',
-                friday_connected=True,
-                auto_task_overlay=False,
-                page_count=2,
-                active_page=0,
-            )
-            r_fc.render_frame(lsnap, hud_fc, placed_cards=cards, widget_data=sample_data)
+        for kind in all_kinds:
+            for sz in all_sizes:
+                cid = "dc" if kind.startswith("plugin:") else "c0"
+                cards, ov = pack_bento_page(
+                    [{"id": cid, "kind": kind, "size": sz}],
+                    grid_rows=rows,
+                    x0=36.0,
+                    y0=geo["grid_y"],
+                    total_w=728.0,
+                    total_h=geo["grid_h"],
+                    gap=geo["gap"],
+                )
+                assert ov == 0 and len(cards) == 1, (rows, kind, sz, ov)
+                hud_fc = rmod.HudState(
+                    grid_rows=rows,
+                    headline_source="XIAOAI",
+                    headline_text="A" * 90,
+                    voice_caption='已唤醒 "星期五"',
+                    workers=(rmod.WorkerSummary(task_id="w1", profile="coding", prompt="校验渲染", elapsed_sec=8),),
+                    channels=(("WX", True), ("XIAOAI", True), ("TG", False)),
+                    speaker_muted=(sz == "2x2"),
+                    friday_connected=True,
+                    auto_task_overlay=False,
+                    page_count=2,
+                    active_page=0,
+                )
+                r_fc.render_frame(lsnap, hud_fc, placed_cards=cards, widget_data=sample_data)
+
+    # Render all HUD states (incl. REM sleep + auto_task_overlay) and verify pure Chinese badges & labels
+    for st_id, (badge_lbl, _) in rmod.STATE_BADGES.items():
+        assert any(ord(ch) > 127 for ch in badge_lbl), (st_id, badge_lbl)
+    for st_id in rmod.STATE_BADGES:
+        anim_st = BotAnimator()
+        sub_p = "rem" if st_id == "sleeping" else "awake"
+        anim_st.set_state(st_id, sub_phase=sub_p, worker_count=(2 if st_id == "working" else 0))
+        st_snap = anim_st.step(0.08, center_x=400.0, center_y=272.0, base_radius=132.0)
+        hud_st = rmod.HudState(
+            grid_rows=3,
+            headline_source="WX · 22:00",
+            headline_text="状态测试通知 ⚠️ ✅",
+            ask_boss_question="确认继续执行吗？" if st_id == "sleeping" else "",
+            workers=(rmod.WorkerSummary(task_id="w1", profile="research", prompt="中文任务摘要", elapsed_sec=12),),
+            channels=(("WX", True), ("XIAOAI", True), ("TG", True)),
+            speaker_muted=(st_id == "sleeping"),
+            auto_task_overlay=(st_id == "sleeping"),
+            friday_connected=True,
+            page_count=1,
+        )
+        r_fc.render_frame(st_snap, hud_st, placed_cards=(), widget_data=sample_data)
+
+    assert rmod._sanitize_hud_text("测试 ⚠️ ✅ ❌ 🔔") == "测试"
+    all_rendered = " | ".join(_Ctx.shown_texts)
+    for bad_tok in ("IDLE", "ONLINE", "TX READY", "SPK MUTE", "MEM ", "CALLS ", "ASK BOSS", "[!]", "[OK]", "P1/", "DLNA OK", "dashboard · OK", "batteryPct"):
+        assert bad_tok not in all_rendered, f"found unlocalized token {bad_tok!r}"
+    for good_tok in ("待机守候", "正在倾听", "梦境整理", "等待您的决策指示", "微信", "小爱", "电报", "已静音", "音量 65%"):
+        assert good_tok in all_rendered, f"missing localized token {good_tok!r}"
 
     # Verify settled marquee-only scroll enters partial-band path and honors MAX_MARQUEE_SURF_W
     _Surf.created_widths.clear()
