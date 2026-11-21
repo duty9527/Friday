@@ -1,0 +1,83 @@
+{
+  "name": "apple-devices",
+  "title": "Apple 设备管理 (国区/国际 iCloud Find My)",
+  "description": "纯 Node.js 原生实现（支持中国大陆云上贵州 icloud.com.cn 与国际区 icloud.com），通过 Apple SRP-6a + 双重认证 (2FA) 获取名下 iPhone、iPad、Mac、Apple Watch、AirPods 的实时电量、充电状态、在线态势与位置围栏，支持远程播放查找提示音（响铃寻物）及低电量静默巡航。",
+  "entry": "index.mjs",
+  "runtime": "in-process",
+  "voiceFastpath": true,
+  "promptHint": "国区/国际 iCloud 查找苹果设备电量、定位围栏、响铃寻物与低电量巡航（默认缓存防耗电，实时传 refresh=true；勿在对话索要密码，引导去 Web 面板或 CLI 登录）。",
+  "actions": [
+    "status",
+    "devices",
+    "locate",
+    "play-sound",
+    "patrol",
+    "auth-login",
+    "auth-verify",
+    "auth-sms",
+    "logout",
+    "config"
+  ],
+  "actionSpecs": [
+    {
+      "name": "status",
+      "label": "查看绑定状态与缓存摘要",
+      "description": "检查 Apple ID 会话绑定状态（未登录 / 等待 2FA / 已绑定 / 已过期）、区域（cn/global）及本地缓存设备摘要；默认不请求苹果服务器（不耗电）。传 refresh=true 可同步触发一次刷新。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "devices",
+      "label": "获取设备列表与电量",
+      "description": "返回名下 iPhone、iPad、Mac、Apple Watch、AirPods 的电量百分比、充电状态、低电量模式、在线状态及最近位置。默认命中 cacheTtlSec（300 秒）缓存；传 refresh=true 强制向苹果服务器实时拉取（受 minRefreshIntervalSec=30 秒冷却保护）。",
+      "defaultArgs": { "refresh": false }
+    },
+    {
+      "name": "locate",
+      "label": "定位单台设备与围栏状态",
+      "description": "按 device（设备名、别名或 \"手机\"/\"iPad\"/\"手表\"/\"电脑\"）查询目标设备的电量与最新位置，并自动匹配已配置常用地点围栏（places，如家/公司）。传 refresh=true 获取最新定位，传 redactCoords=true 可隐去原始经纬度只保留地点标签。",
+      "defaultArgs": { "device": "手机", "refresh": false }
+    },
+    {
+      "name": "play-sound",
+      "label": "远程响铃寻物",
+      "description": "让指定 Apple 设备（device）以最大音量播放“查找”提示音（可突破静音），可选 subject 自定义通知标题。传 dryRun=true 仅预检目标设备不实际发声。",
+      "defaultArgs": { "device": "手机", "dryRun": true }
+    },
+    {
+      "name": "patrol",
+      "label": "低电量静默巡航（定时用）",
+      "description": "面向定时任务的低电量静默巡航：刷新设备电量并检查监控目标；若电量均 >= minBatteryPct（默认 25%）或正在充电，返回 notify:false 静默跳过；若存在低电量未充电设备或会话过期则主动推送告警。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "auth-login",
+      "label": "发起 Apple ID 登录 (SRP)",
+      "description": "使用 Apple ID 与主密码（非 App 专用密码）发起 RFC 5054 SRP-6a 握手；密码仅在当次内存中计算密码学证明，绝不落盘。触发双重认证后会话进入 pending_2fa 状态。",
+      "defaultArgs": { "appleId": "", "password": "", "region": "cn" }
+    },
+    {
+      "name": "auth-verify",
+      "label": "提交 6 位双重认证码 / 免码直通",
+      "description": "提交 6 位数字验证码（code）完成受信任会话建权并获取长期免密票据；mode 可选 trusted_device（默认）或 sms。若仅需查找功能且不便收码，可传 bypass2fa=true 启用 Find My 单因素直通。",
+      "defaultArgs": { "code": "", "mode": "trusted_device" }
+    },
+    {
+      "name": "auth-sms",
+      "label": "改用短信接收 2FA 验证码",
+      "description": "当处于 pending_2fa 状态且不方便查看设备弹窗时，请求苹果向受信任手机号（可选 phoneId）发送短信验证码。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "logout",
+      "label": "退出并清除本机凭据",
+      "description": "删除本机保存的 Apple 会话 Cookie、信任票据与设备缓存。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "config",
+      "label": "读取或更新插件配置",
+      "description": "查看或更新 region（\"cn\" 中国大陆 / \"global\" 国际区）、cacheTtlSec（缓存秒数，默认 300）、minRefreshIntervalSec（最小强制刷新冷却秒数，默认 30）、minBatteryPct（低电量告警阈值，默认 25）、watchDevices（巡航监控设备列表）、customAliases（别名映射）与 places（地点围栏 {名称:{lat,lng,radiusMeters}}）。",
+      "defaultArgs": {}
+    }
+  ]
+}

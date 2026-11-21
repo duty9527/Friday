@@ -28,7 +28,7 @@
   - **微信个人号（iLink 扫码绑定）**：支持微信拆条消息与图片智能聚合、真实视觉看图、生成文档后自动通过 `send_file` 发送附件，以及严格的来源会话路由隔离（Exact-Origin Routing）；同时支持钉钉与 Telegram。
   - **小爱音箱语音栈（XiaoAI）**：支持路由器桥接（`scripts/xiaoai-router-bridge.sh`）、局域网 SSH 直连与 KWS 连续对话，内置本地 CAM++ 声纹识别门禁与尾音防串音裁剪，避免电视背景音误触发。
 - **全能扩展插件与定时器**
-  - 内置 6 个原生插件：`system-pulse`（主机/工作区脉搏诊断与静默巡检）、`fund-tracker`（基金持仓盘中估值与晚间净值结算）、`tv-ir`（红外电视遥控与连续遥控快通）、`tv-agent`（Android TV 无障碍控制与 DLNA 投屏）、`miot`（米家本地设备与 BLE Mesh / MiIO 直控）与 `health-scale`（蓝牙体脂秤采集与健康趋势分析）。
+  - 内置 7 个原生插件：`system-pulse`（主机/工作区脉搏诊断与静默巡检）、`fund-tracker`（基金持仓盘中估值与晚间净值结算）、`tv-ir`（红外电视遥控与连续遥控快通）、`tv-agent`（Android TV 无障碍控制与 DLNA 投屏）、`miot`（米家本地设备与 BLE Mesh / MiIO 直控）、`health-scale`（蓝牙体脂秤采集与健康趋势分析）与 `apple-devices`（国区/国际 iCloud Find My 苹果设备电量、定位围栏、响铃寻物与低电量静默巡航）。
   - 支持 `--daily-at` 定点巡航、`--delay-ms --once` 一次性倒计时提醒，以及在 `~/.friday/plugins/` 下自建扩展插件（`friday` CLI 在守护进程在线时自动走 Daemon RPC，离线时受 `privateHome` 校验本地执行）。
 
 ---
@@ -149,7 +149,8 @@ node dist/cli.js shutdown
 │   ├── tv-ir/              # 小爱 Pro 红外电视遥控与连续快通插件
 │   ├── tv-agent/           # Android TV 无障碍 Agent、DLNA 投屏与多模态导航插件
 │   ├── miot/               # 米家本地中枢、BLE Mesh 与局域网 MiIO 设备直控插件
-│   └── health-scale/       # 蓝牙体脂秤数据采集与健康趋势分析插件
+│   ├── health-scale/       # 蓝牙体脂秤数据采集与健康趋势分析插件
+│   └── apple-devices/      # 国区/国际 iCloud Find My 设备电量、定位围栏、响铃寻物与低电量巡航插件
 ├── docs/                   # 架构说明、IM/语音接入指南与参考资料
 └── test/                   # 端到端与单元验证套件（npm run check）
 ```

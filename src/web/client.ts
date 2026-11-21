@@ -30,6 +30,7 @@ const cs80SurfacePanel = element<HTMLElement>('plugin-panel-cs80-face');
 const laifenSurfacePanel = element<HTMLElement>('plugin-panel-laifen');
 const ninebotSurfacePanel = element<HTMLElement>('plugin-panel-ninebot');
 const netleaSurfacePanel = element<HTMLElement>('plugin-panel-netlea');
+const appleSurfacePanel = element<HTMLElement>('plugin-panel-apple-devices');
 const messagesEl = element('messages');
 const worksEl = element('works');
 const companionEl = element('companion-avatar');
@@ -205,6 +206,17 @@ const pluginSurfaces: PluginSurfaceRegistration[] = [
     load: () => import('./plugins/netlea-ui.js').then(mod =>
       mod.initNetleaUi({
         isVisible: () => !pluginHubBackdrop.hidden && !netleaSurfacePanel.hidden,
+      })),
+  },
+  {
+    pluginName: 'apple-devices',
+    tabId: 'plugin-tab-apple-devices',
+    panelId: 'plugin-panel-apple-devices',
+    label: '苹果设备',
+    messageTrigger: /iPhone|iPad|AirPods|Apple\s*Watch|Find\s*My|苹果设备|apple-devices/i,
+    load: () => import('./plugins/apple-devices-ui.js').then(mod =>
+      mod.initAppleDevicesUi({
+        isVisible: () => !pluginHubBackdrop.hidden && !appleSurfacePanel.hidden,
       })),
   },
 ];

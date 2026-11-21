@@ -30,7 +30,7 @@ export function buildPluginCapabilitiesPrompt(home: string): string {
   }
   const lines = plugins.map(p => {
     const actions = p.actions.length ? p.actions.join('/') : 'run';
-    const hint = p.promptHint?.trim() || p.description || p.title || p.name;
+    const hint = p.title?.trim() || p.promptHint?.trim() || p.description || p.name;
     return `${p.name} (${actions}): ${hint}`;
   });
   return lines.join(' | ');

@@ -6363,6 +6363,81 @@ html[data-theme="industrial"] .fund-holding-row:hover {
 }
 
 /* ============================================================================
+   Apple Devices Surface (Find My Control Center)
+   ============================================================================ */
+.apple-auth-card {
+  border:1px solid var(--border);
+  border-radius:12px;
+  padding:14px;
+  background:var(--raised);
+  box-shadow:var(--card-shadow);
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+}
+.apple-security-note {
+  flex:1 1 280px;
+}
+.apple-2fa-box {
+  margin-top:4px;
+  padding:12px;
+  border-radius:10px;
+  border:1px dashed var(--accent);
+  background:var(--surface);
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+}
+.apple-devices-grid {
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(min(290px, 100%),1fr));
+  gap:12px;
+}
+.apple-device-card {
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+}
+.apple-battery-row {
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+}
+.apple-battery-text {
+  font-size:13px;
+  font-weight:600;
+  font-variant-numeric:tabular-nums;
+  color:var(--text);
+}
+.apple-battery-svg {
+  width:100%;
+  height:10px;
+  display:block;
+}
+.apple-battery-track {
+  fill:rgba(148, 163, 184, 0.24);
+}
+.apple-battery-fill.tone-ok { fill:#22c55e; }
+.apple-battery-fill.tone-charging { fill:#38bdf8; }
+.apple-battery-fill.tone-mid { fill:#f59e0b; }
+.apple-battery-fill.tone-low { fill:#ef4444; }
+.apple-location-line {
+  font-size:12px;
+  word-break:break-word;
+}
+.apple-card-actions {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:8px;
+  margin-top:auto;
+}
+.apple-device-id {
+  font-family:"IBM Plex Mono",monospace;
+  font-size:11px;
+}
+
+/* ============================================================================
    Responsive Breakpoints (1500px+ / 1100px Tablet / 730px & 640px Mobile)
    ============================================================================ */
 @media(min-width:1500px) {
