@@ -120,7 +120,8 @@ export function haversineMeters(lat1, lon1, lat2, lon2) {
   const dLon = toRad(lon2 - lon1);
   const a = (Math.sin(dLat / 2) ** 2)
     + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * (Math.sin(dLon / 2) ** 2);
-  return Math.round(2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+  const clampedA = Math.min(1, Math.max(0, a));
+  return Math.round(2 * R * Math.atan2(Math.sqrt(clampedA), Math.sqrt(1 - clampedA)));
 }
 
 /**
@@ -132,7 +133,26 @@ function defaultGetRequester(url, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const transport = u.protocol === 'https:' ? https : http;
-    const req = transport.request(
+    let settled = false;
+    /** @type {ReturnType<typeof setTimeout> | undefined} */
+    let deadlineTimer;
+    /** @type {import('node:http').ClientRequest | undefined} */
+    let req;
+
+    const finishReject = (/** @type {unknown} */ err) => {
+      if (settled) return;
+      settled = true;
+      if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+      reject(err);
+    };
+    const finishResolve = (/** @type {{ status: number; body: Buffer }} */ val) => {
+      if (settled) return;
+      settled = true;
+      if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+      resolve(val);
+    };
+
+    req = transport.request(
       {
         protocol: u.protocol,
         hostname: u.hostname,
@@ -151,33 +171,52 @@ function defaultGetRequester(url, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS) {
         const chunks = [];
         let total = 0;
         res.on('data', chunk => {
+          if (settled) return;
           const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
           total += buf.length;
           if (total > MAX_HTTP_BYTES) {
-            req.destroy(new Error('Geo response too large'));
+            const err = new Error('Geo response too large');
+            finishReject(err);
+            req?.destroy(err);
             return;
           }
           chunks.push(buf);
         });
         res.on('end', () => {
+          if (settled) return;
           let raw = Buffer.concat(chunks);
           const encHeader = res.headers['content-encoding'];
           const encoding = (Array.isArray(encHeader) ? encHeader[0] : encHeader || '').toLowerCase().trim();
           try {
-            if (encoding === 'gzip') raw = gunzipSync(raw);
-            else if (encoding === 'deflate') raw = inflateSync(raw);
-            else if (encoding === 'br') raw = brotliDecompressSync(raw);
+            if (encoding === 'gzip') raw = gunzipSync(raw, { maxOutputLength: MAX_HTTP_BYTES });
+            else if (encoding === 'deflate') raw = inflateSync(raw, { maxOutputLength: MAX_HTTP_BYTES });
+            else if (encoding === 'br') raw = brotliDecompressSync(raw, { maxOutputLength: MAX_HTTP_BYTES });
           } catch (err) {
-            reject(err);
+            finishReject(err);
             return;
           }
-          resolve({ status: res.statusCode ?? 0, body: raw });
+          finishResolve({ status: res.statusCode ?? 0, body: raw });
         });
-        res.on('error', reject);
+        res.on('close', () => {
+          if (!settled && !res.complete) {
+            finishReject(new Error('Geo response stream closed prematurely'));
+          }
+        });
+        res.on('error', finishReject);
       },
     );
-    req.on('timeout', () => req.destroy(new Error(`请求超时 (${timeoutMs}ms)`)));
-    req.on('error', reject);
+    deadlineTimer = setTimeout(() => {
+      const err = new Error(`请求超时 (${timeoutMs}ms)`);
+      finishReject(err);
+      req?.destroy(err);
+    }, timeoutMs);
+    deadlineTimer.unref?.();
+    req.on('timeout', () => {
+      const err = new Error(`请求超时 (${timeoutMs}ms)`);
+      finishReject(err);
+      req?.destroy(err);
+    });
+    req.on('error', finishReject);
     req.end();
   });
 }
@@ -492,9 +531,11 @@ export async function reverseGeocodeWithCache(opts) {
   const gridKey = `${(Math.round(gcj.lat * 5000) / 5000).toFixed(4)},${(Math.round(gcj.lon * 5000) / 5000).toFixed(4)}`;
 
   const readCache = () => {
+    const dbPath = join(homeDir, 'geo-cache.sqlite');
+    if (!existsSync(dbPath)) return null;
     let db;
     try {
-      db = openGeoCacheDb(homeDir);
+      db = new DatabaseSync(dbPath, { readOnly: true });
       const row = /** @type {Record<string, any> | undefined} */ (
         db.prepare('SELECT * FROM geo_regeo_cache WHERE grid_key=? AND updated_at > ?')
           .get(gridKey, nowMs - GEO_CACHE_TTL_MS)

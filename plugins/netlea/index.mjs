@@ -848,7 +848,6 @@ function resolveSpectrumSpec(safeArgs, profile, config, allowBrightnessScaling =
   const hasExplicitChannel = (
     safeArgs.red ?? safeArgs.r ?? safeArgs.green ?? safeArgs.g
     ?? safeArgs.white ?? safeArgs.w ?? safeArgs.blue ?? safeArgs.b
-    ?? safeArgs.fan ?? safeArgs.f
   ) !== undefined;
   const reqModeCode = clampInt(safeArgs.modeCode, 0, 11);
 
@@ -1011,15 +1010,31 @@ function createDefaultBleRunner(explicitPython) {
    * @returns {Promise<Record<string, unknown>>}
    */
   return async function defaultBleRunner(commandArgs, timeoutMs = 25_000, signal) {
-    const { stdout } = await execFileAsync(pythonBin, [HELPER_PATH, ...commandArgs], {
-      cwd: PLUGIN_DIR,
-      timeout: timeoutMs,
-      maxBuffer: 2 * 1024 * 1024,
-      ...(signal ? { signal } : {}),
-    });
-    const trimmed = String(stdout || '').trim();
-    if (!trimmed) return {};
-    return JSON.parse(trimmed);
+    try {
+      const { stdout } = await execFileAsync(pythonBin, [HELPER_PATH, ...commandArgs], {
+        cwd: PLUGIN_DIR,
+        timeout: timeoutMs,
+        maxBuffer: 2 * 1024 * 1024,
+        ...(signal ? { signal } : {}),
+      });
+      const trimmed = String(stdout || '').trim();
+      if (!trimmed) return {};
+      return JSON.parse(trimmed);
+    } catch (err) {
+      const e = /** @type {{ name?: string; stdout?: unknown }} */ (err);
+      if (signal?.aborted || e?.name === 'AbortError') throw err;
+      const rawOut = String(e?.stdout || '').trim();
+      if (rawOut) {
+        try {
+          const parsed = JSON.parse(rawOut);
+          if (parsed && typeof parsed === 'object') return parsed;
+        } catch {
+          // fall through to sanitized error
+        }
+      }
+      const sanitized = errMsg(err).split(HELPER_PATH).join('ble_helper.py').split(PLUGIN_DIR).join('netlea');
+      throw new Error(sanitized);
+    }
   };
 }
 
@@ -1189,6 +1204,11 @@ async function invokeBleLocked(lockPath, bleRunner, cmdArgs, timeoutMs, signal, 
       let raw = await bleRunner(cmdArgs, timeoutMs, signal);
       if (allowRetry && raw && raw.ok === false && raw.code === 'CONNECT_FAILED') {
         await new Promise(resolvePause => setTimeout(resolvePause, 250));
+        try {
+          writeJsonAtomic(activeLockPath, { pid: process.pid, at: Date.now() }, { mode: 0o600 });
+        } catch {
+          // Best-effort peer lock indicator refresh
+        }
         raw = await bleRunner(cmdArgs, timeoutMs, signal);
       }
       return raw;
@@ -1636,14 +1656,6 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
         return disabledBleResult(platform);
       }
 
-      if (safeArgs.saveTankSize !== false) {
-        await withFileLock(paths.configPath, () => {
-          const cur = loadNormalizedConfig(paths.configPath);
-          cur.tankSize = sanitizeTankSize(computed.tankSize, cur.tankSize);
-          writeConfig(paths.configPath, cur);
-        });
-      }
-
       const cmdRes = await runBleCommandBatch({
         bleRunner,
         lockPath: bleLockPath,
@@ -1666,6 +1678,14 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
         signal,
       });
       if (!cmdRes.ok) return cmdRes.errorResult;
+
+      if (safeArgs.saveTankSize !== false) {
+        await withFileLock(paths.configPath, () => {
+          const cur = loadNormalizedConfig(paths.configPath);
+          cur.tankSize = sanitizeTankSize(computed.tankSize, cur.tankSize);
+          writeConfig(paths.configPath, cur);
+        });
+      }
 
       return {
         ok: true,
@@ -1766,7 +1786,7 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
         sunsetMinutes: clampInt(safeArgs.sunsetMinutes, 0, 300) ?? 0,
         trips: [],
       }, profile.key);
-      const emptySched = {
+      const emptySched = decodeMainScheduleFrame(clearTx, profile.key) ?? {
         rawHex: clearTx,
         travelModel: 0,
         sunEnable: 0,
@@ -1999,15 +2019,22 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
     txFrames = [buildResumeScheduleFrame(hint, 1)];
   } else if (cleanAction === 'clock') {
     const targetTs = safeArgs.timestamp !== undefined ? safeArgs.timestamp : nowFn();
+    const tzHours = clampInt(safeArgs.tzHours, -12, 14);
     const syncTx = buildClockSyncFrame(
       /** @type {Date | number | string} */ (targetTs),
       {
         groupId: clampInt(safeArgs.groupId, 0, 255) ?? 0,
         devId: clampInt(safeArgs.devId, 1, 255) ?? 1,
-        tzHours: safeArgs.tzHours !== undefined ? Number(safeArgs.tzHours) : undefined,
+        ...(tzHours !== undefined ? { tzHours } : {}),
       },
     );
-    plannedMeta = { syncedAt: new Date(Number.isFinite(Number(targetTs)) ? Number(targetTs) : nowFn()).toISOString() };
+    const parsedTs = targetTs instanceof Date
+      ? targetTs
+      : (typeof targetTs === 'number' || (typeof targetTs === 'string' && /^-?\d+$/.test(targetTs.trim()))
+          ? new Date(Number(targetTs))
+          : new Date(String(targetTs)));
+    const syncedAt = Number.isNaN(parsedTs.getTime()) ? new Date(nowFn()).toISOString() : parsedTs.toISOString();
+    plannedMeta = { syncedAt };
     txFrames = [syncTx, buildQueryStatusFrame()];
   }
 
@@ -2100,17 +2127,6 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
     };
   }
 
-  // Persist temp minutes in config.json when writing mode:temp-config
-  if (effectiveAction === 'mode:temp-config' && plannedMeta) {
-    await withFileLock(paths.configPath, () => {
-      const cur = loadNormalizedConfig(paths.configPath);
-      cur.tempOnMinutes = Number(plannedMeta.onMinutes) || cur.tempOnMinutes;
-      cur.tempOffMinutes = Number(plannedMeta.offMinutes) || cur.tempOffMinutes;
-      if (plannedChannels) cur.defaultChannels = plannedChannels;
-      writeConfig(paths.configPath, cur);
-    });
-  }
-
   const cmdRes = await runBleCommandBatch({
     bleRunner,
     lockPath: bleLockPath,
@@ -2127,6 +2143,17 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
   });
   if (!cmdRes.ok) {
     return cmdRes.errorResult;
+  }
+
+  // Persist temp minutes in config.json only after mode:temp-config succeeds on hardware
+  if (effectiveAction === 'mode:temp-config' && plannedMeta) {
+    await withFileLock(paths.configPath, () => {
+      const cur = loadNormalizedConfig(paths.configPath);
+      cur.tempOnMinutes = Number(plannedMeta.onMinutes) || cur.tempOnMinutes;
+      cur.tempOffMinutes = Number(plannedMeta.offMinutes) || cur.tempOffMinutes;
+      if (plannedChannels) cur.defaultChannels = plannedChannels;
+      writeConfig(paths.configPath, cur);
+    });
   }
 
   const { deviceView, state, tempConfig, schedule, replies } = cmdRes;

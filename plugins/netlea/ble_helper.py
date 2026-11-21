@@ -456,6 +456,7 @@ def run_command(args: argparse.Namespace) -> int:
     received_cmds: set[int] = set()
     ack_received = False
     last_ack_ts = 0.0
+    notify_path: str | None = None
     notify_iface: dbus.Interface | None = None
     prop_sig = None
 
@@ -482,7 +483,7 @@ def run_command(args: argparse.Namespace) -> int:
     def on_props_changed(
         interface: str, changed: dict[str, Any], _invalidated: Any, path: str | None = None
     ) -> None:
-        if interface != GATT_CHAR_IFACE or not path or not str(path).startswith(dev_path + "/"):
+        if interface != GATT_CHAR_IFACE or not path or not notify_path or str(path) != notify_path:
             return
         if "Value" not in changed:
             return
@@ -547,7 +548,7 @@ def run_command(args: argparse.Namespace) -> int:
             return 0
 
         objs = get_managed_objects(bus)
-        notify_path: str | None = None
+        notify_path = None
         write_path: str | None = None
         for path, ifaces in sorted(objs.items()):
             if not str(path).startswith(dev_path + "/") or GATT_CHAR_IFACE not in ifaces:

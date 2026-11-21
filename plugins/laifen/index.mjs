@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { closeSync, constants, existsSync, mkdirSync, openSync, readdirSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
+import { chmodSync, closeSync, constants, existsSync, lstatSync, openSync, readdirSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
@@ -539,70 +539,84 @@ function openDb(paths) {
   const dbPath = join(paths.pluginDataDir, 'laifen.db');
   const dbExistsBeforeOpen = existsSync(dbPath);
   const db = new DatabaseSync(dbPath);
-  db.exec(`
-    PRAGMA journal_mode = WAL;
-    PRAGMA busy_timeout = 5000;
-  `);
-
-  if (!dbExistsBeforeOpen || !INITIALIZED_DB_PATHS.has(dbPath)) {
+  try {
+    try {
+      chmodSync(dbPath, 0o600);
+    } catch {
+      // ignore chmod failures on restricted filesystems
+    }
     db.exec(`
-      CREATE TABLE IF NOT EXISTS device_state (
-        id TEXT PRIMARY KEY,
-        mac TEXT,
-        address TEXT,
-        name TEXT,
-        protocol TEXT,
-        rssi INTEGER,
-        battery_pct INTEGER,
-        active_mode INTEGER,
-        modes_json TEXT,
-        duration_sec INTEGER,
-        high_frequency INTEGER,
-        reminder_30s INTEGER,
-        airplane_mode INTEGER,
-        status TEXT,
-        features_json TEXT,
-        last_status_hex TEXT,
-        last_info_hex TEXT,
-        updated_at INTEGER NOT NULL,
-        last_synced_at INTEGER
-      );
-
-      CREATE TABLE IF NOT EXISTS battery_logs (
-        id TEXT PRIMARY KEY,
-        mac TEXT,
-        battery_pct INTEGER NOT NULL,
-        source TEXT NOT NULL,
-        recorded_at INTEGER NOT NULL
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_battery_logs_time
-        ON battery_logs(recorded_at DESC);
-
-      CREATE TABLE IF NOT EXISTS brush_sessions (
-        id TEXT PRIMARY KEY,
-        dedup_key TEXT UNIQUE,
-        mac TEXT,
-        brushed_at INTEGER NOT NULL,
-        duration_sec INTEGER NOT NULL,
-        mode INTEGER,
-        strength INTEGER,
-        range_val INTEGER,
-        speed INTEGER,
-        battery_before INTEGER,
-        battery_after INTEGER,
-        over_pressure_count INTEGER NOT NULL DEFAULT 0,
-        source TEXT NOT NULL,
-        note TEXT,
-        created_at INTEGER NOT NULL
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_brush_sessions_time
-        ON brush_sessions(brushed_at DESC);
+      PRAGMA journal_mode = WAL;
+      PRAGMA busy_timeout = 5000;
     `);
-    INITIALIZED_DB_PATHS.add(dbPath);
+
+    if (!dbExistsBeforeOpen || !INITIALIZED_DB_PATHS.has(dbPath)) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS device_state (
+          id TEXT PRIMARY KEY,
+          mac TEXT,
+          address TEXT,
+          name TEXT,
+          protocol TEXT,
+          rssi INTEGER,
+          battery_pct INTEGER,
+          active_mode INTEGER,
+          modes_json TEXT,
+          duration_sec INTEGER,
+          high_frequency INTEGER,
+          reminder_30s INTEGER,
+          airplane_mode INTEGER,
+          status TEXT,
+          features_json TEXT,
+          last_status_hex TEXT,
+          last_info_hex TEXT,
+          updated_at INTEGER NOT NULL,
+          last_synced_at INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS battery_logs (
+          id TEXT PRIMARY KEY,
+          mac TEXT,
+          battery_pct INTEGER NOT NULL,
+          source TEXT NOT NULL,
+          recorded_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_battery_logs_time
+          ON battery_logs(recorded_at DESC);
+
+        CREATE TABLE IF NOT EXISTS brush_sessions (
+          id TEXT PRIMARY KEY,
+          dedup_key TEXT UNIQUE,
+          mac TEXT,
+          brushed_at INTEGER NOT NULL,
+          duration_sec INTEGER NOT NULL,
+          mode INTEGER,
+          strength INTEGER,
+          range_val INTEGER,
+          speed INTEGER,
+          battery_before INTEGER,
+          battery_after INTEGER,
+          over_pressure_count INTEGER NOT NULL DEFAULT 0,
+          source TEXT NOT NULL,
+          note TEXT,
+          created_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_brush_sessions_time
+          ON brush_sessions(brushed_at DESC);
+      `);
+      INITIALIZED_DB_PATHS.add(dbPath);
+    }
+    return db;
+  } catch (err) {
+    try {
+      db.close();
+    } catch {
+      // ignore close error
+    }
+    throw err;
   }
-  return db;
 }
 
 function getDeviceState(db) {
@@ -979,7 +993,7 @@ async function withManualBleYieldLock(dataDir, fn) {
   } finally {
     try {
       const cur = readJsonSafe(lockPath, null);
-      if (!cur || cur.token === token || cur.pid === process.pid) {
+      if (!cur || cur.token === token) {
         unlinkSync(lockPath);
       }
     } catch {
@@ -1049,8 +1063,13 @@ function ingestWatchOutbox(db, dataDir, config, paths, nowMs) {
     const devMac = normalizeMac(ev.device?.address || currentCfg.targetMac || prevState.mac);
 
     if (!currentCfg.targetMac && MAC_RE.test(devMac) && paths?.configPath) {
-      currentCfg = { ...currentCfg, targetMac: devMac };
-      writeConfig(paths.configPath, currentCfg);
+      const latestCfg = loadLaifenConfig(paths.configPath);
+      if (!latestCfg.targetMac) {
+        currentCfg = { ...latestCfg, targetMac: devMac };
+        writeConfig(paths.configPath, currentCfg);
+      } else {
+        currentCfg = latestCfg;
+      }
     }
 
     if (latestParsed && latestParsed.type === 'status') {
@@ -1279,15 +1298,19 @@ async function defaultBleRunner(commandArgs, timeoutMs = 35_000, signal) {
     });
     return JSON.parse(String(stdout || '{}').trim() || '{}');
   } catch (err) {
-    const rawOut = String(/** @type {{ stdout?: unknown }} */ (err)?.stdout || '').trim();
+    const e = /** @type {{ name?: string; stdout?: unknown }} */ (err);
+    if (signal?.aborted || e?.name === 'AbortError') throw err;
+    const rawOut = String(e?.stdout || '').trim();
     if (rawOut) {
       try {
-        return JSON.parse(rawOut);
+        const parsed = JSON.parse(rawOut);
+        if (parsed && typeof parsed === 'object') return parsed;
       } catch {
-        // fall through to rethrow
+        // fall through to sanitized error
       }
     }
-    throw err;
+    const sanitized = errMsg(err).split(HELPER_PATH).join('ble_helper.py').split(PLUGIN_DIR).join('laifen');
+    throw new Error(sanitized);
   }
 }
 
@@ -1296,6 +1319,9 @@ function defaultSpawnMonitor(commandArgs) {
     cwd: PLUGIN_DIR,
     detached: true,
     stdio: 'ignore',
+  });
+  child.on('error', () => {
+    // Prevent unhandled EventEmitter crash if python binary cannot spawn
   });
   child.unref();
   return child.pid;
@@ -1331,7 +1357,7 @@ async function ensureWatchDaemonIfEnabled(ctx, { force = false } = {}) {
   const namePrefix = String(ctx.args?.namePrefix ?? ctx.config.namePrefix ?? DEFAULT_NAME_PREFIX).trim() || DEFAULT_NAME_PREFIX;
 
   ensurePrivateDir(ctx.dataDir);
-  mkdirSync(outDir, { recursive: true, mode: 0o700 });
+  ensurePrivateDir(outDir);
 
   await withFileLock(wPath, async () => {
     const existing = existsSync(wPath) ? readJsonSafe(wPath, null) : null;
@@ -1408,7 +1434,41 @@ async function stopWatchDaemon(ctx) {
   return getWatchStatus(ctx.dataDir, ctx.config, ctx.nowMs);
 }
 
-function applyWriteResultToDb(ctx, raw, patch, targetMac, source = 'set') {
+async function persistDiscoveredTargetMac(ctx, devMac) {
+  if (!MAC_RE.test(devMac)) return;
+  const saved = await withFileLock(ctx.paths.configPath, () => {
+    const cur = loadLaifenConfig(ctx.paths.configPath);
+    if (cur.targetMac) return cur;
+    const nextCfg = { ...cur, targetMac: devMac };
+    writeConfig(ctx.paths.configPath, nextCfg);
+    return loadLaifenConfig(ctx.paths.configPath);
+  });
+  ctx.config = saved;
+}
+
+function clearStaleOneShotSession(sPath, sessionId, nowMs, errorMsg) {
+  try {
+    const cur = readJsonSafe(sPath, null);
+    if (
+      cur
+      && cur.sessionId === sessionId
+      && ['scanning', 'connecting', 'monitoring'].includes(cur.phase)
+    ) {
+      writeJsonAtomic(sPath, {
+        ...cur,
+        pid: null,
+        phase: 'error',
+        error: errorMsg || '蓝牙指令执行未完成',
+        message: errorMsg || '蓝牙指令执行未完成',
+        updatedAt: nowMs,
+      });
+    }
+  } catch {
+    // ignore cleanup failure
+  }
+}
+
+async function applyWriteResultToDb(ctx, raw, patch, targetMac, source = 'set') {
   /** @type {Partial<NonNullable<ReturnType<typeof getDeviceState>>>} */
   const prev = getDeviceState(ctx.db) || {};
   const baseParsed = raw.baselineHex ? LaifenProtocol.parsePacket(raw.baselineHex, prev) : null;
@@ -1417,11 +1477,21 @@ function applyWriteResultToDb(ctx, raw, patch, targetMac, source = 'set') {
     ? afterParsed
     : (baseParsed && baseParsed.type === 'status' ? baseParsed : null);
 
-  // Merge optimistic fields for V2Pro toggles not echoed in status packets
+  // Merge optimistic fields for V2Pro toggles and mode/params not echoed in 5A C1 03 status packets
   const mergedModes = effective?.modes ? { ...effective.modes } : { ...(prev.modes || defaultModesTable()) };
-  const activeMode = clamp(asInt(patch.mode ?? effective?.activeMode ?? prev.activeMode) ?? 1, 1, 4);
-  if (afterParsed?.type !== 'status') {
-    const slot = { ...(mergedModes[String(activeMode)] || { strength: 5, range: 5, speed: 5 }) };
+  const isV2Pro = effective?.protocol === 'v2pro' || raw.protocol === 'v2pro';
+  const activeMode = clamp(
+    asInt(
+      (isV2Pro && patch.mode !== undefined ? patch.mode : undefined)
+        ?? patch.mode
+        ?? effective?.activeMode
+        ?? prev.activeMode,
+    ) ?? 1,
+    1,
+    4,
+  );
+  if (afterParsed?.type !== 'status' || isV2Pro) {
+    const slot = { ...(mergedModes[String(activeMode)] || { strength: activeMode === 4 ? 14 : 5, range: 5, speed: 5 }) };
     if (patch.strength !== undefined) slot.strength = Number(patch.strength);
     if (patch.range !== undefined) slot.range = Number(patch.range);
     if (patch.speed !== undefined) slot.speed = Number(patch.speed);
@@ -1429,11 +1499,7 @@ function applyWriteResultToDb(ctx, raw, patch, targetMac, source = 'set') {
   }
 
   const devMac = normalizeMac(raw.device?.address || targetMac || prev.mac);
-  if (!ctx.config.targetMac && MAC_RE.test(devMac)) {
-    const nextCfg = { ...ctx.config, targetMac: devMac };
-    writeConfig(ctx.paths.configPath, nextCfg);
-    ctx.config = loadLaifenConfig(ctx.paths.configPath);
-  }
+  await persistDiscoveredTargetMac(ctx, devMac);
 
   return saveDeviceState(ctx.db, {
     mac: devMac,
@@ -1442,7 +1508,7 @@ function applyWriteResultToDb(ctx, raw, patch, targetMac, source = 'set') {
     rssi: raw.device?.rssi,
     protocol: effective?.protocol || raw.protocol || prev.protocol || 'v1',
     batteryPct: effective?.batteryPct ?? prev.batteryPct,
-    activeMode: effective?.activeMode ?? activeMode,
+    activeMode: isV2Pro ? activeMode : (effective?.activeMode ?? activeMode),
     modes: mergedModes,
     durationSec: effective?.durationSec ?? (patch.durationSec !== undefined ? Number(patch.durationSec) : prev.durationSec),
     highFrequency: patch.highFrequency !== undefined ? Boolean(patch.highFrequency) : (effective?.highFrequency ?? prev.highFrequency),
@@ -1552,7 +1618,9 @@ async function handleConfig(ctx) {
     };
   }
 
-  const next = { ...ctx.config };
+  /** @type {boolean | undefined} */
+  let parsedAutoWake;
+
   if (args.targetMac !== undefined) {
     const mac = normalizeMac(args.targetMac);
     if (mac !== '' && !MAC_RE.test(mac)) {
@@ -1563,31 +1631,20 @@ async function handleConfig(ctx) {
         message: 'targetMac 必须为空或形如 XX:XX:XX:XX:XX:XX 的蓝牙 MAC 地址。',
       };
     }
-    next.targetMac = mac;
   }
-  if (args.namePrefix !== undefined) {
-    const prefix = String(args.namePrefix || '').trim();
-    if (!prefix) {
-      return { ok: false, notify: false, title: '前缀无效', message: 'namePrefix 不能为空。' };
-    }
-    next.namePrefix = prefix;
+  if (args.namePrefix !== undefined && !String(args.namePrefix || '').trim()) {
+    return { ok: false, notify: false, title: '前缀无效', message: 'namePrefix 不能为空。' };
   }
   if (args.brushHeadLifespanDays !== undefined) {
     const days = asInt(args.brushHeadLifespanDays);
     if (days === undefined || days < 15 || days > 365) {
       return { ok: false, notify: false, title: '参数超出范围', message: 'brushHeadLifespanDays 需在 15~365 天之间。' };
     }
-    next.brushHeadLifespanDays = days;
   }
-  if (args.brushHeadReplacedAt !== undefined) {
-    if (args.brushHeadReplacedAt === null || args.brushHeadReplacedAt === '') {
-      next.brushHeadReplacedAt = null;
-    } else {
-      const ts = asInt(args.brushHeadReplacedAt);
-      if (ts === undefined || ts <= 0) {
-        return { ok: false, notify: false, title: '时间戳无效', message: 'brushHeadReplacedAt 必须为毫秒时间戳或 null。' };
-      }
-      next.brushHeadReplacedAt = ts;
+  if (args.brushHeadReplacedAt !== undefined && args.brushHeadReplacedAt !== null && args.brushHeadReplacedAt !== '') {
+    const ts = asInt(args.brushHeadReplacedAt);
+    if (ts === undefined || ts <= 0) {
+      return { ok: false, notify: false, title: '时间戳无效', message: 'brushHeadReplacedAt 必须为毫秒时间戳或 null。' };
     }
   }
   if (args.dailyGoalCount !== undefined) {
@@ -1595,29 +1652,52 @@ async function handleConfig(ctx) {
     if (goal === undefined || goal < 1 || goal > 6) {
       return { ok: false, notify: false, title: '参数超出范围', message: 'dailyGoalCount 需在 1~6 次之间。' };
     }
-    next.dailyGoalCount = goal;
   }
   if (args.targetDurationSec !== undefined) {
     const dur = asInt(args.targetDurationSec);
     if (dur === undefined || dur < 60 || dur > 300) {
       return { ok: false, notify: false, title: '参数超出范围', message: 'targetDurationSec 需在 60~300 秒之间。' };
     }
-    next.targetDurationSec = Math.round(dur / 30) * 30;
   }
   if (args.autoWakeSync !== undefined) {
-    const b = asOptionalBoolean(args.autoWakeSync);
-    if (b === undefined) {
+    parsedAutoWake = asOptionalBoolean(args.autoWakeSync);
+    if (parsedAutoWake === undefined) {
       return { ok: false, notify: false, title: '参数无效', message: 'autoWakeSync 必须为布尔值 true/false。' };
     }
-    next.autoWakeSync = b;
   }
 
-  writeConfig(ctx.paths.configPath, next);
-  const saved = loadLaifenConfig(ctx.paths.configPath);
+  const saved = await withFileLock(ctx.paths.configPath, () => {
+    const next = { ...loadLaifenConfig(ctx.paths.configPath) };
+    if (args.targetMac !== undefined) {
+      next.targetMac = normalizeMac(args.targetMac);
+    }
+    if (args.namePrefix !== undefined) {
+      next.namePrefix = String(args.namePrefix || '').trim();
+    }
+    if (args.brushHeadLifespanDays !== undefined) {
+      next.brushHeadLifespanDays = /** @type {number} */ (asInt(args.brushHeadLifespanDays));
+    }
+    if (args.brushHeadReplacedAt !== undefined) {
+      next.brushHeadReplacedAt = (args.brushHeadReplacedAt === null || args.brushHeadReplacedAt === '')
+        ? null
+        : /** @type {number} */ (asInt(args.brushHeadReplacedAt));
+    }
+    if (args.dailyGoalCount !== undefined) {
+      next.dailyGoalCount = /** @type {number} */ (asInt(args.dailyGoalCount));
+    }
+    if (args.targetDurationSec !== undefined) {
+      next.targetDurationSec = Math.round(/** @type {number} */ (asInt(args.targetDurationSec)) / 30) * 30;
+    }
+    if (parsedAutoWake !== undefined) {
+      next.autoWakeSync = parsedAutoWake;
+    }
+    writeConfig(ctx.paths.configPath, next);
+    return loadLaifenConfig(ctx.paths.configPath);
+  });
   ctx.config = saved;
-  if (args.autoWakeSync === true) {
+  if (parsedAutoWake === true) {
     await ensureWatchDaemonIfEnabled(ctx, { force: true });
-  } else if (args.autoWakeSync === false) {
+  } else if (parsedAutoWake === false) {
     await stopWatchDaemon(ctx);
   }
   return {
@@ -1662,8 +1742,13 @@ async function handleScan(ctx) {
   let boundMac = ctx.config.targetMac;
   if (ctx.args.bind === true && devices.length > 0 && devices[0]?.address) {
     boundMac = normalizeMac(devices[0].address);
-    const updatedCfg = { ...ctx.config, targetMac: boundMac };
-    writeConfig(ctx.paths.configPath, updatedCfg);
+    if (MAC_RE.test(boundMac)) {
+      ctx.config = await withFileLock(ctx.paths.configPath, () => {
+        const cur = loadLaifenConfig(ctx.paths.configPath);
+        writeConfig(ctx.paths.configPath, { ...cur, targetMac: boundMac });
+        return loadLaifenConfig(ctx.paths.configPath);
+      });
+    }
     saveDeviceState(ctx.db, {
       mac: boundMac,
       address: boundMac,
@@ -1706,20 +1791,27 @@ async function handleSync(ctx) {
 
   if (pending && pending.patch) {
     const ops = { patch: pending.patch, refreshStatus: true };
-    const raw = await withManualBleYieldLock(ctx.dataDir, () => ctx.bleRunner(
-      [
-        'write',
-        '--timeout', String(timeoutSec),
-        '--target-mac', targetMac,
-        '--name-prefix', namePrefix,
-        '--ops-json', JSON.stringify(ops),
-        '--state-file', sPath,
-        '--session-id', syncSessionId,
-      ],
-      (timeoutSec + 10) * 1000,
-      ctx.signal,
-    ));
+    let raw;
+    try {
+      raw = await withManualBleYieldLock(ctx.dataDir, () => ctx.bleRunner(
+        [
+          'write',
+          '--timeout', String(timeoutSec),
+          '--target-mac', targetMac,
+          '--name-prefix', namePrefix,
+          '--ops-json', JSON.stringify(ops),
+          '--state-file', sPath,
+          '--session-id', syncSessionId,
+        ],
+        (timeoutSec + 10) * 1000,
+        ctx.signal,
+      ));
+    } catch (err) {
+      clearStaleOneShotSession(sPath, syncSessionId, ctx.nowMs, errMsg(err));
+      throw err;
+    }
     if (!raw || raw.ok === false) {
+      clearStaleOneShotSession(sPath, syncSessionId, ctx.nowMs, raw?.error);
       return {
         ok: false,
         notify: false,
@@ -1728,7 +1820,7 @@ async function handleSync(ctx) {
       };
     }
     consumePendingPatchIfMatches(ctx.dataDir, pending.patchId);
-    const saved = applyWriteResultToDb(ctx, raw, pending.patch, targetMac, 'sync');
+    const saved = await applyWriteResultToDb(ctx, raw, pending.patch, targetMac, 'sync');
     return {
       ok: true,
       notify: false,
@@ -1745,19 +1837,26 @@ async function handleSync(ctx) {
     };
   }
 
-  const raw = await withManualBleYieldLock(ctx.dataDir, () => ctx.bleRunner(
-    [
-      'sync',
-      '--timeout', String(timeoutSec),
-      '--target-mac', targetMac,
-      '--name-prefix', namePrefix,
-      '--state-file', sPath,
-      '--session-id', syncSessionId,
-    ],
-    (timeoutSec + 10) * 1000,
-    ctx.signal,
-  ));
+  let raw;
+  try {
+    raw = await withManualBleYieldLock(ctx.dataDir, () => ctx.bleRunner(
+      [
+        'sync',
+        '--timeout', String(timeoutSec),
+        '--target-mac', targetMac,
+        '--name-prefix', namePrefix,
+        '--state-file', sPath,
+        '--session-id', syncSessionId,
+      ],
+      (timeoutSec + 10) * 1000,
+      ctx.signal,
+    ));
+  } catch (err) {
+    clearStaleOneShotSession(sPath, syncSessionId, ctx.nowMs, errMsg(err));
+    throw err;
+  }
   if (!raw || raw.ok === false || !raw.statusHex) {
+    clearStaleOneShotSession(sPath, syncSessionId, ctx.nowMs, raw?.error);
     return {
       ok: false,
       notify: false,
@@ -1780,9 +1879,7 @@ async function handleSync(ctx) {
   const info = raw.infoHex ? LaifenProtocol.parsePacket(raw.infoHex) : null;
   const devMac = normalizeMac(raw.device?.address || targetMac || prev.mac);
 
-  if (!ctx.config.targetMac && MAC_RE.test(devMac)) {
-    writeConfig(ctx.paths.configPath, { ...ctx.config, targetMac: devMac });
-  }
+  await persistDiscoveredTargetMac(ctx, devMac);
 
   const saved = saveDeviceState(ctx.db, {
     mac: devMac,
@@ -1944,21 +2041,28 @@ async function handleSet(ctx) {
   const writeSessionId = `write-${ctx.nowMs}-${randomUUID().slice(0, 6)}`;
   const sPath = sessionFilePath(ctx.dataDir);
 
-  const raw = await withManualBleYieldLock(ctx.dataDir, () => ctx.bleRunner(
-    [
-      'write',
-      '--timeout', String(timeoutSec),
-      '--target-mac', targetMac,
-      '--name-prefix', namePrefix,
-      '--ops-json', JSON.stringify(ops),
-      '--state-file', sPath,
-      '--session-id', writeSessionId,
-    ],
-    (timeoutSec + 10) * 1000,
-    ctx.signal,
-  ));
+  let raw;
+  try {
+    raw = await withManualBleYieldLock(ctx.dataDir, () => ctx.bleRunner(
+      [
+        'write',
+        '--timeout', String(timeoutSec),
+        '--target-mac', targetMac,
+        '--name-prefix', namePrefix,
+        '--ops-json', JSON.stringify(ops),
+        '--state-file', sPath,
+        '--session-id', writeSessionId,
+      ],
+      (timeoutSec + 10) * 1000,
+      ctx.signal,
+    ));
+  } catch (err) {
+    clearStaleOneShotSession(sPath, writeSessionId, ctx.nowMs, errMsg(err));
+    throw err;
+  }
 
   if (!raw || raw.ok === false) {
+    clearStaleOneShotSession(sPath, writeSessionId, ctx.nowMs, raw?.error);
     const txEmpty = !Array.isArray(raw?.txLog) || raw.txLog.length === 0;
     if ((ctx.args.queueIfAsleep === true || ctx.config.autoWakeSync === true) && txEmpty) {
       const pendingPatch = writePendingPatch(ctx.dataDir, mergedPatch, ctx.nowMs);
@@ -1985,7 +2089,7 @@ async function handleSet(ctx) {
   }
 
   consumePendingPatchIfMatches(ctx.dataDir, existingPending?.patchId);
-  const saved = applyWriteResultToDb(ctx, raw, mergedPatch, targetMac, 'set');
+  const saved = await applyWriteResultToDb(ctx, raw, mergedPatch, targetMac, 'set');
 
   return {
     ok: true,
@@ -2035,20 +2139,27 @@ async function handlePower(ctx) {
   const writeSessionId = `write-${ctx.nowMs}-${randomUUID().slice(0, 6)}`;
   const sPath = sessionFilePath(ctx.dataDir);
 
-  const raw = await withManualBleYieldLock(ctx.dataDir, () => ctx.bleRunner(
-    [
-      'write',
-      '--timeout', String(timeoutSec),
-      '--target-mac', targetMac,
-      '--name-prefix', namePrefix,
-      '--ops-json', JSON.stringify(ops),
-      '--state-file', sPath,
-      '--session-id', writeSessionId,
-    ],
-    (timeoutSec + 10) * 1000,
-    ctx.signal,
-  ));
+  let raw;
+  try {
+    raw = await withManualBleYieldLock(ctx.dataDir, () => ctx.bleRunner(
+      [
+        'write',
+        '--timeout', String(timeoutSec),
+        '--target-mac', targetMac,
+        '--name-prefix', namePrefix,
+        '--ops-json', JSON.stringify(ops),
+        '--state-file', sPath,
+        '--session-id', writeSessionId,
+      ],
+      (timeoutSec + 10) * 1000,
+      ctx.signal,
+    ));
+  } catch (err) {
+    clearStaleOneShotSession(sPath, writeSessionId, ctx.nowMs, errMsg(err));
+    throw err;
+  }
   if (!raw || raw.ok === false) {
+    clearStaleOneShotSession(sPath, writeSessionId, ctx.nowMs, raw?.error);
     return {
       ok: false,
       notify: false,
@@ -2059,7 +2170,8 @@ async function handlePower(ctx) {
 
   /** @type {Partial<NonNullable<ReturnType<typeof getDeviceState>>>} */
   const prev = getDeviceState(ctx.db) || {};
-  const parsed = raw.afterHex ? LaifenProtocol.parsePacket(raw.afterHex, prev) : null;
+  const statusPacketHex = raw.afterHex || raw.baselineHex;
+  const parsed = statusPacketHex ? LaifenProtocol.parsePacket(statusPacketHex, prev) : null;
   const saved = saveDeviceState(ctx.db, {
     mac: normalizeMac(raw.device?.address || targetMac || prev.mac),
     name: raw.device?.name || prev.name,
@@ -2094,9 +2206,11 @@ async function handleWatchStart(ctx) {
   if (process.platform !== 'linux' && !ctx.hasInjectedBleRunner && !ctx.hasInjectedSpawnMonitor && !ctx.hasInjectedSpawnWatch) {
     return disabledBleResult();
   }
-  const next = { ...ctx.config, autoWakeSync: true };
-  writeConfig(ctx.paths.configPath, next);
-  ctx.config = loadLaifenConfig(ctx.paths.configPath);
+  ctx.config = await withFileLock(ctx.paths.configPath, () => {
+    const next = { ...loadLaifenConfig(ctx.paths.configPath), autoWakeSync: true };
+    writeConfig(ctx.paths.configPath, next);
+    return loadLaifenConfig(ctx.paths.configPath);
+  });
   const watchStatus = await ensureWatchDaemonIfEnabled(ctx, { force: true });
   const dashboard = buildDashboardData(ctx.db, ctx.dataDir, {
     limit: 30,
@@ -2117,9 +2231,11 @@ async function handleWatchStop(ctx) {
   if (process.platform !== 'linux' && !ctx.hasInjectedBleRunner && !ctx.hasInjectedSpawnMonitor && !ctx.hasInjectedSpawnWatch) {
     return disabledBleResult();
   }
-  const next = { ...ctx.config, autoWakeSync: false };
-  writeConfig(ctx.paths.configPath, next);
-  ctx.config = loadLaifenConfig(ctx.paths.configPath);
+  ctx.config = await withFileLock(ctx.paths.configPath, () => {
+    const next = { ...loadLaifenConfig(ctx.paths.configPath), autoWakeSync: false };
+    writeConfig(ctx.paths.configPath, next);
+    return loadLaifenConfig(ctx.paths.configPath);
+  });
   const watchStatus = await stopWatchDaemon(ctx);
   const dashboard = buildDashboardData(ctx.db, ctx.dataDir, {
     limit: 30,
@@ -2174,8 +2290,18 @@ function acquireSessionLockFile(dataDir) {
     } catch (err) {
       if (/** @type {NodeJS.ErrnoException} */ (err)?.code !== 'EEXIST') throw err;
       const meta = readJsonSafe(lockPath, null);
-      const holderPid = Number(meta?.pid);
-      const stale = !holderPid || !isPidAlive(holderPid) || (Date.now() - Number(meta?.at || 0) > 15_000);
+      let stale = false;
+      if (meta && typeof meta === 'object') {
+        const holderPid = Number(meta.pid);
+        stale = !holderPid || !isPidAlive(holderPid) || (Date.now() - Number(meta.at || 0) > 15_000);
+      } else {
+        try {
+          // Leave brief grace window for concurrent openSync -> writeSync to flush metadata
+          stale = (Date.now() - lstatSync(lockPath).mtimeMs) > 2_000;
+        } catch {
+          stale = true;
+        }
+      }
       if (stale && attempt === 0) {
         try {
           unlinkSync(lockPath);
@@ -2405,7 +2531,7 @@ function handleSessionDelete(ctx) {
   };
 }
 
-function handleBrushheadReset(ctx) {
+async function handleBrushheadReset(ctx) {
   let replacedAt = ctx.nowMs;
   if (ctx.args.replacedAt !== undefined && ctx.args.replacedAt !== null && ctx.args.replacedAt !== '') {
     const ts = asInt(ctx.args.replacedAt);
@@ -2414,9 +2540,12 @@ function handleBrushheadReset(ctx) {
     }
     replacedAt = ts;
   }
-  const next = { ...ctx.config, brushHeadReplacedAt: replacedAt };
-  writeConfig(ctx.paths.configPath, next);
-  const savedCfg = loadLaifenConfig(ctx.paths.configPath);
+  const savedCfg = await withFileLock(ctx.paths.configPath, () => {
+    const next = { ...loadLaifenConfig(ctx.paths.configPath), brushHeadReplacedAt: replacedAt };
+    writeConfig(ctx.paths.configPath, next);
+    return loadLaifenConfig(ctx.paths.configPath);
+  });
+  ctx.config = savedCfg;
   const dash = buildDashboardData(ctx.db, ctx.dataDir, {
     limit: 15,
     nowMs: ctx.nowMs,
@@ -2520,7 +2649,7 @@ export async function runAction(action, args = {}, deps = {}) {
       case 'session-delete':
         return handleSessionDelete(ctx);
       case 'brushhead-reset':
-        return handleBrushheadReset(ctx);
+        return await handleBrushheadReset(ctx);
       default:
         return { ok: false, notify: false, title: '未知动作', message: `不支持动作 ${cleanAction}` };
     }

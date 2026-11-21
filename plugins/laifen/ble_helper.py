@@ -284,10 +284,13 @@ def build_commands_from_patch(
         mode_idx = int(patch["modeIndex"]) if "modeIndex" in patch else (int(patch["mode"]) - 1 if "mode" in patch else 0)
         mode_idx = max(0, min(3, mode_idx))
         if has_params:
-            s = int(patch.get("strength", 11 if mode_idx == 3 else 5))
+            raw_s = patch.get("strength")
+            s = int(raw_s) if raw_s is not None else (11 if mode_idx == 3 else 5)
             s = max(11, min(20, s)) if mode_idx == 3 else max(1, min(10, s))
-            r = max(1, min(10, int(patch.get("range", 5))))
-            sp = max(1, min(10, int(patch.get("speed", 5))))
+            raw_r = patch.get("range")
+            r = max(1, min(10, int(raw_r) if raw_r is not None else 5))
+            raw_sp = patch.get("speed")
+            sp = max(1, min(10, int(raw_sp) if raw_sp is not None else 5))
             cmds.append({
                 "bytes": build_v2pro_cmd(0x0109, [mode_idx, s, r, sp]),
                 "label": "v2pro_mode_params",
@@ -1017,6 +1020,8 @@ class BaseBleSession:
 
     def _handle_connect_failure(self, err_msg: str) -> None:
         self.cancel_timer("resolve_timer_id")
+        self.cancel_timer("connect_timer_id")
+        self.cancel_timer("settle_timer_id")
         self.services_handled = False
         self.notify_active = False
         self.ff02_path = None
@@ -2015,9 +2020,10 @@ class WatchSession(BaseBleSession):
     def _check_yield(self) -> tuple[bool, str]:
         if self._is_manual_lock_active():
             return True, "等待手动操作完成"
-        own_live = os.path.join(os.path.dirname(os.path.abspath(self.state_file)), "live-session.json")
-        if self._is_active_session_file(own_live, 200.0, ("scanning", "connecting", "monitoring")):
-            return True, "等待手动监听或同步完成"
+        if self.state_file:
+            own_live = os.path.join(os.path.dirname(os.path.abspath(self.state_file)), "live-session.json")
+            if self._is_active_session_file(own_live, 200.0, ("scanning", "connecting", "monitoring")):
+                return True, "等待手动监听或同步完成"
         if self._is_active_session_file(self.peer_session_file, 90.0, ("scanning", "connecting", "measuring")):
             return True, "体脂秤测量中，蓝牙礼让"
         if self._is_peer_ble_lock_active():
@@ -2346,6 +2352,9 @@ class WatchSession(BaseBleSession):
             self._handle_connect_failure("蓝牙连接未完成服务解析即断开")
             return
         self.cancel_cycle_timers()
+        if self.cycle_phase == "refreshing_pending":
+            self._finish_pending_write_ok()
+            return
         if self.cycle_phase == "brushing" or (
             self.cycle_running_started_at is not None and self.cycle_active_sec >= 10
         ):
@@ -2505,13 +2514,17 @@ class WatchSession(BaseBleSession):
             self.cycle_cycling_notify = False
             self._finish_pending_write_ok()
             return False
+        def _on_cycle_start_err(_err: Any) -> None:
+            self.cycle_cycling_notify = False
+            self._finish_pending_write_ok()
         try:
             dbus.Interface(self.bus.get_object(BLUEZ_SERVICE, self.ff02_path), GATT_CHAR_IFACE).StartNotify(
                 reply_handler=lambda: self.on_notify_started(),
-                error_handler=lambda _e: self._finish_pending_write_ok(),
+                error_handler=_on_cycle_start_err,
                 timeout=6,
             )
         except Exception:
+            self.cycle_cycling_notify = False
             self._finish_pending_write_ok()
         return False
 
@@ -2524,6 +2537,7 @@ class WatchSession(BaseBleSession):
         return False
 
     def _finish_pending_write_ok(self) -> None:
+        self.cycle_cycling_notify = False
         patch_id = self.cycle_pending_patch_id
         self.cycle_applied_patch_id = patch_id
         self.last_applied_patch_id = patch_id
@@ -2531,6 +2545,9 @@ class WatchSession(BaseBleSession):
         self.cycle_sync_emitted = True
         self._emit_outbox_event("sync")
         self.state["error"] = None
+        if not self.connected:
+            self._disconnect_and_cooldown(self.cooldown_sec, "cooldown", "已完成暂存参数同步，短连接已释放")
+            return
         ref_raw = self.cycle_after_raw or self.cycle_baseline_raw
         self._after_status_synced(parse_status_running(ref_raw) if ref_raw else False, just_wrote=True)
 

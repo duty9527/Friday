@@ -420,7 +420,7 @@ class MeasureSession:
             try:
                 GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, self.on_signal)
             except Exception:
-                signal.signal(sig, lambda *_a: self.on_signal())
+                signal.signal(sig, lambda *_a: GLib.idle_add(lambda: (self.on_signal(), False)[1]))
 
         self.overall_timer_id = GLib.timeout_add(int(max(5.0, float(self.args.timeout)) * 1000), self.on_overall_timeout)
 
@@ -698,10 +698,11 @@ class MeasureSession:
                     stable = bool((encoded >> 31) & 1)
                     if stable and not self.seen_stable_weight:
                         self.seen_stable_weight = True
-                        self.state["message"] = "体重已锁定，正在测量双频生物电阻抗…"
-                        self.cancel_timer("grace_timer_id")
-                        # Wait up to 8.5s for BIA impedance (user might be wearing socks)
-                        self.grace_timer_id = GLib.timeout_add(8500, self._on_weight_only_grace)
+                        if not self.seen_adc:
+                            self.state["message"] = "体重已锁定，正在测量双频生物电阻抗…"
+                            self.cancel_timer("grace_timer_id")
+                            # Wait up to 8.5s for BIA impedance (user might be wearing socks)
+                            self.grace_timer_id = GLib.timeout_add(8500, self._on_weight_only_grace)
                 elif pkt_type == 214:  # PACKET_ADC
                     adc_count = pkt[2]
                     adcs: list[int] = []

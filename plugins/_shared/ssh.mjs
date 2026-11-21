@@ -126,10 +126,13 @@ export function parseSshTargets(rawSpec, defaultId = 'default') {
     const colonIdx = rest.lastIndexOf(':');
     const closeBracketIdx = rest.lastIndexOf(']');
     if (colonIdx > closeBracketIdx && colonIdx > 0) {
-      const maybePort = Number(rest.slice(colonIdx + 1));
-      if (Number.isInteger(maybePort) && maybePort >= 1 && maybePort <= 65535) {
-        port = maybePort;
-        userHost = rest.slice(0, colonIdx).trim();
+      const portStr = rest.slice(colonIdx + 1).trim();
+      if (/^\d{1,5}$/.test(portStr)) {
+        const maybePort = Number(portStr);
+        if (Number.isInteger(maybePort) && maybePort >= 1 && maybePort <= 65535) {
+          port = maybePort;
+          userHost = rest.slice(0, colonIdx).trim();
+        }
       }
     }
 
@@ -162,8 +165,13 @@ export function parseSshSpec(rawSpec, defaultId = 'default') {
  */
 export function resolvePrivateRunDir(homeDir) {
   const runDir = join(resolve(homeDir), 'run');
-  if (existsSync(runDir)) {
-    const st = lstatSync(runDir);
+  let st;
+  try {
+    st = lstatSync(runDir);
+  } catch (err) {
+    if (/** @type {NodeJS.ErrnoException} */ (err)?.code !== 'ENOENT') throw err;
+  }
+  if (st) {
     if (st.isSymbolicLink() || !st.isDirectory()) {
       throw new Error(`Refusing insecure SSH run directory (must be a real directory): ${runDir}`);
     }
@@ -171,6 +179,10 @@ export function resolvePrivateRunDir(homeDir) {
     return runDir;
   }
   mkdirSync(runDir, { recursive: true, mode: 0o700 });
+  const created = lstatSync(runDir);
+  if (created.isSymbolicLink() || !created.isDirectory()) {
+    throw new Error(`Refusing insecure SSH run directory (must be a real directory): ${runDir}`);
+  }
   chmodSync(runDir, 0o700);
   return runDir;
 }
@@ -309,9 +321,11 @@ export async function execSshText(target, remoteCmd, options = {}) {
       useControlMaster: withMaster,
       allowLegacyRsa,
     });
+    let usedControlMaster = false;
     if (withMaster) {
       const ctlArg = sshArgs.find(a => a.startsWith('ControlPath=') && a !== 'ControlPath=none');
       if (ctlArg) {
+        usedControlMaster = true;
         trackControlMaster(ctlArg.slice('ControlPath='.length), target);
       }
     }
@@ -323,24 +337,30 @@ export async function execSshText(target, remoteCmd, options = {}) {
         maxBuffer,
         ...(signal ? { signal } : {}),
       });
-      return { stdout: String(stdout ?? ''), stderr: String(stderr ?? ''), code: 0 };
+      return { stdout: String(stdout ?? ''), stderr: String(stderr ?? ''), code: 0, usedControlMaster };
     } catch (err) {
-      const e = /** @type {{ name?: string; stdout?: unknown; stderr?: unknown; code?: unknown; status?: unknown; message?: string }} */ (err);
-      if (e?.name === 'AbortError') throw err;
-      const code = typeof e?.code === 'number' ? e.code : (typeof e?.status === 'number' ? e.status : 1);
+      const e = /** @type {{ name?: string; stdout?: unknown; stderr?: unknown; code?: unknown; status?: unknown; killed?: boolean; signal?: unknown; message?: string }} */ (err);
+      if (signal?.aborted || e?.name === 'AbortError') throw err;
+      const numericCode = typeof e?.code === 'number' ? e.code : (typeof e?.status === 'number' ? e.status : undefined);
+      const code = numericCode ?? 1;
+      const rawStderr = e?.stderr !== undefined && e?.stderr !== null ? String(e.stderr) : '';
+      const abnormalExit = Boolean(e?.killed || e?.signal || numericCode === undefined);
+      const stderr = rawStderr || (abnormalExit || (e?.stderr === undefined || e?.stderr === null) ? String(e?.message ?? '') : '');
       return {
         stdout: String(e?.stdout ?? ''),
-        stderr: String(e?.stderr ?? e?.message ?? ''),
+        stderr,
         code,
+        usedControlMaster,
       };
     }
   };
 
   const first = await runOnce(useControlMaster);
-  if (first.code === 255 && useControlMaster && SSH_MUX_ERROR_RE.test(first.stderr)) {
-    return await runOnce(false);
+  if (first.code === 255 && first.usedControlMaster && SSH_MUX_ERROR_RE.test(first.stderr)) {
+    const retried = await runOnce(false);
+    return { stdout: retried.stdout, stderr: retried.stderr, code: retried.code };
   }
-  return first;
+  return { stdout: first.stdout, stderr: first.stderr, code: first.code };
 }
 
 /**
@@ -400,11 +420,16 @@ export async function execSshBinary(target, remoteCmd, options = {}) {
       code: 0,
     };
   } catch (err) {
-    const e = /** @type {{ name?: string; stdout?: unknown; stderr?: unknown; code?: unknown; status?: unknown; message?: string }} */ (err);
-    if (e?.name === 'AbortError') throw err;
-    const code = typeof e?.code === 'number' ? e.code : (typeof e?.status === 'number' ? e.status : 1);
+    const e = /** @type {{ name?: string; stdout?: unknown; stderr?: unknown; code?: unknown; status?: unknown; killed?: boolean; signal?: unknown; message?: string }} */ (err);
+    if (signal?.aborted || e?.name === 'AbortError') throw err;
+    const numericCode = typeof e?.code === 'number' ? e.code : (typeof e?.status === 'number' ? e.status : undefined);
+    const code = numericCode ?? 1;
     const stdoutBuf = Buffer.isBuffer(e?.stdout) ? e.stdout : Buffer.from(String(e?.stdout ?? ''), 'utf8');
-    const stderrStr = Buffer.isBuffer(e?.stderr) ? e.stderr.toString('utf8') : String(e?.stderr ?? e?.message ?? '');
+    const rawStderr = Buffer.isBuffer(e?.stderr)
+      ? e.stderr.toString('utf8')
+      : (e?.stderr !== undefined && e?.stderr !== null ? String(e.stderr) : '');
+    const abnormalExit = Boolean(e?.killed || e?.signal || numericCode === undefined);
+    const stderrStr = rawStderr || (abnormalExit || (e?.stderr === undefined || e?.stderr === null) ? String(e?.message ?? '') : '');
     return { stdout: stdoutBuf, stderr: stderrStr, code };
   }
 }

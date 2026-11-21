@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { closeSync, constants, existsSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
+import { chmodSync, closeSync, constants, existsSync, lstatSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
@@ -20,6 +20,7 @@ import {
 const execFileAsync = promisify(execFile);
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url));
 const HELPER_PATH = join(PLUGIN_DIR, 'ble_helper.py');
+const PYTHON_BIN = existsSync('/usr/bin/python3') ? '/usr/bin/python3' : 'python3';
 
 export const DEFAULT_SCALE_MAC = '';
 export const DEFAULT_NAME_PREFIX = 'AFU-WL';
@@ -190,91 +191,105 @@ function openDb(paths, nowMs, config) {
   const dbPath = join(paths.pluginDataDir, 'health.db');
   const dbExistsBeforeOpen = existsSync(dbPath);
   const db = new DatabaseSync(dbPath);
-  db.exec(`
-    PRAGMA journal_mode = WAL;
-    PRAGMA busy_timeout = 5000;
-  `);
-
-  if (!dbExistsBeforeOpen || !INITIALIZED_DB_PATHS.has(dbPath)) {
+  try {
+    try {
+      chmodSync(dbPath, 0o600);
+    } catch {
+      // ignore chmod failures on restricted filesystems
+    }
     db.exec(`
-      CREATE TABLE IF NOT EXISTS profiles (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        sex TEXT NOT NULL,
-        age INTEGER NOT NULL,
-        height_cm REAL NOT NULL,
-        target_weight_kg REAL,
-        unit TEXT NOT NULL DEFAULT 'kg',
-        is_default INTEGER NOT NULL DEFAULT 0,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS devices (
-        mac TEXT PRIMARY KEY,
-        address TEXT NOT NULL,
-        name TEXT NOT NULL,
-        rssi INTEGER,
-        battery INTEGER,
-        charging INTEGER,
-        protocol_ver INTEGER,
-        device_subtype INTEGER,
-        model TEXT,
-        hardware_ver TEXT,
-        software_ver TEXT,
-        manufacturer TEXT,
-        support_funs_json TEXT,
-        raw_adv_json TEXT,
-        last_seen_at INTEGER NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS measurements (
-        id TEXT PRIMARY KEY,
-        dedup_key TEXT UNIQUE,
-        profile_id TEXT NOT NULL,
-        measured_at INTEGER NOT NULL,
-        source TEXT NOT NULL,
-        device_mac TEXT,
-        weight_kg REAL NOT NULL,
-        weight_jin REAL NOT NULL,
-        weight_lb REAL NOT NULL,
-        weight_g INTEGER NOT NULL,
-        stable INTEGER NOT NULL DEFAULT 1,
-        impedance_measured INTEGER NOT NULL DEFAULT 0,
-        adcs_json TEXT,
-        impedances_json TEXT,
-        primary_ohm REAL,
-        secondary_ohm REAL,
-        alg_type INTEGER,
-        heart_rate INTEGER,
-        battery INTEGER,
-        charging INTEGER,
-        rssi INTEGER,
-        calibration_mode INTEGER,
-        over_weight INTEGER,
-        dianji INTEGER,
-        raw_meta_json TEXT,
-        note TEXT,
-        created_at INTEGER NOT NULL
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_measurements_profile_time
-        ON measurements(profile_id, measured_at DESC);
+      PRAGMA journal_mode = WAL;
+      PRAGMA busy_timeout = 5000;
     `);
 
-    const profileCount = db.prepare('SELECT COUNT(*) AS cnt FROM profiles').get().cnt;
-    if (profileCount === 0 && config?.defaultProfile) {
-      const dp = config.defaultProfile;
-      db.prepare(`
-        INSERT INTO profiles (id, name, sex, age, height_cm, target_weight_kg, unit, is_default, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-      `).run(dp.id, dp.name, dp.sex, dp.age, dp.heightCm, dp.targetWeightKg, dp.unit, nowMs, nowMs);
+    if (!dbExistsBeforeOpen || !INITIALIZED_DB_PATHS.has(dbPath)) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS profiles (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          sex TEXT NOT NULL,
+          age INTEGER NOT NULL,
+          height_cm REAL NOT NULL,
+          target_weight_kg REAL,
+          unit TEXT NOT NULL DEFAULT 'kg',
+          is_default INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS devices (
+          mac TEXT PRIMARY KEY,
+          address TEXT NOT NULL,
+          name TEXT NOT NULL,
+          rssi INTEGER,
+          battery INTEGER,
+          charging INTEGER,
+          protocol_ver INTEGER,
+          device_subtype INTEGER,
+          model TEXT,
+          hardware_ver TEXT,
+          software_ver TEXT,
+          manufacturer TEXT,
+          support_funs_json TEXT,
+          raw_adv_json TEXT,
+          last_seen_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS measurements (
+          id TEXT PRIMARY KEY,
+          dedup_key TEXT UNIQUE,
+          profile_id TEXT NOT NULL,
+          measured_at INTEGER NOT NULL,
+          source TEXT NOT NULL,
+          device_mac TEXT,
+          weight_kg REAL NOT NULL,
+          weight_jin REAL NOT NULL,
+          weight_lb REAL NOT NULL,
+          weight_g INTEGER NOT NULL,
+          stable INTEGER NOT NULL DEFAULT 1,
+          impedance_measured INTEGER NOT NULL DEFAULT 0,
+          adcs_json TEXT,
+          impedances_json TEXT,
+          primary_ohm REAL,
+          secondary_ohm REAL,
+          alg_type INTEGER,
+          heart_rate INTEGER,
+          battery INTEGER,
+          charging INTEGER,
+          rssi INTEGER,
+          calibration_mode INTEGER,
+          over_weight INTEGER,
+          dianji INTEGER,
+          raw_meta_json TEXT,
+          note TEXT,
+          created_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_measurements_profile_time
+          ON measurements(profile_id, measured_at DESC);
+      `);
+
+      const profileCount = db.prepare('SELECT COUNT(*) AS cnt FROM profiles').get().cnt;
+      if (profileCount === 0 && config?.defaultProfile) {
+        const dp = config.defaultProfile;
+        db.prepare(`
+          INSERT INTO profiles (id, name, sex, age, height_cm, target_weight_kg, unit, is_default, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+        `).run(dp.id, dp.name, dp.sex, dp.age, dp.heightCm, dp.targetWeightKg, dp.unit, nowMs, nowMs);
+      }
+
+      INITIALIZED_DB_PATHS.add(dbPath);
     }
 
-    INITIALIZED_DB_PATHS.add(dbPath);
+    return { db, dbPath };
+  } catch (err) {
+    try {
+      db.close();
+    } catch {
+      // ignore close failure
+    }
+    throw err;
   }
-
-  return { db, dbPath };
 }
 
 // ---------------------------------------------------------------------------
@@ -1695,7 +1710,7 @@ function readLiveSessionSnapshot(dataDir, db, activeProfileId, nowMs, ingestComp
   const path = sessionFilePath(dataDir);
   if (!existsSync(path)) return null;
 
-  const raw = safeJsonParse(readFileSync(path, 'utf8'), null);
+  const raw = readJsonSafe(path, null);
   if (!raw || typeof raw !== 'object') return null;
 
   let phase = raw.phase || 'idle';
@@ -1703,7 +1718,12 @@ function readLiveSessionSnapshot(dataDir, db, activeProfileId, nowMs, ingestComp
   let error = raw.error || null;
 
   const activePhases = new Set(['scanning', 'connecting', 'measuring']);
-  if (activePhases.has(phase) && raw.pid && !isBleHelperPid(Number(raw.pid))) {
+  if (
+    activePhases.has(phase)
+    && process.platform === 'linux'
+    && raw.pid
+    && !isBleHelperPid(Number(raw.pid))
+  ) {
     // Process exited unexpectedly without writing terminal phase
     phase = 'error';
     error = error || '蓝牙采集进程已退出，请重新发起测量';
@@ -1798,7 +1818,7 @@ function readLiveSessionSnapshot(dataDir, db, activeProfileId, nowMs, ingestComp
         finalLiveProfile = resolveMeasurementProfile(db, profiles, targetProfileId, weightKg, { source: 'live' });
         const adcs = decoded.latestAdc?.adcs || [];
         const impedances = decoded.latestAdc?.impedances || normalizeImpedances(adcs, weightKg);
-        const dedupKey = `live:${raw.sessionId}`;
+        const dedupKey = raw.sessionId ? `live:${raw.sessionId}` : null;
         const res = insertMeasurement(db, {
           dedupKey,
           profileId: finalLiveProfile?.id || targetProfileId,
@@ -1876,20 +1896,39 @@ function readLiveSessionSnapshot(dataDir, db, activeProfileId, nowMs, ingestComp
 // ---------------------------------------------------------------------------
 
 async function defaultBleRunner(commandArgs, timeoutMs = 15_000, signal) {
-  const { stdout } = await execFileAsync('python3', [HELPER_PATH, ...commandArgs], {
-    cwd: PLUGIN_DIR,
-    timeout: timeoutMs,
-    maxBuffer: 2 * 1024 * 1024,
-    ...(signal ? { signal } : {}),
-  });
-  return JSON.parse(String(stdout || '{}').trim() || '{}');
+  try {
+    const { stdout } = await execFileAsync(PYTHON_BIN, [HELPER_PATH, ...commandArgs], {
+      cwd: PLUGIN_DIR,
+      timeout: timeoutMs,
+      maxBuffer: 2 * 1024 * 1024,
+      ...(signal ? { signal } : {}),
+    });
+    return JSON.parse(String(stdout || '{}').trim() || '{}');
+  } catch (err) {
+    const e = /** @type {{ name?: string; stdout?: unknown; message?: string }} */ (err);
+    if (signal?.aborted || e?.name === 'AbortError') throw err;
+    const rawOut = String(e?.stdout || '').trim();
+    if (rawOut) {
+      try {
+        const parsed = JSON.parse(rawOut);
+        if (parsed && typeof parsed === 'object') return parsed;
+      } catch {
+        // fall through to sanitized error
+      }
+    }
+    const sanitized = errMsg(err).split(HELPER_PATH).join('ble_helper.py').split(PLUGIN_DIR).join('health-scale');
+    throw new Error(sanitized);
+  }
 }
 
 function defaultSpawnMeasure(commandArgs) {
-  const child = spawn('python3', [HELPER_PATH, ...commandArgs], {
+  const child = spawn(PYTHON_BIN, [HELPER_PATH, ...commandArgs], {
     cwd: PLUGIN_DIR,
     detached: true,
     stdio: 'ignore',
+  });
+  child.on('error', () => {
+    // Prevent unhandled EventEmitter crash if python binary cannot spawn
   });
   child.unref();
   return child.pid;
@@ -1983,8 +2022,18 @@ function acquireSessionLockFile(dataDir) {
     } catch (err) {
       if (/** @type {NodeJS.ErrnoException} */ (err)?.code !== 'EEXIST') throw err;
       const meta = readJsonSafe(lockPath, null);
-      const holderPid = Number(meta?.pid);
-      const stale = !holderPid || !isPidAlive(holderPid) || (Date.now() - Number(meta?.at || 0) > 15_000);
+      let stale = false;
+      if (meta && typeof meta === 'object') {
+        const holderPid = Number(meta.pid);
+        stale = !holderPid || !isPidAlive(holderPid) || (Date.now() - Number(meta.at || 0) > 15_000);
+      } else {
+        try {
+          // Leave brief grace window for concurrent openSync -> writeSync to flush metadata
+          stale = (Date.now() - lstatSync(lockPath).mtimeMs) > 2_000;
+        } catch {
+          stale = true;
+        }
+      }
       if (stale && attempt === 0) {
         try {
           unlinkSync(lockPath);
@@ -2207,7 +2256,7 @@ function handleProfileSave(ctx) {
   const args = ctx.args;
   const requestedId = args.id ? String(args.id).trim() : '';
   const name = String(args.name || '').trim();
-  const sexRaw = args.sex !== undefined ? String(args.sex).trim() : '';
+  const sexRaw = args.sex !== undefined && args.sex !== null ? String(args.sex).trim() : '';
   const sex = sexRaw ? normalizeSexInput(sexRaw) : undefined;
   const age = args.age !== undefined && args.age !== null && args.age !== '' ? asInt(args.age) : undefined;
   const rawHeight = args.heightCm ?? args.height;
@@ -2457,47 +2506,50 @@ function handleStatus(ctx) {
   };
 }
 
-function handleConfig(ctx) {
+async function handleConfig(ctx) {
   const { args, paths } = ctx;
-  const next = loadScaleConfig(paths.configPath);
-  let changed = false;
+  const { next, changed } = await withFileLock(paths.configPath, () => {
+    const cur = loadScaleConfig(paths.configPath);
+    let didChange = false;
 
-  if (args.targetMac !== undefined) {
-    const mac = normalizeMac(args.targetMac);
-    if (mac && !/^([0-9A-F]{2}:){5}[0-9A-F]{2}$/.test(mac)) {
-      throw new Error(`targetMac "${args.targetMac}" 格式无效（示例 AA:BB:CC:DD:EE:FF 或空字符串）`);
-    }
-    next.targetMac = mac;
-    changed = true;
-  }
-  if (args.namePrefix !== undefined) {
-    const prefix = String(args.namePrefix ?? '').trim();
-    next.namePrefix = prefix || DEFAULT_NAME_PREFIX;
-    changed = true;
-  }
-  if (args.defaultProfile !== undefined) {
-    if (args.defaultProfile === null) {
-      next.defaultProfile = null;
-    } else {
-      const dp = normalizeDefaultProfile(args.defaultProfile);
-      if (!dp) {
-        throw new Error('defaultProfile 格式无效（需包含有效 name、sex、age[5-120]、heightCm[80-230]）');
+    if (args.targetMac !== undefined) {
+      const mac = normalizeMac(args.targetMac);
+      if (mac && !/^([0-9A-F]{2}:){5}[0-9A-F]{2}$/.test(mac)) {
+        throw new Error(`targetMac "${args.targetMac}" 格式无效（示例 AA:BB:CC:DD:EE:FF 或空字符串）`);
       }
-      next.defaultProfile = dp;
-      const cnt = ctx.db.prepare('SELECT COUNT(*) AS cnt FROM profiles').get().cnt;
-      if (cnt === 0) {
-        ctx.db.prepare(`
-          INSERT INTO profiles (id, name, sex, age, height_cm, target_weight_kg, unit, is_default, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-        `).run(dp.id, dp.name, dp.sex, dp.age, dp.heightCm, dp.targetWeightKg, dp.unit, ctx.nowMs, ctx.nowMs);
-      }
+      cur.targetMac = mac;
+      didChange = true;
     }
-    changed = true;
-  }
+    if (args.namePrefix !== undefined) {
+      const prefix = String(args.namePrefix ?? '').trim();
+      cur.namePrefix = prefix || DEFAULT_NAME_PREFIX;
+      didChange = true;
+    }
+    if (args.defaultProfile !== undefined) {
+      if (args.defaultProfile === null) {
+        cur.defaultProfile = null;
+      } else {
+        const dp = normalizeDefaultProfile(args.defaultProfile);
+        if (!dp) {
+          throw new Error('defaultProfile 格式无效（需包含有效 name、sex、age[5-120]、heightCm[80-230]）');
+        }
+        cur.defaultProfile = dp;
+        const cnt = ctx.db.prepare('SELECT COUNT(*) AS cnt FROM profiles').get().cnt;
+        if (cnt === 0) {
+          ctx.db.prepare(`
+            INSERT INTO profiles (id, name, sex, age, height_cm, target_weight_kg, unit, is_default, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+          `).run(dp.id, dp.name, dp.sex, dp.age, dp.heightCm, dp.targetWeightKg, dp.unit, ctx.nowMs, ctx.nowMs);
+        }
+      }
+      didChange = true;
+    }
 
-  if (changed) {
-    writeConfig(paths.configPath, next);
-  }
+    if (didChange) {
+      writeConfig(paths.configPath, cur);
+    }
+    return { next: cur, changed: didChange };
+  });
 
   return {
     ok: true,
@@ -2555,7 +2607,7 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
     switch (name) {
       case 'dashboard': return handleDashboard(ctx);
       case 'status': return handleStatus(ctx);
-      case 'config': return handleConfig(ctx);
+      case 'config': return await handleConfig(ctx);
       case 'scan': return await handleScan(ctx);
       case 'measure-start': return await handleMeasureStart(ctx);
       case 'measure-status': return await handleMeasureStatus(ctx);
