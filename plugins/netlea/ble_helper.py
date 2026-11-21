@@ -5,7 +5,8 @@ Uses system Python `dbus` + `gi.repository.GLib` with zero third-party pip deps.
 Supports two subcommands:
   - scan: discover matching Netlea BLE light(s) and print JSON to stdout
   - command: short-lived GATT connection to 0xFFFA (notify 0xFF01, write 0xFF02),
-             send one 0x5A frame, capture reply/0x14 state frame, and disconnect.
+             send one or more comma-separated 0x5A frames, capture 0x14/0x1A/0x12/ack frames,
+             and disconnect immediately.
 """
 
 from __future__ import annotations
@@ -351,28 +352,63 @@ def run_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+VALID_REPLY_CMDS = {0x02, 0x07, 0x12, 0x13, 0x14, 0x19, 0x1A, 0x1C, 0x1F, 0x20}
+
+
 def is_expected_netlea_reply(raw_bytes: bytes) -> tuple[bool, bool]:
-    """Return (is_ack, is_state_14_frame)."""
+    """Return (is_ack, is_state_14_frame) after verifying frame length and checksum."""
     if len(raw_bytes) < 7 or raw_bytes[0] != 0x5A:
         return False, False
+    declared_len = raw_bytes[1]
+    if declared_len < 7 or len(raw_bytes) < declared_len:
+        return False, False
+    if (sum(raw_bytes[: declared_len - 1]) & 0xFF) != raw_bytes[declared_len - 1]:
+        return False, False
     cmd = raw_bytes[3]
-    if cmd == 0x14 and len(raw_bytes) >= 38:
-        return True, True
-    if cmd == 0x02:
+    if cmd == 0x14:
+        return (True, True) if declared_len >= 38 and len(raw_bytes) >= 38 else (False, False)
+    if cmd == 0x1A:
+        return (True, False) if declared_len >= 19 and len(raw_bytes) >= 19 else (False, False)
+    if cmd == 0x12:
+        return (True, False) if declared_len >= 152 and len(raw_bytes) >= 152 else (False, False)
+    if cmd in VALID_REPLY_CMDS:
         return True, False
     return False, False
 
 
+def _pump_glib(ctx: GLib.MainContext, duration_sec: float) -> None:
+    end_ts = time.monotonic() + max(0.0, duration_sec)
+    while time.monotonic() < end_ts:
+        while ctx.pending():
+            ctx.iteration(False)
+        time.sleep(0.015)
+
+
 def run_command(args: argparse.Namespace) -> int:
-    tx_hex = str(args.tx or "").strip().upper()
-    try:
-        tx_bytes = bytes.fromhex(tx_hex)
-    except ValueError as exc:
-        print(json.dumps({"ok": False, "code": "INVALID_TX", "error": f"无效的 TX 十六进制帧: {exc}"}, ensure_ascii=False))
-        return 0
-    if not tx_bytes:
+    raw_tx_spec = str(args.tx or "").strip().upper()
+    tx_parts = [part.strip() for part in raw_tx_spec.split(",") if part.strip()]
+    tx_frames: list[bytes] = []
+    for part in tx_parts:
+        try:
+            frame_bytes = bytes.fromhex(part)
+        except ValueError as exc:
+            print(json.dumps({"ok": False, "code": "INVALID_TX", "error": f"无效的 TX 十六进制帧: {exc}"}, ensure_ascii=False))
+            return 0
+        if frame_bytes:
+            tx_frames.append(frame_bytes)
+    if not tx_frames:
         print(json.dumps({"ok": False, "code": "INVALID_TX", "error": "TX 命令帧不能为空"}, ensure_ascii=False))
         return 0
+    tx_hex = ",".join(f.hex().upper() for f in tx_frames)
+
+    tx_cmds = {f[3] for f in tx_frames if len(f) >= 4}
+    expected_cmds: set[int] = set()
+    if tx_cmds & {0x13, 0x15, 0x10}:
+        expected_cmds.add(0x14)
+    if tx_cmds & {0x1A, 0x1B}:
+        expected_cmds.add(0x1A)
+    if 0x25 in tx_cmds:
+        expected_cmds.add(0x12)
 
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     bus = dbus.SystemBus()
@@ -412,27 +448,65 @@ def run_command(args: argparse.Namespace) -> int:
     time.sleep(0.15)
 
     replies: list[dict[str, Any]] = []
+    rx_buf = bytearray()
     state_hex: str | None = None
+    temp_config_hex: str | None = None
+    schedule_hex: str | None = None
+    state_has_travel: bool | None = None
+    received_cmds: set[int] = set()
     ack_received = False
+    last_ack_ts = 0.0
     notify_iface: dbus.Interface | None = None
     prop_sig = None
+
+    def process_packet(pkt: bytes, char_name: str) -> None:
+        nonlocal state_hex, temp_config_hex, schedule_hex, state_has_travel, ack_received, last_ack_ts
+        pkt_hex = pkt.hex().upper()
+        replies.append({"char": char_name, "hex": pkt_hex, "at": now_ms()})
+        is_ack, is_state14 = is_expected_netlea_reply(pkt)
+        if not is_ack:
+            return
+        ack_received = True
+        last_ack_ts = time.monotonic()
+        cmd = pkt[3]
+        received_cmds.add(cmd)
+        if is_state14:
+            state_hex = pkt_hex
+            if len(pkt) > 11:
+                state_has_travel = bool(pkt[11] & 0x02)
+        elif cmd == 0x1A:
+            temp_config_hex = pkt_hex
+        elif cmd == 0x12:
+            schedule_hex = pkt_hex
 
     def on_props_changed(
         interface: str, changed: dict[str, Any], _invalidated: Any, path: str | None = None
     ) -> None:
-        nonlocal state_hex, ack_received
         if interface != GATT_CHAR_IFACE or not path or not str(path).startswith(dev_path + "/"):
             return
         if "Value" not in changed:
             return
         raw_bytes = bytes(int(b) & 0xFF for b in changed["Value"])
-        hex_str = raw_bytes.hex().upper()
-        replies.append({"char": str(path).split("/")[-1], "hex": hex_str, "at": now_ms()})
-        is_ack, is_state14 = is_expected_netlea_reply(raw_bytes)
-        if is_state14 and state_hex is None:
-            state_hex = hex_str
-        if is_ack:
-            ack_received = True
+        char_name = str(path).split("/")[-1]
+        rx_buf.extend(raw_bytes)
+        while rx_buf:
+            if rx_buf[0] != 0x5A:
+                idx = rx_buf.find(b"\x5a")
+                if idx < 0:
+                    rx_buf.clear()
+                    break
+                del rx_buf[:idx]
+            if len(rx_buf) < 7:
+                break
+            declared_len = rx_buf[1]
+            if declared_len < 7:
+                del rx_buf[0]
+                continue
+            if len(rx_buf) < declared_len:
+                break
+            pkt = bytes(rx_buf[:declared_len])
+            del rx_buf[:declared_len]
+            process_packet(pkt, char_name)
 
     prop_sig = bus.add_signal_receiver(
         on_props_changed,
@@ -502,32 +576,46 @@ def run_command(args: argparse.Namespace) -> int:
         write_iface = dbus.Interface(bus.get_object(BLUEZ_SERVICE, write_path), GATT_CHAR_IFACE)
 
         notify_iface.StartNotify()
-        pump_until = time.monotonic() + 0.2
-        while time.monotonic() < pump_until:
-            while ctx.pending():
-                ctx.iteration(False)
-            time.sleep(0.02)
+        _pump_glib(ctx, 0.2)
         replies.clear()
+        rx_buf.clear()
         state_hex = None
+        temp_config_hex = None
+        schedule_hex = None
+        state_has_travel = None
+        received_cmds.clear()
         ack_received = False
+        last_ack_ts = 0.0
 
-        arr = dbus.Array([dbus.Byte(b) for b in tx_bytes], signature="y")
-        try:
-            write_iface.WriteValue(arr, dbus.Dictionary({"type": dbus.String("command")}, signature="sv"))
-        except Exception:
-            write_iface.WriteValue(arr, dbus.Dictionary({}, signature="sv"))
+        inter_frame_sec = max(0.05, float(args.inter_frame_ms) / 1000.0)
+        for idx, frame_bytes in enumerate(tx_frames):
+            # Track state_has_travel freshly from any state queries triggered later
+            if len(frame_bytes) >= 4 and frame_bytes[3] in (0x12, 0x10):
+                state_hex = None
+                state_has_travel = None
+                received_cmds.discard(0x14)
+                if frame_bytes[3] == 0x12:
+                    received_cmds.discard(0x12)
+                    schedule_hex = None
+            arr = dbus.Array([dbus.Byte(b) for b in frame_bytes], signature="y")
+            try:
+                write_iface.WriteValue(arr, dbus.Dictionary({"type": dbus.String("command")}, signature="sv"))
+            except Exception:
+                write_iface.WriteValue(arr, dbus.Dictionary({}, signature="sv"))
+            if idx < len(tx_frames) - 1:
+                _pump_glib(ctx, inter_frame_sec)
 
         reply_deadline = time.monotonic() + max(0.5, float(args.reply_timeout))
         while time.monotonic() < reply_deadline:
             while ctx.pending():
                 ctx.iteration(False)
-            if ack_received:
-                # Tiny settle window for trailing packets if any
-                settle_end = time.monotonic() + 0.05
-                while time.monotonic() < settle_end:
-                    while ctx.pending():
-                        ctx.iteration(False)
-                    time.sleep(0.01)
+            eff_expected = set(expected_cmds)
+            if state_has_travel is False:
+                eff_expected.discard(0x12)
+            if eff_expected and eff_expected.issubset(received_cmds):
+                _pump_glib(ctx, 0.1)
+                break
+            if not eff_expected and ack_received and (time.monotonic() - last_ack_ts) >= 0.15:
                 break
             time.sleep(0.02)
 
@@ -555,6 +643,8 @@ def run_command(args: argparse.Namespace) -> int:
                     "tx": tx_hex,
                     "replies": replies,
                     "stateHex": state_hex,
+                    "tempConfigHex": temp_config_hex,
+                    "scheduleHex": schedule_hex,
                 },
                 ensure_ascii=False,
             )
@@ -594,7 +684,8 @@ def build_parser() -> argparse.ArgumentParser:
     cmd_p.add_argument("--name-prefix", default="SG-")
     cmd_p.add_argument("--scan-timeout", type=float, default=6.0)
     cmd_p.add_argument("--connect-timeout", type=float, default=10.0)
-    cmd_p.add_argument("--reply-timeout", type=float, default=3.0)
+    cmd_p.add_argument("--reply-timeout", type=float, default=3.5)
+    cmd_p.add_argument("--inter-frame-ms", type=int, default=120)
     cmd_p.add_argument("--adapter", default="")
 
     return parser

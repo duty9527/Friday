@@ -523,7 +523,10 @@ test('Web console lazy-loads health-scale UI, serves redacted PluginView metadat
     assert.match(html, /id="ninebot-trend-canvas"/);
     assert.match(html, /id="plugin-tab-netlea"/);
     assert.match(html, /id="plugin-panel-netlea"/);
+    assert.match(html, /id="netlea-timeline-canvas"/);
     assert.match(html, /id="netlea-spectrum-canvas"/);
+    assert.match(html, /id="netlea-clock-btn"/);
+    assert.match(html, /id="netlea-workspace-tabs"/);
     assert.match(html, /id="plugin-tab-apple-devices"/);
     assert.match(html, /id="plugin-panel-apple-devices"/);
     assert.match(html, /id="apple-devices-grid"/);
@@ -531,7 +534,7 @@ test('Web console lazy-loads health-scale UI, serves redacted PluginView metadat
     assert.doesNotMatch(html, /id="open-fund-hub-top"/, 'fund surface must live inside M3 plugin hub');
     assert.doesNotMatch(html, /\sstyle="/i);
     assert.doesNotMatch(html, /<input[^>]+type=["']file["']/i);
-    assert.doesNotMatch(html, /018168|192\.168\./, 'index.html must not contain hardcoded personal samples');
+    assert.doesNotMatch(html, /018168|192\.168\.|CC:03:3D/i, 'index.html must not contain hardcoded personal samples');
 
     const clientJs = await (await fetch(`${f.base}/client.js`)).text();
     assert.match(clientJs, /import\(\s*['"]\.\/plugins\/health-scale-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load health-scale-ui.js');
@@ -558,7 +561,7 @@ test('Web console lazy-loads health-scale UI, serves redacted PluginView metadat
     assert.doesNotMatch(ninebotUiJs, /\.style\.|setAttribute\(\s*['"]style['"]/, 'ninebot-ui must obey strict CSP without inline style mutations');
     const netleaUiJs = await (await fetch(`${f.base}/plugins/netlea-ui.js`)).text();
     assert.match(netleaUiJs, /initNetleaUi/);
-    assert.doesNotMatch(netleaUiJs, /\.style\.|setAttribute\(\s*['"]style['"]/, 'netlea-ui must obey strict CSP without inline style mutations');
+    assert.doesNotMatch(netleaUiJs, /\.style\.|setAttribute\(\s*['"]style['"]|\.innerHTML\b/, 'netlea-ui must obey strict CSP without inline style or innerHTML mutations');
     const appleUiJs = await (await fetch(`${f.base}/plugins/apple-devices-ui.js`)).text();
     assert.match(appleUiJs, /initAppleDevicesUi/);
     assert.doesNotMatch(appleUiJs, /\.style\.|setAttribute\(\s*['"]style['"]/, 'apple-devices-ui must obey strict CSP without inline style mutations');
@@ -619,15 +622,31 @@ test('Web console lazy-loads health-scale UI, serves redacted PluginView metadat
     assert.equal(Array.isArray(fundDashRes.data?.snapshots), true);
 
     if (process.platform === 'linux') {
+      const netleaPreviewRes = await (await fetch(`${f.base}/api/plugin-run`, {
+        method: 'POST',
+        headers: f.headers,
+        body: JSON.stringify({
+          plugin: 'netlea',
+          action: 'schedule',
+          args: { op: 'preset', preset: 'open_tank', previewOnly: true, lengthCm: 60, widthCm: 30, heightCm: 36 },
+        }),
+      })).json() as { ok: boolean; notify: boolean; plugin: string; data?: { schedule?: { trips?: unknown[] } } };
+      assert.equal(netleaPreviewRes.ok, true);
+      assert.equal(netleaPreviewRes.notify, false);
+      assert.equal(netleaPreviewRes.plugin, 'netlea');
+      assert.equal(Array.isArray(netleaPreviewRes.data?.schedule?.trips), true);
+      assert.equal(netleaPreviewRes.data?.schedule?.trips?.length, 6);
+
       const netleaDashRes = await (await fetch(`${f.base}/api/plugin-run`, {
         method: 'POST',
         headers: f.headers,
         body: JSON.stringify({ plugin: 'netlea', action: 'dashboard', args: {} }),
-      })).json() as { ok: boolean; notify: boolean; plugin: string; data?: { config?: Record<string, unknown> } };
+      })).json() as { ok: boolean; notify: boolean; plugin: string; data?: { config?: Record<string, unknown>; catalog?: Record<string, unknown> } };
       assert.equal(netleaDashRes.ok, true);
       assert.equal(netleaDashRes.notify, false);
       assert.equal(netleaDashRes.plugin, 'netlea');
       assert.equal(typeof netleaDashRes.data?.config, 'object');
+      assert.equal(typeof netleaDashRes.data?.catalog, 'object');
     }
   } finally { await f.close(); }
 });

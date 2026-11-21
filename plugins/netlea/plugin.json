@@ -6,8 +6,8 @@
   "platforms": [
     "linux"
   ],
-  "promptHint": "蓝牙直控尼特利鱼缸灯（看板/状态/扫描、临时开关调光、恢复行程、配置）。",
-  "description": "通过 Linux BlueZ 低功耗蓝牙本地短连接直控尼特利（Netlea / 水族时光 SG-X-PRO 等）鱼缸灯：支持扫描蓝牙广播与实时时钟、查询主灯/射灯/氛围灯状态与 R/G/W/B/风扇通道、临时开灯调光、临时关灯与恢复 24 小时自动行程；设备 MAC 与默认观赏光谱保存在 <pluginDataDir>/config.json。",
+  "promptHint": "尼特利鱼缸灯（光谱/恒亮/日出日落行程/校时）",
+  "description": "通过 Linux BlueZ 低功耗蓝牙本地短连接直控尼特利（Netlea / 水族时光 SG-X-PRO 系列）鱼缸灯：支持扫描与内置 RTC 时钟校准、12 种原厂光谱档位、自定义四通道与额定功耗上限保护、临时开关调光、手动恒定常亮/关闭、恢复自动行程、24 小时 10 段定时行程与 0~300 分钟日出日落渐变配置，以及开缸/红草/综合/爆藻/绿草/椒榕 6 套官方养殖预设。",
   "entry": "index.mjs",
   "actions": [
     "dashboard",
@@ -15,20 +15,23 @@
     "scan",
     "on",
     "off",
+    "mode",
     "resume",
+    "schedule",
+    "clock",
     "config"
   ],
   "actionSpecs": [
     {
       "name": "dashboard",
       "label": "鱼缸灯看板与副屏卡片数据",
-      "description": "默认零蓝牙开销读取本机最近缓存状态、光谱通道与配置（供 Web 看板与 CS80 副屏卡片秒开展示）；传 refresh=true 可触发实时蓝牙读取。",
+      "description": "默认零蓝牙开销读取缓存状态、灯内行程、临时开关时长、原厂型号目录与配置；传 refresh=true 可单次短连接拉取 0x15/0x1B/0x25 全部实时状态。",
       "defaultArgs": {}
     },
     {
       "name": "status",
       "label": "查询鱼缸灯实时状态",
-      "description": "短连接读取尼特利鱼缸灯 0x14 实时状态（开关、运行模式、R/G/W/B 与风扇通道、内置时钟与信号强度）；传 live=false 可仅读取本机最近缓存状态。",
+      "description": "短连接读取尼特利鱼缸灯实时状态、默认临时配置及灯内定时行程；传 live=false 可仅读取本机缓存。",
       "defaultArgs": {
         "live": true
       }
@@ -36,7 +39,7 @@
     {
       "name": "scan",
       "label": "扫描尼特利鱼缸灯广播",
-      "description": "通过 BlueZ LE 被动扫描周围尼特利鱼缸灯广播，解析型号、MAC 地址、RSSI 与灯具内置实时时钟（RTC）。",
+      "description": "通过 BlueZ LE 被动扫描周围尼特利鱼缸灯广播，解析型号、MAC 地址、RSSI 与灯内实时时钟（RTC）。",
       "defaultArgs": {
         "timeoutSec": 5
       }
@@ -44,25 +47,47 @@
     {
       "name": "on",
       "label": "临时开灯与调光",
-      "description": "执行尼特利 0x1A 临时开灯/调光命令（不影响 24h 自动行程设置）。支持 red/green/white/blue（0-100）、fan（0-5）、brightness（按默认光谱比例缩放 0-100）、fadeSeconds（渐亮渐暗秒数，默认 3）、targetMac 与 dryRun。",
+      "description": "执行尼特利 0x10 临时开灯（倒计时结束后自动恢复行程）。支持官方 12 场景（modeCode 0-11, gear 1-10）、自定义百分比 red/green/white/blue（含额定功耗保护）、brightness（0-100）及 durationMinutes（1-300）。",
       "defaultArgs": {}
     },
     {
       "name": "off",
       "label": "临时关灯",
-      "description": "执行尼特利 0x1A 临时关灯命令，支持 fadeSeconds（默认 3）、targetMac 与 dryRun。",
+      "description": "执行尼特利 0x10 临时关灯命令（暂停自动行程直至倒计时结束或恢复行程），支持 durationMinutes（1-300）与 dryRun。",
       "defaultArgs": {}
+    },
+    {
+      "name": "mode",
+      "label": "手动恒定模式与临时默认配置",
+      "description": "mode=manual 时发送 0x10 永久手动恒亮/关灯；mode=temp-config 时通过 0x1A 保存灯内默认临时开/关灯分钟数（1-300）与默认观赏光谱。",
+      "defaultArgs": {
+        "mode": "manual"
+      }
     },
     {
       "name": "resume",
       "label": "恢复 24h 自动行程",
-      "description": "发送尼特利 0x10 恢复行程命令，使鱼缸灯切回灯具内置日出日落/月光自动行程；支持 lampStateHint（0 或 1，默认 1）、targetMac 与 dryRun。",
+      "description": "发送尼特利 0x10 立即恢复行程命令（restoreSec=1），使鱼缸灯切回灯具内置日出日落自动行程。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "schedule",
+      "label": "定时行程、日出日落与官方预设",
+      "description": "管理灯内 24 小时定时行程与日出日落（0-300 分钟）：op=get 回读灯内行程；op=set 写入最多 10 段行程并激活；op=preset 按缸体长宽高与开灯时间计算并写入开缸/红草/综合/爆藻/绿草/椒榕预设（previewOnly=true 仅预览）；op=clear 清空行程。",
+      "defaultArgs": {
+        "op": "get"
+      }
+    },
+    {
+      "name": "clock",
+      "label": "同步灯具时钟 (RTC)",
+      "description": "发送尼特利 0x04 时间校准帧将当前时区与年月日时分秒写入灯具内置实时时钟。",
       "defaultArgs": {}
     },
     {
       "name": "config",
       "label": "读取或更新鱼缸灯配置",
-      "description": "查看或更新 <pluginDataDir>/config.json 中的 targetMac、namePrefix、fadeSeconds 与 defaultChannels（red/green/white/blue/fan）。",
+      "description": "查看或更新 <pluginDataDir>/config.json 中的 targetMac、namePrefix、tempOnMinutes、tempOffMinutes、tankSize、defaultChannels 与自定义光谱收藏槽。",
       "defaultArgs": {}
     }
   ]

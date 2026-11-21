@@ -20,6 +20,16 @@ interface NetleaChannels {
   fan: number;
 }
 
+interface NetleaSceneMatch {
+  modeCode: number;
+  model: number;
+  seriesName: string;
+  tab: number;
+  name: string;
+  gear: number;
+  powerWatts: number;
+}
+
 interface NetleaDeviceView {
   address: string;
   name: string;
@@ -36,14 +46,104 @@ interface NetleaDeviceView {
 interface NetleaState {
   rawHex: string;
   on: boolean;
+  haveTravel?: boolean;
+  scheduleRunning?: boolean;
+  runMode?: string;
+  runModeLabel?: string;
   channels: NetleaChannels;
+  powerWatts?: number;
+  maxWatts?: number;
+  matchedScene?: NetleaSceneMatch | null;
+}
+
+interface NetleaTrip {
+  enable: number;
+  dayList: number[];
+  startH: number;
+  startM: number;
+  endH: number;
+  endM: number;
+  modeCode: number;
+  gear: number;
+  red: number;
+  green: number;
+  white: number;
+  blue: number;
+  fan: number;
+  powerWatts?: number;
+  name?: string;
+  seriesName?: string;
+  hasSunrise?: boolean;
+  hasSunset?: boolean;
+  sunriseDays?: number[];
+  sunsetDays?: number[];
+}
+
+interface NetleaSchedule {
+  rawHex?: string;
+  travelModel: number;
+  sunEnable?: number;
+  sunriseMinutes: number;
+  sunsetMinutes: number;
+  trips: NetleaTrip[];
+  presetId?: string;
+  presetName?: string;
+  targetBaseWatts?: number;
+}
+
+interface NetleaTempConfig {
+  onMinutes: number;
+  offMinutes: number;
+  channels: NetleaChannels;
+  powerWatts: number;
+  modeCode: number;
+  gear: number;
+}
+
+interface NetleaSavedPreset extends NetleaChannels {
+  name: string;
 }
 
 interface NetleaConfig {
   targetMac: string;
   namePrefix: string;
   fadeSeconds: number;
+  tempOnMinutes: number;
+  tempOffMinutes: number;
+  tankSize: {
+    lengthCm: number;
+    widthCm: number;
+    heightCm: number;
+    lampCount?: number;
+  };
   defaultChannels: NetleaChannels;
+  savedCustomPresets: NetleaSavedPreset[];
+}
+
+interface NetleaCatalogScene {
+  modeCode: number;
+  model: number;
+  seriesName: string;
+  tab: number;
+  name: string;
+  maxGear: number;
+  gears: Array<{
+    gear: number;
+    powerWatts: number;
+    channels: NetleaChannels;
+  }>;
+}
+
+interface NetleaCatalog {
+  modelKey: string;
+  maxWatts: number;
+  scenes: NetleaCatalogScene[];
+  cultivationPresets: Array<{
+    id: string;
+    type: number;
+    name: string;
+    totalHours: number;
+  }>;
 }
 
 interface NetleaDashboardPayload {
@@ -51,7 +151,11 @@ interface NetleaDashboardPayload {
   lastAddress: string | null;
   device: NetleaDeviceView | null;
   state: NetleaState | null;
+  tempConfig?: NetleaTempConfig | null;
+  schedule?: NetleaSchedule | null;
+  activeTrip?: NetleaTrip | null;
   config: NetleaConfig;
+  catalog?: NetleaCatalog;
 }
 
 interface NetleaPluginResponse<T = unknown> {
@@ -64,23 +168,51 @@ interface NetleaPluginResponse<T = unknown> {
   data?: T;
 }
 
-const PRESETS: Record<string, { label: string; channels: NetleaChannels }> = {
-  vivid: { label: '增艳全光谱', channels: { red: 69, green: 54, white: 98, blue: 54, fan: 0 } },
-  daylight: { label: '清澈日光', channels: { red: 35, green: 45, white: 100, blue: 45, fan: 0 } },
-  sunset: { label: '暖金晚霞', channels: { red: 85, green: 30, white: 45, blue: 15, fan: 0 } },
-  moonlight: { label: '静谧月光', channels: { red: 0, green: 5, white: 8, blue: 38, fan: 0 } },
-};
+const DAY_NAMES = ['一', '二', '三', '四', '五', '六', '日'];
 
 function clampInt(raw: number, min: number, max: number): number {
   if (!Number.isFinite(raw)) return min;
   return Math.max(min, Math.min(max, Math.round(raw)));
 }
 
+function pad2(n: number): string {
+  return String(clampInt(n, 0, 99)).padStart(2, '0');
+}
+
+function formatHm(h: number, m: number): string {
+  return `${pad2(h)}:${pad2(m)}`;
+}
+
+function parseHm(value: string, fallbackH = 9, fallbackM = 0): { h: number; m: number } {
+  const parts = value.split(':');
+  if (parts.length !== 2) return { h: fallbackH, m: fallbackM };
+  return {
+    h: clampInt(Number(parts[0]), 0, 23),
+    m: clampInt(Number(parts[1]), 0, 59),
+  };
+}
+
+function formatDaySummary(dayList: number[]): string {
+  const days = Array.isArray(dayList) ? dayList : [1, 1, 1, 1, 1, 1, 1];
+  const activeCount = days.filter(Boolean).length;
+  if (activeCount === 7) return '每天';
+  if (activeCount === 0) return '未选星期';
+  if (days.slice(0, 5).every(Boolean) && !days[5] && !days[6]) return '工作日';
+  if (days.slice(0, 5).every(v => !v) && days[5] && days[6]) return '周末';
+  return `周${days.map((v, i) => (v ? DAY_NAMES[i] : '')).filter(Boolean).join('')}`;
+}
+
+function mixSpectrumRgb(ch: NetleaChannels): [number, number, number] {
+  const r = Math.min(255, Math.round((ch.red / 100) * 245 + (ch.white / 100) * 180));
+  const g = Math.min(255, Math.round((ch.green / 100) * 235 + (ch.white / 100) * 185));
+  const b = Math.min(255, Math.round((ch.blue / 100) * 245 + (ch.white / 100) * 185));
+  return [r, g, b];
+}
+
 function drawSpectrumCanvas(
   canvas: HTMLCanvasElement,
   channels: NetleaChannels,
-  isOn: boolean | null,
-  previewing: boolean,
+  labelBadge: string,
 ): void {
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
@@ -89,7 +221,7 @@ function drawSpectrumCanvas(
   ctx.clearRect(0, 0, w, h);
 
   const isIndustrial = document.documentElement.dataset.theme === 'industrial';
-  const bg = isIndustrial ? '#0d1117' : 'rgba(13, 19, 32, 0.9)';
+  const bg = isIndustrial ? '#11161f' : 'rgba(13, 19, 32, 0.92)';
   const trackBg = isIndustrial ? '#1e2633' : 'rgba(255, 255, 255, 0.08)';
   const textCol = '#e6edf3';
   const mutedCol = '#93a4bc';
@@ -97,29 +229,15 @@ function drawSpectrumCanvas(
   ctx.fillStyle = bg;
   ctx.fillRect(0, 0, w, h);
 
-  // Mixed RGBW ambient preview strip at top
-  const rMix = Math.round((channels.red / 100) * 255 * 0.85 + (channels.white / 100) * 255 * 0.7);
-  const gMix = Math.round((channels.green / 100) * 255 * 0.8 + (channels.white / 100) * 255 * 0.72);
-  const bMix = Math.round((channels.blue / 100) * 255 * 0.9 + (channels.white / 100) * 255 * 0.72);
-  const mr = Math.min(255, rMix);
-  const mg = Math.min(255, gMix);
-  const mb = Math.min(255, bMix);
-
+  const [mr, mg, mb] = mixSpectrumRgb(channels);
   ctx.fillStyle = trackBg;
-  ctx.fillRect(14, 12, w - 28, 16);
+  ctx.fillRect(14, 12, w - 28, 22);
   ctx.fillStyle = `rgb(${mr}, ${mg}, ${mb})`;
-  ctx.fillRect(14, 12, w - 28, 16);
+  ctx.fillRect(14, 12, w - 28, 22);
 
-  ctx.font = '600 11px sans-serif';
+  ctx.font = '600 12px sans-serif';
   ctx.fillStyle = (mr + mg + mb) > 420 ? '#111827' : textCol;
-  const badgeText = previewing
-    ? '预览通道比例（尚未下发）'
-    : isOn === true
-      ? '灯具状态：开启'
-      : isOn === false
-        ? '灯具状态：关闭（下方显示待机/滑块值）'
-        : '尚未读取实时状态';
-  ctx.fillText(badgeText, 22, 24);
+  ctx.fillText(labelBadge, 22, 27);
 
   const rows: Array<{ label: string; value: number; max: number; unit: string; color: string }> = [
     { label: '红光 R', value: channels.red, max: 100, unit: '%', color: '#f87171' },
@@ -129,8 +247,8 @@ function drawSpectrumCanvas(
     { label: '风扇 F', value: channels.fan, max: 5, unit: ' 档', color: '#fbbf24' },
   ];
 
-  const startY = 44;
-  const rowStep = 22;
+  const startY = 48;
+  const rowStep = 24;
   const barX = 76;
   const barW = w - barX - 58;
 
@@ -141,18 +259,207 @@ function drawSpectrumCanvas(
 
     ctx.font = '500 12px sans-serif';
     ctx.fillStyle = mutedCol;
-    ctx.fillText(row.label, 14, y + 10);
+    ctx.fillText(row.label, 14, y + 11);
 
     ctx.fillStyle = trackBg;
-    ctx.fillRect(barX, y, barW, 12);
+    ctx.fillRect(barX, y, barW, 13);
 
     ctx.fillStyle = row.color;
-    ctx.fillRect(barX, y, Math.max(ratio > 0 ? 4 : 0, Math.round(barW * ratio)), 12);
+    ctx.fillRect(barX, y, Math.max(ratio > 0 ? 4 : 0, Math.round(barW * ratio)), 13);
 
     ctx.fillStyle = textCol;
     ctx.font = '600 12px monospace';
-    ctx.fillText(`${row.value}${row.unit}`, barX + barW + 8, y + 10);
+    ctx.fillText(`${row.value}${row.unit}`, barX + barW + 8, y + 11);
   }
+}
+
+function drawTimelineCanvas(
+  canvas: HTMLCanvasElement,
+  trips: NetleaTrip[],
+  sunriseMinutes: number,
+  sunsetMinutes: number,
+  maxWatts: number,
+  todayIdx: number,
+): void {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  const w = canvas.width;
+  const h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  const isIndustrial = document.documentElement.dataset.theme === 'industrial';
+  const bg = isIndustrial ? '#11161f' : 'rgba(13, 19, 32, 0.92)';
+  const gridCol = isIndustrial ? 'rgba(255,255,255,0.08)' : 'rgba(148, 163, 184, 0.14)';
+  const labelCol = '#94a3b8';
+
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, w, h);
+
+  const padL = 42;
+  const padR = 16;
+  const padT = 18;
+  const padB = 28;
+  const plotW = w - padL - padR;
+  const plotH = h - padT - padB;
+  const xForMin = (min: number) => padL + (Math.max(0, Math.min(1440, min)) / 1440) * plotW;
+  const safeMaxW = Math.max(10, maxWatts);
+  const yForWatts = (watts: number) => padT + plotH - (Math.max(0, Math.min(safeMaxW, watts)) / safeMaxW) * plotH;
+
+  // Horizontal wattage lines
+  ctx.font = '11px monospace';
+  ctx.fillStyle = labelCol;
+  ctx.strokeStyle = gridCol;
+  ctx.lineWidth = 1;
+  for (const frac of [0, 0.5, 1]) {
+    const wy = yForWatts(safeMaxW * frac);
+    ctx.beginPath();
+    ctx.moveTo(padL, wy);
+    ctx.lineTo(w - padR, wy);
+    ctx.stroke();
+    ctx.fillText(`${Math.round(safeMaxW * frac)}W`, 6, wy + 4);
+  }
+
+  // Vertical hour ticks (every 3h)
+  for (let hr = 0; hr <= 24; hr += 3) {
+    const x = xForMin(hr * 60);
+    ctx.beginPath();
+    ctx.moveTo(x, padT);
+    ctx.lineTo(x, padT + plotH);
+    ctx.stroke();
+    ctx.fillText(`${pad2(hr)}:00`, Math.min(w - 38, Math.max(padL - 8, x - 14)), h - 8);
+  }
+
+  // Build segments active today (0..1440)
+  interface PlotSeg {
+    start: number;
+    end: number;
+    watts: number;
+    trip: NetleaTrip;
+    hasRise: boolean;
+    hasSet: boolean;
+  }
+  const prevIdx = (todayIdx + 6) % 7;
+  const segs: PlotSeg[] = [];
+  for (const t of trips) {
+    if (!t.enable) continue;
+    const days = Array.isArray(t.dayList) ? t.dayList : [1, 1, 1, 1, 1, 1, 1];
+    const s = clampInt(t.startH, 0, 23) * 60 + clampInt(t.startM, 0, 59);
+    const rawE = clampInt(t.endH, 0, 23) * 60 + clampInt(t.endM, 0, 59);
+    const e = rawE === 0 && s > 0 ? 1440 : rawE;
+    if (s === e) continue;
+    const watts = Math.max(1, Number(t.powerWatts ?? 12));
+    if (e > s) {
+      if (days[todayIdx]) {
+        segs.push({ start: s, end: e, watts, trip: t, hasRise: false, hasSet: false });
+      }
+    } else {
+      if (days[todayIdx]) {
+        segs.push({ start: s, end: 1440, watts, trip: t, hasRise: false, hasSet: false });
+      }
+      if (days[prevIdx] && e > 0) {
+        segs.push({ start: 0, end: e, watts, trip: t, hasRise: false, hasSet: false });
+      }
+    }
+  }
+  segs.sort((a, b) => a.start - b.start || a.end - b.end);
+
+  const rise = clampInt(sunriseMinutes, 0, 300);
+  const set = clampInt(sunsetMinutes, 0, 300);
+  for (let i = 0; i < segs.length; i++) {
+    const cur = segs[i]!;
+    const prev = i > 0 ? segs[i - 1] : null;
+    const next = i < segs.length - 1 ? segs[i + 1] : null;
+    const dur = cur.end - cur.start;
+    let canRise = rise > 0 && (!prev || prev.end < cur.start);
+    let canSet = set > 0 && (!next || cur.end < next.start);
+    if (canRise && canSet && dur < rise + set) {
+      if (dur >= rise) canSet = false;
+      else if (dur < set) { canRise = false; canSet = false; }
+      else canRise = false;
+    } else {
+      if (canRise && dur < rise) canRise = false;
+      if (canSet && dur < set) canSet = false;
+    }
+    cur.hasRise = canRise;
+    cur.hasSet = canSet;
+  }
+
+  if (segs.length === 0) {
+    ctx.font = '500 13px sans-serif';
+    ctx.fillStyle = labelCol;
+    ctx.fillText('今日暂无启用的定时行程（新增时段或选择官方养殖预设即可预览日出/日落曲线）', padL + 24, padT + plotH / 2);
+  } else {
+    for (let i = 0; i < segs.length; i++) {
+      const seg = segs[i]!;
+      const prev = i > 0 ? segs[i - 1] : null;
+      const startWatts = (prev && prev.end === seg.start) ? prev.watts : (seg.hasRise ? 0 : seg.watts);
+      const riseLen = seg.hasRise ? Math.min(rise, seg.end - seg.start) : 0;
+      const setLen = seg.hasSet ? Math.min(set, seg.end - seg.start - riseLen) : 0;
+
+      const x0 = xForMin(seg.start);
+      const x1 = xForMin(seg.start + riseLen);
+      const x2 = xForMin(seg.end - setLen);
+      const x3 = xForMin(seg.end);
+
+      const y0 = yForWatts(startWatts);
+      const yTop = yForWatts(seg.watts);
+      const yBase = yForWatts(0);
+
+      const [r, g, b] = mixSpectrumRgb({
+        red: seg.trip.red,
+        green: seg.trip.green,
+        white: seg.trip.white,
+        blue: seg.trip.blue,
+        fan: seg.trip.fan,
+      });
+
+      ctx.beginPath();
+      ctx.moveTo(x0, yBase);
+      ctx.lineTo(x0, y0);
+      if (riseLen > 0) ctx.lineTo(x1, yTop);
+      else ctx.lineTo(x0, yTop);
+      ctx.lineTo(x2, yTop);
+      if (setLen > 0) ctx.lineTo(x3, yBase);
+      else ctx.lineTo(x3, yTop);
+      ctx.lineTo(x3, yBase);
+      ctx.closePath();
+      ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.34)`;
+      ctx.fill();
+
+      ctx.beginPath();
+      ctx.moveTo(x0, y0);
+      if (riseLen > 0) ctx.lineTo(x1, yTop);
+      else ctx.lineTo(x0, yTop);
+      ctx.lineTo(x2, yTop);
+      if (setLen > 0) ctx.lineTo(x3, yBase);
+      else ctx.lineTo(x3, yTop);
+      ctx.strokeStyle = `rgb(${r}, ${g}, ${b})`;
+      ctx.lineWidth = 2.2;
+      ctx.stroke();
+
+      if (x3 - x0 > 46) {
+        ctx.font = '600 11px sans-serif';
+        ctx.fillStyle = '#e2e8f0';
+        const tag = `${seg.trip.name || '时段'} ${seg.watts}W`;
+        ctx.fillText(tag, Math.min(x3 - 44, (x0 + x3) / 2 - 24), Math.max(padT + 14, yTop - 6));
+      }
+    }
+  }
+
+  // Current wall-clock needle
+  const now = new Date();
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+  const nowX = xForMin(nowMin);
+  ctx.beginPath();
+  ctx.moveTo(nowX, padT);
+  ctx.lineTo(nowX, padT + plotH);
+  ctx.strokeStyle = '#f59e0b';
+  ctx.lineWidth = 1.6;
+  ctx.stroke();
+
+  ctx.font = '600 11px monospace';
+  ctx.fillStyle = '#fbbf24';
+  ctx.fillText(`现在 ${formatHm(now.getHours(), now.getMinutes())}`, Math.min(w - 76, Math.max(padL + 2, nowX + 4)), padT + 12);
 }
 
 export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
@@ -160,20 +467,98 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
   const topBadge = element<HTMLElement>('netlea-top-badge');
   const statusBanner = element<HTMLElement>('netlea-action-status');
   const kpiGrid = element<HTMLElement>('netlea-kpi-grid');
-  const deviceMeta = element<HTMLElement>('netlea-device-meta');
-  const spectrumCanvas = element<HTMLCanvasElement>('netlea-spectrum-canvas');
-  const scanList = element<HTMLElement>('netlea-scan-list');
+  const modelPill = element<HTMLElement>('netlea-model-pill');
 
+  // Top & quick bar
+  const clockBtn = element<HTMLButtonElement>('netlea-clock-btn');
   const scanBtn = element<HTMLButtonElement>('netlea-scan-btn');
   const syncBtn = element<HTMLButtonElement>('netlea-sync-btn');
   const refreshBtn = element<HTMLButtonElement>('netlea-refresh-btn');
   const onBtn = element<HTMLButtonElement>('netlea-on-btn');
   const offBtn = element<HTMLButtonElement>('netlea-off-btn');
   const resumeBtn = element<HTMLButtonElement>('netlea-resume-btn');
-  const presetBar = element<HTMLElement>('netlea-preset-bar');
+  const tempMinInput = element<HTMLInputElement>('netlea-temp-min');
   const brightnessRange = element<HTMLInputElement>('netlea-brightness-range');
   const brightnessVal = element<HTMLElement>('netlea-brightness-val');
   const brightnessBtn = element<HTMLButtonElement>('netlea-brightness-btn');
+
+  // Workspace view switcher
+  const workspaceTabs = element<HTMLElement>('netlea-workspace-tabs');
+  const viewSchedule = element<HTMLElement>('netlea-view-schedule');
+  const viewPreset = element<HTMLElement>('netlea-view-preset');
+  const viewManual = element<HTMLElement>('netlea-view-manual');
+
+  // View 1: Schedule & Sunrise/Sunset
+  const schedBadge = element<HTMLElement>('netlea-sched-badge');
+  const timelineCanvas = element<HTMLCanvasElement>('netlea-timeline-canvas');
+  const timelineCaption = element<HTMLElement>('netlea-timeline-caption');
+  const sunriseInput = element<HTMLInputElement>('netlea-sunrise-min');
+  const sunsetInput = element<HTMLInputElement>('netlea-sunset-min');
+  const sunPills = element<HTMLElement>('netlea-sun-pills');
+  const schedDirtyLabel = element<HTMLElement>('netlea-sched-dirty');
+  const schedReadBtn = element<HTMLButtonElement>('netlea-sched-read-btn');
+  const tripNewBtn = element<HTMLButtonElement>('netlea-trip-new-btn');
+  const schedClearBtn = element<HTMLButtonElement>('netlea-sched-clear-btn');
+  const schedSaveBtn = element<HTMLButtonElement>('netlea-sched-save-btn');
+  const tripListEl = element<HTMLElement>('netlea-trip-list');
+
+  // Trip Editor
+  const tripEditor = element<HTMLElement>('netlea-trip-editor');
+  const tripEditorTitle = element<HTMLElement>('netlea-trip-editor-title');
+  const tripEnabledInput = element<HTMLInputElement>('netlea-trip-enabled');
+  const tripStartInput = element<HTMLInputElement>('netlea-trip-start');
+  const tripEndInput = element<HTMLInputElement>('netlea-trip-end');
+  const tripDaysEl = element<HTMLElement>('netlea-trip-days');
+  const tripDayQuickEl = element<HTMLElement>('netlea-day-quick');
+  const tripSpecModeEl = element<HTMLElement>('netlea-trip-spec-mode');
+  const tripSceneBox = element<HTMLElement>('netlea-trip-scene-box');
+  const tripCustomBox = element<HTMLElement>('netlea-trip-custom-box');
+  const tripSceneSelect = element<HTMLSelectElement>('netlea-trip-scene');
+  const tripGearInput = element<HTMLInputElement>('netlea-trip-gear');
+  const tripGearVal = element<HTMLElement>('netlea-trip-gear-val');
+  const tripWattsSpan = element<HTMLElement>('netlea-trip-watts');
+  const tripR = element<HTMLInputElement>('netlea-trip-r');
+  const tripG = element<HTMLInputElement>('netlea-trip-g');
+  const tripW = element<HTMLInputElement>('netlea-trip-w');
+  const tripB = element<HTMLInputElement>('netlea-trip-b');
+  const tripRVal = element<HTMLElement>('netlea-trip-r-val');
+  const tripGVal = element<HTMLElement>('netlea-trip-g-val');
+  const tripWVal = element<HTMLElement>('netlea-trip-w-val');
+  const tripBVal = element<HTMLElement>('netlea-trip-b-val');
+  const tripCustomWatts = element<HTMLElement>('netlea-trip-custom-watts');
+  const tripCancelBtn = element<HTMLButtonElement>('netlea-trip-cancel-btn');
+  const tripApplyBtn = element<HTMLButtonElement>('netlea-trip-apply-btn');
+
+  // View 2: Official Cultivation Presets
+  const cultivationPills = element<HTMLElement>('netlea-cultivation-pills');
+  const tankLInput = element<HTMLInputElement>('netlea-tank-l');
+  const tankWInput = element<HTMLInputElement>('netlea-tank-w');
+  const tankHInput = element<HTMLInputElement>('netlea-tank-h');
+  const presetStartInput = element<HTMLInputElement>('netlea-preset-start');
+  const presetFadeInput = element<HTMLInputElement>('netlea-preset-fade');
+  const presetMeta = element<HTMLElement>('netlea-preset-meta');
+  const presetPreviewEl = element<HTMLElement>('netlea-preset-preview');
+  const presetImportBtn = element<HTMLButtonElement>('netlea-preset-import-btn');
+  const presetApplyBtn = element<HTMLButtonElement>('netlea-preset-apply-btn');
+
+  // View 3: Manual & 12-Scene Spectrum Workbench + Config
+  const powerBadge = element<HTMLElement>('netlea-power-badge');
+  const sceneSeriesTabs = element<HTMLElement>('netlea-scene-series-tabs');
+  const sceneSelectorBox = element<HTMLElement>('netlea-scene-selector-box');
+  const sceneSubpills = element<HTMLElement>('netlea-scene-subpills');
+  const sceneGearInput = element<HTMLInputElement>('netlea-scene-gear');
+  const sceneGearVal = element<HTMLElement>('netlea-scene-gear-val');
+  const sceneWattsSpan = element<HTMLElement>('netlea-scene-watts');
+  const customSlidersBox = element<HTMLElement>('netlea-custom-sliders-box');
+  const powerClampNote = element<HTMLElement>('netlea-power-clamp-note');
+  const customSlotsEl = element<HTMLElement>('netlea-custom-slots');
+  const saveSlotBtn = element<HTMLButtonElement>('netlea-save-slot-btn');
+  const applyTempBtn = element<HTMLButtonElement>('netlea-apply-channels-btn');
+  const applyManualBtn = element<HTMLButtonElement>('netlea-apply-manual-btn');
+  const manualOffBtn = element<HTMLButtonElement>('netlea-manual-off-btn');
+  const saveDefaultBtn = element<HTMLButtonElement>('netlea-save-default-btn');
+  const spectrumCanvas = element<HTMLCanvasElement>('netlea-spectrum-canvas');
+  const deviceMeta = element<HTMLElement>('netlea-device-meta');
 
   const chRed = element<HTMLInputElement>('netlea-ch-red');
   const chGreen = element<HTMLInputElement>('netlea-ch-green');
@@ -185,15 +570,17 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
   const chWhiteVal = element<HTMLElement>('netlea-ch-white-val');
   const chBlueVal = element<HTMLElement>('netlea-ch-blue-val');
   const chFanVal = element<HTMLElement>('netlea-ch-fan-val');
-  const fadeSecInput = element<HTMLInputElement>('netlea-fade-sec');
-  const saveDefaultBtn = element<HTMLButtonElement>('netlea-save-default-btn');
-  const applyChannelsBtn = element<HTMLButtonElement>('netlea-apply-channels-btn');
 
+  const cfgOnMinInput = element<HTMLInputElement>('netlea-cfg-on-min');
+  const cfgOffMinInput = element<HTMLInputElement>('netlea-cfg-off-min');
+  const cfgTempSaveBtn = element<HTMLButtonElement>('netlea-cfg-temp-save-btn');
   const cfgMacInput = element<HTMLInputElement>('netlea-cfg-mac');
   const cfgPrefixInput = element<HTMLInputElement>('netlea-cfg-prefix');
   const cfgSaveBtn = element<HTMLButtonElement>('netlea-cfg-save-btn');
+  const scanList = element<HTMLElement>('netlea-scan-list');
 
   const actionButtons = [
+    clockBtn,
     scanBtn,
     syncBtn,
     refreshBtn,
@@ -201,15 +588,50 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
     offBtn,
     resumeBtn,
     brightnessBtn,
+    schedReadBtn,
+    schedClearBtn,
+    schedSaveBtn,
+    presetImportBtn,
+    presetApplyBtn,
+    applyTempBtn,
+    applyManualBtn,
+    manualOffBtn,
     saveDefaultBtn,
-    applyChannelsBtn,
+    saveSlotBtn,
+    cfgTempSaveBtn,
     cfgSaveBtn,
   ];
 
   let active = false;
   let busy = false;
+  let activeView: 'schedule' | 'preset' | 'manual' = 'schedule';
   let lastPayload: NetleaDashboardPayload | null = null;
-  let previewMode = false;
+  let catalog: NetleaCatalog | null = null;
+
+  // Schedule editor state
+  let draftTrips: NetleaTrip[] = [];
+  let draftSunrise = 20;
+  let draftSunset = 20;
+  let draftTravelModel = 0;
+  let schedDirty = false;
+  let clearArmed = false;
+  let clearArmTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Single trip editor modal state
+  let editingTripIndex = -1; // -1 = new
+  let editorSpecMode: 'scene' | 'custom' = 'scene';
+  let editorDays: number[] = [1, 1, 1, 1, 1, 1, 1];
+
+  // Cultivation preset preview state
+  let selectedPresetId = 'open_tank';
+  let previewedSchedule: NetleaSchedule | null = null;
+  let presetDebounce: ReturnType<typeof setTimeout> | null = null;
+
+  // Manual workbench state
+  let selectedSeries: '0' | '1' | '2' | 'custom' = '0';
+  let selectedSceneCode = 0;
+  let selectedSceneGear = 8;
+  let manualPreviewDirty = false;
 
   function setBanner(text: string, tone: 'ok' | 'warn' | 'err' = 'ok'): void {
     statusBanner.className = `health-status-banner tone-${tone}`;
@@ -217,7 +639,329 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
     statusBanner.hidden = !text;
   }
 
-  function readSliderChannels(): NetleaChannels {
+  function setBusyState(nextBusy: boolean): void {
+    busy = nextBusy;
+    const disabled = nextBusy || appState.authExpired || !appState.ready;
+    for (const btn of actionButtons) {
+      btn.disabled = disabled;
+    }
+  }
+
+  function findScene(modeCode: number): NetleaCatalogScene | undefined {
+    return catalog?.scenes.find(s => s.modeCode === modeCode);
+  }
+
+  function approxCustomWatts(ch: NetleaChannels): number {
+    const maxW = catalog?.maxWatts ?? 22;
+    const est = Math.round(((ch.red * 0.35 + ch.green * 0.3 + ch.white * 0.1 + ch.blue * 0.3) / 100) * (maxW * 1.4));
+    return clampInt(est, 0, Math.round(maxW * 1.8));
+  }
+
+  function switchWorkspaceView(view: 'schedule' | 'preset' | 'manual'): void {
+    activeView = view;
+    for (const tab of workspaceTabs.querySelectorAll<HTMLButtonElement>('button[data-netlea-view]')) {
+      const isSelected = tab.dataset.netleaView === view;
+      tab.classList.toggle('active', isSelected);
+      tab.setAttribute('aria-selected', String(isSelected));
+    }
+    viewSchedule.hidden = view !== 'schedule';
+    viewPreset.hidden = view !== 'preset';
+    viewManual.hidden = view !== 'manual';
+    if (view === 'schedule') redrawTimeline();
+    if (view === 'preset' && !previewedSchedule) void refreshCultivationPreview();
+    if (view === 'manual') refreshSpectrumPreview();
+  }
+
+  function getTodayIdx(): number {
+    const d = new Date().getDay();
+    return d === 0 ? 6 : d - 1;
+  }
+
+  function markSchedDirty(dirty: boolean): void {
+    schedDirty = dirty;
+    schedDirtyLabel.textContent = dirty
+      ? '⚠️ 有未下发改动，请点击「🚀 保存并下发行程」写入灯具'
+      : '已与灯具缓存同步';
+  }
+
+  function redrawTimeline(): void {
+    const maxW = catalog?.maxWatts ?? lastPayload?.state?.maxWatts ?? 22;
+    drawTimelineCanvas(timelineCanvas, draftTrips, draftSunrise, draftSunset, maxW, getTodayIdx());
+    const enabled = draftTrips.filter(t => t.enable).length;
+    if (enabled === 0) {
+      schedBadge.className = 'hub-badge badge-slate';
+      schedBadge.textContent = '未配置行程';
+      timelineCaption.textContent = '当前尚未设置启用的定时行程；新增时段或使用「🌱 官方养殖预设」即可开启 24h 日出日落曲线。';
+    } else {
+      schedBadge.className = 'hub-badge badge-blue';
+      schedBadge.textContent = `已配置 ${enabled} 段 · 日出 ${draftSunrise}m / 日落 ${draftSunset}m`;
+      timelineCaption.textContent = `今日（周${DAY_NAMES[getTodayIdx()]}）共 ${enabled}/${draftTrips.length} 个启用的时段；橙色竖线为当前时刻。`;
+    }
+  }
+
+  function renderTripList(): void {
+    if (!draftTrips.length) {
+      tripListEl.replaceChildren(node('p', '暂无定时时段，点击「＋ 新增时段」或切换到「🌱 官方养殖预设」一键生成。', 'empty'));
+      redrawTimeline();
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < draftTrips.length; i++) {
+      const trip = draftTrips[i]!;
+      const card = node(
+        'div',
+        '',
+        `netlea-trip-card${trip.enable ? '' : ' is-disabled'}`,
+      );
+
+      const main = node('div', '', 'netlea-trip-main');
+      const titleRow = node('div', '', 'netlea-trip-title');
+      const timeStrong = node('strong', `${formatHm(trip.startH, trip.startM)} - ${formatHm(trip.endH, trip.endM)}`);
+      const modeBadge = node(
+        'span',
+        trip.modeCode === 12
+          ? `自定义 (${trip.powerWatts ?? approxCustomWatts(trip)}W)`
+          : `${trip.seriesName ? `${trip.seriesName}·` : ''}${trip.name || '场景'} ${trip.gear}档 (${trip.powerWatts ?? '--'}W)`,
+        'hub-badge badge-blue',
+      );
+      const daySpan = node('span', formatDaySummary(trip.dayList), 'hub-badge badge-slate');
+      titleRow.append(timeStrong, modeBadge, daySpan);
+
+      if (trip.enable && draftSunrise > 0 && trip.hasSunrise !== false) {
+        titleRow.append(node('span', `🌅 ${draftSunrise}m`, 'hub-badge badge-amber'));
+      }
+      if (trip.enable && draftSunset > 0 && trip.hasSunset !== false) {
+        titleRow.append(node('span', `🌇 ${draftSunset}m`, 'hub-badge badge-amber'));
+      }
+
+      const detail = node(
+        'div',
+        `R${trip.red}% G${trip.green}% W${trip.white}% B${trip.blue}%`,
+        'meta',
+      );
+      main.append(titleRow, detail);
+
+      const actions = node('div', '', 'modal-btn-group');
+      const toggleBtn = button(trip.enable ? '⏸ 停用' : '▶ 启用', () => {
+        trip.enable = trip.enable ? 0 : 1;
+        markSchedDirty(true);
+        renderTripList();
+      }, 'mini-button');
+      const editBtn = button('✏️ 编辑', () => {
+        openTripEditor(i);
+      }, 'mini-button');
+      const delBtn = button('🗑 删除', () => {
+        draftTrips.splice(i, 1);
+        markSchedDirty(true);
+        if (editingTripIndex === i) {
+          tripEditor.hidden = true;
+          editingTripIndex = -1;
+        }
+        renderTripList();
+      }, 'mini-button danger-btn');
+      actions.append(toggleBtn, editBtn, delBtn);
+
+      card.append(main, actions);
+      frag.append(card);
+    }
+    tripListEl.replaceChildren(frag);
+    redrawTimeline();
+  }
+
+  function populateTripSceneSelect(): void {
+    if (!catalog || tripSceneSelect.options.length > 0) return;
+    const frag = document.createDocumentFragment();
+    for (const sc of catalog.scenes) {
+      const opt = document.createElement('option');
+      opt.value = String(sc.modeCode);
+      opt.textContent = `${sc.seriesName} · ${sc.name}`;
+      frag.append(opt);
+    }
+    tripSceneSelect.replaceChildren(frag);
+  }
+
+  function syncTripEditorPreview(): void {
+    const modeCode = clampInt(Number(tripSceneSelect.value || 0), 0, 11);
+    const sc = findScene(modeCode);
+    const maxGear = sc?.maxGear ?? 10;
+    tripGearInput.max = String(maxGear);
+    const gear = clampInt(Number(tripGearInput.value), 1, maxGear);
+    tripGearInput.value = String(gear);
+    const gearObj = sc?.gears.find(g => g.gear === gear);
+    tripGearVal.textContent = `${gear} 档`;
+    tripWattsSpan.textContent = gearObj ? `${gearObj.powerWatts}W` : '--W';
+
+    const ch: NetleaChannels = {
+      red: clampInt(Number(tripR.value), 0, 100),
+      green: clampInt(Number(tripG.value), 0, 100),
+      white: clampInt(Number(tripW.value), 0, 100),
+      blue: clampInt(Number(tripB.value), 0, 100),
+      fan: 0,
+    };
+    tripRVal.textContent = String(ch.red);
+    tripGVal.textContent = String(ch.green);
+    tripWVal.textContent = String(ch.white);
+    tripBVal.textContent = String(ch.blue);
+    const maxW = catalog?.maxWatts ?? 22;
+    const estW = approxCustomWatts(ch);
+    tripCustomWatts.textContent = estW > maxW ? `约 ${estW}W (超 ${maxW}W 将自动限幅)` : `约 ${estW}W / ${maxW}W`;
+    tripCustomWatts.className = `hub-badge ${estW > maxW ? 'badge-amber' : 'badge-slate'}`;
+  }
+
+  function syncEditorDaysUi(): void {
+    for (const btn of tripDaysEl.querySelectorAll<HTMLButtonElement>('button[data-day]')) {
+      const idx = clampInt(Number(btn.dataset.day), 0, 6);
+      btn.classList.toggle('active', Boolean(editorDays[idx]));
+    }
+  }
+
+  function setEditorSpecMode(mode: 'scene' | 'custom'): void {
+    editorSpecMode = mode;
+    for (const btn of tripSpecModeEl.querySelectorAll<HTMLButtonElement>('button[data-spec-mode]')) {
+      btn.classList.toggle('active', btn.dataset.specMode === mode);
+    }
+    tripSceneBox.hidden = mode !== 'scene';
+    tripCustomBox.hidden = mode !== 'custom';
+    syncTripEditorPreview();
+  }
+
+  function openTripEditor(idx: number): void {
+    populateTripSceneSelect();
+    editingTripIndex = idx;
+    if (idx === -1) {
+      tripEditorTitle.textContent = `新增时段 (#${draftTrips.length + 1})`;
+      const last = draftTrips[draftTrips.length - 1];
+      const defStartH = last ? last.endH : 9;
+      const defStartM = last ? last.endM : 0;
+      const defEndMin = Math.min(23 * 60 + 59, defStartH * 60 + defStartM + 120);
+      tripStartInput.value = formatHm(defStartH, defStartM);
+      tripEndInput.value = formatHm(Math.floor(defEndMin / 60), defEndMin % 60);
+      tripEnabledInput.checked = true;
+      editorDays = [1, 1, 1, 1, 1, 1, 1];
+      tripSceneSelect.value = '0';
+      tripGearInput.value = '8';
+      tripR.value = String(lastPayload?.config.defaultChannels.red ?? 39);
+      tripG.value = String(lastPayload?.config.defaultChannels.green ?? 59);
+      tripW.value = String(lastPayload?.config.defaultChannels.white ?? 79);
+      tripB.value = String(lastPayload?.config.defaultChannels.blue ?? 36);
+      setEditorSpecMode('scene');
+    } else {
+      const t = draftTrips[idx]!;
+      tripEditorTitle.textContent = `编辑第 ${idx + 1} 段行程`;
+      tripEnabledInput.checked = Boolean(t.enable);
+      tripStartInput.value = formatHm(t.startH, t.startM);
+      tripEndInput.value = formatHm(t.endH, t.endM);
+      editorDays = Array.isArray(t.dayList) && t.dayList.length === 7 ? [...t.dayList] : [1, 1, 1, 1, 1, 1, 1];
+      if (t.modeCode === 12) {
+        tripR.value = String(t.red);
+        tripG.value = String(t.green);
+        tripW.value = String(t.white);
+        tripB.value = String(t.blue);
+        setEditorSpecMode('custom');
+      } else {
+        tripSceneSelect.value = String(clampInt(t.modeCode, 0, 11));
+        tripGearInput.value = String(clampInt(t.gear, 1, 10));
+        setEditorSpecMode('scene');
+      }
+    }
+    syncEditorDaysUi();
+    syncTripEditorPreview();
+    tripEditor.hidden = false;
+  }
+
+  async function refreshCultivationPreview(): Promise<void> {
+    const start = parseHm(presetStartInput.value, 9, 0);
+    const lengthCm = clampInt(Number(tankLInput.value), 10, 300);
+    const widthCm = clampInt(Number(tankWInput.value), 10, 200);
+    const heightCm = clampInt(Number(tankHInput.value), 10, 200);
+    const sunriseMinutes = clampInt(Number(presetFadeInput.value), 0, 300);
+    try {
+      const res = await api<NetleaPluginResponse<{ schedule: NetleaSchedule }>>('/api/plugin-run', {
+        plugin: 'netlea',
+        action: 'schedule',
+        args: {
+          op: 'preset',
+          preset: selectedPresetId,
+          lengthCm,
+          widthCm,
+          heightCm,
+          startHour: start.h,
+          startMinute: start.m,
+          sunriseMinutes,
+          sunsetMinutes: sunriseMinutes,
+          previewOnly: true,
+        },
+      });
+      if (!res.ok || !res.data?.schedule) return;
+      previewedSchedule = res.data.schedule;
+      const sched = previewedSchedule;
+      presetMeta.textContent = `${sched.presetName || selectedPresetId} · 推荐基准功率约 ${sched.targetBaseWatts ?? '--'}W · 共 ${sched.trips.length} 阶段（含日出/日落 ${sched.sunriseMinutes} 分钟）`;
+
+      const frag = document.createDocumentFragment();
+      for (let i = 0; i < sched.trips.length; i++) {
+        const t = sched.trips[i]!;
+        const card = node('div', '', 'netlea-trip-card');
+        const main = node('div', '', 'netlea-trip-main');
+        const row = node('div', '', 'netlea-trip-title');
+        row.append(
+          node('strong', `阶段 ${i + 1} · ${formatHm(t.startH, t.startM)} - ${formatHm(t.endH, t.endM)}`),
+          node('span', `${t.seriesName || '水草'}·${t.name || '正白'} ${t.gear}档 (${t.powerWatts ?? '--'}W)`, 'hub-badge badge-blue'),
+        );
+        if (t.hasSunrise) row.append(node('span', `🌅 ${sched.sunriseMinutes}m`, 'hub-badge badge-amber'));
+        if (t.hasSunset) row.append(node('span', `🌇 ${sched.sunsetMinutes}m`, 'hub-badge badge-amber'));
+        main.append(row, node('div', `R${t.red}% G${t.green}% W${t.white}% B${t.blue}%`, 'meta'));
+        card.append(main);
+        frag.append(card);
+      }
+      presetPreviewEl.replaceChildren(frag);
+    } catch {
+      // Ignore transient preview errors
+    }
+  }
+
+  function renderSceneSeriesSubpills(): void {
+    const modelIdx = selectedSeries === 'custom' ? -1 : clampInt(Number(selectedSeries), 0, 2);
+    for (const tab of sceneSeriesTabs.querySelectorAll<HTMLButtonElement>('button[data-series]')) {
+      tab.classList.toggle('active', tab.dataset.series === selectedSeries);
+    }
+    sceneSelectorBox.hidden = selectedSeries === 'custom';
+    customSlidersBox.hidden = selectedSeries !== 'custom';
+    if (selectedSeries === 'custom' || !catalog) {
+      refreshSpectrumPreview();
+      return;
+    }
+
+    const seriesScenes = catalog.scenes.filter(s => s.model === modelIdx);
+    if (!seriesScenes.some(s => s.modeCode === selectedSceneCode) && seriesScenes.length > 0) {
+      selectedSceneCode = seriesScenes[0]!.modeCode;
+    }
+
+    const frag = document.createDocumentFragment();
+    for (const sc of seriesScenes) {
+      const btn = button(sc.name, () => {
+        selectedSceneCode = sc.modeCode;
+        manualPreviewDirty = true;
+        renderSceneSeriesSubpills();
+      }, `hub-filter-pill${sc.modeCode === selectedSceneCode ? ' active' : ''}`);
+      frag.append(btn);
+    }
+    sceneSubpills.replaceChildren(frag);
+
+    const activeScene = findScene(selectedSceneCode);
+    const maxGear = activeScene?.maxGear ?? 10;
+    sceneGearInput.max = String(maxGear);
+    selectedSceneGear = clampInt(selectedSceneGear, 1, maxGear);
+    sceneGearInput.value = String(selectedSceneGear);
+    const gearData = activeScene?.gears.find(g => g.gear === selectedSceneGear);
+    sceneGearVal.textContent = `${selectedSceneGear} 档`;
+    sceneWattsSpan.textContent = gearData ? `${gearData.powerWatts}W` : '--W';
+    if (gearData) {
+      syncSliderInputs(gearData.channels);
+    }
+    refreshSpectrumPreview();
+  }
+
+  function readCustomSliderChannels(): NetleaChannels {
     return {
       red: clampInt(Number(chRed.value), 0, 100),
       green: clampInt(Number(chGreen.value), 0, 100),
@@ -227,7 +971,7 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
     };
   }
 
-  function syncSliderLabels(channels: NetleaChannels): void {
+  function syncSliderInputs(channels: NetleaChannels): void {
     chRed.value = String(channels.red);
     chGreen.value = String(channels.green);
     chWhite.value = String(channels.white);
@@ -240,23 +984,65 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
     chFanVal.textContent = String(channels.fan);
   }
 
-  function refreshCanvasPreview(): void {
-    const ch = readSliderChannels();
+  function renderSavedCustomSlots(presets: NetleaSavedPreset[]): void {
+    if (!presets.length) {
+      customSlotsEl.replaceChildren(node('span', '暂无收藏槽（调整四通道后点击「➕ 收藏当前自定义」）', 'meta'));
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    presets.forEach((p, idx) => {
+      const btn = button(`${p.name} (R${p.red} G${p.green} W${p.white} B${p.blue})`, () => {
+        selectedSeries = 'custom';
+        manualPreviewDirty = true;
+        syncSliderInputs(p);
+        renderSceneSeriesSubpills();
+        setBanner(`已加载收藏「${p.name}」，可选择临时下发或设为手动恒亮。`, 'warn');
+      }, 'hub-filter-pill');
+      const rmBtn = button('✕', () => {
+        const next = presets.filter((_, i) => i !== idx);
+        void (async () => {
+          const res = await runNetlea('config', { savedCustomPresets: next });
+          if (res?.ok) await refreshAfterMutation(false);
+        })();
+      }, 'mini-button');
+      frag.append(btn, rmBtn);
+    });
+    customSlotsEl.replaceChildren(frag);
+  }
+
+  function refreshSpectrumPreview(): void {
+    const ch = readCustomSliderChannels();
     chRedVal.textContent = String(ch.red);
     chGreenVal.textContent = String(ch.green);
     chWhiteVal.textContent = String(ch.white);
     chBlueVal.textContent = String(ch.blue);
     chFanVal.textContent = String(ch.fan);
-    const currentOn = lastPayload?.state ? lastPayload.state.on : null;
-    drawSpectrumCanvas(spectrumCanvas, ch, currentOn, previewMode);
-  }
 
-  function setBusyState(nextBusy: boolean): void {
-    busy = nextBusy;
-    const disabled = nextBusy || appState.authExpired || !appState.ready;
-    for (const btn of actionButtons) {
-      btn.disabled = disabled;
+    const maxW = catalog?.maxWatts ?? lastPayload?.state?.maxWatts ?? 22;
+    let watts = approxCustomWatts(ch);
+    let badgeText = '';
+    if (selectedSeries !== 'custom') {
+      const sc = findScene(selectedSceneCode);
+      const gearObj = sc?.gears.find(g => g.gear === selectedSceneGear);
+      if (sc && gearObj) {
+        watts = gearObj.powerWatts;
+        badgeText = `${manualPreviewDirty ? '预览：' : ''}${sc.seriesName} · ${sc.name} ${gearObj.gear}档 (${watts}W)`;
+      }
     }
+    if (!badgeText) {
+      const state = lastPayload?.state;
+      badgeText = manualPreviewDirty
+        ? `自定义通道预览 · 约 ${watts}W`
+        : state
+          ? `当前状态：${state.runModeLabel || (state.on ? '开启' : '关闭')} (${state.powerWatts ?? watts}W)`
+          : '尚未同步实时状态';
+    }
+    powerBadge.textContent = `${watts}W / ${maxW}W`;
+    powerBadge.className = `hub-badge ${watts > maxW ? 'badge-amber' : 'badge-amber'}`;
+    powerClampNote.textContent = watts > maxW
+      ? `⚠️ 超出 ${maxW}W 额定上限，下发时将自动等比限幅至 ${maxW}W`
+      : `开启 ${maxW}W 额定功率上限保护`;
+    drawSpectrumCanvas(spectrumCanvas, ch, badgeText);
   }
 
   function updateBadge(payload: NetleaDashboardPayload | null): void {
@@ -265,32 +1051,44 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
       topBadge.textContent = '待读';
       return;
     }
-    topBadge.textContent = st.on ? `开 · W${st.channels.white}%` : '已关';
+    topBadge.textContent = st.on
+      ? `${st.runModeLabel || '开'} · ${st.powerWatts ?? st.channels.white}W`
+      : '已关';
   }
 
   function renderDashboard(payload: NetleaDashboardPayload, forceInputs = false): void {
     lastPayload = payload;
+    if (payload.catalog) catalog = payload.catalog;
     updateBadge(payload);
 
     const dev = payload.device;
     const st = payload.state;
     const cfg = payload.config;
     const adv = dev?.advertisement;
+    const maxW = catalog?.maxWatts ?? st?.maxWatts ?? 22;
 
-    const statusLabel = st ? (st.on ? '开启' : '关闭') : '未知';
+    modelPill.textContent = `${catalog?.modelKey || dev?.name || 'SG-X-PRO-60'} · ${maxW}W`;
+
+    const statusLabel = st ? (st.runModeLabel || (st.on ? '开启' : '关闭')) : '未知';
     const statusTone = st ? (st.on ? 'positive' : 'default') : 'warning';
     const rssiText = typeof dev?.rssi === 'number' ? `${dev.rssi} dBm` : '--';
     const rtcText = adv?.rtc || '--';
     const chText = st
-      ? `R${st.channels.red} G${st.channels.green} W${st.channels.white} B${st.channels.blue}`
-      : `预设 W${cfg.defaultChannels.white}%`;
+      ? `${st.powerWatts ?? '--'}W · R${st.channels.red} G${st.channels.green} W${st.channels.white} B${st.channels.blue}`
+      : `默认 W${cfg.defaultChannels.white}%`;
+    const sceneSub = st?.matchedScene
+      ? `${st.matchedScene.seriesName}·${st.matchedScene.name} ${st.matchedScene.gear}档`
+      : (st ? '自定义比例' : '尚无缓存');
+    const schedKpi = payload.activeTrip
+      ? `「${payload.activeTrip.name || '时段'}」`
+      : (payload.schedule?.trips?.length ? `${payload.schedule.trips.filter(t => t.enable).length} 段启用` : '无行程');
 
     const kpiFrag = document.createDocumentFragment();
     kpiFrag.append(
-      kpiCard('灯光状态', statusLabel, dev?.name || cfg.targetMac || '未读取', statusTone),
-      kpiCard('四通道光谱', chText, st ? `风扇 ${st.channels.fan} 档` : '默认预设', st?.on ? 'accent' : 'default'),
-      kpiCard('蓝牙信号', rssiText, dev?.address || '自动发现', typeof dev?.rssi === 'number' && dev.rssi > -75 ? 'positive' : 'default'),
-      kpiCard('灯内时钟', rtcText.length >= 19 ? rtcText.slice(11, 19) : rtcText, payload.updatedAt ? `同步于 ${timestamp(payload.updatedAt)}` : '尚无缓存', 'default'),
+      kpiCard('运行模式与开关', statusLabel, dev?.name || cfg.targetMac || '未读取', statusTone),
+      kpiCard('光谱与功率', chText, sceneSub, st?.on ? 'accent' : 'default'),
+      kpiCard('定时行程 / 信号', `${schedKpi} · ${rssiText}`, dev?.address || '自动发现', typeof dev?.rssi === 'number' && dev.rssi > -75 ? 'positive' : 'default'),
+      kpiCard('灯内时钟 (RTC)', rtcText.length >= 19 ? rtcText.slice(11, 19) : rtcText, payload.updatedAt ? `同步于 ${timestamp(payload.updatedAt)}` : '尚无缓存', 'default'),
     );
     kpiGrid.replaceChildren(kpiFrag);
 
@@ -299,29 +1097,58 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
         dev?.name ? `设备：${dev.name}` : '',
         dev?.address ? `MAC：${dev.address}` : '',
         adv?.rtc ? `灯内 RTC：${adv.rtc}` : '',
+        payload.tempConfig ? `灯内临时时长：开 ${payload.tempConfig.onMinutes}m / 关 ${payload.tempConfig.offMinutes}m` : '',
         payload.updatedAt ? `缓存时间：${timestamp(payload.updatedAt)}` : '',
       ].filter(Boolean);
       deviceMeta.textContent = parts.join(' ｜ ');
     } else {
-      deviceMeta.textContent = '尚未读取鱼缸灯实时数据，点击右上角「实时读取」连接灯具。';
+      deviceMeta.textContent = '尚未读取鱼缸灯实时数据，点击右上角「🔄 实时同步」连接灯具。';
     }
+
+    if (!schedDirty && payload.schedule) {
+      draftTrips = (payload.schedule.trips || []).map(t => ({ ...t, dayList: [...(t.dayList || [1, 1, 1, 1, 1, 1, 1])] }));
+      draftSunrise = clampInt(payload.schedule.sunriseMinutes ?? 20, 0, 300);
+      draftSunset = clampInt(payload.schedule.sunsetMinutes ?? 20, 0, 300);
+      draftTravelModel = payload.schedule.travelModel ?? 0;
+      sunriseInput.value = String(draftSunrise);
+      sunsetInput.value = String(draftSunset);
+      markSchedDirty(false);
+    }
+    renderTripList();
 
     if (forceInputs || !isEditingWithin(panel)) {
-      previewMode = false;
+      manualPreviewDirty = false;
       const shownChannels = st && st.on ? st.channels : cfg.defaultChannels;
-      syncSliderLabels(shownChannels);
-      fadeSecInput.value = String(cfg.fadeSeconds);
+      syncSliderInputs(shownChannels);
+      if (st?.matchedScene) {
+        selectedSeries = String(st.matchedScene.model) as '0' | '1' | '2';
+        selectedSceneCode = st.matchedScene.modeCode;
+        selectedSceneGear = st.matchedScene.gear;
+      } else if (st) {
+        selectedSeries = 'custom';
+      }
+      renderSceneSeriesSubpills();
+
+      tempMinInput.value = String(payload.tempConfig?.onMinutes ?? cfg.tempOnMinutes ?? 20);
+      cfgOnMinInput.value = String(payload.tempConfig?.onMinutes ?? cfg.tempOnMinutes ?? 20);
+      cfgOffMinInput.value = String(payload.tempConfig?.offMinutes ?? cfg.tempOffMinutes ?? 20);
       cfgMacInput.value = cfg.targetMac;
       cfgPrefixInput.value = cfg.namePrefix;
+      tankLInput.value = String(cfg.tankSize?.lengthCm ?? 60);
+      tankWInput.value = String(cfg.tankSize?.widthCm ?? 30);
+      tankHInput.value = String(cfg.tankSize?.heightCm ?? 36);
     }
-
-    refreshCanvasPreview();
+    renderSavedCustomSlots(cfg.savedCustomPresets || []);
+    refreshSpectrumPreview();
+    if (!previewedSchedule && !viewPreset.hidden) {
+      void refreshCultivationPreview();
+    }
   }
 
   async function runNetlea(
     action: string,
     args: Record<string, unknown> = {},
-    opts: { silent?: boolean; forceInputs?: boolean } = {},
+    opts: { silent?: boolean } = {},
   ): Promise<NetleaPluginResponse<Record<string, unknown>> | null> {
     if (busy) return null;
     setBusyState(true);
@@ -351,7 +1178,7 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
     const res = await runNetlea(
       'dashboard',
       refresh ? { refresh: true } : {},
-      { silent: !refresh, forceInputs },
+      { silent: !refresh },
     );
     if (res?.ok && res.data) {
       renderDashboard(res.data as unknown as NetleaDashboardPayload, forceInputs);
@@ -386,7 +1213,7 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
       const bindBtn = button('设为绑定 MAC', () => {
         cfgMacInput.value = dev.address;
         void (async () => {
-          const res = await runNetlea('config', { targetMac: dev.address }, { forceInputs: true });
+          const res = await runNetlea('config', { targetMac: dev.address });
           if (res?.ok) await refreshAfterMutation(true);
         })();
       }, 'mini-button');
@@ -396,21 +1223,32 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
     scanList.replaceChildren(frag);
   }
 
+  // Event wiring: Top bar & quick controls
+  clockBtn.addEventListener('click', () => {
+    setBanner('正在通过蓝牙将主机时钟同步写入鱼缸灯 RTC…', 'warn');
+    void (async () => {
+      const res = await runNetlea('clock', {});
+      if (res?.ok) await refreshAfterMutation(false);
+    })();
+  });
+
   scanBtn.addEventListener('click', () => {
     void (async () => {
       setBanner('正在扫描尼特利鱼缸灯蓝牙广播…', 'warn');
       const res = await runNetlea('scan', { timeoutSec: 5 });
       if (res?.ok && res.data) {
-        const devices = Array.isArray(res.data.devices)
-          ? (res.data.devices as NetleaDeviceView[])
-          : [];
+        const devices = Array.isArray(res.data.devices) ? (res.data.devices as NetleaDeviceView[]) : [];
         renderScanResults(devices);
+        if (devices.length > 0 && activeView !== 'manual') {
+          setBanner(`扫描到 ${devices.length} 台设备（已填入「手动控光与光谱库 -> 蓝牙绑定」列表）`, 'ok');
+        }
       }
     })();
   });
 
   syncBtn.addEventListener('click', () => {
-    setBanner('正在通过蓝牙短连接读取灯具状态…', 'warn');
+    setBanner('正在单次短连接读取实时状态、临时设置与灯内行程…', 'warn');
+    schedDirty = false;
     void loadDashboard(true, true);
   });
 
@@ -419,19 +1257,19 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
   });
 
   onBtn.addEventListener('click', () => {
-    const fadeSeconds = clampInt(Number(fadeSecInput.value), 0, 60);
-    setBanner('正在发送临时开灯指令…', 'warn');
+    const durationMinutes = clampInt(Number(tempMinInput.value), 1, 300);
+    setBanner(`正在发送 ${durationMinutes} 分钟临时开灯指令…`, 'warn');
     void (async () => {
-      const res = await runNetlea('on', { fadeSeconds }, { forceInputs: true });
+      const res = await runNetlea('on', { durationMinutes });
       if (res?.ok) await refreshAfterMutation(true);
     })();
   });
 
   offBtn.addEventListener('click', () => {
-    const fadeSeconds = clampInt(Number(fadeSecInput.value), 0, 60);
-    setBanner('正在发送临时关灯指令…', 'warn');
+    const durationMinutes = clampInt(Number(tempMinInput.value), 1, 300);
+    setBanner(`正在发送 ${durationMinutes} 分钟临时关灯指令…`, 'warn');
     void (async () => {
-      const res = await runNetlea('off', { fadeSeconds }, { forceInputs: true });
+      const res = await runNetlea('off', { durationMinutes });
       if (res?.ok) await refreshAfterMutation(true);
     })();
   });
@@ -439,23 +1277,9 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
   resumeBtn.addEventListener('click', () => {
     setBanner('正在切换回 24h 自动行程…', 'warn');
     void (async () => {
-      const res = await runNetlea('resume', {}, { forceInputs: true });
+      const res = await runNetlea('resume', {});
       if (res?.ok) await refreshAfterMutation(true);
     })();
-  });
-
-  presetBar.addEventListener('click', event => {
-    const btn = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-netlea-preset]');
-    const key = btn?.dataset.netleaPreset;
-    const preset = key ? PRESETS[key] : undefined;
-    if (!preset) return;
-    for (const pill of presetBar.querySelectorAll<HTMLButtonElement>('button[data-netlea-preset]')) {
-      pill.classList.toggle('active', pill === btn);
-    }
-    previewMode = true;
-    syncSliderLabels(preset.channels);
-    refreshCanvasPreview();
-    setBanner(`已加载「${preset.label}」预设到滑块，点击「下发当前光谱」即可写入灯具。`, 'warn');
   });
 
   brightnessRange.addEventListener('input', () => {
@@ -464,36 +1288,392 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
 
   brightnessBtn.addEventListener('click', () => {
     const brightness = clampInt(Number(brightnessRange.value), 1, 100);
-    const fadeSeconds = clampInt(Number(fadeSecInput.value), 0, 60);
-    setBanner(`正在按 ${brightness}% 亮度开启…`, 'warn');
+    const durationMinutes = clampInt(Number(tempMinInput.value), 1, 300);
+    setBanner(`正在按默认光谱 ${brightness}% 亮度临时开启…`, 'warn');
     void (async () => {
-      const res = await runNetlea('on', { brightness, fadeSeconds }, { forceInputs: true });
+      const res = await runNetlea('on', { brightness, durationMinutes });
       if (res?.ok) await refreshAfterMutation(true);
     })();
   });
 
+  // Event wiring: Workspace sub-tabs
+  workspaceTabs.addEventListener('click', event => {
+    const btn = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-netlea-view]');
+    const view = btn?.dataset.netleaView as 'schedule' | 'preset' | 'manual' | undefined;
+    if (view) switchWorkspaceView(view);
+  });
+
+  // Event wiring: View 1 - Schedule & Sunrise/Sunset
+  const handleSunChange = () => {
+    draftSunrise = clampInt(Number(sunriseInput.value), 0, 300);
+    draftSunset = clampInt(Number(sunsetInput.value), 0, 300);
+    markSchedDirty(true);
+    renderTripList();
+  };
+  sunriseInput.addEventListener('change', handleSunChange);
+  sunsetInput.addEventListener('change', handleSunChange);
+
+  sunPills.addEventListener('click', event => {
+    const btn = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-sun-min]');
+    if (!btn) return;
+    const min = clampInt(Number(btn.dataset.sunMin), 0, 300);
+    draftSunrise = min;
+    draftSunset = min;
+    sunriseInput.value = String(min);
+    sunsetInput.value = String(min);
+    for (const p of sunPills.querySelectorAll<HTMLButtonElement>('button[data-sun-min]')) {
+      p.classList.toggle('active', p === btn);
+    }
+    markSchedDirty(true);
+    renderTripList();
+  });
+
+  schedReadBtn.addEventListener('click', () => {
+    setBanner('正在从灯具闪存回读 24h 定时行程…', 'warn');
+    void (async () => {
+      const res = await runNetlea('schedule', { op: 'get' });
+      if (res?.ok && res.data?.schedule) {
+        const sc = res.data.schedule as NetleaSchedule;
+        draftTrips = (sc.trips || []).map(t => ({ ...t, dayList: [...t.dayList] }));
+        draftSunrise = clampInt(sc.sunriseMinutes ?? 0, 0, 300);
+        draftSunset = clampInt(sc.sunsetMinutes ?? 0, 0, 300);
+        draftTravelModel = sc.travelModel ?? 0;
+        sunriseInput.value = String(draftSunrise);
+        sunsetInput.value = String(draftSunset);
+        markSchedDirty(false);
+        await refreshAfterMutation(false);
+      }
+    })();
+  });
+
+  tripNewBtn.addEventListener('click', () => {
+    if (draftTrips.length >= 10) {
+      setBanner('灯具最多支持 10 个定时时段，请先删除或修改现有时段。', 'err');
+      return;
+    }
+    openTripEditor(-1);
+  });
+
+  schedClearBtn.addEventListener('click', () => {
+    if (!clearArmed) {
+      clearArmed = true;
+      schedClearBtn.classList.add('is-armed');
+      schedClearBtn.textContent = '⚠ 再次点击确认清空';
+      setBanner('确认清空灯内全部定时行程？请在 5 秒内再次点击「⚠ 再次点击确认清空」。', 'warn');
+      if (clearArmTimer) clearTimeout(clearArmTimer);
+      clearArmTimer = setTimeout(() => {
+        clearArmed = false;
+        schedClearBtn.classList.remove('is-armed');
+        schedClearBtn.textContent = '🧹 清空灯内行程';
+      }, 5000);
+      return;
+    }
+    clearArmed = false;
+    if (clearArmTimer) clearTimeout(clearArmTimer);
+    schedClearBtn.classList.remove('is-armed');
+    schedClearBtn.textContent = '🧹 清空灯内行程';
+    setBanner('正在清空灯内全部定时行程…', 'warn');
+    void (async () => {
+      const res = await runNetlea('schedule', { op: 'clear' });
+      if (res?.ok) {
+        draftTrips = [];
+        markSchedDirty(false);
+        tripEditor.hidden = true;
+        await refreshAfterMutation(false);
+      }
+    })();
+  });
+
+  schedSaveBtn.addEventListener('click', () => {
+    if (draftTrips.length === 0) {
+      setBanner('当前列表没有时段；如需彻底关闭定时请点击「清空灯内行程」。', 'err');
+      return;
+    }
+    const sunriseMinutes = clampInt(Number(sunriseInput.value), 0, 300);
+    const sunsetMinutes = clampInt(Number(sunsetInput.value), 0, 300);
+    setBanner('正在向灯具写入并激活 24h 日出日落行程…', 'warn');
+    void (async () => {
+      const res = await runNetlea('schedule', {
+        op: 'set',
+        travelModel: draftTravelModel,
+        sunriseMinutes,
+        sunsetMinutes,
+        trips: draftTrips,
+      });
+      if (res?.ok) {
+        markSchedDirty(false);
+        await refreshAfterMutation(false);
+      }
+    })();
+  });
+
+  // Event wiring: Trip editor
+  tripDaysEl.addEventListener('click', event => {
+    const btn = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-day]');
+    if (!btn) return;
+    const idx = clampInt(Number(btn.dataset.day), 0, 6);
+    editorDays[idx] = editorDays[idx] ? 0 : 1;
+    syncEditorDaysUi();
+  });
+
+  tripDayQuickEl.addEventListener('click', event => {
+    const btn = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-day-preset]');
+    const preset = btn?.dataset.dayPreset;
+    if (preset === 'all') editorDays = [1, 1, 1, 1, 1, 1, 1];
+    else if (preset === 'workday') editorDays = [1, 1, 1, 1, 1, 0, 0];
+    else if (preset === 'weekend') editorDays = [0, 0, 0, 0, 0, 1, 1];
+    syncEditorDaysUi();
+  });
+
+  tripSpecModeEl.addEventListener('click', event => {
+    const btn = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-spec-mode]');
+    const m = btn?.dataset.specMode as 'scene' | 'custom' | undefined;
+    if (m) setEditorSpecMode(m);
+  });
+
+  tripSceneSelect.addEventListener('change', syncTripEditorPreview);
+  tripGearInput.addEventListener('input', syncTripEditorPreview);
+  for (const el of [tripR, tripG, tripW, tripB]) {
+    el.addEventListener('input', syncTripEditorPreview);
+  }
+
+  tripCancelBtn.addEventListener('click', () => {
+    tripEditor.hidden = true;
+    editingTripIndex = -1;
+  });
+
+  tripApplyBtn.addEventListener('click', () => {
+    const start = parseHm(tripStartInput.value, 9, 0);
+    const end = parseHm(tripEndInput.value, 18, 0);
+    if (start.h === end.h && start.m === end.m) {
+      setBanner('开始时间与结束时间不能相同。', 'err');
+      return;
+    }
+    if (!editorDays.some(Boolean)) {
+      setBanner('请至少选择 1 个生效星期。', 'err');
+      return;
+    }
+    let nextTrip: NetleaTrip;
+    if (editorSpecMode === 'scene') {
+      const modeCode = clampInt(Number(tripSceneSelect.value), 0, 11);
+      const sc = findScene(modeCode);
+      const gear = clampInt(Number(tripGearInput.value), 1, sc?.maxGear ?? 10);
+      const gearObj = sc?.gears.find(g => g.gear === gear);
+      nextTrip = {
+        enable: tripEnabledInput.checked ? 1 : 0,
+        dayList: [...editorDays],
+        startH: start.h,
+        startM: start.m,
+        endH: end.h,
+        endM: end.m,
+        modeCode,
+        gear,
+        red: gearObj?.channels.red ?? 39,
+        green: gearObj?.channels.green ?? 59,
+        white: gearObj?.channels.white ?? 79,
+        blue: gearObj?.channels.blue ?? 36,
+        fan: 0,
+        powerWatts: gearObj?.powerWatts ?? 18,
+        name: sc?.name || '场景',
+        seriesName: sc?.seriesName || '水草',
+      };
+    } else {
+      const red = clampInt(Number(tripR.value), 0, 100);
+      const green = clampInt(Number(tripG.value), 0, 100);
+      const white = clampInt(Number(tripW.value), 0, 100);
+      const blue = clampInt(Number(tripB.value), 0, 100);
+      nextTrip = {
+        enable: tripEnabledInput.checked ? 1 : 0,
+        dayList: [...editorDays],
+        startH: start.h,
+        startM: start.m,
+        endH: end.h,
+        endM: end.m,
+        modeCode: 12,
+        gear: 0,
+        red,
+        green,
+        white,
+        blue,
+        fan: 0,
+        powerWatts: approxCustomWatts({ red, green, white, blue, fan: 0 }),
+        name: '自定义',
+        seriesName: '自定义',
+      };
+    }
+
+    if (editingTripIndex === -1) {
+      draftTrips.push(nextTrip);
+    } else {
+      draftTrips[editingTripIndex] = nextTrip;
+    }
+    draftTrips.sort((a, b) => (a.startH * 60 + a.startM) - (b.startH * 60 + b.startM));
+    draftTravelModel = 0;
+    tripEditor.hidden = true;
+    editingTripIndex = -1;
+    markSchedDirty(true);
+    renderTripList();
+    setBanner('已更新时段列表，请点击「🚀 保存并下发行程」写入灯具。', 'warn');
+  });
+
+  // Event wiring: View 2 - Official Cultivation Presets
+  const schedulePresetPreview = () => {
+    if (presetDebounce) clearTimeout(presetDebounce);
+    presetDebounce = setTimeout(() => {
+      void refreshCultivationPreview();
+    }, 120);
+  };
+
+  cultivationPills.addEventListener('click', event => {
+    const btn = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-cultivation-id]');
+    const pid = btn?.dataset.cultivationId;
+    if (!pid) return;
+    selectedPresetId = pid;
+    for (const pill of cultivationPills.querySelectorAll<HTMLButtonElement>('button[data-cultivation-id]')) {
+      pill.classList.toggle('active', pill === btn);
+    }
+    void refreshCultivationPreview();
+  });
+
+  for (const inp of [tankLInput, tankWInput, tankHInput, presetStartInput, presetFadeInput]) {
+    inp.addEventListener('change', schedulePresetPreview);
+  }
+
+  presetImportBtn.addEventListener('click', () => {
+    void (async () => {
+      if (!previewedSchedule) await refreshCultivationPreview();
+      if (!previewedSchedule) return;
+      draftTrips = previewedSchedule.trips.map(t => ({ ...t, dayList: [...t.dayList] }));
+      draftSunrise = previewedSchedule.sunriseMinutes;
+      draftSunset = previewedSchedule.sunsetMinutes;
+      draftTravelModel = 1;
+      sunriseInput.value = String(draftSunrise);
+      sunsetInput.value = String(draftSunset);
+      markSchedDirty(true);
+      switchWorkspaceView('schedule');
+      renderTripList();
+      setBanner(`已导入「${previewedSchedule.presetName || selectedPresetId}」，可微调后点击「🚀 保存并下发行程」。`, 'warn');
+    })();
+  });
+
+  presetApplyBtn.addEventListener('click', () => {
+    const start = parseHm(presetStartInput.value, 9, 0);
+    const fade = clampInt(Number(presetFadeInput.value), 0, 300);
+    setBanner('正在按缸体尺寸计算预设并写入灯具闪存…', 'warn');
+    void (async () => {
+      const res = await runNetlea('schedule', {
+        op: 'preset',
+        preset: selectedPresetId,
+        lengthCm: clampInt(Number(tankLInput.value), 10, 300),
+        widthCm: clampInt(Number(tankWInput.value), 10, 200),
+        heightCm: clampInt(Number(tankHInput.value), 10, 200),
+        startHour: start.h,
+        startMinute: start.m,
+        sunriseMinutes: fade,
+        sunsetMinutes: fade,
+      });
+      if (res?.ok) {
+        schedDirty = false;
+        await refreshAfterMutation(false);
+        switchWorkspaceView('schedule');
+      }
+    })();
+  });
+
+  // Event wiring: View 3 - Manual Workbench & Config
+  sceneSeriesTabs.addEventListener('click', event => {
+    const btn = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-series]');
+    const ser = btn?.dataset.series as '0' | '1' | '2' | 'custom' | undefined;
+    if (!ser) return;
+    selectedSeries = ser;
+    manualPreviewDirty = true;
+    renderSceneSeriesSubpills();
+  });
+
+  sceneGearInput.addEventListener('input', () => {
+    selectedSceneGear = clampInt(Number(sceneGearInput.value), 1, Number(sceneGearInput.max) || 10);
+    manualPreviewDirty = true;
+    renderSceneSeriesSubpills();
+  });
+
   for (const input of [chRed, chGreen, chWhite, chBlue, chFan]) {
     input.addEventListener('input', () => {
-      previewMode = true;
-      refreshCanvasPreview();
+      selectedSeries = 'custom';
+      for (const tab of sceneSeriesTabs.querySelectorAll<HTMLButtonElement>('button[data-series]')) {
+        tab.classList.toggle('active', tab.dataset.series === 'custom');
+      }
+      sceneSelectorBox.hidden = true;
+      customSlidersBox.hidden = false;
+      manualPreviewDirty = true;
+      refreshSpectrumPreview();
     });
   }
 
-  applyChannelsBtn.addEventListener('click', () => {
-    const channels = readSliderChannels();
-    const fadeSeconds = clampInt(Number(fadeSecInput.value), 0, 60);
-    setBanner('正在下发当前 R/G/W/B 与风扇设置…', 'warn');
+  saveSlotBtn.addEventListener('click', () => {
+    const existing = lastPayload?.config.savedCustomPresets || [];
+    if (existing.length >= 6) {
+      setBanner('最多保存 6 个自定义光谱收藏槽，请先删除不需要的收藏。', 'err');
+      return;
+    }
+    const ch = readCustomSliderChannels();
+    const next = [...existing, { name: `方案 ${existing.length + 1}`, ...ch }];
     void (async () => {
-      const res = await runNetlea('on', { ...channels, fadeSeconds }, { forceInputs: true });
+      const res = await runNetlea('config', { savedCustomPresets: next });
+      if (res?.ok) await refreshAfterMutation(false);
+    })();
+  });
+
+  function buildSpectrumActionArgs(): Record<string, unknown> {
+    if (selectedSeries !== 'custom') {
+      return { modeCode: selectedSceneCode, gear: selectedSceneGear };
+    }
+    return { ...readCustomSliderChannels() };
+  }
+
+  applyTempBtn.addEventListener('click', () => {
+    const durationMinutes = clampInt(Number(tempMinInput.value), 1, 300);
+    setBanner(`正在以当前光谱临时开灯（${durationMinutes} 分钟后恢复行程）…`, 'warn');
+    void (async () => {
+      const res = await runNetlea('on', { ...buildSpectrumActionArgs(), durationMinutes });
+      if (res?.ok) await refreshAfterMutation(true);
+    })();
+  });
+
+  applyManualBtn.addEventListener('click', () => {
+    setBanner('正在切换为手动恒亮模式（常亮不随定时变化）…', 'warn');
+    void (async () => {
+      const res = await runNetlea('mode', { mode: 'manual', on: true, ...buildSpectrumActionArgs() });
+      if (res?.ok) await refreshAfterMutation(true);
+    })();
+  });
+
+  manualOffBtn.addEventListener('click', () => {
+    setBanner('正在发送手动恒定关灯指令…', 'warn');
+    void (async () => {
+      const res = await runNetlea('mode', { mode: 'manual', on: false });
       if (res?.ok) await refreshAfterMutation(true);
     })();
   });
 
   saveDefaultBtn.addEventListener('click', () => {
-    const defaultChannels = readSliderChannels();
-    const fadeSeconds = clampInt(Number(fadeSecInput.value), 0, 60);
+    const defaultChannels = readCustomSliderChannels();
     void (async () => {
-      const res = await runNetlea('config', { fadeSeconds, defaultChannels }, { forceInputs: true });
+      const res = await runNetlea('config', { defaultChannels });
+      if (res?.ok) await refreshAfterMutation(true);
+    })();
+  });
+
+  cfgTempSaveBtn.addEventListener('click', () => {
+    const onMinutes = clampInt(Number(cfgOnMinInput.value), 1, 300);
+    const offMinutes = clampInt(Number(cfgOffMinInput.value), 1, 300);
+    setBanner('正在将默认临时开关灯分钟数写入灯具 (0x1A)…', 'warn');
+    void (async () => {
+      const res = await runNetlea('mode', {
+        mode: 'temp-config',
+        onMinutes,
+        offMinutes,
+        ...buildSpectrumActionArgs(),
+      });
       if (res?.ok) await refreshAfterMutation(true);
     })();
   });
@@ -502,7 +1682,7 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
     const targetMac = cfgMacInput.value.trim();
     const namePrefix = cfgPrefixInput.value.trim() || 'SG-';
     void (async () => {
-      const res = await runNetlea('config', { targetMac, namePrefix }, { forceInputs: true });
+      const res = await runNetlea('config', { targetMac, namePrefix });
       if (res?.ok) await refreshAfterMutation(true);
     })();
   });
@@ -528,6 +1708,7 @@ export function initNetleaUi(options: NetleaUiOptions): NetleaUiController {
             renderDashboard(res.data, false);
           } else {
             lastPayload = res.data;
+            if (res.data.catalog) catalog = res.data.catalog;
             updateBadge(res.data);
           }
         }

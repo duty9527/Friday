@@ -1357,85 +1357,312 @@
           <div class="plugin-surface-bar">
             <div>
               <h3>🐠 鱼缸灯光 · 尼特利蓝牙智控中心</h3>
-              <p class="health-header-sub">SG-X-PRO 低功耗蓝牙短连接直控：四通道光谱调光、临时照明、一键恢复 24h 自动行程</p>
+              <p class="health-header-sub">SG-X-PRO 本地蓝牙全功能控制：24h 日出日落定时行程、6 大官方养殖预设、12 种原厂光谱、手动恒亮与内置时钟同步</p>
             </div>
             <div class="health-header-actions">
+              <button id="netlea-clock-btn" class="mini-button" type="button">⌚ 同步校时</button>
               <button id="netlea-scan-btn" class="mini-button" type="button">🔍 扫描广播</button>
-              <button id="netlea-sync-btn" class="primary" type="button">🔄 实时读取</button>
-              <button id="netlea-refresh-btn" class="mini-button" type="button">↻ 刷新看板</button>
+              <button id="netlea-sync-btn" class="primary" type="button">🔄 实时同步</button>
+              <button id="netlea-refresh-btn" class="mini-button" type="button">↻ 刷新缓存</button>
             </div>
           </div>
           <p id="netlea-action-status" class="health-status-banner" hidden></p>
 
           <div id="netlea-kpi-grid" class="hub-kpi-grid"></div>
 
-          <section class="model-modal-section netlea-hero-grid" aria-label="快捷控光与光谱预览">
-            <div class="hub-form-card">
-              <h3>⚡ 快捷开关与观赏预设</h3>
-              <div class="modal-btn-group">
-                <button id="netlea-on-btn" class="primary" type="button">💡 临时开灯</button>
-                <button id="netlea-off-btn" class="mini-button" type="button">🌑 临时关灯</button>
-                <button id="netlea-resume-btn" class="mini-button" type="button">🕒 恢复 24h 行程</button>
-              </div>
-              <div id="netlea-preset-bar" class="hub-filter-pills" role="group" aria-label="观赏光谱预设">
-                <button class="hub-filter-pill" type="button" data-netlea-preset="vivid">🌿 增艳全光谱</button>
-                <button class="hub-filter-pill" type="button" data-netlea-preset="daylight">☀️ 清澈日光</button>
-                <button class="hub-filter-pill" type="button" data-netlea-preset="sunset">🌇 暖金晚霞</button>
-                <button class="hub-filter-pill" type="button" data-netlea-preset="moonlight">🌙 静谧月光</button>
-              </div>
-              <div class="netlea-slider-row">
-                <label for="netlea-brightness-range">总亮度比例 (<span id="netlea-brightness-val">100%</span>)</label>
-                <input id="netlea-brightness-range" type="range" min="1" max="100" value="100">
-                <button id="netlea-brightness-btn" class="mini-button" type="button">✨ 按比例调光</button>
-              </div>
-            </div>
-
-            <div class="hub-form-card">
-              <h3>🎨 四通道实时光谱图</h3>
-              <div class="netlea-canvas-wrap">
-                <canvas id="netlea-spectrum-canvas" class="netlea-spectrum-canvas" width="560" height="156"></canvas>
-              </div>
-              <p id="netlea-device-meta" class="meta">尚未读取鱼缸灯实时数据，点击右上角「实时读取」连接灯具。</p>
-            </div>
-          </section>
-
-          <section class="model-modal-section" aria-label="四通道精细调光与设备配置">
-            <div class="hub-form-card">
-              <h3>🎛️ R / G / W / B 通道与风扇调光</h3>
-              <div class="netlea-sliders-grid">
-                <label class="netlea-slider-field">
-                  <span>红光 R (<strong id="netlea-ch-red-val">69</strong>%)</span>
-                  <input id="netlea-ch-red" type="range" min="0" max="100" value="69">
-                </label>
-                <label class="netlea-slider-field">
-                  <span>绿光 G (<strong id="netlea-ch-green-val">54</strong>%)</span>
-                  <input id="netlea-ch-green" type="range" min="0" max="100" value="54">
-                </label>
-                <label class="netlea-slider-field">
-                  <span>白光 W (<strong id="netlea-ch-white-val">98</strong>%)</span>
-                  <input id="netlea-ch-white" type="range" min="0" max="100" value="98">
-                </label>
-                <label class="netlea-slider-field">
-                  <span>蓝光 B (<strong id="netlea-ch-blue-val">54</strong>%)</span>
-                  <input id="netlea-ch-blue" type="range" min="0" max="100" value="54">
-                </label>
-                <label class="netlea-slider-field">
-                  <span>散热风扇 (<strong id="netlea-ch-fan-val">0</strong> 档)</span>
-                  <input id="netlea-ch-fan" type="range" min="0" max="5" value="0">
-                </label>
-                <label class="netlea-slider-field">
-                  <span>渐变时长（秒）</span>
-                  <input id="netlea-fade-sec" type="number" min="0" max="60" value="3">
-                </label>
-              </div>
+          <section class="model-modal-section" aria-label="快捷临时控光">
+            <div class="hub-form-card netlea-quick-card">
               <div class="modal-row-head">
-                <span class="hint">拖动滑块可实时预览光谱比例；点击「下发当前光谱」将通过蓝牙短连接写入灯具。</span>
                 <div class="modal-btn-group">
-                  <button id="netlea-save-default-btn" class="mini-button" type="button">💾 存为默认开灯光谱</button>
-                  <button id="netlea-apply-channels-btn" class="primary" type="button">🚀 下发当前光谱</button>
+                  <button id="netlea-on-btn" class="primary" type="button">💡 临时开灯</button>
+                  <button id="netlea-off-btn" class="mini-button" type="button">🌑 临时关灯</button>
+                  <button id="netlea-resume-btn" class="mini-button" type="button">🕒 恢复 24h 行程</button>
+                </div>
+                <div class="netlea-quick-controls">
+                  <label class="netlea-inline-field">临时时长
+                    <input id="netlea-temp-min" class="netlea-num-sm" type="number" min="1" max="300" value="20">
+                    <span>分钟</span>
+                  </label>
+                  <label class="netlea-inline-field">按比例调光
+                    <input id="netlea-brightness-range" type="range" min="1" max="100" value="100">
+                    <span id="netlea-brightness-val">100%</span>
+                  </label>
+                  <button id="netlea-brightness-btn" class="mini-button" type="button">✨ 生效</button>
                 </div>
               </div>
             </div>
+          </section>
+
+          <div class="modal-row-head">
+            <div id="netlea-workspace-tabs" class="hub-filter-pills" role="tablist" aria-label="鱼缸灯光功能模式">
+              <button class="hub-filter-pill active" type="button" role="tab" aria-selected="true" data-netlea-view="schedule">📅 定时行程与日出日落</button>
+              <button class="hub-filter-pill" type="button" role="tab" aria-selected="false" data-netlea-view="preset">🌱 官方养殖预设</button>
+              <button class="hub-filter-pill" type="button" role="tab" aria-selected="false" data-netlea-view="manual">🎛️ 手动控光与光谱库</button>
+            </div>
+            <span id="netlea-model-pill" class="hub-badge badge-slate">SG-X-PRO-60 · 22W</span>
+          </div>
+
+          <!-- 视图 1：定时行程与日出日落 -->
+          <section id="netlea-view-schedule" class="model-modal-section" aria-label="24小时定时行程与日出日落">
+            <div class="hub-form-card">
+              <div class="modal-row-head">
+                <h3>🌅 24 小时日出/日落光照曲线</h3>
+                <span id="netlea-sched-badge" class="hub-badge badge-slate">未配置行程</span>
+              </div>
+              <div class="netlea-canvas-wrap">
+                <canvas id="netlea-timeline-canvas" class="netlea-timeline-canvas" width="880" height="190" aria-label="24小时光照与日出日落曲线图"></canvas>
+              </div>
+              <p id="netlea-timeline-caption" class="meta">当前尚未读取到灯内行程；可点击下方「从灯具读取行程」或新增时段。</p>
+
+              <div class="netlea-sun-row">
+                <label class="netlea-inline-field">🌅 日出渐亮（分）
+                  <input id="netlea-sunrise-min" class="netlea-num-sm" type="number" min="0" max="300" value="20">
+                </label>
+                <label class="netlea-inline-field">🌇 日落渐暗（分）
+                  <input id="netlea-sunset-min" class="netlea-num-sm" type="number" min="0" max="300" value="20">
+                </label>
+                <div id="netlea-sun-pills" class="hub-filter-pills" role="group" aria-label="常用日出日落渐变分钟">
+                  <button class="hub-filter-pill" type="button" data-sun-min="0">无渐变 0m</button>
+                  <button class="hub-filter-pill" type="button" data-sun-min="15">15m</button>
+                  <button class="hub-filter-pill" type="button" data-sun-min="20">20m 默认</button>
+                  <button class="hub-filter-pill" type="button" data-sun-min="30">30m</button>
+                  <button class="hub-filter-pill" type="button" data-sun-min="60">60m</button>
+                </div>
+              </div>
+
+              <div class="modal-row-head">
+                <div>
+                  <h4>定时行程时段表（最多 10 段 · 相邻时段自动平滑衔接）</h4>
+                  <span id="netlea-sched-dirty" class="meta">已与灯具同步</span>
+                </div>
+                <div class="modal-btn-group">
+                  <button id="netlea-sched-read-btn" class="mini-button" type="button">📥 从灯具读取行程</button>
+                  <button id="netlea-trip-new-btn" class="mini-button" type="button">＋ 新增时段</button>
+                  <button id="netlea-sched-clear-btn" class="mini-button danger-btn" type="button">🧹 清空灯内行程</button>
+                  <button id="netlea-sched-save-btn" class="primary" type="button">🚀 保存并下发行程</button>
+                </div>
+              </div>
+
+              <div id="netlea-trip-list" class="netlea-trip-list">
+                <p class="empty">暂无定时时段，点击「＋ 新增时段」或切换到「🌱 官方养殖预设」一键生成。</p>
+              </div>
+
+              <div id="netlea-trip-editor" class="netlea-trip-editor" hidden>
+                <div class="modal-row-head">
+                  <h4 id="netlea-trip-editor-title">编辑定时时段</h4>
+                  <label class="hub-checkbox-label">
+                    <input id="netlea-trip-enabled" type="checkbox" checked>
+                    <span>启用该时段</span>
+                  </label>
+                </div>
+                <div class="netlea-editor-grid">
+                  <label>开始时间
+                    <input id="netlea-trip-start" type="time" value="09:00">
+                  </label>
+                  <label>结束时间
+                    <input id="netlea-trip-end" type="time" value="18:00">
+                  </label>
+                </div>
+                <div class="netlea-day-bar">
+                  <span class="meta">生效星期：</span>
+                  <div id="netlea-trip-days" class="netlea-day-pills" role="group" aria-label="星期选择">
+                    <button class="netlea-day-pill active" type="button" data-day="0">一</button>
+                    <button class="netlea-day-pill active" type="button" data-day="1">二</button>
+                    <button class="netlea-day-pill active" type="button" data-day="2">三</button>
+                    <button class="netlea-day-pill active" type="button" data-day="3">四</button>
+                    <button class="netlea-day-pill active" type="button" data-day="4">五</button>
+                    <button class="netlea-day-pill active" type="button" data-day="5">六</button>
+                    <button class="netlea-day-pill active" type="button" data-day="6">日</button>
+                  </div>
+                  <div id="netlea-day-quick" class="hub-filter-pills">
+                    <button class="hub-filter-pill" type="button" data-day-preset="all">每天</button>
+                    <button class="hub-filter-pill" type="button" data-day-preset="workday">工作日</button>
+                    <button class="hub-filter-pill" type="button" data-day-preset="weekend">周末</button>
+                  </div>
+                </div>
+
+                <div id="netlea-trip-spec-mode" class="hub-filter-pills" role="group" aria-label="时段光谱模式">
+                  <button class="hub-filter-pill active" type="button" data-spec-mode="scene">🎨 官方 12 场景档位</button>
+                  <button class="hub-filter-pill" type="button" data-spec-mode="custom">🎛️ 自定义四通道</button>
+                </div>
+
+                <div id="netlea-trip-scene-box" class="netlea-editor-grid">
+                  <label>选择原厂场景
+                    <select id="netlea-trip-scene"></select>
+                  </label>
+                  <label>功率档位 (<strong id="netlea-trip-gear-val">8 档</strong> · <span id="netlea-trip-watts">18W</span>)
+                    <input id="netlea-trip-gear" type="range" min="1" max="10" value="8">
+                  </label>
+                </div>
+
+                <div id="netlea-trip-custom-box" class="netlea-sliders-grid" hidden>
+                  <label class="netlea-slider-field">
+                    <span>红光 R (<strong id="netlea-trip-r-val">39</strong>%)</span>
+                    <input id="netlea-trip-r" type="range" min="0" max="100" value="39">
+                  </label>
+                  <label class="netlea-slider-field">
+                    <span>绿光 G (<strong id="netlea-trip-g-val">59</strong>%)</span>
+                    <input id="netlea-trip-g" type="range" min="0" max="100" value="59">
+                  </label>
+                  <label class="netlea-slider-field">
+                    <span>白光 W (<strong id="netlea-trip-w-val">79</strong>%)</span>
+                    <input id="netlea-trip-w" type="range" min="0" max="100" value="79">
+                  </label>
+                  <label class="netlea-slider-field">
+                    <span>蓝光 B (<strong id="netlea-trip-b-val">36</strong>%)</span>
+                    <input id="netlea-trip-b" type="range" min="0" max="100" value="36">
+                  </label>
+                  <div class="netlea-slider-field">
+                    <span>时段估算功耗</span>
+                    <span id="netlea-trip-custom-watts" class="hub-badge badge-amber">17W / 22W</span>
+                  </div>
+                </div>
+
+                <div class="modal-row-head">
+                  <span class="hint">修改后需点击上方「🚀 保存并下发行程」才会写入灯具闪存。</span>
+                  <div class="modal-btn-group">
+                    <button id="netlea-trip-cancel-btn" class="mini-button" type="button">取消</button>
+                    <button id="netlea-trip-apply-btn" class="primary" type="button">✓ 保存时段到列表</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- 视图 2：官方科学养殖预设 -->
+          <section id="netlea-view-preset" class="model-modal-section" aria-label="官方科学养殖预设" hidden>
+            <div class="hub-form-card">
+              <div class="modal-row-head">
+                <div>
+                  <h3>🌱 尼特利官方科学养殖预设向导</h3>
+                  <span class="meta">按缸体尺寸与水深自动换算科学功率与光谱阶段，并自动附加平滑日出/日落</span>
+                </div>
+              </div>
+              <div id="netlea-cultivation-pills" class="hub-filter-pills" role="group" aria-label="养殖方案选择">
+                <button class="hub-filter-pill active" type="button" data-cultivation-id="open_tank">🌱 开缸预设 (6h)</button>
+                <button class="hub-filter-pill" type="button" data-cultivation-id="green_plant">🌿 绿草预设 (8h)</button>
+                <button class="hub-filter-pill" type="button" data-cultivation-id="red_plant">🍁 红草预设 (12h)</button>
+                <button class="hub-filter-pill" type="button" data-cultivation-id="mixed">🪴 综合预设 (9h)</button>
+                <button class="hub-filter-pill" type="button" data-cultivation-id="buce">🪨 椒榕预设 (8h)</button>
+                <button class="hub-filter-pill" type="button" data-cultivation-id="algae">⚡ 爆藻预设 (14h)</button>
+              </div>
+              <div class="netlea-preset-form">
+                <label>缸长 (cm)
+                  <input id="netlea-tank-l" type="number" min="10" max="300" value="60">
+                </label>
+                <label>缸宽 (cm)
+                  <input id="netlea-tank-w" type="number" min="10" max="200" value="30">
+                </label>
+                <label>缸高 (cm)
+                  <input id="netlea-tank-h" type="number" min="10" max="200" value="36">
+                </label>
+                <label>开灯时间
+                  <input id="netlea-preset-start" type="time" value="09:00">
+                </label>
+                <label>日出/日落渐变 (分钟)
+                  <input id="netlea-preset-fade" type="number" min="0" max="300" value="20">
+                </label>
+              </div>
+              <p id="netlea-preset-meta" class="meta">正在计算科学养殖阶段方案…</p>
+              <div id="netlea-preset-preview" class="netlea-trip-list"></div>
+              <div class="modal-row-head">
+                <span class="hint">可先导入到「定时行程编辑器」微调时间与星期，或直接一键写入灯具并开启自动运行。</span>
+                <div class="modal-btn-group">
+                  <button id="netlea-preset-import-btn" class="mini-button" type="button">✏️ 导入行程编辑器微调</button>
+                  <button id="netlea-preset-apply-btn" class="primary" type="button">🚀 一键写入此预设行程</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- 视图 3：手动控光、12 原厂光谱与配置 -->
+          <section id="netlea-view-manual" class="model-modal-section" aria-label="手动控光与原厂光谱库" hidden>
+            <div class="netlea-hero-grid">
+              <div class="hub-form-card">
+                <div class="modal-row-head">
+                  <h3>🎛️ 12 种原厂光谱与自定义四通道</h3>
+                  <span id="netlea-power-badge" class="hub-badge badge-amber">17W / 22W</span>
+                </div>
+                <div id="netlea-scene-series-tabs" class="hub-filter-pills" role="group" aria-label="光谱系列选择">
+                  <button class="hub-filter-pill active" type="button" data-series="0">🌿 水草系列</button>
+                  <button class="hub-filter-pill" type="button" data-series="1">🏞️ 原生系列</button>
+                  <button class="hub-filter-pill" type="button" data-series="2">✨ 增艳系列</button>
+                  <button class="hub-filter-pill" type="button" data-series="custom">🎛️ 自定义通道</button>
+                </div>
+
+                <div id="netlea-scene-selector-box">
+                  <div id="netlea-scene-subpills" class="hub-filter-pills" role="group" aria-label="场景选择"></div>
+                  <div class="netlea-slider-row">
+                    <label for="netlea-scene-gear">档位调节 (<strong id="netlea-scene-gear-val">8 档</strong>)</label>
+                    <input id="netlea-scene-gear" type="range" min="1" max="10" value="8">
+                    <span id="netlea-scene-watts" class="meta">18W</span>
+                  </div>
+                </div>
+
+                <div id="netlea-custom-sliders-box" hidden>
+                  <div class="netlea-sliders-grid">
+                    <label class="netlea-slider-field">
+                      <span>红光 R (<strong id="netlea-ch-red-val">39</strong>%)</span>
+                      <input id="netlea-ch-red" type="range" min="0" max="100" value="39">
+                    </label>
+                    <label class="netlea-slider-field">
+                      <span>绿光 G (<strong id="netlea-ch-green-val">59</strong>%)</span>
+                      <input id="netlea-ch-green" type="range" min="0" max="100" value="59">
+                    </label>
+                    <label class="netlea-slider-field">
+                      <span>白光 W (<strong id="netlea-ch-white-val">79</strong>%)</span>
+                      <input id="netlea-ch-white" type="range" min="0" max="100" value="79">
+                    </label>
+                    <label class="netlea-slider-field">
+                      <span>蓝光 B (<strong id="netlea-ch-blue-val">36</strong>%)</span>
+                      <input id="netlea-ch-blue" type="range" min="0" max="100" value="36">
+                    </label>
+                    <label class="netlea-slider-field">
+                      <span>散热风扇 (<strong id="netlea-ch-fan-val">0</strong> 档)</span>
+                      <input id="netlea-ch-fan" type="range" min="0" max="5" value="0">
+                    </label>
+                  </div>
+                  <div class="modal-row-head">
+                    <span id="netlea-power-clamp-note" class="meta">开启 22W 额定功率上限保护</span>
+                    <button id="netlea-save-slot-btn" class="mini-button" type="button">➕ 收藏当前自定义</button>
+                  </div>
+                  <div id="netlea-custom-slots" class="hub-filter-pills" role="group" aria-label="自定义光谱收藏槽"></div>
+                </div>
+
+                <div class="modal-btn-group">
+                  <button id="netlea-apply-channels-btn" class="primary" type="button">💡 临时观赏下发</button>
+                  <button id="netlea-apply-manual-btn" class="mini-button" type="button">🔒 设为手动恒亮</button>
+                  <button id="netlea-manual-off-btn" class="mini-button" type="button">🌑 手动恒定关灯</button>
+                  <button id="netlea-save-default-btn" class="mini-button" type="button">⭐ 存为默认临时开灯光谱</button>
+                </div>
+              </div>
+
+              <div class="hub-form-card">
+                <h3>🎨 四通道实时光谱分布</h3>
+                <div class="netlea-canvas-wrap">
+                  <canvas id="netlea-spectrum-canvas" class="netlea-spectrum-canvas" width="560" height="176"></canvas>
+                </div>
+                <p id="netlea-device-meta" class="meta">尚未读取鱼缸灯实时数据，点击右上角「实时同步」连接灯具。</p>
+              </div>
+            </div>
+
+            <details class="hub-compose-details">
+              <summary class="hub-compose-summary">⏱️ 灯内默认临时开/关灯时长配置 (0x1A)</summary>
+              <div class="hub-compose-body">
+                <div class="hub-form-grid">
+                  <label>默认临时开灯时长（分钟，1-300）
+                    <input id="netlea-cfg-on-min" type="number" min="1" max="300" value="20">
+                  </label>
+                  <label>默认临时关灯时长（分钟，1-300）
+                    <input id="netlea-cfg-off-min" type="number" min="1" max="300" value="20">
+                  </label>
+                </div>
+                <div class="modal-row-head">
+                  <span class="hint">临时开/关灯到达设定分钟数后，灯具硬件将自动切换回 24h 日出/日落行程。</span>
+                  <button id="netlea-cfg-temp-save-btn" class="primary" type="button">💾 写入灯具默认临时参数</button>
+                </div>
+              </div>
+            </details>
 
             <details class="hub-compose-details">
               <summary class="hub-compose-summary">⚙️ 蓝牙绑定参数与扫描列表</summary>
