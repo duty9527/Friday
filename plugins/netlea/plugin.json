@@ -1,0 +1,69 @@
+{
+  "name": "netlea",
+  "title": "尼特利鱼缸灯蓝牙直控 (Netlea BLE)",
+  "runtime": "in-process",
+  "voiceFastpath": false,
+  "platforms": [
+    "linux"
+  ],
+  "promptHint": "蓝牙直控尼特利鱼缸灯（看板/状态/扫描、临时开关调光、恢复行程、配置）。",
+  "description": "通过 Linux BlueZ 低功耗蓝牙本地短连接直控尼特利（Netlea / 水族时光 SG-X-PRO 等）鱼缸灯：支持扫描蓝牙广播与实时时钟、查询主灯/射灯/氛围灯状态与 R/G/W/B/风扇通道、临时开灯调光、临时关灯与恢复 24 小时自动行程；设备 MAC 与默认观赏光谱保存在 <pluginDataDir>/config.json。",
+  "entry": "index.mjs",
+  "actions": [
+    "dashboard",
+    "status",
+    "scan",
+    "on",
+    "off",
+    "resume",
+    "config"
+  ],
+  "actionSpecs": [
+    {
+      "name": "dashboard",
+      "label": "鱼缸灯看板与副屏卡片数据",
+      "description": "默认零蓝牙开销读取本机最近缓存状态、光谱通道与配置（供 Web 看板与 CS80 副屏卡片秒开展示）；传 refresh=true 可触发实时蓝牙读取。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "status",
+      "label": "查询鱼缸灯实时状态",
+      "description": "短连接读取尼特利鱼缸灯 0x14 实时状态（开关、运行模式、R/G/W/B 与风扇通道、内置时钟与信号强度）；传 live=false 可仅读取本机最近缓存状态。",
+      "defaultArgs": {
+        "live": true
+      }
+    },
+    {
+      "name": "scan",
+      "label": "扫描尼特利鱼缸灯广播",
+      "description": "通过 BlueZ LE 被动扫描周围尼特利鱼缸灯广播，解析型号、MAC 地址、RSSI 与灯具内置实时时钟（RTC）。",
+      "defaultArgs": {
+        "timeoutSec": 5
+      }
+    },
+    {
+      "name": "on",
+      "label": "临时开灯与调光",
+      "description": "执行尼特利 0x1A 临时开灯/调光命令（不影响 24h 自动行程设置）。支持 red/green/white/blue（0-100）、fan（0-5）、brightness（按默认光谱比例缩放 0-100）、fadeSeconds（渐亮渐暗秒数，默认 3）、targetMac 与 dryRun。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "off",
+      "label": "临时关灯",
+      "description": "执行尼特利 0x1A 临时关灯命令，支持 fadeSeconds（默认 3）、targetMac 与 dryRun。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "resume",
+      "label": "恢复 24h 自动行程",
+      "description": "发送尼特利 0x10 恢复行程命令，使鱼缸灯切回灯具内置日出日落/月光自动行程；支持 lampStateHint（0 或 1，默认 1）、targetMac 与 dryRun。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "config",
+      "label": "读取或更新鱼缸灯配置",
+      "description": "查看或更新 <pluginDataDir>/config.json 中的 targetMac、namePrefix、fadeSeconds 与 defaultChannels（red/green/white/blue/fan）。",
+      "defaultArgs": {}
+    }
+  ]
+}

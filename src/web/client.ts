@@ -29,6 +29,7 @@ const fundSurfacePanel = element<HTMLElement>('plugin-panel-fund-tracker');
 const cs80SurfacePanel = element<HTMLElement>('plugin-panel-cs80-face');
 const laifenSurfacePanel = element<HTMLElement>('plugin-panel-laifen');
 const ninebotSurfacePanel = element<HTMLElement>('plugin-panel-ninebot');
+const netleaSurfacePanel = element<HTMLElement>('plugin-panel-netlea');
 const messagesEl = element('messages');
 const worksEl = element('works');
 const companionEl = element('companion-avatar');
@@ -193,6 +194,17 @@ const pluginSurfaces: PluginSurfaceRegistration[] = [
     load: () => import('./plugins/ninebot-ui.js').then(mod =>
       mod.initNinebotUi({
         isVisible: () => !pluginHubBackdrop.hidden && !ninebotSurfacePanel.hidden,
+      })),
+  },
+  {
+    pluginName: 'netlea',
+    tabId: 'plugin-tab-netlea',
+    panelId: 'plugin-panel-netlea',
+    label: '鱼缸灯光',
+    messageTrigger: /鱼缸灯|尼特利|水草灯|netlea/i,
+    load: () => import('./plugins/netlea-ui.js').then(mod =>
+      mod.initNetleaUi({
+        isVisible: () => !pluginHubBackdrop.hidden && !netleaSurfacePanel.hidden,
       })),
   },
 ];
