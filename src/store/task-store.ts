@@ -342,7 +342,7 @@ export class TaskStore {
     this.atomic(() => {
       const previous = this.db.prepare('SELECT body FROM operations WHERE id=?').get(op.id);
       this.db.prepare('INSERT INTO operations VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body').run(op.id, op.taskId, JSON.stringify(op));
-      if (previous && (JSON.parse(String(previous.body)) as Operation).status === op.status) return;
+      if (previous && parseJsonSafe<Operation>(previous.body)?.status === op.status) return;
       const task = this.get(op.taskId);
       this.conversation.emit({
         type: 'trace',
@@ -452,7 +452,12 @@ export class TaskStore {
         const op = parseJsonSafe<Operation>(row.body);
         if (!op) continue;
         op.status = 'unknown';
-        this.operation(op);
+        try {
+          this.operation(op);
+        } catch {
+          this.db.prepare('INSERT INTO operations VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body')
+            .run(op.id, op.taskId, JSON.stringify(op));
+        }
       }
       for (const row of this.db.prepare("SELECT body FROM tasks WHERE (CASE WHEN json_valid(body) THEN json_extract(body,'$.status') END) IN ('running','queued') ORDER BY rowid").all()) {
         const task = parseJsonSafe<Task>(row.body);

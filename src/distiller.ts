@@ -103,13 +103,13 @@ function extractBalancedJsonObjects(raw: string): unknown[] {
       const candidate = raw.slice(i, foundEnd + 1);
       try {
         results.push(JSON.parse(candidate) as unknown);
+        i = foundEnd + 1;
+        continue;
       } catch {
-        // Keep scanning for another valid JSON object.
+        // Keep scanning inside the span in case an unmatched `{` appeared in prose.
       }
-      i = foundEnd + 1;
-    } else {
-      i++;
     }
+    i++;
   }
   return results;
 }

@@ -481,14 +481,15 @@ function splitProviderAndModel(
   rawProvider: string,
   rawModel: string,
 ): { provider: string; model: string } {
-  const normProv = normalizeProviderId(rawProvider.trim()) ?? rawProvider.trim();
+  const trimmedProv = rawProvider.trim();
+  const normProv = normalizeProviderId(trimmedProv) ?? trimmedProv;
   const cleanedModel = splitModelAndLevel(rawModel.trim()).model;
   if (!normProv) {
     const parsed = parseCatalogModelSpec(cleanedModel);
     return { provider: parsed.providerId, model: parsed.modelId };
   }
   const parsed = parseCatalogModelSpec(cleanedModel, {
-    fallbackProvider: normProv,
+    fallbackProvider: trimmedProv,
     preferFallbackProvider: true,
   });
   return {

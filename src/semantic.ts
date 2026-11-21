@@ -227,7 +227,7 @@ async function downloadFileWithMirrors(params: {
   }
 
   let entry = inFlightFileDownloads.get(destPath);
-  if (!entry) {
+  if (!entry || entry.controller.signal.aborted) {
     const controller = new AbortController();
     const created: InFlightDownloadEntry = {
       controller,
@@ -289,6 +289,9 @@ async function downloadFileWithMirrors(params: {
     released = true;
     entry.waiters = Math.max(0, entry.waiters - 1);
     if (abortIfIdle && entry.waiters === 0 && !entry.controller.signal.aborted) {
+      if (inFlightFileDownloads.get(destPath) === entry) {
+        inFlightFileDownloads.delete(destPath);
+      }
       entry.controller.abort();
     }
   };
@@ -514,18 +517,19 @@ class SemanticEngine implements SemanticEmbedder {
     if (this.isReady()) return true;
     if (signal?.aborted) return false;
 
-    if (!this.readyAttempt) {
+    if (!this.readyAttempt || this.readyAttempt.controller.signal.aborted) {
       const controller = new AbortController();
       const attempt = {
         controller,
         waiters: 0,
-        promise: this.initialize(controller.signal).finally(() => {
-          if (this.readyAttempt === attempt) {
-            this.readyAttempt = undefined;
-          }
-        }),
+        promise: Promise.resolve(false),
       };
       this.readyAttempt = attempt;
+      attempt.promise = this.initialize(controller.signal).finally(() => {
+        if (this.readyAttempt === attempt) {
+          this.readyAttempt = undefined;
+        }
+      });
     }
 
     const attempt = this.readyAttempt;
@@ -546,7 +550,10 @@ class SemanticEngine implements SemanticEmbedder {
         settled = true;
         signal.removeEventListener('abort', onAbort);
         attempt.waiters = Math.max(0, attempt.waiters - 1);
-        if (!value && attempt.waiters === 0) {
+        if (!value && attempt.waiters === 0 && !attempt.controller.signal.aborted) {
+          if (this.readyAttempt === attempt) {
+            this.readyAttempt = undefined;
+          }
           attempt.controller.abort();
         }
         resolve(value);
@@ -565,6 +572,7 @@ class SemanticEngine implements SemanticEmbedder {
   }
 
   private async initialize(signal?: AbortSignal): Promise<boolean> {
+    let localSession: SemanticSessionLike | undefined;
     try {
       if (this.closed || isSemanticDisabled(this.options) || signal?.aborted) return false;
 
@@ -619,6 +627,7 @@ class SemanticEngine implements SemanticEmbedder {
       if (this.closed || signal?.aborted) return false;
 
       const session = await sessFactory({ modelPath: this.modelPath });
+      localSession = session;
       if (this.closed || signal?.aborted) {
         await Promise.resolve(session.release?.()).catch(() => {});
         return false;
@@ -629,11 +638,8 @@ class SemanticEngine implements SemanticEmbedder {
       this.ready = true;
       return true;
     } catch {
-      this.ready = false;
-      this.tokenizer = undefined;
-      if (this.session) {
-        await Promise.resolve(this.session.release?.()).catch(() => {});
-        this.session = undefined;
+      if (localSession && localSession !== this.session) {
+        await Promise.resolve(localSession.release?.()).catch(() => {});
       }
       return false;
     }
@@ -917,6 +923,7 @@ class SemanticEngine implements SemanticEmbedder {
     this.readyAttempt?.controller.abort();
     this.tokenizer = undefined;
     this.cache.clear();
+    await this.runQueue.catch(() => {});
     const sess = this.session;
     this.session = undefined;
     if (sess?.release) {

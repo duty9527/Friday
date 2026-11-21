@@ -231,10 +231,10 @@ export class SqliteDb {
         this.db.exec(`
           UPDATE memories
           SET
-            access_count = coalesce(CAST(json_extract(body, '$.accessCount') AS INTEGER), access_count, 0),
-            last_accessed_at = coalesce(CAST(json_extract(body, '$.lastAccessedAt') AS INTEGER), last_accessed_at),
-            last_reinforced_at = coalesce(CAST(json_extract(body, '$.lastReinforcedAt') AS INTEGER), last_reinforced_at),
-            importance = coalesce(CAST(json_extract(body, '$.importance') AS INTEGER), importance)
+            access_count = coalesce(CAST(CASE WHEN json_valid(body) THEN json_extract(body, '$.accessCount') END AS INTEGER), access_count, 0),
+            last_accessed_at = coalesce(CAST(CASE WHEN json_valid(body) THEN json_extract(body, '$.lastAccessedAt') END AS INTEGER), last_accessed_at),
+            last_reinforced_at = coalesce(CAST(CASE WHEN json_valid(body) THEN json_extract(body, '$.lastReinforcedAt') END AS INTEGER), last_reinforced_at),
+            importance = coalesce(CAST(CASE WHEN json_valid(body) THEN json_extract(body, '$.importance') END AS INTEGER), importance)
         `);
       }
     });
@@ -251,7 +251,7 @@ export class SqliteDb {
         this.db.exec(`
           UPDATE memories
           SET pinned = CASE
-            WHEN json_extract(body, '$.pinned') IN (1, '1', 'true') THEN 1
+            WHEN (CASE WHEN json_valid(body) THEN json_extract(body, '$.pinned') END) IN (1, '1', 'true') THEN 1
             ELSE 0
           END
         `);

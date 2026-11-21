@@ -100,6 +100,23 @@ export interface ModelUsageEvent {
   usage: unknown;
 }
 
+function extractPersistedSelectedModelIds(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const sel of raw) {
+    const id = typeof sel === 'string'
+      ? sel.trim()
+      : (sel && typeof sel === 'object' && typeof (sel as { id?: unknown }).id === 'string'
+          ? (sel as { id: string }).id.trim()
+          : '');
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
 export class ModelHub {
   private readonly sdkDir: string;
   private readonly statePath: string;
@@ -117,6 +134,7 @@ export class ModelHub {
   }>();
   private usageListener?: (entry: ModelUsageEvent) => void;
   private saveQueue: Promise<void> = Promise.resolve();
+  private mutationQueue: Promise<void> = Promise.resolve();
   private runtimePromise?: Promise<ModelRuntime>;
   private closed = false;
   private readonly envProviderKeys = new Map<string, string>();
@@ -255,67 +273,75 @@ export class ModelHub {
       .map(([id]) => id);
   }
 
+  private withMutationLock<T>(run: () => Promise<T>): Promise<T> {
+    const next = this.mutationQueue.then(run, run);
+    this.mutationQueue = next.then(() => undefined, () => undefined);
+    return next;
+  }
+
   async init(initialProviderKeys?: Record<string, string | undefined>): Promise<void> {
-    await mkdir(this.sdkDir, { recursive: true, mode: 0o700 });
-    if (existsSync(this.statePath)) {
-      try {
-        const raw = JSON.parse(await readFile(this.statePath, 'utf8')) as Partial<PersistedModelHubState>;
-        this.state = {
-          routerProvider: raw.routerProvider,
-          routerModel: raw.routerModel,
-          workerProvider: raw.workerProvider,
-          fastModel: raw.fastModel,
-          balancedModel: raw.balancedModel,
-          strongModel: raw.strongModel,
-          decision: raw.decision && typeof raw.decision === 'object' ? raw.decision : undefined,
-          providers: raw.providers && typeof raw.providers === 'object' ? raw.providers : {},
-          modelStats: raw.modelStats && typeof raw.modelStats === 'object' ? raw.modelStats : {},
-          statsEpoch: typeof raw.statsEpoch === 'string' ? raw.statsEpoch : undefined,
-          lastProbe: raw.lastProbe,
-        };
-      } catch {
-        this.state = { providers: {}, modelStats: {} };
-      }
-    }
-    this.envProviderKeys.clear();
-    if (initialProviderKeys) {
-      for (const [prov, key] of Object.entries(initialProviderKeys)) {
-        const norm = normalizeProviderId(prov);
-        if (norm && key?.trim()) {
-          this.envProviderKeys.set(norm, key.trim());
+    return this.withMutationLock(async () => {
+      await mkdir(this.sdkDir, { recursive: true, mode: 0o700 });
+      if (existsSync(this.statePath)) {
+        try {
+          const raw = JSON.parse(await readFile(this.statePath, 'utf8')) as Partial<PersistedModelHubState>;
+          this.state = {
+            routerProvider: raw.routerProvider,
+            routerModel: raw.routerModel,
+            workerProvider: raw.workerProvider,
+            fastModel: raw.fastModel,
+            balancedModel: raw.balancedModel,
+            strongModel: raw.strongModel,
+            decision: raw.decision && typeof raw.decision === 'object' ? raw.decision : undefined,
+            providers: raw.providers && typeof raw.providers === 'object' ? raw.providers : {},
+            modelStats: raw.modelStats && typeof raw.modelStats === 'object' ? raw.modelStats : {},
+            statsEpoch: typeof raw.statsEpoch === 'string' ? raw.statsEpoch : undefined,
+            lastProbe: raw.lastProbe,
+          };
+        } catch {
+          this.state = { providers: {}, modelStats: {} };
         }
       }
-    }
-    const runtime = await this.ensureRuntime();
-    if (this.mode === 'real') {
-      const creds = await runtime.listCredentials();
-      const candidateIds = new Set<string>([
-        ...FEATURED_PROVIDERS.map(p => p.id),
-        ...Object.keys(this.state.providers),
-        ...this.envProviderKeys.keys(),
-      ]);
-      const syncTasks: Array<Promise<void>> = [];
-      for (const provId of candidateIds) {
-        const cfg = this.state.providers[provId];
-        if (cfg?.enabled === false) continue;
-        const hasCred = Boolean(
-          this.getEffectiveProviderKey(provId).key
-          || cfg?.baseUrl
-          || creds.some(c => c.providerId === provId)
-          || runtime.getProviderAuthStatus(provId).configured,
-        );
-        if (hasCred && (!cfg?.fetchedModels?.length || cfg?.fetchError)) {
-          syncTasks.push(
-            this.syncProviderModelsFromApi(runtime, provId).then(() => {}, () => {}),
+      this.envProviderKeys.clear();
+      if (initialProviderKeys) {
+        for (const [prov, key] of Object.entries(initialProviderKeys)) {
+          const norm = normalizeProviderId(prov);
+          if (norm && key?.trim()) {
+            this.envProviderKeys.set(norm, key.trim());
+          }
+        }
+      }
+      const runtime = await this.ensureRuntime();
+      if (this.mode === 'real') {
+        const creds = await runtime.listCredentials();
+        const candidateIds = new Set<string>([
+          ...FEATURED_PROVIDERS.map(p => p.id),
+          ...Object.keys(this.state.providers),
+          ...this.envProviderKeys.keys(),
+        ]);
+        const syncTasks: Array<Promise<void>> = [];
+        for (const provId of candidateIds) {
+          const cfg = this.state.providers[provId];
+          if (cfg?.enabled === false) continue;
+          const hasCred = Boolean(
+            this.getEffectiveProviderKey(provId).key
+            || cfg?.baseUrl
+            || creds.some(c => c.providerId === provId)
+            || runtime.getProviderAuthStatus(provId).configured,
           );
+          if (hasCred && (!cfg?.fetchedModels?.length || cfg?.fetchError)) {
+            syncTasks.push(
+              this.syncProviderModelsFromApi(runtime, provId).then(() => {}, () => {}),
+            );
+          }
+        }
+        if (syncTasks.length) {
+          await Promise.all(syncTasks);
+          await this.saveState();
         }
       }
-      if (syncTasks.length) {
-        await Promise.all(syncTasks);
-        await this.saveState();
-      }
-    }
-    await this.applyStateToRuntime(runtime);
+      await this.applyStateToRuntime(runtime);
+    });
   }
 
   private getKnownProviders(): Set<string> {
@@ -446,19 +472,21 @@ export class ModelHub {
   }
 
   async fetchModels(input: ModelHubFetchInput): Promise<ModelHubView> {
-    const runtime = await this.ensureRuntime();
-    const providerId = normalizeProviderId(input.providerId);
-    if (!providerId) throw new Error('请指定提供方 ID');
-    if (!this.isProviderEnabled(providerId)) {
-      throw new Error(`提供方 "${providerId}" 已禁用，无法拉取模型；请先启用该提供方`);
-    }
-    await this.syncProviderModelsFromApi(runtime, providerId, {
-      apiKey: input.apiKey,
-      baseUrl: input.baseUrl,
+    return this.withMutationLock(async () => {
+      const runtime = await this.ensureRuntime();
+      const providerId = normalizeProviderId(input.providerId);
+      if (!providerId) throw new Error('请指定提供方 ID');
+      if (!this.isProviderEnabled(providerId)) {
+        throw new Error(`提供方 "${providerId}" 已禁用，无法拉取模型；请先启用该提供方`);
+      }
+      await this.syncProviderModelsFromApi(runtime, providerId, {
+        apiKey: input.apiKey,
+        baseUrl: input.baseUrl,
+      });
+      await this.applyStateToRuntime(runtime);
+      await this.saveState();
+      return this.getView();
     });
-    await this.applyStateToRuntime(runtime);
-    await this.saveState();
-    return this.getView();
   }
 
   private async applyStateToRuntime(runtime: ModelRuntime): Promise<void> {
@@ -479,9 +507,7 @@ export class ModelHub {
       const customRouterModelId = cfg.baseUrl && providerId === activeRouterProv
         ? this.state.routerModel?.trim()
         : undefined;
-      const selectedModelIds = Array.isArray(cfg.selectedModels)
-        ? normalizeSelectedModels(cfg.selectedModels).map(s => s.id)
-        : [];
+      const selectedModelIds = extractPersistedSelectedModelIds(cfg.selectedModels);
       if (
         cfg.fetchedModels?.length
         || cfg.baseUrl
@@ -719,7 +745,7 @@ export class ModelHub {
     if (!clean) return false;
     if (runtime.getModel(providerId, clean) || getPristineSdkModel(providerId, clean)) return true;
     if (persisted?.customModels?.includes(clean)) return true;
-    if (Array.isArray(persisted?.selectedModels) && normalizeSelectedModels(persisted.selectedModels).some(s => s.id === clean)) return true;
+    if (extractPersistedSelectedModelIds(persisted?.selectedModels).includes(clean)) return true;
     return this.buildProviderCatalogModels(runtime, providerId, persisted).some(m => m.id === clean);
   }
 
@@ -739,9 +765,7 @@ export class ModelHub {
     if (firstRuntime) return firstRuntime;
     const customFirst = persisted?.customModels?.map(m => m.trim()).find(Boolean);
     if (customFirst) return customFirst;
-    const selectedFirst = Array.isArray(persisted?.selectedModels)
-      ? normalizeSelectedModels(persisted.selectedModels)[0]?.id
-      : undefined;
+    const selectedFirst = extractPersistedSelectedModelIds(persisted?.selectedModels)[0];
     return selectedFirst || undefined;
   }
 
@@ -1100,18 +1124,20 @@ export class ModelHub {
   }
 
   async syncDecisionEraStats(tasks: readonly DecisionEraTaskRecord[]): Promise<void> {
-    if (this.state.statsEpoch === DECISION_STATS_EPOCH) return;
-    const nextStats = accumulateDecisionEraStats(tasks, this.cachedPool, this.currentTiers.provider);
-    this.state.modelStats = nextStats;
-    this.state.statsEpoch = DECISION_STATS_EPOCH;
-    for (const entry of [...this.cachedPool, ...this.cachedCatalog]) {
-      const st = nextStats[entry.spec];
-      entry.successCount = st?.successCount;
-      entry.failCount = st ? computeEffectiveFailCount(st) : undefined;
-      entry.latencyMs = st?.lastLatencyMs;
-      entry.avgQualityScore = st?.avgQualityScore;
-    }
-    await this.saveState();
+    return this.withMutationLock(async () => {
+      if (this.state.statsEpoch === DECISION_STATS_EPOCH) return;
+      const nextStats = accumulateDecisionEraStats(tasks, this.cachedPool, this.currentTiers.provider);
+      this.state.modelStats = nextStats;
+      this.state.statsEpoch = DECISION_STATS_EPOCH;
+      for (const entry of [...this.cachedPool, ...this.cachedCatalog]) {
+        const st = nextStats[entry.spec];
+        entry.successCount = st?.successCount;
+        entry.failCount = st ? computeEffectiveFailCount(st) : undefined;
+        entry.latencyMs = st?.lastLatencyMs;
+        entry.avgQualityScore = st?.avgQualityScore;
+      }
+      await this.saveState();
+    });
   }
 
   private validateExplicitModel(rawModelInput: string): {
@@ -1489,7 +1515,11 @@ export class ModelHub {
     };
   }
 
-  async configure(input: ModelHubConfigureInput): Promise<ModelHubView> {
+  configure(input: ModelHubConfigureInput): Promise<ModelHubView> {
+    return this.withMutationLock(async () => this.configureLocked(input));
+  }
+
+  private async configureLocked(input: ModelHubConfigureInput): Promise<ModelHubView> {
     const runtime = await this.ensureRuntime();
     let nextDecision: PersistedDecisionConfig | undefined = this.state.decision
       ? { ...this.state.decision }
@@ -1862,8 +1892,16 @@ export class ModelHub {
       // Use an isolated runtime if this provider isn't registered on the live runtime yet.
       let callRuntime = runtime;
       if (!runtime.getProvider(provider) || inlineBaseUrl) {
+        const isolatedCredentials = !allowStoredKey
+          ? {
+              read: async () => undefined,
+              list: async () => [],
+              modify: async () => undefined,
+              delete: async () => {},
+            }
+          : undefined;
         callRuntime = await ModelRuntime.create({
-          authPath: join(this.sdkDir, 'auth.json'),
+          ...(isolatedCredentials ? { credentials: isolatedCredentials } : { authPath: join(this.sdkDir, 'auth.json') }),
           modelsPath: null,
           modelsStorePath: join(this.sdkDir, 'models-cache.json'),
           refreshOnCreate: false,

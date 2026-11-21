@@ -197,7 +197,7 @@ export class MemoryStore {
        ORDER BY m.updated_at DESC, m.rowid DESC
        LIMIT ?`,
     ).all(MAX_EMBEDDING_CACHE_SIZE);
-    for (const row of rows) {
+    for (const row of rows.reverse()) {
       if (!(row.vector instanceof Uint8Array)) continue;
       const vec = deserializeEmbedding(row.vector, Number(row.dim));
       if (!vec) continue;
@@ -429,7 +429,12 @@ export class MemoryStore {
               this.upsertEmbeddingRecord(card.id, modelId, updatedHash, normalizedInputVec, now);
             } else {
               const cached = this.embeddingCache.get(card.id);
-              if (cached && cached.contentHash !== updatedHash) this.deleteEmbeddingRecord(card.id);
+              if (cached) {
+                if (cached.contentHash !== updatedHash) this.deleteEmbeddingRecord(card.id);
+              } else {
+                const deleted = this.db.prepare('DELETE FROM memory_embeddings WHERE memory_id=? AND content_hash!=?').run(card.id, updatedHash);
+                if (deleted.changes > 0) this.embeddingCache.delete(card.id);
+              }
             }
           }
         }
@@ -636,7 +641,13 @@ export class MemoryStore {
     if (!embedding && this.semantic?.isReady()) {
       const topic = String(publicData(rawTopic)).slice(0, 160);
       const content = String(publicData(rawContent)).slice(0, 8192);
-      const tags = [...new Set((input.tags ?? []).map(tag => String(publicData(tag.trim())).slice(0, 64)).filter(Boolean))].slice(0, 16);
+      let effectiveTagsInput = input.tags;
+      if (effectiveTagsInput === undefined && input.id) {
+        try {
+          effectiveTagsInput = this.getMemory(input.id).tags;
+        } catch { /* ignore if creating a new memory with explicit id */ }
+      }
+      const tags = [...new Set((effectiveTagsInput ?? []).map(tag => String(publicData(tag.trim())).slice(0, 64)).filter(Boolean))].slice(0, 16);
       const docText = memoryDocumentText({ topic, content, tags });
       const docHash = computeSemanticContentHash(docText);
       const existing = input.id ? this.embeddingCache.get(input.id) : undefined;
@@ -898,7 +909,7 @@ export class MemoryStore {
     const limit = Math.max(1, options.limit ?? 8);
     const reqCwd = normalizeCwd(options.cwd);
     const explicitCards: MemoryCard[] = [];
-    for (const id of options.memoryIds ?? []) {
+    for (const id of [...new Set(options.memoryIds ?? [])]) {
       try {
         const card = this.touchMemory(id, { active: true }) ?? this.getMemory(id);
         selected.set(card.id, card);

@@ -227,15 +227,21 @@ export function buildRouterTurns(events: TraceEvent[]): MindmapRouterTurn[] {
       turn.tools.push(toolCall);
     } else {
       const syntheticId = `synthetic:${first.at}`;
-      const synthetic: MindmapRouterTurn = {
-        spanId: syntheticId,
-        triggerKind: 'CHAT',
-        startedAt: startAt,
-        status: last.status,
-        llmTurns: 0,
-        tools: [toolCall],
-      };
-      turnsById.set(syntheticId, synthetic);
+      const existing = turnsById.get(syntheticId);
+      if (existing) {
+        existing.tools.push(toolCall);
+        existing.status = last.status;
+      } else {
+        const synthetic: MindmapRouterTurn = {
+          spanId: syntheticId,
+          triggerKind: 'CHAT',
+          startedAt: startAt,
+          status: last.status,
+          llmTurns: 0,
+          tools: [toolCall],
+        };
+        turnsById.set(syntheticId, synthetic);
+      }
     }
   }
 
@@ -530,8 +536,8 @@ export function buildTaskDetail(
       const phaseEndBoundary = rp.endedAt ?? matchedQg?.at ?? rp.startedAt;
       const matchedReportTurn = routerTurns.find(rt => {
         if (claimedReportSpans.has(rt.spanId)) return false;
-        if (rt.triggerTaskId) return rt.triggerTaskId === task.id;
         if (rt.triggerKind !== 'WORKER_REPORT') return false;
+        if (rt.triggerTaskId) return rt.triggerTaskId === task.id;
         return rt.startedAt >= phaseEndBoundary - 1500 && rt.startedAt <= nextPhaseStart + 2500;
       });
       if (matchedReportTurn) claimedReportSpans.add(matchedReportTurn.spanId);
@@ -562,8 +568,9 @@ export function buildTaskDetail(
     const fallbackEnd = allSteps.at(-1)?.at ?? (task.createdAt + Math.round(task.activeMs));
     const matchedReportTurn = routerTurns.find(rt => {
       if (claimedReportSpans.has(rt.spanId)) return false;
+      if (rt.triggerKind !== 'WORKER_REPORT') return false;
       if (rt.triggerTaskId) return rt.triggerTaskId === task.id;
-      return rt.triggerKind === 'WORKER_REPORT';
+      return true;
     });
     if (matchedReportTurn) claimedReportSpans.add(matchedReportTurn.spanId);
     executionPhases.push({

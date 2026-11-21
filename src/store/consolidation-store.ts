@@ -253,7 +253,7 @@ export class ConsolidationStore {
 
       while (true) {
         const rows = this.db.prepare(
-          `SELECT rowid AS _rowid, body, access_count, last_accessed_at, last_reinforced_at, importance
+          `SELECT rowid AS _rowid, updated_at AS _updated_at, pinned AS _pinned, body, access_count, last_accessed_at, last_reinforced_at, importance
            FROM memories
            WHERE superseded_by IS NULL
              AND (updated_at > ? OR (updated_at = ? AND rowid > ?))
@@ -263,6 +263,7 @@ export class ConsolidationStore {
         if (!rows.length) break;
 
         for (const row of rows) {
+          cursorUpdatedAt = Number(row._updated_at);
           cursorRowId = Number(row._rowid);
           let card: MemoryCard;
           try {
@@ -274,7 +275,10 @@ export class ConsolidationStore {
           if (row.last_accessed_at !== undefined && row.last_accessed_at !== null) card.lastAccessedAt = Number(row.last_accessed_at);
           if (row.last_reinforced_at !== undefined && row.last_reinforced_at !== null) card.lastReinforcedAt = Number(row.last_reinforced_at);
           if (row.importance !== undefined && row.importance !== null) card.importance = Number(row.importance);
-          cursorUpdatedAt = card.updatedAt;
+          if (row._pinned !== undefined && row._pinned !== null) {
+            if (Number(row._pinned) === 1) card.pinned = true;
+            else delete card.pinned;
+          }
 
           const imp = card.importance ?? defaultImportanceFor(card);
           const recentlyReinforced = Boolean(card.lastReinforcedAt && now - card.lastReinforcedAt < stubMaxAgeMs);

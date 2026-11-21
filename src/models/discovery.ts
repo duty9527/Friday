@@ -116,7 +116,7 @@ export async function fetchRemoteModelsFromEndpoint(
         thinking?: boolean;
       }>;
     };
-    const rawList = Array.isArray(data.models) ? data.models : [];
+    const rawList = data && typeof data === 'object' && Array.isArray(data.models) ? data.models : [];
     const entries: ModelCatalogEntry[] = [];
     for (const item of rawList) {
       if (!item.name) continue;
@@ -168,7 +168,7 @@ export async function fetchRemoteModelsFromEndpoint(
     const data = await res.json() as {
       data?: Array<{ id?: string; display_name?: string }>;
     };
-    const rawList = Array.isArray(data.data) ? data.data : [];
+    const rawList = data && typeof data === 'object' && Array.isArray(data.data) ? data.data : [];
     const entries: ModelCatalogEntry[] = [];
     for (const item of rawList) {
       if (!item.id) continue;
@@ -240,11 +240,13 @@ export async function fetchRemoteModelsFromEndpoint(
       pricing?: RemoteModelPricing;
     }>;
   };
-  const rawList = Array.isArray(data.data)
-    ? data.data
-    : Array.isArray(data.models)
-      ? data.models
-      : [];
+  const rawList = data && typeof data === 'object'
+    ? (Array.isArray(data.data)
+      ? data.data
+      : Array.isArray(data.models)
+        ? data.models
+        : [])
+    : [];
   const entries: ModelCatalogEntry[] = [];
   for (const item of rawList) {
     const id = (item.id || item.slug || '').trim();

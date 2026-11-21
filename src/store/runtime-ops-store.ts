@@ -261,13 +261,13 @@ export class RuntimeOpsStore {
         ).run(channelId, accountId, cutoff);
         this.db.prepare(
           `DELETE FROM wechat_quote_cache
-           WHERE channel_id=? AND account_id=? AND message_id IN (
-             SELECT message_id FROM wechat_quote_cache
+           WHERE rowid IN (
+             SELECT rowid FROM wechat_quote_cache
              WHERE channel_id=? AND account_id=?
              ORDER BY created_at DESC
              LIMIT -1 OFFSET ?
            )`,
-        ).run(channelId, accountId, channelId, accountId, QUOTE_CACHE_MAX_PER_ACCOUNT);
+        ).run(channelId, accountId, QUOTE_CACHE_MAX_PER_ACCOUNT);
       }
     });
   }
