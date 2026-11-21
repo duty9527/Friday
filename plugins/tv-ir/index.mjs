@@ -7,6 +7,7 @@ import {
   readConfig,
   readJsonSafe,
   resolvePluginPaths,
+  withFileLock,
   writeJsonAtomic,
 } from '../_shared/config-store.mjs';
 import {
@@ -549,32 +550,35 @@ function handleKeys(paths) {
   };
 }
 
-function handleConfig(args, paths) {
-  const current = loadConfig(paths.configPath);
-  const next = { ...current };
-  let updated = false;
+async function handleConfig(args, paths) {
+  const { config: next, updated } = await withFileLock(paths.configPath, () => {
+    const current = loadConfig(paths.configPath);
+    const draft = { ...current };
+    let changed = false;
 
-  if (args.sshTarget !== undefined) {
-    const val = String(args.sshTarget).trim();
-    if (!val) {
-      delete next.sshTarget;
-    } else {
-      next.sshTarget = val;
+    if (args.sshTarget !== undefined) {
+      const val = String(args.sshTarget).trim();
+      if (!val) {
+        delete draft.sshTarget;
+      } else {
+        draft.sshTarget = val;
+      }
+      changed = true;
     }
-    updated = true;
-  }
-  if (args.defaultIntervalMs !== undefined) {
-    next.defaultIntervalMs = clampInt(args.defaultIntervalMs, DEFAULT_INTERVAL_MS, 50, 5000);
-    updated = true;
-  }
-  if (args.defaultFrames !== undefined) {
-    next.defaultFrames = clampInt(args.defaultFrames, 2, 1, 8);
-    updated = true;
-  }
+    if (args.defaultIntervalMs !== undefined) {
+      draft.defaultIntervalMs = clampInt(args.defaultIntervalMs, DEFAULT_INTERVAL_MS, 50, 5000);
+      changed = true;
+    }
+    if (args.defaultFrames !== undefined) {
+      draft.defaultFrames = clampInt(args.defaultFrames, 2, 1, 8);
+      changed = true;
+    }
 
-  if (updated) {
-    writeJsonPrivate(paths.configPath, next);
-  }
+    if (changed) {
+      writeJsonPrivate(paths.configPath, draft);
+    }
+    return { config: draft, updated: changed };
+  });
   return {
     ok: true,
     notify: true,
@@ -773,7 +777,12 @@ async function handleLearn(args, deps, paths, sshRunner, sleepFn) {
   let capturedCode = '';
   try {
     while (nowFn() < deadline && !deps.signal?.aborted) {
-      await sleepFn(pollIntervalMs);
+      try {
+        await sleepFn(pollIntervalMs);
+      } catch (err) {
+        if (deps.signal?.aborted) break;
+        throw err;
+      }
       if (deps.signal?.aborted) break;
       const readRes = await sshRunner(discovery.target, buildLearnReadCommand(targetKey), 5_000);
       if (readRes.code !== 0) continue;
@@ -810,17 +819,19 @@ async function handleLearn(args, deps, paths, sshRunner, sleepFn) {
     };
   }
 
-  const learnedKeys = loadLearnedKeys(paths.learnedPath);
-  const learnedAt = Date.now();
-  learnedKeys[targetKey] = {
-    key: targetKey,
-    label,
-    code: capturedCode,
-    freq,
-    frames: 1,
-    learnedAt,
-  };
-  writeJsonPrivate(paths.learnedPath, learnedKeys);
+  const learnedAt = nowFn();
+  await withFileLock(paths.learnedPath, () => {
+    const learnedKeys = loadLearnedKeys(paths.learnedPath);
+    learnedKeys[targetKey] = {
+      key: targetKey,
+      label,
+      code: capturedCode,
+      freq,
+      frames: 1,
+      learnedAt,
+    };
+    writeJsonPrivate(paths.learnedPath, learnedKeys);
+  });
 
   const pulseCount = capturedCode.split(',').filter(Boolean).length;
   return {
@@ -852,31 +863,35 @@ async function handleLearn(args, deps, paths, sshRunner, sleepFn) {
  * @returns {Promise<import('../_shared/types.d.ts').PluginActionResult>}
  */
 export async function executeTvIrAction(action = 'status', args = {}, deps = {}) {
-  const paths = getRuntimePaths(deps);
-  const sshRunner = deps.sshRunner ?? ((target, cmd, timeoutMs, runOpts = {}) => defaultSshRunner(target, cmd, timeoutMs, {
+  const safeArgs = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
+  const safeDeps = deps && typeof deps === 'object' ? deps : {};
+  const paths = getRuntimePaths(safeDeps);
+  const sshRunner = safeDeps.sshRunner ?? ((target, cmd, timeoutMs, runOpts = {}) => defaultSshRunner(target, cmd, timeoutMs, {
     homeDir: paths.homeDir,
-    signal: runOpts && 'signal' in runOpts ? runOpts.signal : deps.signal,
+    signal: runOpts && 'signal' in runOpts ? runOpts.signal : safeDeps.signal,
   }));
-  const sleepFn = deps.sleep ?? delay;
+  const sleepFn = typeof safeDeps.sleep === 'function'
+    ? safeDeps.sleep
+    : (ms => delay(ms, undefined, safeDeps.signal ? { signal: safeDeps.signal } : undefined));
   const normalizedAction = String(action || 'status').trim();
 
   if (normalizedAction === 'status') {
-    return handleStatus(args, deps, paths, sshRunner);
+    return handleStatus(safeArgs, safeDeps, paths, sshRunner);
   }
   if (normalizedAction === 'keys') {
     return handleKeys(paths);
   }
   if (normalizedAction === 'config') {
-    return handleConfig(args, paths);
+    return handleConfig(safeArgs, paths);
   }
   if (normalizedAction === 'learn') {
-    return handleLearn(args, deps, paths, sshRunner, sleepFn);
+    return handleLearn(safeArgs, safeDeps, paths, sshRunner, sleepFn);
   }
   if (normalizedAction === 'sequence') {
-    return handleSequence(args, deps, paths, sshRunner, sleepFn);
+    return handleSequence(safeArgs, safeDeps, paths, sshRunner, sleepFn);
   }
   if (normalizedAction === 'press') {
-    return handlePress(args, deps, paths, sshRunner, sleepFn);
+    return handlePress(safeArgs, safeDeps, paths, sshRunner, sleepFn);
   }
 
   // Allow direct key name as action (e.g. pluginAction: "menu" or "back" in timers / shortcuts)
@@ -887,8 +902,8 @@ export async function executeTvIrAction(action = 'status', args = {}, deps = {})
     || Boolean(findLearnedEntry(learnedKeys, [normalizedAction]));
   if (isDirectKey) {
     return handlePress(
-      { ...args, key: args.key ?? normalizedAction },
-      deps,
+      { ...safeArgs, key: safeArgs.key ?? normalizedAction },
+      safeDeps,
       paths,
       sshRunner,
       sleepFn,

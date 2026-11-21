@@ -27,8 +27,10 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -45,12 +47,25 @@ public final class TvAgentAccessibilityService extends AccessibilityService {
     private volatile ExecutorService screenshotExecutor = Executors.newSingleThreadExecutor();
     private final Object screenshotLock = new Object();
 
-    private volatile long lastScreenshotAtMs = 0L;
-    private volatile int lastScreenshotMaxWidth = 0;
-    private volatile int lastScreenshotQuality = 0;
-    private volatile int lastScreenshotWidth = 0;
-    private volatile int lastScreenshotHeight = 0;
-    private volatile String lastScreenshotBase64 = null;
+    private static final class ScreenshotCache {
+        final long atMs;
+        final int maxWidth;
+        final int lastScreenshotQuality;
+        final int width;
+        final int height;
+        final String base64;
+
+        ScreenshotCache(long atMs, int maxWidth, int quality, int width, int height, String base64) {
+            this.atMs = atMs;
+            this.maxWidth = maxWidth;
+            this.lastScreenshotQuality = quality;
+            this.width = width;
+            this.height = height;
+            this.base64 = base64;
+        }
+    }
+
+    private volatile ScreenshotCache lastScreenshot = null;
 
     public static final class NodeSnapshot {
         public final String id;
@@ -201,10 +216,7 @@ public final class TvAgentAccessibilityService extends AccessibilityService {
     private void releaseResources() {
         latestNodes = Collections.emptyMap();
         synchronized (screenshotLock) {
-            lastScreenshotBase64 = null;
-            lastScreenshotAtMs = 0L;
-            lastScreenshotMaxWidth = 0;
-            lastScreenshotQuality = 0;
+            lastScreenshot = null;
         }
         synchronized (executorLock) {
             if (screenshotExecutor != null && !screenshotExecutor.isShutdown()) {
@@ -319,10 +331,11 @@ public final class TvAgentAccessibilityService extends AccessibilityService {
                     return Integer.compare(b.priorityScore, a.priorityScore);
                 }
             });
-            final List<NodeSnapshot> selectedSublist = byPriority.subList(0, limit);
-            List<NodeSnapshot> ordered = new ArrayList<>();
+            final Set<NodeSnapshot> selectedSet = Collections.newSetFromMap(new IdentityHashMap<NodeSnapshot, Boolean>(limit));
+            selectedSet.addAll(byPriority.subList(0, limit));
+            List<NodeSnapshot> ordered = new ArrayList<>(limit);
             for (NodeSnapshot candidate : rawCandidates) {
-                if (selectedSublist.contains(candidate)) {
+                if (selectedSet.contains(candidate)) {
                     ordered.add(candidate);
                 }
             }
@@ -551,16 +564,17 @@ public final class TvAgentAccessibilityService extends AccessibilityService {
 
         synchronized (screenshotLock) {
             long now = SystemClock.elapsedRealtime();
-            if (lastScreenshotBase64 != null
-                    && (now - lastScreenshotAtMs) < 900L
-                    && lastScreenshotMaxWidth == targetMaxWidth
-                    && lastScreenshotQuality == jpegQuality) {
+            ScreenshotCache snap = lastScreenshot;
+            if (snap != null
+                    && (now - snap.atMs) < 900L
+                    && snap.maxWidth == targetMaxWidth
+                    && snap.lastScreenshotQuality == jpegQuality) {
                 JSONObject cached = new JSONObject();
                 cached.put("ok", true);
                 cached.put("mimeType", "image/jpeg");
-                cached.put("width", lastScreenshotWidth);
-                cached.put("height", lastScreenshotHeight);
-                cached.put("base64", lastScreenshotBase64);
+                cached.put("width", snap.width);
+                cached.put("height", snap.height);
+                cached.put("base64", snap.base64);
                 cached.put("cached", true);
                 return cached;
             }
@@ -568,16 +582,17 @@ public final class TvAgentAccessibilityService extends AccessibilityService {
             JSONObject result = captureOnce(targetMaxWidth, jpegQuality);
             if (!result.optBoolean("ok", false)
                     && result.optInt("errorCode", -1) == AccessibilityService.ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT) {
-                if (lastScreenshotBase64 != null
-                        && (SystemClock.elapsedRealtime() - lastScreenshotAtMs) < 5000L
-                        && lastScreenshotMaxWidth == targetMaxWidth
-                        && lastScreenshotQuality == jpegQuality) {
+                snap = lastScreenshot;
+                if (snap != null
+                        && (SystemClock.elapsedRealtime() - snap.atMs) < 5000L
+                        && snap.maxWidth == targetMaxWidth
+                        && snap.lastScreenshotQuality == jpegQuality) {
                     JSONObject fallback = new JSONObject();
                     fallback.put("ok", true);
                     fallback.put("mimeType", "image/jpeg");
-                    fallback.put("width", lastScreenshotWidth);
-                    fallback.put("height", lastScreenshotHeight);
-                    fallback.put("base64", lastScreenshotBase64);
+                    fallback.put("width", snap.width);
+                    fallback.put("height", snap.height);
+                    fallback.put("base64", snap.base64);
                     fallback.put("cached", true);
                     return fallback;
                 }
@@ -631,12 +646,13 @@ public final class TvAgentAccessibilityService extends AccessibilityService {
                     int finalW = scaledBitmap.getWidth();
                     int finalH = scaledBitmap.getHeight();
 
-                    lastScreenshotAtMs = SystemClock.elapsedRealtime();
-                    lastScreenshotMaxWidth = targetMaxWidth;
-                    lastScreenshotQuality = jpegQuality;
-                    lastScreenshotWidth = finalW;
-                    lastScreenshotHeight = finalH;
-                    lastScreenshotBase64 = b64;
+                    lastScreenshot = new ScreenshotCache(
+                            SystemClock.elapsedRealtime(),
+                            targetMaxWidth,
+                            jpegQuality,
+                            finalW,
+                            finalH,
+                            b64);
 
                     out.put("ok", true);
                     out.put("mimeType", "image/jpeg");

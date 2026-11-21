@@ -128,9 +128,9 @@ export async function runAction(action = 'status', args = {}, context = {}) {
   const snap = await collectSnapshot(safeArgs, context);
 
   if (name === 'patrol') {
-    const maxLoadPerCore = typeof safeArgs.maxLoadPerCore === 'number' ? safeArgs.maxLoadPerCore : 2.5;
-    const maxMemUsedPct = typeof safeArgs.maxMemUsedPct === 'number' ? safeArgs.maxMemUsedPct : 94;
-    const minDiskFreeGb = typeof safeArgs.minDiskFreeGb === 'number' ? safeArgs.minDiskFreeGb : 2;
+    const maxLoadPerCore = typeof safeArgs.maxLoadPerCore === 'number' && Number.isFinite(safeArgs.maxLoadPerCore) ? safeArgs.maxLoadPerCore : 2.5;
+    const maxMemUsedPct = typeof safeArgs.maxMemUsedPct === 'number' && Number.isFinite(safeArgs.maxMemUsedPct) ? safeArgs.maxMemUsedPct : 94;
+    const minDiskFreeGb = typeof safeArgs.minDiskFreeGb === 'number' && Number.isFinite(safeArgs.minDiskFreeGb) ? safeArgs.minDiskFreeGb : 2;
     const alerts = [];
     if (snap.cpu.loadPerCore > maxLoadPerCore) {
       alerts.push(`CPU 单核负载偏高 (${snap.cpu.loadPerCore} > ${maxLoadPerCore}，1m 负载 ${snap.cpu.load1}/${snap.cpu.cores} 核)`);

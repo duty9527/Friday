@@ -26,6 +26,7 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.HashMap;
@@ -124,6 +125,8 @@ public final class TvAgentHttpServer {
                 }
             } catch (Throwable t) {
                 if (ss.isClosed()) break;
+                Log.w(TvAgentSelfHealer.TAG, "acceptLoop error: " + t.getMessage());
+                SystemClock.sleep(150L);
             }
         }
     }
@@ -394,14 +397,21 @@ public final class TvAgentHttpServer {
         if (!requested.isAbsolute()) {
             requested = new File(new File(filesDir, "screenshots"), rawSavePath);
         }
+        if (Files.isSymbolicLink(requested.toPath())) {
+            return null;
+        }
         String canonicalTarget = requested.getCanonicalPath();
+        File canonicalFile = new File(canonicalTarget);
+        if (Files.isSymbolicLink(canonicalFile.toPath())) {
+            return null;
+        }
         if (filesDir != null) {
             String filesPrefix = filesDir.getCanonicalPath() + File.separator;
-            if (canonicalTarget.startsWith(filesPrefix)) return new File(canonicalTarget);
+            if (canonicalTarget.startsWith(filesPrefix)) return canonicalFile;
         }
         if (cacheDir != null) {
             String cachePrefix = cacheDir.getCanonicalPath() + File.separator;
-            if (canonicalTarget.startsWith(cachePrefix)) return new File(canonicalTarget);
+            if (canonicalTarget.startsWith(cachePrefix)) return canonicalFile;
         }
         return null;
     }
@@ -560,7 +570,8 @@ public final class TvAgentHttpServer {
         if (ctx == null) return "";
         synchronized (TOKEN_LOCK) {
             try {
-                Context storage = ctx.createDeviceProtectedStorageContext();
+                Context dp = ctx.createDeviceProtectedStorageContext();
+                Context storage = dp != null ? dp : ctx;
                 SharedPreferences prefs = storage.getSharedPreferences("tv_agent_prefs", Context.MODE_PRIVATE);
                 String existing = prefs.getString("x_tv_token", "");
                 if (existing != null && existing.trim().length() >= 16) {
@@ -592,7 +603,8 @@ public final class TvAgentHttpServer {
         }
         synchronized (TOKEN_LOCK) {
             try {
-                Context storage = ctx.createDeviceProtectedStorageContext();
+                Context dp = ctx.createDeviceProtectedStorageContext();
+                Context storage = dp != null ? dp : ctx;
                 SharedPreferences prefs = storage.getSharedPreferences("tv_agent_prefs", Context.MODE_PRIVATE);
                 prefs.edit().putString("x_tv_token", trimmed).commit();
                 return trimmed;

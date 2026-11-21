@@ -9,6 +9,7 @@ import {
   errMsg,
   readConfig as readSharedConfig,
   resolvePluginPaths,
+  withFileLock,
   writeConfig as writeSharedConfig,
 } from '../_shared/config-store.mjs';
 import { execSshText, parseSshSpec, shellQuote } from '../_shared/ssh.mjs';
@@ -247,24 +248,36 @@ export function resolveDecisionEndpoint(baseUrl) {
 // HTTP / SOAP primitives
 // ---------------------------------------------------------------------------
 
+function finiteNumber(value, fallback, min = 0, max = Number.MAX_SAFE_INTEGER) {
+  if (value === null || value === undefined || value === '' || typeof value === 'boolean') return fallback;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
 function makeCtx(args, deps) {
-  const paths = getRuntimePaths(deps);
+  const safeDeps = deps && typeof deps === 'object' ? deps : {};
+  const paths = getRuntimePaths(safeDeps);
   const cfg = effectiveConfig(args, paths);
+  const sleepFn = typeof safeDeps.sleep === 'function'
+    ? safeDeps.sleep
+    : (ms => delay(ms, undefined, safeDeps.signal ? { signal: safeDeps.signal } : undefined));
   return {
     args,
-    deps,
+    deps: safeDeps,
     paths,
     cfg,
     aliases: buildAliasIndex(cfg.appAliases),
-    fetchFn: deps.fetch ?? globalThis.fetch,
-    sleep: deps.sleep ?? delay,
+    fetchFn: safeDeps.fetch ?? globalThis.fetch,
+    sleep: sleepFn,
     agentBase: cfg.tvHost ? `http://${cfg.tvHost}:${cfg.agentPort}` : '',
     dlnaBase: cfg.tvHost ? `http://${cfg.tvHost}:${cfg.dlnaPort}` : '',
   };
 }
 
 function buildRequestSignal(timeoutMs, externalSignal) {
-  const timerSignal = AbortSignal.timeout(timeoutMs);
+  const safeTimeoutMs = finiteNumber(timeoutMs, AGENT_TIMEOUT_MS, 1, 300_000);
+  const timerSignal = AbortSignal.timeout(safeTimeoutMs);
   if (!externalSignal) return timerSignal;
   if (typeof AbortSignal.any === 'function') {
     return AbortSignal.any([timerSignal, externalSignal]);
@@ -385,10 +398,12 @@ async function pairTvTokenViaAdbOrSsh(ctx) {
   ctx.cfg.tvToken = token;
   try {
     if (ctx.paths?.configPath) {
-      const persisted = loadConfig(ctx.paths);
-      if (!persisted.tvToken) {
-        saveConfig(ctx.paths, { ...persisted, tvToken: token });
-      }
+      await withFileLock(ctx.paths.configPath, () => {
+        const persisted = loadConfig(ctx.paths);
+        if (!persisted.tvToken) {
+          saveConfig(ctx.paths, { ...persisted, tvToken: token });
+        }
+      });
     }
   } catch {
     // Best-effort cache; token remains valid for current call even if config dir isn't writable.
@@ -460,7 +475,7 @@ function xmlUnescape(value) {
 }
 
 function xmlTag(xml, tag) {
-  const m = new RegExp(`<(?:[\\w-]+:)?${tag}[^>]*>([\\s\\S]*?)</(?:[\\w-]+:)?${tag}>`, 'i').exec(xml);
+  const m = new RegExp(`<(?:[\\w-]+:)?${tag}(?:>|\\s[^>]*>)([\\s\\S]*?)</(?:[\\w-]+:)?${tag}\\s*>`, 'i').exec(xml);
   return m ? xmlUnescape(m[1].trim()) : undefined;
 }
 
@@ -615,8 +630,8 @@ async function handlePower(ctx) {
   if (!wanted) {
     return failure('电视电源', `不支持的电源状态 "${state}"，可用：on、off、toggle。`);
   }
-  const waitMs = Math.max(0, Number(args.waitMs ?? 22000) || 0);
-  const pollMs = Math.max(1, Number(ctx.deps.pollMs ?? args.pollMs ?? 1500));
+  const waitMs = finiteNumber(args.waitMs, 22000, 0, 120_000);
+  const pollMs = finiteNumber(ctx.deps.pollMs ?? args.pollMs, 1500, 1, 30_000);
   const first = await probe(ctx);
   const target = wanted === 'toggle' ? (first.online ? 'off' : 'on') : wanted;
 
@@ -658,7 +673,7 @@ async function handlePower(ctx) {
   if (!ir || ir.ok === false) {
     return failure('电视关机失败', `红外电源键发送失败：${ir?.message ?? '未知错误'}`, { irSent: false, ir });
   }
-  const offWaitMs = Math.max(0, Number(args.offWaitMs ?? 8000) || 0);
+  const offWaitMs = finiteNumber(args.offWaitMs, 8000, 0, 120_000);
   const polls = Math.ceil(offWaitMs / pollMs);
   for (let i = 0; i < polls; i++) {
     await ctx.sleep(pollMs);
@@ -1046,64 +1061,68 @@ function redactConfigView(cfg) {
 
 async function handleConfig(ctx) {
   const { args, paths } = ctx;
-  const current = loadConfig(paths);
-  const next = { ...current };
-  const changed = [];
-  if (args.tvHost !== undefined) {
-    const rawHost = String(args.tvHost ?? '').trim();
-    if (!rawHost) {
-      next.tvHost = '';
-      changed.push('tvHost');
-    } else {
-      const host = sanitizeHost(rawHost);
-      if (!host) return failure('电视配置', 'tvHost 无效（仅支持主机名或 IP）。');
-      next.tvHost = host;
-      changed.push('tvHost');
+  const lockResult = await withFileLock(paths.configPath, () => {
+    const current = loadConfig(paths);
+    const draft = { ...current };
+    const mods = [];
+    if (args.tvHost !== undefined) {
+      const rawHost = String(args.tvHost ?? '').trim();
+      if (!rawHost) {
+        draft.tvHost = '';
+        mods.push('tvHost');
+      } else {
+        const host = sanitizeHost(rawHost);
+        if (!host) return { error: failure('电视配置', 'tvHost 无效（仅支持主机名或 IP）。') };
+        draft.tvHost = host;
+        mods.push('tvHost');
+      }
     }
-  }
-  if (args.tvToken !== undefined) {
-    next.tvToken = String(args.tvToken ?? '').trim();
-    changed.push('tvToken');
-  }
-  for (const key of ['agentPort', 'dlnaPort']) {
-    if (args[key] !== undefined) {
-      const port = sanitizePort(args[key]);
-      if (!port) return failure('电视配置', `${key} 必须是 1-65535 的整数。`);
-      next[key] = port;
-      changed.push(key);
+    if (args.tvToken !== undefined) {
+      draft.tvToken = String(args.tvToken ?? '').trim();
+      mods.push('tvToken');
     }
-  }
-  if (args.sshTarget !== undefined) {
-    next.sshTarget = String(args.sshTarget ?? '').trim();
-    changed.push('sshTarget');
-  }
-  if (args.adbTarget !== undefined) {
-    const rawAdb = String(args.adbTarget ?? '').trim();
-    if (!rawAdb) {
-      delete next.adbTarget;
-      changed.push('adbTarget');
-    } else {
-      const cleanAdb = sanitizeAdbTarget(rawAdb);
-      if (!cleanAdb) return failure('电视配置', 'adbTarget 无效（示例 192.168.1.50:5555）。');
-      next.adbTarget = cleanAdb;
-      changed.push('adbTarget');
+    for (const key of ['agentPort', 'dlnaPort']) {
+      if (args[key] !== undefined) {
+        const port = sanitizePort(args[key]);
+        if (!port) return { error: failure('电视配置', `${key} 必须是 1-65535 的整数。`) };
+        draft[key] = port;
+        mods.push(key);
+      }
     }
-  }
-  if (args.appAliases !== undefined) {
-    if (!args.appAliases || typeof args.appAliases !== 'object' || Array.isArray(args.appAliases)) {
-      return failure('电视配置', 'appAliases 必须是 JSON 对象（包名 -> 别名数组，或 别名 -> 包名）。');
+    if (args.sshTarget !== undefined) {
+      draft.sshTarget = String(args.sshTarget ?? '').trim();
+      mods.push('sshTarget');
     }
-    next.appAliases = normalizeCustomAliases(args.appAliases);
-    changed.push('appAliases');
-  }
-  if (changed.length) saveConfig(paths, next);
+    if (args.adbTarget !== undefined) {
+      const rawAdb = String(args.adbTarget ?? '').trim();
+      if (!rawAdb) {
+        delete draft.adbTarget;
+        mods.push('adbTarget');
+      } else {
+        const cleanAdb = sanitizeAdbTarget(rawAdb);
+        if (!cleanAdb) return { error: failure('电视配置', 'adbTarget 无效（示例 192.168.1.50:5555）。') };
+        draft.adbTarget = cleanAdb;
+        mods.push('adbTarget');
+      }
+    }
+    if (args.appAliases !== undefined) {
+      if (!args.appAliases || typeof args.appAliases !== 'object' || Array.isArray(args.appAliases)) {
+        return { error: failure('电视配置', 'appAliases 必须是 JSON 对象（包名 -> 别名数组，或 别名 -> 包名）。') };
+      }
+      draft.appAliases = normalizeCustomAliases(args.appAliases);
+      mods.push('appAliases');
+    }
+    if (mods.length) saveConfig(paths, draft);
+    return { next: draft, changed: mods };
+  });
+  if (lockResult.error) return lockResult.error;
+  const { next, changed } = lockResult;
   if (args.pair === true && !next.tvToken && (next.adbTarget || next.sshTarget || next.tvHost)) {
     const pairCtx = { ...ctx, cfg: { ...next }, _tokenPairAttempted: false };
     const paired = await pairTvTokenViaAdbOrSsh(pairCtx);
     if (paired) {
       next.tvToken = paired;
       changed.push('tvToken');
-      saveConfig(paths, next);
     }
   }
   return success('电视配置', changed.length ? `已更新：${changed.join('、')}` : '当前电视配置', redactConfigView(next));
@@ -1310,7 +1329,7 @@ async function askDecision(ctx, creds, { goal, searchText, tree, history, screen
       },
     },
   };
-  const timeoutMs = Number(ctx.args.decisionTimeoutMs ?? ctx.deps.decisionTimeoutMs ?? 25_000);
+  const timeoutMs = finiteNumber(ctx.args.decisionTimeoutMs ?? ctx.deps.decisionTimeoutMs, 25_000, 100, 300_000);
   const res = await httpRequest(ctx, resolveDecisionEndpoint(creds.baseUrl), {
     method: 'POST',
     body,
@@ -1344,8 +1363,8 @@ async function handleNavigate(ctx) {
   const goal = String(args.goal ?? '').trim();
   if (!goal) return failure('电视导航', 'navigate 需要 goal（例如 "在 B 站搜索周杰伦并播放"）。');
   const maxSteps = Math.max(1, Math.min(12, Math.round(Number(args.maxSteps ?? 8)) || 8));
-  const settleMs = Math.max(0, Number(args.settleMs ?? ctx.deps.settleMs ?? 900) || 0);
-  const launchSettleMs = Math.max(0, Number(args.launchSettleMs ?? ctx.deps.launchSettleMs ?? 1400) || 0);
+  const settleMs = finiteNumber(args.settleMs ?? ctx.deps.settleMs, 900, 0, 30_000);
+  const launchSettleMs = finiteNumber(args.launchSettleMs ?? ctx.deps.launchSettleMs, 1400, 0, 30_000);
   const searchText = (typeof args.searchText === 'string' && args.searchText.trim()) || extractQuoted(goal) || '';
   const trace = [];
 

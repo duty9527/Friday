@@ -7,6 +7,7 @@ import {
   errMsg,
   readConfig,
   resolvePluginPaths,
+  withFileLock,
   writeConfig,
 } from '../_shared/config-store.mjs';
 
@@ -83,7 +84,7 @@ function listHoldingsFromDb(db) {
  * @param {import('node:sqlite').DatabaseSync} db
  * @param {import('../_shared/types.d.ts').PluginPaths} paths
  */
-function syncConfigHoldingsFromDb(db, paths) {
+async function syncConfigHoldingsFromDb(db, paths) {
   const rows = listHoldingsFromDb(db).map(row => ({
     code: String(row.code),
     name: String(row.name),
@@ -97,8 +98,10 @@ function syncConfigHoldingsFromDb(db, paths) {
     initNavDate: String(row.init_nav_date),
     shares: Number(row.shares),
   }));
-  const cfg = readConfig(paths.configPath, DEFAULT_CONFIG);
-  writeConfig(paths.configPath, { ...cfg, holdings: rows });
+  await withFileLock(paths.configPath, () => {
+    const cfg = readConfig(paths.configPath, DEFAULT_CONFIG);
+    writeConfig(paths.configPath, { ...cfg, holdings: rows });
+  });
 }
 
 /**
@@ -290,14 +293,24 @@ async function fetchFundNavHistory(code, pageSize = 10, fetchFn = fetch, signal)
   if (!res.ok) throw new Error(`Eastmoney NAV HTTP ${res.status} for ${code}`);
   const json = /** @type {{ Data?: { LSJZList?: Array<Record<string, unknown>> } }} */ (await res.json());
   const list = Array.isArray(json?.Data?.LSJZList) ? json.Data.LSJZList : [];
-  return list
-    .filter(row => row?.FSRQ && row?.DWJZ && !Number.isNaN(Number(row.DWJZ)))
-    .map(row => ({
-      navDate: String(row.FSRQ),
-      nav: Number(row.DWJZ),
-      accNav: row.LJJZ && !Number.isNaN(Number(row.LJJZ)) ? Number(row.LJJZ) : Number(row.DWJZ),
-      dailyReturn: row.JZZZL && !Number.isNaN(Number(row.JZZZL)) ? Number(row.JZZZL) : 0,
-    }));
+  const out = [];
+  for (const row of list) {
+    const navDate = row?.FSRQ ? String(row.FSRQ).trim() : '';
+    const rawNav = typeof row?.DWJZ === 'string' ? row.DWJZ.trim() : row?.DWJZ;
+    const nav = rawNav !== '' && rawNav !== null && rawNav !== undefined ? Number(rawNav) : NaN;
+    if (!navDate || !Number.isFinite(nav) || nav <= 0) continue;
+
+    const rawAcc = typeof row?.LJJZ === 'string' ? row.LJJZ.trim() : row?.LJJZ;
+    const accCandidate = rawAcc !== '' && rawAcc !== null && rawAcc !== undefined ? Number(rawAcc) : NaN;
+    const accNav = Number.isFinite(accCandidate) && accCandidate > 0 ? accCandidate : nav;
+
+    const rawRet = typeof row?.JZZZL === 'string' ? row.JZZZL.trim() : row?.JZZZL;
+    const retCandidate = rawRet !== '' && rawRet !== null && rawRet !== undefined ? Number(rawRet) : NaN;
+    const dailyReturn = Number.isFinite(retCandidate) ? retCandidate : 0;
+
+    out.push({ navDate, nav, accNav, dailyReturn });
+  }
+  return out;
 }
 
 /**
@@ -374,7 +387,7 @@ async function syncAllNavs(db, holdings, opts = {}) {
         for (const item of history) {
           upsertNav.run(code, item.navDate, item.nav, item.accNav, item.dailyReturn, now);
         }
-        const latest = history[0];
+        const latest = history.reduce((best, item) => (item.navDate > best.navDate ? item : best), history[0]);
         if (latest) {
           updateHoldingLatest.run(latest.nav, latest.navDate, now, code);
         }
@@ -809,7 +822,8 @@ async function computeValuation(db, mode = 'noon', offline = false, opts = {}) {
     if (useOfficialNav) {
       currentNav = latestNavObj.nav;
       changePct = latestNavObj.dailyReturn;
-      baseNav = prevNavObj ? prevNavObj.nav : Number((currentNav / (1 + changePct / 100)).toFixed(4));
+      const denom = 1 + changePct / 100;
+      baseNav = prevNavObj ? prevNavObj.nav : (denom > 0 ? Number((currentNav / denom).toFixed(4)) : currentNav);
       navSource = hasSameDayOfficialNav
         ? `✅ 正式净值(${latestNavObj.navDate})`
         : `✅ 正式净值(${latestNavObj.navDate}，QDII晚间披露)`;
@@ -1054,8 +1068,6 @@ export async function runAction(action = 'status', args = {}, depsOrCtx = {}) {
         const normalized = safeArgs.holdings.map(item =>
           normalizeHoldingInput(/** @type {Record<string, unknown>} */ (item)),
         );
-        next.holdings = normalized;
-        writeConfig(paths.configPath, next);
         changed = true;
 
         db.exec('BEGIN');
@@ -1096,7 +1108,8 @@ export async function runAction(action = 'status', args = {}, depsOrCtx = {}) {
           try { db.exec('ROLLBACK'); } catch { /* ignore */ }
           throw err;
         }
-        syncConfigHoldingsFromDb(db, paths);
+        await syncConfigHoldingsFromDb(db, paths);
+        next.holdings = readConfig(paths.configPath, DEFAULT_CONFIG).holdings;
       }
 
       const dbHoldings = listHoldingsFromDb(db);
@@ -1165,7 +1178,7 @@ export async function runAction(action = 'status', args = {}, depsOrCtx = {}) {
         normalized.positionRatio, normalized.initAmount, normalized.cost, normalized.initNav,
         normalized.initNavDate, normalized.shares, normalized.initNav, normalized.initNavDate, now,
       );
-      syncConfigHoldingsFromDb(db, paths);
+      await syncConfigHoldingsFromDb(db, paths);
       const saved = db.prepare('SELECT * FROM holdings WHERE code=?').get(normalized.code);
       return {
         ok: true,
@@ -1186,7 +1199,7 @@ export async function runAction(action = 'status', args = {}, depsOrCtx = {}) {
         return { ok: false, notify: false, title: '删除基金失败', message: `未找到基金持仓 ${code}。` };
       }
       db.prepare('DELETE FROM holdings WHERE code=?').run(code);
-      syncConfigHoldingsFromDb(db, paths);
+      await syncConfigHoldingsFromDb(db, paths);
       return {
         ok: true,
         notify: true,
@@ -1316,7 +1329,7 @@ export async function runAction(action = 'status', args = {}, depsOrCtx = {}) {
         initNavDate, initNav, initNavDate, initNavDate,
         nowFn(), code,
       );
-      syncConfigHoldingsFromDb(db, paths);
+      await syncConfigHoldingsFromDb(db, paths);
       const after = /** @type {Record<string, unknown>} */ (
         db.prepare('SELECT * FROM holdings WHERE code=?').get(code)
       );

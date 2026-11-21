@@ -509,7 +509,8 @@ function isKeySupported(key, learnedKeys) {
  * @returns {Promise<import('../_shared/types.d.ts').VoiceFastpathResult>}
  */
 export async function handleTvIrVoiceFastpath(request, context = {}, actionExecutor) {
-  const paths = resolvePluginPaths('tv-ir', context, {
+  const safeContext = context && typeof context === 'object' ? context : {};
+  const paths = resolvePluginPaths('tv-ir', safeContext, {
     learnedPath: 'learned-keys.json',
   });
   const learnedKeys = readJsonSafe(paths.learnedPath, {});
@@ -570,12 +571,28 @@ export async function handleTvIrVoiceFastpath(request, context = {}, actionExecu
         }
         for (let i = 0; i < step.count; i++) expanded.push({ key: execKey });
       }
-      const baseArgs = context.sshTarget ? { sshTarget: context.sshTarget } : {};
+      const baseArgs = safeContext.sshTarget ? { sshTarget: safeContext.sshTarget } : {};
       try {
         const execRes = expanded.length === 1
-          ? await actionExecutor('press', { ...baseArgs, key: expanded[0].key }, context)
-          : await actionExecutor('sequence', { ...baseArgs, keys: expanded }, context);
+          ? await actionExecutor('press', { ...baseArgs, key: expanded[0].key }, safeContext)
+          : await actionExecutor('sequence', { ...baseArgs, keys: expanded }, safeContext);
         initialIrResult = execRes?.data ?? null;
+        if (execRes && execRes.ok === false) {
+          return {
+            handled: true,
+            action: 'tv_remote_enter',
+            ok: false,
+            speech: execRes.message || '已进入电视遥控模式，但执行初始按键失败。',
+            followUp: true,
+            followUpWaitMs: TV_REMOTE_FOLLOW_UP_WAIT_MS,
+            sessionState: buildRemoteSessionState(),
+            data: {
+              enteredRemoteMode: true,
+              steps: entryCheck.initialSteps,
+              irResult: initialIrResult,
+            },
+          };
+        }
         initialSpeech = `已进入电视遥控模式，并已按${formatStepsSpeech(entryCheck.initialSteps)}。`;
       } catch (err) {
         initialSpeech = `已进入电视遥控模式，但执行初始按键失败：${errMsg(err)}`;
@@ -598,7 +615,7 @@ export async function handleTvIrVoiceFastpath(request, context = {}, actionExecu
   // 4. Direct TV power on/off ("打开电视" / "关闭电视"): prefer tv-agent power when available, fallback to IR.
   const powerIntent = parseTvPowerPhrase(cleaned);
   if (powerIntent) {
-    const agentAttempt = await tryTvAgentPower(powerIntent.state, context);
+    const agentAttempt = await tryTvAgentPower(powerIntent.state, safeContext);
     if (agentAttempt.used) {
       const res = agentAttempt.result;
       return {
@@ -627,9 +644,9 @@ export async function handleTvIrVoiceFastpath(request, context = {}, actionExecu
           'press',
           {
             key: 'power',
-            ...(context.sshTarget ? { sshTarget: context.sshTarget } : {}),
+            ...(safeContext.sshTarget ? { sshTarget: safeContext.sshTarget } : {}),
           },
-          context,
+          safeContext,
         );
         return {
           handled: true,
@@ -687,7 +704,7 @@ export async function handleTvIrVoiceFastpath(request, context = {}, actionExecu
       const hasLearnedMute = isKeySupported('mute', learnedKeys);
       if (!hasLearnedMute) {
         const isUnmute = step.key === 'unmute';
-        const muteAgent = await tryTvAgentMute(!isUnmute, context);
+        const muteAgent = await tryTvAgentMute(!isUnmute, safeContext);
         if (muteAgent.used) {
           return {
             handled: true,
@@ -739,11 +756,11 @@ export async function handleTvIrVoiceFastpath(request, context = {}, actionExecu
         expanded.push({ key: execKey });
       }
     }
-    const baseArgs = context.sshTarget ? { sshTarget: context.sshTarget } : {};
+    const baseArgs = safeContext.sshTarget ? { sshTarget: safeContext.sshTarget } : {};
     try {
       const execResult = expanded.length === 1
-        ? await actionExecutor('press', { ...baseArgs, key: expanded[0].key }, context)
-        : await actionExecutor('sequence', { ...baseArgs, keys: expanded }, context);
+        ? await actionExecutor('press', { ...baseArgs, key: expanded[0].key }, safeContext)
+        : await actionExecutor('sequence', { ...baseArgs, keys: expanded }, safeContext);
 
       const stepOk = execResult?.ok !== false;
       // Docs contract: continuous TV remote mode suppresses TTS on key execution (zero-TTS passthrough).

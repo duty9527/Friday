@@ -1167,20 +1167,26 @@ export async function runAction(action, args = {}, deps = {}) {
       }
       if (!isSessionTokenValid(/** @type {any} */ (session), nowMs)) {
         if (config.username && config.password) {
+          const sameUser = !session.username || session.username === config.username;
           const loggedIn = await client.passportLogin({
             username: config.username,
             password: config.password,
             areaCode: config.areaCode,
           });
           session = {
-            ...session,
+            deviceId: session.deviceId,
+            ...(sameUser ? session : {}),
             ...loggedIn,
           };
+          if (!sameUser) {
+            delete session.businessUid;
+            delete session.vehicles;
+          }
           try {
             const bizUid = await client.businessLogin(/** @type {any} */ (session), session.deviceId);
             if (bizUid) session.businessUid = bizUid;
           } catch {
-            // Preserve existing businessUid or empty fallback if businessLogin fails transiently
+            // Preserve existing businessUid (same account) or empty fallback if businessLogin fails transiently
           }
           await saveSessionLocked(paths.sessionPath, session);
         } else {
@@ -1228,12 +1234,21 @@ export async function runAction(action, args = {}, deps = {}) {
         }
       }
       if (!renewed && config.username && config.password) {
+        const sameUser = !activeSession.username || activeSession.username === config.username;
         const loggedIn = await client.passportLogin({
           username: config.username,
           password: config.password,
           areaCode: config.areaCode,
         });
-        activeSession = { ...activeSession, ...loggedIn };
+        activeSession = {
+          deviceId: activeSession.deviceId,
+          ...(sameUser ? activeSession : {}),
+          ...loggedIn,
+        };
+        if (!sameUser) {
+          delete activeSession.businessUid;
+          delete activeSession.vehicles;
+        }
         renewed = true;
       }
       if (!renewed) throw err;
@@ -1490,17 +1505,19 @@ export async function runAction(action, args = {}, deps = {}) {
         };
       }
 
+      const sameUser = !session.username || session.username === username;
       const loggedIn = await client.passportLogin({ username, password, areaCode });
-      let businessUid = session.businessUid || '';
+      let businessUid = sameUser ? (session.businessUid || '') : '';
       try {
         const uid = await client.businessLogin(/** @type {any} */ (loggedIn), session.deviceId);
         if (uid) businessUid = uid;
       } catch {
-        // Keep best-effort businessUid fallback
+        // Keep best-effort businessUid fallback for same account
       }
 
       session = {
-        ...session,
+        deviceId: session.deviceId,
+        ...(sameUser ? session : {}),
         ...loggedIn,
         businessUid,
       };

@@ -699,7 +699,9 @@ async function getDevicesWithCache(opts) {
       serverTimestamp: live.serverTimestamp,
       entries: enriched.entries,
     };
-    await withFileLock(paths.sessionPath, () => saveSession(paths.sessionPath, session));
+    await withFileLock(paths.sessionPath, () => {
+      if (existsSync(paths.sessionPath)) saveSession(paths.sessionPath, session);
+    });
     await withFileLock(paths.cachePath, () => writeJsonAtomic(paths.cachePath, cacheObj, { mode: 0o600 }));
     return {
       ok: true,
@@ -712,11 +714,9 @@ async function getDevicesWithCache(opts) {
       geoConfigured: enriched.configured,
     };
   } catch (err) {
-    if (err instanceof AppleClientError && err.code === 'AUTH_EXPIRED') {
-      await withFileLock(paths.sessionPath, () => saveSession(paths.sessionPath, session));
-    } else {
-      await withFileLock(paths.sessionPath, () => saveSession(paths.sessionPath, session));
-    }
+    await withFileLock(paths.sessionPath, () => {
+      if (existsSync(paths.sessionPath)) saveSession(paths.sessionPath, session);
+    });
     return {
       ok: false,
       errorCode: err instanceof AppleClientError ? err.code : 'FMIP_ERROR',
@@ -734,7 +734,7 @@ async function getDevicesWithCache(opts) {
 /**
  * Main plugin entry point for `apple-devices`.
  * @param {string} [action]
- * @param {Record<string, unknown>} [args]
+ * @param {Record<string, unknown>} [rawArgs]
  * @param {import('../_shared/types.d.ts').PluginExecutionContext & {
  *   fetchFn?: typeof fetch;
  *   locatePollDelayMs?: number;
@@ -742,10 +742,16 @@ async function getDevicesWithCache(opts) {
  *   httpRequester?: (url: string) => Promise<{ status: number; body: Buffer | string }>;
  *   amapUrl?: string;
  *   hosts?: { amap?: string };
- * }} [deps]
+ * }} [rawDeps]
  * @returns {Promise<import('../_shared/types.d.ts').PluginActionResult>}
  */
-export async function runAction(action = 'status', args = {}, deps = {}) {
+export async function runAction(action = 'status', rawArgs = {}, rawDeps = {}) {
+  const args = /** @type {Record<string, unknown>} */ (
+    rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs) ? rawArgs : {}
+  );
+  const deps = /** @type {NonNullable<typeof rawDeps>} */ (
+    rawDeps && typeof rawDeps === 'object' && !Array.isArray(rawDeps) ? rawDeps : {}
+  );
   const paths = resolvePluginPaths('apple-devices', deps, {
     sessionPath: 'session.json',
     cachePath: 'devices-cache.json',
@@ -754,7 +760,9 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
 
   const fetchFn = typeof deps?.fetchFn === 'function' ? deps.fetchFn : fetch;
   const nowFn = typeof deps?.nowFn === 'function' ? deps.nowFn : Date.now;
-  const locatePollDelayMs = typeof deps?.locatePollDelayMs === 'number' ? deps.locatePollDelayMs : undefined;
+  const locatePollDelayMs = typeof deps?.locatePollDelayMs === 'number' && Number.isFinite(deps.locatePollDelayMs)
+    ? deps.locatePollDelayMs
+    : undefined;
   const signal = deps?.signal;
   const env = deps?.env;
   const amapRequester = /** @type {((url: string) => Promise<{ status: number; body: Buffer | string }>) | undefined} */ (
@@ -1360,7 +1368,9 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
         fetchFn,
         signal,
       });
-      await withFileLock(paths.sessionPath, () => saveSession(paths.sessionPath, session));
+      await withFileLock(paths.sessionPath, () => {
+        if (existsSync(paths.sessionPath)) saveSession(paths.sessionPath, session);
+      });
       const statusMsg = targetDev.online
         ? `已向 ${targetDev.name} 发送 Find My 响铃指令，设备将以最大音量播放查找提示音。`
         : `已向 ${targetDev.name} 发送 Find My 响铃指令（设备当前处于${targetDev.deviceStatusLabel}状态，苹果服务器将在其唤醒联网时立即响铃）。`;
@@ -1372,7 +1382,9 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
         data: { dryRun: false, device: targetDev, subject },
       };
     } catch (err) {
-      await withFileLock(paths.sessionPath, () => saveSession(paths.sessionPath, session));
+      await withFileLock(paths.sessionPath, () => {
+        if (existsSync(paths.sessionPath)) saveSession(paths.sessionPath, session);
+      });
       return {
         ok: false,
         notify: true,
@@ -1485,8 +1497,17 @@ async function main() {
   } catch {
     args = {};
   }
-  const result = await runAction(action, args);
-  process.stdout.write(`${JSON.stringify(result)}\n`);
+  try {
+    const result = await runAction(action, args);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+  } catch (err) {
+    process.stdout.write(`${JSON.stringify({
+      ok: false,
+      notify: true,
+      title: '🍎 Apple 设备操作失败',
+      message: errMsg(err),
+    })}\n`);
+  }
 }
 
 const isEntrypoint = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);

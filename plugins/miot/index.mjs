@@ -12,6 +12,7 @@ import {
   readConfig,
   resolveHomeDir,
   resolvePluginPaths,
+  withFileLock,
   writeConfig,
   writeJsonAtomic,
 } from '../_shared/config-store.mjs';
@@ -1077,7 +1078,8 @@ function routerTarget(ctx) {
 }
 
 function makeCtx(args, deps) {
-  const paths = getRuntimePaths(deps);
+  const safeDeps = deps && typeof deps === 'object' ? deps : {};
+  const paths = getRuntimePaths(safeDeps);
   const stored = loadConfig(paths);
   const cfg = {
     ...stored,
@@ -1087,32 +1089,35 @@ function makeCtx(args, deps) {
     topologyTtlMs: clampInt(args.topologyTtlMs, 0, 3_600_000) ?? stored.topologyTtlMs,
     udpTimeoutMs: clampInt(args.udpTimeoutMs, 300, 30_000) ?? stored.udpTimeoutMs,
   };
-  const sshBin = deps.sshBinaryExec
+  const sshBin = safeDeps.sshBinaryExec
     ?? ((target, cmd, opts = {}) => defaultSshBinaryExec(target, cmd, {
       ...opts,
       homeDir: paths.homeDir,
-      signal: deps.signal,
+      signal: safeDeps.signal,
     }));
-  const sshText = deps.sshTextExec
+  const sshText = safeDeps.sshTextExec
     ?? ((target, cmd, timeoutMs) => defaultSshTextExec(target, cmd, timeoutMs, {
       homeDir: paths.homeDir,
-      signal: deps.signal,
+      signal: safeDeps.signal,
     }));
-  const tvRun = deps.tvAgentRunner
-    ?? (typeof deps.callPlugin === 'function'
-      ? (action, tvArgs) => deps.callPlugin('tv-agent', action, tvArgs)
-      : (action, tvArgs) => defaultTvAgentRunner(action, tvArgs, paths, deps));
+  const tvRun = safeDeps.tvAgentRunner
+    ?? (typeof safeDeps.callPlugin === 'function'
+      ? (action, tvArgs) => safeDeps.callPlugin('tv-agent', action, tvArgs)
+      : (action, tvArgs) => defaultTvAgentRunner(action, tvArgs, paths, safeDeps));
+  const sleepFn = typeof safeDeps.sleepFn === 'function'
+    ? safeDeps.sleepFn
+    : (ms => delay(ms, undefined, safeDeps.signal ? { signal: safeDeps.signal } : undefined));
   return {
     args,
-    deps,
+    deps: safeDeps,
     paths,
     cfg,
     sshBin,
     sshText,
-    udp: deps.udpCall ?? udpCall,
-    sleep: deps.sleepFn ?? delay,
-    now: deps.nowFn ?? Date.now,
-    fetchRows: deps.fetchHubRawRows ?? (opts => defaultFetchHubRawRows({ ...opts, homeDir: paths.homeDir, sshBinaryExec: sshBin })),
+    udp: safeDeps.udpCall ?? udpCall,
+    sleep: sleepFn,
+    now: safeDeps.nowFn ?? Date.now,
+    fetchRows: safeDeps.fetchHubRawRows ?? (opts => defaultFetchHubRawRows({ ...opts, homeDir: paths.homeDir, sshBinaryExec: sshBin })),
     tvRun,
     snapshot: undefined,
   };
@@ -1200,7 +1205,7 @@ function fileSig(filePath) {
   try {
     if (!filePath || !existsSync(filePath)) return '';
     const st = statSync(filePath);
-    return `${st.mtimeMs}:${st.size}`;
+    return `${st.ino}:${st.mtimeMs}:${st.size}`;
   } catch {
     return '';
   }
@@ -1406,7 +1411,7 @@ function stateText(device, live) {
 
 async function handleStatus(ctx) {
   const routerSpec = /** @type {any} */ ((() => { try { return routerTarget(ctx); } catch (e) { return { error: errMsg(e) }; } })());
-  const speaker = await discoverSpeakerSsh({ speakerSsh: ctx.args.speakerSsh, dataDir: ctx.paths.dataDir, homeDir: ctx.paths.homeDir });
+  const speakerSpec = /** @type {any} */ (await discoverSpeakerSsh({ speakerSsh: ctx.args.speakerSsh, dataDir: ctx.paths.dataDir, homeDir: ctx.paths.homeDir }).catch(e => ({ error: errMsg(e) })));
   /** @param {any} target @param {string} cmd @returns {Promise<{ reachable: boolean; code?: number; ms?: number; out: string; err?: string; error?: string }>} */
   const probe = async (target, cmd) => {
     const startedAt = ctx.now();
@@ -1421,16 +1426,21 @@ async function handleStatus(ctx) {
     routerSpec.error
       ? Promise.resolve(/** @type {{ reachable: boolean; code?: number; ms?: number; out: string; err?: string; error?: string }} */ ({ reachable: false, error: routerSpec.error, out: '' }))
       : probe(routerSpec, 'echo FRIDAY_OK; pidof central_service | awk \'{print $1}\''),
-    probe(speaker, 'echo FRIDAY_OK; ubus list 2>/dev/null | grep -c mibrain'),
+    speakerSpec.error
+      ? Promise.resolve(/** @type {{ reachable: boolean; code?: number; ms?: number; out: string; err?: string; error?: string }} */ ({ reachable: false, error: speakerSpec.error, out: '' }))
+      : probe(speakerSpec, 'echo FRIDAY_OK; ubus list 2>/dev/null | grep -c mibrain'),
   ]);
   const centralPid = router.reachable ? (router.out.split('\n').map(s => s.trim()).filter(s => /^\d+$/.test(s))[0] ?? null) : null;
   const mibrain = spk.reachable ? Number((spk.out.split('\n').map(s => s.trim()).filter(s => /^\d+$/.test(s))[0] ?? '0')) > 0 : false;
   const cache = readHubCache(ctx.paths);
   const now = ctx.now();
   const hotFetchedAt = cache ? (typeof cache.hotDataFetchedAt === 'number' ? cache.hotDataFetchedAt : cache.fetchedAt) : 0;
+  const speakerInfo = speakerSpec.error
+    ? { id: null, ssh: '', source: 'none', reachable: false, mibrain: false, ...(spk.error ? { error: spk.error } : {}) }
+    : { id: speakerSpec.id, ssh: `${speakerSpec.userHost}${speakerSpec.port ? `:${speakerSpec.port}` : ''}`, source: speakerSpec.source, reachable: spk.reachable, mibrain, ms: spk.ms, ...(spk.error || spk.err ? { error: spk.error ?? spk.err } : {}) };
   const data = {
     router: { ssh: ctx.cfg.routerSsh, reachable: router.reachable, centralServicePid: centralPid, ms: router.ms, ...(router.error || router.err ? { error: router.error ?? router.err } : {}) },
-    speaker: { id: speaker.id, ssh: `${speaker.userHost}${speaker.port ? `:${speaker.port}` : ''}`, source: speaker.source, reachable: spk.reachable, mibrain, ms: spk.ms, ...(spk.error || spk.err ? { error: spk.error ?? spk.err } : {}) },
+    speaker: speakerInfo,
     cache: cache ? {
       exists: true,
       deviceCount: cache.devices.length,
@@ -1443,7 +1453,9 @@ async function handleStatus(ctx) {
   };
   const lines = [
     `中枢 ${ctx.cfg.routerSsh}：${router.reachable ? `可达${centralPid ? `（central_service pid ${centralPid}）` : '（未发现 central_service 进程）'}` : `不可达${router.error ? `（${router.error}）` : ''}`}`,
-    `小爱音箱 ${speaker.id}（${data.speaker.ssh}，来源 ${speaker.source}）：${spk.reachable ? `可达${mibrain ? '，mibrain 可用' : '，未发现 mibrain'}` : `不可达${spk.error ? `（${spk.error}）` : ''}`}`,
+    speakerSpec.error
+      ? `小爱音箱（未配置）：${spk.error}`
+      : `小爱音箱 ${speakerSpec.id}（${data.speaker.ssh}，来源 ${speakerSpec.source}）：${spk.reachable ? `可达${mibrain ? '，mibrain 可用' : '，未发现 mibrain'}` : `不可达${spk.error ? `（${spk.error}）` : ''}`}`,
     cache ? `设备缓存：${cache.devices.length} 台，${Math.round(data.cache.ageMs / 1000)} 秒前` : '设备缓存：无',
   ];
   const ok = router.reachable;
@@ -1832,6 +1844,14 @@ function assertNotProtected(ctx, device, title = '米家设备受保护') {
   );
 }
 
+function parseMiotId(raw) {
+  if (raw === null || raw === undefined || typeof raw === 'boolean') return undefined;
+  if (typeof raw === 'string' && !raw.trim()) return undefined;
+  if (typeof raw !== 'number' && typeof raw !== 'string') return undefined;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : undefined;
+}
+
 async function handleSet(ctx) {
   const { args } = ctx;
   const dryRun = isDry(args);
@@ -1847,6 +1867,15 @@ async function handleSet(ctx) {
   const onValue = parseBoolish(args.on);
   const wantToggle = args.toggle === true || args.toggle === 'true' || onValue === 'toggle';
   const hasGeneric = args.siid !== undefined && args.piid !== undefined && args.value !== undefined;
+  let genericSiid;
+  let genericPiid;
+  if (hasGeneric) {
+    genericSiid = parseMiotId(args.siid);
+    genericPiid = parseMiotId(args.piid);
+    if (genericSiid === undefined || genericPiid === undefined) {
+      return failure('米家设备控制失败', 'siid 与 piid 必须为非负整数。', { device: publicDevice(device) });
+    }
+  }
   const base = publicDevice(device);
 
   try {
@@ -1886,7 +1915,7 @@ async function handleSet(ctx) {
     // ---- BLE Mesh lights / switches / outlets ----
     if (device.controlChannel === 'bt_mesh') {
       if (hasGeneric) {
-        const item = { did: device.did, siid: Number(args.siid), piid: Number(args.piid), value: coerceValue(args.value) };
+        const item = { did: device.did, siid: /** @type {number} */ (genericSiid), piid: /** @type {number} */ (genericPiid), value: coerceValue(args.value) };
         if (dryRun) {
           return success('米家设备控制（预演）', `将向 ${name} 写入 ${item.siid}.${item.piid}=${JSON.stringify(item.value)}`, { dryRun: true, transport: 'bt_mesh', plan: { method: 'set_properties', params: [item] }, device: base });
         }
@@ -1931,7 +1960,7 @@ async function handleSet(ctx) {
       if (!hasGeneric) {
         return failure('米家设备控制失败', `${name} 走 Wi-Fi MiIO 直连，请通过 siid/piid/value 写入属性，或用 action 调用动作。`, { device: base });
       }
-      const item = { did: device.did, siid: Number(args.siid), piid: Number(args.piid), value: coerceValue(args.value) };
+      const item = { did: device.did, siid: /** @type {number} */ (genericSiid), piid: /** @type {number} */ (genericPiid), value: coerceValue(args.value) };
       if (dryRun) {
         return success('米家设备控制（预演）', `将向 ${name} 写入 ${item.siid}.${item.piid}=${JSON.stringify(item.value)}`, { dryRun: true, transport: 'miio_udp', plan: { method: 'set_properties', params: [item] }, device: base });
       }
@@ -2179,65 +2208,72 @@ async function handleCommand(ctx) {
 
 async function handleConfig(ctx) {
   const { args, paths } = ctx;
-  const prev = loadConfig(paths);
-  const next = { ...prev };
-  const errors = [];
-  let changed = false;
-  let routerChanged = false;
-  if (args.routerSsh !== undefined) {
-    const v = String(args.routerSsh ?? '').trim();
-    if (!v) next.routerSsh = DEFAULT_CONFIG.routerSsh;
-    else if (parseSshTargets(v, 'router').length === 0) errors.push(`routerSsh "${v}" 格式应为 [id=]user@host[:port]`);
-    else next.routerSsh = v;
-    changed = true;
-    routerChanged = next.routerSsh !== prev.routerSsh;
-  }
-  if (args.speakerSsh !== undefined) {
-    const v = String(args.speakerSsh ?? '').trim();
-    if (v && (v.includes('@') ? parseSshTargets(v, 'lx06').length === 0 : !/^[A-Za-z0-9._-]+$/.test(v))) {
-      errors.push(`speakerSsh "${v}" 格式应为 [id=]user@host[:port]`);
-    } else {
-      next.speakerSsh = v;
+  const lockOutcome = await withFileLock(paths.configPath, () => {
+    const prev = loadConfig(paths);
+    const next = { ...prev };
+    const errors = [];
+    let changed = false;
+    let routerChanged = false;
+    if (args.routerSsh !== undefined) {
+      const v = String(args.routerSsh ?? '').trim();
+      if (!v) next.routerSsh = DEFAULT_CONFIG.routerSsh;
+      else if (parseSshTargets(v, 'router').length === 0) errors.push(`routerSsh "${v}" 格式应为 [id=]user@host[:port]`);
+      else next.routerSsh = v;
+      changed = true;
+      routerChanged = next.routerSsh !== prev.routerSsh;
     }
-    changed = true;
-  }
-  if (args.protectedDevices !== undefined) {
-    next.protectedDevices = normalizeProtectedDevices(args.protectedDevices);
-    changed = true;
-  }
-  if (args.customAliases !== undefined) {
-    if (!args.customAliases || typeof args.customAliases !== 'object' || Array.isArray(args.customAliases)) {
-      errors.push('customAliases 必须是 JSON 对象');
-    } else {
-      next.customAliases = normalizeCustomAliases(args.customAliases);
+    if (args.speakerSsh !== undefined) {
+      const v = String(args.speakerSsh ?? '').trim();
+      if (v && (v.includes('@') ? parseSshTargets(v, 'lx06').length === 0 : !/^[A-Za-z0-9._-]+$/.test(v))) {
+        errors.push(`speakerSsh "${v}" 格式应为 [id=]user@host[:port]`);
+      } else {
+        next.speakerSsh = v;
+      }
       changed = true;
     }
-  }
-  if (args.cacheTtlMs !== undefined) {
-    const v = clampInt(args.cacheTtlMs, 0, 3_600_000);
-    if (v === undefined) errors.push('cacheTtlMs 必须是 0-3600000 的数字');
-    else next.cacheTtlMs = v;
-    changed = true;
-  }
-  if (args.topologyTtlMs !== undefined) {
-    const v = clampInt(args.topologyTtlMs, 0, 3_600_000);
-    if (v === undefined) errors.push('topologyTtlMs 必须是 0-3600000 的数字');
-    else next.topologyTtlMs = v;
-    changed = true;
-  }
-  if (args.udpTimeoutMs !== undefined) {
-    const v = clampInt(args.udpTimeoutMs, 300, 30_000);
-    if (v === undefined) errors.push('udpTimeoutMs 必须是 300-30000 的数字');
-    else next.udpTimeoutMs = v;
-    changed = true;
-  }
-  if (errors.length) return failure('米家配置无效', errors.join('；'), { config: loadConfig(paths) });
-  if (changed) {
-    saveConfig(paths, next);
-    if (routerChanged) {
-      invalidateHubCache(paths);
+    if (args.protectedDevices !== undefined) {
+      next.protectedDevices = normalizeProtectedDevices(args.protectedDevices);
+      changed = true;
     }
+    if (args.customAliases !== undefined) {
+      if (!args.customAliases || typeof args.customAliases !== 'object' || Array.isArray(args.customAliases)) {
+        errors.push('customAliases 必须是 JSON 对象');
+      } else {
+        next.customAliases = normalizeCustomAliases(args.customAliases);
+        changed = true;
+      }
+    }
+    if (args.cacheTtlMs !== undefined) {
+      const v = clampInt(args.cacheTtlMs, 0, 3_600_000);
+      if (v === undefined) errors.push('cacheTtlMs 必须是 0-3600000 的数字');
+      else next.cacheTtlMs = v;
+      changed = true;
+    }
+    if (args.topologyTtlMs !== undefined) {
+      const v = clampInt(args.topologyTtlMs, 0, 3_600_000);
+      if (v === undefined) errors.push('topologyTtlMs 必须是 0-3600000 的数字');
+      else next.topologyTtlMs = v;
+      changed = true;
+    }
+    if (args.udpTimeoutMs !== undefined) {
+      const v = clampInt(args.udpTimeoutMs, 300, 30_000);
+      if (v === undefined) errors.push('udpTimeoutMs 必须是 300-30000 的数字');
+      else next.udpTimeoutMs = v;
+      changed = true;
+    }
+    if (errors.length) return { errors, prev };
+    if (changed) {
+      saveConfig(paths, next);
+      if (routerChanged) {
+        invalidateHubCache(paths);
+      }
+    }
+    return { errors, next, changed };
+  });
+  if (lockOutcome.errors.length) {
+    return failure('米家配置无效', lockOutcome.errors.join('；'), { config: lockOutcome.prev });
   }
+  const { next, changed } = lockOutcome;
   let speaker = null;
   try {
     speaker = await discoverSpeakerSsh({ pluginDataDir: paths.pluginDataDir, dataDir: paths.dataDir, homeDir: paths.homeDir });

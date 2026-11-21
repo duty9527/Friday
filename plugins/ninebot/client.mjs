@@ -188,10 +188,11 @@ export function defaultHttpRequester(reqSpec) {
             let raw = Buffer.concat(chunks);
             const encHeader = res.headers['content-encoding'];
             const encoding = (Array.isArray(encHeader) ? encHeader[0] : encHeader || '').toLowerCase().trim();
+            const zlibOpts = { maxOutputLength: MAX_RESPONSE_BYTES * 4 };
             try {
-              if (encoding === 'gzip') raw = gunzipSync(raw);
-              else if (encoding === 'deflate') raw = inflateSync(raw);
-              else if (encoding === 'br') raw = brotliDecompressSync(raw);
+              if (encoding === 'gzip') raw = gunzipSync(raw, zlibOpts);
+              else if (encoding === 'deflate') raw = inflateSync(raw, zlibOpts);
+              else if (encoding === 'br') raw = brotliDecompressSync(raw, zlibOpts);
             } catch (err) {
               finishReject(err);
               return;
@@ -203,6 +204,11 @@ export function defaultHttpRequester(reqSpec) {
             });
           });
           res.on('error', finishReject);
+          res.on('close', () => {
+            if (!settled && !res.complete) {
+              finishReject(new Error('连接在响应结束前关闭 (eof)'));
+            }
+          });
         },
       );
 

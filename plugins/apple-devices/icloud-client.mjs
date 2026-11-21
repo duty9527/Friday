@@ -94,6 +94,9 @@ export function splitSetCookieHeader(headerValue) {
       inExpires = true;
     } else if (inExpires && headerValue[i] === ';') {
       inExpires = false;
+    } else if (inExpires && headerValue[i] === ',') {
+      // HTTP-date in Expires contains at most one comma (after weekday); reset so a following cookie is not swallowed.
+      inExpires = false;
     } else if (!inExpires && headerValue[i] === ',') {
       const candidate = headerValue.slice(start, i).trim();
       if (candidate) parts.push(candidate);
@@ -1226,7 +1229,7 @@ export async function fetchFindMyDevices({
       const boundedServerDelay = Number.isFinite(serverDelayRaw)
         ? Math.max(800, Math.min(2500, serverDelayRaw))
         : 2200;
-      const delayMs = typeof locatePollDelayMs === 'number' && locatePollDelayMs >= 0
+      const delayMs = typeof locatePollDelayMs === 'number' && Number.isFinite(locatePollDelayMs) && locatePollDelayMs >= 0
         ? locatePollDelayMs
         : boundedServerDelay;
 

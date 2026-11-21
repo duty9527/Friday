@@ -453,8 +453,10 @@ public final class TvAgentSelfHealer {
                 item.put("label", entry.getValue());
                 result.put(item);
             }
-            cachedAppsArray = result;
-            lastAppsCacheTimeMs = now;
+            if (result.length() > 0) {
+                cachedAppsArray = result;
+                lastAppsCacheTimeMs = now;
+            }
         } catch (Throwable t) {
             Log.w(TAG, "getLaunchableApps failed: " + t.getMessage());
         }
