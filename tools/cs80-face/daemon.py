@@ -576,7 +576,7 @@ class FaceDaemon:
         text = snap_hud.headline_text
         if self._banner_text and now < self._banner_until:
             meta = self._banner_meta or "F.R.I.D.A.Y. · 互动"
-            source = "ALERT · 互动"
+            source = "互动提醒"
             text = self._banner_text
         elif self._banner_text and now >= self._banner_until:
             self._banner_text = None
@@ -1209,7 +1209,7 @@ def render_single_png(
     sub_phase: str = "awake",
     expr: str = "auto",
     workers: int = 0,
-    headline_meta: str = "F.R.I.D.A.Y. · WECHAT · 20:50",
+    headline_meta: str = "F.R.I.D.A.Y. · 微信 · 20:50",
     headline_text: str = "已接入拉卡拉 CS80 竖屏与内置喇叭，当前系统运转正常。",
     ask_boss: str = "",
 ) -> None:
@@ -1323,11 +1323,11 @@ def render_single_png(
     }
     hud = HudState(
         headline_meta=headline_meta,
-        headline_source="WX · 20:50",
+        headline_source="微信 · 20:50",
         headline_text=headline_text,
         ask_boss_question=ask_boss,
         workers=wk_rows,
-        channels=(("WX", True), ("XIAOAI", True), ("TG", True)),
+        channels=(("微信", True), ("小爱", True), ("电报", True)),
         memory_count=128,
         today_calls=42,
         speaker_volume=65,
@@ -1392,7 +1392,7 @@ def main() -> int:
             demo_dir / "working.png",
             state="working",
             workers=2,
-            headline_meta="F.R.I.D.A.Y. · WORKING",
+            headline_meta="F.R.I.D.A.Y. · 协同执行",
             headline_text="正在后台并发核查 CS80 固件特性位并合成提示音。",
         )
         render_single_png(

@@ -13,6 +13,18 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from avatar_math import extract_bot_expression, strip_bot_tags
 from renderer import HudState, WorkerSummary
 
+CHANNEL_LABELS_ZH: Dict[str, str] = {
+    "WECHAT": "微信",
+    "TELEGRAM": "电报",
+    "DINGTALK": "钉钉",
+    "XIAOAI": "小爱",
+    "LOCAL": "控制台",
+    "WEB": "控制台",
+    "USER": "提问",
+    "FRIDAY": "主脑",
+    "OFFLINE": "离线",
+}
+
 
 def resolve_friday_home(explicit_home: Optional[str] = None) -> Path:
     """Resolve Friday home directory matching src/paths.ts precedence."""
@@ -137,8 +149,9 @@ class FridayClient:
                 sub_phase="nrem",
                 hud=HudState(
                     headline_meta="F.R.I.D.A.Y. · 等待守护进程",
-                    headline_source="OFFLINE",
-                    headline_text="正在等待 friday.service 协调守护进程上线…",
+                    headline_source="离线",
+                    headline_text="正在等待主脑守护进程上线…",
+                    channels=(("微信", False), ("小爱", False), ("电报", False)),
                     friday_connected=False,
                     clock_hm=time.strftime("%H:%M"),
                 ),
@@ -284,18 +297,18 @@ class FridayClient:
             auto_expr = extract_bot_expression(raw_text)
             clean_text = strip_bot_tags(raw_text) or "正在整理回复…"
             raw_ch = str((latest_assistant.get("origin") or {}).get("channel") or "local").upper()
-            short_ch = {"WECHAT": "WX", "TELEGRAM": "TG", "DINGTALK": "DT", "LOCAL": "WEB"}.get(raw_ch, raw_ch[:6])
+            zh_ch = CHANNEL_LABELS_ZH.get(raw_ch, raw_ch[:6])
             ts_str = time.strftime("%H:%M", time.localtime(int(latest_assistant.get("at") or now_ms) / 1000.0))
-            headline_meta = f"F.R.I.D.A.Y. · {raw_ch} · {ts_str}"
-            headline_source = f"{short_ch} · {ts_str}"
+            headline_meta = f"F.R.I.D.A.Y. · {zh_ch} · {ts_str}"
+            headline_source = f"{zh_ch} · {ts_str}"
             headline_text = clean_text
         elif latest_user is not None:
-            headline_meta = "USER · 刚刚"
-            headline_source = "USER · 刚刚"
+            headline_meta = "提问 · 刚刚"
+            headline_source = "提问 · 刚刚"
             headline_text = strip_bot_tags(str(latest_user.get("text") or ""))
         else:
             headline_meta = "F.R.I.D.A.Y. · 就绪"
-            headline_source = "FRIDAY"
+            headline_source = "主脑"
             headline_text = "主脑在线，随时待命。"
 
         ask_boss_q = ""
@@ -350,7 +363,7 @@ class FridayClient:
                 headline_text=headline_text,
                 ask_boss_question=ask_boss_q,
                 workers=tuple(worker_rows),
-                channels=(("WX", ch_map["WX"]), ("XIAOAI", ch_map["XIAOAI"]), ("TG", ch_map["TG"])),
+                channels=(("微信", ch_map["WX"]), ("小爱", ch_map["XIAOAI"]), ("电报", ch_map["TG"])),
                 memory_count=mem_count,
                 today_calls=today_calls,
                 friday_connected=True,

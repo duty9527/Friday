@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -20,30 +21,195 @@ BUILTIN_PLUGIN_WIDGETS: Tuple[str, ...] = (
     "health-scale",
     "miot",
     "ninebot",
+    "laifen",
+    "netlea",
+    "apple-devices",
     "tv-agent",
     "tv-ir",
 )
+
+LAIFEN_MODE_ZH: Dict[int, str] = {
+    1: "柔和护龈",
+    2: "日常清洁",
+    3: "强劲清洁",
+    4: "高频亮白",
+}
+
+APPLE_CATEGORY_ZH: Dict[str, str] = {
+    "iphone": "手机",
+    "ipad": "平板",
+    "watch": "手表",
+    "airpods": "耳机",
+    "mac": "电脑",
+    "airtag": "追踪器",
+}
+
+TV_APP_NAME_ZH: Dict[str, str] = {
+    "com.bili.tv.bili_tv_app": "哔哩哔哩",
+    "com.xiaodianshi.tv.yst": "哔哩哔哩",
+    "tv.danmaku.bili": "哔哩哔哩",
+    "com.ktcp.video": "云视听极光",
+    "com.ktcp.tvvideo": "云视听极光",
+    "com.tencent.qqlivetv": "云视听极光",
+    "com.gitvdemo.video": "银河奇异果",
+    "com.qiyi.video.speaker": "银河奇异果",
+    "com.iqiyi.i18n.tv": "银河奇异果",
+    "com.gitv.video": "银河奇异果",
+    "com.cibn.tv": "酷喵影视",
+    "com.youku.tv": "酷喵影视",
+    "org.xbmc.kodi": "本地影院",
+    "org.courville.nova": "本地影院",
+    "com.mxtech.videoplayer.ad": "本地影院",
+    "com.mxtech.videoplayer.pro": "本地影院",
+    "org.videolan.vlc": "本地影院",
+    "com.plexapp.android": "本地影院",
+    "com.mb.android": "本地影院",
+    "org.jellyfin.androidtv": "本地影院",
+    "com.xiaomi.mitv.mediaexplorer": "本地影院",
+    "org.smarttube.stable": "YouTube",
+    "org.smarttube.beta": "YouTube",
+    "com.google.android.youtube.tv": "YouTube",
+    "com.liskovsoft.smarttubetv": "YouTube",
+    "com.mitv.tvhome": "电视桌面",
+    "com.xiaomi.mitv.tvhome": "电视桌面",
+    "com.dangbei.tvlauncher": "电视桌面",
+    "com.google.android.tvlauncher": "电视桌面",
+    "com.google.android.apps.tv.launcherx": "电视桌面",
+    "com.android.tv.launcher": "电视桌面",
+    "com.tcl.cyberui": "电视桌面",
+    "com.sony.dtv.homelauncher": "电视桌面",
+}
+
+SCALAR_INTERNAL_BLOCKLIST: Set[str] = {
+    "id",
+    "pid",
+    "stubpid",
+    "ok",
+    "notify",
+    "live",
+    "dryrun",
+    "fromcache",
+    "refreshed",
+    "updatedat",
+    "fetchedat",
+    "createdat",
+    "savedat",
+    "startedat",
+    "cacheagesec",
+    "cooldownactive",
+    "cooldownremainingsec",
+    "fadeseconds",
+    "lastaddress",
+    "targetmac",
+    "nameprefix",
+    "tx",
+    "infohex",
+    "laststatushex",
+    "token",
+    "secret",
+    "password",
+    "cookies",
+    "rawadv",
+    "impedances",
+    "adcs",
+    "configpath",
+    "datadir",
+    "errorcode",
+}
+
+SCALAR_KEY_TRANSLATIONS: Dict[str, Tuple[str, str]] = {
+    "batterypct": ("电量", "%"),
+    "batterypercent": ("电量", "%"),
+    "battery": ("电量", "%"),
+    "activemode": ("当前模式", ""),
+    "mode": ("当前模式", ""),
+    "todaycount": ("今日次数", "次"),
+    "streakdays": ("连续打卡", "天"),
+    "brushheaddaysleft": ("刷头剩余", "天"),
+    "daysleft": ("剩余天数", "天"),
+    "percentleft": ("剩余寿命", "%"),
+    "temperature": ("温度", "°C"),
+    "tempc": ("温度", "°C"),
+    "temp": ("温度", "°C"),
+    "humidity": ("湿度", "%"),
+    "hum": ("湿度", "%"),
+    "brightness": ("亮度", "%"),
+    "volume": ("音量", "%"),
+    "online": ("在线", ""),
+    "status": ("状态", ""),
+    "state": ("状态", ""),
+    "enabled": ("启用", ""),
+    "active": ("活跃", ""),
+    "powerstate": ("电源状态", ""),
+    "authstate": ("认证状态", ""),
+    "charging": ("充电状态", ""),
+    "durationsec": ("时长", "秒"),
+    "dailygoal": ("每日目标", "次"),
+    "dailygoalcount": ("每日目标", "次"),
+    "strength": ("振动强度", ""),
+    "range": ("扫幅", ""),
+    "speed": ("扫速", ""),
+    "count": ("数量", ""),
+    "total": ("总数", ""),
+    "red": ("红光", "%"),
+    "green": ("绿光", "%"),
+    "white": ("白光", "%"),
+    "blue": ("蓝光", "%"),
+    "fan": ("风扇", "档"),
+}
+
+SCALAR_VALUE_ZH: Dict[str, str] = {
+    "online": "在线",
+    "offline": "离线",
+    "running": "运行中",
+    "idle": "待命",
+    "true": "是",
+    "false": "否",
+    "standby_or_off": "待机",
+    "authenticated": "已登录",
+    "unauthenticated": "未绑定",
+    "pending_2fa": "待验证",
+    "expired": "已过期",
+    "charging": "充电中",
+    "notcharging": "未充电",
+    "charged": "已充满",
+    "watching": "监听中",
+    "stopped": "已停止",
+    "starting": "启动中",
+    "completed": "已完成",
+    "ready": "就绪",
+}
 
 WMO_WEATHER_ZH: Dict[int, str] = {
     0: "晴",
     1: "晴间少云",
     2: "多云",
     3: "阴",
+    4: "霾",
     45: "雾",
     48: "冻雾",
     51: "毛毛雨",
     53: "小雨",
     55: "中雨",
+    56: "冻毛毛雨",
+    57: "强冻毛毛雨",
     61: "小雨",
     63: "中雨",
     65: "大雨",
+    66: "小冻雨",
+    67: "大冻雨",
     71: "小雪",
     73: "中雪",
     75: "大雪",
+    77: "米雪",
     80: "阵雨",
     81: "强阵雨",
     82: "暴雨",
+    85: "小阵雪",
+    86: "大阵雪",
     95: "雷阵雨",
+    96: "雷阵雨伴冰雹",
+    99: "强雷阵雨",
 }
 
 
@@ -456,8 +622,8 @@ def discover_widget_catalog(
             "kind": "fund-tracker",
             "category": "plugin",
             "plugin": "fund-tracker",
-            "title": "基金持仓与盈亏",
-            "subtitle": "资产净值 · 日盈亏率 · 收益曲线与重点持仓",
+            "title": "投资收益",
+            "subtitle": "实时估值 · 当日盈亏 · 收益走势与重仓明细",
             "defaultSize": "1x1",
             "supportedSizes": list(VALID_SIZES),
             "enabled": manifests.get("fund-tracker", {}).get("enabled", True),
@@ -466,8 +632,8 @@ def discover_widget_catalog(
             "kind": "health-scale",
             "category": "plugin",
             "plugin": "health-scale",
-            "title": "体脂健康档案",
-            "subtitle": "体重走势 · 体脂骨骼肌 · BMI 与身体评分",
+            "title": "体脂健康",
+            "subtitle": "体重曲线 · 体脂肌肉率 · 身体评分与成分",
             "defaultSize": "1x1",
             "supportedSizes": list(VALID_SIZES),
             "enabled": manifests.get("health-scale", {}).get("enabled", True),
@@ -476,8 +642,8 @@ def discover_widget_catalog(
             "kind": "miot",
             "category": "plugin",
             "plugin": "miot",
-            "title": "米家全屋智能",
-            "subtitle": "房间环境 · 在线设备开关状态矩阵",
+            "title": "全屋智能",
+            "subtitle": "环境温湿度 · 房间设备在线与开关矩阵",
             "defaultSize": "1x1",
             "supportedSizes": list(VALID_SIZES),
             "enabled": manifests.get("miot", {}).get("enabled", True),
@@ -486,27 +652,48 @@ def discover_widget_catalog(
             "kind": "ninebot",
             "category": "plugin",
             "plugin": "ninebot",
-            "title": "九号守护",
-            "subtitle": "电量与72V电压 · 精准续航 · 充电功率与锁车定位",
+            "title": "九号座驾",
+            "subtitle": "电量与续航 · 充电功率 · 锁车安防与停放位置",
             "defaultSize": "1x1",
             "supportedSizes": list(VALID_SIZES),
             "enabled": manifests.get("ninebot", {}).get("enabled", True),
         },
         {
-            "kind": "system-pulse",
-            "category": "core",
-            "title": "主机算力脉搏",
-            "subtitle": "CPU 负载 · 内存磁盘 · 定时日程与通道在线率",
+            "kind": "laifen",
+            "category": "plugin",
+            "plugin": "laifen",
+            "title": "口腔护理",
+            "subtitle": "牙刷电量 · 护齿模式 · 刷牙打卡与刷头寿命",
             "defaultSize": "1x1",
             "supportedSizes": list(VALID_SIZES),
-            "enabled": True,
+            "enabled": manifests.get("laifen", {}).get("enabled", True),
+        },
+        {
+            "kind": "netlea",
+            "category": "plugin",
+            "plugin": "netlea",
+            "title": "生态水草灯",
+            "subtitle": "灯具状态 · 四通道光谱比例 · 自动日出日落",
+            "defaultSize": "1x1",
+            "supportedSizes": list(VALID_SIZES),
+            "enabled": manifests.get("netlea", {}).get("enabled", True),
+        },
+        {
+            "kind": "apple-devices",
+            "category": "plugin",
+            "plugin": "apple-devices",
+            "title": "苹果设备",
+            "subtitle": "多设备电量 · 充电状态 · 常用地点守护",
+            "defaultSize": "1x1",
+            "supportedSizes": list(VALID_SIZES),
+            "enabled": manifests.get("apple-devices", {}).get("enabled", True),
         },
         {
             "kind": "tv-agent",
             "category": "plugin",
             "plugin": "tv-agent",
-            "title": "智能电视控制",
-            "subtitle": "电视在线/待机 · 音量静音 · 前台应用",
+            "title": "客厅电视",
+            "subtitle": "播放与待机 · 当前应用 · 音量状态",
             "defaultSize": "1x1",
             "supportedSizes": list(VALID_SIZES),
             "enabled": manifests.get("tv-agent", {}).get("enabled", True),
@@ -515,17 +702,26 @@ def discover_widget_catalog(
             "kind": "tv-ir",
             "category": "plugin",
             "plugin": "tv-ir",
-            "title": "音箱红外遥控",
-            "subtitle": "LX06 红外 TX/RX 就绪 · 预设与学习按键",
+            "title": "电视遥控",
+            "subtitle": "全向红外控制 · 快捷按键与自学习指令",
             "defaultSize": "1x1",
             "supportedSizes": list(VALID_SIZES),
             "enabled": manifests.get("tv-ir", {}).get("enabled", True),
         },
         {
+            "kind": "system-pulse",
+            "category": "core",
+            "title": "主机脉搏",
+            "subtitle": "处理器与内存 · 磁盘空间 · 近期日程",
+            "defaultSize": "1x1",
+            "supportedSizes": list(VALID_SIZES),
+            "enabled": True,
+        },
+        {
             "kind": "memory",
             "category": "core",
-            "title": "全息突触记忆",
-            "subtitle": "活跃记忆量 · 赫布突触连接网络图谱",
+            "title": "突触记忆",
+            "subtitle": "长期记忆库 · 核心置顶 · 关联知识星图",
             "defaultSize": "2x1",
             "supportedSizes": list(VALID_SIZES),
             "enabled": True,
@@ -533,8 +729,8 @@ def discover_widget_catalog(
         {
             "kind": "timers",
             "category": "core",
-            "title": "定时与目标调度",
-            "subtitle": "启用中的定时巡检、单次提醒与目标跟踪",
+            "title": "日程与巡检",
+            "subtitle": "今日待触发提醒 · 周期巡检与目标追踪",
             "defaultSize": "1x1",
             "supportedSizes": list(VALID_SIZES),
             "enabled": True,
@@ -542,8 +738,8 @@ def discover_widget_catalog(
         {
             "kind": "usage",
             "category": "core",
-            "title": "今日算力与消费",
-            "subtitle": "调用次数 · Token 消耗与预估费用",
+            "title": "今日算力",
+            "subtitle": "模型调用次数 · 算力消耗与今日账单",
             "defaultSize": "1x1",
             "supportedSizes": list(VALID_SIZES),
             "enabled": True,
@@ -551,8 +747,8 @@ def discover_widget_catalog(
         {
             "kind": "weather",
             "category": "core",
-            "title": "实时气象卡片",
-            "subtitle": "当前温度 · 天气实况与风速（Open-Meteo）",
+            "title": "本地气象",
+            "subtitle": "实时气温 · 天气状况 · 高低温与风湿实况",
             "defaultSize": "1x1",
             "supportedSizes": list(VALID_SIZES),
             "enabled": True,
@@ -560,8 +756,8 @@ def discover_widget_catalog(
         {
             "kind": "workers",
             "category": "core",
-            "title": "活跃 Worker 任务",
-            "subtitle": "后台并发代理、耗时与提问等待状态",
+            "title": "后台任务",
+            "subtitle": "并发智能体进度 · 运行耗时与请示状态",
             "defaultSize": "2x1",
             "supportedSizes": list(VALID_SIZES),
             "enabled": True,
@@ -579,7 +775,7 @@ def discover_widget_catalog(
                 "category": "custom_plugin",
                 "plugin": name,
                 "title": info.get("title") or name,
-                "subtitle": (info.get("description") or "自定义插件实时卡片")[:68],
+                "subtitle": (info.get("description") or "扩展插件实时状态")[:68],
                 "actions": actions,
                 "defaultAction": default_act,
                 "configurableAction": True,
@@ -608,32 +804,182 @@ def _fmt_money(v: float) -> str:
     return f"{sign}{av:,.0f}"
 
 
+def _is_scalar_key_blocked(key: str) -> bool:
+    ks = str(key).strip()
+    if not ks:
+        return True
+    kl = ks.lower()
+    if kl in SCALAR_INTERNAL_BLOCKLIST:
+        return True
+    if ks.endswith(("Id", "At", "Hex", "Path", "Url", "Mac", "ID", "URL", "MAC")):
+        return True
+    if kl.endswith(("_id", "_at", "_hex", "_path", "_url", "_mac")):
+        return True
+    return False
+
+
 def _extract_scalars(obj: Any, prefix: str = "", out: Optional[List[Tuple[str, str]]] = None) -> List[Tuple[str, str]]:
     if out is None:
         out = []
     if len(out) >= 6 or obj is None:
         return out
     if isinstance(obj, dict):
-        for k, v in list(obj.items())[:14]:
+        for k, v in obj.items():
             if len(out) >= 6:
                 break
-            ks = str(k)
-            if ks.lower() in ("token", "secret", "password", "cookies", "rawadv", "impedances", "adcs"):
+            ks = str(k).strip()
+            if _is_scalar_key_blocked(ks):
                 continue
-            label = f"{prefix}.{ks}" if prefix else ks
-            if isinstance(v, (int, float, bool)):
-                if isinstance(v, bool):
-                    val = "是" if v else "否"
-                elif isinstance(v, float):
-                    val = f"{v:.2f}".rstrip("0").rstrip(".")
-                else:
-                    val = str(v)
-                out.append((ks[:12], val[:18]))
-            elif isinstance(v, str) and v.strip() and len(v.strip()) <= 26:
-                out.append((ks[:12], v.strip()))
+            kl = ks.lower()
+            lbl, unit = SCALAR_KEY_TRANSLATIONS.get(kl, (ks, ""))
+            if isinstance(v, bool):
+                val = "是" if v else "否"
+                out.append((lbl[:12], val[:18]))
+            elif isinstance(v, (int, float)):
+                num_s = f"{v:.2f}".rstrip("0").rstrip(".") if isinstance(v, float) else str(v)
+                val = f"{num_s}{unit}" if unit else num_s
+                out.append((lbl[:12], val[:18]))
+            elif isinstance(v, str):
+                sv = v.strip()
+                if not sv or len(sv) > 26:
+                    continue
+                mapped = SCALAR_VALUE_ZH.get(sv.lower())
+                val = mapped if mapped is not None else sv
+                out.append((lbl[:12], val[:18]))
             elif isinstance(v, dict) and not prefix:
-                _extract_scalars(v, label, out)
+                _extract_scalars(v, ks, out)
     return out
+
+
+def _is_pid_alive(pid: Any) -> bool:
+    try:
+        p = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if p <= 0:
+        return False
+    try:
+        os.kill(p, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> int:
+    r = 6_371_000.0
+    to_rad = math.pi / 180.0
+    d_lat = (lat2 - lat1) * to_rad
+    d_lon = (lon2 - lon1) * to_rad
+    a = (math.sin(d_lat * 0.5) ** 2) + math.cos(lat1 * to_rad) * math.cos(lat2 * to_rad) * (math.sin(d_lon * 0.5) ** 2)
+    return int(round(2.0 * r * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))))
+
+
+def _normalize_tv_app_name(app_name: Any, package_name: Any, *, online: bool) -> str:
+    pkg = str(package_name or "").strip()
+    raw_app = str(app_name or "").strip()
+    if pkg:
+        direct = TV_APP_NAME_ZH.get(pkg.lower())
+        if direct:
+            return direct
+    probe = f"{pkg} {raw_app}".lower()
+    if any(t in probe for t in ("bili", "小电视", "哔哩")):
+        return "哔哩哔哩"
+    if any(t in probe for t in ("ktcp", "qqlive", "云视听", "极光")):
+        return "云视听极光"
+    if any(t in probe for t in ("qiyi", "gitv", "奇异果")):
+        return "银河奇异果"
+    if any(t in probe for t in ("youku", "cibn", "酷喵")):
+        return "酷喵影视"
+    if any(t in probe for t in ("smarttube", "youtube")):
+        return "YouTube"
+    if any(t in probe for t in ("kodi", "vlc", "nova", "mxtech", "plex", "emby", "jellyfin", "mediaexplorer", "本地影院")):
+        return "本地影院"
+    if any(t in probe for t in ("tvhome", "launcher", "电视桌面")):
+        return "电视桌面"
+    if raw_app and "." not in raw_app:
+        return raw_app[:16]
+    if pkg and "." not in pkg:
+        return pkg[:16]
+    return "电视桌面" if online else "已待机"
+
+
+def _is_miot_bridge_node(d: Dict[str, Any]) -> bool:
+    cat = str(d.get("category") or "").strip().lower()
+    ch = str(d.get("controlChannel") or "").strip().lower()
+    urn = str(d.get("urn") or "").strip().lower()
+    model = str(d.get("model") or "").strip().lower()
+    name = str(d.get("dev_name") or d.get("name") or "").strip().lower()
+    if cat in ("router", "gateway", "hub", "bridge") or ch == "router":
+        return True
+    if any(t in urn for t in (":gateway:", ":router:", ":mesh-gateway:", ":ble-gateway:")):
+        return True
+    if any(t in model for t in (".router.", ".gateway.", "gateway", "bridge")):
+        return True
+    if (not d.get("controllable")) and any(t in name for t in ("网关", "中枢", "路由器", "gateway", "bridge", "hub")):
+        return True
+    return False
+
+
+def _coerce_float(val: Any) -> Optional[float]:
+    if isinstance(val, bool) or val is None:
+        return None
+    try:
+        f = float(val)
+        return f if math.isfinite(f) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_miot_env(raw_devices: Sequence[Dict[str, Any]]) -> Tuple[Optional[float], Optional[float]]:
+    temp_val: Optional[float] = None
+    hum_val: Optional[float] = None
+    temp_keys = ("temperature", "envtemp", "indoortemp", "currenttemperature", "temp")
+    hum_keys = ("humidity", "envhum", "indoorhumidity", "relativehumidity", "hum")
+    for d in raw_devices:
+        if not isinstance(d, dict):
+            continue
+        cat = str(d.get("category") or "").lower()
+        if cat == "air_fryer":
+            continue
+        state = d.get("state") if isinstance(d.get("state"), dict) else {}
+        cached = d.get("cachedState") if isinstance(d.get("cachedState"), dict) else {}
+        raw_keys = cached.get("rawKeys") if isinstance(cached.get("rawKeys"), dict) else {}
+        props = cached.get("properties") if isinstance(cached.get("properties"), dict) else {}
+
+        for source in (d, state, raw_keys):
+            for k, raw_v in source.items():
+                kl = str(k).lower()
+                val = raw_v.get("value") if isinstance(raw_v, dict) else raw_v
+                num = _coerce_float(val)
+                if num is None:
+                    continue
+                if temp_val is None and kl in temp_keys and -20.0 <= num <= 55.0:
+                    temp_val = round(num, 1)
+                if hum_val is None and kl in hum_keys and 0.0 <= num <= 100.0:
+                    hum_val = round(num, 1)
+
+        # Fallback: MIoT sensor properties when device metadata identifies an env sensor
+        probe = f"{d.get('urn') or ''} {d.get('model') or ''} {d.get('dev_name') or d.get('name') or ''} {cat}".lower()
+        is_env_sensor = any(t in probe for t in ("sensor_ht", "thermometer", "hygrometer", "temperature-humidity", "environment", "温湿度", "湿度计", "温度计"))
+        if is_env_sensor and isinstance(props, dict):
+            for pk in ("2.1", "2.7", "3.1"):
+                if temp_val is not None:
+                    break
+                entry = props.get(pk)
+                num = _coerce_float(entry.get("value") if isinstance(entry, dict) else entry)
+                if num is not None and -20.0 <= num <= 55.0:
+                    temp_val = round(num, 1)
+            for pk in ("2.2", "2.8", "3.2"):
+                if hum_val is not None:
+                    break
+                entry = props.get(pk)
+                num = _coerce_float(entry.get("value") if isinstance(entry, dict) else entry)
+                if num is not None and 0.0 <= num <= 100.0:
+                    hum_val = round(num, 1)
+
+        if temp_val is not None and hum_val is not None:
+            break
+    return temp_val, hum_val
 
 
 class WidgetDataHub:
@@ -735,7 +1081,7 @@ class WidgetDataHub:
             ttl = 60.0 if _is_market_hours_now() else 300.0
             db_path = self.home / "plugins" / "fund-tracker" / "funds.sqlite"
             mtime_changed = self._file_mtime_changed("fund-tracker", db_path)
-            if mtime_changed or self._due("fund-tracker", ttl, now_mono, force=force):
+            if self._should_poll("fund-tracker", ttl, now_mono, force=force, mtime_changed=mtime_changed):
                 self._collect_fund_tracker(db_path, connected=connected, allow_refresh=_is_market_hours_now())
 
         if "health-scale" in by_kind:
@@ -743,20 +1089,48 @@ class WidgetDataHub:
             sess_path = self.home / "plugins" / "health-scale" / "live-session.json"
             m1 = self._file_mtime_changed("health-scale:db", db_path)
             m2 = self._file_mtime_changed("health-scale:sess", sess_path)
-            if m1 or m2 or self._due("health-scale", 600.0, now_mono, force=force):
+            if self._should_poll("health-scale", 600.0, now_mono, force=force, mtime_changed=(m1 or m2)):
                 self._collect_health_scale(db_path, connected=connected)
 
         if "miot" in by_kind:
             cache_path = self.home / "plugins" / "miot" / "hub-cache.json"
             m_changed = self._file_mtime_changed("miot:cache", cache_path)
-            if m_changed or self._due("miot", 180.0, now_mono, force=force):
+            if self._should_poll("miot", 180.0, now_mono, force=force, mtime_changed=m_changed):
                 self._collect_miot(cache_path, connected=connected)
 
         if "ninebot" in by_kind:
             db_path = self.home / "plugins" / "ninebot" / "ninebot.sqlite"
             m_changed = self._file_mtime_changed("ninebot:db", db_path)
-            if m_changed or self._due("ninebot", 180.0, now_mono, force=force):
+            if self._should_poll("ninebot", 180.0, now_mono, force=force, mtime_changed=m_changed):
                 self._collect_ninebot(db_path, connected=connected)
+
+        if "laifen" in by_kind:
+            db_path = self.home / "plugins" / "laifen" / "laifen.db"
+            wal_path = self.home / "plugins" / "laifen" / "laifen.db-wal"
+            watch_path = self.home / "plugins" / "laifen" / "watch-state.json"
+            sess_path = self.home / "plugins" / "laifen" / "live-session.json"
+            m1 = self._file_mtime_changed("laifen:db", db_path)
+            m2 = self._file_mtime_changed("laifen:wal", wal_path)
+            m3 = self._file_mtime_changed("laifen:watch", watch_path)
+            m4 = self._file_mtime_changed("laifen:sess", sess_path)
+            if self._should_poll("laifen", 180.0, now_mono, force=force, mtime_changed=(m1 or m2 or m3 or m4)):
+                self._collect_laifen(db_path, connected=connected)
+
+        if "netlea" in by_kind:
+            state_path = self.home / "plugins" / "netlea" / "last-state.json"
+            cfg_path = self.home / "plugins" / "netlea" / "config.json"
+            m1 = self._file_mtime_changed("netlea:state", state_path)
+            m2 = self._file_mtime_changed("netlea:cfg", cfg_path)
+            if self._should_poll("netlea", 180.0, now_mono, force=force, mtime_changed=(m1 or m2)):
+                self._collect_netlea(state_path, connected=connected)
+
+        if "apple-devices" in by_kind:
+            cache_path = self.home / "plugins" / "apple-devices" / "devices-cache.json"
+            sess_path = self.home / "plugins" / "apple-devices" / "session.json"
+            m1 = self._file_mtime_changed("apple-devices:cache", cache_path)
+            m2 = self._file_mtime_changed("apple-devices:sess", sess_path)
+            if self._should_poll("apple-devices", 180.0, now_mono, force=force, mtime_changed=(m1 or m2)):
+                self._collect_apple_devices(cache_path, connected=connected)
 
         if "tv-agent" in by_kind:
             if self._due("tv-agent", 45.0, now_mono, force=force):
@@ -777,6 +1151,17 @@ class WidgetDataHub:
             ttl = float(max(15, min(3600, int(c.get("ttlSec") or 120))))
             if self._due(key, ttl, now_mono, force=force, alt_kind=k):
                 self._collect_custom_plugin(key, c, connected=connected)
+
+    def _should_poll(
+        self,
+        key: str,
+        ttl: float,
+        now_mono: float,
+        *,
+        force: bool = False,
+        mtime_changed: bool = False,
+    ) -> bool:
+        return self._due(key, ttl, now_mono, force=(force or mtime_changed))
 
     def _due(self, key: str, ttl: float, now_mono: float, *, force: bool = False, alt_kind: str = "") -> bool:
         with self._lock:
@@ -898,7 +1283,7 @@ class WidgetDataHub:
                 "uptimeH": round(uptime_h, 1),
                 "timerCount": len(enabled_timers),
                 "nextTimer": next_timer_str,
-                "headline": f"CPU {cpu_pct:.0f}% · RAM {mem_pct:.0f}%",
+                "headline": f"处理器 {cpu_pct:.0f}% · 内存 {mem_pct:.0f}%",
                 "subline": next_timer_str or f"负载 {load_1:.2f} · 磁盘可用 {disk_free_gb:.0f}G",
             },
         )
@@ -967,8 +1352,8 @@ class WidgetDataHub:
                     "tokStr": tok_str,
                     "costCny": round(cost_cny, 3),
                     "costUsd": round(cost_usd, 4),
-                    "headline": f"¥{cost_cny:.2f} · {calls}次",
-                    "subline": f"Token {tok_str} · ${cost_usd:.3f}",
+                    "headline": f"¥{cost_cny:.2f} · {calls} 次调用",
+                    "subline": f"今日吞吐 {tok_str}",
                 },
             )
         elif kind == "workers":
@@ -993,8 +1378,8 @@ class WidgetDataHub:
                     "ok": True,
                     "count": len(works),
                     "rows": rows,
-                    "headline": f"{len(works)} 个并发任务" if works else "Worker 队列空闲",
-                    "subline": rows[0]["prompt"] if rows else "主脑随时可执行代码/研究子任务",
+                    "headline": f"{len(works)} 个后台任务" if works else "任务队列空闲",
+                    "subline": rows[0]["prompt"] if rows else "随时可执行代码与研究子任务",
                 },
             )
 
@@ -1226,15 +1611,16 @@ class WidgetDataHub:
         )
 
     def _collect_miot(self, cache_path: Path, *, connected: bool) -> None:
-        raw_devices: List[Dict[str, Any]] = []
+        cached_devices: List[Dict[str, Any]] = []
         fetched_at = 0.0
         if cache_path.is_file():
             try:
                 parsed = json.loads(cache_path.read_text(encoding="utf-8"))
-                raw_devices = list(parsed.get("devices") or [])
+                cached_devices = list(parsed.get("devices") or [])
                 fetched_at = float(parsed.get("hotDataFetchedAt") or parsed.get("fetchedAt") or 0.0)
             except Exception:
-                raw_devices = []
+                cached_devices = []
+        raw_devices: List[Dict[str, Any]] = list(cached_devices)
 
         cache_age_sec = (time.time() * 1000.0 - fetched_at) / 1000.0 if fetched_at > 0 else 999999.0
         if connected and (not raw_devices or cache_age_sec > 360.0):
@@ -1246,6 +1632,11 @@ class WidgetDataHub:
                 data = (res or {}).get("data") if isinstance(res, dict) else None
                 if isinstance(data, dict) and isinstance(data.get("devices"), list):
                     raw_devices = list(data["devices"])
+                    if cache_path.is_file():
+                        try:
+                            cached_devices = list(json.loads(cache_path.read_text(encoding="utf-8")).get("devices") or [])
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
@@ -1258,13 +1649,21 @@ class WidgetDataHub:
                     "online": 0,
                     "total": 0,
                     "onCount": 0,
+                    "envTemp": None,
+                    "envHum": None,
                     "devices": [],
                     "headline": "未连接米家中枢",
-                    "subline": "请检查 miot hub-cache",
+                    "subline": "等待同步全屋设备",
                 },
             )
             return
 
+        cached_by_did = {
+            str(cd.get("did") or ""): cd
+            for cd in cached_devices
+            if isinstance(cd, dict) and cd.get("did")
+        }
+        merged_for_env: List[Dict[str, Any]] = []
         items: List[Dict[str, Any]] = []
         online_cnt = 0
         on_cnt = 0
@@ -1272,23 +1671,31 @@ class WidgetDataHub:
         for d in raw_devices:
             if not isinstance(d, dict):
                 continue
-            online = bool(d.get("online", True))
+            did = str(d.get("did") or "")
+            cached_entry = cached_by_did.get(did) or {}
+            merged_d = dict(d)
+            if "cachedState" not in merged_d and isinstance(cached_entry.get("cachedState"), dict):
+                merged_d["cachedState"] = cached_entry["cachedState"]
+            merged_for_env.append(merged_d)
+
+            online = bool(merged_d.get("online", True))
             if online:
                 online_cnt += 1
             on_val: Optional[bool] = None
-            if isinstance(d.get("state"), dict) and "on" in d["state"]:
-                on_val = bool(d["state"]["on"])
+            if isinstance(merged_d.get("state"), dict) and "on" in merged_d["state"]:
+                on_val = bool(merged_d["state"]["on"])
             else:
-                props = ((d.get("cachedState") or {}).get("properties") or {})
+                props = ((merged_d.get("cachedState") or {}).get("properties") or {})
                 if isinstance(props, dict) and "2.1" in props and isinstance(props["2.1"], dict):
                     v = props["2.1"].get("value")
                     if v is not None:
                         on_val = v in (True, 1, "1", "true")
             if on_val:
                 on_cnt += 1
-            name = str(d.get("dev_name") or d.get("name") or "设备")[:14]
-            room = str(d.get("room_name") or d.get("room") or "默认")[:8]
-            cat = str(d.get("category") or "")
+            name = str(merged_d.get("dev_name") or merged_d.get("name") or "设备")[:14]
+            room = str(merged_d.get("room_name") or merged_d.get("room") or "默认")[:8]
+            cat = str(merged_d.get("category") or "")
+            is_bridge = _is_miot_bridge_node(merged_d)
             rooms[room] = rooms.get(room, 0) + 1
             items.append(
                 {
@@ -1297,12 +1704,28 @@ class WidgetDataHub:
                     "cat": cat,
                     "online": online,
                     "on": on_val,
-                    "controllable": bool(d.get("controllable")),
+                    "controllable": bool(merged_d.get("controllable")),
+                    "_is_bridge": is_bridge,
                 }
             )
 
-        # Put controllable / currently ON items first
-        items.sort(key=lambda x: (0 if x["on"] else (1 if x["controllable"] else 2), 0 if x["online"] else 1))
+        env_temp, env_hum = _extract_miot_env(merged_for_env)
+        # Deprioritize pure bridge/gateway/hub nodes; put controllable / currently ON items first
+        items.sort(
+            key=lambda x: (
+                1 if x["_is_bridge"] else 0,
+                0 if x["on"] else (1 if x["controllable"] else 2),
+                0 if x["online"] else 1,
+            )
+        )
+        clean_devices = [{k: v for k, v in it.items() if k != "_is_bridge"} for it in items[:10]]
+        env_parts = []
+        if env_temp is not None:
+            env_parts.append(f"室内 {env_temp:.1f}°C")
+        if env_hum is not None:
+            env_parts.append(f"{env_hum:.0f}%" if env_temp is not None else f"湿度 {env_hum:.0f}%")
+        env_str = " · ".join(env_parts)
+        subline = f"{env_str} · 开启 {on_cnt} 台" if env_str else f"开启 {on_cnt} 台 · {len(rooms)} 个房间"
         self._store_widget(
             "miot",
             {
@@ -1311,9 +1734,11 @@ class WidgetDataHub:
                 "online": online_cnt,
                 "onCount": on_cnt,
                 "rooms": len(rooms),
-                "devices": items[:10],
+                "envTemp": env_temp,
+                "envHum": env_hum,
+                "devices": clean_devices,
                 "headline": f"{online_cnt}/{len(items)} 在线",
-                "subline": f"开启 {on_cnt} 台 · {len(rooms)} 个房间",
+                "subline": subline,
             },
         )
 
@@ -1459,7 +1884,7 @@ class WidgetDataHub:
 
         batt_str = f"{batt_num}%" if batt_num is not None else "--%"
         range_str = f"续航 {float(range_km):.1f}km" if range_km is not None else "续航 --"
-        lock_str = "⚡充电" if charging else ("未锁车" if (power_on or locked is False) else ("已锁" if locked is True else "待机"))
+        lock_str = "充电中" if charging else ("未锁车" if (power_on or locked is False) else ("已锁" if locked is True else "待机"))
         self._store_widget(
             "ninebot",
             {
@@ -1488,14 +1913,556 @@ class WidgetDataHub:
             },
         )
 
+    def _collect_laifen(self, db_path: Path, *, connected: bool) -> None:
+        dash: Optional[Dict[str, Any]] = None
+        if connected:
+            try:
+                res = self._rpc(
+                    {"command": "plugin-run", "plugin": "laifen", "action": "dashboard", "args": {"limit": 30}},
+                    5.0,
+                )
+                d = (res or {}).get("data") if isinstance(res, dict) else None
+                if isinstance(d, dict):
+                    dash = d
+            except Exception:
+                dash = None
+
+        laifen_dir = self.home / "plugins" / "laifen"
+        if dash is None:
+            cfg: Dict[str, Any] = {}
+            cfg_path = laifen_dir / "config.json"
+            if cfg_path.is_file():
+                try:
+                    parsed_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+                    if isinstance(parsed_cfg, dict):
+                        cfg = parsed_cfg
+                except Exception:
+                    cfg = {}
+
+            daily_goal = max(1, min(6, int(cfg.get("dailyGoalCount") or 2)))
+            lifespan_days = max(15, min(365, int(cfg.get("brushHeadLifespanDays") or 90)))
+            replaced_at_raw = cfg.get("brushHeadReplacedAt")
+            replaced_at = int(replaced_at_raw) if isinstance(replaced_at_raw, (int, float)) and replaced_at_raw > 0 else None
+
+            dev_fb: Optional[Dict[str, Any]] = None
+            session_times: List[int] = []
+            if db_path.is_file():
+                try:
+                    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+                    con.row_factory = sqlite3.Row
+                    cur = con.cursor()
+                    row = cur.execute(
+                        "SELECT name, battery_pct, active_mode, modes_json, duration_sec, status, updated_at, last_synced_at "
+                        "FROM device_state ORDER BY CASE WHEN id = 'primary' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1"
+                    ).fetchone()
+                    if row is not None:
+                        try:
+                            modes = json.loads(str(row["modes_json"] or "{}"))
+                        except Exception:
+                            modes = {}
+                        if not isinstance(modes, dict):
+                            modes = {}
+                        active_mode = row["active_mode"] if row["active_mode"] is not None else 1
+                        slot = modes.get(str(active_mode)) or modes.get("1") or {}
+                        if not isinstance(slot, dict):
+                            slot = {}
+                        dev_fb = {
+                            "name": str(row["name"] or ""),
+                            "batteryPct": row["battery_pct"],
+                            "activeMode": active_mode,
+                            "activeStrength": slot.get("strength"),
+                            "activeRange": slot.get("range"),
+                            "activeSpeed": slot.get("speed"),
+                            "durationSec": row["duration_sec"],
+                            "status": str(row["status"] or "Idle"),
+                            "updatedAt": row["updated_at"],
+                            "lastSyncedAt": row["last_synced_at"],
+                        }
+                    s_rows = cur.execute("SELECT brushed_at FROM brush_sessions ORDER BY brushed_at DESC").fetchall()
+                    session_times = [int(r["brushed_at"]) for r in s_rows if r["brushed_at"] is not None]
+                    con.close()
+                except Exception:
+                    dev_fb = None
+                    session_times = []
+
+            now_ms = int(time.time() * 1000.0)
+            by_day: Dict[str, int] = {}
+            for ts_ms in session_times:
+                day_key = time.strftime("%Y-%m-%d", time.localtime(ts_ms / 1000.0))
+                by_day[day_key] = by_day.get(day_key, 0) + 1
+
+            def _day_key_offset(delta_days: int) -> str:
+                return time.strftime("%Y-%m-%d", time.localtime(time.time() + delta_days * 86400.0))
+
+            today_key = _day_key_offset(0)
+            yesterday_key = _day_key_offset(-1)
+            today_count_fb = by_day.get(today_key, 0)
+            last7 = [{"count": by_day.get(_day_key_offset(d), 0)} for d in range(-6, 1)]
+
+            streak_fb = 0
+            start_off: Optional[int] = 0 if today_key in by_day else (-1 if yesterday_key in by_day else None)
+            if start_off is not None:
+                off = start_off
+                while _day_key_offset(off) in by_day:
+                    streak_fb += 1
+                    off -= 1
+
+            earliest_sess = min(session_times) if session_times else None
+            last_synced = dev_fb.get("lastSyncedAt") if dev_fb else None
+            anchor_at = replaced_at or earliest_sess or last_synced or now_ms
+            days_used = max(0, int((now_ms - float(anchor_at)) // 86_400_000))
+            days_left = max(0, lifespan_days - days_used)
+            pct_left = round(max(0.0, min(100.0, (days_left / max(1, lifespan_days)) * 100.0)), 1)
+
+            watch_running = False
+            watch_path = laifen_dir / "watch-state.json"
+            if watch_path.is_file():
+                try:
+                    w_raw = json.loads(watch_path.read_text(encoding="utf-8"))
+                    if isinstance(w_raw, dict):
+                        w_phase = str(w_raw.get("phase") or "")
+                        w_pid = w_raw.get("pid")
+                        if w_phase in ("watching", "syncing", "brushing", "cooldown", "yielding", "connecting"):
+                            watch_running = _is_pid_alive(w_pid) if w_pid else False
+                except Exception:
+                    watch_running = False
+
+            live_phase = ""
+            sess_path = laifen_dir / "live-session.json"
+            if sess_path.is_file():
+                try:
+                    s_raw = json.loads(sess_path.read_text(encoding="utf-8"))
+                    if isinstance(s_raw, dict):
+                        sp = str(s_raw.get("phase") or "")
+                        if sp in ("scanning", "connecting", "monitoring") and _is_pid_alive(s_raw.get("pid")):
+                            live_phase = sp
+                except Exception:
+                    live_phase = ""
+
+            dash = {
+                "device": dev_fb,
+                "stats": {
+                    "todayCount": today_count_fb,
+                    "dailyGoalCount": daily_goal,
+                    "streakDays": streak_fb,
+                    "totalSessions": len(session_times),
+                    "last7Days": last7,
+                    "brushHead": {
+                        "daysLeft": days_left,
+                        "percentLeft": pct_left,
+                    },
+                },
+                "watchStatus": {"running": watch_running},
+                "liveSession": {"phase": live_phase} if live_phase else None,
+                "config": {"dailyGoalCount": daily_goal},
+            }
+
+        dev = dash.get("device") if isinstance(dash, dict) and isinstance(dash.get("device"), dict) else None
+        stats = dash.get("stats") if isinstance(dash, dict) and isinstance(dash.get("stats"), dict) else {}
+        bh = stats.get("brushHead") if isinstance(stats.get("brushHead"), dict) else {}
+        watch_st = dash.get("watchStatus") if isinstance(dash, dict) and isinstance(dash.get("watchStatus"), dict) else {}
+        live_sess = dash.get("liveSession") if isinstance(dash, dict) and isinstance(dash.get("liveSession"), dict) else {}
+        cfg_d = dash.get("config") if isinstance(dash, dict) and isinstance(dash.get("config"), dict) else {}
+
+        watching = bool(watch_st.get("running")) or str(live_sess.get("phase") or "") in ("scanning", "connecting", "monitoring")
+        today_count = int(stats.get("todayCount") if stats.get("todayCount") is not None else ((dash or {}).get("todayCount") or 0))
+        daily_goal = int(stats.get("dailyGoalCount") or cfg_d.get("dailyGoalCount") or 2)
+        streak_days = int(stats.get("streakDays") if stats.get("streakDays") is not None else ((dash or {}).get("streakDays") or 0))
+        raw_days_left = bh.get("daysLeft") if bh.get("daysLeft") is not None else (dash or {}).get("brushHeadDaysLeft")
+        brush_days_left = int(raw_days_left) if raw_days_left is not None else None
+        raw_brush_pct = bh.get("percentLeft")
+        if raw_brush_pct is not None:
+            brush_pct = round(max(0.0, min(100.0, float(raw_brush_pct))), 1)
+        elif brush_days_left is not None:
+            brush_pct = round(max(0.0, min(100.0, (brush_days_left / 90.0) * 100.0)), 1)
+        else:
+            brush_pct = 100.0
+
+        last7_raw = stats.get("last7Days") if isinstance(stats.get("last7Days"), list) else []
+        week_counts = [int(item.get("count") or 0) for item in last7_raw[-7:] if isinstance(item, dict)]
+        if len(week_counts) < 7:
+            week_counts = [0] * (7 - len(week_counts)) + week_counts
+
+        total_sessions = int(stats.get("totalSessions") or 0)
+        has_data = (dev is not None) or (total_sessions > 0) or (today_count > 0)
+
+        raw_name = str((dev or {}).get("name") or "").strip()
+        name = "徕芬声波牙刷" if (not raw_name or raw_name.upper() == "LFTB") else raw_name[:16]
+        batt = int(round(float(dev["batteryPct"]))) if dev and dev.get("batteryPct") is not None else None
+        mode = int(dev["activeMode"]) if dev and dev.get("activeMode") is not None else None
+        mode_label = LAIFEN_MODE_ZH.get(mode, f"{mode}档" if mode else ("未连接" if has_data else "待同步")) if mode is not None else ("未连接" if has_data else "待同步")
+        strength = int(dev["activeStrength"]) if dev and dev.get("activeStrength") is not None else None
+        rng = int(dev["activeRange"]) if dev and dev.get("activeRange") is not None else None
+        speed = int(dev["activeSpeed"]) if dev and dev.get("activeSpeed") is not None else None
+        dur_sec = int(dev["durationSec"]) if dev and dev.get("durationSec") is not None else None
+        ts_ms = float(dev.get("lastSyncedAt") or dev.get("updatedAt") or 0.0) if dev else 0.0
+        updated_hm = time.strftime("%H:%M", time.localtime(ts_ms / 1000.0)) if ts_ms > 0 else ""
+
+        if not has_data:
+            headline = "待同步牙刷"
+            subline = "自动唤醒监听中 · 拿起即同步" if watching else "轻按牙刷亮灯即可同步状态"
+        else:
+            headline = (
+                f"{batt}% · {mode_label}"
+                if batt is not None
+                else (mode_label if dev is not None else f"今日 {today_count}/{daily_goal} 次")
+            )
+            bh_part = f" · 刷头余 {brush_days_left} 天" if brush_days_left is not None else ""
+            subline = f"今日 {today_count}/{daily_goal} 次{bh_part}"
+
+        self._store_widget(
+            "laifen",
+            {
+                "ok": has_data,
+                "empty": not has_data,
+                "name": name,
+                "battery": batt,
+                "mode": mode,
+                "modeLabel": mode_label,
+                "todayCount": today_count,
+                "dailyGoal": daily_goal,
+                "streakDays": streak_days,
+                "brushDaysLeft": brush_days_left,
+                "brushPct": brush_pct,
+                "strength": strength,
+                "range": rng,
+                "speed": speed,
+                "durationSec": dur_sec,
+                "watching": watching,
+                "weekCounts": week_counts,
+                "updatedHm": updated_hm,
+                "headline": headline,
+                "subline": subline,
+            },
+        )
+
+    def _collect_netlea(self, state_path: Path, *, connected: bool) -> None:
+        data: Optional[Dict[str, Any]] = None
+        if connected:
+            try:
+                res = self._rpc(
+                    {"command": "plugin-run", "plugin": "netlea", "action": "dashboard", "args": {"refresh": False}},
+                    4.5,
+                )
+                d = (res or {}).get("data") if isinstance(res, dict) else None
+                if isinstance(d, dict):
+                    data = d
+            except Exception:
+                data = None
+
+        netlea_dir = self.home / "plugins" / "netlea"
+        if data is None:
+            snap_raw: Dict[str, Any] = {}
+            if state_path.is_file():
+                try:
+                    parsed = json.loads(state_path.read_text(encoding="utf-8"))
+                    if isinstance(parsed, dict):
+                        snap_raw = parsed
+                except Exception:
+                    snap_raw = {}
+            cfg_raw: Dict[str, Any] = {}
+            cfg_path = netlea_dir / "config.json"
+            if cfg_path.is_file():
+                try:
+                    parsed_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+                    if isinstance(parsed_cfg, dict):
+                        cfg_raw = parsed_cfg
+                except Exception:
+                    cfg_raw = {}
+            data = {
+                "updatedAt": snap_raw.get("updatedAt"),
+                "device": snap_raw.get("device"),
+                "state": snap_raw.get("state"),
+                "config": cfg_raw,
+            }
+
+        dev = data.get("device") if isinstance(data.get("device"), dict) else None
+        st = data.get("state") if isinstance(data.get("state"), dict) else None
+        cfg = data.get("config") if isinstance(data.get("config"), dict) else {}
+        updated_at = float(data.get("updatedAt") or 0.0)
+        updated_hm = time.strftime("%H:%M", time.localtime(updated_at / 1000.0)) if updated_at > 0 else ""
+
+        raw_name = str((dev or {}).get("name") or "").strip()
+        name = raw_name[:18] if raw_name else "尼特利水草灯"
+
+        if not isinstance(st, dict):
+            self._store_widget(
+                "netlea",
+                {
+                    "ok": False,
+                    "empty": True,
+                    "name": name,
+                    "on": None,
+                    "modeLabel": "待同步",
+                    "brightness": None,
+                    "red": 0,
+                    "green": 0,
+                    "white": 0,
+                    "blue": 0,
+                    "fan": 0,
+                    "updatedHm": updated_hm,
+                    "headline": "待同步灯具",
+                    "subline": "在「生态水草灯」面板同步状态",
+                },
+            )
+            return
+
+        ch = st.get("channels") if isinstance(st.get("channels"), dict) else {}
+        red = max(0, min(100, int(round(float(ch.get("red") or 0)))))
+        green = max(0, min(100, int(round(float(ch.get("green") or 0)))))
+        white = max(0, min(100, int(round(float(ch.get("white") or 0)))))
+        blue = max(0, min(100, int(round(float(ch.get("blue") or 0)))))
+        fan = max(0, min(5, int(round(float(ch.get("fan") or 0)))))
+        on_val = bool(st.get("on"))
+
+        if not on_val:
+            brightness: Optional[int] = 0
+        else:
+            def_ch = cfg.get("defaultChannels") if isinstance(cfg.get("defaultChannels"), dict) else {}
+            def_sum = sum(
+                max(0, int(def_ch.get(c, d)))
+                for c, d in (("red", 69), ("green", 54), ("white", 98), ("blue", 54))
+            )
+            cur_sum = red + green + white + blue
+            if cur_sum <= 0:
+                brightness = 0
+            elif def_sum > 0:
+                brightness = max(1, min(100, int(round(100.0 * cur_sum / def_sum))))
+            else:
+                brightness = max(1, min(100, int(round(cur_sum / 4.0))))
+
+        master = st.get("master") if isinstance(st.get("master"), dict) else {}
+        lamp_mode = master.get("lampMode")
+        state_type = master.get("stateType")
+        if not on_val:
+            mode_label = "已关闭"
+        elif lamp_mode == 1:
+            mode_label = "手动补光"
+        elif state_type == 1:
+            mode_label = "自动行程"
+        else:
+            mode_label = "手动补光"
+
+        headline = f"开启 · {brightness}%" if on_val else "已关闭"
+        subline = f"红{red} 绿{green} 白{white} 蓝{blue} · {mode_label}"
+        self._store_widget(
+            "netlea",
+            {
+                "ok": True,
+                "empty": False,
+                "name": name,
+                "on": on_val,
+                "modeLabel": mode_label,
+                "brightness": brightness,
+                "red": red,
+                "green": green,
+                "white": white,
+                "blue": blue,
+                "fan": fan,
+                "updatedHm": updated_hm,
+                "headline": headline,
+                "subline": subline,
+            },
+        )
+
+    def _collect_apple_devices(self, cache_path: Path, *, connected: bool) -> None:
+        data: Optional[Dict[str, Any]] = None
+        if connected:
+            try:
+                res = self._rpc(
+                    {"command": "plugin-run", "plugin": "apple-devices", "action": "status", "args": {"refresh": False}},
+                    4.5,
+                )
+                d = (res or {}).get("data") if isinstance(res, dict) else None
+                if isinstance(d, dict):
+                    data = d
+            except Exception:
+                data = None
+
+        apple_dir = self.home / "plugins" / "apple-devices"
+        if data is None:
+            sess_raw: Dict[str, Any] = {}
+            sess_path = apple_dir / "session.json"
+            if sess_path.is_file():
+                try:
+                    parsed_s = json.loads(sess_path.read_text(encoding="utf-8"))
+                    if isinstance(parsed_s, dict):
+                        sess_raw = parsed_s
+                except Exception:
+                    sess_raw = {}
+            raw_state = str(sess_raw.get("state") or "")
+            auth_state = raw_state if raw_state in ("authenticated", "pending_2fa", "expired") else "unauthenticated"
+
+            cfg_raw: Dict[str, Any] = {}
+            cfg_path = apple_dir / "config.json"
+            if cfg_path.is_file():
+                try:
+                    parsed_c = json.loads(cfg_path.read_text(encoding="utf-8"))
+                    if isinstance(parsed_c, dict):
+                        cfg_raw = parsed_c
+                except Exception:
+                    cfg_raw = {}
+            places_cfg = cfg_raw.get("places") if isinstance(cfg_raw.get("places"), dict) else {}
+
+            fetched_at: Optional[float] = None
+            raw_devices_fb: List[Dict[str, Any]] = []
+            if cache_path.is_file():
+                try:
+                    c_raw = json.loads(cache_path.read_text(encoding="utf-8"))
+                    if isinstance(c_raw, dict):
+                        if isinstance(c_raw.get("fetchedAt"), (int, float)):
+                            fetched_at = float(c_raw["fetchedAt"])
+                        for entry in (c_raw.get("entries") or []):
+                            if not isinstance(entry, dict) or not isinstance(entry.get("device"), dict):
+                                continue
+                            dev_obj = dict(entry["device"])
+                            loc = dev_obj.get("location")
+                            best_place: Optional[Dict[str, Any]] = None
+                            if isinstance(loc, dict) and isinstance(loc.get("latitude"), (int, float)) and isinstance(loc.get("longitude"), (int, float)):
+                                lat = float(loc["latitude"])
+                                lon = float(loc["longitude"])
+                                for pname, pcfg in places_cfg.items():
+                                    if not isinstance(pcfg, dict):
+                                        continue
+                                    plat = pcfg.get("lat", pcfg.get("latitude"))
+                                    plng = pcfg.get("lng", pcfg.get("lon", pcfg.get("longitude")))
+                                    if not isinstance(plat, (int, float)) or not isinstance(plng, (int, float)):
+                                        continue
+                                    radius = int(pcfg.get("radiusMeters") or pcfg.get("radius") or 250)
+                                    dist = _haversine_meters(lat, lon, float(plat), float(plng))
+                                    cand = {"name": str(pname), "distanceMeters": dist, "inside": dist <= radius}
+                                    if (
+                                        best_place is None
+                                        or (cand["inside"] and not best_place["inside"])
+                                        or (cand["inside"] == best_place["inside"] and cand["distanceMeters"] < best_place["distanceMeters"])
+                                    ):
+                                        best_place = cand
+                            dev_obj["place"] = best_place
+                            dev_obj.pop("location", None)
+                            raw_devices_fb.append(dev_obj)
+                except Exception:
+                    raw_devices_fb = []
+
+            data = {
+                "authState": auth_state,
+                "fetchedAt": fetched_at,
+                "devices": raw_devices_fb,
+                "config": cfg_raw,
+            }
+
+        auth_state = str(data.get("authState") or "unauthenticated")
+        cfg_d = data.get("config") if isinstance(data.get("config"), dict) else {}
+        min_batt_pct = int(cfg_d.get("minBatteryPct") or 25)
+        fetched_ms = float(data.get("fetchedAt") or 0.0)
+        updated_hm = time.strftime("%H:%M", time.localtime(fetched_ms / 1000.0)) if fetched_ms > 0 else ""
+
+        raw_devs = [d for d in (data.get("devices") or []) if isinstance(d, dict)]
+        cat_order = {"iphone": 0, "watch": 1, "ipad": 2, "mac": 3, "airpods": 4, "airtag": 5}
+        devices_out: List[Tuple[int, int, Dict[str, Any]]] = []
+        online_cnt = 0
+        low_cnt = 0
+        for d in raw_devs:
+            cat = str(d.get("category") or "").strip().lower()
+            probe = f"{d.get('model') or ''} {d.get('name') or ''} {d.get('displayName') or ''}".lower()
+            if (not cat or cat == "other") and "airtag" in probe:
+                cat = "airtag"
+            cat_label = APPLE_CATEGORY_ZH.get(cat, "设备")
+            raw_batt = d.get("batteryPercent")
+            batt = max(0, min(100, int(round(float(raw_batt))))) if isinstance(raw_batt, (int, float)) else None
+            b_status = str(d.get("batteryStatus") or "Unknown")
+            charging = b_status == "Charging"
+            online = bool(d.get("online"))
+            if online:
+                online_cnt += 1
+            if batt is not None and batt < min_batt_pct and b_status not in ("Charging", "Charged"):
+                low_cnt += 1
+
+            place_str = ""
+            place_obj = d.get("place")
+            if isinstance(place_obj, dict) and place_obj.get("name"):
+                pname = str(place_obj["name"]).strip()[:10]
+                if place_obj.get("inside"):
+                    place_str = pname if pname.startswith("在") else f"在{pname}"
+                else:
+                    dist = place_obj.get("distanceMeters")
+                    if isinstance(dist, (int, float)):
+                        place_str = f"距{pname}{int(round(dist))}m" if dist < 1000 else f"距{pname}{dist / 1000.0:.1f}km"
+                    else:
+                        place_str = f"距{pname}"
+
+            dev_item = {
+                "name": str(d.get("name") or d.get("displayName") or cat_label)[:16],
+                "catLabel": cat_label,
+                "battery": batt,
+                "charging": charging,
+                "online": online,
+                "place": place_str,
+            }
+            devices_out.append((0 if online else 1, cat_order.get(cat, 6), dev_item))
+
+        devices_out.sort(key=lambda item: (item[0], item[1]))
+        final_devices = [item[2] for item in devices_out]
+        total = len(final_devices)
+
+        if total == 0:
+            if auth_state == "pending_2fa":
+                headline = "待完成验证"
+            elif auth_state == "expired":
+                headline = "会话已过期"
+            elif auth_state == "authenticated":
+                headline = "暂无设备缓存"
+            else:
+                headline = "待绑定苹果账号"
+            subline = "请在「苹果设备」面板刷新" if auth_state == "authenticated" else "请在「苹果设备」完成登录"
+            self._store_widget(
+                "apple-devices",
+                {
+                    "ok": False,
+                    "empty": True,
+                    "authState": auth_state,
+                    "total": 0,
+                    "online": 0,
+                    "lowCount": 0,
+                    "devices": [],
+                    "updatedHm": updated_hm,
+                    "headline": headline,
+                    "subline": subline,
+                },
+            )
+            return
+
+        first = final_devices[0]
+        first_batt = f" {first['battery']}%" if first["battery"] is not None else ""
+        headline = f"{online_cnt}/{total} 台在线"
+        subline = (
+            f"{low_cnt} 台低电量 · {first['name']}{first_batt}"
+            if low_cnt > 0
+            else f"电量正常 · {first['name']}{first_batt}"
+        )
+        self._store_widget(
+            "apple-devices",
+            {
+                "ok": True,
+                "empty": False,
+                "authState": auth_state,
+                "total": total,
+                "online": online_cnt,
+                "lowCount": low_cnt,
+                "devices": final_devices,
+                "updatedHm": updated_hm,
+                "headline": headline,
+                "subline": subline,
+            },
+        )
+
     def _collect_tv_agent(self, *, connected: bool) -> None:
         cfg_path = self.home / "plugins" / "tv-agent" / "config.json"
-        tv_host = ""
+        configured = False
         if cfg_path.is_file():
             try:
-                tv_host = str(json.loads(cfg_path.read_text(encoding="utf-8")).get("tvHost") or "")
+                configured = bool(str(json.loads(cfg_path.read_text(encoding="utf-8")).get("tvHost") or "").strip())
             except Exception:
-                pass
+                configured = False
         data: Dict[str, Any] = {}
         if connected:
             try:
@@ -1504,24 +2471,31 @@ class WidgetDataHub:
                     data = dict(res["data"])
             except Exception:
                 pass
+        if data.get("tvHost"):
+            configured = True
         online = data.get("powerState") == "online"
         vol = data.get("volume")
         muted = bool(data.get("muted"))
-        app = str(data.get("appName") or data.get("packageName") or "")[:18]
-        host = str(data.get("tvHost") or tv_host or "未配置")
+        app_display = _normalize_tv_app_name(data.get("appName"), data.get("packageName"), online=online)
+        vol_desc = "已静音" if muted else (f"音量 {vol}%" if vol is not None else "已连接")
+        headline = f"播放中 · {app_display}" if online else ("客厅电视待机" if configured else "待配置电视")
+        subline = (
+            f"{app_display} · {vol_desc}"
+            if online
+            else ("已开启联动控制 · 可语音唤醒" if configured else "请在「客厅电视」配置设备")
+        )
         self._store_widget(
             "tv-agent",
             {
-                "ok": online or bool(host != "未配置"),
+                "ok": online or configured,
                 "online": online,
-                "host": host,
-                "appName": app or ("桌面待机" if online else "已关机"),
+                "appName": app_display if online else ("已待机" if configured else "未配置"),
                 "volume": vol,
                 "muted": muted,
                 "dlnaOk": bool(data.get("dlnaReachable")),
                 "agentOk": bool(data.get("agentReachable")),
-                "headline": "TV 在线" if online else "TV 待机",
-                "subline": (f"{app or '在线'} · 音量 {vol if vol is not None else '--'}" if online else f"主机 {host}"),
+                "headline": headline,
+                "subline": subline,
             },
         )
 
@@ -1548,6 +2522,7 @@ class WidgetDataHub:
         rx_ready = bool(data.get("rxReady", False))
         preset_cnt = int(data.get("presetCount") or 12)
         learned_cnt = int(data.get("learnedCount") if data.get("learnedCount") is not None else learned_cnt)
+        subline = "支持电源 · 音量 · 方向导航" + (f" · 已学 {learned_cnt} 键" if learned_cnt > 0 else "")
         self._store_widget(
             "tv-ir",
             {
@@ -1556,8 +2531,8 @@ class WidgetDataHub:
                 "rxReady": rx_ready,
                 "presetCount": preset_cnt,
                 "learnedCount": learned_cnt,
-                "headline": "红外就绪" if tx_ready else "红外待检",
-                "subline": f"预设 {preset_cnt} 键 · 已学 {learned_cnt} 键",
+                "headline": "全向红外就绪" if tx_ready else "等待音箱连接",
+                "subline": subline,
             },
         )
 
@@ -1573,8 +2548,13 @@ class WidgetDataHub:
                     "ok": False,
                     "city": city,
                     "temp": None,
+                    "feelsLike": None,
+                    "tempMax": None,
+                    "tempMin": None,
+                    "wcode": 0,
                     "desc": "离线模式",
                     "wind": 0.0,
+                    "windDesc": "微风",
                     "headline": f"{city} · 离线",
                     "subline": "网络检查已禁用",
                 },
@@ -1583,29 +2563,57 @@ class WidgetDataHub:
         try:
             url = (
                 f"https://api.open-meteo.com/v1/forecast?latitude={lat:.4f}&longitude={lon:.4f}"
-                "&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m&timezone=auto"
+                "&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m"
+                "&daily=temperature_2m_max,temperature_2m_min&forecast_days=1&timezone=auto"
             )
             req = urllib.request.Request(url, headers={"User-Agent": "friday-cs80/1.0"})
             with urllib.request.urlopen(req, timeout=2.5) as resp:
                 raw = json.loads(resp.read().decode("utf-8"))
             cur = raw.get("current") or {}
+            daily = raw.get("daily") or {}
             temp = cur.get("temperature_2m")
+            feels_like = cur.get("apparent_temperature")
             hum = cur.get("relative_humidity_2m")
             wcode = int(cur.get("weather_code") or 0)
             wind = float(cur.get("wind_speed_10m") or 0.0)
+            tmax_list = daily.get("temperature_2m_max") or []
+            tmin_list = daily.get("temperature_2m_min") or []
+            temp_max = round(float(tmax_list[0]), 1) if tmax_list and tmax_list[0] is not None else None
+            temp_min = round(float(tmin_list[0]), 1) if tmin_list and tmin_list[0] is not None else None
+
+            if wind < 6.0:
+                wind_desc = "微风"
+            elif wind < 18.0:
+                wind_desc = "轻风"
+            elif wind < 35.0:
+                wind_desc = "和风"
+            else:
+                wind_desc = "强风"
+
             desc = WMO_WEATHER_ZH.get(wcode, "多云")
             t_str = f"{float(temp):.0f}°C" if temp is not None else "--°C"
+            hum_str = f"{int(round(float(hum)))}%" if hum is not None else "--%"
+            range_str = (
+                f" · {temp_min:.0f}~{temp_max:.0f}°"
+                if temp_min is not None and temp_max is not None
+                else ""
+            )
             self._store_widget(
                 "weather",
                 {
                     "ok": True,
                     "city": city,
-                    "temp": float(temp) if temp is not None else None,
-                    "humidity": int(hum) if hum is not None else None,
+                    "temp": round(float(temp), 1) if temp is not None else None,
+                    "feelsLike": round(float(feels_like), 1) if feels_like is not None else None,
+                    "tempMax": temp_max,
+                    "tempMin": temp_min,
+                    "humidity": int(round(float(hum))) if hum is not None else None,
+                    "wcode": wcode,
                     "wind": round(wind, 1),
+                    "windDesc": wind_desc,
                     "desc": desc,
                     "headline": f"{t_str} · {desc}",
-                    "subline": f"{city} · 湿度 {hum or '--'}% · 风 {wind:.0f}km/h",
+                    "subline": f"{city} · 湿度 {hum_str} · {wind_desc}{range_str}",
                 },
             )
         except Exception:
@@ -1618,8 +2626,13 @@ class WidgetDataHub:
                         "ok": False,
                         "city": city,
                         "temp": None,
+                        "feelsLike": None,
+                        "tempMax": None,
+                        "tempMin": None,
+                        "wcode": 0,
                         "desc": "暂无气象",
                         "wind": 0.0,
+                        "windDesc": "微风",
                         "headline": f"{city} --°C",
                         "subline": "气象源暂不可达",
                     },
@@ -1639,10 +2652,10 @@ class WidgetDataHub:
                     "plugin": plugin,
                     "action": action,
                     "title": title,
-                    "message": "等待连接 F.R.I.D.A.Y. 服务",
+                    "message": "等待连接主脑服务",
                     "kpis": [],
                     "headline": f"{title} · 待连接",
-                    "subline": f"action={action}",
+                    "subline": "等待主脑服务上线",
                 },
             )
             return
@@ -1653,6 +2666,7 @@ class WidgetDataHub:
             msg = str((res or {}).get("message") or "").strip()
             kpis = _extract_scalars((res or {}).get("data"))
             first_line = next((ln.strip() for ln in msg.splitlines() if ln.strip()), "")
+            kpi_summary = " · ".join(f"{kl} {kv}" for kl, kv in kpis[:2]) if kpis else ""
             self._store_widget(
                 key,
                 {
@@ -1662,8 +2676,8 @@ class WidgetDataHub:
                     "title": r_title,
                     "message": msg[:240],
                     "kpis": kpis,
-                    "headline": kpis[0][1] if kpis else (first_line[:22] or ("在线" if ok else "异常")),
-                    "subline": first_line[:36] or f"{plugin}/{action}",
+                    "headline": kpis[0][1] if kpis else (first_line[:22] or ("运行正常" if ok else "状态异常")),
+                    "subline": first_line[:36] or kpi_summary or ("插件运行正常" if ok else "插件状态异常"),
                 },
             )
         except Exception as exc:
@@ -1677,6 +2691,6 @@ class WidgetDataHub:
                     "message": str(exc)[:140],
                     "kpis": [],
                     "headline": "调用失败",
-                    "subline": str(exc)[:34],
+                    "subline": "插件调用失败，请稍后重试",
                 },
             )
