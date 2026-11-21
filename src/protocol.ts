@@ -11,6 +11,8 @@ const LONG_COMMANDS = new Set([
   'voice-enroll-start',
   'memory-search',
   'memory-save',
+  'note-promote-memory',
+  'diary-promote-memory',
   'im-telegram-quick',
   'im-telegram-sync-commands',
   'model-configure',

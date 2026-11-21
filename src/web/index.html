@@ -50,6 +50,12 @@
         <span>IM 与声纹</span>
         <span id="im-top-badge" class="hub-pill-badge">0</span>
       </button>
+      <button id="open-notebook-hub-top" class="hub-pill-btn" type="button" title="记事本与 F.R.I.D.A.Y. 日记">
+        <span class="te-key-prefix" aria-hidden="true">M5</span>
+        <span class="hub-pill-icon" aria-hidden="true"><svg class="hub-svg-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/><path d="M8 7h8"/><path d="M8 11h6"/></svg></span>
+        <span>笔记与日记</span>
+        <span id="notebook-top-badge" class="hub-pill-badge">0</span>
+      </button>
     </div>
     <div class="topbar-right-controls">
       <button id="open-system-hub-top" class="hub-pill-btn system-base-pill" type="button" title="系统底座：模型与提供方、用量账本">
@@ -2221,6 +2227,145 @@
               <div id="geo-probe-result" class="model-probe-result" hidden></div>
             </div>
           </section>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 6. 笔记与日记弹窗 -->
+  <div id="notebook-hub-backdrop" class="modal-backdrop" hidden>
+    <div id="notebook-hub-modal" class="model-modal hub-modal notebook-modal" role="dialog" aria-modal="true" aria-labelledby="notebook-modal-title">
+      <div class="model-modal-header plugin-modal-header">
+        <div class="hub-modal-title-block">
+          <h2 id="notebook-modal-title">📒 笔记与日记</h2>
+          <p id="notebook-role-hint" class="hub-modal-sub">F.R.I.D.A.Y. 替你记事 · 与全息记忆隔离存储，支持按需转存</p>
+        </div>
+        <div class="hub-modal-header-right">
+          <div id="notebook-hub-tabs" class="hub-surface-tabs" role="tablist" aria-label="笔记与日记切换">
+            <button id="notebook-tab-notes" class="hub-surface-tab active" type="button" role="tab" aria-selected="true" aria-controls="notebook-panel-notes">
+              <span>📒 记事本</span>
+              <span id="notebook-notes-tab-badge" class="hub-pill-badge">0</span>
+            </button>
+            <button id="notebook-tab-diary" class="hub-surface-tab" type="button" role="tab" aria-selected="false" aria-controls="notebook-panel-diary">
+              <span>📔 F.R.I.D.A.Y. 日记</span>
+              <span id="notebook-diary-tab-badge" class="hub-pill-badge">0</span>
+            </button>
+          </div>
+          <button id="notebook-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
+        </div>
+      </div>
+
+      <div class="model-modal-body notebook-modal-body">
+        <div id="notebook-panel-notes" class="hub-tab-panel notebook-tab-panel" role="tabpanel" aria-labelledby="notebook-tab-notes">
+          <div class="notebook-split">
+            <aside class="notebook-sidebar" aria-label="记事本列表">
+              <div class="notebook-sidebar-top">
+                <input id="note-search-input" type="search" maxlength="160" placeholder="搜索笔记标题、标签或正文…" aria-label="搜索记事本">
+                <button id="note-new-btn" class="primary mini-button" type="button">+ 新建</button>
+              </div>
+              <div class="hub-filter-pills notebook-filter-row" role="group" aria-label="记事筛选">
+                <button id="note-filter-all" class="hub-filter-pill active" type="button">全部</button>
+                <button id="note-filter-pinned" class="hub-filter-pill" type="button">★ 已置顶</button>
+              </div>
+              <div id="note-tag-chips" class="notebook-tag-chips" hidden></div>
+              <div id="note-list" class="notebook-item-list"><p class="empty">暂无记事。</p></div>
+            </aside>
+
+            <section class="notebook-main" aria-label="记事本内容区">
+              <div id="note-empty-state" class="notebook-empty-state">
+                <p class="notebook-empty-title">还没有选中的记事</p>
+                <p class="meta">在对话中对 F.R.I.D.A.Y. 说「帮我记一下…」，或者点击新建手动记录 Markdown 笔记。</p>
+                <button id="note-empty-new-btn" class="primary mini-button" type="button">+ 新建一条笔记</button>
+              </div>
+
+              <div id="note-workspace" class="notebook-workspace" hidden>
+                <div id="note-conflict-bar" class="notebook-conflict-bar" role="status" hidden>
+                  <span class="notebook-conflict-text">⚠️ F.R.I.D.A.Y. 在后台更新了这篇笔记</span>
+                  <div class="modal-btn-group">
+                    <button id="note-conflict-load-btn" class="mini-button primary" type="button">载入最新</button>
+                    <button id="note-conflict-keep-btn" class="mini-button" type="button">保留当前编辑</button>
+                  </div>
+                </div>
+
+                <div class="notebook-workspace-head">
+                  <input id="note-title-input" class="note-title-input" type="text" maxlength="160" placeholder="无标题笔记…" aria-label="笔记标题">
+                  <div class="notebook-workspace-actions">
+                    <div class="hub-surface-tabs note-mode-tabs" role="group" aria-label="视图模式">
+                      <button id="note-mode-preview" class="hub-surface-tab active" type="button">阅读</button>
+                      <button id="note-mode-edit" class="hub-surface-tab" type="button">编辑</button>
+                      <button id="note-mode-split" class="hub-surface-tab" type="button">分栏</button>
+                    </div>
+                    <button id="note-pin-btn" class="mini-button" type="button" title="置顶或取消置顶">☆ 置顶</button>
+                    <button id="note-promote-btn" class="mini-button" type="button" title="按需复制到全息神经记忆">🧠 转存记忆</button>
+                    <button id="note-delete-btn" class="mini-button danger" type="button">删除</button>
+                  </div>
+                </div>
+
+                <div class="note-meta-bar">
+                  <input id="note-tags-input" class="note-tags-input" type="text" maxlength="256" placeholder="标签（逗号分隔，如：清单, 项目）" aria-label="笔记标签">
+                  <span id="note-meta-info" class="meta note-meta-info"></span>
+                  <span id="note-save-status" class="hub-status-pill badge-slate">就绪</span>
+                </div>
+
+                <div id="note-md-toolbar" class="note-md-toolbar" role="toolbar" aria-label="Markdown 快捷格式" hidden>
+                  <button class="mini-button note-md-btn" type="button" data-md-op="h2" title="插入二级标题">H2</button>
+                  <button class="mini-button note-md-btn" type="button" data-md-op="bold" title="加粗">B</button>
+                  <button class="mini-button note-md-btn" type="button" data-md-op="list" title="无序列表">• 列表</button>
+                  <button class="mini-button note-md-btn" type="button" data-md-op="check" title="待办事项">☑ 待办</button>
+                  <button class="mini-button note-md-btn" type="button" data-md-op="code" title="代码块">&lt;/&gt; 代码</button>
+                  <button id="note-save-now-btn" class="mini-button primary note-save-now-btn" type="button">💾 保存</button>
+                </div>
+
+                <div id="note-editor-body" class="note-editor-body is-mode-preview">
+                  <textarea id="note-content-input" class="note-content-input" maxlength="16384" placeholder="支持 Markdown 语法记录…" aria-label="笔记 Markdown 正文"></textarea>
+                  <div id="note-preview-pane" class="note-preview-pane md-content" aria-label="Markdown 预览"></div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </div>
+
+        <div id="notebook-panel-diary" class="hub-tab-panel notebook-tab-panel" role="tabpanel" aria-labelledby="notebook-tab-diary" hidden>
+          <div class="notebook-split diary-split">
+            <aside class="notebook-sidebar" aria-label="F.R.I.D.A.Y. 日记时间线">
+              <div class="notebook-sidebar-top">
+                <input id="diary-search-input" type="search" maxlength="160" placeholder="搜索日记内容、标题或日期…" aria-label="搜索 F.R.I.D.A.Y. 日记">
+              </div>
+              <div id="diary-mood-filters" class="hub-filter-pills notebook-filter-row" role="group" aria-label="按心情筛选日记"></div>
+              <div id="diary-list" class="notebook-item-list"><p class="empty">F.R.I.D.A.Y. 还没有写下日记。</p></div>
+            </aside>
+
+            <section class="notebook-main diary-main" aria-label="F.R.I.D.A.Y. 日记阅读区">
+              <div id="diary-empty-state" class="notebook-empty-state">
+                <p class="notebook-empty-title">暂无选中日记</p>
+                <p class="meta">F.R.I.D.A.Y. 会在对话有感而发或夜间潜意识回想时，自主用第一人称把心情与心路记录在这里。</p>
+              </div>
+
+              <article id="diary-reader" class="diary-reader" hidden>
+                <header class="diary-masthead">
+                  <div id="diary-avatar-slot" class="diary-avatar-slot" aria-hidden="true"></div>
+                  <div class="diary-masthead-meta">
+                    <div class="diary-eyebrow-row">
+                      <span id="diary-date-display" class="diary-date-badge"></span>
+                      <div id="diary-badges-row" class="diary-badges-row"></div>
+                    </div>
+                    <h3 id="diary-title-display" class="diary-title-display"></h3>
+                    <div id="diary-tags-row" class="diary-tags-row"></div>
+                  </div>
+                </header>
+
+                <div id="diary-content-body" class="diary-reader-body md-content"></div>
+
+                <footer class="diary-reader-footer">
+                  <span class="meta">F.R.I.D.A.Y. 自主书写 · 纯净只读</span>
+                  <div class="modal-btn-group">
+                    <button id="diary-promote-btn" class="mini-button" type="button" title="按需将此日记转存到全息记忆">🧠 转存记忆</button>
+                    <button id="diary-delete-btn" class="mini-button danger" type="button">删除</button>
+                  </div>
+                </footer>
+              </article>
+            </section>
+          </div>
         </div>
       </div>
     </div>

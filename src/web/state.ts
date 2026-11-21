@@ -27,6 +27,7 @@ export interface AppHooks {
   loadWork: (id: string, generation: number, background?: boolean) => Promise<void>;
   openPluginHubModal: (pluginName?: string, expandSource?: boolean, mode?: 'catalog' | 'surface') => void;
   openSystemHubModal: (tab?: 'models' | 'usage' | 'services', focusProviderId?: string) => void;
+  openNotebookHubModal: (tab?: 'notes' | 'diary') => void;
   closeAllHubModals: () => void;
 }
 
@@ -94,6 +95,7 @@ export const hooks: AppHooks = {
   loadWork: async () => {},
   openPluginHubModal: () => {},
   openSystemHubModal: () => {},
+  openNotebookHubModal: () => {},
   closeAllHubModals: () => {},
 };
 

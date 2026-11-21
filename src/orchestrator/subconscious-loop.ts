@@ -6,7 +6,7 @@ import type { ModelHub } from '../model-hub.js';
 import { resolveEnv } from '../paths.js';
 import { text } from '../protocol.js';
 import type { SemanticEmbedder } from '../semantic.js';
-import type { DreamMaterial, Store, Task } from '../store.js';
+import { formatLocalDate, type DreamMaterial, type Store, type Task } from '../store.js';
 import type { ChatMessage, ModelTier, SubconsciousStatusView, ThinkingLevel } from '../view.js';
 import { parseStringArray, toolInput } from './router-tools.js';
 
@@ -547,6 +547,23 @@ export class SubconsciousController {
           if (card.pinned) throw new Error('Pinned core memories cannot be forgotten during sleep');
           return JSON.stringify({ removed: this.host.store.deleteMemory(id) });
         },
+      }, {
+        name: 'write_diary',
+        description: 'Write or append a first-person personal reflection in F.R.I.D.A.Y.\'s own daily diary (separate from Boss notes and factual memories). Input JSON: {date?, title?, content, mood?, tags?, append?}.',
+        execute: async input => {
+          controller.signal.throwIfAborted();
+          const args = toolInput(input, ['date', 'title', 'content', 'mood', 'tags', 'append']);
+          const entry = this.host.store.writeDiaryEntry({
+            date: args.date === undefined ? formatLocalDate(this.now()) : text(args.date, 'date', 32),
+            ...(args.title !== undefined ? { title: text(args.title, 'title', 160) } : {}),
+            content: text(args.content, 'content', 16_384),
+            ...(args.mood !== undefined ? { mood: text(args.mood, 'mood', 32) } : {}),
+            tags: sanitizeTags(parseStringArray(args.tags, 'tags', 12, 32)),
+            source: 'sleep',
+            append: args.append === undefined ? true : Boolean(args.append),
+          });
+          return JSON.stringify({ entry: { id: entry.id, date: entry.date, title: entry.title, mood: entry.mood } });
+        },
       }];
 
       const dreamer = await this.host.factory.create('dreamer', `dream-${randomUUID()}`, dreamerTools, {
@@ -559,9 +576,17 @@ export class SubconsciousController {
       const timeoutSignal = AbortSignal.timeout(90_000);
       const combinedSignal = AbortSignal.any([controller.signal, timeoutSignal]);
       try {
+        const recentDiary = this.host.store.listDiaryEntries({ limit: 3 }).map(entry => ({
+          date: entry.date,
+          title: entry.title,
+          mood: entry.mood,
+          preview: entry.content.slice(0, 180),
+        }));
         const rawOutput = await dreamer.prompt(JSON.stringify({
           kind: 'DREAM',
           cwd: dreamCwd,
+          todayDate: formatLocalDate(this.now()),
+          recentDiary,
           material: {
             candidateCwds: material.candidateCwds,
             undigestedMessages: material.undigestedMessages,

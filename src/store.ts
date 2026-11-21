@@ -18,6 +18,17 @@ import {
   type SearchContextOptions,
   type SearchContextResult,
 } from './store/memory-store.js';
+import {
+  formatLocalDate,
+  NotebookStore,
+  NoteConflictError,
+  normalizeDiaryMood,
+  validateDateString,
+  type ListDiaryOptions,
+  type ListNotesOptions,
+  type SaveNoteInput,
+  type WriteDiaryInput,
+} from './store/notebook-store.js';
 import { RuntimeOpsStore, type ImChannelConfig, type Timer, type WechatQuoteRecord } from './store/runtime-ops-store.js';
 import { SqliteDb } from './store/sqlite-db.js';
 import {
@@ -49,7 +60,16 @@ import {
   type UsageTodaySummary,
   type UsageTotalsView,
 } from './store/usage-store.js';
-import type { ImChannelView, MemoryCard, MemoryDirectory, SynapseRelation } from './view.js';
+import type {
+  DiaryEntry,
+  ImChannelView,
+  MemoryCard,
+  MemoryDirectory,
+  NotebookSummaryView,
+  NoteItem,
+  NoteTagCount,
+  SynapseRelation,
+} from './view.js';
 
 export type {
   ChatSubconscious,
@@ -58,10 +78,13 @@ export type {
   HomeostaticPassOptions,
   HomeostaticPassResult,
   ImChannelConfig,
+  ListDiaryOptions,
+  ListNotesOptions,
   Notice,
   Operation,
   RecordDreamOutcomeInput,
   SaveMemoryInput,
+  SaveNoteInput,
   SearchContextOptions,
   SearchContextResult,
   SubconsciousResidue,
@@ -73,6 +96,7 @@ export type {
   TaskStatus,
   Timer,
   WechatQuoteRecord,
+  WriteDiaryInput,
   UsageActor,
   UsageBucketView,
   UsageCostSource,
@@ -89,7 +113,7 @@ export type {
   UsageTodaySummary,
   UsageTotalsView,
 };
-export { memoryDocumentText, TaskConflictError };
+export { formatLocalDate, memoryDocumentText, normalizeDiaryMood, NoteConflictError, TaskConflictError, validateDateString };
 
 /**
  * Unified persistence facade delegating to specialized SQLite sub-stores while
@@ -100,6 +124,7 @@ export class Store {
   private readonly tasks: TaskStore;
   private readonly runtimeOps: RuntimeOpsStore;
   private readonly memories: MemoryStore;
+  private readonly notebook: NotebookStore;
   private readonly consolidation: ConsolidationStore;
   private readonly usage: UsageStore;
   readonly conversation: Conversation;
@@ -111,6 +136,7 @@ export class Store {
     this.tasks = new TaskStore(this.sqlite.db, atomic, this.conversation);
     this.runtimeOps = new RuntimeOpsStore(this.sqlite.db, atomic);
     this.memories = new MemoryStore(this.sqlite.db, atomic, this.tasks, this.conversation);
+    this.notebook = new NotebookStore(this.sqlite.db, atomic);
     this.consolidation = new ConsolidationStore(
       this.sqlite.db,
       atomic,
@@ -359,6 +385,101 @@ export class Store {
 
   async backfillEmbeddings(limit = 64, signal?: AbortSignal): Promise<number> {
     return this.memories.backfillEmbeddings(limit, signal);
+  }
+
+  // --- Notebook & F.R.I.D.A.Y. Diary ---
+  notebookSummary(): NotebookSummaryView {
+    return this.notebook.summary();
+  }
+
+  listNotes(options?: ListNotesOptions): NoteItem[] {
+    return this.notebook.listNotes(options);
+  }
+
+  listNoteTags(): NoteTagCount[] {
+    return this.notebook.listNoteTags();
+  }
+
+  getNote(id: string): NoteItem {
+    return this.notebook.getNote(id);
+  }
+
+  findNoteByTitle(title: string): NoteItem | undefined {
+    return this.notebook.findNoteByTitle(title);
+  }
+
+  saveNote(input: SaveNoteInput): NoteItem {
+    return this.notebook.saveNote(input);
+  }
+
+  pinNote(id: string, pinned = true): NoteItem {
+    return this.notebook.pinNote(id, pinned);
+  }
+
+  deleteNote(id: string): boolean {
+    return this.notebook.deleteNote(id);
+  }
+
+  listDiaryEntries(options?: ListDiaryOptions): DiaryEntry[] {
+    return this.notebook.listDiaryEntries(options);
+  }
+
+  getDiaryEntry(idOrDate: string): DiaryEntry {
+    return this.notebook.getDiaryEntry(idOrDate);
+  }
+
+  getDiaryByDate(date: string): DiaryEntry | undefined {
+    return this.notebook.getDiaryByDate(date);
+  }
+
+  writeDiaryEntry(input: WriteDiaryInput): DiaryEntry {
+    return this.notebook.writeDiaryEntry(input);
+  }
+
+  deleteDiaryEntry(idOrDate: string): boolean {
+    return this.notebook.deleteDiaryEntry(idOrDate);
+  }
+
+  private resolveActivePromotedMemoryId(candidateId?: string): string | undefined {
+    if (!candidateId) return undefined;
+    try {
+      const existing = this.memories.getMemory(candidateId);
+      return existing.supersededBy ? undefined : existing.id;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async promoteNoteToMemory(id: string): Promise<{ note: NoteItem; memory: MemoryCard }> {
+    const note = this.notebook.getNote(id);
+    const contentText = (note.content.trim() || note.title.trim() || '记事本摘录').slice(0, 8192);
+    const existingMemoryId = this.resolveActivePromotedMemoryId(note.promotedMemoryId);
+    const memory = await this.memories.saveMemoryAsync({
+      id: existingMemoryId,
+      topic: (note.title.trim() || '记事本笔记').slice(0, 160),
+      content: contentText,
+      tags: [...new Set(['记事本', ...note.tags])].slice(0, 12),
+      sourceMessageId: note.sourceMessageId,
+    });
+    const updatedNote = this.notebook.setNotePromotedMemory(note.id, memory.id);
+    return { note: updatedNote, memory };
+  }
+
+  async promoteDiaryToMemory(idOrDate: string): Promise<{ entry: DiaryEntry; memory: MemoryCard }> {
+    const entry = this.notebook.getDiaryEntry(idOrDate);
+    const contentText = (entry.content.trim() || entry.title.trim()).slice(0, 8192);
+    const existingMemoryId = this.resolveActivePromotedMemoryId(entry.promotedMemoryId);
+    const topicPrefix = `F.R.I.D.A.Y. 日记 · ${entry.date}`;
+    const rawTopic = entry.title.includes(entry.date) ? `F.R.I.D.A.Y. 日记 · ${entry.title}` : `${topicPrefix} ${entry.title}`;
+    const memory = await this.memories.saveMemoryAsync({
+      id: existingMemoryId,
+      topic: rawTopic.trim().slice(0, 160),
+      content: contentText,
+      tags: [...new Set(['日记', ...entry.tags])].slice(0, 12),
+      sourceMessageId: entry.sourceMessageId,
+    });
+    const updatedEntry = this.notebook.setDiaryPromotedMemory(entry.id, memory.id);
+    return { entry: updatedEntry, memory };
   }
 
   // --- Distiller & Subconscious / Dreamer State ---

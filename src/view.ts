@@ -33,7 +33,7 @@ export type {
 } from './mindmap-types.js';
 
 export type MessageState = 'queued' | 'processing' | 'streaming' | 'completed' | 'interrupted' | 'failed';
-export type RouteKind = 'new_work' | 'followup' | 'related_work' | 'inspect' | 'stop' | 'resume' | 'recall' | 'search_memory' | 'save_memory' | 'timer' | 'plugin' | 'send_file' | 'switch_channel' | 'reply';
+export type RouteKind = 'new_work' | 'followup' | 'related_work' | 'inspect' | 'stop' | 'resume' | 'recall' | 'search_memory' | 'save_memory' | 'note' | 'diary' | 'timer' | 'plugin' | 'send_file' | 'switch_channel' | 'reply';
 export type SessionLinkKind =
   | 'task_link'
   | 'msg_link'
@@ -525,10 +525,66 @@ export interface VoiceListeningView {
   updatedAt: number;
 }
 
+export type NoteAuthor = 'friday' | 'user';
+export type DiarySource = 'chat' | 'sleep' | 'manual';
+export type DiaryMood =
+  | 'neutral'
+  | 'happy'
+  | 'calm'
+  | 'surprised'
+  | 'inspecting'
+  | 'squinted'
+  | 'sleepy'
+  | 'confused'
+  | 'sad';
+
+export interface NoteItem {
+  id: string;
+  title: string;
+  content: string;
+  tags: string[];
+  pinned: boolean;
+  author: NoteAuthor;
+  updatedBy: NoteAuthor;
+  sourceMessageId?: string;
+  promotedMemoryId?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface NoteTagCount {
+  tag: string;
+  count: number;
+}
+
+export interface DiaryEntry {
+  id: string;
+  date: string;
+  title: string;
+  content: string;
+  mood: DiaryMood;
+  tags: string[];
+  source: DiarySource;
+  sourceMessageId?: string;
+  promotedMemoryId?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface NotebookSummaryView {
+  noteCount: number;
+  pinnedNoteCount: number;
+  diaryCount: number;
+  latestNoteUpdatedAt: number | null;
+  latestDiaryDate: string | null;
+  latestDiaryUpdatedAt: number | null;
+}
+
 export interface MainView {
   mode: 'real' | 'offline'; health: { status: string; executorAvailable: boolean };
   messages: MessagePage; works: WorkView[]; cursor: number;
   memoryDirectory?: MemoryDirectory;
+  notebookSummary?: NotebookSummaryView;
   modelTiers?: ModelTierConfig;
   modelHub?: ModelHubView;
   timers?: TimerView[];

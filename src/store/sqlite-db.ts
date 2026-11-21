@@ -92,6 +92,34 @@ export class SqliteDb {
       );
       CREATE INDEX IF NOT EXISTS model_usage_at ON model_usage(at);
       CREATE INDEX IF NOT EXISTS model_usage_model ON model_usage(provider, model, at);
+      CREATE TABLE IF NOT EXISTS notes(
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        content TEXT NOT NULL DEFAULT '',
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        pinned INTEGER NOT NULL DEFAULT 0,
+        author TEXT NOT NULL DEFAULT 'friday',
+        updated_by TEXT NOT NULL DEFAULT 'friday',
+        source_message_id TEXT,
+        promoted_memory_id TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS notes_order ON notes(pinned DESC, updated_at DESC);
+      CREATE TABLE IF NOT EXISTS diary_entries(
+        id TEXT PRIMARY KEY,
+        entry_date TEXT NOT NULL UNIQUE,
+        title TEXT NOT NULL,
+        content TEXT NOT NULL DEFAULT '',
+        mood TEXT NOT NULL DEFAULT 'calm',
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        source TEXT NOT NULL DEFAULT 'chat',
+        source_message_id TEXT,
+        promoted_memory_id TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS diary_entries_date ON diary_entries(entry_date DESC, updated_at DESC);
     `);
     this.runSchemaMigrations();
   }
@@ -117,6 +145,45 @@ export class SqliteDb {
       this.migrateModelUsageCacheColumns();
       this.db.exec('PRAGMA user_version = 3;');
     }
+    if (version < 4) {
+      this.migrateNotebookTables();
+      this.db.exec('PRAGMA user_version = 4;');
+    }
+  }
+
+  private migrateNotebookTables(): void {
+    this.transaction(() => {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS notes(
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          content TEXT NOT NULL DEFAULT '',
+          tags_json TEXT NOT NULL DEFAULT '[]',
+          pinned INTEGER NOT NULL DEFAULT 0,
+          author TEXT NOT NULL DEFAULT 'friday',
+          updated_by TEXT NOT NULL DEFAULT 'friday',
+          source_message_id TEXT,
+          promoted_memory_id TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS notes_order ON notes(pinned DESC, updated_at DESC);
+        CREATE TABLE IF NOT EXISTS diary_entries(
+          id TEXT PRIMARY KEY,
+          entry_date TEXT NOT NULL UNIQUE,
+          title TEXT NOT NULL,
+          content TEXT NOT NULL DEFAULT '',
+          mood TEXT NOT NULL DEFAULT 'calm',
+          tags_json TEXT NOT NULL DEFAULT '[]',
+          source TEXT NOT NULL DEFAULT 'chat',
+          source_message_id TEXT,
+          promoted_memory_id TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS diary_entries_date ON diary_entries(entry_date DESC, updated_at DESC);
+      `);
+    });
   }
 
   private migrateModelUsageCacheColumns(): void {

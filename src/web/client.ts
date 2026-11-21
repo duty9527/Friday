@@ -13,6 +13,7 @@ import { initTracePanel } from './panels/trace.js';
 import { initMemoryHub } from './hubs/memory-hub.js';
 import { initTimerPluginHub, type PluginSurfaceRegistration } from './hubs/timer-plugin-hub.js';
 import { initImVoiceHub } from './hubs/im-voice-hub.js';
+import { initNotebookHub } from './hubs/notebook-hub.js';
 import { initSystemHub } from './hubs/system-hub.js';
 import { api, appState, fetchMessagesBatch, hooks, request } from './state.js';
 
@@ -23,6 +24,7 @@ const memoryHubBackdrop = element<HTMLElement>('memory-hub-backdrop');
 const timerHubBackdrop = element<HTMLElement>('timer-hub-backdrop');
 const pluginHubBackdrop = element<HTMLElement>('plugin-hub-backdrop');
 const imHubBackdrop = element<HTMLElement>('im-hub-backdrop');
+const notebookHubBackdrop = element<HTMLElement>('notebook-hub-backdrop');
 const systemHubBackdrop = element<HTMLElement>('system-hub-backdrop');
 const healthSurfacePanel = element<HTMLElement>('plugin-panel-health-scale');
 const fundSurfacePanel = element<HTMLElement>('plugin-panel-fund-tracker');
@@ -236,6 +238,7 @@ const tracePanel = initTracePanel();
 const memoryHub = initMemoryHub();
 const timerPluginHub = initTimerPluginHub({ pluginSurfaces });
 const imVoiceHub = initImVoiceHub();
+const notebookHub = initNotebookHub();
 const systemHub = initSystemHub();
 
 let lastPluginCheckSeq = 0;
@@ -257,6 +260,7 @@ function closeAllHubModals(): void {
   timerPluginHub.closeTimerModal();
   timerPluginHub.closePluginModal();
   imVoiceHub.closeModal();
+  notebookHub.closeModal();
   systemHub.closeModal();
 }
 
@@ -276,6 +280,7 @@ function expireAuthentication(): void {
   timerPluginHub.renderTimers();
   timerPluginHub.renderPlugins();
   imVoiceHub.render();
+  notebookHub.render();
   systemHub.render();
   chatPanel.renderMessages();
   syncCompanionState();
@@ -358,6 +363,7 @@ async function refreshView(initial = false): Promise<void> {
       timerPluginHub.renderTimers();
       timerPluginHub.renderPlugins();
       imVoiceHub.render();
+      notebookHub.render();
       systemHub.render();
       const newMessages = result.messages.items.filter(m => m.seq > lastPluginCheckSeq);
       lastPluginCheckSeq = result.messages.items.reduce((acc, m) => Math.max(acc, m.seq), lastPluginCheckSeq);
@@ -408,6 +414,7 @@ Object.assign(hooks, {
   loadWork: tracePanel.loadWork,
   openPluginHubModal: timerPluginHub.openPluginModal,
   openSystemHubModal: systemHub.openModal,
+  openNotebookHubModal: notebookHub.openModal,
   closeAllHubModals,
 });
 
@@ -509,6 +516,7 @@ const modalBackdrops = [
   timerHubBackdrop,
   pluginHubBackdrop,
   imHubBackdrop,
+  notebookHubBackdrop,
   systemHubBackdrop,
 ];
 mobileNavBtn?.addEventListener('click', () => {
@@ -529,7 +537,7 @@ appTopbar?.addEventListener('click', event => {
   if (!document.body.classList.contains('mobile-nav-open')) return;
   const target = event.target instanceof Element ? event.target : null;
   if (!target) return;
-  if (target.closest('#work-toggle, #open-memory-hub-top, #open-timer-hub-top, #open-plugin-hub-top, #open-im-hub-top, #open-system-hub-top')) {
+  if (target.closest('#work-toggle, #open-memory-hub-top, #open-timer-hub-top, #open-plugin-hub-top, #open-im-hub-top, #open-notebook-hub-top, #open-system-hub-top')) {
     setMobileNavOpen(false);
   }
 });

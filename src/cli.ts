@@ -22,6 +22,8 @@ const help = `F.R.I.D.A.Y. (friday) — Local persistent personal AI assistant &
   timer list | add [--name NAME] [--every-ms 60000] [--delay-ms MS] [--daily-at HH:MM] [--once] [--until CONDITION] [--max-failures 5] [--plugin NAME] [--action ACTION] [--channel ID] [--target TARGET] [--cwd DIR] ["instruction"] | toggle ID [--enabled|--no-enabled] | complete ID [--summary TEXT] | remove ID
   plugin list | run NAME [ACTION] [--args JSON]
   memory list | search [--scope all|memories|works|messages] [--cwd DIR] "query" | save --topic TOPIC [--tag TAG ...] [--link ID ...] [--pinned] [--cwd DIR] "content" | link ID TARGET_ID | pin ID [--unpin] | remove ID
+  note list [--tag TAG] [--pinned] ["query"] | get ID | save [--id ID] [--title TITLE] [--tag TAG ...] [--pinned] [--append] "content" | pin ID [--unpin] | promote ID | remove ID
+  diary list [--mood MOOD] [--month YYYY-MM] ["query"] | get [YYYY-MM-DD|ID] | write [--date YYYY-MM-DD] [--title TITLE] [--mood MOOD] [--tag TAG ...] [--append] "content" | promote [YYYY-MM-DD|ID] | remove [YYYY-MM-DD|ID]
   im list | login [CHANNEL_ID] [--name NAME] [--api-base URL] [--no-wait] | add --platform telegram|dingtalk|wechat|xiaoai --name NAME [--bot-token TOKEN] [--account-id ID] [--webhook-url URL] [--secret SECRET] [--target CHAT_ID] [--allow SENDER ...] [--telegram-mention-exempt=CHAT_ID[:THREAD_ID] ...] [--api-base URL] [--every-ms MS] | toggle ID [--enabled|--no-enabled] | test ID ["message"] | remove ID | voice ...
   voice status | list | model | enroll [NAME] [--role owner|member] [--append] [--channel ID] [--target ID] [--no-wait] | remove NAME_OR_ID | clear | enable | disable | config [--threshold N] [--wake-precheck|--no-wake-precheck] | rename TARGET NEW_NAME | role TARGET owner|member
   model list | probe [PROVIDER/]MODEL ["prompt"] | set [--provider PROVIDER] [--router MODEL] [--router-provider PROVIDER] [--worker-provider PROVIDER] [--fast MODEL] [--balanced MODEL] [--strong MODEL] [--base-url URL] [--api-key KEY]
@@ -85,6 +87,7 @@ async function main() {
       plugin: { type: 'string' }, action: { type: 'string' }, channel: { type: 'string' }, args: { type: 'string' },
       cwd: { type: 'string' },
       topic: { type: 'string' }, scope: { type: 'string' }, tag: { type: 'string', multiple: true },
+      title: { type: 'string' }, date: { type: 'string' }, mood: { type: 'string' }, month: { type: 'string' }, id: { type: 'string' },
       link: { type: 'string', multiple: true }, pinned: { type: 'boolean' }, unpin: { type: 'boolean' },
       platform: { type: 'string' }, 'bot-token': { type: 'string' }, 'account-id': { type: 'string' }, 'webhook-url': { type: 'string' },
       secret: { type: 'string' }, target: { type: 'string' }, allow: { type: 'string', multiple: true }, 'api-base': { type: 'string' },
@@ -324,6 +327,68 @@ async function main() {
       else throw new Error(`Unknown memory subcommand: ${sub}`);
       break;
     }
+    case 'note': {
+      const sub = args[0] ?? 'list';
+      if (sub === 'list' || sub === 'search') {
+        const query = args.slice(1).join(' ').trim() || undefined;
+        message = { command: 'note-list', query, tag: values.tag?.[0], pinnedOnly: values.pinned };
+      } else if (sub === 'get') {
+        message = { command: 'note-get', id: args[1] ?? values.id };
+      } else if (sub === 'save' || sub === 'add') {
+        const bodyText = args.slice(1).join(' ');
+        message = {
+          command: 'note-save',
+          id: values.id,
+          title: values.title,
+          ...(bodyText || !values.id ? { content: bodyText } : {}),
+          tags: values.tag,
+          pinned: values.pinned,
+          append: values.append,
+          author: 'user',
+          updatedBy: 'user',
+        };
+      } else if (sub === 'pin') {
+        message = { command: 'note-pin', id: args[1] ?? values.id, pinned: !values.unpin };
+      } else if (sub === 'promote') {
+        message = { command: 'note-promote-memory', id: args[1] ?? values.id };
+      } else if (sub === 'remove' || sub === 'rm' || sub === 'delete') {
+        message = { command: 'note-remove', id: args[1] ?? values.id };
+      } else {
+        throw new Error(`Unknown note subcommand: ${sub}`);
+      }
+      break;
+    }
+    case 'diary': {
+      const sub = args[0] ?? 'list';
+      if (sub === 'list' || sub === 'search') {
+        const query = args.slice(1).join(' ').trim() || undefined;
+        message = { command: 'diary-list', query, mood: values.mood, tag: values.tag?.[0], month: values.month };
+      } else if (sub === 'get') {
+        const target = args[1] ?? values.id ?? values.date;
+        message = { command: 'diary-get', id: target, date: values.date };
+      } else if (sub === 'write') {
+        message = {
+          command: 'diary-write',
+          id: values.id,
+          date: values.date,
+          title: values.title,
+          content: args.slice(1).join(' '),
+          mood: values.mood,
+          tags: values.tag,
+          source: 'manual',
+          append: values.append,
+        };
+      } else if (sub === 'promote') {
+        const target = args[1] ?? values.id ?? values.date;
+        message = { command: 'diary-promote-memory', id: target, date: values.date };
+      } else if (sub === 'remove' || sub === 'rm' || sub === 'delete') {
+        const target = args[1] ?? values.id ?? values.date;
+        message = { command: 'diary-remove', id: target, date: values.date };
+      } else {
+        throw new Error(`Unknown diary subcommand: ${sub}`);
+      }
+      break;
+    }
     case 'im': {
       const sub = args[0] ?? 'list';
       if (sub === 'list') message = { command: 'im-list' };
@@ -430,6 +495,7 @@ async function main() {
         pendingDecisions: works.filter(w => Boolean(w.pendingQuestion)),
         recentWorksCount: works.length,
         memoryDirectory: view.memoryDirectory,
+        notebookSummary: view.notebookSummary,
         timers,
         plugins: plugins.map(p => ({ name: p.name, title: p.title, actions: p.actions })),
         imChannels: view.imChannels,

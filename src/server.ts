@@ -347,6 +347,109 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
           );
           case 'memory-pin': return store.pinMemory(text(command.id, 'id', 128), command.pinned === undefined ? true : Boolean(command.pinned));
           case 'memory-remove': return { removed: store.deleteMemory(text(command.id, 'id', 128)) };
+          case 'note-list': return {
+            items: store.listNotes({
+              query: command.query === undefined ? undefined : text(command.query, 'query', 512),
+              tag: command.tag === undefined ? undefined : text(command.tag, 'tag', 32),
+              pinnedOnly: command.pinnedOnly === undefined ? undefined : Boolean(command.pinnedOnly),
+              limit: integer(command.limit, 200, 1, 500),
+            }),
+            tags: store.listNoteTags(),
+            summary: store.notebookSummary(),
+          };
+          case 'note-get': return store.getNote(text(command.id, 'id', 128));
+          case 'note-save': {
+            const boundedOptional = (value: unknown, name: string, max: number): string | undefined => {
+              if (value === undefined) return undefined;
+              if (typeof value !== 'string' || value.length > max) {
+                throw new Error(`${name} must be a string of at most ${max} characters`);
+              }
+              return value;
+            };
+            const id = command.id === undefined ? undefined : text(command.id, 'id', 128);
+            const title = boundedOptional(command.title, 'title', 160);
+            const content = boundedOptional(command.content, 'content', 16_384);
+            if (id === undefined && title === undefined && content === undefined) {
+              throw new Error('note-save requires id, title, or content');
+            }
+            const tags = command.tags === undefined
+              ? undefined
+              : Array.isArray(command.tags)
+                ? command.tags.map(tag => text(tag, 'tag', 32))
+                : (() => { throw new Error('tags must be a string array'); })();
+            const author = command.author === 'friday' || command.author === 'user' ? command.author : undefined;
+            const updatedBy = command.updatedBy === 'friday' || command.updatedBy === 'user' ? command.updatedBy : undefined;
+            const expectedUpdatedAt = command.expectedUpdatedAt === undefined
+              ? undefined
+              : integer(command.expectedUpdatedAt, 0, 0, Number.MAX_SAFE_INTEGER);
+            const note = store.saveNote({
+              id,
+              title,
+              content,
+              tags,
+              pinned: command.pinned === undefined ? undefined : Boolean(command.pinned),
+              append: command.append === undefined ? undefined : Boolean(command.append),
+              author,
+              updatedBy,
+              expectedUpdatedAt,
+            });
+            return { note, summary: store.notebookSummary() };
+          }
+          case 'note-pin': {
+            const note = store.pinNote(
+              text(command.id, 'id', 128),
+              command.pinned === undefined ? true : Boolean(command.pinned),
+            );
+            return { note, summary: store.notebookSummary() };
+          }
+          case 'note-remove': return {
+            removed: store.deleteNote(text(command.id, 'id', 128)),
+            summary: store.notebookSummary(),
+          };
+          case 'note-promote-memory': {
+            const result = await store.promoteNoteToMemory(text(command.id, 'id', 128));
+            return { ...result, summary: store.notebookSummary() };
+          }
+          case 'diary-list': return {
+            items: store.listDiaryEntries({
+              query: command.query === undefined ? undefined : text(command.query, 'query', 512),
+              mood: command.mood === undefined ? undefined : text(command.mood, 'mood', 32),
+              tag: command.tag === undefined ? undefined : text(command.tag, 'tag', 32),
+              month: command.month === undefined ? undefined : text(command.month, 'month', 16),
+              limit: integer(command.limit, 120, 1, 365),
+            }),
+            summary: store.notebookSummary(),
+          };
+          case 'diary-get': return store.getDiaryEntry(text(command.id ?? command.date, 'id or date', 128));
+          case 'diary-write': {
+            const tags = command.tags === undefined
+              ? undefined
+              : Array.isArray(command.tags)
+                ? command.tags.map(tag => text(tag, 'tag', 32))
+                : (() => { throw new Error('tags must be a string array'); })();
+            const source = command.source === 'sleep' || command.source === 'manual' || command.source === 'chat'
+              ? command.source
+              : undefined;
+            const entry = store.writeDiaryEntry({
+              id: command.id === undefined ? undefined : text(command.id, 'id', 128),
+              date: command.date === undefined ? undefined : text(command.date, 'date', 32),
+              title: command.title === undefined ? undefined : text(command.title, 'title', 160),
+              content: text(command.content, 'content', 16_384),
+              mood: command.mood === undefined ? undefined : text(command.mood, 'mood', 32),
+              tags,
+              source,
+              append: command.append === undefined ? undefined : Boolean(command.append),
+            });
+            return { entry, summary: store.notebookSummary() };
+          }
+          case 'diary-remove': return {
+            removed: store.deleteDiaryEntry(text(command.id ?? command.date, 'id or date', 128)),
+            summary: store.notebookSummary(),
+          };
+          case 'diary-promote-memory': {
+            const result = await store.promoteDiaryToMemory(text(command.id ?? command.date, 'id or date', 128));
+            return { ...result, summary: store.notebookSummary() };
+          }
           case 'im-list': return coordinator.im.listChannels();
           case 'im-save': {
             const platform = text(command.platform, 'platform', 32);

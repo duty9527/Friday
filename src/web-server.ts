@@ -107,6 +107,8 @@ async function bridge(home: string, command: unknown): Promise<unknown> {
     const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
     if (['ENOENT', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT'].includes(String(code)) || (error instanceof Error && /^(Service request timed out|Service closed without a response|Response too large|Response exceeds limit|Invalid service response)/.test(error.message))) throw new HttpFailure(503, '协调服务连接不可用；已记录的内容不会因断线而重发。');
     if (error instanceof Error && error.message === 'Request is too large') throw new HttpFailure(413, 'Request exceeds 64 KiB IPC limit');
+    if (error instanceof Error && /Note was updated elsewhere/i.test(error.message)) throw new HttpFailure(409, error.message);
+    if (error instanceof Error && /(?:Note|Diary entry) not found/i.test(error.message)) throw new HttpFailure(404, error.message);
     throw new HttpFailure(400, error instanceof Error ? error.message : 'Service request failed');
   }
 }
@@ -563,6 +565,35 @@ export async function startWeb(options: StartWebOptions): Promise<{ url: string;
               ? { command: 'memory-search', query: search.get('query'), scope: search.get('scope') ?? undefined, cwd: search.get('cwd') ?? undefined, limit: numeric('limit') }
               : { command: 'memory-list', cwd: search.get('cwd') ?? undefined, topic: search.get('topic') ?? undefined, limit: numeric('limit') };
             break;
+          case '/api/notes':
+            command = {
+              command: 'note-list',
+              query: search.get('query') || undefined,
+              tag: search.get('tag') || undefined,
+              pinnedOnly: search.get('pinned') === '1' || search.get('pinned') === 'true' ? true : undefined,
+              limit: numeric('limit'),
+            };
+            break;
+          case '/api/note':
+            command = { command: 'note-get', id: search.get('id') };
+            break;
+          case '/api/diary':
+            command = {
+              command: 'diary-list',
+              query: search.get('query') || undefined,
+              mood: search.get('mood') || undefined,
+              tag: search.get('tag') || undefined,
+              month: search.get('month') || undefined,
+              limit: numeric('limit'),
+            };
+            break;
+          case '/api/diary-entry':
+            command = {
+              command: 'diary-get',
+              id: search.get('id') || undefined,
+              date: search.get('date') || undefined,
+            };
+            break;
           case '/api/operation': command = { command: 'operation', taskId: search.get('taskId'), operationId: search.get('operationId') }; break;
           default: throw new HttpFailure(404, 'Unknown API endpoint');
         }
@@ -571,6 +602,8 @@ export async function startWeb(options: StartWebOptions): Promise<{ url: string;
         const commands: Record<string, string> = {
           '/api/chat': 'chat', '/api/stop': 'stop', '/api/resume': 'resume', '/api/chat-stop': 'chat-stop',
           '/api/memory-save': 'memory-save', '/api/memory-link': 'memory-link', '/api/memory-pin': 'memory-pin', '/api/memory-remove': 'memory-remove',
+          '/api/note-save': 'note-save', '/api/note-pin': 'note-pin', '/api/note-remove': 'note-remove', '/api/note-promote-memory': 'note-promote-memory',
+          '/api/diary-write': 'diary-write', '/api/diary-remove': 'diary-remove', '/api/diary-promote-memory': 'diary-promote-memory',
           '/api/timer-add': 'timer-add', '/api/timer-toggle': 'timer-toggle', '/api/timer-complete': 'timer-complete', '/api/timer-remove': 'timer-remove',
           '/api/plugin-run': 'plugin-run',
           '/api/im-save': 'im-save', '/api/im-toggle': 'im-toggle', '/api/im-remove': 'im-remove', '/api/im-test': 'im-test',

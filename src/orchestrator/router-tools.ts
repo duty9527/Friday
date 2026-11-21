@@ -9,7 +9,7 @@ import { resolveEnv } from '../paths.js';
 import { listPluginsSync, listPluginViews, runPlugin, type PluginRunResult } from '../plugin.js';
 import { integer, text } from '../protocol.js';
 import { reconcileRuntimeSessionAfterTool } from '../session.js';
-import type { Store, Task } from '../store.js';
+import { formatLocalDate, type Store, type Task } from '../store.js';
 import type { PromptTrace } from '../trace.js';
 import type {
   AttachmentView,
@@ -377,6 +377,8 @@ const ROUTE_TOOL_KINDS: Record<string, RouteKind> = {
   recall_messages: 'recall',
   search_memory: 'search_memory',
   save_memory: 'save_memory',
+  manage_note: 'note',
+  manage_diary: 'diary',
   manage_timer: 'timer',
   run_plugin: 'plugin',
   send_file: 'send_file',
@@ -879,6 +881,211 @@ export function createRouterTools(
         linkedMemoryIds: parseStringArray(args.linkedMemoryIds, 'linkedMemoryIds', 12, 128),
       });
       return JSON.stringify({ action: 'save', memory: card });
+    },
+  }, {
+    name: 'manage_note',
+    description: 'Manage the Boss\'s Markdown notepad (where F.R.I.D.A.Y. records, updates, and organizes notes/memos/lists for the Boss; separate from save_memory). Input JSON {action?: "list"|"search"|"get"|"save"|"append"|"pin"|"unpin"|"delete", id?, title?, content?, tags?, pinned?, query?, tag?, limit?}.',
+    execute: async input => {
+      if (host.isClosing()) throw new Error('Service is shutting down');
+      const turn = host.getTurn();
+      const callerOrigin = turn?.chatContext?.message.origin
+        ?? turn?.activeReportTask?.origin
+        ?? turn?.reportChatContext?.message.origin;
+      if (callerOrigin?.speakerRole === 'member') {
+        throw new Error('权限不足：当前声纹成员无权访问老板记事本');
+      }
+      const args = toolInput(input, ['action', 'id', 'title', 'content', 'tags', 'pinned', 'query', 'tag', 'limit', 'summary']);
+      const action = args.action === undefined ? 'list' : text(args.action, 'action', 32);
+      const summarizeNote = (note: ReturnType<Store['getNote']>) => ({
+        id: note.id,
+        title: note.title,
+        tags: note.tags,
+        pinned: note.pinned,
+        author: note.author,
+        updatedBy: note.updatedBy,
+        updatedAt: note.updatedAt,
+        ...(note.promotedMemoryId ? { promotedMemoryId: note.promotedMemoryId } : {}),
+        preview: note.content.slice(0, 180),
+      });
+
+      if (action === 'list') {
+        const limit = args.limit === undefined ? 30 : integer(args.limit, 30, 1, 100);
+        const notes = host.store.listNotes({
+          query: args.query === undefined ? undefined : text(args.query, 'query', 512),
+          tag: args.tag === undefined ? undefined : text(args.tag, 'tag', 32),
+          pinnedOnly: args.pinned === undefined ? undefined : Boolean(args.pinned),
+          limit,
+        });
+        return JSON.stringify({
+          action: 'list',
+          summary: host.store.notebookSummary(),
+          tags: host.store.listNoteTags(),
+          notes: notes.map(summarizeNote),
+        });
+      }
+      if (action === 'search') {
+        const query = args.query === undefined ? undefined : text(args.query, 'query', 512);
+        const tag = args.tag === undefined ? undefined : text(args.tag, 'tag', 32);
+        if (!query && !tag) throw new Error('manage_note search requires query or tag');
+        const limit = args.limit === undefined ? 20 : integer(args.limit, 20, 1, 100);
+        const notes = host.store.listNotes({ query, tag, limit });
+        return JSON.stringify({
+          action: 'search',
+          total: notes.length,
+          notes: notes.map(summarizeNote),
+        });
+      }
+      if (action === 'get') {
+        if (args.id !== undefined) {
+          return JSON.stringify({ action: 'get', note: host.store.getNote(text(args.id, 'id', 128)) });
+        }
+        if (args.title !== undefined) {
+          const found = host.store.findNoteByTitle(text(args.title, 'title', 160));
+          if (!found) throw new Error(`Note not found: ${String(args.title)}`);
+          return JSON.stringify({ action: 'get', note: found });
+        }
+        throw new Error('manage_note get requires id or title');
+      }
+      if (action === 'pin' || action === 'unpin') {
+        const id = text(args.id, 'id', 128);
+        return JSON.stringify({ action, note: host.store.pinNote(id, action === 'pin') });
+      }
+      if (action === 'delete') {
+        const id = text(args.id, 'id', 128);
+        return JSON.stringify({ action: 'delete', removedId: id, removed: host.store.deleteNote(id) });
+      }
+      if (action !== 'save' && action !== 'append') {
+        throw new Error(`Unknown manage_note action: ${action}`);
+      }
+
+      const optionalBoundedStr = (value: unknown, label: string, max: number): string | undefined => {
+        if (value === undefined) return undefined;
+        if (typeof value !== 'string' || value.length > max) {
+          throw new Error(`${label} must be a string of at most ${max} characters`);
+        }
+        return value;
+      };
+      const sourceMessageId = turn?.chatContext?.message.id ?? turn?.activeReportTask?.originMessageId;
+      const tags = parseStringArray(args.tags, 'tags', 12, 32);
+      const pinned = args.pinned === undefined ? undefined : Boolean(args.pinned);
+      const title = optionalBoundedStr(args.title, 'title', 160);
+      const content = optionalBoundedStr(args.content, 'content', 16_384);
+
+      if (action === 'append') {
+        if (content === undefined || !content.trim()) throw new Error('manage_note append requires non-empty content');
+        let targetId = args.id === undefined ? undefined : text(args.id, 'id', 128);
+        if (!targetId && title?.trim()) {
+          targetId = host.store.findNoteByTitle(title)?.id;
+        }
+        const note = host.store.saveNote({
+          ...(targetId ? { id: targetId, append: true } : {}),
+          ...(title !== undefined ? { title } : {}),
+          content,
+          ...(tags !== undefined ? { tags } : {}),
+          ...(pinned !== undefined ? { pinned } : {}),
+          author: 'friday',
+          updatedBy: 'friday',
+          sourceMessageId,
+        });
+        return JSON.stringify({ action: 'append', note });
+      }
+
+      if (args.id === undefined && title === undefined && content === undefined) {
+        throw new Error('manage_note save requires id, title, or content');
+      }
+      const note = host.store.saveNote({
+        ...(args.id !== undefined ? { id: text(args.id, 'id', 128) } : {}),
+        ...(title !== undefined ? { title } : {}),
+        ...(content !== undefined ? { content } : {}),
+        ...(tags !== undefined ? { tags } : {}),
+        ...(pinned !== undefined ? { pinned } : {}),
+        author: 'friday',
+        updatedBy: 'friday',
+        sourceMessageId,
+      });
+      return JSON.stringify({ action: 'save', note });
+    },
+  }, {
+    name: 'manage_diary',
+    description: 'Read or write F.R.I.D.A.Y.\'s own personal first-person daily diary (one entry per calendar date YYYY-MM-DD; separate from Boss notes and holographic memory). Input JSON {action?: "list"|"search"|"get"|"write"|"append"|"delete", id?, date?, title?, content?, mood?: "neutral"|"happy"|"calm"|"surprised"|"inspecting"|"squinted"|"sleepy"|"confused"|"sad", tags?, query?, limit?}.',
+    execute: async input => {
+      if (host.isClosing()) throw new Error('Service is shutting down');
+      const turn = host.getTurn();
+      const callerOrigin = turn?.chatContext?.message.origin
+        ?? turn?.activeReportTask?.origin
+        ?? turn?.reportChatContext?.message.origin;
+      if (callerOrigin?.speakerRole === 'member') {
+        throw new Error('权限不足：当前声纹成员无权访问 F.R.I.D.A.Y. 日记本');
+      }
+      const args = toolInput(input, ['action', 'id', 'date', 'title', 'content', 'mood', 'tags', 'query', 'limit', 'summary']);
+      const action = args.action === undefined ? 'list' : text(args.action, 'action', 32);
+      const summarizeDiary = (entry: ReturnType<Store['getDiaryEntry']>) => ({
+        id: entry.id,
+        date: entry.date,
+        title: entry.title,
+        mood: entry.mood,
+        tags: entry.tags,
+        source: entry.source,
+        updatedAt: entry.updatedAt,
+        ...(entry.promotedMemoryId ? { promotedMemoryId: entry.promotedMemoryId } : {}),
+        preview: entry.content.slice(0, 180),
+      });
+
+      if (action === 'list') {
+        const limit = args.limit === undefined ? 30 : integer(args.limit, 30, 1, 120);
+        const entries = host.store.listDiaryEntries({
+          query: args.query === undefined ? undefined : text(args.query, 'query', 512),
+          mood: args.mood === undefined ? undefined : text(args.mood, 'mood', 32),
+          limit,
+        });
+        return JSON.stringify({
+          action: 'list',
+          summary: host.store.notebookSummary(),
+          entries: entries.map(summarizeDiary),
+        });
+      }
+      if (action === 'search') {
+        const query = args.query === undefined ? undefined : text(args.query, 'query', 512);
+        const mood = args.mood === undefined ? undefined : text(args.mood, 'mood', 32);
+        if (!query && !mood) throw new Error('manage_diary search requires query or mood');
+        const limit = args.limit === undefined ? 20 : integer(args.limit, 20, 1, 120);
+        const entries = host.store.listDiaryEntries({ query, mood, limit });
+        return JSON.stringify({
+          action: 'search',
+          total: entries.length,
+          entries: entries.map(summarizeDiary),
+        });
+      }
+      if (action === 'get') {
+        const target = args.id !== undefined
+          ? text(args.id, 'id', 128)
+          : args.date !== undefined
+            ? text(args.date, 'date', 32)
+            : formatLocalDate();
+        return JSON.stringify({ action: 'get', entry: host.store.getDiaryEntry(target) });
+      }
+      if (action === 'delete') {
+        const target = args.id !== undefined
+          ? text(args.id, 'id', 128)
+          : text(args.date, 'date', 32);
+        return JSON.stringify({ action: 'delete', removed: host.store.deleteDiaryEntry(target) });
+      }
+      if (action !== 'write' && action !== 'append') {
+        throw new Error(`Unknown manage_diary action: ${action}`);
+      }
+      const sourceMessageId = turn?.chatContext?.message.id ?? turn?.activeReportTask?.originMessageId;
+      const entry = host.store.writeDiaryEntry({
+        ...(args.id !== undefined ? { id: text(args.id, 'id', 128) } : {}),
+        ...(args.date !== undefined ? { date: text(args.date, 'date', 32) } : {}),
+        ...(args.title !== undefined ? { title: text(args.title, 'title', 160) } : {}),
+        content: text(args.content, 'content', 16_384),
+        ...(args.mood !== undefined ? { mood: text(args.mood, 'mood', 32) } : {}),
+        tags: parseStringArray(args.tags, 'tags', 12, 32),
+        source: 'chat',
+        sourceMessageId,
+        append: action === 'append',
+      });
+      return JSON.stringify({ action, entry });
     },
   }, {
     name: 'stop_work',

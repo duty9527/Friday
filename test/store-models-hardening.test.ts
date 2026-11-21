@@ -72,15 +72,15 @@ function makeUserMsg(id: string, text: string, extra: Partial<Omit<ChatMessage, 
 test('SqliteDb: SQLITE_BUSY never leaks transaction depth, migrations bootstrap full schema & pinned column', async () => {
   const home = await mkdtemp(join(await realpath(tmpdir()), 'sa-sqlite-hardening-'));
   try {
-    // 1. Fresh SqliteDb bootstraps metadata & conversation tables + user_version = 3
+    // 1. Fresh SqliteDb bootstraps metadata & conversation tables + user_version = 4
     const db1 = new SqliteDb(home);
     const tables = (db1.db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>)
       .map(r => r.name);
-    for (const req of ['messages', 'message_tasks', 'journal', 'metadata', 'memories', 'tasks', 'model_usage']) {
+    for (const req of ['messages', 'message_tasks', 'journal', 'metadata', 'memories', 'tasks', 'model_usage', 'notes', 'diary_entries']) {
       assert.ok(tables.includes(req), `table ${req} exists on fresh SqliteDb`);
     }
     const verRow = db1.db.prepare('PRAGMA user_version').get() as { user_version: number };
-    assert.equal(verRow.user_version, 3);
+    assert.equal(verRow.user_version, 4);
     const usageCols = (db1.db.prepare('PRAGMA table_info(model_usage)').all() as Array<{ name: string }>).map(r => r.name);
     for (const col of ['cache_write_1h_tokens', 'unit_cache_read_usd', 'unit_cache_write_usd']) {
       assert.ok(usageCols.includes(col), `model_usage must include ${col}`);
@@ -151,8 +151,11 @@ test('SqliteDb: SQLITE_BUSY never leaks transaction depth, migrations bootstrap 
       assert.ok(migratedUsageCols.includes('cache_write_1h_tokens'));
       assert.ok(migratedUsageCols.includes('unit_cache_read_usd'));
       assert.ok(migratedUsageCols.includes('unit_cache_write_usd'));
-      const v3 = migrated.db.prepare('PRAGMA user_version').get() as { user_version: number };
-      assert.equal(v3.user_version, 3);
+      const migratedTables = (migrated.db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>).map(r => r.name);
+      assert.ok(migratedTables.includes('notes'));
+      assert.ok(migratedTables.includes('diary_entries'));
+      const v4 = migrated.db.prepare('PRAGMA user_version').get() as { user_version: number };
+      assert.equal(v4.user_version, 4);
       migrated.close();
     } finally {
       await rm(legacyHome, { recursive: true, force: true });

@@ -46,6 +46,8 @@ export function routeLabel(action: Pick<RouteAction, 'kind'>): string {
     recall: '回看历史',
     search_memory: '检索全局记忆',
     save_memory: '沉淀长期记忆',
+    note: '更新记事本',
+    diary: '书写日记本',
     timer: '管理定时任务',
     plugin: '执行功能插件',
     send_file: '发送微信附件',
@@ -76,6 +78,8 @@ export function routeState(action: Pick<RouteAction, 'status' | 'kind' | 'delive
   return action.kind === 'reply' ? 'F.R.I.D.A.Y. 已回复'
     : action.kind === 'inspect' || action.kind === 'recall' || action.kind === 'search_memory' ? '查询已完成'
     : action.kind === 'save_memory' ? '记忆已更新'
+    : action.kind === 'note' ? '记事本已更新'
+    : action.kind === 'diary' ? '日记已记录'
     : '已受理';
 }
 
@@ -91,7 +95,7 @@ const WORKER_TOOLS: Record<string, string> = {
   read: '读取文件', ls: '列出目录', find: '查找文件', grep: '搜索内容', bash: '执行命令',
   edit: '修改文件', write: '写入文件', start_read: '读取文件副本',
 };
-const ROUTER_TOOLS = new Set(['start_work', 'continue_work', 'inspect_work', 'stop_work', 'resume_work', 'recall_messages', 'search_memory', 'save_memory', 'manage_timer', 'run_plugin', 'send_file', 'switch_channel', 'dispatch_worker']);
+const ROUTER_TOOLS = new Set(['start_work', 'continue_work', 'inspect_work', 'stop_work', 'resume_work', 'recall_messages', 'search_memory', 'save_memory', 'manage_note', 'manage_diary', 'manage_timer', 'run_plugin', 'send_file', 'switch_channel', 'dispatch_worker']);
 const NOT_A_STEP = new Set(['visible_text', 'thinking', 'work_linked', 'session_assigned']);
 export function record(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};

@@ -691,6 +691,7 @@ export class Coordinator {
       messages: this.store.conversation.history(),
       cursor: this.store.conversation.latestSeq(),
       memoryDirectory: this.store.memoryDirectory(24),
+      notebookSummary: this.store.notebookSummary(),
       ...(this.factory.modelTiers ? { modelTiers: this.factory.modelTiers } : {}),
       timers: this.store.listTimers(),
       plugins: listPluginViews(this.home),
