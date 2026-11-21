@@ -501,10 +501,38 @@ assert dirty <= 160, f"marquee step dirtied {dirty} tiles > 160"
 
 # 3. LayoutStore, Bento packer, all-15-builtin + custom plugin catalog & telemetry collectors
 import sqlite3, time as _time
-from widgets import WidgetDataHub, _extract_scalars
+from widgets import WidgetDataHub, _extract_scalars, default_pages_payload
+
+expected_builtin_kinds = {
+    "fund-tracker", "health-scale", "miot", "ninebot", "laifen", "netlea", "apple-devices",
+    "tv-agent", "tv-ir", "system-pulse", "memory", "timers", "usage", "weather", "workers",
+}
+
+def_pages = default_pages_payload()
+assert len(def_pages) == 5, f"expected 5 default pages, got {len(def_pages)}"
+def_kinds = {c["kind"] for p in def_pages for c in p["cards"]}
+assert def_kinds == expected_builtin_kinds, f"default pages mismatch: missing={expected_builtin_kinds - def_kinds}, extra={def_kinds - expected_builtin_kinds}"
 
 home = Path(${JSON.stringify(tmpHome)})
 ls = LayoutStore(home / "plugins" / "cs80-face")
+legacy_cfg, _, _ = ls.apply_patch({
+    "weatherCity": "西安",
+    "pages": [{
+        "id": "legacy",
+        "name": "旧版兼容",
+        "cards": [
+            {"id": "c-lf", "kind": "plugin:laifen", "plugin": "laifen", "action": "dashboard", "title": "徕芬扫振电动牙刷与口腔护理", "size": "2x1"},
+            {"id": "c-nl", "kind": "plugin:netlea", "plugin": "netlea", "action": "dashboard", "title": "尼特利鱼缸灯蓝牙直控 (Netlea BLE)", "size": "2x1"},
+        ],
+    }],
+})
+assert legacy_cfg["weatherCity"] == "西安"
+assert abs(legacy_cfg["weatherLat"] - 34.2658) < 1e-4 and abs(legacy_cfg["weatherLon"] - 108.9541) < 1e-4, legacy_cfg
+assert [c["kind"] for c in legacy_cfg["pages"][0]["cards"]] == ["laifen", "netlea"], legacy_cfg["pages"]
+assert "plugin" not in legacy_cfg["pages"][0]["cards"][0] and "title" not in legacy_cfg["pages"][0]["cards"][0]
+reset_cfg, _, _ = ls.apply_patch({"reset": True})
+assert len(reset_cfg["pages"]) == 5 and reset_cfg["weatherCity"] == "西安" and abs(reset_cfg["weatherLat"] - 34.2658) < 1e-4
+
 cfg, grid_changed, added = ls.apply_patch({
     "gridRows": 3,
     "pages": [{
@@ -520,10 +548,6 @@ cfg, grid_changed, added = ls.apply_patch({
 })
 assert grid_changed and cfg["gridRows"] == 3 and "fund-tracker" in cfg["pages"][0]["cards"][0]["kind"]
 catalog = discover_widget_catalog(home, repo_plugins_dir=Path(${JSON.stringify(join(REPO_ROOT, 'plugins'))}))
-expected_builtin_kinds = {
-    "fund-tracker", "health-scale", "miot", "ninebot", "laifen", "netlea", "apple-devices",
-    "tv-agent", "tv-ir", "system-pulse", "memory", "timers", "usage", "weather", "workers",
-}
 catalog_kinds = {item["kind"] for item in catalog}
 assert expected_builtin_kinds.issubset(catalog_kinds), f"missing builtin kinds: {expected_builtin_kinds - catalog_kinds}"
 assert "plugin:demo-custom" in catalog_kinds, "missing custom plugin in catalog"

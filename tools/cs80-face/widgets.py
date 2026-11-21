@@ -212,19 +212,87 @@ WMO_WEATHER_ZH: Dict[int, str] = {
     99: "强雷阵雨",
 }
 
+CITY_COORDS_ZH: Dict[str, Tuple[float, float]] = {
+    "上海": (31.2304, 121.4737),
+    "北京": (39.9042, 116.4074),
+    "深圳": (22.5431, 114.0579),
+    "广州": (23.1291, 113.2644),
+    "杭州": (30.2741, 120.1551),
+    "西安": (34.2658, 108.9541),
+    "成都": (30.5728, 104.0668),
+    "重庆": (29.5630, 106.5516),
+    "武汉": (30.5928, 114.3055),
+    "南京": (32.0603, 118.7969),
+    "苏州": (31.2989, 120.5853),
+    "天津": (39.3434, 117.3616),
+    "长沙": (28.2282, 112.9388),
+    "郑州": (34.7466, 113.6253),
+    "青岛": (36.0671, 120.3826),
+    "厦门": (24.4798, 118.0894),
+    "香港": (22.3193, 114.1694),
+    "台北": (25.0330, 121.5654),
+}
+
+
+def _resolve_city_coords(city: str) -> Optional[Tuple[float, float]]:
+    clean = str(city or "").strip()
+    if not clean:
+        return None
+    if clean in CITY_COORDS_ZH:
+        return CITY_COORDS_ZH[clean]
+    stripped = clean.rstrip("市区县")
+    if stripped and stripped in CITY_COORDS_ZH:
+        return CITY_COORDS_ZH[stripped]
+    return None
+
 
 def default_pages_payload() -> List[Dict[str, Any]]:
     return [
         {
-            "id": "main",
-            "name": "核心总览",
+            "id": "overview",
+            "name": "日常总览",
             "cards": [
                 {"id": "c-fund", "kind": "fund-tracker", "size": "1x1"},
                 {"id": "c-health", "kind": "health-scale", "size": "1x1"},
                 {"id": "c-miot", "kind": "miot", "size": "1x1"},
-                {"id": "c-sys", "kind": "system-pulse", "size": "1x1"},
+                {"id": "c-weather", "kind": "weather", "size": "1x1"},
             ],
-        }
+        },
+        {
+            "id": "mobility",
+            "name": "出行与随身",
+            "cards": [
+                {"id": "c-ninebot", "kind": "ninebot", "size": "2x1"},
+                {"id": "c-apple", "kind": "apple-devices", "size": "2x1"},
+            ],
+        },
+        {
+            "id": "care-eco",
+            "name": "个护与生态",
+            "cards": [
+                {"id": "c-laifen", "kind": "laifen", "size": "2x1"},
+                {"id": "c-netlea", "kind": "netlea", "size": "2x1"},
+            ],
+        },
+        {
+            "id": "media-hub",
+            "name": "影音与中枢",
+            "cards": [
+                {"id": "c-tv", "kind": "tv-agent", "size": "1x1"},
+                {"id": "c-tv-ir", "kind": "tv-ir", "size": "1x1"},
+                {"id": "c-sys", "kind": "system-pulse", "size": "1x1"},
+                {"id": "c-timers", "kind": "timers", "size": "1x1"},
+            ],
+        },
+        {
+            "id": "brain-compute",
+            "name": "主脑与算力",
+            "cards": [
+                {"id": "c-memory", "kind": "memory", "size": "2x1"},
+                {"id": "c-usage", "kind": "usage", "size": "1x1"},
+                {"id": "c-workers", "kind": "workers", "size": "1x1"},
+            ],
+        },
     ]
 
 
@@ -370,20 +438,27 @@ def _sanitize_card(raw: Any, fallback_id: str) -> Optional[Dict[str, Any]]:
     kind = str(raw.get("kind") or "").strip()[:64]
     if not kind:
         return None
+    migrated_builtin = False
+    if kind.startswith("plugin:") and kind[7:] in BUILTIN_PLUGIN_WIDGETS:
+        kind = kind[7:]
+        migrated_builtin = True
     card_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(raw.get("id") or fallback_id))[:40] or fallback_id
     out: Dict[str, Any] = {
         "id": card_id,
         "kind": kind,
         "size": _clean_size(raw.get("size"), "1x1"),
     }
-    if raw.get("plugin"):
-        out["plugin"] = str(raw["plugin"]).strip()[:64]
-    elif kind.startswith("plugin:"):
-        out["plugin"] = kind[7:][:64]
-    if raw.get("action"):
-        out["action"] = str(raw["action"]).strip()[:64]
+    if not migrated_builtin:
+        if raw.get("plugin"):
+            out["plugin"] = str(raw["plugin"]).strip()[:64]
+        elif kind.startswith("plugin:"):
+            out["plugin"] = kind[7:][:64]
+        if raw.get("action"):
+            out["action"] = str(raw["action"]).strip()[:64]
     if raw.get("title"):
-        out["title"] = str(raw["title"]).strip()[:48]
+        raw_title = str(raw["title"]).strip()[:48]
+        if not (migrated_builtin and ("(" in raw_title or len(raw_title) > 10)):
+            out["title"] = raw_title
     if raw.get("ttlSec") is not None:
         try:
             out["ttlSec"] = max(15, min(3600, int(raw["ttlSec"])))
@@ -474,6 +549,17 @@ class LayoutStore:
         except (TypeError, ValueError):
             weather_lon = 121.47
 
+        has_raw_city = isinstance(raw.get("weatherCity"), str) and bool(str(raw.get("weatherCity")).strip())
+        has_raw_coords = (
+            ("weatherLat" in raw and raw["weatherLat"] is not None)
+            or ("weatherLon" in raw and raw["weatherLon"] is not None)
+        )
+        is_default_shanghai_coords = (round(weather_lat, 2), round(weather_lon, 2)) == (31.23, 121.47)
+        if (has_raw_city and not has_raw_coords) or (weather_city != "上海" and is_default_shanghai_coords):
+            resolved = _resolve_city_coords(weather_city)
+            if resolved is not None:
+                weather_lat, weather_lon = resolved
+
         return {
             "version": 1,
             "gridRows": grid_rows,
@@ -546,7 +632,25 @@ class LayoutStore:
             }
             src = dict(patch.get("layout")) if isinstance(patch.get("layout"), dict) else dict(patch)
             if src.get("reset") is True:
-                src = default_layout_dict()
+                reset_src = default_layout_dict()
+                if self._config.get("weatherCity"):
+                    reset_src["weatherCity"] = self._config["weatherCity"]
+                    reset_src["weatherLat"] = self._config["weatherLat"]
+                    reset_src["weatherLon"] = self._config["weatherLon"]
+                for key in (
+                    "gridRows",
+                    "marqueeMode",
+                    "marqueeSpeed",
+                    "pageRotateSec",
+                    "autoTaskOverlay",
+                    "activePage",
+                    "weatherCity",
+                    "weatherLat",
+                    "weatherLon",
+                ):
+                    if key in src and src[key] is not None:
+                        reset_src[key] = src[key]
+                src = reset_src
             nxt = self._normalize(src, base=self._config)
             self._config = nxt
             self.revision += 1
