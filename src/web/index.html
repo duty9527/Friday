@@ -958,24 +958,7 @@
         </section>
         </div>
 
-        <div id="plugin-panel-cs80-face" class="hub-tab-panel" role="tabpanel" aria-labelledby="plugin-tab-cs80-face" hidden>
-          <div class="plugin-surface-bar">
-            <div>
-              <h3>🖥️ CS80 副屏 · 战术桌面、Bento 卡片与声光控台</h3>
-            </div>
-            <div class="fund-header-actions">
-              <label class="hub-checkbox-label">
-                <input id="cs80-auto-preview" type="checkbox" checked>
-                <span>自动刷新镜像</span>
-              </label>
-              <button id="cs80-refresh-btn" class="mini-button" type="button">🔄 刷新预览</button>
-              <button id="cs80-save-layout-btn" class="primary" type="button">💾 保存并同步副屏</button>
-            </div>
-          </div>
-          <p id="cs80-action-status" class="health-status-banner" hidden></p>
-
-          <div id="cs80-kpi-grid" class="hub-kpi-grid"></div>
-
+        <div id="plugin-panel-cs80-face" class="hub-tab-panel cs80-panel" role="tabpanel" aria-labelledby="plugin-tab-cs80-face" hidden>
           <section class="cs80-studio-grid" aria-label="CS80 实时预览与卡片编排工作室">
             <div class="cs80-preview-column">
               <div class="cs80-preview-card">
@@ -996,7 +979,25 @@
             </div>
 
             <div class="cs80-config-column">
-              <div class="cs80-section-card">
+              <div class="cs80-config-scroll">
+                <div class="plugin-surface-bar cs80-surface-bar">
+                  <div>
+                    <h3>🖥️ CS80 副屏 · 战术桌面、Bento 卡片与声光控台</h3>
+                  </div>
+                  <div class="fund-header-actions">
+                    <label class="hub-checkbox-label">
+                      <input id="cs80-auto-preview" type="checkbox" checked>
+                      <span>自动刷新镜像</span>
+                    </label>
+                    <button id="cs80-refresh-btn" class="mini-button" type="button">🔄 刷新预览</button>
+                    <button id="cs80-save-layout-btn" class="primary" type="button">💾 保存并同步副屏</button>
+                  </div>
+                </div>
+                <p id="cs80-action-status" class="health-status-banner" hidden></p>
+
+                <div id="cs80-kpi-grid" class="hub-kpi-grid cs80-kpi-grid"></div>
+
+                <div class="cs80-section-card">
                 <div class="modal-row-head">
                   <h3>1. 画布密度与跑马灯设置</h3>
                   <span id="cs80-sync-badge" class="hub-badge badge-amber">已同步</span>
@@ -1132,6 +1133,7 @@
                     </div>
                   </div>
                 </div>
+              </div>
               </div>
             </div>
           </section>

@@ -3671,13 +3671,20 @@ class FaceRenderer:
             ctx.show_text(_fit_single_line_cairo(ctx, str(d.get("subline") or "请在「苹果设备」完成登录同步"), w - 36.0))
             return
 
+        def pick_single_line(text: str, max_w: float, sizes: Sequence[float]) -> Tuple[float, bool]:
+            for fs in sizes:
+                ctx.set_font_size(fs)
+                if ctx.text_extents(text).x_advance <= max_w:
+                    return fs, True
+            return sizes[-1], False
+
         def draw_device_row(rx: float, ry: float, rw: float, rh: float, dev: Dict[str, Any], capsule: bool) -> None:
             bat = dev.get("battery")
             bat_val = int(bat) if bat is not None else None
             charging = bool(dev.get("charging"))
             dev_online = bool(dev.get("online"))
             cat = str(dev.get("catLabel") or "设备")[:4]
-            name = str(dev.get("name") or "设备")
+            clean_name = " ".join(_sanitize_hud_text(str(dev.get("name") or "设备")).replace("\r", "\n").split()) or "设备"
             place = str(dev.get("place") or ("在线" if dev_online else "离线"))
             if bat_val is not None and bat_val <= 20 and not charging:
                 b_col = COL_RED
@@ -3685,6 +3692,9 @@ class FaceRenderer:
                 b_col = COL_EMERALD
             else:
                 b_col = COL_AMBER_BRIGHT
+
+            bat_str = f"{bat_val}%" if bat_val is not None else "--"
+            ratio = (float(bat_val or 0) / 100.0) if bat_val is not None else 0.0
 
             if capsule:
                 _cairo_rounded_rect(ctx, rx, ry, rw, rh, 10.0)
@@ -3694,54 +3704,107 @@ class FaceRenderer:
                 ctx.set_line_width(1.2)
                 ctx.stroke()
 
-            pad = 10.0 if capsule else 0.0
-            ix = rx + pad
-            iw = rw - pad * 2.0
-            top_y = ry + (8.0 if capsule else 2.0)
+                pad = 10.0
+                ix = rx + pad
+                iw = rw - pad * 2.0
+                tall = rh >= 76.0
+                top_y = ry + (7.0 if tall else 5.0)
+                pill_h = 18.0 if tall else 17.0
 
-            cat_w = _draw_pill(
-                ctx,
-                ix,
-                top_y,
-                20.0,
-                cat,
-                COL_AMBER_BRIGHT if dev_online else COL_AMBER_DIM,
-                font_size=11.5,
-                pad_x=7.0,
-                font_family=self.font_family,
-            )
+                _draw_pill(
+                    ctx,
+                    ix,
+                    top_y,
+                    pill_h,
+                    cat,
+                    COL_AMBER_BRIGHT if dev_online else COL_AMBER_DIM,
+                    font_size=11.0,
+                    pad_x=6.0,
+                    font_family=self.font_family,
+                )
 
-            bat_str = f"{bat_val}%" if bat_val is not None else "--"
+                ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+                ctx.set_font_size(14.5 if tall else 13.5)
+                bat_w = ctx.text_extents(bat_str).x_advance
+                ctx.set_source_rgb(*(b_col if dev_online else COL_AMBER_DIM))
+                ctx.move_to(ix + iw - bat_w, top_y + (14.0 if tall else 13.0))
+                ctx.show_text(bat_str)
+                if charging:
+                    ctx.set_source_rgb(*COL_EMERALD)
+                    _cairo_lightning_bolt(ctx, ix + iw - bat_w - 11.0, top_y + 2.0, 12.5)
+
+                ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD if dev_online else cairo.FONT_WEIGHT_NORMAL)
+                ctx.set_source_rgb(*(COL_WHITE if dev_online else COL_AMBER_DIM))
+                fs, fits = pick_single_line(clean_name, iw, (14.5, 13.0) if tall else (13.5, 12.5, 11.5))
+                if fits:
+                    ctx.set_font_size(fs)
+                    ctx.move_to(ix, ry + (45.0 if tall else 38.5))
+                    ctx.show_text(clean_name)
+                elif tall:
+                    ctx.set_font_size(12.5)
+                    for li, line in enumerate(_wrap_text_cairo(ctx, clean_name, iw, 2)):
+                        ctx.move_to(ix, ry + 39.5 + li * 14.5)
+                        ctx.show_text(line)
+                else:
+                    ctx.set_font_size(11.5)
+                    ctx.move_to(ix, ry + 38.5)
+                    ctx.show_text(_fit_single_line_cairo(ctx, clean_name, iw))
+
+                bot_y = ry + rh - (11.0 if tall else 10.0)
+                ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+                ctx.set_font_size(11.5)
+                pl_str = _fit_single_line_cairo(ctx, place, iw * 0.44)
+                pl_w = ctx.text_extents(pl_str).x_advance
+                ctx.set_source_rgb(*(COL_AMBER if dev_online else COL_AMBER_DIM))
+                ctx.move_to(ix + iw - pl_w, bot_y + 3.5)
+                ctx.show_text(pl_str)
+
+                bar_w = max(40.0, iw - pl_w - 10.0)
+                _draw_progress_bar(ctx, ix, bot_y - 2.0, bar_w, 4.5, ratio, b_col)
+                return
+
+            ix = rx
+            iw = rw
+            top_y = ry + 2.0
+
             ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-            ctx.set_font_size(15.0)
+            ctx.set_font_size(14.5)
             bat_w = ctx.text_extents(bat_str).x_advance
             ctx.set_source_rgb(*(b_col if dev_online else COL_AMBER_DIM))
-            ctx.move_to(ix + iw - bat_w, top_y + 15.0)
+            ctx.move_to(ix + iw - bat_w, top_y + 14.5)
             ctx.show_text(bat_str)
             bolt_reserve = 13.0 if charging else 0.0
             if charging:
                 ctx.set_source_rgb(*COL_EMERALD)
-                _cairo_lightning_bolt(ctx, ix + iw - bat_w - 11.0, top_y + 2.5, 13.0)
+                _cairo_lightning_bolt(ctx, ix + iw - bat_w - 11.0, top_y + 2.0, 12.5)
 
             ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD if dev_online else cairo.FONT_WEIGHT_NORMAL)
-            ctx.set_font_size(14.5)
             ctx.set_source_rgb(*(COL_WHITE if dev_online else COL_AMBER_DIM))
-            name_max = max(40.0, iw - cat_w - bat_w - bolt_reserve - 14.0)
-            ctx.move_to(ix + cat_w + 7.0, top_y + 15.0)
-            ctx.show_text(_fit_single_line_cairo(ctx, name, name_max))
+            name_max = max(80.0, iw - bat_w - bolt_reserve - 10.0)
+            fs, fits = pick_single_line(clean_name, name_max, (14.5, 13.0, 12.0))
+            ctx.set_font_size(fs)
+            ctx.move_to(ix, top_y + 14.5)
+            ctx.show_text(clean_name if fits else _fit_single_line_cairo(ctx, clean_name, name_max))
 
-            # Bottom mini battery bar + place tag
-            bot_y = ry + rh - (14.0 if capsule else 10.0)
+            bot_y = ry + rh - 10.0
+            ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(11.0)
+            cat_w = ctx.text_extents(cat).x_advance
+            ctx.set_source_rgb(*(COL_AMBER_BRIGHT if dev_online else COL_AMBER_DIM))
+            ctx.move_to(ix, bot_y + 3.5)
+            ctx.show_text(cat)
+
             ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
-            ctx.set_font_size(12.0)
-            pl_str = _fit_single_line_cairo(ctx, place, iw * 0.44)
+            ctx.set_font_size(11.5)
+            pl_str = _fit_single_line_cairo(ctx, place, iw * 0.40)
             pl_w = ctx.text_extents(pl_str).x_advance
             ctx.set_source_rgb(*(COL_AMBER if dev_online else COL_AMBER_DIM))
-            ctx.move_to(ix + iw - pl_w, bot_y + 4.0)
+            ctx.move_to(ix + iw - pl_w, bot_y + 3.5)
             ctx.show_text(pl_str)
 
-            bar_w = max(40.0, iw - pl_w - 10.0)
-            _draw_progress_bar(ctx, ix, bot_y - 2.0, bar_w, 5.0, (float(bat_val or 0) / 100.0) if bat_val is not None else 0.0, b_col)
+            bar_x = ix + cat_w + 8.0
+            bar_w = max(36.0, iw - cat_w - pl_w - 18.0)
+            _draw_progress_bar(ctx, bar_x, bot_y - 2.0, bar_w, 4.5, ratio, b_col)
 
         if card.w_span == 2 and card.h_span == 1:
             cols = 2

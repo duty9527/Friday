@@ -2577,8 +2577,9 @@ class WidgetDataHub:
             elif short_addr:
                 place_str = short_addr[:16]
 
+            raw_name = str(d.get("name") or d.get("displayName") or "").strip() or cat_label
             dev_item = {
-                "name": str(d.get("name") or d.get("displayName") or cat_label)[:16],
+                "name": raw_name[:64],
                 "catLabel": cat_label,
                 "battery": batt,
                 "charging": charging,

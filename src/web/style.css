@@ -7069,14 +7069,51 @@ html[data-theme="industrial"] .fund-holding-row:hover {
   display:grid;
   grid-template-columns:minmax(260px, 340px) minmax(0, 1fr);
   gap:14px;
-  align-items:start;
+  align-items:stretch;
 }
-.cs80-preview-column,
-.cs80-config-column {
+.cs80-preview-column {
   display:flex;
   flex-direction:column;
   gap:12px;
   min-width:0;
+}
+.cs80-config-column {
+  position:relative;
+  min-width:0;
+  min-height:0;
+  border:1px solid var(--border);
+  border-radius:14px;
+  background:var(--surface);
+  box-shadow:var(--card-shadow);
+  overflow:hidden;
+}
+.cs80-config-scroll {
+  position:absolute;
+  inset:0;
+  overflow-y:auto;
+  overflow-x:hidden;
+  overscroll-behavior:contain;
+  padding:12px;
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+  min-width:0;
+}
+.cs80-config-scroll > * {
+  flex-shrink:0;
+}
+.cs80-surface-bar {
+  flex-shrink:0;
+  padding:10px 12px;
+  gap:8px 12px;
+  background:var(--raised);
+}
+.cs80-kpi-grid {
+  grid-template-columns:repeat(auto-fit, minmax(min(138px, 100%), 1fr));
+  gap:10px;
+}
+.cs80-kpi-grid .hub-kpi-card {
+  padding:10px 12px;
 }
 .cs80-preview-card,
 .cs80-section-card {
@@ -7193,9 +7230,9 @@ html[data-theme="industrial"] .fund-holding-row:hover {
 .cs80-editor-card-sub {
   font-size:12px;
   color:var(--muted);
-  overflow:hidden;
-  text-overflow:ellipsis;
-  white-space:nowrap;
+  line-height:1.4;
+  white-space:normal;
+  overflow-wrap:anywhere;
 }
 .cs80-editor-card-value {
   font-size:14px;
@@ -7322,6 +7359,13 @@ html[data-theme="industrial"] .cs80-section-card {
   border-radius:10px;
   background:var(--surface);
 }
+html[data-theme="industrial"] .cs80-config-column {
+  border-radius:10px;
+  background:var(--raised);
+}
+html[data-theme="industrial"] .cs80-surface-bar {
+  background:var(--surface);
+}
 html[data-theme="industrial"] .cs80-bento-editor {
   border-radius:8px;
   background:var(--raised);
@@ -7337,6 +7381,15 @@ html[data-theme="industrial"] .cs80-catalog-item {
 @media (max-width: 960px) {
   .cs80-studio-grid {
     grid-template-columns:minmax(0, 1fr);
+    align-items:start;
+  }
+  .cs80-config-column {
+    overflow:visible;
+  }
+  .cs80-config-scroll {
+    position:static;
+    inset:auto;
+    overflow:visible;
   }
 }
 

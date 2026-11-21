@@ -791,12 +791,15 @@ gcj_home_lat, gcj_home_lon = _wgs84_to_gcj02(31.2305, 121.4738)
 apple_cache.write_text(json.dumps({
     "fetchedAt": now_ms,
     "entries": [
-        {"device": {"name": "iPhone 17 Pro", "category": "iphone", "batteryPercent": 88, "batteryStatus": "NotCharging", "online": True, "location": {"latitude": 31.2305, "longitude": 121.4738, "shortAddress": "黄浦区人民广场"}}},
-        {"device": {"name": "MacBook Pro", "category": "mac", "batteryPercent": 72, "batteryStatus": "NotCharging", "online": True, "location": {"latitude": 31.2988, "longitude": 121.5299, "shortAddress": "杨浦区五角场万达"}}},
+        {"device": {"name": "张三的 iPhone 17 Pro Max", "category": "iphone", "batteryPercent": 88, "batteryStatus": "NotCharging", "online": True, "location": {"latitude": 31.2305, "longitude": 121.4738, "shortAddress": "黄浦区人民广场"}}},
+        {"device": {"name": "我的 MacBook Pro 14-inch M4", "category": "mac", "batteryPercent": 72, "batteryStatus": "NotCharging", "online": True, "location": {"latitude": 31.2988, "longitude": 121.5299, "shortAddress": "杨浦区五角场万达"}}},
     ],
 }), encoding="utf-8")
 hub._collect_apple_devices(apple_cache, connected=False)
 ap_geo_w = hub.get_widget("apple-devices")
+assert ap_geo_w["devices"][0]["name"] == "张三的 iPhone 17 Pro Max", ap_geo_w
+assert ap_geo_w["devices"][1]["name"] == "我的 MacBook Pro 14-inch M4", ap_geo_w
+assert "张三的 iPhone 17 Pro Max" in ap_geo_w["subline"], ap_geo_w
 assert ap_geo_w["devices"][0]["place"] == "在家", ap_geo_w
 assert ap_geo_w["devices"][1]["place"] == "杨浦区五角场万达", ap_geo_w
 ap_geo_dump = json.dumps(ap_geo_w, ensure_ascii=False)
@@ -859,6 +862,43 @@ try:
                     active_page=0,
                 )
                 r_fc.render_frame(lsnap, hud_fc, placed_cards=cards, widget_data=sample_data)
+
+    # Verify long Apple device names render untruncated (single-line & 2-line capsule wrap)
+    geo2 = rmod.stage_geometry_for_rows(2)
+    ap_cards, ap_ov = pack_bento_page(
+        [{"id": "c-ap-long", "kind": "apple-devices", "size": "2x1"}],
+        grid_rows=2,
+        x0=36.0,
+        y0=geo2["grid_y"],
+        total_w=728.0,
+        total_h=geo2["grid_h"],
+        gap=geo2["gap"],
+    )
+    assert ap_ov == 0 and len(ap_cards) == 1
+    ap_long_name_1 = "张三的 iPhone 16 Pro Max (主力)"
+    ap_long_name_2 = "张三的 MacBook Pro 14-inch M4 Max 工作室主力机"
+    ap_long_data = {
+        "apple-devices": {
+            "ok": True,
+            "empty": False,
+            "authState": "authenticated",
+            "total": 2,
+            "online": 2,
+            "lowCount": 0,
+            "devices": [
+                {"name": ap_long_name_1, "catLabel": "手机", "battery": 88, "charging": True, "online": True, "place": "在家"},
+                {"name": ap_long_name_2, "catLabel": "电脑", "battery": 76, "charging": False, "online": True, "place": "工作室"},
+            ],
+            "updatedHm": "12:40",
+        }
+    }
+    mark_idx = len(_Ctx.shown_texts)
+    r_fc._card_apple_devices(_Ctx(_Surf(0, 800, 1280)), ap_cards[0], ap_long_data["apple-devices"])
+    ap_texts = _Ctx.shown_texts[mark_idx:]
+    assert ap_long_name_1 in ap_texts, ap_texts
+    wrapped_joined = "".join(t for t in ap_texts if t.startswith("张三的 MacBook") or t == "作室主力机")
+    assert wrapped_joined == ap_long_name_2, (ap_texts, wrapped_joined)
+    assert not any("…" in t and "MacBook" in t for t in ap_texts), ap_texts
 
     # Render all HUD states (incl. REM sleep + auto_task_overlay) and verify pure Chinese badges & labels
     for st_id, (badge_lbl, _) in rmod.STATE_BADGES.items():
