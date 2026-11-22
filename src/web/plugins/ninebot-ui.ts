@@ -1,6 +1,12 @@
 import { element, isEditingWithin, node } from '../shared/dom.js';
 import { errorText, timestamp } from '../shared/format.js';
-import { api, appState, hooks } from '../state.js';
+import {
+  announceStatus,
+  attachDelayedFormValidation,
+  confirmAction,
+  safeFocus,
+} from '../shared/ui-primitives.js';
+import { api, appState, hooks, type ApiRequestOptions } from '../state.js';
 
 export interface NinebotUiOptions {
   isVisible: () => boolean;
@@ -9,7 +15,90 @@ export interface NinebotUiOptions {
 export interface NinebotUiController {
   activate: () => void;
   deactivate: () => void;
+  dispose: () => void;
   refreshBadge: () => Promise<void>;
+}
+
+function isAbortError(err: unknown): boolean {
+  return err instanceof Error && err.name === 'AbortError';
+}
+
+function isDocumentHidden(): boolean {
+  return typeof document !== 'undefined' && Boolean((document as { hidden?: boolean }).hidden);
+}
+
+function getDevicePixelRatio(): number {
+  if (typeof window === 'undefined') return 1;
+  const raw = Number((window as { devicePixelRatio?: number }).devicePixelRatio);
+  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 2) : 1;
+}
+
+function getThemeName(): string {
+  return typeof document !== 'undefined' ? (document.documentElement?.dataset?.theme ?? '') : '';
+}
+
+function listenEvent(
+  target: {
+    addEventListener: (
+      type: string,
+      listener: EventListenerOrEventListenerObject,
+      options?: boolean | AddEventListenerOptions,
+    ) => void;
+    removeEventListener: (
+      type: string,
+      listener: EventListenerOrEventListenerObject,
+      options?: boolean | EventListenerOptions,
+    ) => void;
+  },
+  type: string,
+  listener: (ev: Event) => void,
+  signal?: AbortSignal,
+): void {
+  if (signal?.aborted) return;
+  const wrapped: EventListener = ev => {
+    listener(ev);
+  };
+  target.addEventListener(type, wrapped, signal ? { signal } : undefined);
+  signal?.addEventListener(
+    'abort',
+    () => {
+      target.removeEventListener(type, wrapped);
+    },
+    { once: true },
+  );
+}
+
+function bindFormSubmission(
+  formEl: HTMLElement | null,
+  submitBtn: HTMLButtonElement,
+  onSubmit: () => void,
+  signal: AbortSignal,
+): void {
+  if (!formEl) {
+    listenEvent(submitBtn, 'click', onSubmit, signal);
+    return;
+  }
+  listenEvent(
+    formEl,
+    'submit',
+    ev => {
+      ev.preventDefault();
+      onSubmit();
+    },
+    signal,
+  );
+  attachDelayedFormValidation(formEl as HTMLFormElement, signal);
+  listenEvent(
+    submitBtn,
+    'click',
+    () => {
+      const btnType = (submitBtn.getAttribute('type') ?? '').toLowerCase();
+      if (typeof (formEl as { requestSubmit?: unknown }).requestSubmit !== 'function' || btnType === 'button') {
+        onSubmit();
+      }
+    },
+    signal,
+  );
 }
 
 interface NinebotLocation {
@@ -244,6 +333,7 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
   const trendCanvas = element<HTMLCanvasElement>('ninebot-trend-canvas');
   const trendCaptionEl = element<HTMLElement>('ninebot-trend-caption');
 
+  const loginForm = typeof document !== 'undefined' ? document.getElementById('ninebot-login-form') : null;
   const loginUserInput = element<HTMLInputElement>('ninebot-login-user');
   const loginPassInput = element<HTMLInputElement>('ninebot-login-pass');
   const loginAreaInput = element<HTMLInputElement>('ninebot-login-area');
@@ -251,6 +341,7 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
   const loginBtn = element<HTMLButtonElement>('ninebot-login-btn');
   const clearCredsBtn = element<HTMLButtonElement>('ninebot-clear-creds-btn');
 
+  const cfgForm = typeof document !== 'undefined' ? document.getElementById('ninebot-cfg-form') : null;
   const cfgLineSelect = element<HTMLSelectElement>('ninebot-cfg-line');
   const cfgLowBattInput = element<HTMLInputElement>('ninebot-cfg-low-batt');
   const cfgMinRangeInput = element<HTMLInputElement>('ninebot-cfg-min-range');
@@ -267,6 +358,17 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
   const tripKpisEl = element<HTMLElement>('ninebot-trip-kpis');
   const tripsListEl = element<HTMLElement>('ninebot-trips-list');
 
+  trendCanvas.setAttribute('aria-describedby', 'ninebot-trend-caption');
+  loginUserInput.setAttribute('aria-invalid', 'false');
+  loginPassInput.setAttribute('aria-invalid', 'false');
+
+  const lifecycleAc = new AbortController();
+  let activeAc: AbortController | undefined;
+  let pollAc: AbortController | undefined;
+  let manualAc: AbortController | undefined;
+  let badgeAc: AbortController | undefined;
+  let disposed = false;
+
   let active = false;
   let busy = false;
   let draftDirty = false;
@@ -274,26 +376,48 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
   let badgeSeq = 0;
   let trendMetric: TrendMetricKey = 'battery';
   let latestData: NinebotDashboardPayload | undefined;
-  let pollTimer: ReturnType<typeof setInterval> | undefined;
+  let pollTimer: ReturnType<typeof setTimeout> | undefined;
+  let pollInFlight = false;
+  let chartResizeObserver: ResizeObserver | undefined;
+  let chartRafId: number | undefined;
   let themeObserver: MutationObserver | undefined;
+  let hoveredPointIdx: number | null = null;
+  let lastPlottedChart: {
+    points: Array<{ val: number; ts: number; x: number; y: number }>;
+    unit: string;
+    label: string;
+    defaultCaption: string;
+    cssW: number;
+    plotRangeMinX: number;
+    plotRangeMaxX: number;
+  } | undefined;
 
   function setBanner(text: string, isError = false): void {
+    if (disposed) return;
     statusBanner.textContent = text;
     statusBanner.classList.toggle('is-error', isError);
     statusBanner.hidden = !text;
+    if (text) {
+      announceStatus(text, isError ? 'assertive' : 'polite');
+    }
   }
 
   async function callPlugin<T = unknown>(
     action: string,
     args: Record<string, unknown> = {},
     timeoutMs?: number,
+    reqOpts?: ApiRequestOptions,
   ): Promise<PluginRunResponse<T>> {
-    return api<PluginRunResponse<T>>('/api/plugin-run', {
+    const body = {
       plugin: 'ninebot',
       action,
       args: { silent: true, ...args },
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
-    });
+    };
+    const opts: ApiRequestOptions | undefined = reqOpts
+      ? (timeoutMs !== undefined ? { timeoutMs, ...reqOpts } : reqOpts)
+      : (timeoutMs !== undefined ? { timeoutMs } : undefined);
+    return opts ? api<PluginRunResponse<T>>('/api/plugin-run', body, opts) : api<PluginRunResponse<T>>('/api/plugin-run', body);
   }
 
   function updateTopBadge(data: NinebotDashboardPayload): void {
@@ -365,11 +489,23 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
     for (let i = 0; i < children.length; i++) {
       children[i]!.classList.toggle('is-filled', i < filledCount);
     }
-    energyBarEl.setAttribute('aria-label', battery !== null ? `动力电池电量 ${battery}%` : '动力电池电量待同步');
+    energyBarEl.setAttribute('role', 'progressbar');
+    energyBarEl.setAttribute('aria-valuemin', '0');
+    energyBarEl.setAttribute('aria-valuemax', '100');
+    if (battery !== null && Number.isFinite(battery)) {
+      const clamped = Math.max(0, Math.min(100, Math.round(battery)));
+      energyBarEl.setAttribute('aria-valuenow', String(clamped));
+      energyBarEl.setAttribute('aria-valuetext', `${battery}%`);
+      energyBarEl.setAttribute('aria-label', `动力电池电量 ${battery}%`);
+    } else {
+      energyBarEl.removeAttribute('aria-valuenow');
+      energyBarEl.setAttribute('aria-valuetext', '待同步');
+      energyBarEl.setAttribute('aria-label', '动力电池电量待同步');
+    }
   }
 
   function renderScooterShowroom(imgs: NinebotVehicleImages | undefined): void {
-    const isIndustrial = document.documentElement.dataset.theme === 'industrial';
+    const isIndustrial = getThemeName() === 'industrial';
     const candidate = isIndustrial
       ? (imgs?.lightDataUrl || imgs?.darkDataUrl || null)
       : (imgs?.darkDataUrl || imgs?.lightDataUrl || null);
@@ -569,7 +705,9 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
 
   function renderTrendPills(): void {
     for (const btn of trendPillsEl.querySelectorAll<HTMLButtonElement>('button[data-metric]')) {
-      btn.classList.toggle('active', btn.dataset.metric === trendMetric);
+      const selected = btn.dataset.metric === trendMetric;
+      btn.classList.toggle('active', selected);
+      btn.setAttribute('aria-pressed', String(selected));
     }
   }
 
@@ -581,7 +719,7 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
     const rect = trendCanvas.getBoundingClientRect();
     const cssW = Math.max(300, Math.round(rect.width || trendCanvas.clientWidth || 520));
     const cssH = Math.max(140, Math.round(rect.height || trendCanvas.clientHeight || 156));
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const dpr = getDevicePixelRatio();
     if (trendCanvas.width !== cssW * dpr || trendCanvas.height !== cssH * dpr) {
       trendCanvas.width = cssW * dpr;
       trendCanvas.height = cssH * dpr;
@@ -589,7 +727,7 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cssW, cssH);
 
-    const chronological = (data.history ?? []).slice().reverse();
+    const chronological = (data.history ?? []).toReversed();
     const points = chronological
       .map(item => ({
         val: trendMetric === 'battery' ? item.battery : item.effectiveRangeKm,
@@ -599,9 +737,13 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
 
     const unit = trendMetric === 'battery' ? '%' : ' km';
     const label = trendMetric === 'battery' ? '主电池电量' : '预估续航';
+    const isIndustrial = getThemeName() === 'industrial';
+    const mutedInk = isIndustrial ? '#52525b' : '#94a3b8';
 
     if (points.length === 0) {
-      ctx.fillStyle = '#94a3b8';
+      lastPlottedChart = undefined;
+      hoveredPointIdx = null;
+      ctx.fillStyle = mutedInk;
       ctx.font = '12.5px sans-serif';
       ctx.textAlign = 'center';
       ctx.fillText(`暂无「${label}」历史快照，点击「实时同步车况」开始记录`, cssW / 2, cssH / 2);
@@ -609,13 +751,14 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
       return;
     }
 
-    const isIndustrial = document.documentElement.dataset.theme === 'industrial';
     const strokeColor = trendMetric === 'battery'
       ? (isIndustrial ? '#15803d' : '#3ecf4c')
       : (isIndustrial ? '#ff6b1a' : '#22d3ee');
     const fillRgb = trendMetric === 'battery'
       ? '62, 207, 76'
       : (isIndustrial ? '255, 107, 26' : '34, 211, 238');
+    const gridStroke = isIndustrial ? 'rgba(82, 82, 91, 0.2)' : 'rgba(148, 163, 184, 0.16)';
+    const pointOutline = isIndustrial ? '#f7f4ed' : '#090b10';
 
     const vals = points.map(p => p.val);
     const minRaw = Math.min(...vals);
@@ -641,12 +784,12 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
     for (let i = 0; i <= steps; i++) {
       const v = minV + (span * (steps - i)) / steps;
       const y = padT + (plotH * i) / steps;
-      ctx.strokeStyle = 'rgba(148, 163, 184, 0.16)';
+      ctx.strokeStyle = gridStroke;
       ctx.beginPath();
       ctx.moveTo(padL, y);
       ctx.lineTo(cssW - padR, y);
       ctx.stroke();
-      ctx.fillStyle = '#94a3b8';
+      ctx.fillStyle = mutedInk;
       ctx.fillText(`${Math.round(v)}${trendMetric === 'battery' ? '%' : ''}`, padL - 6, y + 3.5);
     }
 
@@ -676,19 +819,88 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
       ctx.stroke();
     }
 
-    for (let i = 0; i < points.length; i++) {
-      const px = xOf(i);
-      const py = yOf(points[i]!.val);
-      const isLast = i === points.length - 1;
+    const plottedPoints = points.map((pt, i) => ({
+      val: pt.val,
+      ts: pt.ts,
+      x: xOf(i),
+      y: yOf(pt.val),
+    }));
+    const activeIdx = hoveredPointIdx !== null && hoveredPointIdx >= 0 && hoveredPointIdx < plottedPoints.length
+      ? hoveredPointIdx
+      : null;
+    if (activeIdx === null) {
+      hoveredPointIdx = null;
+    }
+
+    if (activeIdx !== null) {
+      const hoveredPt = plottedPoints[activeIdx]!;
+      ctx.save?.();
+      ctx.strokeStyle = gridStroke;
+      ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.arc(px, py, isLast ? 4 : 2.5, 0, Math.PI * 2);
+      ctx.moveTo(hoveredPt.x, padT);
+      ctx.lineTo(hoveredPt.x, padT + plotH);
+      ctx.stroke();
+      ctx.restore?.();
+    }
+
+    for (let i = 0; i < plottedPoints.length; i++) {
+      const pt = plottedPoints[i]!;
+      const isLast = i === plottedPoints.length - 1;
+      const isHovered = i === activeIdx;
+      if (isHovered) {
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, 8, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(${fillRgb}, 0.22)`;
+        ctx.fill();
+      }
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, isHovered ? 5 : isLast ? 4 : 2.5, 0, Math.PI * 2);
       ctx.fillStyle = strokeColor;
       ctx.fill();
+      ctx.strokeStyle = pointOutline;
+      ctx.lineWidth = isHovered ? 2 : 1.25;
+      ctx.stroke();
     }
 
     const latest = points[points.length - 1]!;
     const first = points[0]!;
-    trendCaptionEl.textContent = `共 ${points.length} 个快照点 · 最新 ${latest.val}${unit}（范围 ${minRaw}${unit} ~ ${maxRaw}${unit}，起始 ${timestamp(first.ts)}）`;
+    const defaultCaption = `共 ${points.length} 个快照点 · 最新 ${latest.val}${unit}（范围 ${minRaw}${unit} ~ ${maxRaw}${unit}，起始 ${timestamp(first.ts)}）`;
+    lastPlottedChart = {
+      points: plottedPoints,
+      unit,
+      label,
+      defaultCaption,
+      cssW,
+      plotRangeMinX: Math.max(0, padL - 12),
+      plotRangeMaxX: Math.min(cssW, cssW - padR + 12),
+    };
+
+    if (activeIdx !== null) {
+      const hoveredPt = plottedPoints[activeIdx]!;
+      const tagText = `${hoveredPt.val}${unit} · ${timestamp(hoveredPt.ts)}`;
+      if (typeof ctx.fillRect === 'function') {
+        ctx.font = '11px monospace';
+        const boxW = Math.min(cssW - padL - padR, Math.max(96, tagText.length * 7 + 14));
+        const boxH = 22;
+        const rawX = hoveredPt.x - boxW / 2;
+        const boxX = Math.max(padL, Math.min(cssW - padR - boxW, rawX));
+        const boxY = hoveredPt.y > padT + 30 ? hoveredPt.y - 30 : Math.min(padT + plotH - boxH, hoveredPt.y + 10);
+        ctx.fillStyle = isIndustrial ? 'rgba(247, 244, 237, 0.94)' : 'rgba(15, 23, 42, 0.92)';
+        ctx.fillRect(boxX, boxY, boxW, boxH);
+        if (typeof ctx.strokeRect === 'function') {
+          ctx.strokeStyle = strokeColor;
+          ctx.lineWidth = 1;
+          ctx.strokeRect(boxX, boxY, boxW, boxH);
+        }
+        ctx.fillStyle = isIndustrial ? '#18181b' : '#f1f5f9';
+        ctx.textAlign = 'center';
+        ctx.fillText(tagText, boxX + boxW / 2, boxY + 15);
+      }
+      trendCaptionEl.textContent = `选中快照：${hoveredPt.val}${unit} · ${timestamp(hoveredPt.ts)}（${defaultCaption}）`;
+    } else {
+      trendCaptionEl.textContent = defaultCaption;
+    }
   }
 
   function renderFormsFromConfig(cfg: NinebotRedactedConfig): void {
@@ -784,89 +996,216 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
     renderTrips(data);
   }
 
-  async function refreshDashboard(): Promise<void> {
-    if (appState.authExpired) return;
+  function cancelScheduledChartRedraw(): void {
+    if (chartRafId !== undefined && typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(chartRafId);
+    }
+    chartRafId = undefined;
+  }
+
+  function scheduleChartRedraw(): void {
+    if (!active || disposed || !latestData) return;
+    if (typeof requestAnimationFrame !== 'function') {
+      if (options.isVisible()) renderTrendChart(latestData);
+      return;
+    }
+    if (chartRafId !== undefined) return;
+    chartRafId = requestAnimationFrame(() => {
+      chartRafId = undefined;
+      if (active && !disposed && options.isVisible() && latestData) {
+        renderTrendChart(latestData);
+      }
+    });
+  }
+
+  function stopPolling(): void {
+    if (pollTimer !== undefined) {
+      clearTimeout(pollTimer);
+      pollTimer = undefined;
+    }
+    pollAc?.abort();
+    pollAc = undefined;
+  }
+
+  function scheduleNextPoll(): void {
+    if (!active || disposed || isDocumentHidden()) return;
+    if (pollTimer !== undefined) clearTimeout(pollTimer);
+    pollTimer = setTimeout(() => {
+      pollTimer = undefined;
+      if (!active || disposed || isDocumentHidden()) return;
+      if (options.isVisible() && !appState.authExpired && !busy && !draftDirty && !isEditingWithin(panelEl)) {
+        void refreshDashboard(true).finally(() => {
+          scheduleNextPoll();
+        });
+      } else {
+        scheduleNextPoll();
+      }
+    }, 15_000);
+  }
+
+  async function refreshDashboard(isBackground = false): Promise<void> {
+    if (disposed || appState.authExpired) return;
+    if (isBackground && (isDocumentHidden() || busy || pollInFlight)) return;
     const seq = ++dashboardSeq;
+    if (isBackground) {
+      pollAc?.abort();
+      pollAc = new AbortController();
+      pollInFlight = true;
+    } else {
+      pollAc?.abort();
+      pollAc = undefined;
+      manualAc?.abort();
+      manualAc = new AbortController();
+    }
+    const signal = isBackground ? pollAc!.signal : manualAc!.signal;
     try {
-      const res = await callPlugin<NinebotDashboardPayload>('dashboard', { limit: 30 });
-      if (seq !== dashboardSeq || appState.authExpired) return;
+      const res = await callPlugin<NinebotDashboardPayload>(
+        'dashboard',
+        { limit: 30 },
+        undefined,
+        isBackground ? { priority: 'low', signal } : { signal },
+      );
+      if (disposed || signal.aborted || seq !== dashboardSeq || appState.authExpired) return;
       if (res.ok && res.data) {
         renderDashboard(res.data);
-      } else if (!res.ok) {
+      } else if (!res.ok && !isBackground) {
         setBanner(res.message || '读取九号电摩看板失败', true);
       }
     } catch (err) {
-      if (seq !== dashboardSeq || appState.authExpired) return;
-      setBanner(errorText(err), true);
+      if (disposed || signal.aborted || isAbortError(err) || seq !== dashboardSeq || appState.authExpired) return;
+      if (!isBackground) {
+        setBanner(errorText(err), true);
+      }
+    } finally {
+      if (isBackground) {
+        pollInFlight = false;
+        if (pollAc?.signal === signal) {
+          pollAc = undefined;
+        }
+      } else if (manualAc?.signal === signal) {
+        manualAc = undefined;
+      }
     }
   }
 
   async function runBusyAction(label: string, fn: () => Promise<void>): Promise<void> {
-    if (busy || appState.authExpired) return;
+    if (disposed || busy || appState.authExpired) return;
     busy = true;
     ++dashboardSeq;
+    pollAc?.abort();
+    pollAc = undefined;
+    manualAc?.abort();
+    manualAc = undefined;
     setBanner(label);
     try {
       await fn();
     } catch (err) {
-      setBanner(errorText(err), true);
+      if (!disposed) {
+        setBanner(errorText(err), true);
+      }
     } finally {
       busy = false;
     }
   }
 
-  vehicleSelect.addEventListener('change', () => {
+  listenEvent(vehicleSelect, 'change', () => {
     const selectSn = vehicleSelect.value.trim();
-    if (!selectSn) return;
+    if (!selectSn || disposed) return;
     void runBusyAction(`正在切换默认车辆至 ${selectSn}…`, async () => {
       const res = await callPlugin('vehicles', { selectSn }, 20_000);
       setBanner(res.message || (res.ok ? '已切换车辆' : '切换失败'), !res.ok);
-      await refreshDashboard();
+      await refreshDashboard(false);
     });
-  });
+  }, lifecycleAc.signal);
 
-  syncBtn.addEventListener('click', () => {
+  listenEvent(syncBtn, 'click', () => {
+    if (disposed) return;
     void runBusyAction('正在连接九号云端同步实时车况与本月行程…', async () => {
       const res = await callPlugin('status', {}, 30_000);
       if (res.ok) {
         await callPlugin('trips', { limit: 20 }, 30_000).catch(() => undefined);
       }
       setBanner(res.message || (res.ok ? '同步成功' : '同步失败'), !res.ok);
-      await refreshDashboard();
+      await refreshDashboard(false);
     });
-  });
+  }, lifecycleAc.signal);
 
-  patrolBtn.addEventListener('click', () => {
+  listenEvent(patrolBtn, 'click', () => {
+    if (disposed) return;
     void runBusyAction('正在执行电摩安全与补能巡检…', async () => {
       const res = await callPlugin('patrol', { force: true }, 30_000);
       setBanner(res.message || (res.ok ? '巡检完成' : '巡检失败'), !res.ok);
-      await refreshDashboard();
+      await refreshDashboard(false);
     });
-  });
+  }, lifecycleAc.signal);
 
-  tripsSyncBtn.addEventListener('click', () => {
+  listenEvent(tripsSyncBtn, 'click', () => {
+    if (disposed) return;
     void runBusyAction('正在同步九号骑行轨迹与极速统计…', async () => {
       const month = monthInput.value.trim();
       const args: Record<string, unknown> = { limit: 20 };
       if (month) args.month = month;
       const res = await callPlugin('trips', args, 30_000);
       setBanner(res.message || (res.ok ? '行程同步完成' : '行程同步失败'), !res.ok);
-      await refreshDashboard();
+      await refreshDashboard(false);
     });
-  });
+  }, lifecycleAc.signal);
 
-  refreshBtn.addEventListener('click', () => {
+  listenEvent(refreshBtn, 'click', () => {
+    if (disposed) return;
     draftDirty = false;
-    void refreshDashboard();
-  });
+    void refreshDashboard(false);
+  }, lifecycleAc.signal);
 
-  trendPillsEl.addEventListener('click', ev => {
+  listenEvent(trendPillsEl, 'click', ev => {
+    if (disposed) return;
     const btn = (ev.target as HTMLElement).closest<HTMLButtonElement>('button[data-metric]');
     if (!btn) return;
     const metric = btn.dataset.metric === 'range' ? 'range' : 'battery';
     trendMetric = metric;
+    hoveredPointIdx = null;
     if (latestData) renderTrendChart(latestData);
-  });
+  }, lifecycleAc.signal);
+
+  function updateChartHoverFromPointer(ev: Event): void {
+    if (!latestData || !lastPlottedChart || lastPlottedChart.points.length === 0) return;
+    const pe = ev as { clientX?: number; offsetX?: number };
+    const rect = trendCanvas.getBoundingClientRect();
+    let localX: number | null = null;
+    if (typeof pe.clientX === 'number' && Number.isFinite(pe.clientX) && rect.width > 0) {
+      localX = ((pe.clientX - rect.left) / rect.width) * lastPlottedChart.cssW;
+    } else if (typeof pe.offsetX === 'number' && Number.isFinite(pe.offsetX)) {
+      const scale = rect.width > 0 ? lastPlottedChart.cssW / rect.width : 1;
+      localX = pe.offsetX * scale;
+    }
+    if (localX === null) return;
+    let nextIdx: number | null = null;
+    if (localX >= lastPlottedChart.plotRangeMinX && localX <= lastPlottedChart.plotRangeMaxX) {
+      let bestDist = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < lastPlottedChart.points.length; i++) {
+        const dist = Math.abs(lastPlottedChart.points[i]!.x - localX);
+        if (dist < bestDist) {
+          bestDist = dist;
+          nextIdx = i;
+        }
+      }
+    }
+    if (nextIdx !== hoveredPointIdx) {
+      hoveredPointIdx = nextIdx;
+      renderTrendChart(latestData);
+    }
+  }
+
+  function clearChartHover(): void {
+    if (hoveredPointIdx === null) return;
+    hoveredPointIdx = null;
+    if (latestData) renderTrendChart(latestData);
+  }
+
+  listenEvent(trendCanvas, 'pointermove', updateChartHoverFromPointer, lifecycleAc.signal);
+  listenEvent(trendCanvas, 'pointerdown', updateChartHoverFromPointer, lifecycleAc.signal);
+  listenEvent(trendCanvas, 'pointerleave', clearChartHover, lifecycleAc.signal);
+  listenEvent(trendCanvas, 'pointercancel', clearChartHover, lifecycleAc.signal);
 
   for (const inputEl of [
     loginUserInput,
@@ -880,46 +1219,98 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
     cfgUnlockedCheck,
     cfgDsKeyInput,
   ]) {
-    inputEl.addEventListener('input', () => { draftDirty = true; });
-    inputEl.addEventListener('change', () => { draftDirty = true; });
+    listenEvent(inputEl, 'input', () => {
+      draftDirty = true;
+      if (inputEl === loginUserInput || inputEl === loginPassInput) {
+        inputEl.setAttribute('aria-invalid', 'false');
+      }
+    }, lifecycleAc.signal);
+    listenEvent(inputEl, 'change', () => {
+      draftDirty = true;
+    }, lifecycleAc.signal);
   }
 
-  loginBtn.addEventListener('click', () => {
+  function submitLogin(): void {
+    if (disposed || busy || appState.authExpired) return;
     const username = loginUserInput.value.trim();
     const password = loginPassInput.value;
     const areaCode = loginAreaInput.value.trim() || '86';
-    if (!username || !password) {
+    loginUserInput.setAttribute('aria-invalid', username ? 'false' : 'true');
+    loginPassInput.setAttribute('aria-invalid', password ? 'false' : 'true');
+    if (!username) {
       setBanner('请输入九号子账号手机号与登录密码。', true);
+      safeFocus(loginUserInput);
+      return;
+    }
+    if (!password) {
+      setBanner('请输入九号子账号手机号与登录密码。', true);
+      safeFocus(loginPassInput);
       return;
     }
     void runBusyAction('正在登录九号账号并自动发现绑定车辆…', async () => {
-      const res = await callPlugin('login', { username, password, areaCode }, 30_000);
-      setBanner(res.message || (res.ok ? '登录成功' : '登录失败'), !res.ok);
-      if (res.ok) {
+      let resOk = false;
+      try {
+        const res = await callPlugin('login', { username, password, areaCode }, 30_000);
+        resOk = res.ok;
+        setBanner(res.message || (res.ok ? '登录成功' : '登录失败'), !res.ok);
+        if (res.ok) {
+          draftDirty = false;
+          await callPlugin('status', {}, 30_000).catch(() => undefined);
+          await callPlugin('trips', { limit: 20 }, 30_000).catch(() => undefined);
+        }
+      } finally {
+        loginPassInput.value = '';
+        loginPassInput.setAttribute('aria-invalid', 'false');
+        if (resOk) {
+          draftDirty = false;
+        }
+      }
+      await refreshDashboard(false);
+    });
+  }
+
+  bindFormSubmission(loginForm, loginBtn, submitLogin, lifecycleAc.signal);
+
+  listenEvent(clearCredsBtn, 'click', () => {
+    if (disposed || busy || appState.authExpired) return;
+    void (async () => {
+      const confirmed = await confirmAction({
+        title: '清除九号账号凭据',
+        message: '确定要清除已保存的九号账号密码、本地会话及自动巡检凭据吗？',
+        confirmLabel: '确认清除',
+        cancelLabel: '取消',
+        danger: true,
+      });
+      if (!confirmed || disposed || busy || appState.authExpired) return;
+      await runBusyAction('正在清除已保存的账号密码与会话…', async () => {
+        const res = await callPlugin('config', { clearCredentials: true });
+        setBanner(res.message || (res.ok ? '已清除凭据' : '清除失败'), !res.ok);
         loginPassInput.value = '';
         draftDirty = false;
-        await callPlugin('status', {}, 30_000).catch(() => undefined);
-        await callPlugin('trips', { limit: 20 }, 30_000).catch(() => undefined);
-      }
-      await refreshDashboard();
-    });
-  });
+        await refreshDashboard(false);
+      });
+    })();
+  }, lifecycleAc.signal);
 
-  clearCredsBtn.addEventListener('click', () => {
-    void runBusyAction('正在清除已保存的账号密码与会话…', async () => {
-      const res = await callPlugin('config', { clearCredentials: true });
-      setBanner(res.message || (res.ok ? '已清除凭据' : '清除失败'), !res.ok);
-      loginPassInput.value = '';
-      draftDirty = false;
-      await refreshDashboard();
-    });
-  });
-
-  openGeoBtn.addEventListener('click', () => {
+  listenEvent(openGeoBtn, 'click', () => {
+    if (disposed) return;
     hooks.openSystemHubModal?.('services', 'amap');
-  });
+  }, lifecycleAc.signal);
 
-  cfgSaveBtn.addEventListener('click', () => {
+  function submitConfig(): void {
+    if (disposed || busy || appState.authExpired) return;
+    if (cfgForm) {
+      const maybeCheck = (cfgForm as { checkValidity?: () => boolean }).checkValidity;
+      if (typeof maybeCheck === 'function' && !maybeCheck.call(cfgForm)) {
+        const invalidEl = cfgForm.querySelector<HTMLElement>(':invalid');
+        if (invalidEl) {
+          invalidEl.setAttribute('aria-invalid', 'true');
+          safeFocus(invalidEl);
+        }
+        setBanner('请检查配置字段中的无效数值。', true);
+        return;
+      }
+    }
     void runBusyAction('正在保存九号守护配置…', async () => {
       const args: Record<string, unknown> = {
         preferredLine: cfgLineSelect.value === 'ebike' ? 'ebike' : 'motor',
@@ -937,57 +1328,130 @@ export function initNinebotUi(options: NinebotUiOptions): NinebotUiController {
         cfgDsKeyInput.value = '';
         draftDirty = false;
       }
-      await refreshDashboard();
+      await refreshDashboard(false);
     });
-  });
+  }
 
-  window.addEventListener('resize', () => {
-    if (active && options.isVisible() && latestData) {
-      renderTrendChart(latestData);
-    }
-  });
+  bindFormSubmission(cfgForm, cfgSaveBtn, submitConfig, lifecycleAc.signal);
 
   return {
     activate() {
+      if (disposed) return;
       active = true;
       draftDirty = false;
       ++badgeSeq;
+      badgeAc?.abort();
+      badgeAc = undefined;
+      activeAc?.abort();
+      activeAc = new AbortController();
       if (!appState.authExpired) {
-        void refreshDashboard();
+        void refreshDashboard(false);
       }
-      if (pollTimer) clearInterval(pollTimer);
-      pollTimer = setInterval(() => {
-        if (active && options.isVisible() && !appState.authExpired && !busy && !draftDirty && !isEditingWithin(panelEl)) {
-          void refreshDashboard();
-        }
-      }, 15_000);
-      themeObserver?.disconnect();
-      themeObserver = new MutationObserver(() => {
-        if (active && latestData) {
-          renderScooterShowroom(latestData.vehicleImages);
-          renderTrendChart(latestData);
-        }
-      });
-      themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
-    },
-    deactivate() {
-      active = false;
-      if (pollTimer) {
-        clearInterval(pollTimer);
-        pollTimer = undefined;
+      scheduleNextPoll();
+      if (typeof document !== 'undefined') {
+        listenEvent(
+          document,
+          'visibilitychange',
+          () => {
+            if (!active || disposed) return;
+            if (isDocumentHidden()) {
+              stopPolling();
+            } else {
+              scheduleNextPoll();
+              if (options.isVisible() && !appState.authExpired && !busy && !draftDirty && !isEditingWithin(panelEl)) {
+                void refreshDashboard(true);
+              }
+            }
+          },
+          activeAc.signal,
+        );
+      }
+      if (typeof window !== 'undefined') {
+        listenEvent(
+          window,
+          'friday:themechange',
+          () => {
+            if (!active || disposed || !latestData) return;
+            renderScooterShowroom(latestData.vehicleImages);
+            renderTrendChart(latestData);
+          },
+          activeAc.signal,
+        );
+      }
+      chartResizeObserver?.disconnect();
+      chartResizeObserver = undefined;
+      if (typeof ResizeObserver !== 'undefined') {
+        const chartTarget = trendCanvas.parentElement ?? trendCanvas;
+        chartResizeObserver = new ResizeObserver(() => {
+          scheduleChartRedraw();
+        });
+        chartResizeObserver.observe(chartTarget);
       }
       themeObserver?.disconnect();
       themeObserver = undefined;
+      if (typeof MutationObserver !== 'undefined' && typeof document !== 'undefined' && document.documentElement) {
+        themeObserver = new MutationObserver(() => {
+          if (active && !disposed && latestData) {
+            renderScooterShowroom(latestData.vehicleImages);
+            renderTrendChart(latestData);
+          }
+        });
+        themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+      }
+    },
+    deactivate() {
+      active = false;
+      stopPolling();
+      manualAc?.abort();
+      manualAc = undefined;
+      activeAc?.abort();
+      activeAc = undefined;
+      cancelScheduledChartRedraw();
+      chartResizeObserver?.disconnect();
+      chartResizeObserver = undefined;
+      themeObserver?.disconnect();
+      themeObserver = undefined;
+    },
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      active = false;
+      stopPolling();
+      manualAc?.abort();
+      manualAc = undefined;
+      badgeAc?.abort();
+      badgeAc = undefined;
+      activeAc?.abort();
+      activeAc = undefined;
+      cancelScheduledChartRedraw();
+      chartResizeObserver?.disconnect();
+      chartResizeObserver = undefined;
+      themeObserver?.disconnect();
+      themeObserver = undefined;
+      lifecycleAc.abort();
     },
     async refreshBadge() {
-      if (active || appState.authExpired) return;
+      if (disposed || active || appState.authExpired) return;
       const seq = ++badgeSeq;
+      badgeAc?.abort();
+      const ac = new AbortController();
+      badgeAc = ac;
       try {
-        const res = await callPlugin<NinebotDashboardPayload>('dashboard', { limit: 1 });
-        if (active || seq !== badgeSeq || appState.authExpired) return;
+        const res = await callPlugin<NinebotDashboardPayload>(
+          'dashboard',
+          { limit: 1 },
+          undefined,
+          { priority: 'low', signal: ac.signal },
+        );
+        if (disposed || ac.signal.aborted || active || seq !== badgeSeq || appState.authExpired) return;
         if (res.ok && res.data) updateTopBadge(res.data);
-      } catch {
+      } catch (err) {
+        if (isAbortError(err)) return;
         // Ignore badge refresh error
+      } finally {
+        if (badgeAc === ac) {
+          badgeAc = undefined;
+        }
       }
     },
   };

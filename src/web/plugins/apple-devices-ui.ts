@@ -1,6 +1,7 @@
 import { button, element, isEditingWithin, kpiCard, node, svgNode } from '../shared/dom.js';
 import { errorText, timestamp } from '../shared/format.js';
-import { api, appState, hooks } from '../state.js';
+import { announceStatus, attachDelayedFormValidation, confirmAction, safeFocus } from '../shared/ui-primitives.js';
+import { api, appState, hooks, type ApiRequestOptions } from '../state.js';
 
 export interface AppleDevicesUiOptions {
   isVisible: () => boolean;
@@ -10,6 +11,7 @@ export interface AppleDevicesUiController {
   activate: () => void;
   deactivate: () => void;
   refreshBadge: () => Promise<void>;
+  dispose: () => void;
 }
 
 interface ApplePlaceMatch {
@@ -108,12 +110,51 @@ const AUTH_STATE_DISPLAY: Record<string, { text: string; badgeClass: string }> =
   unauthenticated: { text: '未绑定', badgeClass: 'hub-badge badge-slate' },
 };
 
-async function runApplePlugin(action: string, args: Record<string, unknown> = {}): Promise<PluginRunEnvelope> {
+async function runApplePlugin(
+  action: string,
+  args: Record<string, unknown> = {},
+  reqOpts?: ApiRequestOptions,
+): Promise<PluginRunEnvelope> {
   return await api<PluginRunEnvelope>('/api/plugin-run', {
     plugin: 'apple-devices',
     action,
     args,
-  });
+  }, reqOpts);
+}
+
+function listenEvent(
+  target: EventTarget,
+  type: string,
+  handler: EventListenerOrEventListenerObject,
+  signal?: AbortSignal,
+): void {
+  if (signal?.aborted) return;
+  target.addEventListener(type, handler, signal ? { signal } : undefined);
+  if (signal) {
+    signal.addEventListener('abort', () => {
+      target.removeEventListener(type, handler);
+    }, { once: true });
+  }
+}
+
+function bindFormSubmission(
+  form: HTMLFormElement,
+  submitBtn: HTMLButtonElement,
+  onSubmit: () => void,
+  signal?: AbortSignal,
+): void {
+  attachDelayedFormValidation(form, signal);
+  listenEvent(form, 'submit', e => {
+    e.preventDefault();
+    onSubmit();
+  }, signal);
+  // FakeDOM fallback: FakeElement.click() on <button type="submit"> does not dispatch form 'submit'.
+  listenEvent(submitBtn, 'click', e => {
+    if (typeof form.requestSubmit !== 'function') {
+      e.preventDefault();
+      onSubmit();
+    }
+  }, signal);
 }
 
 function formatPlacesTextarea(places: ApplePluginConfig['places'] | undefined): string {
@@ -201,13 +242,14 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
   const statusBanner = element<HTMLElement>('apple-action-status');
   const authSection = element<HTMLElement>('apple-auth-section');
   const boundAccountEl = element<HTMLElement>('apple-bound-account');
+  const loginSubmitForm = element<HTMLFormElement>('apple-login-submit-form');
   const loginForm = element<HTMLElement>('apple-login-form');
   const loginActions = element<HTMLElement>('apple-login-actions');
   const regionSelect = element<HTMLSelectElement>('apple-region-select');
   const appleIdInput = element<HTMLInputElement>('apple-id-input');
   const passwordInput = element<HTMLInputElement>('apple-password-input');
   const loginBtn = element<HTMLButtonElement>('apple-login-btn');
-  const twoFaBox = element<HTMLElement>('apple-2fa-box');
+  const twoFaBox = element<HTMLFormElement>('apple-2fa-box');
   const twoFaPhonesEl = element<HTMLElement>('apple-2fa-phones');
   const twoFaCodeInput = element<HTMLInputElement>('apple-2fa-code-input');
   const twoFaModeSelect = element<HTMLSelectElement>('apple-2fa-mode-select');
@@ -218,6 +260,7 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
   const devicesSubtitle = element<HTMLElement>('apple-devices-subtitle');
   const devicesGrid = element<HTMLElement>('apple-devices-grid');
   const configDetails = element<HTMLDetailsElement>('apple-config-details');
+  const cfgForm = element<HTMLFormElement>('apple-cfg-form');
   const cfgCacheTtl = element<HTMLInputElement>('apple-cfg-cache-ttl');
   const cfgCooldown = element<HTMLInputElement>('apple-cfg-cooldown');
   const cfgMinBattery = element<HTMLInputElement>('apple-cfg-min-battery');
@@ -229,16 +272,26 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
   const openGeoBtn = element<HTMLButtonElement>('apple-open-geo-btn');
   const cfgSaveBtn = element<HTMLButtonElement>('apple-cfg-save-btn');
 
+  const lifecycleAc = new AbortController();
   let active = false;
+  let disposed = false;
   let busy = false;
   let statusSeq = 0;
+  let badgeSeq = 0;
+  let badgeAc: AbortController | null = null;
   let ringingId: string | null = null;
   let lastData: ApplePluginStatusData | undefined;
+  let lastStatusBanner = '';
 
   function setStatus(text: string, tone: 'ok' | 'warn' | 'err' = 'ok'): void {
+    const trimmed = text.trim();
     statusBanner.hidden = !text;
     statusBanner.textContent = text;
     statusBanner.className = `health-status-banner tone-${tone}`;
+    if (trimmed && trimmed !== lastStatusBanner && options.isVisible()) {
+      announceStatus(trimmed, tone === 'err' ? 'assertive' : 'polite');
+    }
+    lastStatusBanner = trimmed;
   }
 
   function resolveDeviceBadge(dev: AppleDeviceItem): { text: string; badgeClass: string } {
@@ -360,6 +413,9 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
     if (devices.length === 0) {
       devicesGrid.replaceChildren(node('p', authState === 'authenticated' ? '暂无设备缓存，请点击右上角「🔄 实时刷新」。' : '请先在上方绑定你的 Apple ID。', 'empty'));
     } else {
+      const focusedDeviceId = typeof document !== 'undefined' && devicesGrid.contains?.(document.activeElement)
+        ? ((document.activeElement as HTMLElement | null)?.dataset?.deviceId ?? null)
+        : null;
       const frag = document.createDocumentFragment();
       for (const dev of devices) {
         const card = node('article', '', 'hub-entity-card apple-device-card');
@@ -417,11 +473,21 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
           void handlePlaySound(dev);
         }, 'mini-button apple-ring-btn');
         ringBtn.dataset.soundCapable = String(dev.soundCapable !== false);
+        ringBtn.dataset.deviceId = dev.id;
+        ringBtn.setAttribute(
+          'aria-label',
+          ringingId === dev.id ? `正在向 ${dev.name} 发送提示音` : `播放 ${dev.name} 提示音`,
+        );
         actionsRow.append(ringBtn);
         card.append(actionsRow);
         frag.append(card);
       }
       devicesGrid.replaceChildren(frag);
+      if (focusedDeviceId) {
+        const targetBtn = Array.from(devicesGrid.querySelectorAll<HTMLButtonElement>('button.apple-ring-btn'))
+          .find(btn => btn.dataset.deviceId === focusedDeviceId);
+        if (targetBtn) safeFocus(targetBtn, { preventScroll: true });
+      }
     }
 
     if (data.geoConfigured === true) {
@@ -447,7 +513,7 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
   }
 
   async function loadStatus(mode: 'auto' | 'refresh' | 'cache' = 'auto', opts?: { preserveBanner?: boolean }): Promise<void> {
-    if (busy || appState.authExpired) return;
+    if (disposed || busy || appState.authExpired) return;
     const seq = ++statusSeq;
     setBusy(true);
     if (mode === 'refresh') {
@@ -455,11 +521,11 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
     }
     try {
       const res = mode === 'refresh'
-        ? await runApplePlugin('devices', { refresh: true })
+        ? await runApplePlugin('devices', { refresh: true }, { signal: lifecycleAc.signal })
         : mode === 'cache'
-          ? await runApplePlugin('status', { cacheOnly: true })
-          : await runApplePlugin('status', {});
-      if (seq !== statusSeq || appState.authExpired) return;
+          ? await runApplePlugin('status', { cacheOnly: true }, { signal: lifecycleAc.signal })
+          : await runApplePlugin('status', {}, { signal: lifecycleAc.signal });
+      if (disposed || seq !== statusSeq || appState.authExpired) return;
       busy = false;
       if (res.data) {
         render(res.data);
@@ -479,44 +545,49 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
         }
       }
     } catch (err) {
-      if (seq !== statusSeq || appState.authExpired) return;
+      if (disposed || seq !== statusSeq || appState.authExpired) return;
       if (!opts?.preserveBanner) {
         setStatus(`加载苹果设备状态失败：${errorText(err)}`, 'err');
       }
     } finally {
-      setBusy(false);
+      if (seq === statusSeq) setBusy(false);
     }
   }
 
   async function handlePlaySound(dev: AppleDeviceItem): Promise<void> {
-    if (busy || appState.authExpired) return;
+    if (disposed || busy || appState.authExpired) return;
     const seq = ++statusSeq;
     ringingId = dev.id;
     setBusy(true);
     if (lastData) render(lastData);
     setStatus(`正在向 ${dev.name} 发送 Find My 响铃指令…`, 'warn');
     try {
-      const res = await runApplePlugin('play-sound', { device: dev.id });
-      if (seq !== statusSeq || appState.authExpired) return;
+      const res = await runApplePlugin('play-sound', { device: dev.id }, { signal: lifecycleAc.signal });
+      if (disposed || seq !== statusSeq || appState.authExpired) return;
       setStatus(res.message || (res.ok ? `已触发 ${dev.name} 响铃` : '响铃失败'), res.ok ? 'ok' : 'err');
     } catch (err) {
-      if (seq !== statusSeq || appState.authExpired) return;
+      if (disposed || seq !== statusSeq || appState.authExpired) return;
       setStatus(`发送响铃失败：${errorText(err)}`, 'err');
     } finally {
-      ringingId = null;
-      busy = false;
-      if (lastData) render(lastData);
-      syncControlStates();
+      if (seq === statusSeq) {
+        ringingId = null;
+        busy = false;
+        if (lastData) render(lastData);
+        syncControlStates();
+      }
     }
   }
 
   async function handleLogin(): Promise<void> {
-    if (busy || appState.authExpired) return;
+    if (disposed || busy || appState.authExpired) return;
     const appleId = appleIdInput.value.trim();
     const password = passwordInput.value;
     const region = regionSelect.value === 'global' ? 'global' : 'cn';
+    appleIdInput.setAttribute('aria-invalid', appleId ? 'false' : 'true');
+    passwordInput.setAttribute('aria-invalid', password ? 'false' : 'true');
     if (!appleId || !password) {
       setStatus('请输入 Apple ID 账号与主密码。', 'warn');
+      safeFocus(!appleId ? appleIdInput : passwordInput);
       return;
     }
     const seq = ++statusSeq;
@@ -524,87 +595,99 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
     setBusy(true);
     setStatus('正在通过 SRP-6a 协议连接苹果认证服务器…', 'warn');
     try {
-      const res = await runApplePlugin('auth-login', { appleId, password, region });
-      if (seq !== statusSeq || appState.authExpired) return;
+      const res = await runApplePlugin('auth-login', { appleId, password, region }, { signal: lifecycleAc.signal });
+      if (disposed || seq !== statusSeq || appState.authExpired) return;
       busy = false;
       if (res.data) {
         render(res.data);
       }
       setStatus(res.message, res.ok ? (res.data?.authState === 'pending_2fa' ? 'warn' : 'ok') : 'err');
     } catch (err) {
-      if (seq !== statusSeq || appState.authExpired) return;
+      if (disposed || seq !== statusSeq || appState.authExpired) return;
       setStatus(`登录失败：${errorText(err)}`, 'err');
     } finally {
-      setBusy(false);
+      passwordInput.value = '';
+      if (seq === statusSeq) setBusy(false);
     }
   }
 
   async function handleSendSms(): Promise<void> {
-    if (busy || appState.authExpired) return;
+    if (disposed || busy || appState.authExpired) return;
     const seq = ++statusSeq;
     setBusy(true);
     setStatus('正在请求向受信任手机号发送短信验证码…', 'warn');
     try {
-      const res = await runApplePlugin('auth-sms', {});
-      if (seq !== statusSeq || appState.authExpired) return;
+      const res = await runApplePlugin('auth-sms', {}, { signal: lifecycleAc.signal });
+      if (disposed || seq !== statusSeq || appState.authExpired) return;
       busy = false;
       if (res.data) render(res.data);
       if (res.ok) twoFaModeSelect.value = 'sms';
       setStatus(res.message, res.ok ? 'ok' : 'err');
     } catch (err) {
-      if (seq !== statusSeq || appState.authExpired) return;
+      if (disposed || seq !== statusSeq || appState.authExpired) return;
       setStatus(`发送短信验证码失败：${errorText(err)}`, 'err');
     } finally {
-      setBusy(false);
+      if (seq === statusSeq) setBusy(false);
     }
   }
 
   async function handleVerify2fa(): Promise<void> {
-    if (busy || appState.authExpired) return;
+    if (disposed || busy || appState.authExpired) return;
     const code = twoFaCodeInput.value.trim();
     const mode = twoFaModeSelect.value === 'sms' ? 'sms' : 'trusted_device';
-    if (!/^\d{6}$/.test(code)) {
+    const validCode = /^\d{6}$/.test(code);
+    twoFaCodeInput.setAttribute('aria-invalid', validCode ? 'false' : 'true');
+    if (!validCode) {
       setStatus('请输入 6 位数字双重认证验证码。', 'warn');
+      safeFocus(twoFaCodeInput);
       return;
     }
     const seq = ++statusSeq;
     setBusy(true);
     setStatus('正在核验 6 位验证码并建立长期信任会话…', 'warn');
     try {
-      const res = await runApplePlugin('auth-verify', { code, mode });
-      if (seq !== statusSeq || appState.authExpired) return;
+      const res = await runApplePlugin('auth-verify', { code, mode }, { signal: lifecycleAc.signal });
+      if (disposed || seq !== statusSeq || appState.authExpired) return;
       if (res.ok) twoFaCodeInput.value = '';
       busy = false;
       if (res.data) render(res.data);
       setStatus(res.message, res.ok ? 'ok' : 'err');
     } catch (err) {
-      if (seq !== statusSeq || appState.authExpired) return;
+      if (disposed || seq !== statusSeq || appState.authExpired) return;
       setStatus(`2FA 验证失败：${errorText(err)}`, 'err');
     } finally {
-      setBusy(false);
+      if (seq === statusSeq) setBusy(false);
     }
   }
 
   async function handleLogout(): Promise<void> {
-    if (busy || appState.authExpired) return;
+    if (disposed || busy || appState.authExpired) return;
+    const confirmed = await confirmAction({
+      title: '退出 Apple ID 会话',
+      message: '确定退出当前 Apple ID 会话并清除本机缓存的查找认证状态吗？退出后需重新登录并完成双重认证。',
+      confirmLabel: '确认退出',
+      cancelLabel: '取消',
+      danger: true,
+    });
+    if (!confirmed || disposed || busy || appState.authExpired) return;
     const seq = ++statusSeq;
     setBusy(true);
     try {
-      const res = await runApplePlugin('logout', {});
-      if (seq !== statusSeq || appState.authExpired) return;
+      const res = await runApplePlugin('logout', {}, { signal: lifecycleAc.signal });
+      if (disposed || seq !== statusSeq || appState.authExpired) return;
       setStatus(res.message, res.ok ? 'ok' : 'err');
       busy = false;
       await loadStatus('cache', { preserveBanner: true });
     } catch (err) {
-      if (seq !== statusSeq || appState.authExpired) return;
+      if (disposed || seq !== statusSeq || appState.authExpired) return;
       setStatus(`退出失败：${errorText(err)}`, 'err');
     } finally {
-      setBusy(false);
+      if (seq === statusSeq) setBusy(false);
     }
   }
 
   async function handleSaveConfig(): Promise<void> {
-    if (busy || appState.authExpired) return;
+    if (disposed || busy || appState.authExpired) return;
     const seq = ++statusSeq;
     setBusy(true);
     try {
@@ -621,73 +704,95 @@ export function initAppleDevicesUi(options: AppleDevicesUiOptions): AppleDevices
         watchDevices,
         customAliases: parseAliasesTextarea(cfgAliases.value),
         places: parsePlacesTextarea(cfgPlaces.value),
-      });
-      if (seq !== statusSeq || appState.authExpired) return;
+      }, { signal: lifecycleAc.signal });
+      if (disposed || seq !== statusSeq || appState.authExpired) return;
       setStatus(res.message, res.ok ? 'ok' : 'err');
       busy = false;
       await loadStatus('auto', { preserveBanner: true });
     } catch (err) {
-      if (seq !== statusSeq || appState.authExpired) return;
+      if (disposed || seq !== statusSeq || appState.authExpired) return;
       setStatus(`保存配置失败：${errorText(err)}`, 'err');
     } finally {
-      setBusy(false);
+      if (seq === statusSeq) setBusy(false);
     }
   }
 
   async function handleBypass2fa(): Promise<void> {
-    if (busy || appState.authExpired) return;
+    if (disposed || busy || appState.authExpired) return;
     const seq = ++statusSeq;
     setBusy(true);
     setStatus('正在尝试 Find My 单因素免码直通通道…', 'warn');
     try {
-      const res = await runApplePlugin('auth-verify', { bypass2fa: true });
-      if (seq !== statusSeq || appState.authExpired) return;
+      const res = await runApplePlugin('auth-verify', { bypass2fa: true }, { signal: lifecycleAc.signal });
+      if (disposed || seq !== statusSeq || appState.authExpired) return;
       busy = false;
       if (res.data) render(res.data);
       setStatus(res.message, res.ok ? 'ok' : 'err');
     } catch (err) {
-      if (seq !== statusSeq || appState.authExpired) return;
+      if (disposed || seq !== statusSeq || appState.authExpired) return;
       setStatus(`免码直通失败：${errorText(err)}`, 'err');
     } finally {
-      setBusy(false);
+      if (seq === statusSeq) setBusy(false);
     }
   }
 
-  refreshBtn.addEventListener('click', () => { void loadStatus('refresh'); });
-  cachedBtn.addEventListener('click', () => { void loadStatus('cache'); });
-  loginBtn.addEventListener('click', () => { void handleLogin(); });
-  smsBtn.addEventListener('click', () => { void handleSendSms(); });
-  bypass2faBtn.addEventListener('click', () => { void handleBypass2fa(); });
-  twoFaVerifyBtn.addEventListener('click', () => { void handleVerify2fa(); });
-  logoutBtn.addEventListener('click', () => { void handleLogout(); });
-  cfgSaveBtn.addEventListener('click', () => { void handleSaveConfig(); });
-  openGeoBtn.addEventListener('click', () => { hooks.openSystemHubModal?.('services', 'amap'); });
+  listenEvent(refreshBtn, 'click', () => { void loadStatus('refresh'); }, lifecycleAc.signal);
+  listenEvent(cachedBtn, 'click', () => { void loadStatus('cache'); }, lifecycleAc.signal);
+  bindFormSubmission(loginSubmitForm, loginBtn, () => { void handleLogin(); }, lifecycleAc.signal);
+  listenEvent(smsBtn, 'click', () => { void handleSendSms(); }, lifecycleAc.signal);
+  listenEvent(bypass2faBtn, 'click', () => { void handleBypass2fa(); }, lifecycleAc.signal);
+  bindFormSubmission(twoFaBox, twoFaVerifyBtn, () => { void handleVerify2fa(); }, lifecycleAc.signal);
+  listenEvent(logoutBtn, 'click', () => { void handleLogout(); }, lifecycleAc.signal);
+  bindFormSubmission(cfgForm, cfgSaveBtn, () => { void handleSaveConfig(); }, lifecycleAc.signal);
+  listenEvent(openGeoBtn, 'click', () => { hooks.openSystemHubModal?.('services', 'amap'); }, lifecycleAc.signal);
+
+  function deactivate(): void {
+    active = false;
+    syncControlStates();
+  }
 
   return {
     activate: () => {
+      if (disposed) return;
       active = true;
+      ++badgeSeq;
+      badgeAc?.abort();
+      badgeAc = null;
       syncControlStates();
       if (options.isVisible()) {
         void loadStatus('auto');
       }
     },
-    deactivate: () => {
-      active = false;
-      syncControlStates();
-    },
+    deactivate,
     refreshBadge: async () => {
-      if (active || appState.authExpired) return;
-      const seq = ++statusSeq;
+      if (disposed || active || busy || appState.authExpired) return;
+      const bSeq = ++badgeSeq;
+      badgeAc?.abort();
+      const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      badgeAc = ac;
       try {
-        const res = await runApplePlugin('status', { cacheOnly: true });
-        if (active || seq !== statusSeq || appState.authExpired) return;
+        const res = await runApplePlugin('status', { cacheOnly: true }, {
+          priority: 'low',
+          ...(ac ? { signal: ac.signal } : {}),
+        });
+        if (disposed || active || busy || bSeq !== badgeSeq || appState.authExpired) return;
         if (res.data) {
           lastData = res.data;
           updateTopBadge(res.data);
         }
       } catch {
         // Silent badge refresh failure
+      } finally {
+        if (badgeAc === ac) badgeAc = null;
       }
+    },
+    dispose: () => {
+      if (disposed) return;
+      disposed = true;
+      deactivate();
+      badgeAc?.abort();
+      badgeAc = null;
+      lifecycleAc.abort();
     },
   };
 }

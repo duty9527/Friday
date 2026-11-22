@@ -1,6 +1,7 @@
 import { button, element, isEditingWithin, kpiCard, node } from '../shared/dom.js';
 import { errorText, timestamp } from '../shared/format.js';
-import { api, appState } from '../state.js';
+import { announceStatus, attachDelayedFormValidation, confirmAction, safeFocus } from '../shared/ui-primitives.js';
+import { api, appState, type ApiRequestOptions } from '../state.js';
 
 export interface LaifenUiOptions {
   isVisible: () => boolean;
@@ -10,6 +11,7 @@ export interface LaifenUiController {
   activate: () => void;
   deactivate: () => void;
   refreshBadge: () => Promise<void>;
+  dispose: () => void;
 }
 
 interface ModeSlot {
@@ -211,6 +213,44 @@ function formatLaifenDisplayName(raw?: string | null): string {
   return s && /[\u4e00-\u9fff]/.test(s) ? s : '徕芬电动牙刷';
 }
 
+function isDocHidden(): boolean {
+  return typeof document !== 'undefined' && Boolean(document.hidden);
+}
+
+function listenEvent(
+  target: EventTarget,
+  type: string,
+  handler: EventListenerOrEventListenerObject,
+  signal?: AbortSignal,
+): void {
+  if (signal?.aborted) return;
+  target.addEventListener(type, handler, signal ? { signal } : undefined);
+  if (signal) {
+    signal.addEventListener('abort', () => {
+      target.removeEventListener(type, handler);
+    }, { once: true });
+  }
+}
+
+function bindFormSubmission(
+  form: HTMLFormElement,
+  submitBtn: HTMLButtonElement,
+  onSubmit: () => void,
+  signal?: AbortSignal,
+): void {
+  attachDelayedFormValidation(form, signal);
+  listenEvent(form, 'submit', e => {
+    e.preventDefault();
+    onSubmit();
+  }, signal);
+  listenEvent(submitBtn, 'click', e => {
+    if (typeof form.requestSubmit !== 'function') {
+      e.preventDefault();
+      onSubmit();
+    }
+  }, signal);
+}
+
 export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
   const panelEl = element<HTMLElement>('plugin-panel-laifen');
   const topBadge = element<HTMLElement>('laifen-top-badge');
@@ -257,6 +297,7 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
   const sessionsSubtitleEl = element<HTMLElement>('laifen-sessions-subtitle');
   const sessionsListEl = element<HTMLElement>('laifen-sessions-list');
 
+  const cfgForm = element<HTMLFormElement>('laifen-cfg-form');
   const cfgMacInput = element<HTMLInputElement>('laifen-cfg-mac');
   const cfgPrefixInput = element<HTMLInputElement>('laifen-cfg-prefix');
   const cfgLifespanInput = element<HTMLInputElement>('laifen-cfg-lifespan');
@@ -268,17 +309,25 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
   const calLimpBtn = element<HTMLButtonElement>('laifen-cal-limp-btn');
   const calAlignBtn = element<HTMLButtonElement>('laifen-cal-align-btn');
 
+  const lifecycleAc = new AbortController();
+  let activeAc: AbortController | null = null;
+  let pollAc: AbortController | null = null;
+  let blePollAc: AbortController | null = null;
+  let badgeAc: AbortController | null = null;
   let active = false;
+  let disposed = false;
   let pollTimer: ReturnType<typeof setTimeout> | undefined;
   let liveTickTimer: ReturnType<typeof setInterval> | undefined;
-  let bleProgressTimer: ReturnType<typeof setInterval> | undefined;
+  let bleProgressTimer: ReturnType<typeof setTimeout> | undefined;
   let latestData: LaifenDashboardPayload | undefined;
   let selectedMode = 1;
+  let selectedPresetId = '';
   let draftDirty = false;
   let busy = false;
   let bleOpInFlight = false;
   let dashboardSeq = 0;
   let badgeSeq = 0;
+  let lastBannerText = '';
 
   // Dynamic strict-CSP UI elements injected into existing plugin panel
   const watchRow = node('div', '', 'modal-row-head');
@@ -341,9 +390,14 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
   }
 
   function setBanner(text: string, isError = false): void {
+    const trimmed = text.trim();
     statusBanner.textContent = text;
     statusBanner.classList.toggle('is-error', isError);
     statusBanner.hidden = !text;
+    if (trimmed && trimmed !== lastBannerText && options.isVisible()) {
+      announceStatus(trimmed, isError ? 'assertive' : 'polite');
+    }
+    lastBannerText = trimmed;
   }
 
   function buildSetArgs(extras: Record<string, unknown> = {}): Record<string, unknown> {
@@ -393,6 +447,8 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
     const live = data.liveSession;
     const shouldTick = Boolean(
       active
+      && !disposed
+      && !isDocHidden()
       && options.isVisible()
       && live
       && ACTIVE_LIVE_PHASES.has(live.phase)
@@ -404,7 +460,7 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
     }
     if (!liveTickTimer) {
       liveTickTimer = setInterval(() => {
-        if (!active || !options.isVisible() || !latestData?.liveSession?.brushingActive) {
+        if (!active || disposed || isDocHidden() || !options.isVisible() || !latestData?.liveSession?.brushingActive) {
           stopLiveTickTimer();
           return;
         }
@@ -418,6 +474,8 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
       clearTimeout(pollTimer);
       pollTimer = undefined;
     }
+    pollAc?.abort();
+    pollAc = null;
   }
 
   function isFastPollingNeeded(data?: LaifenDashboardPayload): boolean {
@@ -428,14 +486,14 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
 
   function schedulePoll(): void {
     stopPollTimer();
-    if (!active) return;
+    if (!active || disposed || isDocHidden()) return;
     const delay = isFastPollingNeeded(latestData) ? 1500 : 4000;
     pollTimer = setTimeout(() => {
       pollTimer = undefined;
-      if (!active) return;
+      if (!active || disposed || isDocHidden()) return;
       if (options.isVisible() && !appState.authExpired && !busy && !isEditingWithin(panelEl)) {
-        void refreshDashboard().finally(() => {
-          if (active && !pollTimer) schedulePoll();
+        void refreshDashboard({ background: true }).finally(() => {
+          if (active && !disposed && !isDocHidden() && !pollTimer) schedulePoll();
         });
       } else {
         schedulePoll();
@@ -500,6 +558,7 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
       watchBadgeEl.className = `hub-badge ${wBadge.cls}`;
       watchBadgeEl.textContent = wBadge.text;
       watchToggleBtn.textContent = watch.enabled ? '关闭自动唤醒' : '开启自动唤醒同步';
+      watchToggleBtn.setAttribute('aria-pressed', String(Boolean(watch.enabled)));
     }
 
     syncLiveTickTimer(data);
@@ -509,13 +568,14 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
     action: string,
     args: Record<string, unknown> = {},
     timeoutMs?: number,
+    reqOpts?: ApiRequestOptions,
   ): Promise<PluginRunResponse<T>> {
     return api<PluginRunResponse<T>>('/api/plugin-run', {
       plugin: 'laifen',
       action,
       args: { silent: true, ...args },
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
-    });
+    }, reqOpts);
   }
 
   function updateTopBadge(payload?: { batteryPct?: number | null; device?: LaifenDeviceState | null }): void {
@@ -537,19 +597,29 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
     const rawStr = Number(strengthInput.value);
     const clampedStr = isHf ? Math.max(11, Math.min(20, rawStr)) : Math.max(1, Math.min(10, rawStr));
     if (clampedStr !== rawStr) strengthInput.value = String(clampedStr);
+    const strengthText = `${clampedStr}${isHf ? ' 档（高频）' : ' 档'}`;
     strengthValEl.textContent = `${clampedStr}${isHf ? ' (高频)' : ''}`;
+    strengthInput.setAttribute('aria-valuetext', strengthText);
+
     rangeValEl.textContent = rangeInput.value;
+    rangeInput.setAttribute('aria-valuetext', `${rangeInput.value} 档`);
+
     speedValEl.textContent = speedInput.value;
+    speedInput.setAttribute('aria-valuetext', `${speedInput.value} 档`);
+
     const dur = Number(durationInput.value);
     const mins = (dur / 60).toFixed(dur % 60 === 0 ? 0 : 1);
     durationValEl.textContent = `${dur}s (${mins} 分钟)`;
+    durationInput.setAttribute('aria-valuetext', `${mins} 分钟（${dur} 秒）`);
   }
 
   function renderModePills(): void {
     const pills = modePillsEl.querySelectorAll<HTMLButtonElement>('button[data-mode]');
     for (const pill of pills) {
       const m = Number(pill.dataset.mode);
-      pill.classList.toggle('active', m === selectedMode);
+      const isActive = m === selectedMode;
+      pill.classList.toggle('active', isActive);
+      pill.setAttribute('aria-pressed', String(isActive));
     }
   }
 
@@ -661,9 +731,16 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
     // Presets
     presetPillsEl.replaceChildren();
     for (const preset of data.presets || []) {
+      const isSelected = preset.id === selectedPresetId;
       const btn = button(preset.label, () => {
+        selectedPresetId = preset.id;
         selectedMode = preset.mode;
         renderModePills();
+        for (const pill of presetPillsEl.querySelectorAll<HTMLButtonElement>('button')) {
+          const activePill = pill === btn;
+          pill.classList.toggle('active', activePill);
+          pill.setAttribute('aria-pressed', String(activePill));
+        }
         strengthInput.value = String(preset.strength);
         rangeInput.value = String(preset.range);
         speedInput.value = String(preset.speed);
@@ -671,7 +748,8 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
         draftDirty = true;
         syncSliderReadouts();
         setBanner(`已载入预设「${preset.label}」（Mode ${preset.mode}），可点「⚡ 唤醒并写入牙刷」或「📥 暂存」。`);
-      }, 'hub-filter-pill');
+      }, `hub-filter-pill${isSelected ? ' active' : ''}`);
+      btn.setAttribute('aria-pressed', String(isSelected));
       btn.title = preset.description;
       presetPillsEl.append(btn);
     }
@@ -715,25 +793,43 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
         ].filter(Boolean).join(' · ');
         left.append(titleLine, node('div', subText, 'meta'));
 
-        const delBtn = button('删除', async () => {
-          if (busy || appState.authExpired) return;
-          busy = true;
-          ++dashboardSeq;
-          try {
-            const res = await callPlugin<LaifenDashboardPayload & { dashboard?: LaifenDashboardPayload }>('session-delete', { id: s.id });
-            if (!res.ok) {
-              setBanner(res.message || '删除失败', true);
-            } else {
-              setBanner(res.message || '已删除记录');
-              if (res.data?.dashboard) renderDashboard(res.data.dashboard);
-              else await refreshDashboard();
+        const timeLabel = timestamp(s.brushedAt);
+        const delBtn = button('删除', () => {
+          void (async () => {
+            if (disposed || busy || appState.authExpired) return;
+            const confirmed = await confirmAction({
+              title: '删除刷牙记录',
+              message: `确定删除 ${timeLabel} 的刷牙记录（${s.durationSec} 秒）吗？`,
+              confirmLabel: '确认删除',
+              cancelLabel: '取消',
+              danger: true,
+            });
+            if (!confirmed || disposed || busy || appState.authExpired) return;
+            busy = true;
+            ++dashboardSeq;
+            try {
+              const res = await callPlugin<LaifenDashboardPayload & { dashboard?: LaifenDashboardPayload }>(
+                'session-delete',
+                { id: s.id },
+                undefined,
+                { signal: lifecycleAc.signal },
+              );
+              if (disposed || appState.authExpired) return;
+              if (!res.ok) {
+                setBanner(res.message || '删除失败', true);
+              } else {
+                setBanner(res.message || '已删除记录');
+                if (res.data?.dashboard) renderDashboard(res.data.dashboard);
+                else await refreshDashboard();
+              }
+            } catch (err) {
+              if (!disposed && !appState.authExpired) setBanner(errorText(err), true);
+            } finally {
+              busy = false;
             }
-          } catch (err) {
-            setBanner(errorText(err), true);
-          } finally {
-            busy = false;
-          }
+          })();
         }, 'mini-button');
+        delBtn.setAttribute('aria-label', `删除 ${timeLabel} 的刷牙记录`);
         row.append(left, delBtn);
         listFrag.append(row);
       }
@@ -741,57 +837,94 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
     }
   }
 
-  async function refreshDashboard(): Promise<void> {
-    if (appState.authExpired) return;
+  async function refreshDashboard(opts: { background?: boolean } = {}): Promise<void> {
+    if (disposed || appState.authExpired) return;
     const seq = ++dashboardSeq;
+    let ac: AbortController | null = null;
+    if (opts.background) {
+      pollAc?.abort();
+      ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      pollAc = ac;
+    }
+    const reqOpts: ApiRequestOptions = {
+      ...(opts.background ? { priority: 'low' } : {}),
+      signal: ac ? ac.signal : lifecycleAc.signal,
+    };
     try {
-      const res = await callPlugin<LaifenDashboardPayload>('dashboard', { limit: 30 });
-      if (seq !== dashboardSeq || appState.authExpired) return;
+      const res = await callPlugin<LaifenDashboardPayload>('dashboard', { limit: 30 }, undefined, reqOpts);
+      if (disposed || seq !== dashboardSeq || appState.authExpired) return;
       if (res.ok && res.data) {
         renderDashboard(res.data);
-        if (active) schedulePoll();
+        if (active && !isDocHidden()) schedulePoll();
       } else if (!res.ok) {
         setBanner(res.message || '读取口腔护理看板失败', true);
       }
     } catch (err) {
-      if (seq !== dashboardSeq || appState.authExpired) return;
+      if (ac?.signal.aborted || (err instanceof Error && err.name === 'AbortError')) return;
+      if (disposed || seq !== dashboardSeq || appState.authExpired) return;
       setBanner(errorText(err), true);
+    } finally {
+      if (ac && pollAc === ac) pollAc = null;
     }
   }
 
   async function runBusyAction(label: string, fn: () => Promise<void>): Promise<void> {
-    if (busy || appState.authExpired) return;
+    if (disposed || busy || appState.authExpired) return;
     busy = true;
     ++dashboardSeq;
     setBanner(label);
     try {
       await fn();
     } catch (err) {
-      setBanner(errorText(err), true);
+      if (!disposed && !appState.authExpired) setBanner(errorText(err), true);
     } finally {
       busy = false;
     }
   }
 
   function stopBleProgressPolling(): void {
-    if (bleProgressTimer) {
-      clearInterval(bleProgressTimer);
+    if (bleProgressTimer !== undefined) {
+      clearTimeout(bleProgressTimer);
       bleProgressTimer = undefined;
     }
+    blePollAc?.abort();
+    blePollAc = null;
+  }
+
+  function scheduleBleProgressPoll(): void {
+    stopBleProgressPolling();
+    if (disposed || !bleOpInFlight || !active || !options.isVisible() || isDocHidden()) return;
+    bleProgressTimer = setTimeout(() => {
+      bleProgressTimer = undefined;
+      void pollBleProgressOnce();
+    }, 900);
   }
 
   async function pollBleProgressOnce(): Promise<void> {
-    if (!bleOpInFlight || !active || !options.isVisible()) return;
+    if (disposed || !bleOpInFlight || !active || !options.isVisible() || isDocHidden()) return;
+    blePollAc?.abort();
+    const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    blePollAc = ac;
     try {
-      const res = await callPlugin<LaifenDashboardPayload>('dashboard', { limit: 10 });
-      if (!bleOpInFlight || !res.ok || !res.data) return;
+      const res = await callPlugin<LaifenDashboardPayload>(
+        'dashboard',
+        { limit: 10 },
+        undefined,
+        { priority: 'low', ...(ac ? { signal: ac.signal } : {}) },
+      );
+      if (disposed || !bleOpInFlight || !res.ok || !res.data) return;
       renderHeroLiveState(res.data);
       const liveMsg = res.data.liveSession?.message;
       if (liveMsg && ACTIVE_LIVE_PHASES.has(res.data.liveSession?.phase || '')) {
         setBanner(liveMsg);
       }
     } catch {
-      // ignore transient progress poll errors
+      // ignore transient or aborted progress poll errors
+    } finally {
+      if (blePollAc === ac) blePollAc = null;
+      if (!disposed && bleOpInFlight && active && options.isVisible() && !isDocHidden()) {
+        scheduleBleProgressPoll();
+      }
     }
   }
 
@@ -799,10 +932,7 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
     await runBusyAction(label, async () => {
       bleOpInFlight = true;
       if (latestData) renderHeroLiveState(latestData);
-      stopBleProgressPolling();
-      bleProgressTimer = setInterval(() => {
-        void pollBleProgressOnce();
-      }, 900);
+      scheduleBleProgressPoll();
       try {
         await fn();
       } finally {
@@ -812,14 +942,21 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
     });
   }
 
-  modePillsEl.addEventListener('click', ev => {
+  syncSliderReadouts();
+
+  listenEvent(modePillsEl, 'click', ev => {
     const btn = (ev.target as HTMLElement).closest<HTMLButtonElement>('button[data-mode]');
     if (!btn) return;
     const mode = Number(btn.dataset.mode);
     if (mode >= 1 && mode <= 4) {
       selectedMode = mode;
+      selectedPresetId = '';
       draftDirty = true;
       renderModePills();
+      for (const pill of presetPillsEl.querySelectorAll<HTMLButtonElement>('button')) {
+        pill.classList.remove('active');
+        pill.setAttribute('aria-pressed', 'false');
+      }
       const slot = latestData?.device?.modes?.[String(mode)];
       if (slot) {
         strengthInput.value = String(slot.strength);
@@ -829,176 +966,249 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
       if (mode === 4) hfCheck.checked = true;
       syncSliderReadouts();
     }
-  });
+  }, lifecycleAc.signal);
 
   for (const inputEl of [strengthInput, rangeInput, speedInput, durationInput]) {
-    inputEl.addEventListener('input', () => {
+    listenEvent(inputEl, 'input', () => {
+      selectedPresetId = '';
       draftDirty = true;
       syncSliderReadouts();
-    });
+    }, lifecycleAc.signal);
   }
   for (const checkEl of [hfCheck, reminderCheck, airplaneCheck, deepCleanCheck, antiSplashCheck, rampUpCheck, bristleCheck, wakeCheck, overPressureSelect]) {
-    checkEl.addEventListener('change', () => {
+    listenEvent(checkEl, 'change', () => {
       draftDirty = true;
-    });
+    }, lifecycleAc.signal);
   }
   for (const cfgInput of [cfgMacInput, cfgPrefixInput, cfgLifespanInput, cfgGoalInput]) {
-    cfgInput.addEventListener('input', () => {
+    listenEvent(cfgInput, 'input', () => {
       draftDirty = true;
-    });
+    }, lifecycleAc.signal);
   }
 
-  refreshBtn.addEventListener('click', () => {
+  listenEvent(refreshBtn, 'click', () => {
     draftDirty = false;
     void refreshDashboard();
-  });
+  }, lifecycleAc.signal);
 
-  scanBtn.addEventListener('click', () => {
+  listenEvent(scanBtn, 'click', () => {
     void runBusyAction('正在扫描周围唤醒中的徕芬牙刷（请拿起或按亮牙刷）…', async () => {
-      const res = await callPlugin('scan', { timeoutSec: 5, bind: true }, 25_000);
+      const res = await callPlugin('scan', { timeoutSec: 5, bind: true }, 25_000, { signal: lifecycleAc.signal });
       setBanner(res.message || (res.ok ? '扫描完成' : '扫描失败'), !res.ok);
       draftDirty = false;
       await refreshDashboard();
     });
-  });
+  }, lifecycleAc.signal);
 
-  syncBtn.addEventListener('click', () => {
+  listenEvent(syncBtn, 'click', () => {
     void runBleOpWithProgress('请拿起或轻按牙刷亮灯，正在等待蓝牙连接同步（25秒窗口）…', async () => {
-      const res = await callPlugin('sync', { timeoutSec: 25 }, 60_000);
+      const res = await callPlugin('sync', { timeoutSec: 25 }, 60_000, { signal: lifecycleAc.signal });
       setBanner(res.message || (res.ok ? '同步成功' : '同步失败'), !res.ok);
       if (res.ok) draftDirty = false;
       await refreshDashboard();
     });
-  });
+  }, lifecycleAc.signal);
 
-  applyBtn.addEventListener('click', () => {
+  listenEvent(applyBtn, 'click', () => {
     void runBleOpWithProgress('请保持牙刷唤醒亮灯，正在写入并校验参数…', async () => {
-      const res = await callPlugin('set', buildSetArgs({ timeoutSec: 25, queueIfAsleep: true }), 60_000);
+      const res = await callPlugin('set', buildSetArgs({ timeoutSec: 25, queueIfAsleep: true }), 60_000, { signal: lifecycleAc.signal });
       setBanner(res.message || (res.ok ? '写入并校验完成' : '写入失败'), !res.ok);
       if (res.ok) draftDirty = false;
       await refreshDashboard();
     });
-  });
+  }, lifecycleAc.signal);
 
-  monitorStartBtn.addEventListener('click', () => {
+  listenEvent(monitorStartBtn, 'click', () => {
     void runBusyAction('正在启动后台刷牙监听会话…', async () => {
-      const res = await callPlugin('monitor-start', { timeoutSec: 360 });
+      const res = await callPlugin('monitor-start', { timeoutSec: 360 }, undefined, { signal: lifecycleAc.signal });
       setBanner(res.message || (res.ok ? '已启动监听' : '启动监听失败'), !res.ok);
       await refreshDashboard();
     });
-  });
+  }, lifecycleAc.signal);
 
-  monitorStopBtn.addEventListener('click', () => {
-    if (appState.authExpired) return;
+  listenEvent(monitorStopBtn, 'click', () => {
+    if (disposed || appState.authExpired) return;
     // Allow cancelling even while sync/set/power is waiting in runBleOpWithProgress
     monitorStopBtn.disabled = true;
     setBanner('正在停止蓝牙等待…');
-    void callPlugin('monitor-stop', {})
+    void callPlugin('monitor-stop', {}, undefined, { signal: lifecycleAc.signal })
       .then(async res => {
-        if (appState.authExpired) return;
+        if (disposed || appState.authExpired) return;
         setBanner(res.message || (res.ok ? '已停止等待' : '停止失败'), !res.ok);
         if (!bleOpInFlight) await refreshDashboard();
       })
       .catch(err => {
-        if (!appState.authExpired) setBanner(errorText(err), true);
+        if (!disposed && !appState.authExpired) setBanner(errorText(err), true);
       })
       .finally(() => {
         monitorStopBtn.disabled = appState.authExpired;
       });
-  });
+  }, lifecycleAc.signal);
 
-  checkinBtn.addEventListener('click', () => {
+  listenEvent(checkinBtn, 'click', () => {
     void runBusyAction('正在记录本次刷牙打卡…', async () => {
       const res = await callPlugin('session-add', {
         durationSec: Number(durationInput.value) || 180,
         mode: selectedMode,
         note: '面板手动打卡',
-      });
+      }, undefined, { signal: lifecycleAc.signal });
       setBanner(res.message || (res.ok ? '打卡成功' : '打卡失败'), !res.ok);
       await refreshDashboard();
     });
-  });
+  }, lifecycleAc.signal);
 
-  brushheadResetBtn.addEventListener('click', () => {
-    void runBusyAction('正在重置刷头寿命计时…', async () => {
-      const res = await callPlugin('brushhead-reset', {});
-      setBanner(res.message || (res.ok ? '已重置刷头寿命' : '重置失败'), !res.ok);
-      await refreshDashboard();
-    });
-  });
+  listenEvent(brushheadResetBtn, 'click', () => {
+    void (async () => {
+      if (disposed || busy || appState.authExpired) return;
+      const confirmed = await confirmAction({
+        title: '重置刷头寿命计时',
+        message: '确定将当前刷头已使用天数与次数清零并从今天重新计算吗？',
+        confirmLabel: '确认重置',
+        cancelLabel: '取消',
+        danger: true,
+      });
+      if (!confirmed || disposed || appState.authExpired) return;
+      void runBusyAction('正在重置刷头寿命计时…', async () => {
+        const res = await callPlugin('brushhead-reset', {}, undefined, { signal: lifecycleAc.signal });
+        setBanner(res.message || (res.ok ? '已重置刷头寿命' : '重置失败'), !res.ok);
+        await refreshDashboard();
+      });
+    })();
+  }, lifecycleAc.signal);
 
-  cfgSaveBtn.addEventListener('click', () => {
+  function saveLaifenConfig(): void {
+    if (disposed || appState.authExpired) return;
+    cfgLifespanInput.setAttribute('aria-invalid', 'false');
+    cfgGoalInput.setAttribute('aria-invalid', 'false');
+    const lifespan = Number(cfgLifespanInput.value);
+    if (!Number.isFinite(lifespan) || lifespan < 15 || lifespan > 365) {
+      cfgLifespanInput.setAttribute('aria-invalid', 'true');
+      setBanner('刷头更换周期需在 15 ~ 365 天之间。', true);
+      safeFocus(cfgLifespanInput);
+      return;
+    }
+    const goal = Number(cfgGoalInput.value);
+    if (!Number.isFinite(goal) || goal < 1 || goal > 6) {
+      cfgGoalInput.setAttribute('aria-invalid', 'true');
+      setBanner('每日目标刷牙次数需在 1 ~ 6 次之间。', true);
+      safeFocus(cfgGoalInput);
+      return;
+    }
     void runBusyAction('正在保存牙刷配置…', async () => {
       const res = await callPlugin('config', {
         targetMac: cfgMacInput.value.trim(),
         namePrefix: cfgPrefixInput.value.trim() || 'LFTB',
-        brushHeadLifespanDays: Number(cfgLifespanInput.value) || 90,
-        dailyGoalCount: Number(cfgGoalInput.value) || 2,
-      });
+        brushHeadLifespanDays: lifespan,
+        dailyGoalCount: goal,
+      }, undefined, { signal: lifecycleAc.signal });
       setBanner(res.message || (res.ok ? '配置已保存' : '配置保存失败'), !res.ok);
       if (res.ok) draftDirty = false;
       await refreshDashboard();
     });
-  });
+  }
 
-  powerOnBtn.addEventListener('click', () => {
+  bindFormSubmission(cfgForm, cfgSaveBtn, saveLaifenConfig, lifecycleAc.signal);
+
+  listenEvent(powerOnBtn, 'click', () => {
     void runBleOpWithProgress('请唤醒牙刷，正在发送电机启动指令…', async () => {
-      const res = await callPlugin('power', { on: true, timeoutSec: 25 }, 60_000);
+      const res = await callPlugin('power', { on: true, timeoutSec: 25 }, 60_000, { signal: lifecycleAc.signal });
       setBanner(res.message || (res.ok ? '电机已启动' : '控制失败'), !res.ok);
       await refreshDashboard();
     });
-  });
+  }, lifecycleAc.signal);
 
-  powerOffBtn.addEventListener('click', () => {
+  listenEvent(powerOffBtn, 'click', () => {
     void runBleOpWithProgress('正在发送电机停止指令…', async () => {
-      const res = await callPlugin('power', { on: false, timeoutSec: 25 }, 60_000);
+      const res = await callPlugin('power', { on: false, timeoutSec: 25 }, 60_000, { signal: lifecycleAc.signal });
       setBanner(res.message || (res.ok ? '电机已停止' : '控制失败'), !res.ok);
       await refreshDashboard();
     });
-  });
+  }, lifecycleAc.signal);
 
-  calLimpBtn.addEventListener('click', () => {
+  listenEvent(calLimpBtn, 'click', () => {
     void runBleOpWithProgress('正在切换刷头松弛对准模式…', async () => {
-      const res = await callPlugin('power', { calibration: 'limp', timeoutSec: 25 }, 60_000);
+      const res = await callPlugin('power', { calibration: 'limp', timeoutSec: 25 }, 60_000, { signal: lifecycleAc.signal });
       setBanner(res.message || (res.ok ? '已进入松弛对准' : '操作失败'), !res.ok);
     });
-  });
+  }, lifecycleAc.signal);
 
-  calAlignBtn.addEventListener('click', () => {
+  listenEvent(calAlignBtn, 'click', () => {
     void runBleOpWithProgress('正在执行刷头零位校准…', async () => {
-      const res = await callPlugin('power', { calibration: 'calibrate', timeoutSec: 25 }, 60_000);
+      const res = await callPlugin('power', { calibration: 'calibrate', timeoutSec: 25 }, 60_000, { signal: lifecycleAc.signal });
       setBanner(res.message || (res.ok ? '校准完成' : '校准失败'), !res.ok);
     });
-  });
+  }, lifecycleAc.signal);
+
+  function deactivate(): void {
+    active = false;
+    activeAc?.abort();
+    activeAc = null;
+    stopLiveTickTimer();
+    stopBleProgressPolling();
+    stopPollTimer();
+  }
 
   return {
     activate() {
+      if (disposed) return;
       active = true;
       draftDirty = false;
       ++badgeSeq;
+      badgeAc?.abort();
+      badgeAc = null;
+      activeAc?.abort();
+      activeAc = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      if (typeof document !== 'undefined' && activeAc) {
+        listenEvent(document, 'visibilitychange', () => {
+          if (!active || disposed) return;
+          if (isDocHidden()) {
+            stopLiveTickTimer();
+            stopPollTimer();
+            stopBleProgressPolling();
+          } else {
+            if (!appState.authExpired && options.isVisible() && !busy && !isEditingWithin(panelEl)) {
+              void refreshDashboard({ background: true });
+            }
+            if (bleOpInFlight) scheduleBleProgressPoll();
+            if (latestData) syncLiveTickTimer(latestData);
+          }
+        }, activeAc.signal);
+      }
       if (!appState.authExpired) {
         void refreshDashboard();
       }
       schedulePoll();
     },
-    deactivate() {
-      active = false;
-      stopLiveTickTimer();
-      stopBleProgressPolling();
-      stopPollTimer();
-    },
+    deactivate,
     async refreshBadge() {
-      if (active || appState.authExpired) return;
+      if (disposed || active || appState.authExpired) return;
       const seq = ++badgeSeq;
+      badgeAc?.abort();
+      const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      badgeAc = ac;
       try {
-        const res = await callPlugin<LaifenDashboardPayload>('status', {});
-        if (active || seq !== badgeSeq || appState.authExpired) return;
+        const res = await callPlugin<LaifenDashboardPayload>('status', {}, undefined, {
+          priority: 'low',
+          ...(ac ? { signal: ac.signal } : {}),
+        });
+        if (disposed || active || seq !== badgeSeq || appState.authExpired) return;
         if (res.ok && res.data) updateTopBadge(res.data);
-      } catch {
-        if (!active && seq === badgeSeq && !appState.authExpired) {
+      } catch (err) {
+        if (ac?.signal.aborted || (err instanceof Error && err.name === 'AbortError')) return;
+        if (!disposed && !active && seq === badgeSeq && !appState.authExpired) {
           topBadge.textContent = '—';
         }
+      } finally {
+        if (badgeAc === ac) badgeAc = null;
       }
+    },
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      deactivate();
+      badgeAc?.abort();
+      badgeAc = null;
+      lifecycleAc.abort();
     },
   };
 }

@@ -1,6 +1,7 @@
 import { button, element, isEditingWithin, kpiCard, node } from '../shared/dom.js';
 import { errorText, timestamp } from '../shared/format.js';
-import { api, appState } from '../state.js';
+import { announceStatus, attachDelayedFormValidation, prefersReducedMotion, safeFocus } from '../shared/ui-primitives.js';
+import { api, appState, type ApiRequestOptions } from '../state.js';
 
 export interface FundTrackerUiOptions {
   isVisible: () => boolean;
@@ -10,6 +11,7 @@ export interface FundTrackerUiController {
   activate: () => void;
   deactivate: () => void;
   refreshBadge: () => Promise<void>;
+  dispose: () => void;
 }
 
 interface FundHoldingRow {
@@ -147,7 +149,7 @@ const PRIVACY_STORAGE_KEY = 'friday.fund.privacy';
 
 function readPrivacyPref(): boolean {
   try {
-    return window.localStorage.getItem(PRIVACY_STORAGE_KEY) === '1';
+    return typeof window !== 'undefined' ? window.localStorage.getItem(PRIVACY_STORAGE_KEY) === '1' : false;
   } catch {
     return false;
   }
@@ -155,10 +157,48 @@ function readPrivacyPref(): boolean {
 
 function writePrivacyPref(value: boolean): void {
   try {
-    window.localStorage.setItem(PRIVACY_STORAGE_KEY, value ? '1' : '0');
+    if (typeof window !== 'undefined') window.localStorage.setItem(PRIVACY_STORAGE_KEY, value ? '1' : '0');
   } catch {
     // Ignore storage quota / restriction errors
   }
+}
+
+function listenEvent(
+  target: EventTarget,
+  type: string,
+  handler: EventListenerOrEventListenerObject,
+  signal?: AbortSignal,
+): void {
+  if (signal?.aborted) return;
+  target.addEventListener(type, handler, signal ? { signal } : undefined);
+  if (signal) {
+    signal.addEventListener('abort', () => {
+      target.removeEventListener(type, handler);
+    }, { once: true });
+  }
+}
+
+function bindFormSubmission(
+  form: HTMLFormElement,
+  submitBtn: HTMLButtonElement,
+  onSubmit: () => void,
+  signal?: AbortSignal,
+): void {
+  attachDelayedFormValidation(form, signal);
+  listenEvent(form, 'submit', e => {
+    e.preventDefault();
+    onSubmit();
+  }, signal);
+  listenEvent(submitBtn, 'click', e => {
+    if (typeof form.requestSubmit !== 'function') {
+      e.preventDefault();
+      onSubmit();
+    }
+  }, signal);
+}
+
+function scrollRespectingMotion(el: HTMLElement): void {
+  el.scrollIntoView?.({ behavior: prefersReducedMotion() ? 'auto' : 'smooth', block: 'nearest' });
 }
 
 function formatMoney(n: number, privacy: boolean): string {
@@ -227,6 +267,7 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
   const fundHoldingsList = element<HTMLElement>('fund-holdings-list');
   const fundFormDetails = element<HTMLDetailsElement>('fund-form-details');
   const fundFormSummary = element<HTMLElement>('fund-form-summary');
+  const fundHoldingForm = element<HTMLFormElement>('fund-holding-form');
   const fundEditOriginalCode = element<HTMLInputElement>('fund-edit-original-code');
   const fundFormCode = element<HTMLInputElement>('fund-form-code');
   const fundFormName = element<HTMLInputElement>('fund-form-name');
@@ -240,6 +281,15 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
   const fundFormInitDate = element<HTMLInputElement>('fund-form-init-date');
   const fundFormResetBtn = element<HTMLButtonElement>('fund-form-reset-btn');
   const fundFormSaveBtn = element<HTMLButtonElement>('fund-form-save-btn');
+
+  fundTrendCanvas.setAttribute('aria-describedby', 'fund-trend-caption');
+
+  const lifecycleAc = new AbortController();
+  let activeAc: AbortController | null = null;
+  let resizeObserver: ResizeObserver | null = null;
+  let resizeRafId: number | null = null;
+  let quietFetchAc: AbortController | null = null;
+  let disposed = false;
 
   const deleteArmed = new Map<string, number>();
   const deleteArmedTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -257,6 +307,7 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
   let lastChartCssH = 220;
   let busy = false;
   let requestSeq = 0;
+  let lastStatusBanner = '';
 
   function clearHoldingDeleteArm(code: string) {
     deleteArmed.delete(code);
@@ -281,23 +332,39 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
   }
 
   function setActionStatus(text = '', tone: '' | 'ok' | 'warn' | 'err' = '') {
+    const trimmed = text.trim();
     if (!text) {
       fundActionStatus.hidden = true;
       fundActionStatus.textContent = '';
       fundActionStatus.className = 'health-status-banner';
+      lastStatusBanner = '';
       return;
     }
     fundActionStatus.hidden = false;
     fundActionStatus.textContent = text;
     fundActionStatus.className = `health-status-banner${tone ? ` tone-${tone}` : ''}`;
+    if (trimmed && trimmed !== lastStatusBanner && options.isVisible()) {
+      announceStatus(trimmed, tone === 'err' ? 'assertive' : 'polite');
+    }
+    lastStatusBanner = trimmed;
   }
 
-  async function runFundPlugin<T>(action: string, args: Record<string, unknown> = {}): Promise<FundPluginResponse<T>> {
+  async function runFundPlugin<T>(
+    action: string,
+    args: Record<string, unknown> = {},
+    reqOpts?: ApiRequestOptions,
+  ): Promise<FundPluginResponse<T>> {
     return api<FundPluginResponse<T>>('/api/plugin-run', {
       plugin: 'fund-tracker',
       action,
       args,
-    });
+    }, reqOpts);
+  }
+
+  function clearFormInvalidStates() {
+    for (const field of [fundFormCode, fundFormName, fundFormCost, fundFormShares, fundFormRatio, fundFormInitNav]) {
+      field.setAttribute('aria-invalid', 'false');
+    }
   }
 
   function resetForm(openAfter = false) {
@@ -313,6 +380,7 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
     fundFormRatio.value = '';
     fundFormInitNav.value = '';
     fundFormInitDate.value = '';
+    clearFormInvalidStates();
     fundFormSummary.textContent = '➕ 新增或修改股票 / 基金持仓';
     if (openAfter) {
       fundFormDetails.open = true;
@@ -332,10 +400,11 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
     fundFormRatio.value = String(cfg.positionRatio);
     fundFormInitNav.value = String(cfg.initNav);
     fundFormInitDate.value = cfg.initNavDate;
+    clearFormInvalidStates();
     fundFormSummary.textContent = `✏️ 正在修改持仓：${cfg.name} (${cfg.code})`;
     fundFormDetails.open = true;
-    fundFormDetails.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    fundFormCost.focus();
+    scrollRespectingMotion(fundFormDetails);
+    safeFocus(fundFormCost);
   }
 
   function renderTopBadge() {
@@ -398,6 +467,7 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
 
     fundPrivacyBtn.textContent = privacyMode ? '👁 显示金额' : '👁 隐藏金额';
     fundPrivacyBtn.classList.toggle('active', privacyMode);
+    fundPrivacyBtn.setAttribute('aria-pressed', String(privacyMode));
 
     if (lastDataMode === 'settle') {
       fundModeBadge.textContent = '🌙 晚间结算';
@@ -458,10 +528,14 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
 
   function renderTrendControls() {
     for (const btn of fundTrendMetrics.querySelectorAll<HTMLButtonElement>('button[data-metric]')) {
-      btn.classList.toggle('active', btn.dataset.metric === trendMetric);
+      const isActive = btn.dataset.metric === trendMetric;
+      btn.classList.toggle('active', isActive);
+      btn.setAttribute('aria-pressed', String(isActive));
     }
     for (const btn of fundTrendRanges.querySelectorAll<HTMLButtonElement>('button[data-range]')) {
-      btn.classList.toggle('active', Number(btn.dataset.range) === trendLimit);
+      const isActive = Number(btn.dataset.range) === trendLimit;
+      btn.classList.toggle('active', isActive);
+      btn.setAttribute('aria-pressed', String(isActive));
     }
     renderNavSelector();
   }
@@ -476,7 +550,8 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
     const cssH = Math.max(180, Math.round(rect.height || canvas.clientHeight || 220));
     lastChartCssW = cssW;
     lastChartCssH = cssH;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const rawDpr = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
+    const dpr = Math.min(rawDpr, 2);
     if (canvas.width !== cssW * dpr || canvas.height !== cssH * dpr) {
       canvas.width = cssW * dpr;
       canvas.height = cssH * dpr;
@@ -484,6 +559,10 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cssW, cssH);
     plottedPoints = [];
+
+    const isIndustrial = typeof document !== 'undefined' && document.documentElement?.dataset?.theme === 'industrial';
+    const axisTextCol = isIndustrial ? '#52525b' : '#94a3b8';
+    const gridStrokeCol = isIndustrial ? 'rgba(24, 24, 27, 0.12)' : 'rgba(148, 163, 184, 0.16)';
 
     if (!dashboard) {
       fundTrendCaption.textContent = '暂无图表数据。';
@@ -495,7 +574,6 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
       dateLabel: string;
       subLabel: string;
     }
-    const isIndustrial = document.documentElement.dataset.theme === 'industrial';
     const series: SeriesItem[] = [];
     let metricTitle = '总资产';
     let strokeColor = isIndustrial ? '#ff6b1a' : '#f59e0b';
@@ -555,7 +633,7 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
     }
 
     if (series.length === 0) {
-      ctx.fillStyle = '#94a3b8';
+      ctx.fillStyle = axisTextCol;
       ctx.font = '13px sans-serif';
       ctx.textAlign = 'center';
       ctx.fillText(`暂无「${metricTitle}」历史数据，执行估值/结算或净值同步后自动绘制`, cssW / 2, cssH / 2);
@@ -591,13 +669,13 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
     for (let i = 0; i <= gridSteps; i++) {
       const val = minV + (vRange * (gridSteps - i)) / gridSteps;
       const y = padT + (plotH * i) / gridSteps;
-      ctx.strokeStyle = 'rgba(148, 163, 184, 0.16)';
+      ctx.strokeStyle = gridStrokeCol;
       ctx.beginPath();
       ctx.moveTo(padL, y);
       ctx.lineTo(cssW - padR, y);
       ctx.stroke();
 
-      ctx.fillStyle = '#94a3b8';
+      ctx.fillStyle = axisTextCol;
       const axisText = isMoneySeries
         ? (privacyMode ? '****' : Math.round(val).toLocaleString('en-US'))
         : val.toFixed(3);
@@ -661,7 +739,7 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
       ctx.restore();
     }
 
-    ctx.fillStyle = '#94a3b8';
+    ctx.fillStyle = axisTextCol;
     ctx.font = '11px sans-serif';
     ctx.textAlign = 'center';
     const tickCount = Math.min(pts.length, 6);
@@ -673,8 +751,9 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
     }
 
     const activeIdx = hoveredPointIdx !== null && hoveredPointIdx < pts.length ? hoveredPointIdx : pts.length - 1;
-    const focusAccent = isIndustrial ? '#ff6b1a' : '#fbbf24';
-    const focusCrosshair = isIndustrial ? 'rgba(255, 107, 26, 0.50)' : 'rgba(251, 191, 36, 0.45)';
+    const focusAccent = isIndustrial ? '#c2410c' : '#fbbf24';
+    const focusCrosshair = isIndustrial ? 'rgba(194, 65, 12, 0.50)' : 'rgba(251, 191, 36, 0.45)';
+    const pointOutline = isIndustrial ? '#f7f4ed' : '#090b10';
     for (let i = 0; i < pts.length; i++) {
       const p = pts[i];
       if (!p) continue;
@@ -694,7 +773,7 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
       ctx.arc(p.x, p.y, isActive ? 5.2 : 3.2, 0, Math.PI * 2);
       ctx.fillStyle = isActive ? focusAccent : strokeColor;
       ctx.fill();
-      ctx.strokeStyle = '#090b10';
+      ctx.strokeStyle = pointOutline;
       ctx.lineWidth = 1.5;
       ctx.stroke();
     }
@@ -707,7 +786,9 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
 
   function renderHoldingsList() {
     for (const btn of fundTypeFilters.querySelectorAll<HTMLButtonElement>('button[data-filter]')) {
-      btn.classList.toggle('active', btn.dataset.filter === typeFilter);
+      const isActive = btn.dataset.filter === typeFilter;
+      btn.classList.toggle('active', isActive);
+      btn.setAttribute('aria-pressed', String(isActive));
     }
     const allRows = dashboard?.summary.holdings ?? [];
     const configsByCode = new Map((dashboard?.holdings ?? []).map(c => [c.code, c]));
@@ -723,6 +804,10 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
       fundHoldingsList.replaceChildren(node('p', '当前筛选下暂无持仓记录。', 'empty'));
       return;
     }
+
+    const focusedActionKey = typeof document !== 'undefined' && fundHoldingsList.contains?.(document.activeElement)
+      ? ((document.activeElement as HTMLElement | null)?.dataset?.holdingFocusKey ?? null)
+      : null;
 
     const now = Date.now();
     const frag = document.createDocumentFragment();
@@ -779,8 +864,10 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
         hoveredPointIdx = null;
         renderTrendControls();
         renderTrendChart();
-        fundChartSection.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        scrollRespectingMotion(fundChartSection);
       }, 'mini-button');
+      trendBtn.setAttribute('aria-label', `查看 ${row.name} (${row.code}) 净值走势`);
+      trendBtn.dataset.holdingFocusKey = `${row.code}:trend`;
 
       const editBtn = button('✏️ 编辑', () => {
         if (cfg) {
@@ -804,6 +891,8 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
           });
         }
       }, 'mini-button');
+      editBtn.setAttribute('aria-label', `编辑持仓 ${row.name} (${row.code})`);
+      editBtn.dataset.holdingFocusKey = `${row.code}:edit`;
 
       const armedAt = deleteArmed.get(row.code) ?? 0;
       const isArmed = now - armedAt < 5000;
@@ -818,12 +907,22 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
         renderHoldingsList();
         void deleteHoldingFromUi(row.code);
       }, 'mini-button danger-btn');
+      delBtn.setAttribute(
+        'aria-label',
+        isArmed ? `确认删除持仓 ${row.name} (${row.code})` : `删除持仓 ${row.name} (${row.code})`,
+      );
+      delBtn.dataset.holdingFocusKey = `${row.code}:del`;
 
       actionsCol.append(trendBtn, editBtn, delBtn);
       card.append(mainCol, actionsCol);
       frag.append(card);
     }
     fundHoldingsList.replaceChildren(frag);
+    if (focusedActionKey) {
+      const targetBtn = Array.from(fundHoldingsList.querySelectorAll<HTMLButtonElement>('button[data-holding-focus-key]'))
+        .find(b => b.dataset.holdingFocusKey === focusedActionKey);
+      if (targetBtn) safeFocus(targetBtn, { preventScroll: true });
+    }
   }
 
   function renderModal() {
@@ -840,10 +939,25 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
     quiet?: boolean;
     dataMode?: 'cached' | 'live' | 'settle';
   } = {}) {
-    if (appState.authExpired) return;
+    if (disposed || appState.authExpired) return;
     const seq = ++requestSeq;
     const isRefresh = Boolean(opts.refresh);
     const mode = opts.mode === 'settle' ? 'settle' : 'status';
+    const isQuietPoll = Boolean(opts.quiet && !isRefresh);
+    let ac: AbortController | null = null;
+    if (isQuietPoll) {
+      quietFetchAc?.abort();
+      ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      quietFetchAc = ac;
+    } else {
+      quietFetchAc?.abort();
+      quietFetchAc = null;
+    }
+    const reqOpts: ApiRequestOptions = {
+      ...(isQuietPoll ? { priority: 'low' } : {}),
+      signal: ac ? ac.signal : lifecycleAc.signal,
+    };
+
     if (!opts.quiet) {
       setActionStatus(
         mode === 'settle' ? '正在从东方财富与腾讯财经拉取最新正式净值进行结算…' : isRefresh ? '正在刷新实时估值与市场行情…' : '正在加载投资看板…',
@@ -854,8 +968,8 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
       const res = await runFundPlugin<FundDashboardData>('dashboard', {
         refresh: isRefresh,
         mode,
-      });
-      if (seq !== requestSeq || appState.authExpired) {
+      }, reqOpts);
+      if (disposed || seq !== requestSeq || appState.authExpired) {
         return;
       }
       if (!res.ok || !res.data) {
@@ -872,9 +986,12 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
         }
       }
     } catch (err) {
-      if (seq === requestSeq && !opts.quiet && options.isVisible() && !appState.authExpired) {
+      if (ac?.signal.aborted || (err instanceof Error && err.name === 'AbortError')) return;
+      if (!disposed && seq === requestSeq && !opts.quiet && options.isVisible() && !appState.authExpired) {
         setActionStatus(`加载投资看板失败：${errorText(err)}`, 'err');
       }
+    } finally {
+      if (ac && quietFetchAc === ac) quietFetchAc = null;
     }
   }
 
@@ -928,14 +1045,18 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
     const costRaw = fundFormCost.value.trim();
     const cost = Number(costRaw);
 
+    clearFormInvalidStates();
     if (!code || !name) {
+      const invalidField = !code ? fundFormCode : fundFormName;
+      invalidField.setAttribute('aria-invalid', 'true');
       setActionStatus('请填写标的代码和名称', 'warn');
-      (!code ? fundFormCode : fundFormName).focus();
+      safeFocus(invalidField);
       return;
     }
     if (costRaw === '' || !Number.isFinite(cost) || cost < 0) {
+      fundFormCost.setAttribute('aria-invalid', 'true');
       setActionStatus('请输入大于或等于 0 的有效总成本', 'warn');
-      fundFormCost.focus();
+      safeFocus(fundFormCost);
       return;
     }
 
@@ -944,8 +1065,9 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
     if (sharesRaw !== '') {
       const v = Number(sharesRaw);
       if (!Number.isFinite(v) || v <= 0) {
+        fundFormShares.setAttribute('aria-invalid', 'true');
         setActionStatus('持有份额/股数必须大于 0（或留空自动推算）', 'warn');
-        fundFormShares.focus();
+        safeFocus(fundFormShares);
         return;
       }
       parsedShares = v;
@@ -956,8 +1078,9 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
     if (ratioRaw !== '') {
       const v = Number(ratioRaw);
       if (!Number.isFinite(v) || v <= 0 || v > 1) {
+        fundFormRatio.setAttribute('aria-invalid', 'true');
         setActionStatus('仓位映射系数必须在 (0, 1] 之间', 'warn');
-        fundFormRatio.focus();
+        safeFocus(fundFormRatio);
         return;
       }
       parsedRatio = v;
@@ -968,8 +1091,9 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
     if (initNavRaw !== '') {
       const v = Number(initNavRaw);
       if (!Number.isFinite(v) || v <= 0) {
+        fundFormInitNav.setAttribute('aria-invalid', 'true');
         setActionStatus('建仓基准净值必须大于 0', 'warn');
-        fundFormInitNav.focus();
+        safeFocus(fundFormInitNav);
         return;
       }
       parsedInitNav = v;
@@ -1033,7 +1157,7 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
     }
   }
 
-  function handleCanvasHover(event: MouseEvent) {
+  function handleCanvasHover(event: PointerEvent) {
     if (!plottedPoints.length) return;
     const rect = fundTrendCanvas.getBoundingClientRect();
     const scaleX = rect.width > 0 ? lastChartCssW / rect.width : 1;
@@ -1057,22 +1181,56 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
     }
   }
 
+  function scheduleChartRedraw() {
+    if (!options.isVisible() || !dashboard) return;
+    if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+      if (resizeRafId !== null) window.cancelAnimationFrame(resizeRafId);
+      resizeRafId = window.requestAnimationFrame(() => {
+        resizeRafId = null;
+        if (options.isVisible() && dashboard) renderTrendChart();
+      });
+    } else {
+      renderTrendChart();
+    }
+  }
+
   function activate() {
+    if (disposed) return;
     setActionStatus();
     fundRefreshBtn.disabled = appState.authExpired;
     fundSettleBtn.disabled = appState.authExpired;
     fundFormSaveBtn.disabled = appState.authExpired;
+    activeAc?.abort();
+    activeAc = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    if (typeof window !== 'undefined' && activeAc) {
+      listenEvent(window, 'friday:themechange', () => {
+        if (options.isVisible()) renderTrendChart();
+      }, activeAc.signal);
+    }
+    resizeObserver?.disconnect();
+    resizeObserver = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      const target = fundTrendCanvas.parentElement ?? fundTrendCanvas;
+      resizeObserver = new ResizeObserver(() => {
+        scheduleChartRedraw();
+      });
+      resizeObserver.observe(target);
+    }
     if (appState.authExpired) return;
     if (dashboard) {
       renderModal();
-      window.requestAnimationFrame(() => {
-        if (options.isVisible() && dashboard) renderTrendChart();
-      });
+      if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+        window.requestAnimationFrame(() => {
+          if (options.isVisible() && dashboard) renderTrendChart();
+        });
+      } else {
+        renderTrendChart();
+      }
       void refreshDashboard({ refresh: true, mode: 'status', quiet: true, dataMode: 'live' });
       return;
     }
     void refreshDashboard({ refresh: false, quiet: true }).then(() => {
-      if (options.isVisible() && !appState.authExpired) {
+      if (!disposed && options.isVisible() && !appState.authExpired) {
         return refreshDashboard({ refresh: true, mode: 'status', quiet: true, dataMode: 'live' });
       }
       return undefined;
@@ -1080,6 +1238,14 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
   }
 
   function deactivate() {
+    activeAc?.abort();
+    activeAc = null;
+    resizeObserver?.disconnect();
+    resizeObserver = null;
+    if (resizeRafId !== null && typeof window !== 'undefined' && typeof window.cancelAnimationFrame === 'function') {
+      window.cancelAnimationFrame(resizeRafId);
+      resizeRafId = null;
+    }
     for (const timer of deleteArmedTimers.values()) {
       clearTimeout(timer);
     }
@@ -1087,30 +1253,30 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
     deleteArmed.clear();
   }
 
-  fundPrivacyBtn.addEventListener('click', () => {
+  listenEvent(fundPrivacyBtn, 'click', () => {
     privacyMode = !privacyMode;
     writePrivacyPref(privacyMode);
     renderTopBadge();
     renderModal();
-  });
-  fundRefreshBtn.addEventListener('click', () => void triggerManualRefresh('status'));
-  fundSettleBtn.addEventListener('click', () => void triggerManualRefresh('settle'));
-  fundAddJumpBtn.addEventListener('click', () => {
+  }, lifecycleAc.signal);
+  listenEvent(fundRefreshBtn, 'click', () => void triggerManualRefresh('status'), lifecycleAc.signal);
+  listenEvent(fundSettleBtn, 'click', () => void triggerManualRefresh('settle'), lifecycleAc.signal);
+  listenEvent(fundAddJumpBtn, 'click', () => {
     resetForm(true);
-    fundFormDetails.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    fundFormCode.focus();
-  });
-  fundFormResetBtn.addEventListener('click', () => {
+    scrollRespectingMotion(fundFormDetails);
+    safeFocus(fundFormCode);
+  }, lifecycleAc.signal);
+  listenEvent(fundFormResetBtn, 'click', () => {
     resetForm(true);
     setActionStatus();
-  });
-  fundFormSaveBtn.addEventListener('click', () => void saveHoldingFromUi());
-  fundFormType.addEventListener('change', () => {
+  }, lifecycleAc.signal);
+  bindFormSubmission(fundHoldingForm, fundFormSaveBtn, () => void saveHoldingFromUi(), lifecycleAc.signal);
+  listenEvent(fundFormType, 'change', () => {
     if (!fundEditOriginalCode.value && !isEditingWithin(fundFormRatio)) {
       fundFormRatio.placeholder = fundFormType.value === 'a_stock' ? '默认 1' : '基金默认 0.95，股票默认 1';
     }
-  });
-  fundTrendMetrics.addEventListener('click', event => {
+  }, lifecycleAc.signal);
+  listenEvent(fundTrendMetrics, 'click', event => {
     const target = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-metric]');
     const metric = target?.dataset.metric as FundTrendMetricKey | undefined;
     if (!metric) return;
@@ -1118,8 +1284,8 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
     hoveredPointIdx = null;
     renderTrendControls();
     renderTrendChart();
-  });
-  fundTrendRanges.addEventListener('click', event => {
+  }, lifecycleAc.signal);
+  listenEvent(fundTrendRanges, 'click', event => {
     const target = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-range]');
     const range = Number(target?.dataset.range);
     if (!Number.isFinite(range) || range <= 0) return;
@@ -1127,41 +1293,42 @@ export function initFundTrackerUi(options: FundTrackerUiOptions): FundTrackerUiC
     hoveredPointIdx = null;
     renderTrendControls();
     renderTrendChart();
-  });
-  fundNavSelect.addEventListener('change', () => {
+  }, lifecycleAc.signal);
+  listenEvent(fundNavSelect, 'change', () => {
     if (!fundNavSelect.value) return;
     selectedNavCode = fundNavSelect.value;
     hoveredPointIdx = null;
     renderTrendChart();
-  });
-  fundTypeFilters.addEventListener('click', event => {
+  }, lifecycleAc.signal);
+  listenEvent(fundTypeFilters, 'click', event => {
     const target = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-filter]');
     const filter = target?.dataset.filter as FundTypeFilterKey | undefined;
     if (!filter) return;
     typeFilter = filter;
     renderHoldingsList();
-  });
-  fundTrendCanvas.addEventListener('mousemove', handleCanvasHover);
-  fundTrendCanvas.addEventListener('mouseleave', () => {
+  }, lifecycleAc.signal);
+  listenEvent(fundTrendCanvas, 'pointermove', ev => handleCanvasHover(ev as PointerEvent), lifecycleAc.signal);
+  listenEvent(fundTrendCanvas, 'pointerdown', ev => handleCanvasHover(ev as PointerEvent), lifecycleAc.signal);
+  const clearCanvasHover = () => {
     if (hoveredPointIdx !== null) {
       hoveredPointIdx = null;
       renderTrendChart();
     }
-  });
-  window.addEventListener('resize', () => {
-    if (options.isVisible() && dashboard) {
-      renderTrendChart();
-    }
-  });
-  window.addEventListener('friday:themechange', () => {
-    if (options.isVisible()) {
-      renderTrendChart();
-    }
-  });
+  };
+  listenEvent(fundTrendCanvas, 'pointerleave', clearCanvasHover, lifecycleAc.signal);
+  listenEvent(fundTrendCanvas, 'pointercancel', clearCanvasHover, lifecycleAc.signal);
 
   return {
     activate,
     deactivate,
-    refreshBadge: () => (appState.authExpired ? Promise.resolve() : refreshDashboard({ refresh: false, quiet: true })),
+    refreshBadge: () => (disposed || appState.authExpired ? Promise.resolve() : refreshDashboard({ refresh: false, quiet: true })),
+    dispose: () => {
+      if (disposed) return;
+      disposed = true;
+      deactivate();
+      quietFetchAc?.abort();
+      quietFetchAc = null;
+      lifecycleAc.abort();
+    },
   };
 }

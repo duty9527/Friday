@@ -1,6 +1,14 @@
 import { button, element, isEditingWithin, kpiCard, node } from '../shared/dom.js';
 import { errorText, timestamp } from '../shared/format.js';
-import { api, appState } from '../state.js';
+import {
+  announceStatus,
+  attachDelayedFormValidation,
+  bindRovingTablist,
+  confirmAction,
+  safeFocus,
+  syncRovingTablist,
+} from '../shared/ui-primitives.js';
+import { api, appState, type ApiRequestOptions } from '../state.js';
 
 export interface MiotUiOptions {
   isVisible: () => boolean;
@@ -10,6 +18,7 @@ export interface MiotUiController {
   activate: () => void;
   deactivate: () => void;
   refreshBadge: () => Promise<void>;
+  dispose: () => void;
 }
 
 interface MiotDeviceItem {
@@ -156,12 +165,50 @@ const CHANNEL_LABELS: Record<string, string> = {
   unknown: '未知通道',
 };
 
-async function runMiotPlugin(action: string, args: Record<string, unknown> = {}): Promise<PluginRunEnvelope> {
+async function runMiotPlugin(
+  action: string,
+  args: Record<string, unknown> = {},
+  reqOpts?: ApiRequestOptions,
+): Promise<PluginRunEnvelope> {
   return await api<PluginRunEnvelope>('/api/plugin-run', {
     plugin: 'miot',
     action,
     args,
-  });
+  }, reqOpts);
+}
+
+function listenEvent(
+  target: EventTarget,
+  type: string,
+  handler: EventListenerOrEventListenerObject,
+  signal?: AbortSignal,
+): void {
+  if (signal?.aborted) return;
+  target.addEventListener(type, handler, signal ? { signal } : undefined);
+  if (signal) {
+    signal.addEventListener('abort', () => {
+      target.removeEventListener(type, handler);
+    }, { once: true });
+  }
+}
+
+function bindFormSubmission(
+  form: HTMLFormElement,
+  submitBtn: HTMLButtonElement,
+  onSubmit: () => void,
+  signal?: AbortSignal,
+): void {
+  attachDelayedFormValidation(form, signal);
+  listenEvent(form, 'submit', e => {
+    e.preventDefault();
+    onSubmit();
+  }, signal);
+  listenEvent(submitBtn, 'click', e => {
+    if (typeof form.requestSubmit !== 'function') {
+      e.preventDefault();
+      onSubmit();
+    }
+  }, signal);
 }
 
 function formatCustomAliasesTextarea(aliases: MiotConfigData['customAliases'] | undefined): string {
@@ -219,7 +266,7 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
 
   const geekNewToggleBtn = element<HTMLButtonElement>('miot-geek-new-toggle');
   const geekRefreshBtn = element<HTMLButtonElement>('miot-geek-refresh-btn');
-  const geekCreateBox = element<HTMLElement>('miot-geek-create-box');
+  const geekCreateBox = element<HTMLFormElement>('miot-geek-create-box');
   const geekNewNameInput = element<HTMLInputElement>('miot-geek-new-name');
   const geekNewDeviceSelect = element<HTMLSelectElement>('miot-geek-new-device');
   const geekNewOnTime = element<HTMLInputElement>('miot-geek-new-on-time');
@@ -233,6 +280,7 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
 
   const scenesRefreshBtn = element<HTMLButtonElement>('miot-scenes-refresh-btn');
   const scenesList = element<HTMLElement>('miot-scenes-list');
+  const varsForm = element<HTMLFormElement>('miot-vars-form');
   const varScopeInput = element<HTMLInputElement>('miot-var-scope');
   const varIdInput = element<HTMLInputElement>('miot-var-id');
   const varTypeSelect = element<HTMLSelectElement>('miot-var-type');
@@ -240,7 +288,7 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
   const varCreateBtn = element<HTMLButtonElement>('miot-var-create-btn');
   const varsList = element<HTMLElement>('miot-vars-list');
 
-  const configCard = element<HTMLElement>('miot-config-card');
+  const configCard = element<HTMLFormElement>('miot-config-card');
   const cfgRouterInput = element<HTMLInputElement>('miot-cfg-router');
   const cfgSpeakerInput = element<HTMLInputElement>('miot-cfg-speaker');
   const cfgProtectedInput = element<HTMLInputElement>('miot-cfg-protected');
@@ -250,19 +298,47 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
   const cfgUdpTimeoutInput = element<HTMLInputElement>('miot-cfg-udp-timeout');
   const cfgSaveBtn = element<HTMLButtonElement>('miot-cfg-save-btn');
 
+  const lifecycleAc = new AbortController();
+  const openRuleDetails = new Set<string>();
+  const dirtyVars = new Map<string, string>();
+  let badgeAc: AbortController | null = null;
   let active = false;
+  let disposed = false;
   let busy = false;
   let requestSeq = 0;
+  let badgeSeq = 0;
   let currentView: MiotWorkspaceView = 'mesh';
   let selectedRoom = '';
   let selectedChannel = 'all';
   let selectedLogGraphId = '';
   let lastData: MiotDashboardData | undefined;
+  let lastStatusBanner = '';
+
+  geekNewToggleBtn.setAttribute('aria-controls', 'miot-geek-create-box');
+  geekNewToggleBtn.setAttribute('aria-expanded', String(!geekCreateBox.hidden));
+
+  function setGeekCreateOpen(open: boolean, moveFocus = true): void {
+    const wasInside = typeof document !== 'undefined' && geekCreateBox.contains?.(document.activeElement);
+    geekCreateBox.hidden = !open;
+    geekNewToggleBtn.setAttribute('aria-expanded', String(open));
+    if (moveFocus) {
+      if (open) {
+        safeFocus(geekNewNameInput);
+      } else if (wasInside) {
+        safeFocus(geekNewToggleBtn);
+      }
+    }
+  }
 
   function setStatus(text: string, tone: 'ok' | 'warn' | 'err' = 'ok'): void {
+    const trimmed = text.trim();
     statusBanner.hidden = !text;
     statusBanner.textContent = text;
     statusBanner.className = `health-status-banner tone-${tone}`;
+    if (trimmed && trimmed !== lastStatusBanner && options.isVisible()) {
+      announceStatus(trimmed, tone === 'err' ? 'assertive' : 'polite');
+    }
+    lastStatusBanner = trimmed;
   }
 
   function syncControlStates(): void {
@@ -303,11 +379,13 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
     for (const [key, panel] of Object.entries(views) as Array<[MiotWorkspaceView, HTMLElement]>) {
       panel.hidden = key !== nextView;
     }
+    let matchedTab: HTMLElement | undefined;
     for (const tab of workspaceTabs.querySelectorAll<HTMLButtonElement>('[data-miot-view]')) {
       const isMatch = tab.dataset.miotView === nextView;
       tab.classList.toggle('active', isMatch);
-      tab.setAttribute('aria-selected', String(isMatch));
+      if (isMatch) matchedTab = tab;
     }
+    syncRovingTablist(workspaceTabs, matchedTab);
   }
 
   function updateTopBadge(data?: MiotDashboardData): void {
@@ -334,6 +412,7 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
     for (const link of [openGeekLink, openGeekLink2]) {
       if (safeUrl) {
         link.href = safeUrl;
+        link.rel = 'noopener noreferrer';
         link.hidden = false;
       } else {
         link.removeAttribute('href');
@@ -376,23 +455,39 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
     if (selectedRoom && !rooms.includes(selectedRoom)) {
       selectedRoom = '';
     }
+    const focusedRoomKey = typeof document !== 'undefined' && roomPills.contains?.(document.activeElement)
+      ? ((document.activeElement as HTMLElement | null)?.dataset?.roomKey ?? null)
+      : null;
+
     const frag = document.createDocumentFragment();
     const allBtn = button('全部房间', () => {
       selectedRoom = '';
       if (lastData) renderMeshView(lastData);
     }, `hub-filter-pill${selectedRoom === '' ? ' active' : ''}`);
+    allBtn.dataset.roomKey = '__all__';
+    allBtn.setAttribute('aria-pressed', String(selectedRoom === ''));
     frag.append(allBtn);
     for (const room of rooms) {
+      const isSelected = selectedRoom === room;
       const btn = button(room, () => {
         selectedRoom = room;
         if (lastData) renderMeshView(lastData);
-      }, `hub-filter-pill${selectedRoom === room ? ' active' : ''}`);
+      }, `hub-filter-pill${isSelected ? ' active' : ''}`);
+      btn.dataset.roomKey = room;
+      btn.setAttribute('aria-pressed', String(isSelected));
       frag.append(btn);
     }
     roomPills.replaceChildren(frag);
+    if (focusedRoomKey) {
+      const target = Array.from(roomPills.querySelectorAll<HTMLButtonElement>('button[data-room-key]'))
+        .find(b => b.dataset.roomKey === focusedRoomKey);
+      if (target) safeFocus(target, { preventScroll: true });
+    }
 
     for (const chBtn of channelPills.querySelectorAll<HTMLButtonElement>('[data-miot-channel]')) {
-      chBtn.classList.toggle('active', chBtn.dataset.miotChannel === selectedChannel);
+      const isSelected = chBtn.dataset.miotChannel === selectedChannel;
+      chBtn.classList.toggle('active', isSelected);
+      chBtn.setAttribute('aria-pressed', String(isSelected));
     }
   }
 
@@ -408,13 +503,18 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
       return;
     }
 
+    const focusedDeviceAction = typeof document !== 'undefined' && devicesGrid.contains?.(document.activeElement)
+      ? ((document.activeElement as HTMLElement | null)?.dataset?.miotActionKey ?? null)
+      : null;
+
     const frag = document.createDocumentFragment();
     for (const dev of filtered) {
+      const devLabel = dev.fullName || dev.name || dev.did;
       const card = node('article', '', 'hub-entity-card miot-device-card');
       const head = node('div', '', 'hub-card-head');
       const titleGroup = node('div', '', 'hub-card-title-group');
       const icon = CATEGORY_ICONS[dev.category] ?? '📦';
-      titleGroup.append(node('span', `${icon} ${dev.fullName || dev.name}`, 'hub-card-title'));
+      titleGroup.append(node('span', `${icon} ${devLabel}`, 'hub-card-title'));
 
       if (dev.state?.on !== undefined) {
         titleGroup.append(node('span', dev.state.on ? '已打开' : '已关闭', dev.state.on ? 'hub-badge badge-green' : 'hub-badge badge-slate'));
@@ -443,7 +543,11 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
       const actionsRow = node('div', '', 'miot-card-actions');
       if (dev.controlChannel === 'bt_mesh' && dev.controllable) {
         const onBtn = button('💡 打开', () => { void handleDeviceSet(dev, { on: true }); }, 'mini-button');
+        onBtn.setAttribute('aria-label', `打开 ${devLabel}`);
+        onBtn.dataset.miotActionKey = `${dev.did}:on`;
         const offBtn = button('🌑 关闭', () => { void handleDeviceSet(dev, { on: false }); }, 'mini-button');
+        offBtn.setAttribute('aria-label', `关闭 ${devLabel}`);
+        offBtn.dataset.miotActionKey = `${dev.did}:off`;
         if (dev.protected) {
           for (const btn of [onBtn, offBtn]) {
             btn.dataset.locked = 'true';
@@ -452,21 +556,32 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
         }
         actionsRow.append(onBtn, offBtn);
       } else if (dev.category === 'air_fryer' && dev.controlChannel === 'miio_udp') {
-        actionsRow.append(
-          button('📊 状态', () => { void handleFryerOp(dev, 'status'); }, 'mini-button'),
-          button('⏸ 暂停', () => { void handleFryerOp(dev, 'pause'); }, 'mini-button'),
-          button('⏹ 停止', () => { void handleFryerOp(dev, 'stop'); }, 'mini-button'),
-        );
+        const stBtn = button('📊 状态', () => { void handleFryerOp(dev, 'status'); }, 'mini-button');
+        stBtn.setAttribute('aria-label', `查询 ${devLabel} 状态`);
+        stBtn.dataset.miotActionKey = `${dev.did}:status`;
+        const pauseBtn = button('⏸ 暂停', () => { void handleFryerOp(dev, 'pause'); }, 'mini-button');
+        pauseBtn.setAttribute('aria-label', `暂停 ${devLabel}`);
+        pauseBtn.dataset.miotActionKey = `${dev.did}:pause`;
+        const stopBtn = button('⏹ 停止', () => { void handleFryerOp(dev, 'stop'); }, 'mini-button');
+        stopBtn.setAttribute('aria-label', `停止 ${devLabel}`);
+        stopBtn.dataset.miotActionKey = `${dev.did}:stop`;
+        actionsRow.append(stBtn, pauseBtn, stopBtn);
       } else if (dev.controlChannel === 'xiaoai_nlp' && dev.category === 'air_conditioner') {
-        actionsRow.append(
-          button('❄️ 开机', () => { void handleDeviceSet(dev, { on: true }); }, 'mini-button'),
-          button('26℃', () => { void handleDeviceSet(dev, { temperature: 26 }); }, 'mini-button'),
-          button('⏹ 关机', () => { void handleDeviceSet(dev, { on: false }); }, 'mini-button'),
-        );
+        const onBtn = button('❄️ 开机', () => { void handleDeviceSet(dev, { on: true }); }, 'mini-button');
+        onBtn.setAttribute('aria-label', `开启 ${devLabel}`);
+        onBtn.dataset.miotActionKey = `${dev.did}:ac-on`;
+        const tempBtn = button('26℃', () => { void handleDeviceSet(dev, { temperature: 26 }); }, 'mini-button');
+        tempBtn.setAttribute('aria-label', `将 ${devLabel} 设为 26 摄氏度`);
+        tempBtn.dataset.miotActionKey = `${dev.did}:ac-26`;
+        const offBtn = button('⏹ 关机', () => { void handleDeviceSet(dev, { on: false }); }, 'mini-button');
+        offBtn.setAttribute('aria-label', `关闭 ${devLabel}`);
+        offBtn.dataset.miotActionKey = `${dev.did}:ac-off`;
+        actionsRow.append(onBtn, tempBtn, offBtn);
       } else if (dev.controlChannel === 'tv_agent') {
-        actionsRow.append(
-          button('📺 电源切换', () => { void handleDeviceSet(dev, { toggle: true }); }, 'mini-button'),
-        );
+        const tvBtn = button('📺 电源切换', () => { void handleDeviceSet(dev, { toggle: true }); }, 'mini-button');
+        tvBtn.setAttribute('aria-label', `切换 ${devLabel} 电源`);
+        tvBtn.dataset.miotActionKey = `${dev.did}:tv-toggle`;
+        actionsRow.append(tvBtn);
       } else {
         actionsRow.append(node('span', dev.controllable ? '仅查看' : '中枢/只读节点', 'meta'));
       }
@@ -474,6 +589,11 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
       frag.append(card);
     }
     devicesGrid.replaceChildren(frag);
+    if (focusedDeviceAction) {
+      const target = Array.from(devicesGrid.querySelectorAll<HTMLButtonElement>('button[data-miot-action-key]'))
+        .find(b => b.dataset.miotActionKey === focusedDeviceAction);
+      if (target) safeFocus(target, { preventScroll: true });
+    }
   }
 
   function renderMeshView(data: MiotDashboardData): void {
@@ -510,13 +630,17 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
     if (graphs.length === 0) {
       geekList.replaceChildren(node('p', data.configured === false ? '请先配置 BE6500 Pro 路由器 SSH。' : '中枢上暂无极客版自动化规则。', 'empty'));
     } else {
+      const focusedGeekKey = typeof document !== 'undefined' && geekList.contains?.(document.activeElement)
+        ? ((document.activeElement as HTMLElement | null)?.dataset?.geekFocusKey ?? null)
+        : null;
       const frag = document.createDocumentFragment();
       for (const g of graphs) {
+        const ruleName = g.name || g.id;
         const card = node('article', '', 'hub-entity-card miot-geek-card');
         const head = node('div', '', 'hub-card-head');
         const titleGroup = node('div', '', 'hub-card-title-group');
         titleGroup.append(
-          node('span', `⚡ ${g.name || g.id}`, 'hub-card-title'),
+          node('span', `⚡ ${ruleName}`, 'hub-card-title'),
           node('span', g.enable ? '运行中' : '已停用', g.enable ? 'hub-badge badge-green' : 'hub-badge badge-slate'),
         );
         head.append(titleGroup, node('span', `ID ${g.id} · ${g.nodeCount} 节点`, 'meta'));
@@ -533,8 +657,15 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
         }
 
         if (g.steps && g.steps.length > 0) {
-          const details = node('details', '', 'miot-rule-details');
-          details.append(node('summary', `查看节点明细 (${g.steps.length})`, 'meta'));
+          const details = node('details', '', 'miot-rule-details') as HTMLDetailsElement;
+          details.open = openRuleDetails.has(g.id);
+          details.addEventListener('toggle', () => {
+            if (details.open) openRuleDetails.add(g.id);
+            else openRuleDetails.delete(g.id);
+          });
+          const summary = node('summary', `查看节点明细 (${g.steps.length})`, 'meta');
+          summary.dataset.geekFocusKey = `${g.id}:details`;
+          details.append(summary);
           const ul = node('ul', '', 'miot-step-list');
           for (const step of g.steps) {
             ul.append(node('li', `[${step.type}] ${step.description}`, 'meta'));
@@ -545,25 +676,30 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
 
         const rowBottom = node('div', '', 'modal-row-head');
         const updatedText = g.lastUpdateTime ? `更新于 ${timestamp(g.lastUpdateTime)}` : '';
-        rowBottom.append(
-          node('span', updatedText, 'meta'),
-          (() => {
-            const btns = node('div', '', 'modal-btn-group');
-            btns.append(
-              button(g.enable ? '⏸ 停用' : '▶ 启用', () => {
-                void handleToggleGeekRule(g);
-              }, g.enable ? 'mini-button' : 'primary'),
-              button('🗑 删除', () => {
-                void handleDeleteGeekRule(g);
-              }, 'mini-button danger-btn'),
-            );
-            return btns;
-          })(),
-        );
+        const btns = node('div', '', 'modal-btn-group');
+        const toggleBtn = button(g.enable ? '⏸ 停用' : '▶ 启用', () => {
+          void handleToggleGeekRule(g);
+        }, g.enable ? 'mini-button' : 'primary');
+        toggleBtn.setAttribute('aria-label', `${g.enable ? '停用' : '启用'}极客规则 ${ruleName}`);
+        toggleBtn.dataset.geekFocusKey = `${g.id}:toggle`;
+
+        const delBtn = button('🗑 删除', () => {
+          void handleDeleteGeekRule(g);
+        }, 'mini-button danger-btn');
+        delBtn.setAttribute('aria-label', `删除极客规则 ${ruleName}`);
+        delBtn.dataset.geekFocusKey = `${g.id}:del`;
+        btns.append(toggleBtn, delBtn);
+
+        rowBottom.append(node('span', updatedText, 'meta'), btns);
         card.append(rowBottom);
         frag.append(card);
       }
       geekList.replaceChildren(frag);
+      if (focusedGeekKey) {
+        const target = Array.from(geekList.querySelectorAll<HTMLElement>('[data-geek-focus-key]'))
+          .find(el => el.dataset.geekFocusKey === focusedGeekKey);
+        if (target) safeFocus(target, { preventScroll: true });
+      }
     }
 
     const prevLogFilter = selectedLogGraphId;
@@ -619,12 +755,16 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
     if (scenes.length === 0) {
       scenesList.replaceChildren(node('p', '当前没有已本地化的米家手动场景。', 'empty'));
     } else {
+      const focusedSceneKey = typeof document !== 'undefined' && scenesList.contains?.(document.activeElement)
+        ? ((document.activeElement as HTMLElement | null)?.dataset?.sceneFocusKey ?? null)
+        : null;
       const frag = document.createDocumentFragment();
       for (const sc of scenes) {
+        const sceneTitle = sc.summary || sc.id;
         const card = node('article', '', 'hub-entity-card miot-scene-card');
         const head = node('div', '', 'hub-card-head');
         const titleGroup = node('div', '', 'hub-card-title-group');
-        titleGroup.append(node('span', `🎬 ${sc.summary || sc.id}`, 'hub-card-title'));
+        titleGroup.append(node('span', `🎬 ${sceneTitle}`, 'hub-card-title'));
         if (sc.turnsOffProtected) {
           titleGroup.append(node('span', '🛡️ 含关闭保护设备', 'hub-badge badge-amber'));
         }
@@ -635,45 +775,87 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
           card.append(node('p', `同步时间：${timestamp(sc.updatedAt)}`, 'meta'));
         }
         const actionsRow = node('div', '', 'miot-card-actions');
-        actionsRow.append(button('▶ 立即触发', () => {
+        const runBtn = button('▶ 立即触发', () => {
           void handleRunScene(sc);
-        }, 'primary'));
+        }, 'primary');
+        runBtn.setAttribute('aria-label', `触发本地场景 ${sceneTitle}`);
+        runBtn.dataset.sceneFocusKey = sc.id;
+        actionsRow.append(runBtn);
         card.append(actionsRow);
         frag.append(card);
       }
       scenesList.replaceChildren(frag);
+      if (focusedSceneKey) {
+        const target = Array.from(scenesList.querySelectorAll<HTMLButtonElement>('button[data-scene-focus-key]'))
+          .find(b => b.dataset.sceneFocusKey === focusedSceneKey);
+        if (target) safeFocus(target, { preventScroll: true });
+      }
     }
 
     const vars = data.variables ?? [];
     if (vars.length === 0) {
       varsList.replaceChildren(node('p', '当前极客版没有自定义变量，可在上方创建一个与 Friday 联动。', 'empty'));
     } else {
+      const focusedVarKey = typeof document !== 'undefined' && varsList.contains?.(document.activeElement)
+        ? ((document.activeElement as HTMLElement | null)?.dataset?.varFocusKey ?? null)
+        : null;
+      const activeInput = focusedVarKey?.endsWith(':input')
+        ? (document.activeElement as HTMLInputElement | null)
+        : null;
+      const selStart = activeInput?.selectionStart ?? null;
+      const selEnd = activeInput?.selectionEnd ?? null;
+
       const frag = document.createDocumentFragment();
       for (const v of vars) {
+        const varKey = `${v.scope}.${v.id}`;
         const row = node('div', '', 'miot-var-row');
         const info = node('div', '', 'miot-var-info');
         info.append(
-          node('strong', `${v.scope}.${v.id}`),
+          node('strong', varKey),
           node('span', v.type, 'hub-badge badge-slate'),
         );
         const valInput = node('input', '', 'hub-input') as HTMLInputElement;
         valInput.type = 'text';
-        valInput.value = v.value === undefined || v.value === null ? '' : String(v.value);
-        valInput.setAttribute('aria-label', `${v.scope}.${v.id} 变量值`);
+        const serverVal = v.value === undefined || v.value === null ? '' : String(v.value);
+        valInput.value = dirtyVars.has(varKey) ? dirtyVars.get(varKey)! : serverVal;
+        valInput.setAttribute('aria-label', `${varKey} 变量值`);
+        valInput.dataset.varFocusKey = `${varKey}:input`;
+        valInput.addEventListener('input', () => {
+          dirtyVars.set(varKey, valInput.value);
+        });
+
+        const setBtn = button('写入', () => {
+          void handleSetVar(v.scope, v.id, valInput.value);
+        }, 'mini-button');
+        setBtn.setAttribute('aria-label', `写入变量 ${varKey}`);
+        setBtn.dataset.varFocusKey = `${varKey}:set`;
+
+        const delBtn = button('删除', () => {
+          void handleDeleteVar(v.scope, v.id);
+        }, 'mini-button danger-btn');
+        delBtn.setAttribute('aria-label', `删除变量 ${varKey}`);
+        delBtn.dataset.varFocusKey = `${varKey}:del`;
 
         const btns = node('div', '', 'modal-btn-group');
-        btns.append(
-          button('写入', () => {
-            void handleSetVar(v.scope, v.id, valInput.value);
-          }, 'mini-button'),
-          button('删除', () => {
-            void handleDeleteVar(v.scope, v.id);
-          }, 'mini-button danger-btn'),
-        );
+        btns.append(setBtn, delBtn);
         row.append(info, valInput, btns);
         frag.append(row);
       }
       varsList.replaceChildren(frag);
+      if (focusedVarKey) {
+        const target = Array.from(varsList.querySelectorAll<HTMLElement>('[data-var-focus-key]'))
+          .find(el => el.dataset.varFocusKey === focusedVarKey);
+        if (target) {
+          safeFocus(target, { preventScroll: true });
+          if (selStart !== null && selEnd !== null && 'setSelectionRange' in target) {
+            try {
+              (target as HTMLInputElement).setSelectionRange(selStart, selEnd);
+            } catch {
+              // Ignore selection restore failures on stub inputs
+            }
+          }
+        }
+      }
     }
   }
 
@@ -745,7 +927,7 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
     mode: 'auto' | 'refresh' | 'live' | 'cache' = 'auto',
     opts?: { preserveBanner?: boolean },
   ): Promise<void> {
-    if (busy || appState.authExpired) return;
+    if (disposed || busy || appState.authExpired) return;
     const seq = ++requestSeq;
     setBusy(true);
     if (!opts?.preserveBanner) {
@@ -763,8 +945,8 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
           : mode === 'refresh'
             ? { refresh: true, live: false }
             : { refresh: false, live: false };
-      const res = await runMiotPlugin('dashboard', args);
-      if (seq !== requestSeq || appState.authExpired) return;
+      const res = await runMiotPlugin('dashboard', args, { signal: lifecycleAc.signal });
+      if (disposed || seq !== requestSeq || appState.authExpired) return;
       busy = false;
       if (res.data) {
         render(res.data);
@@ -781,12 +963,12 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
         }
       }
     } catch (err) {
-      if (seq !== requestSeq || appState.authExpired) return;
+      if (disposed || seq !== requestSeq || appState.authExpired) return;
       if (!opts?.preserveBanner) {
         setStatus(`加载米家中枢失败：${errorText(err)}`, 'err');
       }
     } finally {
-      setBusy(false);
+      if (seq === requestSeq) setBusy(false);
     }
   }
 
@@ -796,13 +978,13 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
     pendingMsg: string,
     reloadMode: 'auto' | 'refresh' | 'live' = 'auto',
   ): Promise<boolean> {
-    if (busy || appState.authExpired) return false;
+    if (disposed || busy || appState.authExpired) return false;
     const seq = ++requestSeq;
     setBusy(true);
     setStatus(pendingMsg, 'warn');
     try {
-      const res = await runMiotPlugin(action, args);
-      if (seq !== requestSeq || appState.authExpired) return false;
+      const res = await runMiotPlugin(action, args, { signal: lifecycleAc.signal });
+      if (disposed || seq !== requestSeq || appState.authExpired) return false;
       setStatus(res.message || (res.ok ? '操作成功' : '操作失败'), res.ok ? 'ok' : 'err');
       busy = false;
       if (res.ok) {
@@ -810,11 +992,11 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
       }
       return res.ok;
     } catch (err) {
-      if (seq !== requestSeq || appState.authExpired) return false;
+      if (disposed || seq !== requestSeq || appState.authExpired) return false;
       setStatus(`操作失败：${errorText(err)}`, 'err');
       return false;
     } finally {
-      setBusy(false);
+      if (seq === requestSeq) setBusy(false);
     }
   }
 
@@ -827,12 +1009,17 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
   }
 
   async function handleBatchMesh(targetOn: boolean): Promise<void> {
+    if (disposed || busy || appState.authExpired) return;
     const scopeLabel = selectedRoom ? `「${selectedRoom}」的` : '全屋';
     const actionLabel = targetOn ? '打开' : '关闭';
-    const confirmed = typeof window.confirm === 'function'
-      ? window.confirm(`确定批量${actionLabel}${scopeLabel}蓝牙 Mesh 设备吗？（受保护设备会自动跳过）`)
-      : true;
-    if (!confirmed) return;
+    const confirmed = await confirmAction({
+      title: `批量${actionLabel}蓝牙 Mesh 设备`,
+      message: `确定批量${actionLabel}${scopeLabel}蓝牙 Mesh 设备吗？（受保护设备会自动跳过）`,
+      confirmLabel: `确认${actionLabel}`,
+      cancelLabel: '取消',
+      danger: true,
+    });
+    if (!confirmed || disposed || appState.authExpired) return;
     await runAndReload(
       'mesh',
       { op: 'batch', on: targetOn, ...(selectedRoom ? { room: selectedRoom } : {}) },
@@ -852,31 +1039,48 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
   }
 
   async function handleDeleteGeekRule(rule: MiotGeekRuleItem): Promise<void> {
-    const confirmed = typeof window.confirm === 'function'
-      ? window.confirm(`确定删除极客规则「${rule.name}」（ID: ${rule.id}）吗？删除后无法恢复。`)
-      : true;
-    if (!confirmed) return;
+    if (disposed || busy || appState.authExpired) return;
+    const confirmed = await confirmAction({
+      title: '删除极客规则',
+      message: `确定删除极客规则「${rule.name}」（ID: ${rule.id}）吗？删除后无法恢复。`,
+      confirmLabel: '确认删除',
+      cancelLabel: '取消',
+      danger: true,
+    });
+    if (!confirmed || disposed || appState.authExpired) return;
     await runAndReload('geek', { op: 'delete', id: rule.id }, `正在删除极客规则「${rule.name}」…`, 'auto');
   }
 
   async function handleCreateGeekSchedule(): Promise<void> {
+    if (disposed || busy || appState.authExpired) return;
+    geekNewNameInput.setAttribute('aria-invalid', 'false');
+    geekNewDeviceSelect.setAttribute('aria-invalid', 'false');
+    geekNewOnTime.setAttribute('aria-invalid', 'false');
+    geekNewOffTime.setAttribute('aria-invalid', 'false');
+
     const name = geekNewNameInput.value.trim();
     const did = geekNewDeviceSelect.value.trim();
     const onTime = geekNewOnTime.value.trim();
     const offTime = geekNewOffTime.value.trim();
     if (!name) {
+      geekNewNameInput.setAttribute('aria-invalid', 'true');
       setStatus('请输入规则名称。', 'warn');
+      safeFocus(geekNewNameInput);
       return;
     }
     if (!did) {
+      geekNewDeviceSelect.setAttribute('aria-invalid', 'true');
       setStatus('请选择目标蓝牙 Mesh 设备。', 'warn');
+      safeFocus(geekNewDeviceSelect);
       return;
     }
     const rules: Array<{ time: string; did: string; on: boolean }> = [];
     if (onTime) rules.push({ time: onTime, did, on: true });
     if (offTime) rules.push({ time: offTime, did, on: false });
     if (rules.length === 0) {
+      geekNewOnTime.setAttribute('aria-invalid', 'true');
       setStatus('请至少填写一个开启或关闭时间。', 'warn');
+      safeFocus(geekNewOnTime);
       return;
     }
     const ok = await runAndReload(
@@ -892,17 +1096,22 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
     );
     if (ok) {
       geekNewNameInput.value = '';
-      geekCreateBox.hidden = true;
+      setGeekCreateOpen(false, false);
     }
   }
 
   async function handleRunScene(sc: MiotSceneItem): Promise<void> {
+    if (disposed || busy || appState.authExpired) return;
     let confirmProtected = false;
     if (sc.turnsOffProtected) {
-      const confirmed = typeof window.confirm === 'function'
-        ? window.confirm(`本地场景「${sc.summary}」包含关闭保护设备的操作，确定要触发吗？`)
-        : false;
-      if (!confirmed) return;
+      const confirmed = await confirmAction({
+        title: '触发含保护设备的场景',
+        message: `本地场景「${sc.summary}」包含关闭保护设备的操作，确定要触发吗？`,
+        confirmLabel: '确认触发',
+        cancelLabel: '取消',
+        danger: true,
+      });
+      if (!confirmed || disposed || appState.authExpired) return;
       confirmProtected = true;
     }
     await runAndReload(
@@ -914,12 +1123,18 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
   }
 
   async function handleCreateVar(): Promise<void> {
+    if (disposed || busy || appState.authExpired) return;
+    varScopeInput.setAttribute('aria-invalid', 'false');
+    varIdInput.setAttribute('aria-invalid', 'false');
     const scope = varScopeInput.value.trim();
     const id = varIdInput.value.trim();
     const type = varTypeSelect.value === 'string' ? 'string' : 'number';
     const value = varValueInput.value.trim();
     if (!scope || !id) {
+      const invalidField = !scope ? varScopeInput : varIdInput;
+      invalidField.setAttribute('aria-invalid', 'true');
       setStatus('请填写变量 Scope 与 ID（仅限英文字母与数字）。', 'warn');
+      safeFocus(invalidField);
       return;
     }
     const ok = await runAndReload(
@@ -935,15 +1150,26 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
   }
 
   async function handleSetVar(scope: string, id: string, value: string): Promise<void> {
-    await runAndReload('geek', { op: 'var-set', scope, id, value }, `正在更新变量 ${scope}.${id}…`, 'auto');
+    const ok = await runAndReload('geek', { op: 'var-set', scope, id, value }, `正在更新变量 ${scope}.${id}…`, 'auto');
+    if (ok) {
+      dirtyVars.delete(`${scope}.${id}`);
+    }
   }
 
   async function handleDeleteVar(scope: string, id: string): Promise<void> {
-    const confirmed = typeof window.confirm === 'function'
-      ? window.confirm(`确定删除极客版变量 ${scope}.${id} 吗？`)
-      : true;
-    if (!confirmed) return;
-    await runAndReload('geek', { op: 'var-delete', scope, id }, `正在删除变量 ${scope}.${id}…`, 'auto');
+    if (disposed || busy || appState.authExpired) return;
+    const confirmed = await confirmAction({
+      title: '删除极客版变量',
+      message: `确定删除极客版变量 ${scope}.${id} 吗？`,
+      confirmLabel: '确认删除',
+      cancelLabel: '取消',
+      danger: true,
+    });
+    if (!confirmed || disposed || appState.authExpired) return;
+    const ok = await runAndReload('geek', { op: 'var-delete', scope, id }, `正在删除变量 ${scope}.${id}…`, 'auto');
+    if (ok) {
+      dirtyVars.delete(`${scope}.${id}`);
+    }
   }
 
   async function handleSaveConfig(): Promise<void> {
@@ -967,70 +1193,94 @@ export function initMiotUi(options: MiotUiOptions): MiotUiController {
     );
   }
 
-  workspaceTabs.addEventListener('click', evt => {
-    const target = (evt.target as HTMLElement | null)?.closest<HTMLButtonElement>('[data-miot-view]');
-    const view = target?.dataset.miotView as MiotWorkspaceView | undefined;
-    if (view && (view === 'mesh' || view === 'geek' || view === 'scenes' || view === 'config')) {
-      switchView(view);
-    }
+  bindRovingTablist(workspaceTabs, {
+    signal: lifecycleAc.signal,
+    onActivate: tab => {
+      const view = tab.dataset.miotView as MiotWorkspaceView | undefined;
+      if (view && (view === 'mesh' || view === 'geek' || view === 'scenes' || view === 'config')) {
+        switchView(view);
+      }
+    },
   });
 
-  channelPills.addEventListener('click', evt => {
+  listenEvent(channelPills, 'click', evt => {
     const target = (evt.target as HTMLElement | null)?.closest<HTMLButtonElement>('[data-miot-channel]');
     const ch = target?.dataset.miotChannel;
     if (ch) {
       selectedChannel = ch;
       if (lastData) renderMeshView(lastData);
     }
-  });
+  }, lifecycleAc.signal);
 
-  liveRefreshBtn.addEventListener('click', () => { void loadDashboard('live'); });
-  refreshBtn.addEventListener('click', () => { void loadDashboard('refresh'); });
-  batchOnBtn.addEventListener('click', () => { void handleBatchMesh(true); });
-  batchOffBtn.addEventListener('click', () => { void handleBatchMesh(false); });
+  listenEvent(liveRefreshBtn, 'click', () => { void loadDashboard('live'); }, lifecycleAc.signal);
+  listenEvent(refreshBtn, 'click', () => { void loadDashboard('refresh'); }, lifecycleAc.signal);
+  listenEvent(batchOnBtn, 'click', () => { void handleBatchMesh(true); }, lifecycleAc.signal);
+  listenEvent(batchOffBtn, 'click', () => { void handleBatchMesh(false); }, lifecycleAc.signal);
 
-  geekNewToggleBtn.addEventListener('click', () => {
-    geekCreateBox.hidden = !geekCreateBox.hidden;
-  });
-  geekCancelBtn.addEventListener('click', () => {
-    geekCreateBox.hidden = true;
-  });
-  geekCreateBtn.addEventListener('click', () => { void handleCreateGeekSchedule(); });
-  geekRefreshBtn.addEventListener('click', () => { void loadDashboard('refresh'); });
-  logFilterSelect.addEventListener('change', () => {
+  listenEvent(geekNewToggleBtn, 'click', () => {
+    setGeekCreateOpen(geekCreateBox.hidden);
+  }, lifecycleAc.signal);
+  listenEvent(geekCancelBtn, 'click', () => {
+    setGeekCreateOpen(false);
+  }, lifecycleAc.signal);
+  bindFormSubmission(geekCreateBox, geekCreateBtn, () => { void handleCreateGeekSchedule(); }, lifecycleAc.signal);
+  listenEvent(geekRefreshBtn, 'click', () => { void loadDashboard('refresh'); }, lifecycleAc.signal);
+  listenEvent(logFilterSelect, 'change', () => {
     selectedLogGraphId = logFilterSelect.value;
     if (lastData) renderGeekLogs(lastData.geekLogs ?? []);
-  });
+  }, lifecycleAc.signal);
 
-  scenesRefreshBtn.addEventListener('click', () => { void loadDashboard('refresh'); });
-  varCreateBtn.addEventListener('click', () => { void handleCreateVar(); });
-  cfgSaveBtn.addEventListener('click', () => { void handleSaveConfig(); });
+  listenEvent(scenesRefreshBtn, 'click', () => { void loadDashboard('refresh'); }, lifecycleAc.signal);
+  bindFormSubmission(varsForm, varCreateBtn, () => { void handleCreateVar(); }, lifecycleAc.signal);
+  bindFormSubmission(configCard, cfgSaveBtn, () => { void handleSaveConfig(); }, lifecycleAc.signal);
+
+  function deactivate(): void {
+    active = false;
+    syncControlStates();
+  }
 
   return {
     activate: () => {
+      if (disposed) return;
       active = true;
+      ++badgeSeq;
+      badgeAc?.abort();
+      badgeAc = null;
       syncControlStates();
       if (options.isVisible()) {
         void loadDashboard('auto');
       }
     },
-    deactivate: () => {
-      active = false;
-      syncControlStates();
-    },
+    deactivate,
     refreshBadge: async () => {
-      if (active || appState.authExpired) return;
-      const seq = ++requestSeq;
+      if (disposed || active || busy || appState.authExpired) return;
+      const bSeq = ++badgeSeq;
+      badgeAc?.abort();
+      const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      badgeAc = ac;
       try {
-        const res = await runMiotPlugin('dashboard', { cacheOnly: true });
-        if (active || seq !== requestSeq || appState.authExpired) return;
+        const res = await runMiotPlugin('dashboard', { cacheOnly: true }, {
+          priority: 'low',
+          ...(ac ? { signal: ac.signal } : {}),
+        });
+        if (disposed || active || busy || bSeq !== badgeSeq || appState.authExpired) return;
         if (res.data) {
           lastData = res.data;
           updateTopBadge(res.data);
         }
       } catch {
         // Silent badge refresh failure
+      } finally {
+        if (badgeAc === ac) badgeAc = null;
       }
+    },
+    dispose: () => {
+      if (disposed) return;
+      disposed = true;
+      deactivate();
+      badgeAc?.abort();
+      badgeAc = null;
+      lifecycleAc.abort();
     },
   };
 }

@@ -1,6 +1,7 @@
 import { button, element, isEditingWithin, kpiCard, node } from '../shared/dom.js';
 import { errorText } from '../shared/format.js';
-import { api, appState } from '../state.js';
+import { announceStatus, attachDelayedFormValidation, confirmAction, promptInput, safeFocus } from '../shared/ui-primitives.js';
+import { api, appState, type ApiRequestOptions } from '../state.js';
 
 export interface Cs80FaceUiOptions {
   isVisible: () => boolean;
@@ -10,6 +11,7 @@ export interface Cs80FaceUiController {
   activate: () => void;
   deactivate: () => void;
   refreshBadge: () => Promise<void>;
+  dispose: () => void;
 }
 
 type CardSize = '1x1' | '2x1' | '1x2' | '2x2';
@@ -246,7 +248,47 @@ function localizeCardAction(actionName: string, pluginName?: string): string {
 }
 
 function cloneLayout(src: Cs80LayoutConfig): Cs80LayoutConfig {
-  return JSON.parse(JSON.stringify(src)) as Cs80LayoutConfig;
+  return typeof structuredClone === 'function'
+    ? structuredClone(src)
+    : (JSON.parse(JSON.stringify(src)) as Cs80LayoutConfig);
+}
+
+function isDocHidden(): boolean {
+  return typeof document !== 'undefined' && Boolean(document.hidden);
+}
+
+function listenEvent(
+  target: EventTarget,
+  type: string,
+  handler: EventListenerOrEventListenerObject,
+  signal?: AbortSignal,
+): void {
+  if (signal?.aborted) return;
+  target.addEventListener(type, handler, signal ? { signal } : undefined);
+  if (signal) {
+    signal.addEventListener('abort', () => {
+      target.removeEventListener(type, handler);
+    }, { once: true });
+  }
+}
+
+function bindFormSubmission(
+  form: HTMLFormElement,
+  submitBtn: HTMLButtonElement,
+  onSubmit: () => void,
+  signal?: AbortSignal,
+): void {
+  attachDelayedFormValidation(form, signal);
+  listenEvent(form, 'submit', e => {
+    e.preventDefault();
+    onSubmit();
+  }, signal);
+  listenEvent(submitBtn, 'click', e => {
+    if (typeof form.requestSubmit !== 'function') {
+      e.preventDefault();
+      onSubmit();
+    }
+  }, signal);
 }
 
 function estimateOverflowFlags(cards: readonly Cs80CardSpec[], gridRows: number): boolean[] {
@@ -332,6 +374,7 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
   const catalogPickerEl = element<HTMLElement>('cs80-catalog-picker');
 
   const expressBtnsEl = element<HTMLElement>('cs80-express-btns');
+  const bannerForm = element<HTMLFormElement>('cs80-banner-form');
   const bannerInput = element<HTMLInputElement>('cs80-banner-input');
   const bannerSendBtn = element<HTMLButtonElement>('cs80-banner-send-btn');
   const brightnessPillsEl = element<HTMLElement>('cs80-brightness-pills');
@@ -342,7 +385,12 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
   const chimeBtnsEl = element<HTMLElement>('cs80-chime-btns');
 
   const SAFE_PREVIEW_DATA_URL_RE = /^data:image\/(?:png|jpeg|webp);base64,/i;
+  const lifecycleAc = new AbortController();
+  let activeAc: AbortController | null = null;
+  let pollAc: AbortController | null = null;
+  let badgeAc: AbortController | null = null;
   let active = false;
+  let disposed = false;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
   let expressRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   let latestData: Cs80DashboardPayload | undefined;
@@ -353,6 +401,9 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
   let layoutSeq = 0;
   let layoutEditRev = 0;
   let badgeSeq = 0;
+  let layoutWriteChain: Promise<void> = Promise.resolve();
+  let layoutWriteDepth = 0;
+  let lastBannerText = '';
 
   function markLayoutDirty(): void {
     dirty = true;
@@ -360,11 +411,11 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
   }
 
   async function runFaceAction(errPrefix: string, fn: () => Promise<void>): Promise<void> {
-    if (appState.authExpired) return;
+    if (disposed || appState.authExpired) return;
     try {
       await fn();
     } catch (err) {
-      if (!appState.authExpired) {
+      if (!disposed && !appState.authExpired) {
         setBanner(`${errPrefix}：${errorText(err)}`, true);
       }
     }
@@ -376,24 +427,33 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
     }
     expressRefreshTimer = setTimeout(() => {
       expressRefreshTimer = undefined;
-      if (active && options.isVisible() && !appState.authExpired) {
-        void refreshDashboard();
+      if (active && options.isVisible() && !isDocHidden() && !appState.authExpired) {
+        void refreshDashboard({ background: true });
       }
     }, delayMs);
   }
 
   function setBanner(text: string, isError = false): void {
+    const trimmed = text.trim();
     statusBanner.textContent = text;
     statusBanner.classList.toggle('is-error', isError);
     statusBanner.hidden = !text;
+    if (trimmed && trimmed !== lastBannerText && options.isVisible()) {
+      announceStatus(trimmed, isError ? 'assertive' : 'polite');
+    }
+    lastBannerText = trimmed;
   }
 
-  async function callPlugin<T = unknown>(action: string, args: Record<string, unknown> = {}): Promise<PluginRunResponse<T>> {
+  async function callPlugin<T = unknown>(
+    action: string,
+    args: Record<string, unknown> = {},
+    reqOpts?: ApiRequestOptions,
+  ): Promise<PluginRunResponse<T>> {
     return api<PluginRunResponse<T>>('/api/plugin-run', {
       plugin: 'cs80-face',
       action,
       args: { silent: true, ...args },
-    });
+    }, reqOpts);
   }
 
   function updateTopBadge(st?: Cs80StatusData): void {
@@ -476,13 +536,16 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
 
     if (!isEditingWithin(panelEl)) {
       for (const btn of brightnessPillsEl.querySelectorAll<HTMLButtonElement>('button[data-brightness]')) {
-        btn.classList.toggle('active', Number(btn.dataset.brightness) === (st.brightness ?? 100));
+        const isActive = Number(btn.dataset.brightness) === (st.brightness ?? 100);
+        btn.classList.toggle('active', isActive);
+        btn.setAttribute('aria-pressed', String(isActive));
       }
       const volVal = String(Math.round(Number(spk.volume ?? 65)));
       if ([...volumeSelect.options].some(opt => opt.value === volVal)) {
         volumeSelect.value = volVal;
       }
       muteBtn.textContent = spk.muted ? '🔊 取消静音' : '🔇 静音切换';
+      muteBtn.setAttribute('aria-pressed', String(Boolean(spk.muted)));
       quietHoursInput.value = String(spk.quietHours || '');
     }
   }
@@ -491,7 +554,9 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
     if (!draftLayout) return;
     if (!isEditingWithin(panelEl)) {
       for (const btn of gridRowsPills.querySelectorAll<HTMLButtonElement>('button[data-grid-rows]')) {
-        btn.classList.toggle('active', Number(btn.dataset.gridRows) === draftLayout.gridRows);
+        const isActive = Number(btn.dataset.gridRows) === draftLayout.gridRows;
+        btn.classList.toggle('active', isActive);
+        btn.setAttribute('aria-pressed', String(isActive));
       }
       marqueeModeSelect.value = draftLayout.marqueeMode;
       marqueeSpeedSelect.value = String(draftLayout.marqueeSpeed);
@@ -512,11 +577,21 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
     const curPage = activePage();
     pageDelBtn.disabled = draftLayout.pages.length <= 1;
 
+    const focusedPageId = typeof document !== 'undefined' && pageTabsEl.contains?.(document.activeElement)
+      ? ((document.activeElement as HTMLElement | null)?.dataset?.pageId ?? null)
+      : null;
+    const focusedCardAction = typeof document !== 'undefined' && bentoEditorEl.contains?.(document.activeElement)
+      ? ((document.activeElement as HTMLElement | null)?.dataset?.cardFocusKey ?? null)
+      : null;
+
     // 1. Page tabs
     pageTabsEl.replaceChildren();
     draftLayout.pages.forEach((pg, idx) => {
-      const btn = node('button', `${pg.name} (${pg.cards.length})`, `hub-filter-pill${idx === draftLayout!.activePage ? ' active' : ''}`);
+      const isSelected = idx === draftLayout!.activePage;
+      const btn = node('button', `${pg.name} (${pg.cards.length})`, `hub-filter-pill${isSelected ? ' active' : ''}`);
       btn.type = 'button';
+      btn.dataset.pageId = pg.id;
+      btn.setAttribute('aria-pressed', String(isSelected));
       btn.addEventListener('click', () => {
         if (!draftLayout) return;
         draftLayout.activePage = idx;
@@ -525,6 +600,11 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
       });
       pageTabsEl.append(btn);
     });
+    if (focusedPageId) {
+      const targetTab = Array.from(pageTabsEl.querySelectorAll<HTMLButtonElement>('button[data-page-id]'))
+        .find(b => b.dataset.pageId === focusedPageId);
+      if (targetTab) safeFocus(targetTab, { preventScroll: true });
+    }
 
     // 2. Bento Editor Grid
     bentoEditorEl.replaceChildren();
@@ -557,12 +637,17 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
       const tools = node('div', '', 'cs80-editor-card-tools');
       const sizeGroup = node('div', '', 'cs80-size-group');
       for (const sz of CARD_SIZES) {
-        const sb = button(sz.replace('x', '×'), () => {
+        const sizeLabel = sz.replace('x', '×');
+        const isCurrentSize = card.size === sz;
+        const sb = button(sizeLabel, () => {
           card.size = sz;
           markLayoutDirty();
           renderPageTabsAndEditor();
           void syncLayoutToDaemon({ pages: draftLayout!.pages, activePage: draftLayout!.activePage });
-        }, `cs80-size-btn${card.size === sz ? ' active' : ''}`);
+        }, `cs80-size-btn${isCurrentSize ? ' active' : ''}`);
+        sb.setAttribute('aria-pressed', String(isCurrentSize));
+        sb.setAttribute('aria-label', `${titleText} 尺寸 ${sizeLabel}`);
+        sb.dataset.cardFocusKey = `${card.id}:size:${sz}`;
         sizeGroup.append(sb);
       }
 
@@ -576,6 +661,9 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
         void syncLayoutToDaemon({ pages: draftLayout!.pages, activePage: draftLayout!.activePage });
       }, 'mini-button');
       upBtn.disabled = idx === 0;
+      upBtn.setAttribute('aria-label', `上移卡片 ${titleText}`);
+      upBtn.dataset.cardFocusKey = `${card.id}:up`;
+
       const downBtn = button('↓', () => {
         if (idx >= curPage.cards.length - 1) return;
         const arr = curPage.cards;
@@ -585,12 +673,31 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
         void syncLayoutToDaemon({ pages: draftLayout!.pages, activePage: draftLayout!.activePage });
       }, 'mini-button');
       downBtn.disabled = idx === curPage.cards.length - 1;
+      downBtn.setAttribute('aria-label', `下移卡片 ${titleText}`);
+      downBtn.dataset.cardFocusKey = `${card.id}:down`;
+
       const delBtn = button('✕', () => {
-        curPage.cards.splice(idx, 1);
-        markLayoutDirty();
-        renderPageTabsAndEditor();
-        void syncLayoutToDaemon({ pages: draftLayout!.pages, activePage: draftLayout!.activePage });
+        void (async () => {
+          if (!draftLayout) return;
+          const confirmed = await confirmAction({
+            title: '移除副屏卡片',
+            message: `确定从当前页移除卡片「${titleText}」吗？`,
+            confirmLabel: '确认移除',
+            cancelLabel: '取消',
+            danger: true,
+          });
+          if (!confirmed || !draftLayout) return;
+          const page = activePage();
+          const removeIdx = page ? page.cards.indexOf(card) : -1;
+          if (!page || removeIdx < 0) return;
+          page.cards.splice(removeIdx, 1);
+          markLayoutDirty();
+          renderPageTabsAndEditor();
+          void syncLayoutToDaemon({ pages: draftLayout.pages, activePage: draftLayout.activePage });
+        })();
       }, 'mini-button danger-btn');
+      delBtn.setAttribute('aria-label', `移除卡片 ${titleText}`);
+      delBtn.dataset.cardFocusKey = `${card.id}:del`;
       moveGroup.append(upBtn, downBtn, delBtn);
       tools.append(sizeGroup, moveGroup);
 
@@ -638,6 +745,12 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
 
       bentoEditorEl.append(box);
     });
+
+    if (focusedCardAction) {
+      const targetBtn = Array.from(bentoEditorEl.querySelectorAll<HTMLButtonElement>('button[data-card-focus-key]'))
+        .find(b => b.dataset.cardFocusKey === focusedCardAction);
+      if (targetBtn) safeFocus(targetBtn, { preventScroll: true });
+    }
   }
 
   function renderCatalogPicker(): void {
@@ -711,13 +824,20 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
     renderCatalogPicker();
   }
 
-  async function refreshDashboard(): Promise<void> {
-    if (busyDepth > 0 || appState.authExpired) return;
+  async function refreshDashboard(opts: { background?: boolean } = {}): Promise<void> {
+    if (disposed || busyDepth > 0 || appState.authExpired) return;
     const seq = ++layoutSeq;
     const startEditRev = layoutEditRev;
+    pollAc?.abort();
+    const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    pollAc = ac;
+    const reqOpts: ApiRequestOptions = {
+      ...(opts.background ? { priority: 'low' } : {}),
+      ...(ac ? { signal: ac.signal } : {}),
+    };
     try {
-      const res = await callPlugin<Cs80DashboardPayload>('dashboard', { includePreview: true });
-      if (seq !== layoutSeq || busyDepth > 0 || appState.authExpired) return;
+      const res = await callPlugin<Cs80DashboardPayload>('dashboard', { includePreview: true }, reqOpts);
+      if (disposed || seq !== layoutSeq || busyDepth > 0 || appState.authExpired) return;
       if (res.ok && res.data) {
         setBanner('');
         if (layoutEditRev !== startEditRev) dirty = true;
@@ -727,33 +847,52 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
         setBanner(res.message || 'CS80 守护进程尚未响应，请确认 friday-face.service 已启动。', true);
       }
     } catch (err) {
-      if (seq !== layoutSeq || appState.authExpired) return;
+      if (ac?.signal.aborted || (err instanceof Error && err.name === 'AbortError')) return;
+      if (disposed || seq !== layoutSeq || appState.authExpired) return;
       setBanner(`读取 CS80 副屏数据失败：${errorText(err)}`, true);
+    } finally {
+      if (pollAc === ac) pollAc = null;
     }
   }
 
   async function syncLayoutToDaemon(patch?: Record<string, unknown>): Promise<void> {
-    if (!draftLayout || appState.authExpired) return;
+    if (disposed || !draftLayout || appState.authExpired) return;
     const seq = ++layoutSeq;
     const startEditRev = layoutEditRev;
+    const payload = patch
+      ? { ...patch, includePreview: true }
+      : {
+          gridRows: draftLayout.gridRows,
+          marqueeMode: draftLayout.marqueeMode,
+          marqueeSpeed: draftLayout.marqueeSpeed,
+          pageRotateSec: draftLayout.pageRotateSec,
+          autoTaskOverlay: draftLayout.autoTaskOverlay,
+          activePage: draftLayout.activePage,
+          weatherCity: weatherCityInput.value.trim() || draftLayout.weatherCity || '上海',
+          pages: draftLayout.pages,
+          refreshWidgets: true,
+          includePreview: true,
+        };
+
+    const prevChain = layoutWriteChain;
+    const shouldAwaitPrev = layoutWriteDepth > 0;
+    let releaseChain!: () => void;
+    layoutWriteChain = new Promise<void>(resolve => {
+      releaseChain = resolve;
+    });
+    layoutWriteDepth++;
     busyDepth++;
     try {
-      const payload = patch
-        ? { ...patch, includePreview: true }
-        : {
-            gridRows: draftLayout.gridRows,
-            marqueeMode: draftLayout.marqueeMode,
-            marqueeSpeed: draftLayout.marqueeSpeed,
-            pageRotateSec: draftLayout.pageRotateSec,
-            autoTaskOverlay: draftLayout.autoTaskOverlay,
-            activePage: draftLayout.activePage,
-            weatherCity: weatherCityInput.value.trim() || draftLayout.weatherCity || '上海',
-            pages: draftLayout.pages,
-            refreshWidgets: true,
-            includePreview: true,
-          };
-      const res = await callPlugin<{ ok?: boolean; layout?: Cs80LayoutConfig; previewDataUrl?: string }>('layout', payload);
-      if (appState.authExpired) return;
+      if (shouldAwaitPrev) {
+        await prevChain;
+      }
+      if (disposed || appState.authExpired) return;
+      const res = await callPlugin<{ ok?: boolean; layout?: Cs80LayoutConfig; previewDataUrl?: string }>(
+        'layout',
+        payload,
+        { signal: lifecycleAc.signal },
+      );
+      if (disposed || appState.authExpired) return;
       if (res.ok && res.data?.layout) {
         if (seq === layoutSeq && layoutEditRev === startEditRev) {
           draftLayout = cloneLayout(res.data.layout);
@@ -775,52 +914,62 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
         setBanner(res.message || '同步副屏布局失败', true);
       }
     } catch (err) {
-      if (!appState.authExpired) {
+      if (!disposed && !appState.authExpired) {
         setBanner(`同步副屏布局失败：${errorText(err)}`, true);
       }
     } finally {
       busyDepth = Math.max(0, busyDepth - 1);
+      layoutWriteDepth = Math.max(0, layoutWriteDepth - 1);
+      releaseChain();
     }
   }
 
   // ---- Wire Interactive Controls ----
-  refreshBtn.addEventListener('click', () => {
+  listenEvent(refreshBtn, 'click', () => {
     void refreshDashboard();
-  });
+  }, lifecycleAc.signal);
 
-  saveLayoutBtn.addEventListener('click', () => {
+  listenEvent(saveLayoutBtn, 'click', () => {
     if (!draftLayout) return;
     draftLayout.weatherCity = weatherCityInput.value.trim() || '上海';
     void syncLayoutToDaemon();
-  });
+  }, lifecycleAc.signal);
 
-  weatherCityInput.addEventListener('input', () => {
+  listenEvent(weatherCityInput, 'input', () => {
     if (!draftLayout) return;
     weatherCityDirty = true;
     draftLayout.weatherCity = weatherCityInput.value.trim() || '上海';
     markLayoutDirty();
     updateSyncBadge();
-  });
+  }, lifecycleAc.signal);
 
-  forceFullBtn.addEventListener('click', () => {
+  listenEvent(forceFullBtn, 'click', () => {
     void runFaceAction('全量刷新副屏失败', async () => {
-      await callPlugin('screen', { refresh: true });
+      await callPlugin('screen', { refresh: true }, { signal: lifecycleAc.signal });
       await refreshDashboard();
     });
-  });
+  }, lifecycleAc.signal);
 
-  standbyBtn.addEventListener('click', () => {
+  listenEvent(standbyBtn, 'click', () => {
     void runFaceAction('切换待机状态失败', async () => {
       const curStandby = Boolean(latestData?.status?.standby);
-      await callPlugin('screen', { standby: !curStandby });
+      await callPlugin('screen', { standby: !curStandby }, { signal: lifecycleAc.signal });
       await refreshDashboard();
     });
-  });
+  }, lifecycleAc.signal);
 
-  resetLayoutBtn.addEventListener('click', () => {
+  listenEvent(resetLayoutBtn, 'click', () => {
     void runFaceAction('恢复默认布局失败', async () => {
+      const confirmed = await confirmAction({
+        title: '恢复默认布局',
+        message: '确定将 CS80 副屏的多页卡片与画布布局恢复为默认配置吗？当前自定义编排将被覆盖。',
+        confirmLabel: '确认恢复',
+        cancelLabel: '取消',
+        danger: true,
+      });
+      if (!confirmed || disposed || appState.authExpired) return;
       ++layoutSeq;
-      const res = await callPlugin('layout', { reset: true, refreshWidgets: true, includePreview: true });
+      const res = await callPlugin('layout', { reset: true, refreshWidgets: true, includePreview: true }, { signal: lifecycleAc.signal });
       if (!res.ok) {
         setBanner(res.message || '恢复默认布局失败', true);
         return;
@@ -830,9 +979,9 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
       ++layoutEditRev;
       await refreshDashboard();
     });
-  });
+  }, lifecycleAc.signal);
 
-  gridRowsPills.addEventListener('click', ev => {
+  listenEvent(gridRowsPills, 'click', ev => {
     const btn = (ev.target as HTMLElement).closest<HTMLButtonElement>('button[data-grid-rows]');
     if (!btn || !draftLayout) return;
     const rows = Number(btn.dataset.gridRows) === 3 ? 3 : 2;
@@ -841,38 +990,38 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
     renderGlobalControls();
     renderPageTabsAndEditor();
     void syncLayoutToDaemon({ gridRows: rows });
-  });
+  }, lifecycleAc.signal);
 
-  marqueeModeSelect.addEventListener('change', () => {
+  listenEvent(marqueeModeSelect, 'change', () => {
     if (!draftLayout) return;
     draftLayout.marqueeMode = marqueeModeSelect.value as Cs80LayoutConfig['marqueeMode'];
     markLayoutDirty();
     void syncLayoutToDaemon({ marqueeMode: draftLayout.marqueeMode });
-  });
+  }, lifecycleAc.signal);
 
-  marqueeSpeedSelect.addEventListener('change', () => {
+  listenEvent(marqueeSpeedSelect, 'change', () => {
     if (!draftLayout) return;
     const spd = Math.max(1, Math.min(3, Number(marqueeSpeedSelect.value) || 2)) as 1 | 2 | 3;
     draftLayout.marqueeSpeed = spd;
     markLayoutDirty();
     void syncLayoutToDaemon({ marqueeSpeed: spd });
-  });
+  }, lifecycleAc.signal);
 
-  pageRotateSelect.addEventListener('change', () => {
+  listenEvent(pageRotateSelect, 'change', () => {
     if (!draftLayout) return;
     draftLayout.pageRotateSec = Number(pageRotateSelect.value) || 0;
     markLayoutDirty();
     void syncLayoutToDaemon({ pageRotateSec: draftLayout.pageRotateSec });
-  });
+  }, lifecycleAc.signal);
 
-  taskOverlayCheck.addEventListener('change', () => {
+  listenEvent(taskOverlayCheck, 'change', () => {
     if (!draftLayout) return;
     draftLayout.autoTaskOverlay = taskOverlayCheck.checked;
     markLayoutDirty();
     void syncLayoutToDaemon({ autoTaskOverlay: draftLayout.autoTaskOverlay });
-  });
+  }, lifecycleAc.signal);
 
-  pageAddBtn.addEventListener('click', () => {
+  listenEvent(pageAddBtn, 'click', () => {
     if (!draftLayout) return;
     if (draftLayout.pages.length >= 6) {
       setBanner('最多支持配置 6 个轮播页签。', true);
@@ -888,29 +1037,51 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
     markLayoutDirty();
     renderPageTabsAndEditor();
     void syncLayoutToDaemon({ pages: draftLayout.pages, activePage: draftLayout.activePage });
-  });
+  }, lifecycleAc.signal);
 
-  pageRenameBtn.addEventListener('click', () => {
-    const pg = activePage();
-    if (!draftLayout || !pg) return;
-    const next = window.prompt('请输入当前卡片页名称：', pg.name);
-    if (!next || !next.trim()) return;
-    pg.name = next.trim().slice(0, 24);
-    markLayoutDirty();
-    renderPageTabsAndEditor();
-    void syncLayoutToDaemon({ pages: draftLayout.pages });
-  });
+  listenEvent(pageRenameBtn, 'click', () => {
+    void (async () => {
+      const pg = activePage();
+      if (!draftLayout || !pg) return;
+      const next = await promptInput({
+        title: '重命名卡片页',
+        message: '请输入当前卡片页名称（最多 24 个字符）：',
+        defaultValue: pg.name,
+        placeholder: '如：主页 / 副页',
+        confirmLabel: '确认重命名',
+        cancelLabel: '取消',
+      });
+      if (!next || !next.trim() || !draftLayout) return;
+      pg.name = next.trim().slice(0, 24);
+      markLayoutDirty();
+      renderPageTabsAndEditor();
+      void syncLayoutToDaemon({ pages: draftLayout.pages });
+    })();
+  }, lifecycleAc.signal);
 
-  pageDelBtn.addEventListener('click', () => {
-    if (!draftLayout || draftLayout.pages.length <= 1) return;
-    draftLayout.pages.splice(draftLayout.activePage, 1);
-    draftLayout.activePage = Math.max(0, Math.min(draftLayout.pages.length - 1, draftLayout.activePage));
-    markLayoutDirty();
-    renderPageTabsAndEditor();
-    void syncLayoutToDaemon({ pages: draftLayout.pages, activePage: draftLayout.activePage });
-  });
+  listenEvent(pageDelBtn, 'click', () => {
+    void (async () => {
+      if (!draftLayout || draftLayout.pages.length <= 1) return;
+      const pg = activePage();
+      const confirmed = await confirmAction({
+        title: '删除当前卡片页',
+        message: `确定删除卡片页「${pg?.name ?? '当前页'}」吗？该页上的 ${pg?.cards.length ?? 0} 张卡片编排将一并移除。`,
+        confirmLabel: '确认删除',
+        cancelLabel: '取消',
+        danger: true,
+      });
+      if (!confirmed || !draftLayout || draftLayout.pages.length <= 1) return;
+      const targetIdx = pg ? draftLayout.pages.indexOf(pg) : draftLayout.activePage;
+      if (targetIdx < 0) return;
+      draftLayout.pages.splice(targetIdx, 1);
+      draftLayout.activePage = Math.max(0, Math.min(draftLayout.pages.length - 1, draftLayout.activePage));
+      markLayoutDirty();
+      renderPageTabsAndEditor();
+      void syncLayoutToDaemon({ pages: draftLayout.pages, activePage: draftLayout.activePage });
+    })();
+  }, lifecycleAc.signal);
 
-  expressBtnsEl.addEventListener('click', ev => {
+  listenEvent(expressBtnsEl, 'click', ev => {
     const btn = (ev.target as HTMLElement).closest<HTMLButtonElement>('button[data-expr]');
     if (!btn) return;
     const expr = btn.dataset.expr || 'auto';
@@ -922,104 +1093,148 @@ export function initCs80FaceUi(options: Cs80FaceUiOptions): Cs80FaceUiController
         ...(poke ? { poke } : {}),
         ...(channel ? { channel } : {}),
         holdSec: expr === 'auto' ? 0 : 8,
-      });
+      }, { signal: lifecycleAc.signal });
       scheduleExpressRefresh(220);
     });
-  });
+  }, lifecycleAc.signal);
 
-  bannerSendBtn.addEventListener('click', () => {
+  function submitBannerMessage(): void {
     const text = bannerInput.value.trim();
-    if (!text) return;
+    bannerInput.setAttribute('aria-invalid', text ? 'false' : 'true');
+    if (!text) {
+      setBanner('请输入要投送到副屏跑马灯的文字内容。', true);
+      safeFocus(bannerInput);
+      return;
+    }
     void runFaceAction('发送横幅消息失败', async () => {
-      await callPlugin('express', { text, title: '控制台 · 互动消息', holdSec: 14 });
+      await callPlugin('express', { text, title: '控制台 · 互动消息', holdSec: 14 }, { signal: lifecycleAc.signal });
       bannerInput.value = '';
+      bannerInput.setAttribute('aria-invalid', 'false');
       scheduleExpressRefresh(180);
     });
-  });
+  }
 
-  brightnessPillsEl.addEventListener('click', ev => {
+  bindFormSubmission(bannerForm, bannerSendBtn, submitBannerMessage, lifecycleAc.signal);
+
+  listenEvent(brightnessPillsEl, 'click', ev => {
     const btn = (ev.target as HTMLElement).closest<HTMLButtonElement>('button[data-brightness]');
     if (!btn) return;
     const val = Number(btn.dataset.brightness) || 100;
     void runFaceAction('调节屏幕亮度失败', async () => {
-      await callPlugin('screen', { brightness: val });
+      await callPlugin('screen', { brightness: val }, { signal: lifecycleAc.signal });
       await refreshDashboard();
     });
-  });
+  }, lifecycleAc.signal);
 
-  volumeSelect.addEventListener('change', () => {
+  listenEvent(volumeSelect, 'change', () => {
     void runFaceAction('调节喇叭音量失败', async () => {
-      await callPlugin('sound', { volume: Number(volumeSelect.value) });
+      await callPlugin('sound', { volume: Number(volumeSelect.value) }, { signal: lifecycleAc.signal });
       await refreshDashboard();
     });
-  });
+  }, lifecycleAc.signal);
 
-  muteBtn.addEventListener('click', () => {
+  listenEvent(muteBtn, 'click', () => {
     void runFaceAction('切换静音状态失败', async () => {
       const nextMute = !(latestData?.status?.speaker?.muted ?? false);
-      await callPlugin('sound', { muted: nextMute });
+      await callPlugin('sound', { muted: nextMute }, { signal: lifecycleAc.signal });
       await refreshDashboard();
     });
-  });
+  }, lifecycleAc.signal);
 
-  quietSaveBtn.addEventListener('click', () => {
+  listenEvent(quietSaveBtn, 'click', () => {
     void runFaceAction('保存夜间免打扰时段失败', async () => {
       await callPlugin('sound', {
         volume: Number(volumeSelect.value),
         quietHours: quietHoursInput.value.trim(),
-      });
+      }, { signal: lifecycleAc.signal });
       await refreshDashboard();
     });
-  });
+  }, lifecycleAc.signal);
 
-  chimeBtnsEl.addEventListener('click', ev => {
+  listenEvent(chimeBtnsEl, 'click', ev => {
     const btn = (ev.target as HTMLElement).closest<HTMLButtonElement>('button[data-chime]');
     if (!btn) return;
     const chime = btn.dataset.chime || 'wake';
     void runFaceAction('喇叭试音失败', async () => {
-      const res = await callPlugin('sound', { chime, force: true });
+      const res = await callPlugin('sound', { chime, force: true }, { signal: lifecycleAc.signal });
       if (!res.ok) setBanner(res.message || '喇叭试音失败', true);
     });
-  });
+  }, lifecycleAc.signal);
+
+  function deactivate(): void {
+    active = false;
+    activeAc?.abort();
+    activeAc = null;
+    pollAc?.abort();
+    pollAc = null;
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = undefined;
+    }
+    if (expressRefreshTimer !== undefined) {
+      clearTimeout(expressRefreshTimer);
+      expressRefreshTimer = undefined;
+    }
+  }
 
   return {
     activate() {
+      if (disposed) return;
       active = true;
       dirty = false;
       weatherCityDirty = false;
+      ++badgeSeq;
+      badgeAc?.abort();
+      badgeAc = null;
+      activeAc?.abort();
+      activeAc = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      if (typeof document !== 'undefined' && activeAc) {
+        listenEvent(document, 'visibilitychange', () => {
+          if (active && options.isVisible() && !isDocHidden() && !appState.authExpired && autoPreviewCheck.checked && !isEditingWithin(panelEl)) {
+            void refreshDashboard({ background: true });
+          }
+        }, activeAc.signal);
+      }
       if (!appState.authExpired) {
         void refreshDashboard();
       }
       if (pollTimer) clearInterval(pollTimer);
       pollTimer = setInterval(() => {
-        if (active && options.isVisible() && !appState.authExpired && autoPreviewCheck.checked && !isEditingWithin(panelEl)) {
-          void refreshDashboard();
+        if (active && options.isVisible() && !isDocHidden() && !appState.authExpired && autoPreviewCheck.checked && !isEditingWithin(panelEl)) {
+          void refreshDashboard({ background: true });
         }
       }, 3500);
     },
-    deactivate() {
-      active = false;
-      if (pollTimer) {
-        clearInterval(pollTimer);
-        pollTimer = undefined;
-      }
-      if (expressRefreshTimer !== undefined) {
-        clearTimeout(expressRefreshTimer);
-        expressRefreshTimer = undefined;
-      }
-    },
+    deactivate,
     async refreshBadge() {
-      if (active || appState.authExpired) return;
+      if (disposed || active || appState.authExpired) return;
       const seq = ++badgeSeq;
+      badgeAc?.abort();
+      const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      badgeAc = ac;
       try {
-        const res = await callPlugin<Cs80StatusData>('status');
-        if (active || seq !== badgeSeq || appState.authExpired) return;
+        const res = await callPlugin<Cs80StatusData>('status', {}, {
+          priority: 'low',
+          ...(ac ? { signal: ac.signal } : {}),
+        });
+        if (disposed || active || seq !== badgeSeq || appState.authExpired) return;
         if (res.data) updateTopBadge(res.data);
-      } catch {
-        if (!active && seq === badgeSeq && !appState.authExpired) {
+      } catch (err) {
+        if (ac?.signal.aborted || (err instanceof Error && err.name === 'AbortError')) return;
+        if (!disposed && !active && seq === badgeSeq && !appState.authExpired) {
           topBadge.textContent = '—';
         }
+      } finally {
+        if (badgeAc === ac) badgeAc = null;
       }
+    },
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      deactivate();
+      badgeAc?.abort();
+      badgeAc = null;
+      lifecycleAc.abort();
     },
   };
 }
