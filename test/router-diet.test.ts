@@ -404,6 +404,7 @@ test('Router transformContext compacts historical toolResult <=480, assistant te
         `Expected historical toolCall args <= ${ROUTER_HISTORICAL_TOOL_ARG_MAX_CHARS}, got ${compactedArgsJson.length}`,
       );
       assert.equal(typeof histToolCallBlocks[0]!.arguments?.input, 'string', 'preserves {input} wrapper schema');
+      assert.doesNotThrow(() => JSON.parse(histToolCallBlocks[0]!.arguments!.input!));
 
       const histAssistantBlocks = routerOut[3]!.content as Array<{ type: string; text?: string }>;
       assert.deepEqual(histAssistantBlocks.map(b => b.type), ['text']);
@@ -1421,4 +1422,66 @@ test('compactPluginResultForRouter shrinks bloated health-scale measure-status p
   // Dashboard action & explicit includeRecords: true remain untouched
   assert.equal(compactPluginResultForRouter(rawResult, 'dashboard', {}), rawResult);
   assert.equal(compactPluginResultForRouter(rawResult, 'measure-status', { includeRecords: true }), rawResult);
+});
+
+test('compactToolCallArguments preserves valid inner JSON for historical { input, summary } tool calls', () => {
+  const messages = [
+    {
+      role: 'assistant',
+      content: [
+        {
+          type: 'toolCall',
+          id: 'tc-start-with-summary',
+          name: 'start_work',
+          arguments: {
+            input: JSON.stringify({ instruction: `任务：${'长'.repeat(600)}`, profile: 'research' }),
+            summary: '派发群聊上下文溯源分析',
+          },
+        },
+        {
+          type: 'toolCall',
+          id: 'tc-bulky-both',
+          name: 'start_work',
+          arguments: {
+            input: JSON.stringify({ instruction: `任务：${'长'.repeat(600)}`, profile: 'coding' }),
+            summary: '摘'.repeat(400),
+          },
+        },
+        {
+          type: 'toolCall',
+          id: 'tc-malformed-json-input',
+          name: 'continue_work',
+          arguments: {
+            input: `{"taskId":"t1","instruction":"${'破'.repeat(500)}`,
+            summary: '补充要求',
+          },
+        },
+      ],
+    },
+    { role: 'user', content: [{ type: 'text', text: 'HOST_EVENT\n{"kind":"CHAT"}' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'latest' }] },
+  ] as Array<{ role: string; content: unknown }>;
+
+  const compacted = transformAgentContextMessages(messages, 'router');
+  const toolCalls = (compacted[0] as unknown as {
+    content: Array<{ id: string; arguments: { input: string; summary?: string } }>;
+  }).content;
+
+  // 1. Valid { input, summary } preserves summary and keeps inner JSON valid
+  const first = toolCalls[0]!.arguments;
+  assert.ok(JSON.stringify(first).length <= ROUTER_HISTORICAL_TOOL_ARG_MAX_CHARS);
+  assert.equal(first.summary, '派发群聊上下文溯源分析');
+  const firstInner = JSON.parse(first.input) as Record<string, unknown>;
+  assert.equal(typeof firstInner.instruction, 'string');
+
+  // 2. Both bulky input and bulky summary stay within budget while keeping inner JSON valid
+  const second = toolCalls[1]!.arguments;
+  assert.ok(JSON.stringify(second).length <= ROUTER_HISTORICAL_TOOL_ARG_MAX_CHARS);
+  assert.doesNotThrow(() => JSON.parse(second.input));
+
+  // 3. Malformed JSON-like input with summary is wrapped into valid JSON instead of unterminated string
+  const third = toolCalls[2]!.arguments;
+  assert.ok(JSON.stringify(third).length <= ROUTER_HISTORICAL_TOOL_ARG_MAX_CHARS);
+  const thirdInner = JSON.parse(third.input) as Record<string, unknown>;
+  assert.equal(typeof thirdInner._compacted, 'string');
 });

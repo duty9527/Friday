@@ -169,31 +169,77 @@ function compactToolCallArguments(
   const serialized = JSON.stringify(args);
   if (serialized.length <= maxChars) return { changed: false, value: args };
 
-  const keys = Object.keys(args);
-  if (keys.length === 1 && typeof args.input === 'string') {
-    const rawInput = args.input;
-    try {
-      const inner: unknown = JSON.parse(rawInput);
-      if (isPlainRecord(inner)) {
-        let budget = Math.max(24, maxChars - 40);
-        for (let attempt = 0; attempt < 4 && budget >= 16; attempt++) {
-          const wrapped = { input: JSON.stringify(compactPlainObjectToBudget(inner, budget)) };
-          if (JSON.stringify(wrapped).length <= maxChars) {
-            return { changed: true, value: wrapped };
-          }
-          budget = Math.floor(budget * 0.7);
+  if (typeof args.input === 'string') {
+    const { input: rawInput, ...rest } = args;
+    const hasRest = Object.keys(rest).length > 0;
+    const restBudget = Math.min(120, Math.max(24, Math.floor(maxChars * 0.3)));
+    const compactedRest = hasRest
+      ? (JSON.stringify(rest).length <= restBudget ? rest : compactPlainObjectToBudget(rest, restBudget))
+      : {};
+
+    const fitStructuredInner = (
+      innerObj: Record<string, unknown>,
+      extra: Record<string, unknown>,
+    ): Record<string, unknown> | undefined => {
+      const extraOverhead = Object.keys(extra).length > 0 ? JSON.stringify(extra).length : 0;
+      let budget = Math.max(24, maxChars - extraOverhead - 24);
+      for (let attempt = 0; attempt < 8 && budget >= 16; attempt++) {
+        const candidate = { input: JSON.stringify(compactPlainObjectToBudget(innerObj, budget)), ...extra };
+        if (JSON.stringify(candidate).length <= maxChars) {
+          return candidate;
         }
+        budget = Math.floor(budget * 0.7);
       }
-    } catch { /* raw input string */ }
-    let sliceLen = Math.max(8, maxChars - 20);
-    while (sliceLen > 4) {
-      const wrapped = { input: truncateWithSuffix(rawInput, sliceLen, '…') };
-      if (JSON.stringify(wrapped).length <= maxChars) {
-        return { changed: true, value: wrapped };
+      const minimal = { input: JSON.stringify({ _compacted: '…' }), ...extra };
+      return JSON.stringify(minimal).length <= maxChars ? minimal : undefined;
+    };
+
+    try {
+      const inner: unknown = JSON.parse(rawInput.trim());
+      if (isPlainRecord(inner)) {
+        const fitted = fitStructuredInner(inner, compactedRest) ?? (hasRest ? fitStructuredInner(inner, {}) : undefined);
+        return { changed: true, value: fitted ?? { input: '{}' } };
       }
-      sliceLen = Math.floor(sliceLen * 0.7);
+    } catch { /* raw or malformed input string */ }
+
+    const fitWrappedCompacted = (extra: Record<string, unknown>): Record<string, unknown> | undefined => {
+      const extraOverhead = Object.keys(extra).length > 0 ? JSON.stringify(extra).length : 0;
+      let sliceLen = Math.max(8, maxChars - extraOverhead - 40);
+      while (sliceLen >= 0) {
+        const candidate = {
+          input: JSON.stringify({ _compacted: truncateWithSuffix(rawInput, sliceLen, '…') }),
+          ...extra,
+        };
+        if (JSON.stringify(candidate).length <= maxChars) {
+          return candidate;
+        }
+        if (sliceLen === 0) break;
+        sliceLen = Math.floor(sliceLen * 0.6);
+      }
+      return undefined;
+    };
+
+    const fitPlainInput = (extra: Record<string, unknown>): Record<string, unknown> | undefined => {
+      const extraOverhead = Object.keys(extra).length > 0 ? JSON.stringify(extra).length : 0;
+      let sliceLen = Math.max(8, maxChars - extraOverhead - 20);
+      while (sliceLen > 4) {
+        const candidate = { input: truncateWithSuffix(rawInput, sliceLen, '…'), ...extra };
+        if (JSON.stringify(candidate).length <= maxChars) {
+          return candidate;
+        }
+        sliceLen = Math.floor(sliceLen * 0.7);
+      }
+      return undefined;
+    };
+
+    const trimmedInput = rawInput.trimStart();
+    if (trimmedInput.startsWith('{') || trimmedInput.startsWith('[')) {
+      const fitted = fitWrappedCompacted(compactedRest) ?? (hasRest ? fitWrappedCompacted({}) : undefined);
+      return { changed: true, value: fitted ?? { input: '{}' } };
     }
-    return { changed: true, value: { input: '…' } };
+
+    const fitted = fitPlainInput(compactedRest) ?? (hasRest ? fitPlainInput({}) : undefined);
+    return { changed: true, value: fitted ?? { input: '…' } };
   }
 
   return { changed: true, value: compactPlainObjectToBudget(args, maxChars) };
