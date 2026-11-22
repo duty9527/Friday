@@ -93,6 +93,8 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
   private readonly prewarmedTargets = new Set<string>();
   private readonly healthMeasureWatches = new Map<string, { sessionId: string; stop: () => void }>();
   private readonly announcedMeasureSessions = new BoundedMap<string, number>(64);
+  private readonly laifenMonitorWatches = new Map<string, { sessionId: string; stop: () => void }>();
+  private readonly announcedBrushSessions = new BoundedMap<string, number>(64);
 
   constructor(private readonly ctx: ImGatewayContext) {}
 
@@ -102,6 +104,11 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     }
     this.healthMeasureWatches.clear();
     this.announcedMeasureSessions.clear();
+    for (const watch of [...this.laifenMonitorWatches.values()]) {
+      watch.stop();
+    }
+    this.laifenMonitorWatches.clear();
+    this.announcedBrushSessions.clear();
     this.kwsMonitor?.close();
     this.kwsMonitor = undefined;
     this.kwsDepsRef = undefined;
@@ -1119,11 +1126,14 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     };
   }
 
-  private stopHealthMeasureWatch(key: string): void {
-    const existing = this.healthMeasureWatches.get(key);
+  private stopWatchEntry(
+    watchMap: Map<string, { sessionId: string; stop: () => void }>,
+    key: string,
+  ): void {
+    const existing = watchMap.get(key);
     if (existing) {
       existing.stop();
-      this.healthMeasureWatches.delete(key);
+      watchMap.delete(key);
     }
   }
 
@@ -1141,11 +1151,11 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     if (announcedId) {
       this.announcedMeasureSessions.set(announcedId, Date.now());
       if (this.healthMeasureWatches.get(key)?.sessionId === announcedId) {
-        this.stopHealthMeasureWatch(key);
+        this.stopWatchEntry(this.healthMeasureWatches, key);
       }
     }
     if (result.plugin === 'health-scale' && result.action === 'measure-stop') {
-      this.stopHealthMeasureWatch(key);
+      this.stopWatchEntry(this.healthMeasureWatches, key);
     }
     const watchId = typeof dataObj?.watchMeasureSessionId === 'string'
       ? dataObj.watchMeasureSessionId.trim()
@@ -1154,41 +1164,68 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
       const timeoutSec = Number(dataObj?.timeoutSec ?? 45);
       this.startHealthMeasureWatch(channelId, targetId, watchId, Number.isFinite(timeoutSec) ? timeoutSec : 45);
     }
+
+    if (result.plugin === 'laifen' && result.action === 'monitor-stop') {
+      this.stopWatchEntry(this.laifenMonitorWatches, key);
+    }
+    const watchBrushId = typeof dataObj?.watchBrushSessionId === 'string'
+      ? dataObj.watchBrushSessionId.trim()
+      : '';
+    if (watchBrushId) {
+      const timeoutSec = Number(dataObj?.timeoutSec ?? 360);
+      this.startLaifenMonitorWatch(channelId, targetId, watchBrushId, Number.isFinite(timeoutSec) ? timeoutSec : 360);
+    }
   }
 
-  private startHealthMeasureWatch(
-    channelId: string,
-    targetId: string,
-    sessionId: string,
-    timeoutSec = 45,
-  ): void {
-    if (this.ctx.isClosing() || !sessionId || this.announcedMeasureSessions.has(sessionId)) {
+  private startPluginSessionWatch(opts: {
+    watchMap: Map<string, { sessionId: string; stop: () => void }>;
+    announcedMap: BoundedMap<string, number>;
+    channelId: string;
+    targetId: string;
+    sessionId: string;
+    timeoutSec: number;
+    minTimeoutSec: number;
+    maxTimeoutSec: number;
+    extraDeadlineMs: number;
+    pollIntervalMs: number;
+    plugin: string;
+    pollEvent: string;
+    sessionIdField: string;
+    activePhases: readonly string[];
+    cs80Scene: 'weighing_scale' | 'managing_laifen';
+    completedUserText: string;
+    completedAction: string;
+    logTag: string;
+  }): void {
+    if (this.ctx.isClosing() || !opts.sessionId || opts.announcedMap.has(opts.sessionId)) {
       return;
     }
-    const key = `${channelId}:${targetId}`;
-    const existing = this.healthMeasureWatches.get(key);
-    if (existing?.sessionId === sessionId) return;
+    const key = `${opts.channelId}:${opts.targetId}`;
+    const existing = opts.watchMap.get(key);
+    if (existing?.sessionId === opts.sessionId) return;
     existing?.stop();
 
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const entry = {
-      sessionId,
+      sessionId: opts.sessionId,
       stop: () => {
         stopped = true;
         if (timer) {
           clearTimeout(timer);
           timer = undefined;
         }
-        if (this.healthMeasureWatches.get(key) === entry) {
-          this.healthMeasureWatches.delete(key);
+        if (opts.watchMap.get(key) === entry) {
+          opts.watchMap.delete(key);
         }
       },
     };
-    this.healthMeasureWatches.set(key, entry);
+    opts.watchMap.set(key, entry);
 
-    const pollIntervalMs = Math.max(20, this.deps?.measurePollIntervalMs ?? 1_500);
-    const deadline = Date.now() + (Math.min(120, Math.max(10, timeoutSec)) + 8) * 1000;
+    const startedAt = Date.now();
+    let deadline = startedAt
+      + Math.min(opts.maxTimeoutSec, Math.max(opts.minTimeoutSec, opts.timeoutSec)) * 1000
+      + opts.extraDeadlineMs;
 
     void (async () => {
       try {
@@ -1197,40 +1234,50 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
             timer = setTimeout(() => {
               timer = undefined;
               resolve();
-            }, pollIntervalMs);
+            }, opts.pollIntervalMs);
             timer.unref?.();
           });
           if (stopped || this.ctx.isClosing()) break;
 
           const pollRes = await this.ctx.runVoiceFastpath({
             text: '',
-            channelId,
+            channelId: opts.channelId,
             platform: 'xiaoai',
-            targetId,
-            allowedPlugins: ['health-scale'],
+            targetId: opts.targetId,
+            allowedPlugins: [opts.plugin],
             sessionState: {
-              event: 'measure_poll',
-              watchMeasureSessionId: sessionId,
+              event: opts.pollEvent,
+              [opts.sessionIdField]: opts.sessionId,
             },
           }).catch(() => undefined);
 
           if (stopped || this.ctx.isClosing() || !pollRes?.handled) break;
 
           const dataObj = asRecord(pollRes.data);
+          const nextTimeout = Number(dataObj?.timeoutSec);
+          if (Number.isFinite(nextTimeout) && nextTimeout > 0) {
+            const extended = startedAt
+              + Math.min(opts.maxTimeoutSec, Math.max(opts.minTimeoutSec, nextTimeout)) * 1000
+              + opts.extraDeadlineMs;
+            if (extended > deadline) {
+              deadline = extended;
+            }
+          }
+
           const phase = String(dataObj?.phase ?? '');
-          if (['scanning', 'connecting', 'measuring'].includes(phase)) {
+          if (opts.activePhases.includes(phase)) {
             continue;
           }
 
           entry.stop();
           pushCs80Scene(
-            { scene: 'weighing_scale', phase: 'end', tailSec: phase === 'completed' ? 1.2 : 0 },
+            { scene: opts.cs80Scene, phase: 'end', tailSec: phase === 'completed' ? 1.2 : 0 },
             { skipWhenMocked: Boolean(this.deps?.sshRunner) },
           );
-          if (phase === 'superseded' || this.announcedMeasureSessions.has(sessionId)) {
+          if (phase === 'superseded' || opts.announcedMap.has(opts.sessionId)) {
             break;
           }
-          this.announcedMeasureSessions.set(sessionId, Date.now());
+          opts.announcedMap.set(opts.sessionId, Date.now());
 
           const speech = pollRes.speech?.trim();
           if (!speech) break;
@@ -1239,23 +1286,23 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
             const replyId = randomUUID();
             this.ctx.markMessageDelivered(replyId, Number.MAX_SAFE_INTEGER);
             try {
-              const ch = this.ctx.coordinator.store.getImChannel(channelId);
+              const ch = this.ctx.coordinator.store.getImChannel(opts.channelId);
               const recorded = await Promise.resolve(this.ctx.coordinator.recordFastpathTurn({
-                channelId,
-                senderId: targetId,
-                senderName: targetId,
-                userText: '[体脂秤实测同步]',
+                channelId: opts.channelId,
+                senderId: opts.targetId,
+                senderName: opts.targetId,
+                userText: opts.completedUserText,
                 replyText: `${speech} [[END]]`,
-                pluginName: 'health-scale',
-                action: 'measure-completed',
+                pluginName: opts.plugin,
+                action: opts.completedAction,
                 latencyMs: 0,
                 replyId,
                 origin: {
                   channel: ch.platform,
                   channelId: ch.id,
                   accountId: ch.accountId,
-                  conversationId: targetId,
-                  senderId: targetId,
+                  conversationId: opts.targetId,
+                  senderId: opts.targetId,
                 },
               }));
               if (recorded?.replyMessage?.id) {
@@ -1266,15 +1313,71 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
             }
           }
 
-          this.enqueueDirectSpeech(channelId, targetId, speech);
+          this.enqueueDirectSpeech(opts.channelId, opts.targetId, speech);
           break;
         }
       } catch (err) {
-        console.warn(`[xiaoai-health-watch] ${channelId}/${targetId}: ${err instanceof Error ? err.message : String(err)}`);
+        console.warn(`[${opts.logTag}] ${opts.channelId}/${opts.targetId}: ${err instanceof Error ? err.message : String(err)}`);
       } finally {
         entry.stop();
       }
     })();
+  }
+
+  private startHealthMeasureWatch(
+    channelId: string,
+    targetId: string,
+    sessionId: string,
+    timeoutSec = 45,
+  ): void {
+    this.startPluginSessionWatch({
+      watchMap: this.healthMeasureWatches,
+      announcedMap: this.announcedMeasureSessions,
+      channelId,
+      targetId,
+      sessionId,
+      timeoutSec,
+      minTimeoutSec: 10,
+      maxTimeoutSec: 120,
+      extraDeadlineMs: 8_000,
+      pollIntervalMs: Math.max(20, this.deps?.measurePollIntervalMs ?? 1_500),
+      plugin: 'health-scale',
+      pollEvent: 'measure_poll',
+      sessionIdField: 'watchMeasureSessionId',
+      activePhases: ['scanning', 'connecting', 'measuring'],
+      cs80Scene: 'weighing_scale',
+      completedUserText: '[体脂秤实测同步]',
+      completedAction: 'measure-completed',
+      logTag: 'xiaoai-health-watch',
+    });
+  }
+
+  private startLaifenMonitorWatch(
+    channelId: string,
+    targetId: string,
+    sessionId: string,
+    timeoutSec = 360,
+  ): void {
+    this.startPluginSessionWatch({
+      watchMap: this.laifenMonitorWatches,
+      announcedMap: this.announcedBrushSessions,
+      channelId,
+      targetId,
+      sessionId,
+      timeoutSec,
+      minTimeoutSec: 15,
+      maxTimeoutSec: 600,
+      extraDeadlineMs: 15_000,
+      pollIntervalMs: Math.max(20, this.deps?.measurePollIntervalMs ?? 2_000),
+      plugin: 'laifen',
+      pollEvent: 'brushing_poll',
+      sessionIdField: 'watchBrushSessionId',
+      activePhases: ['scanning', 'connecting', 'monitoring', 'reconnecting'],
+      cs80Scene: 'managing_laifen',
+      completedUserText: '[刷牙实测同步]',
+      completedAction: 'monitor-completed',
+      logTag: 'xiaoai-laifen-watch',
+    });
   }
 
   private async handleKwsCaptureCancel(event: {

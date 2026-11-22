@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { listPluginsSync, runPlugin, type PluginRunResult } from '../plugin.js';
@@ -11,6 +11,7 @@ export const PLUGIN_REFRESH_INTERVALS = Object.freeze({
   miotLiveMs: 30 * 60_000,
   ninebotMs: 30 * 60_000,
   netleaMs: 30 * 60_000,
+  laifenMaintenanceMs: 30_000,
   appleMs: 60 * 60_000,
   bleDeferMs: 60_000,
   failureBackoffBaseMs: 5 * 60_000,
@@ -21,6 +22,7 @@ export type RefreshPluginName =
   | 'miot'
   | 'ninebot'
   | 'netlea'
+  | 'laifen'
   | 'apple-devices';
 
 const REFRESH_ORDER: readonly RefreshPluginName[] = [
@@ -28,6 +30,7 @@ const REFRESH_ORDER: readonly RefreshPluginName[] = [
   'miot',
   'ninebot',
   'netlea',
+  'laifen',
   'apple-devices',
 ];
 
@@ -168,6 +171,17 @@ function isBleSessionActive(
   }
 }
 
+function isPidAliveSafe(pid: unknown): boolean {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  try {
+    process.kill(n, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Checks whether `health-scale` or `laifen` currently holds/uses the local BLE adapter.
  */
@@ -183,14 +197,14 @@ export function isBlePeerBusy(home: string, nowMs: number): boolean {
     || isBleSessionActive(
       join(pluginsRoot, 'laifen', 'live-session.json'),
       nowMs,
-      200_000,
-      ['scanning', 'connecting', 'monitoring'],
+      420_000,
+      ['scanning', 'connecting', 'monitoring', 'reconnecting'],
     )
     || isBleSessionActive(
       join(pluginsRoot, 'laifen', 'watch-state.json'),
       nowMs,
       60_000,
-      ['connecting', 'syncing', 'brushing'],
+      ['connecting', 'syncing', 'brushing', 'reconnecting'],
     )
   );
 }
@@ -448,6 +462,68 @@ export class PluginRefreshScheduler {
     };
   }
 
+  private prepareLaifenPlan(now: number, entry: PluginRefreshEntryState): RefreshPlan | null {
+    if (this.platform !== 'linux') return null;
+    const dir = join(this.home, 'plugins', 'laifen');
+    const outboxDir = join(dir, 'watch-outbox');
+    let hasOutbox = false;
+    try {
+      if (existsSync(outboxDir)) {
+        hasOutbox = readdirSync(outboxDir).some(f => f.startsWith('ev-') && f.endsWith('.json'));
+      }
+    } catch {
+      hasOutbox = false;
+    }
+
+    const live = readJsonRecordSafe(join(dir, 'live-session.json'));
+    const livePhase = typeof live?.phase === 'string' ? live.phase.trim().toLowerCase() : '';
+    const isTerminalUningested = Boolean(
+      live
+      && (livePhase === 'completed' || livePhase === 'stopped')
+      && !live.ingestedSessionId
+      && (
+        Number(live.activeBrushingSec || 0) >= 10
+        || (typeof live.latestStatusHex === 'string' && live.latestStatusHex.length > 0 && !live.finalStateSynced)
+      ),
+    );
+    const isDeadActive = Boolean(
+      live
+      && ['scanning', 'connecting', 'monitoring', 'reconnecting'].includes(livePhase)
+      && (
+        (Number(live.pid || 0) > 0 && !isPidAliveSafe(live.pid))
+        || (now - toFiniteTs(live.updatedAt ?? live.startedAt) > (Number(live.timeoutSec || 360) + 20) * 1000)
+      ),
+    );
+
+    const cfg = readJsonRecordSafe(join(dir, 'config.json'));
+    let watchNeedsStart = false;
+    if (cfg?.autoWakeSync === true) {
+      const watch = readJsonRecordSafe(join(dir, 'watch-state.json'));
+      const watchPhase = typeof watch?.phase === 'string' ? watch.phase.trim().toLowerCase() : '';
+      const watchAlive = Boolean(watch && watchPhase !== 'stopped' && isPidAliveSafe(watch.pid));
+      watchNeedsStart = !watchAlive;
+    }
+
+    if (!hasOutbox && !isTerminalUningested && !isDeadActive && !watchNeedsStart) {
+      return null;
+    }
+    if (
+      !hasOutbox
+      && entry.lastSuccessAt > 0
+      && now - entry.lastSuccessAt < PLUGIN_REFRESH_INTERVALS.laifenMaintenanceMs
+    ) {
+      return null;
+    }
+
+    return {
+      plugin: 'laifen',
+      action: 'status',
+      args: { silent: true },
+      timeoutMs: 10_000,
+      intervalMs: PLUGIN_REFRESH_INTERVALS.laifenMaintenanceMs,
+    };
+  }
+
   private prepareAppleDevicesPlan(now: number, entry: PluginRefreshEntryState): RefreshPlan | null {
     const dir = join(this.home, 'plugins', 'apple-devices');
     const sess = readJsonRecordSafe(join(dir, 'session.json'));
@@ -489,6 +565,9 @@ export class PluginRefreshScheduler {
           break;
         case 'netlea':
           candidate = this.prepareNetleaPlan(now, entry);
+          break;
+        case 'laifen':
+          candidate = this.prepareLaifenPlan(now, entry);
           break;
         case 'apple-devices':
           candidate = this.prepareAppleDevicesPlan(now, entry);

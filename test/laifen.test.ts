@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -663,5 +663,407 @@ test('laifen WatchSession._check_yield respects fresh netlea ble-active.lock and
     await execFileAsync('python3', ['-c', pyScript]);
   } finally {
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('ble_helper.py MonitorSession & WatchSession handle mid-brush reconnect, pause accumulation, idle sleep, and parser defaults', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'friday-laifen-py-sm-'));
+  try {
+    const idleHex = buildV1StatusHex({ modeIndex: 2, battery: 74, durationSec: 180, running: false });
+    const runHex = buildV1StatusHex({ modeIndex: 2, battery: 74, durationSec: 180, running: true });
+    const helperPath = join(process.cwd(), 'plugins/laifen/ble_helper.py');
+    const monState = join(dir, 'monitor-state.json');
+    const watchDir = join(dir, 'watch');
+    const outboxDir = join(watchDir, 'outbox');
+    mkdirSync(outboxDir, { recursive: true });
+    const watchState = join(watchDir, 'watch-state.json');
+
+    const pyScript = [
+      'import importlib.util, json, os, sys, types',
+      'timers = []',
+      'next_tid = 1',
+      'class FakeGLib:',
+      '    PRIORITY_DEFAULT = 0',
+      '    @staticmethod',
+      '    def timeout_add(ms, cb, *a):',
+      '        global next_tid',
+      '        tid = next_tid',
+      '        next_tid += 1',
+      '        timers.append((tid, ms, cb))',
+      '        return tid',
+      '    @staticmethod',
+      '    def source_remove(tid): pass',
+      '    @staticmethod',
+      '    def idle_add(*a): return 1',
+      'class FakeBus:',
+      '    def get_object(self, *a): return object()',
+      '    def add_signal_receiver(self, *a, **kw): return types.SimpleNamespace(remove=lambda: None)',
+      'dbus_mod = types.ModuleType("dbus")',
+      'dbus_mod.SystemBus = lambda: FakeBus()',
+      'dbus_mod.Interface = lambda obj, iface: types.SimpleNamespace(StopDiscovery=lambda: None, StartDiscovery=lambda: None, SetDiscoveryFilter=lambda *a: None, StopNotify=lambda **kw: None, Disconnect=lambda: None, RemoveDevice=lambda *a: None)',
+      'dbus_mod.ObjectPath = lambda p: p',
+      'dbus_mod.String = lambda s: s',
+      'dbus_mod.Boolean = lambda b: b',
+      'dbus_mod.Dictionary = lambda d, **kw: d',
+      'dbus_mod.DBusException = Exception',
+      'for mod in ["dbus.mainloop", "dbus.mainloop.glib", "gi", "gi.repository"]:',
+      '    sys.modules[mod] = types.ModuleType(mod)',
+      'sys.modules["dbus"] = dbus_mod',
+      'sys.modules["dbus.mainloop.glib"].DBusGMainLoop = lambda **kw: None',
+      'sys.modules["gi.repository"].GLib = FakeGLib',
+      `spec = importlib.util.spec_from_file_location("lfh2", ${JSON.stringify(helperPath)})`,
+      'm = importlib.util.module_from_spec(spec)',
+      'spec.loader.exec_module(m)',
+      'fake_ms = [1_000_000]',
+      'm.now_ms = lambda: fake_ms[0]',
+      'm.time.monotonic = lambda: fake_ms[0] / 1000.0',
+      '',
+      '# 1. Parser defaults',
+      'p = m.build_parser()',
+      'mon_args = p.parse_args(["monitor", "--state-file", "/tmp/s.json"])',
+      'assert mon_args.timeout == 360.0',
+      'w_args = p.parse_args(["watch", "--state-file", "/tmp/w.json", "--outbox-dir", "/tmp/o"])',
+      'assert w_args.idle_hold_sec == 25.0 and w_args.cooldown_sec == 15.0',
+      '',
+      '# 2. BaseBleSession._merge_device_snapshot preserves RSSI and name',
+      'def make_monitor(state_path, timeout_sec=360.0):',
+      '    ms = object.__new__(m.MonitorSession)',
+      '    ms.bus = FakeBus()',
+      '    ms.loop = types.SimpleNamespace(quit=lambda: None)',
+      '    ms.adapter_path = "/org/bluez/hci0"',
+      '    ms.adapter_props = {"Address": "B4:D5:BD:F0:B4:FE"}',
+      '    ms.adapter = dbus_mod.Interface(None, None)',
+      '    ms.target_mac = "C0:00:00:06:64:0A"; ms.name_prefix = "LFTB"; ms.target_dev_suffix = "/DEV_C0_00_00_06_64_0A"',
+      '    ms.ignored_paths = set(); ms.timeout_sec = timeout_sec; ms.started_at = fake_ms[0]; ms.start_mono = m.time.monotonic()',
+      '    ms.has_deadline = True; ms.allow_warm_cache = True; ms.deadline = ms.start_mono + timeout_sec; ms.max_attempts = 0',
+      '    ms.connect_attempts = 0; ms.attempt_errors = []; ms.stopping = False; ms.finished = False',
+      '    ms.initial_cleanup_done = True; ms.warm_cache_fast_try = False; ms.discovery_active = False',
+      '    ms.settling_match = False; ms.connecting = False; ms.direct_retried_for_current_adv = False; ms.services_handled = True',
+      '    ms.device_path = "/dev/1"; ms.device_snapshot = {"address": "C0:00:00:06:64:0A", "name": "LFTB01-P-640A", "rawName": "LFTB01-P-640A", "alias": "LFTB01-P-640A", "rssi": -72}',
+      '    ms.ff02_path = "/ff02"; ms.gap_name_path = None; ms.connected = True; ms.notify_active = True',
+      '    for a in ("overall_timer_id","scan_rsp_timer_id","settle_timer_id","connect_timer_id","resolve_timer_id","retry_timer_id","grace_timer_id","tick_timer_id","reconnect_grace_timer_id"):',
+      '        setattr(ms, a, None)',
+      '    ms.receivers = []; ms.notifications = []; ms.status_frames = []; ms.info_frames = []; ms.ack_frames = []; ms.status_seq = 0',
+      '    ms.state_file = state_path; ms.target_duration_sec = 180; ms.connected_at = fake_ms[0]',
+      '    ms.running_started_at = None; ms.first_running_started_at = None; ms.segment_started_at = None',
+      '    ms.accumulated_active_ms = 0; ms.last_running = False; ms.brushing_ever_started = False',
+      '    ms.reconnecting_brushing = False; ms.disconnect_while_running_at = None; ms.reconnect_count = 0',
+      '    ms.over_pressure_events = 0; ms.over_pressure_active = False',
+      '    ms.first_status_hex = None; ms.latest_status_hex = None; ms.info_hex = None',
+      '    ms.state = {"sessionId": "brush-py-1", "pid": os.getpid(), "phase": "monitoring", "startedAt": fake_ms[0], "updatedAt": fake_ms[0], "timeoutSec": 360.0, "message": "", "device": ms.device_snapshot, "notifications": [], "error": None}',
+      '    return ms',
+      '',
+      'ms_snap = make_monitor(' + JSON.stringify(monState) + ')',
+      'ms_snap._merge_device_snapshot("/dev/1", {"Address": "C0:00:00:06:64:0A", "Connected": True})',
+      'assert ms_snap.device_snapshot["rssi"] == -72',
+      'assert ms_snap.device_snapshot["name"] == "LFTB01-P-640A"',
+      '',
+      `idle_bytes = bytes.fromhex(${JSON.stringify(idleHex)})`,
+      `run_bytes = bytes.fromhex(${JSON.stringify(runHex)})`,
+      '',
+      '# 3. MonitorSession mid-brush disconnect -> reconnect bridges gap to full 180s (and extends short deadline)',
+      'timers.clear()',
+      'ms1 = make_monitor(' + JSON.stringify(monState) + ', timeout_sec=180.0)',
+      `ms1.on_ff02_packet(idle_bytes, ${JSON.stringify(idleHex)})`,
+      'fake_ms[0] += 5_000',
+      `ms1.on_ff02_packet(run_bytes, ${JSON.stringify(runHex)})`,
+      'assert ms1.deadline >= ms1.start_mono + 270.0, "starting brush must extend 180s deadline"',
+      'fake_ms[0] += 23_000',
+      'ms1.on_device_disconnected()',
+      'assert ms1.finished is False',
+      'assert ms1.reconnecting_brushing is True',
+      'assert ms1.state["phase"] == "reconnecting"',
+      'assert ms1.state["activeBrushingSec"] == 23',
+      'assert ms1.reconnect_grace_timer_id is not None',
+      'fake_ms[0] += 12_000',
+      'ms1.services_handled = True; ms1.connected = True',
+      `ms1.on_ff02_packet(run_bytes, ${JSON.stringify(runHex)})`,
+      'assert ms1.reconnecting_brushing is False',
+      'assert ms1.state["phase"] == "monitoring"',
+      'fake_ms[0] += 145_000',
+      `ms1.on_ff02_packet(idle_bytes, ${JSON.stringify(idleHex)})`,
+      'assert ms1.finished is False, "12s pause grace must not finish immediately"',
+      'assert timers[-1][1] == 12000',
+      'ms1.on_device_disconnected()',
+      'assert ms1.finished is True',
+      'assert ms1.state["phase"] == "completed"',
+      'assert ms1.state["activeBrushingSec"] == 180',
+      '',
+      '# 4. MonitorSession mid-brush disconnect that never reconnects keeps pre-disconnect 23s without dead-air inflation',
+      'fake_ms[0] = 2_000_000',
+      'ms2 = make_monitor(' + JSON.stringify(monState) + ')',
+      `ms2.on_ff02_packet(run_bytes, ${JSON.stringify(runHex)})`,
+      'fake_ms[0] += 23_000',
+      'ms2.on_device_disconnected()',
+      'assert ms2.finished is False and ms2.reconnecting_brushing is True',
+      'fake_ms[0] += 60_000',
+      'ms2._on_reconnect_grace_timeout()',
+      'assert ms2.finished is True and ms2.state["phase"] == "completed"',
+      'assert ms2.state["activeBrushingSec"] == 23',
+      '',
+      '# 5. MonitorSession pause 5s + resume excludes paused time',
+      'fake_ms[0] = 3_000_000',
+      'ms3 = make_monitor(' + JSON.stringify(monState) + ')',
+      `ms3.on_ff02_packet(run_bytes, ${JSON.stringify(runHex)})`,
+      'fake_ms[0] += 15_000',
+      `ms3.on_ff02_packet(idle_bytes, ${JSON.stringify(idleHex)})`,
+      'assert ms3.finished is False and ms3.state["activeBrushingSec"] == 15',
+      'fake_ms[0] += 5_000',
+      `ms3.on_ff02_packet(run_bytes, ${JSON.stringify(runHex)})`,
+      'fake_ms[0] += 20_000',
+      `ms3.on_ff02_packet(idle_bytes, ${JSON.stringify(idleHex)})`,
+      'ms3._on_idle_grace()',
+      'assert ms3.finished is True and ms3.state["activeBrushingSec"] == 35',
+      '',
+      '# 6. MonitorSession idle disconnect BEFORE brushing does not abort session',
+      'fake_ms[0] = 4_000_000',
+      'ms4 = make_monitor(' + JSON.stringify(monState) + ')',
+      'ms4.connected_at = 4_000_000',
+      `ms4.on_ff02_packet(idle_bytes, ${JSON.stringify(idleHex)})`,
+      'fake_ms[0] += 15_000',
+      'ms4.on_device_disconnected()',
+      'assert ms4.finished is False',
+      '',
+      '# 7. WatchSession mid-brush disconnect preserves cycle across begin_scan & bridges gap into outbox session',
+      'ws = object.__new__(m.WatchSession)',
+      'ws.bus = FakeBus(); ws.adapter = dbus_mod.Interface(None, None); ws.target_mac = "C0:00:00:06:64:0A"; ws.name_prefix = "LFTB"',
+      'ws.target_dev_suffix = "/DEV_C0_00_00_06_64_0A"; ws.ignored_paths = set(); ws.has_deadline = False',
+      'ws.started_at = 5_000_000; ws.connect_attempts = 0; ws.attempt_errors = []',
+      'ws.stopping = False; ws.finished = False; ws.services_handled = True; ws.connected = True; ws.connecting = False',
+      'ws.settling_match = False; ws.discovery_active = False; ws.notify_active = True; ws.direct_retried_for_current_adv = False',
+      'ws.device_path = "/dev/1"; ws.ff02_path = "/ff02"; ws.gap_name_path = None',
+      'ws.device_snapshot = {"address": "C0:00:00:06:64:0A", "name": "LFTB01-P-640A", "rssi": -68}',
+      'ws.notifications = []; ws.status_frames = []; ws.info_frames = []; ws.ack_frames = []; ws.status_seq = 0',
+      `ws.state_file = ${JSON.stringify(watchState)}; ws.outbox_dir = ${JSON.stringify(outboxDir)}`,
+      'ws.pending_file = ""; ws.yield_lock_file = ""; ws.peer_session_file = ""',
+      'ws.cooldown_sec = 15.0; ws.idle_hold_sec = 25.0; ws.outbox_seq = 0; ws.cycle_seq = 0',
+      'ws.cooldown_until = 0.0; ws.last_applied_patch_id = None; ws.last_flush_mono = 0.0; ws._last_flushed_sig = None',
+      'for a in ("tick_timer_id","scan_rsp_timer_id","settle_timer_id","connect_timer_id","resolve_timer_id","retry_timer_id","idle_release_timer_id","sync_emit_timer_id","status_wait_timer_id","grace_timer_id","reconnect_grace_timer_id","ack_timer_id","write_delay_timer_id","refresh_timer_id","cycle_timer_id"):',
+      '    setattr(ws, a, None)',
+      'ws.state = {"phase": "watching", "message": "", "error": None}',
+      'ws._reset_cycle_state()',
+      'ws.cycle_phase = "waiting_status"',
+      'fake_ms[0] = 5_000_000',
+      `ws.on_ff02_packet(run_bytes, ${JSON.stringify(runHex)})`,
+      'fake_ms[0] += 30_000',
+      'ws.on_device_disconnected()',
+      'assert ws.cycle_reconnecting_brushing is True',
+      'assert ws.state["phase"] == "reconnecting"',
+      'assert ws.cooldown_until == 0.0',
+      'ws.on_connecting_started({"address": "C0:00:00:06:64:0A", "name": "LFTB01-P-640A", "rssi": -70})',
+      'assert ws.cycle_reconnecting_brushing is True',
+      'assert ws.cycle_accumulated_ms == 30_000',
+      'fake_ms[0] += 10_000',
+      'ws.services_handled = True; ws.connected = True',
+      `ws.on_ff02_packet(run_bytes, ${JSON.stringify(runHex)})`,
+      'fake_ms[0] += 140_000',
+      `ws.on_ff02_packet(idle_bytes, ${JSON.stringify(idleHex)})`,
+      'ws._on_brushing_idle_grace()',
+      `ev_files = sorted(f for f in os.listdir(${JSON.stringify(outboxDir)}) if f.startswith("ev-") and f.endswith(".json"))`,
+      `sessions = [json.load(open(os.path.join(${JSON.stringify(outboxDir)}, f))) for f in ev_files]`,
+      'sess_evs = [s for s in sessions if s.get("kind") == "session"]',
+      'assert len(sess_evs) == 1 and sess_evs[0]["activeBrushingSec"] == 180, sess_evs',
+    ].join('\n');
+
+    await execFileAsync('python3', ['-c', pyScript]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('laifen ingestMonitorSessionIfReady avoids active write race, resets status to Idle on end, and ignores short-tap inflation', async () => {
+  const mod = await loadPluginModule();
+  const dataDir = mkdtempSync(join(tmpdir(), 'friday-laifen-ingest-'));
+  const now = new Date('2026-11-22T18:00:00+08:00').getTime();
+
+  try {
+    const sPath = join(dataDir, 'live-session.json');
+    const runHex = buildV1StatusHex({ modeIndex: 2, battery: 74, durationSec: 180, running: true });
+    const idleHex = buildV1StatusHex({ modeIndex: 2, battery: 74, durationSec: 180, running: false });
+
+    // 1. Active monitoring with alive PID must NOT mutate or rewrite live-session.json
+    const activePayload = JSON.stringify({
+      sessionId: 'brush-race-1',
+      pid: process.pid,
+      phase: 'monitoring',
+      startedAt: now - 20_000,
+      updatedAt: now - 1_000,
+      timeoutSec: 360,
+      message: '正在刷牙中',
+      device: { address: 'C0:00:00:06:64:0A', name: 'LFTB01-P-640A', rssi: -72 },
+      firstStatusHex: idleHex,
+      latestStatusHex: runHex,
+      runningStartedAt: now - 15_000,
+      segmentStartedAt: now - 15_000,
+      accumulatedActiveSec: 0,
+      activeBrushingSec: 14,
+      brushingActive: true,
+      overPressureEvents: 0,
+      notifications: [],
+    });
+    writeFileSync(sPath, activePayload);
+
+    const d1 = await mod.runAction('dashboard', {}, { dataDir, nowFn: () => now });
+    assert.equal(d1.ok, true);
+    assert.equal(readFileSync(sPath, 'utf8'), activePayload, 'live-session.json must not be overwritten while helper PID is alive');
+    assert.equal((d1.data as { device: { status: string } }).device.status, 'Running');
+
+    // 2. Reconnecting with alive PID also leaves live-session.json untouched
+    const reconnPayload = JSON.stringify({
+      ...JSON.parse(activePayload) as Record<string, unknown>,
+      phase: 'reconnecting',
+      brushingActive: false,
+      accumulatedActiveSec: 23,
+      activeBrushingSec: 23,
+    });
+    writeFileSync(sPath, reconnPayload);
+    await mod.runAction('dashboard', {}, { dataDir, nowFn: () => now + 1000 });
+    assert.equal(readFileSync(sPath, 'utf8'), reconnPayload);
+
+    // 3. Completed short-tap (4s active, 25s wall-clock elapsed, latestStatusHex still Running) must reset status to Idle and NOT record a 25s session
+    writeFileSync(sPath, JSON.stringify({
+      sessionId: 'brush-race-1',
+      pid: null,
+      phase: 'completed',
+      startedAt: now - 30_000,
+      updatedAt: now,
+      timeoutSec: 360,
+      message: '牙刷已断开',
+      device: { address: 'C0:00:00:06:64:0A', name: 'LFTB01-P-640A', rssi: -72 },
+      firstStatusHex: idleHex,
+      latestStatusHex: runHex,
+      runningStartedAt: now - 25_000,
+      segmentStartedAt: null,
+      accumulatedActiveSec: 4,
+      activeBrushingSec: 4,
+      brushingActive: false,
+      overPressureEvents: 0,
+      notifications: [],
+    }));
+    const d3 = await mod.runAction('dashboard', {}, { dataDir, nowFn: () => now + 2000 });
+    const d3Data = d3.data as { device: { status: string }; stats: { totalSessions: number } };
+    assert.equal(d3Data.device.status, 'Idle');
+    assert.equal(d3Data.stats.totalSessions, 0, '4s short tap must not be inflated by wall clock to 25s');
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('laifen handleVoiceFastpath covers monitor-start phrases, assistant_reply, brushing_poll, and completion speech', async () => {
+  const mod = await loadPluginModule();
+  const dataDir = mkdtempSync(join(tmpdir(), 'friday-laifen-fp-watch-'));
+  let now = new Date('2026-11-22T18:10:00+08:00').getTime();
+
+  try {
+    const startPhrases = ['记录刷牙', '记录刷牙愧不敢。', '我要刷牙了', '我去刷牙了', '刷牙监听'];
+    for (const phrase of startPhrases) {
+      const res = await mod.handleVoiceFastpath(
+        { text: phrase, channelId: 'xiaoai:1', platform: 'xiaoai' },
+        {
+          dataDir,
+          nowFn: () => now,
+          spawnMonitor: () => process.pid,
+        },
+      );
+      assert.equal(res.handled, true, `phrase should be handled: ${phrase}`);
+      assert.equal(res.action, 'monitor-start', `phrase should start monitor: ${phrase}`);
+      const d = res.data as { watchBrushSessionId?: string; timeoutSec?: number };
+      assert.ok(d.watchBrushSessionId?.startsWith('brush-'), `must return watchBrushSessionId for ${phrase}`);
+      assert.equal(d.timeoutSec, 360);
+      await mod.runAction('monitor-stop', {}, { dataDir, nowFn: () => now });
+      now += 1000;
+    }
+
+    // Query phrases must NOT start monitor
+    for (const query of ['今天刷牙几次了', '查看刷牙记录']) {
+      const res = await mod.handleVoiceFastpath(
+        { text: query, channelId: 'xiaoai:1', platform: 'xiaoai' },
+        { dataDir, nowFn: () => now, spawnMonitor: () => process.pid },
+      );
+      assert.notEqual(res.action, 'monitor-start', `query must not start monitor: ${query}`);
+    }
+
+    // "连接来分" phonetic match triggers sync
+    const syncHex = buildV1StatusHex({ modeIndex: 2, battery: 74, durationSec: 180 });
+    const laifenSync = await mod.handleVoiceFastpath(
+      { text: '连接来分', channelId: 'xiaoai:1', platform: 'xiaoai' },
+      {
+        dataDir,
+        nowFn: () => now,
+        bleRunner: async () => ({
+          ok: true,
+          syncedAt: now,
+          device: { address: 'C0:00:00:06:64:0A', name: 'LFTB01-P-640A', rssi: -70 },
+          statusHex: syncHex,
+        }),
+      },
+    );
+    assert.equal(laifenSync.handled, true);
+    assert.equal(laifenSync.action, 'sync');
+
+    // assistant_reply hook detects fresh brush-* session and brushing_poll completes with speech
+    const sPath = join(dataDir, 'live-session.json');
+    const started = await mod.handleVoiceFastpath(
+      { text: '记录刷牙', channelId: 'xiaoai:1', platform: 'xiaoai' },
+      { dataDir, nowFn: () => now, spawnMonitor: () => process.pid },
+    );
+    const sid = (started.data as { watchBrushSessionId: string }).watchBrushSessionId;
+
+    const hook = await mod.handleVoiceFastpath(
+      { text: '', channelId: 'xiaoai:1', platform: 'xiaoai', sessionState: { event: 'assistant_reply', assistantReply: 'ok' } },
+      { dataDir, nowFn: () => now + 1000 },
+    );
+    assert.equal(hook.handled, true);
+    assert.equal((hook.data as { watchBrushSessionId?: string }).watchBrushSessionId, sid);
+
+    // Poll during reconnecting stays active
+    writeFileSync(sPath, JSON.stringify({
+      sessionId: sid,
+      pid: process.pid,
+      phase: 'reconnecting',
+      startedAt: now,
+      updatedAt: now + 5000,
+      timeoutSec: 420,
+      message: '重连中',
+      activeBrushingSec: 23,
+      notifications: [],
+    }));
+    const pRecon = await mod.handleVoiceFastpath(
+      { text: '', channelId: 'xiaoai:1', platform: 'xiaoai', sessionState: { event: 'brushing_poll', watchBrushSessionId: sid } },
+      { dataDir, nowFn: () => now + 6000 },
+    );
+    assert.equal(pRecon.handled, true);
+    assert.equal((pRecon.data as { phase?: string; timeoutSec?: number }).phase, 'reconnecting');
+    assert.equal((pRecon.data as { timeoutSec?: number }).timeoutSec, 420);
+
+    // Complete with 180s session
+    const doneHex = buildV1StatusHex({ modeIndex: 2, battery: 73, durationSec: 180, running: false });
+    writeFileSync(sPath, JSON.stringify({
+      sessionId: sid,
+      pid: null,
+      phase: 'completed',
+      startedAt: now,
+      updatedAt: now + 185_000,
+      timeoutSec: 420,
+      message: '已完成',
+      device: { address: 'C0:00:00:06:64:0A', name: 'LFTB01-P-640A', rssi: -70 },
+      firstStatusHex: syncHex,
+      latestStatusHex: doneHex,
+      runningStartedAt: now + 3_000,
+      accumulatedActiveSec: 180,
+      activeBrushingSec: 180,
+      brushingActive: false,
+      overPressureEvents: 0,
+      notifications: [],
+    }));
+    const pDone = await mod.handleVoiceFastpath(
+      { text: '', channelId: 'xiaoai:1', platform: 'xiaoai', sessionState: { event: 'brushing_poll', watchBrushSessionId: sid } },
+      { dataDir, nowFn: () => now + 186_000 },
+    );
+    assert.equal(pDone.handled, true);
+    assert.equal(pDone.action, 'monitor-completed');
+    assert.match(String(pDone.speech), /刷牙已记录.*3 分钟.*Mode 3.*百分之 73/);
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true });
   }
 });

@@ -100,6 +100,12 @@ interface LaifenLiveSession {
   phase: string;
   message: string;
   activeBrushingSec: number;
+  accumulatedActiveSec?: number;
+  brushingActive?: boolean;
+  segmentStartedAt?: number | null;
+  runningStartedAt?: number | null;
+  targetDurationSec?: number | null;
+  reconnectCount?: number;
   overPressureEvents: number;
   startedAt: number | null;
   updatedAt: number | null;
@@ -122,6 +128,9 @@ interface LaifenWatchStatus {
   updatedAt: number | null;
   lastSyncedAt?: number | null;
   lastEventKind?: string | null;
+  activeBrushingSec?: number;
+  brushingActive?: boolean;
+  targetDurationSec?: number | null;
   error?: string | null;
 }
 
@@ -162,10 +171,13 @@ const SOURCE_LABELS: Record<string, string> = {
   manual: '手动打卡',
 };
 
+const ACTIVE_LIVE_PHASES = new Set(['scanning', 'connecting', 'monitoring', 'reconnecting']);
+
 const PHASE_BADGES: Record<string, { text: string; cls: string }> = {
   scanning: { text: '扫描唤醒中', cls: 'badge-amber' },
   connecting: { text: '连接中', cls: 'badge-amber' },
   monitoring: { text: '监听同步中', cls: 'badge-green' },
+  reconnecting: { text: '信号闪断 · 重连中', cls: 'badge-amber' },
   watching: { text: '自动唤醒监听中', cls: 'badge-green' },
   brushing: { text: '自动监测刷牙中', cls: 'badge-green' },
   cooldown: { text: '已同步 · 冷却待机', cls: 'badge-green' },
@@ -177,6 +189,22 @@ const PHASE_BADGES: Record<string, { text: string; cls: string }> = {
   timeout: { text: '已超时', cls: 'badge-slate' },
   error: { text: '异常', cls: 'badge-red' },
 };
+
+function formatClockSec(sec: number): string {
+  const clean = Math.max(0, Math.floor(sec));
+  const mins = Math.floor(clean / 60);
+  const rem = clean % 60;
+  return `${String(mins).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
+}
+
+function computeLiveBrushingSec(live: LaifenLiveSession, nowMs = Date.now()): number {
+  const base = Math.max(0, live.accumulatedActiveSec ?? 0);
+  if (live.brushingActive && typeof live.segmentStartedAt === 'number' && live.segmentStartedAt > 0) {
+    const segDelta = Math.max(0, Math.floor((nowMs - live.segmentStartedAt) / 1000));
+    return Math.max(live.activeBrushingSec || 0, base + segDelta);
+  }
+  return Math.max(0, live.activeBrushingSec || base);
+}
 
 function formatLaifenDisplayName(raw?: string | null): string {
   const s = (raw || '').trim();
@@ -241,7 +269,8 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
   const calAlignBtn = element<HTMLButtonElement>('laifen-cal-align-btn');
 
   let active = false;
-  let pollTimer: ReturnType<typeof setInterval> | undefined;
+  let pollTimer: ReturnType<typeof setTimeout> | undefined;
+  let liveTickTimer: ReturnType<typeof setInterval> | undefined;
   let bleProgressTimer: ReturnType<typeof setInterval> | undefined;
   let latestData: LaifenDashboardPayload | undefined;
   let selectedMode = 1;
@@ -353,10 +382,71 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
     return parts.join(' · ') || '自定义参数';
   }
 
+  function stopLiveTickTimer(): void {
+    if (liveTickTimer) {
+      clearInterval(liveTickTimer);
+      liveTickTimer = undefined;
+    }
+  }
+
+  function syncLiveTickTimer(data: LaifenDashboardPayload): void {
+    const live = data.liveSession;
+    const shouldTick = Boolean(
+      active
+      && options.isVisible()
+      && live
+      && ACTIVE_LIVE_PHASES.has(live.phase)
+      && live.brushingActive,
+    );
+    if (!shouldTick) {
+      stopLiveTickTimer();
+      return;
+    }
+    if (!liveTickTimer) {
+      liveTickTimer = setInterval(() => {
+        if (!active || !options.isVisible() || !latestData?.liveSession?.brushingActive) {
+          stopLiveTickTimer();
+          return;
+        }
+        renderHeroLiveState(latestData);
+      }, 1000);
+    }
+  }
+
+  function stopPollTimer(): void {
+    if (pollTimer) {
+      clearTimeout(pollTimer);
+      pollTimer = undefined;
+    }
+  }
+
+  function isFastPollingNeeded(data?: LaifenDashboardPayload): boolean {
+    const livePhase = data?.liveSession?.phase || '';
+    const watchPhase = data?.watchStatus?.phase || '';
+    return ACTIVE_LIVE_PHASES.has(livePhase) || ['connecting', 'syncing', 'brushing', 'reconnecting'].includes(watchPhase);
+  }
+
+  function schedulePoll(): void {
+    stopPollTimer();
+    if (!active) return;
+    const delay = isFastPollingNeeded(latestData) ? 1500 : 4000;
+    pollTimer = setTimeout(() => {
+      pollTimer = undefined;
+      if (!active) return;
+      if (options.isVisible() && !appState.authExpired && !busy && !isEditingWithin(panelEl)) {
+        void refreshDashboard().finally(() => {
+          if (active && !pollTimer) schedulePoll();
+        });
+      } else {
+        schedulePoll();
+      }
+    }, delay);
+  }
+
   function renderHeroLiveState(data: LaifenDashboardPayload): void {
     const live = data.liveSession;
     const watch = data.watchStatus;
-    const isLiveActive = Boolean(live && ['scanning', 'connecting', 'monitoring'].includes(live.phase));
+    const isLiveActive = Boolean(live && ACTIVE_LIVE_PHASES.has(live.phase));
     const showStop = bleOpInFlight || isLiveActive;
     monitorStartBtn.hidden = showStop;
     monitorStopBtn.hidden = !showStop;
@@ -367,14 +457,29 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
       const badge = PHASE_BADGES[live.phase] || { text: live.phase, cls: 'badge-amber' };
       livePhaseEl.className = `hub-badge ${badge.cls}`;
       livePhaseEl.textContent = badge.text;
-      liveMessageEl.textContent = live.activeBrushingSec > 0
-        ? `${live.message}（本次累计 ${live.activeBrushingSec}s）`
-        : live.message;
+      const sec = computeLiveBrushingSec(live);
+      const targetDur = live.targetDurationSec ?? data.device?.durationSec ?? data.config?.targetDurationSec ?? 180;
+      if (live.phase === 'reconnecting') {
+        liveMessageEl.textContent = sec > 0
+          ? `刷牙中蓝牙闪断，正在自动重连续接…（已累计 ${formatClockSec(sec)} / ${formatClockSec(targetDur)}）`
+          : live.message;
+      } else if (live.brushingActive) {
+        liveMessageEl.textContent = `正在刷牙中…（已刷 ${formatClockSec(sec)} / ${formatClockSec(targetDur)}）`;
+      } else if (sec > 0) {
+        liveMessageEl.textContent = `${live.message}（已刷 ${formatClockSec(sec)} / ${formatClockSec(targetDur)}）`;
+      } else {
+        liveMessageEl.textContent = live.message;
+      }
     } else if (watch?.enabled && watch.running) {
       const badge = PHASE_BADGES[watch.phase] || { text: '自动唤醒监听中', cls: 'badge-green' };
       livePhaseEl.className = `hub-badge ${badge.cls}`;
       livePhaseEl.textContent = badge.text;
-      liveMessageEl.textContent = watch.message || '后台自动唤醒监听中：拿起牙刷亮灯即自动同步电量与打卡';
+      const baseMsg = watch.message || '后台自动唤醒监听中：拿起牙刷亮灯即自动同步电量与打卡';
+      const watchSec = watch.activeBrushingSec ?? 0;
+      const watchTarget = watch.targetDurationSec ?? data.device?.durationSec ?? data.config?.targetDurationSec ?? 180;
+      liveMessageEl.textContent = (watch.phase === 'brushing' || watch.phase === 'reconnecting') && watchSec > 0
+        ? `${baseMsg}（已累计 ${formatClockSec(watchSec)} / ${formatClockSec(watchTarget)}）`
+        : baseMsg;
     } else if (live) {
       const badge = PHASE_BADGES[live.phase] || { text: live.phase, cls: 'badge-slate' };
       livePhaseEl.className = `hub-badge ${badge.cls}`;
@@ -396,6 +501,8 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
       watchBadgeEl.textContent = wBadge.text;
       watchToggleBtn.textContent = watch.enabled ? '关闭自动唤醒' : '开启自动唤醒同步';
     }
+
+    syncLiveTickTimer(data);
   }
 
   async function callPlugin<T = unknown>(
@@ -642,6 +749,7 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
       if (seq !== dashboardSeq || appState.authExpired) return;
       if (res.ok && res.data) {
         renderDashboard(res.data);
+        if (active) schedulePoll();
       } else if (!res.ok) {
         setBanner(res.message || '读取口腔护理看板失败', true);
       }
@@ -679,7 +787,7 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
       if (!bleOpInFlight || !res.ok || !res.data) return;
       renderHeroLiveState(res.data);
       const liveMsg = res.data.liveSession?.message;
-      if (liveMsg && ['scanning', 'connecting', 'monitoring'].includes(res.data.liveSession?.phase || '')) {
+      if (liveMsg && ACTIVE_LIVE_PHASES.has(res.data.liveSession?.phase || '')) {
         setBanner(liveMsg);
       }
     } catch {
@@ -774,7 +882,7 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
 
   monitorStartBtn.addEventListener('click', () => {
     void runBusyAction('正在启动后台刷牙监听会话…', async () => {
-      const res = await callPlugin('monitor-start', { timeoutSec: 180 });
+      const res = await callPlugin('monitor-start', { timeoutSec: 360 });
       setBanner(res.message || (res.ok ? '已启动监听' : '启动监听失败'), !res.ok);
       await refreshDashboard();
     });
@@ -871,20 +979,13 @@ export function initLaifenUi(options: LaifenUiOptions): LaifenUiController {
       if (!appState.authExpired) {
         void refreshDashboard();
       }
-      if (pollTimer) clearInterval(pollTimer);
-      pollTimer = setInterval(() => {
-        if (active && options.isVisible() && !appState.authExpired && !busy && !isEditingWithin(panelEl)) {
-          void refreshDashboard();
-        }
-      }, 4000);
+      schedulePoll();
     },
     deactivate() {
       active = false;
+      stopLiveTickTimer();
       stopBleProgressPolling();
-      if (pollTimer) {
-        clearInterval(pollTimer);
-        pollTimer = undefined;
-      }
+      stopPollTimer();
     },
     async refreshBadge() {
       if (active || appState.authExpired) return;

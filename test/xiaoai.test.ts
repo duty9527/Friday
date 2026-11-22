@@ -3898,3 +3898,116 @@ test('XiaoaiChannelAdapter auto-watches active health-scale session and announce
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test('XiaoaiChannelAdapter auto-watches active laifen monitor session and announces completed brushing via TTS', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-laifen-watch-'));
+  try {
+    const laifenMeta = listPluginsSync(home).find(p => p.name === 'laifen');
+    if (!laifenMeta?.enabled) {
+      return;
+    }
+
+    const pluginDataDir = resolvePluginDataDir(home, 'laifen');
+    await mkdir(pluginDataDir, { recursive: true });
+    const sessionPath = join(pluginDataDir, 'live-session.json');
+    const startedAt = Date.now();
+    await writeFile(sessionPath, JSON.stringify({
+      sessionId: 'brush-auto-watch-1',
+      pid: null,
+      phase: 'scanning',
+      startedAt,
+      updatedAt: startedAt,
+      timeoutSec: 360,
+      notifications: [],
+    }));
+
+    const routerFactory: AgentFactory = {
+      mode: 'real',
+      nativeTools: true,
+      async create(role) {
+        if (role !== 'router') return offlineFactory().create(role, role, []);
+        return {
+          close() {},
+          async prompt() {
+            return '好，已经开始看着刷牙了。[[END]]';
+          },
+        };
+      },
+    };
+
+    const ttsPayloads: string[] = [];
+    const coordinator = new Coordinator(home, routerFactory, { skipExecutor: true });
+    await coordinator.ready();
+    try {
+      coordinator.im.xiaoaiDeps = {
+        measurePollIntervalMs: 30,
+        sshRunner: async (_target, remoteCommand) => {
+          if (remoteCommand.includes('text_to_speech')) {
+            ttsPayloads.push(remoteCommand);
+          }
+          return { stdout: '{"code":0,"info":"{ \\"status\\": 0 }"}', stderr: '', code: 0 };
+        },
+      };
+      coordinator.im.saveChannel({
+        id: 'xiaoai-laifen-watch',
+        platform: 'xiaoai',
+        name: '小爱刷牙播报测试',
+        enabled: true,
+        notifyAll: false,
+        allowedSenders: [],
+        apiBase: 'ssh://lx06=root@192.0.2.104',
+        defaultTarget: 'lx06',
+        pollIntervalMs: 50,
+      });
+      coordinator.im.start();
+
+      const res = await coordinator.im.ingestMessage({
+        channelId: 'xiaoai-laifen-watch',
+        externalId: 'ext-laifen-watch-1',
+        senderId: 'lx06',
+        target: 'lx06',
+        text: '帮我看着点牙刷',
+        explicitWake: true,
+      });
+      assert.equal(res.action, 'routed_to_chat');
+
+      await until(() => ttsPayloads.some(cmd => cmd.includes('已经开始看着刷牙了')));
+      await delay(50);
+
+      // Write completed 180s V1 brushing session (74% -> 73%, Mode 3) into live-session.json
+      await writeFile(sessionPath, JSON.stringify({
+        sessionId: 'brush-auto-watch-1',
+        pid: null,
+        phase: 'completed',
+        startedAt,
+        updatedAt: Date.now(),
+        timeoutSec: 360,
+        device: { address: 'C0:00:00:06:64:0A', name: 'LFTB01-P-640A', rssi: -72 },
+        firstStatusHex: 'AA0A0217020104040406060A0A0A0B0606004A0100B401000000014C',
+        latestStatusHex: 'AA0A0217020104040406060A0A0A0B060600490100B401000000014F',
+        runningStartedAt: startedAt + 3_000,
+        accumulatedActiveSec: 180,
+        activeBrushingSec: 180,
+        brushingActive: false,
+        overPressureEvents: 0,
+        notifications: [],
+      }));
+
+      await until(() => ttsPayloads.some(cmd => cmd.includes('刷牙已记录') && cmd.includes('3 分钟')));
+      const history = coordinator.store.conversation.history(undefined, 20).items;
+      assert.ok(
+        history.some(m => m.role === 'user' && m.text === '[刷牙实测同步]'),
+        'Completed brushing auto-broadcast must be recorded in conversation history',
+      );
+      const dash = await runPlugin(home, 'laifen', 'dashboard', {});
+      const dashData = dash.data as { todayCount: number; sessions: Array<{ durationSec: number; source: string }> };
+      assert.equal(dashData.todayCount, 1);
+      assert.equal(dashData.sessions[0]?.durationSec, 180);
+      assert.equal(dashData.sessions[0]?.source, 'ble_monitor');
+    } finally {
+      await coordinator.close();
+    }
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});

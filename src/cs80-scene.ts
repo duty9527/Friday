@@ -211,8 +211,8 @@ export function classifyPluginCs80Scene(
         : undefined;
     }
     if (act === 'monitor-start') {
-      const timeoutSec = Number(args?.timeoutSec ?? 180);
-      const holdSec = Number.isFinite(timeoutSec) && timeoutSec > 0 ? Math.min(240, Math.round(timeoutSec) + 5) : 185;
+      const timeoutSec = Number(args?.timeoutSec ?? 360);
+      const holdSec = Number.isFinite(timeoutSec) && timeoutSec > 0 ? Math.min(600, Math.round(timeoutSec) + 10) : 370;
       return { scene: 'managing_laifen', caption: '徕芬牙刷刷牙实时监听中…', holdSec, finishHoldSec: holdSec };
     }
     if (act === 'sync') {
@@ -340,6 +340,16 @@ export function classifyFastpathCs80Scene(
     return undefined;
   }
 
+  if (ev === 'brushing_poll') {
+    if (act === 'monitor-completed') {
+      return { scene: 'managing_laifen', phase: 'end', tailSec: 1.2 };
+    }
+    if (['monitor-timeout', 'monitor-ended', 'monitor-stop'].includes(act)) {
+      return { scene: 'managing_laifen', phase: 'end', tailSec: 0 };
+    }
+    return undefined;
+  }
+
   if (plugin === 'tv-ir' || plugin === 'tv-agent') {
     if (act === 'tv_remote_exit') {
       return { scene: 'operating_tv', phase: 'end', tailSec: 0 };
@@ -377,7 +387,9 @@ export function classifyFastpathCs80Scene(
       return { scene: 'managing_laifen', phase: 'end', tailSec: 0 };
     }
     if (act === 'monitor-start') {
-      return { scene: 'managing_laifen', phase: 'start', holdSec: 185, caption: '徕芬牙刷刷牙实时监听中…' };
+      const timeoutSec = Number(data?.timeoutSec ?? 360);
+      const holdSec = Number.isFinite(timeoutSec) && timeoutSec > 0 ? Math.min(600, Math.round(timeoutSec) + 10) : 370;
+      return { scene: 'managing_laifen', phase: 'start', holdSec, caption: '徕芬牙刷刷牙实时监听中…' };
     }
     if (['sync', 'set', 'power', 'brushhead-reset', 'session-add'].includes(act)) {
       return { scene: 'managing_laifen', phase: 'pulse', holdSec: 4.5, caption: '正在管理徕芬电动牙刷…' };

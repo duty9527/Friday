@@ -21,7 +21,7 @@ function withTmpHome(fn: (home: string) => Promise<void> | void): Promise<void> 
 
 function makeManifests(home: string, enabledNames: string[]): PluginManifest[] {
   const enabledSet = new Set(enabledNames);
-  return ['fund-tracker', 'miot', 'ninebot', 'netlea', 'apple-devices'].map(name => ({
+  return ['fund-tracker', 'miot', 'ninebot', 'netlea', 'laifen', 'apple-devices'].map(name => ({
     name,
     title: name,
     description: name,
@@ -425,5 +425,65 @@ test('PluginRefreshScheduler enforces single-flight sequential execution and cle
     await scheduler.awaitSettled();
     assert.equal(firstAborted, true);
     assert.equal(scheduler.status().activePlugin, null);
+  });
+});
+
+test('PluginRefreshScheduler runs laifen maintenance on pending outbox or autoWakeSync recovery, and isBlePeerBusy honors reconnecting', async () => {
+  await withTmpHome(async home => {
+    let now = Date.now();
+    const laifenDir = join(home, 'plugins', 'laifen');
+
+    // 1. isBlePeerBusy detects laifen live-session and watch-state in 'reconnecting' phase
+    writeJson(join(laifenDir, 'live-session.json'), { phase: 'reconnecting', updatedAt: now });
+    assert.equal(isBlePeerBusy(home, now), true);
+    writeJson(join(laifenDir, 'live-session.json'), { phase: 'completed', updatedAt: now });
+    assert.equal(isBlePeerBusy(home, now), false);
+
+    writeJson(join(laifenDir, 'watch-state.json'), { phase: 'reconnecting', updatedAt: now });
+    assert.equal(isBlePeerBusy(home, now), true);
+    writeJson(join(laifenDir, 'watch-state.json'), { phase: 'watching', updatedAt: now });
+    assert.equal(isBlePeerBusy(home, now), false);
+
+    // 2. Clean idle laifen triggers zero refresh calls
+    const calls: Array<{ plugin: string; action: string }> = [];
+    const ac = new AbortController();
+    const scheduler = new PluginRefreshScheduler({
+      home,
+      mode: 'real',
+      closingSignal: ac.signal,
+      isClosing: () => false,
+      enabled: true,
+      nowFn: () => now,
+      platform: 'linux',
+      initialDelayMs: 0,
+      checkIntervalMs: 0,
+      staggerMs: 0,
+      listPluginsFn: h => makeManifests(h, ['laifen']),
+      runPluginFn: async (_h, plugin, action = 'status') => {
+        calls.push({ plugin, action });
+        return { ok: true, plugin, action, notify: false, message: 'ok' };
+      },
+    });
+    scheduler.tick();
+    await scheduler.awaitSettled();
+    assert.equal(calls.length, 0);
+
+    // 3. Pending watch-outbox event triggers laifen/status
+    writeJson(join(laifenDir, 'watch-outbox', 'ev-001.json'), { eventId: 'ev-001', kind: 'session' });
+    scheduler.tick();
+    await scheduler.awaitSettled();
+    assert.deepEqual(calls, [{ plugin: 'laifen', action: 'status' }]);
+
+    // 4. autoWakeSync enabled with stopped watch-state triggers recovery after maintenance interval
+    rmSync(join(laifenDir, 'watch-outbox', 'ev-001.json'));
+    writeJson(join(laifenDir, 'config.json'), { autoWakeSync: true });
+    writeJson(join(laifenDir, 'watch-state.json'), { phase: 'stopped', pid: null });
+    now += PLUGIN_REFRESH_INTERVALS.laifenMaintenanceMs;
+    scheduler.tick();
+    await scheduler.awaitSettled();
+    assert.deepEqual(calls, [
+      { plugin: 'laifen', action: 'status' },
+      { plugin: 'laifen', action: 'status' },
+    ]);
   });
 });

@@ -254,6 +254,23 @@ def parse_status_running(raw: bytes) -> bool | None:
     return None
 
 
+def parse_status_duration_sec(raw: bytes) -> int | None:
+    if len(raw) >= 26 and raw[0] == 0xAA and raw[1] == 0x0A and raw[2] == 0x02:
+        val = (raw[20] << 8) | raw[21]
+        return val if 60 <= val <= 300 else None
+    if len(raw) >= 10 and raw[0] == 0x5A and raw[1] in (0xC1, 0x81) and raw[2] == 0x03:
+        paylen = raw[5]
+        if len(raw) >= 6 + paylen + 1 and paylen >= 33:
+            val = raw[6 + 5] | (raw[6 + 6] << 8)
+            return val if 60 <= val <= 300 else None
+    if len(raw) >= 10 and raw[0] == 0x5A and raw[2] == 0x03:
+        paylen = raw[5]
+        if len(raw) >= 6 + paylen + 1 and paylen >= 22:
+            val = raw[6 + 21]
+            return val if 60 <= val <= 300 else None
+    return None
+
+
 def is_over_pressure_frame(raw: bytes) -> bool:
     if len(raw) >= 10 and raw[0] == 0x5A and raw[1] == 0x82 and raw[2] == 0x0C:
         paylen = raw[5]
@@ -886,6 +903,21 @@ class BaseBleSession:
             raw = bytes(int(b) & 0xFF for b in changed["Value"])
             self._record_ff02_packet(raw)
 
+    def _merge_device_snapshot(self, path: str, props: dict[str, Any]) -> None:
+        fresh = serialize_device(path, props)
+        prev = getattr(self, "device_snapshot", None)
+        if prev is not None and (
+            not fresh.get("address")
+            or not prev.get("address")
+            or fresh.get("address") == prev.get("address")
+        ):
+            if fresh.get("rssi") is None and prev.get("rssi") is not None:
+                fresh["rssi"] = prev["rssi"]
+            for key in ("name", "rawName", "alias"):
+                if not fresh.get(key) and prev.get(key):
+                    fresh[key] = prev[key]
+        self.device_snapshot = fresh
+
     def _handle_candidate_sighted(self, dev: dict[str, Any]) -> None:
         if self.stopping or self.finished or self.settling_match or self.connecting:
             return
@@ -912,7 +944,7 @@ class BaseBleSession:
             props = dict(
                 dbus.Interface(self.bus.get_object(BLUEZ_SERVICE, self.device_path), PROPERTIES_IFACE).GetAll(DEVICE_IFACE)
             )
-            self.device_snapshot = serialize_device(self.device_path, props)
+            self._merge_device_snapshot(self.device_path, props)
         except Exception:
             pass
         if self.device_snapshot and is_excluded_device(self.device_snapshot):
@@ -968,7 +1000,7 @@ class BaseBleSession:
             props = dict(
                 dbus.Interface(self.bus.get_object(BLUEZ_SERVICE, self.device_path), PROPERTIES_IFACE).GetAll(DEVICE_IFACE)
             )
-            self.device_snapshot = serialize_device(self.device_path, props)
+            self._merge_device_snapshot(self.device_path, props)
             if bool(props.get("Connected", False)):
                 self.connected = True
                 if bool(props.get("ServicesResolved", False)):
@@ -997,7 +1029,7 @@ class BaseBleSession:
             props = dict(
                 dbus.Interface(self.bus.get_object(BLUEZ_SERVICE, self.device_path), PROPERTIES_IFACE).GetAll(DEVICE_IFACE)
             )
-            self.device_snapshot = serialize_device(self.device_path, props)
+            self._merge_device_snapshot(self.device_path, props)
             if bool(props.get("ServicesResolved", False)):
                 self._on_services_resolved()
                 return
@@ -1659,9 +1691,18 @@ class MonitorSession(BaseBleSession):
         )
         self.args = args
         self.state_file = args.state_file
+        self.start_mono = time.monotonic()
+        self.target_duration_sec = 180
         self.connected_at: int | None = None
         self.running_started_at: int | None = None
+        self.first_running_started_at: int | None = None
+        self.segment_started_at: int | None = None
+        self.accumulated_active_ms = 0
         self.last_running = False
+        self.brushing_ever_started = False
+        self.reconnecting_brushing = False
+        self.disconnect_while_running_at: int | None = None
+        self.reconnect_count = 0
         self.over_pressure_events = 0
         self.over_pressure_active = False
 
@@ -1669,6 +1710,8 @@ class MonitorSession(BaseBleSession):
         self.latest_status_hex: str | None = None
         self.info_hex: str | None = None
         self.grace_timer_id: int | None = None
+        self.tick_timer_id: int | None = None
+        self.reconnect_grace_timer_id: int | None = None
 
         self.session_id = getattr(args, "session_id", "") or f"brush-{self.started_at}"
         self.state: dict[str, Any] = {
@@ -1688,7 +1731,13 @@ class MonitorSession(BaseBleSession):
             "latestStatusHex": None,
             "infoHex": None,
             "runningStartedAt": None,
+            "segmentStartedAt": None,
+            "accumulatedActiveSec": 0,
             "activeBrushingSec": 0,
+            "brushingActive": False,
+            "targetDurationSec": self.target_duration_sec,
+            "reconnectCount": 0,
+            "connectAttempts": 0,
             "overPressureEvents": 0,
             "notifications": self.notifications,
             "error": None,
@@ -1697,25 +1746,73 @@ class MonitorSession(BaseBleSession):
     def cancel_all_timers(self) -> None:
         super().cancel_all_timers()
         self.cancel_timer("grace_timer_id")
+        self.cancel_timer("tick_timer_id")
+        self.cancel_timer("reconnect_grace_timer_id")
+
+    def _current_active_ms(self, now: int | None = None) -> int:
+        ts = now_ms() if now is None else now
+        acc = int(getattr(self, "accumulated_active_ms", 0) or 0)
+        if getattr(self, "last_running", False) and getattr(self, "segment_started_at", None) is not None:
+            return acc + max(0, ts - int(self.segment_started_at))
+        return acc
+
+    def _close_running_segment(self, end_ms: int | None = None) -> None:
+        ts = now_ms() if end_ms is None else end_ms
+        if getattr(self, "last_running", False) and getattr(self, "segment_started_at", None) is not None:
+            self.accumulated_active_ms = int(getattr(self, "accumulated_active_ms", 0) or 0) + max(
+                0, ts - int(self.segment_started_at)
+            )
+        self.segment_started_at = None
+        self.last_running = False
+
+    def _extend_deadline_for_brushing(self) -> None:
+        if not getattr(self, "has_deadline", True):
+            return
+        target_dur = float(getattr(self, "target_duration_sec", 180) or 180)
+        start_mono = float(getattr(self, "start_mono", time.monotonic()))
+        min_needed = time.monotonic() + max(target_dur + 90.0, 240.0)
+        target_deadline = min(min_needed, start_mono + 600.0)
+        if target_deadline > self.deadline:
+            self.deadline = target_deadline
+            self.state["timeoutSec"] = round(self.deadline - start_mono)
+            self.cancel_timer("overall_timer_id")
+            remaining_ms = max(1000, int((self.deadline - time.monotonic()) * 1000))
+            self.overall_timer_id = GLib.timeout_add(remaining_ms, self.on_overall_timeout)
+
+    def _on_tick(self) -> bool:
+        if self.stopping or self.finished:
+            self.tick_timer_id = None
+            return False
+        if self.last_running or self.reconnecting_brushing:
+            self.flush()
+        return True
 
     def flush(self) -> None:
+        now = now_ms()
+        active_ms = self._current_active_ms(now)
         self.state["device"] = self.device_snapshot
-        self.state["updatedAt"] = now_ms()
+        self.state["updatedAt"] = now
         self.state["firstStatusHex"] = self.first_status_hex
         self.state["latestStatusHex"] = self.latest_status_hex
         self.state["infoHex"] = self.info_hex
-        self.state["runningStartedAt"] = self.running_started_at
+        self.state["runningStartedAt"] = self.first_running_started_at
+        self.state["segmentStartedAt"] = self.segment_started_at
+        self.state["accumulatedActiveSec"] = int((getattr(self, "accumulated_active_ms", 0) or 0) / 1000)
+        self.state["activeBrushingSec"] = int(active_ms / 1000)
+        self.state["brushingActive"] = bool(self.last_running)
+        self.state["targetDurationSec"] = self.target_duration_sec
+        self.state["reconnectCount"] = self.reconnect_count
+        self.state["connectAttempts"] = self.connect_attempts
         self.state["overPressureEvents"] = self.over_pressure_events
-        if self.running_started_at is not None and self.last_running:
-            self.state["activeBrushingSec"] = max(
-                int(self.state.get("activeBrushingSec") or 0),
-                int((now_ms() - self.running_started_at) / 1000),
-            )
         atomic_write_json(self.state_file, self.state)
 
     def finish(self, phase: str, message: str, error: str | None = None) -> None:
         if self.finished:
             return
+        if self.last_running:
+            self._close_running_segment(now_ms())
+        self.reconnecting_brushing = False
+        self.disconnect_while_running_at = None
         self.finished = True
         self.stopping = True
         self.state["phase"] = phase
@@ -1727,53 +1824,138 @@ class MonitorSession(BaseBleSession):
 
     def on_overall_timeout(self) -> bool:
         self.overall_timer_id = None
-        if self.latest_status_hex:
-            self.finish("completed", "刷牙监听窗口结束，已保存最新牙刷状态与刷牙时长")
+        if self.last_running:
+            self._close_running_segment(now_ms())
+        self.reconnecting_brushing = False
+        self.disconnect_while_running_at = None
+        active_sec = int(self._current_active_ms() / 1000)
+        if active_sec >= 10:
+            self.finish("completed", f"刷牙监听窗口结束，已保存本次刷牙 {active_sec}s")
+        elif self.latest_status_hex:
+            self.finish("completed", "刷牙监听窗口结束，已保存最新牙刷状态")
         else:
             self.finish("timeout", "等待超时：未检测到唤醒中的徕芬牙刷，请确认蓝牙未被手机 App 占用", "监听等待超时")
         return False
 
     def on_scan_started(self) -> None:
-        self.state["phase"] = "scanning"
-        self.state["message"] = "正在扫描徕芬牙刷广播（请拿起或按亮牙刷）…"
+        if self.reconnecting_brushing:
+            active_sec = int(self._current_active_ms() / 1000)
+            self.state["phase"] = "reconnecting"
+            self.state["message"] = f"刷牙中蓝牙闪断（已累计 {active_sec}s），正在搜索牙刷重连…"
+        else:
+            self.state["phase"] = "scanning"
+            self.state["message"] = "正在扫描徕芬牙刷广播（请拿起或按亮牙刷）…"
         self.flush()
 
     def on_connecting_started(self, dev: dict[str, Any]) -> None:
-        self.state["phase"] = "connecting"
-        self.state["message"] = f"发现 {dev.get('name') or dev.get('address') or 'LFTB'}，正在建立 GATT 连接…"
+        if self.reconnecting_brushing:
+            active_sec = int(self._current_active_ms() / 1000)
+            self.state["phase"] = "reconnecting"
+            self.state["message"] = f"已重新发现牙刷（已累计 {active_sec}s），正在重连恢复…"
+        else:
+            self.state["phase"] = "connecting"
+            self.state["message"] = f"发现 {dev.get('name') or dev.get('address') or 'LFTB'}，正在建立 GATT 连接…"
         self.flush()
 
     def on_connected(self) -> None:
         self.connected_at = now_ms()
 
     def on_retry_scheduled(self, msg: str) -> None:
-        self.state["phase"] = "scanning"
-        self.state["message"] = msg
+        if self.reconnecting_brushing:
+            active_sec = int(self._current_active_ms() / 1000)
+            self.state["phase"] = "reconnecting"
+            self.state["message"] = f"牙刷重连中（已累计 {active_sec}s）：{msg}"
+        else:
+            self.state["phase"] = "scanning"
+            self.state["message"] = msg
         self.flush()
 
-    def on_device_disconnected(self) -> None:
-        elapsed_ms = now_ms() - (self.connected_at or self.started_at)
-        if self.latest_status_hex and (self.running_started_at is not None or elapsed_ms >= 10000):
-            if self.running_started_at is not None and self.last_running:
-                self.state["activeBrushingSec"] = max(
-                    int(self.state.get("activeBrushingSec") or 0),
-                    int((now_ms() - self.running_started_at) / 1000),
-                )
-            self.finish("completed", "牙刷已结束并断开连接，本次刷牙数据已同步")
-        elif not self.services_handled:
-            self._handle_connect_failure("蓝牙连接未完成即断开")
+    def _on_reconnect_grace_timeout(self) -> bool:
+        self.reconnect_grace_timer_id = None
+        if self.stopping or self.finished:
+            return False
+        self.reconnecting_brushing = False
+        self.disconnect_while_running_at = None
+        active_sec = int(self._current_active_ms() / 1000)
+        if active_sec >= 10:
+            self.finish("completed", f"刷牙监听结束（断开前已累计 {active_sec}s，已自动归档）")
         else:
-            self._handle_connect_failure("牙刷暂时休眠断开")
+            self.state["phase"] = "scanning"
+            self.state["message"] = "连接已断开，继续扫描等待牙刷唤醒…"
+            self.flush()
+            self.begin_scan()
+        return False
+
+    def on_device_disconnected(self) -> None:
+        if self.stopping or self.finished:
+            return
+        if self.last_running:
+            ts = now_ms()
+            self._close_running_segment(ts)
+            self.disconnect_while_running_at = ts
+            active_sec = int(self._current_active_ms(ts) / 1000)
+            remaining_est = max(0, self.target_duration_sec - active_sec)
+            grace_sec = (
+                15.0
+                if active_sec >= max(30, self.target_duration_sec - 15)
+                else max(45.0, min(remaining_est + 20.0, 90.0))
+            )
+            self.reconnecting_brushing = True
+            self.reconnect_count += 1
+            self.cancel_timer("resolve_timer_id")
+            self.cancel_timer("connect_timer_id")
+            self.cancel_timer("settle_timer_id")
+            self.cancel_timer("grace_timer_id")
+            self.cancel_timer("retry_timer_id")
+            self.cancel_timer("reconnect_grace_timer_id")
+            self.services_handled = False
+            self.notify_active = False
+            self.ff02_path = None
+            self.gap_name_path = None
+            self.device_path = None
+            self.connecting = False
+            self.settling_match = False
+            self.direct_retried_for_current_adv = False
+            self.reconnect_grace_timer_id = GLib.timeout_add(int(grace_sec * 1000), self._on_reconnect_grace_timeout)
+            self.state["phase"] = "reconnecting"
+            self.state["message"] = f"刷牙中蓝牙闪断（已累计 {active_sec}s），正在自动重连续接…"
+            self.flush()
+            if not self.has_deadline or time.monotonic() + 0.5 < self.deadline:
+                self.retry_timer_id = GLib.timeout_add(400, self.begin_scan)
+            else:
+                self._on_reconnect_grace_timeout()
+            return
+
+        active_sec = int(self._current_active_ms() / 1000)
+        if not self.reconnecting_brushing and self.brushing_ever_started and not self.last_running and active_sec >= 10:
+            self.cancel_timer("grace_timer_id")
+            self.finish("completed", f"牙刷已结束并断开连接，本次刷牙 {active_sec}s 已同步")
+            return
+
+        if not self.services_handled:
+            self._handle_connect_failure("蓝牙连接未完成即断开")
+            return
+
+        if self.reconnecting_brushing:
+            self._handle_connect_failure("牙刷重连中再次断开，继续重连…")
+            return
+
+        self._handle_connect_failure("牙刷暂时休眠断开，继续等待拿起开始刷牙…")
 
     def on_notify_started(self) -> None:
         self.state["phase"] = "monitoring"
-        self.state["message"] = "已连接徕芬牙刷，正在实时监听刷牙状态…"
+        if self.reconnecting_brushing:
+            active_sec = int(self._current_active_ms() / 1000)
+            self.state["message"] = f"已重连牙刷（已累计 {active_sec}s），正在确认刷牙状态…"
+        else:
+            self.state["message"] = "已连接徕芬牙刷，正在实时监听刷牙状态…"
         self.flush()
 
     def _on_idle_grace(self) -> bool:
         self.grace_timer_id = None
         if not self.stopping and not self.finished and not self.last_running and self.latest_status_hex:
-            self.finish("completed", "检测到本次刷牙结束，已自动记录")
+            active_sec = int(self._current_active_ms() / 1000)
+            self.finish("completed", f"检测到本次刷牙结束（累计 {active_sec}s），已自动记录")
         return False
 
     def on_ff02_packet(self, raw: bytes, hex_str: str) -> None:
@@ -1790,21 +1972,49 @@ class MonitorSession(BaseBleSession):
             if self.first_status_hex is None:
                 self.first_status_hex = hex_str
             self.latest_status_hex = hex_str
+            parsed_dur = parse_status_duration_sec(raw)
+            if parsed_dur is not None:
+                self.target_duration_sec = parsed_dur
             running = parse_status_running(raw)
             if running is True:
                 self.cancel_timer("grace_timer_id")
+                self.cancel_timer("reconnect_grace_timer_id")
+                ts = now_ms()
+                if self.reconnecting_brushing and self.disconnect_while_running_at is not None:
+                    self.accumulated_active_ms += max(0, ts - self.disconnect_while_running_at)
+                self.reconnecting_brushing = False
+                self.disconnect_while_running_at = None
                 if not self.last_running:
-                    self.running_started_at = self.running_started_at or now_ms()
-                self.last_running = True
+                    self.first_running_started_at = self.first_running_started_at or ts
+                    self.running_started_at = self.first_running_started_at
+                    self.segment_started_at = ts
+                    self.last_running = True
+                    self.brushing_ever_started = True
+                    self._extend_deadline_for_brushing()
+                self.state["phase"] = "monitoring"
                 self.state["message"] = "正在刷牙中，实时追踪档位与时长…"
-            elif running is False and self.last_running:
-                self.last_running = False
-                elapsed_sec = int((now_ms() - (self.running_started_at or now_ms())) / 1000)
-                self.state["activeBrushingSec"] = max(int(self.state.get("activeBrushingSec") or 0), elapsed_sec)
-                if elapsed_sec >= 10:
-                    self.state["message"] = "检测到停止转动，正在收尾归档…"
-                    self.cancel_timer("grace_timer_id")
-                    self.grace_timer_id = GLib.timeout_add(1500, self._on_idle_grace)
+            elif running is False:
+                if self.reconnecting_brushing:
+                    self.reconnecting_brushing = False
+                    self.disconnect_while_running_at = None
+                    self.cancel_timer("reconnect_grace_timer_id")
+                    active_sec = int(self._current_active_ms() / 1000)
+                    self.state["phase"] = "monitoring"
+                    if active_sec >= 10:
+                        self.state["message"] = f"重连后检测到已暂停（已刷 {active_sec}s），12 秒内恢复将继续累计…"
+                        self.cancel_timer("grace_timer_id")
+                        self.grace_timer_id = GLib.timeout_add(12000, self._on_idle_grace)
+                    else:
+                        self.state["message"] = "已重连牙刷，等待开始刷牙…"
+                elif self.last_running:
+                    self._close_running_segment(now_ms())
+                    active_sec = int(self._current_active_ms() / 1000)
+                    if active_sec >= 10:
+                        self.state["message"] = f"检测到暂停（已刷 {active_sec}s），12 秒内恢复将继续累计…"
+                        self.cancel_timer("grace_timer_id")
+                        self.grace_timer_id = GLib.timeout_add(12000, self._on_idle_grace)
+                    else:
+                        self.state["message"] = "已连接徕芬牙刷，等待开始刷牙…"
         self.flush()
 
     def start(self) -> int:
@@ -1812,6 +2022,7 @@ class MonitorSession(BaseBleSession):
         install_signal_handlers(lambda: self.finish("stopped", "已手动停止刷牙监听"))
 
         self.overall_timer_id = GLib.timeout_add(int(max(10.0, float(self.args.timeout)) * 1000), self.on_overall_timeout)
+        self.tick_timer_id = GLib.timeout_add(1000, self._on_tick)
         self.install_receivers()
         self.begin_scan()
         try:
@@ -1852,13 +2063,14 @@ class WatchSession(BaseBleSession):
         self.cooldown_until = 0.0
         self.last_applied_patch_id: str | None = None
         self.last_flush_mono = 0.0
-        self._last_flushed_sig: tuple[str, str] | None = None
+        self._last_flushed_sig: tuple[Any, ...] | None = None
 
         self.tick_timer_id: int | None = None
         self.idle_release_timer_id: int | None = None
         self.sync_emit_timer_id: int | None = None
         self.status_wait_timer_id: int | None = None
         self.grace_timer_id: int | None = None
+        self.reconnect_grace_timer_id: int | None = None
         self.ack_timer_id: int | None = None
         self.write_delay_timer_id: int | None = None
         self.refresh_timer_id: int | None = None
@@ -1873,7 +2085,13 @@ class WatchSession(BaseBleSession):
         self.cycle_sync_emitted = False
         self.cycle_session_emitted = False
         self.cycle_running_started_at: int | None = None
+        self.cycle_segment_started_at: int | None = None
+        self.cycle_accumulated_ms = 0
         self.cycle_last_running = False
+        self.cycle_brushing_ever_started = False
+        self.cycle_reconnecting_brushing = False
+        self.cycle_disconnect_while_running_at: int | None = None
+        self.cycle_target_duration_sec = 180
         self.cycle_active_sec = 0
         self.cycle_over_pressure = 0
         self.cycle_over_pressure_active = False
@@ -1905,10 +2123,12 @@ class WatchSession(BaseBleSession):
             "lastStatusHex": None,
             "lastEventKind": None,
             "activeBrushingSec": 0,
+            "brushingActive": False,
+            "targetDurationSec": 180,
             "error": None,
         }
 
-    def cancel_cycle_timers(self) -> None:
+    def _cancel_link_timers(self) -> None:
         for attr in (
             "scan_rsp_timer_id",
             "settle_timer_id",
@@ -1926,15 +2146,37 @@ class WatchSession(BaseBleSession):
         ):
             self.cancel_timer(attr)
 
+    def cancel_cycle_timers(self) -> None:
+        self._cancel_link_timers()
+        self.cancel_timer("reconnect_grace_timer_id")
+
     def cancel_all_timers(self) -> None:
         super().cancel_all_timers()
         self.cancel_cycle_timers()
         self.cancel_timer("tick_timer_id")
 
+    def _current_cycle_active_ms(self, now: int | None = None) -> int:
+        ts = now_ms() if now is None else now
+        acc = int(getattr(self, "cycle_accumulated_ms", 0) or 0)
+        seg = getattr(self, "cycle_segment_started_at", None)
+        if getattr(self, "cycle_last_running", False) and seg is not None:
+            return acc + max(0, ts - int(seg))
+        return acc
+
+    def _close_cycle_running_segment(self, end_ms: int | None = None) -> None:
+        ts = now_ms() if end_ms is None else end_ms
+        seg = getattr(self, "cycle_segment_started_at", None)
+        if getattr(self, "cycle_last_running", False) and seg is not None:
+            self.cycle_accumulated_ms = int(getattr(self, "cycle_accumulated_ms", 0) or 0) + max(0, ts - int(seg))
+        self.cycle_segment_started_at = None
+        self.cycle_last_running = False
+        self.cycle_active_sec = int(self._current_cycle_active_ms(ts) / 1000)
+
     def flush(self, force: bool = False) -> None:
         phase = str(self.state.get("phase") or "")
         msg = str(self.state.get("message") or "")
-        sig = (phase, msg)
+        brushing_active = bool(getattr(self, "cycle_last_running", False))
+        sig = (phase, msg, int(getattr(self, "cycle_active_sec", 0) or 0), brushing_active)
         now_mono = time.monotonic()
         if not force and sig == self._last_flushed_sig and (now_mono - self.last_flush_mono) < 10.0:
             return
@@ -1943,6 +2185,8 @@ class WatchSession(BaseBleSession):
         self.state["device"] = self.device_snapshot
         self.state["updatedAt"] = now_ms()
         self.state["activeBrushingSec"] = self.cycle_active_sec
+        self.state["brushingActive"] = brushing_active
+        self.state["targetDurationSec"] = int(getattr(self, "cycle_target_duration_sec", 180) or 180)
         try:
             atomic_write_json(self.state_file, self.state)
         except Exception:
@@ -1951,6 +2195,10 @@ class WatchSession(BaseBleSession):
     def finish(self, phase: str, message: str, error: str | None = None) -> None:
         if self.finished:
             return
+        if getattr(self, "cycle_last_running", False):
+            self._close_cycle_running_segment(now_ms())
+        self.cycle_reconnecting_brushing = False
+        self.cycle_disconnect_while_running_at = None
         self.finished = True
         self.stopping = True
         self.state["phase"] = phase
@@ -2022,7 +2270,7 @@ class WatchSession(BaseBleSession):
             return True, "等待手动操作完成"
         if self.state_file:
             own_live = os.path.join(os.path.dirname(os.path.abspath(self.state_file)), "live-session.json")
-            if self._is_active_session_file(own_live, 200.0, ("scanning", "connecting", "monitoring")):
+            if self._is_active_session_file(own_live, 420.0, ("scanning", "connecting", "monitoring", "reconnecting")):
                 return True, "等待手动监听或同步完成"
         if self._is_active_session_file(self.peer_session_file, 90.0, ("scanning", "connecting", "measuring")):
             return True, "体脂秤测量中，蓝牙礼让"
@@ -2066,7 +2314,13 @@ class WatchSession(BaseBleSession):
         self.cycle_sync_emitted = False
         self.cycle_session_emitted = False
         self.cycle_running_started_at = None
+        self.cycle_segment_started_at = None
+        self.cycle_accumulated_ms = 0
         self.cycle_last_running = False
+        self.cycle_brushing_ever_started = False
+        self.cycle_reconnecting_brushing = False
+        self.cycle_disconnect_while_running_at = None
+        self.cycle_target_duration_sec = 180
         self.cycle_active_sec = 0
         self.cycle_over_pressure = 0
         self.cycle_over_pressure_active = False
@@ -2126,6 +2380,8 @@ class WatchSession(BaseBleSession):
 
     def _disconnect_and_cooldown(self, cooldown_sec: float, phase: str, msg: str) -> None:
         self.cancel_cycle_timers()
+        self.cycle_reconnecting_brushing = False
+        self.cycle_disconnect_while_running_at = None
         safe_stop_discovery(self.adapter)
         self.discovery_active = False
         if self.ff02_path:
@@ -2158,8 +2414,12 @@ class WatchSession(BaseBleSession):
         self.retry_timer_id = None
         if self.stopping or self.finished:
             return False
-        self.cancel_cycle_timers()
-        self._reset_cycle_state()
+        reconnecting = bool(getattr(self, "cycle_reconnecting_brushing", False))
+        if reconnecting:
+            self._cancel_link_timers()
+        else:
+            self.cancel_cycle_timers()
+            self._reset_cycle_state()
         self.settling_match = False
         self.connecting = False
         self.services_handled = False
@@ -2178,7 +2438,7 @@ class WatchSession(BaseBleSession):
             self.flush()
             return False
 
-        if time.monotonic() < self.cooldown_until:
+        if not reconnecting and time.monotonic() < self.cooldown_until:
             safe_stop_discovery(self.adapter)
             self.discovery_active = False
             rem = max(1, int((self.cooldown_until - time.monotonic()) + 0.999))
@@ -2195,8 +2455,12 @@ class WatchSession(BaseBleSession):
             self.device_snapshot = already_connected
             self.connecting = True
             self.connected = True
-            self.state["phase"] = "connecting"
-            self.state["message"] = "检测到牙刷已连接，正在读取最新状态…"
+            self.state["phase"] = "reconnecting" if reconnecting else "connecting"
+            self.state["message"] = (
+                f"检测到牙刷重连（已累计 {self.cycle_active_sec}s），正在恢复监测…"
+                if reconnecting
+                else "检测到牙刷已连接，正在读取最新状态…"
+            )
             self.flush()
             if already_connected.get("servicesResolved"):
                 self._on_services_resolved()
@@ -2204,10 +2468,14 @@ class WatchSession(BaseBleSession):
                 self._on_connect_ok()
             return False
 
-        self.state["phase"] = "watching"
-        self.state["message"] = "后台自动唤醒监听中：拿起牙刷亮灯即自动同步电量与打卡"
+        if reconnecting:
+            self.state["phase"] = "reconnecting"
+            self.state["message"] = f"刷牙中蓝牙闪断（已累计 {self.cycle_active_sec}s），正在搜索牙刷重连…"
+        else:
+            self.state["phase"] = "watching"
+            self.state["message"] = "后台自动唤醒监听中：拿起牙刷亮灯即自动同步电量与打卡"
         self.flush()
-        safe_start_le_discovery(self.adapter, duplicate_data=False)
+        safe_start_le_discovery(self.adapter, duplicate_data=reconnecting)
         self.discovery_active = True
         return False
 
@@ -2221,12 +2489,13 @@ class WatchSession(BaseBleSession):
             if time.monotonic() < self.cooldown_until:
                 self.cooldown_until = 0.0
 
+        reconnecting = bool(getattr(self, "cycle_reconnecting_brushing", False))
         yielding, reason = self._check_yield()
         if self.connected or self.connecting or self.settling_match:
-            if self._is_manual_lock_active() and self.cycle_phase != "brushing":
+            if yielding and self.cycle_phase != "brushing" and not reconnecting:
                 self._abort_for_yield(reason or "等待手动操作")
-            elif self.cycle_last_running and self.cycle_running_started_at is not None:
-                self.cycle_active_sec = max(self.cycle_active_sec, int((now_ms() - self.cycle_running_started_at) / 1000))
+            elif self.cycle_last_running:
+                self.cycle_active_sec = int(self._current_cycle_active_ms() / 1000)
                 self.flush()
             return True
 
@@ -2239,7 +2508,7 @@ class WatchSession(BaseBleSession):
             self.flush()
             return True
 
-        if time.monotonic() < self.cooldown_until:
+        if not reconnecting and time.monotonic() < self.cooldown_until:
             if self.discovery_active:
                 safe_stop_discovery(self.adapter)
                 self.discovery_active = False
@@ -2251,6 +2520,10 @@ class WatchSession(BaseBleSession):
 
         if not self.discovery_active:
             self.begin_scan()
+        elif reconnecting:
+            self.state["phase"] = "reconnecting"
+            self.state["message"] = f"刷牙中蓝牙闪断（已累计 {self.cycle_active_sec}s），正在搜索牙刷重连…"
+            self.flush()
         else:
             self.state["phase"] = "watching"
             self.state["message"] = "后台自动唤醒监听中：拿起牙刷亮灯即自动同步电量与打卡"
@@ -2258,22 +2531,36 @@ class WatchSession(BaseBleSession):
         return True
 
     def on_scan_started(self) -> None:
-        self.state["phase"] = "watching"
-        self.state["message"] = "后台自动唤醒监听中：拿起牙刷亮灯即自动同步电量与打卡"
+        if getattr(self, "cycle_reconnecting_brushing", False):
+            self.state["phase"] = "reconnecting"
+            self.state["message"] = f"刷牙中蓝牙闪断（已累计 {self.cycle_active_sec}s），正在搜索牙刷重连…"
+        else:
+            self.state["phase"] = "watching"
+            self.state["message"] = "后台自动唤醒监听中：拿起牙刷亮灯即自动同步电量与打卡"
         self.flush()
 
     def on_connecting_started(self, dev: dict[str, Any]) -> None:
         self.discovery_active = False
-        self._reset_cycle_state()
+        reconnecting = bool(getattr(self, "cycle_reconnecting_brushing", False))
+        if not reconnecting:
+            self._reset_cycle_state()
         rssi = dev.get("rssi")
         rssi_txt = f" (RSSI {rssi} dBm)" if rssi is not None else ""
-        self.state["phase"] = "connecting"
-        self.state["message"] = f"检测到牙刷唤醒 {dev.get('name') or dev.get('address') or 'LFTB'}{rssi_txt}，正在快速同步…"
+        if reconnecting:
+            self.state["phase"] = "reconnecting"
+            self.state["message"] = f"已重新发现牙刷（已累计 {self.cycle_active_sec}s），正在重连恢复…"
+        else:
+            self.state["phase"] = "connecting"
+            self.state["message"] = f"检测到牙刷唤醒 {dev.get('name') or dev.get('address') or 'LFTB'}{rssi_txt}，正在快速同步…"
         self.flush(force=True)
 
     def on_retry_scheduled(self, _msg: str) -> None:
-        self.state["phase"] = "connecting"
-        self.state["message"] = "牙刷广播未稳，正在快速重连…"
+        if getattr(self, "cycle_reconnecting_brushing", False):
+            self.state["phase"] = "reconnecting"
+            self.state["message"] = f"牙刷重连中（已累计 {self.cycle_active_sec}s），正在快速重试…"
+        else:
+            self.state["phase"] = "connecting"
+            self.state["message"] = "牙刷广播未稳，正在快速重连…"
         self.flush()
 
     def on_notify_started(self) -> None:
@@ -2284,16 +2571,44 @@ class WatchSession(BaseBleSession):
             self.cancel_timer("refresh_timer_id")
             self.refresh_timer_id = GLib.timeout_add(1500, self._on_watch_cycle_refresh_timeout)
             return
-        self.cycle_phase = "waiting_status"
-        self.state["phase"] = "syncing"
-        self.state["message"] = "已连接牙刷，正在自动同步状态…"
+        if getattr(self, "cycle_reconnecting_brushing", False):
+            self.state["phase"] = "reconnecting"
+            self.state["message"] = f"已重连牙刷（已累计 {self.cycle_active_sec}s），正在确认刷牙状态…"
+        else:
+            self.cycle_phase = "waiting_status"
+            self.state["phase"] = "syncing"
+            self.state["message"] = "已连接牙刷，正在自动同步状态…"
         self.flush(force=True)
         self.cancel_timer("status_wait_timer_id")
         self.status_wait_timer_id = GLib.timeout_add(4500, self._on_watch_status_wait_timeout)
 
     def _on_watch_status_wait_timeout(self) -> bool:
         self.status_wait_timer_id = None
-        if not self.stopping and not self.finished and not self.cycle_latest_status_hex:
+        if self.stopping or self.finished:
+            return False
+        if getattr(self, "cycle_reconnecting_brushing", False):
+            self._cancel_link_timers()
+            if self.ff02_path:
+                try:
+                    dbus.Interface(self.bus.get_object(BLUEZ_SERVICE, self.ff02_path), GATT_CHAR_IFACE).StopNotify(timeout=1)
+                except Exception:
+                    pass
+            if self.device_path:
+                try:
+                    dbus.Interface(self.bus.get_object(BLUEZ_SERVICE, self.device_path), DEVICE_IFACE).Disconnect()
+                except Exception:
+                    pass
+            self.notify_active = False
+            self.device_path = None
+            self.ff02_path = None
+            self.gap_name_path = None
+            self.connected = False
+            self.connecting = False
+            self.settling_match = False
+            self.services_handled = False
+            self.retry_timer_id = GLib.timeout_add(400, self.begin_scan)
+            return False
+        if not self.cycle_latest_status_hex:
             self._disconnect_and_cooldown(5.0, "watching", "已连接但未收到状态帧，已释放并继续监听")
         return False
 
@@ -2331,14 +2646,36 @@ class WatchSession(BaseBleSession):
         self._complete_brushing_cycle()
         return False
 
+    def _on_watch_reconnect_grace_timeout(self) -> bool:
+        self.reconnect_grace_timer_id = None
+        if self.stopping or self.finished:
+            return False
+        self.cycle_reconnecting_brushing = False
+        self.cycle_disconnect_while_running_at = None
+        self._complete_brushing_cycle()
+        return False
+
     def _complete_brushing_cycle(self) -> None:
-        if self.cycle_running_started_at is not None:
-            elapsed = int((now_ms() - self.cycle_running_started_at) / 1000)
-            self.cycle_active_sec = max(self.cycle_active_sec, elapsed)
+        ts = now_ms()
+        if getattr(self, "cycle_last_running", False):
+            self._close_cycle_running_segment(ts)
+        self.cycle_reconnecting_brushing = False
+        self.cycle_disconnect_while_running_at = None
+        computed_sec = int(self._current_cycle_active_ms(ts) / 1000)
+        if (
+            computed_sec > 0
+            or getattr(self, "cycle_segment_started_at", None) is not None
+            or int(getattr(self, "cycle_accumulated_ms", 0) or 0) > 0
+        ):
+            self.cycle_active_sec = computed_sec
         if self.cycle_active_sec >= 10 and not self.cycle_session_emitted and self.cycle_latest_status_hex:
             self.cycle_session_emitted = True
             self._emit_outbox_event("session")
-            self._disconnect_and_cooldown(25.0, "cooldown", "检测到本次刷牙结束并已自动打卡，连接已释放")
+            self._disconnect_and_cooldown(
+                15.0,
+                "cooldown",
+                f"检测到本次刷牙结束（{self.cycle_active_sec}s）并已自动打卡，连接已释放",
+            )
         else:
             if not self.cycle_sync_emitted and self.cycle_latest_status_hex:
                 self.cycle_sync_emitted = True
@@ -2351,12 +2688,62 @@ class WatchSession(BaseBleSession):
         if not self.services_handled:
             self._handle_connect_failure("蓝牙连接未完成服务解析即断开")
             return
+        if getattr(self, "cycle_last_running", False):
+            self._cancel_link_timers()
+            ts = now_ms()
+            self._close_cycle_running_segment(ts)
+            self.cycle_disconnect_while_running_at = ts
+            active_sec = int(self._current_cycle_active_ms(ts) / 1000)
+            target_dur = int(getattr(self, "cycle_target_duration_sec", 180) or 180)
+            remaining_est = max(0, target_dur - active_sec)
+            grace_sec = (
+                15.0
+                if active_sec >= max(30, target_dur - 15)
+                else max(45.0, min(remaining_est + 20.0, 90.0))
+            )
+            self.cycle_reconnecting_brushing = True
+            self.notify_active = False
+            self.device_path = None
+            self.ff02_path = None
+            self.gap_name_path = None
+            self.connected = False
+            self.connecting = False
+            self.settling_match = False
+            self.services_handled = False
+            self.direct_retried_for_current_adv = False
+            self.cooldown_until = 0.0
+            self.cancel_timer("reconnect_grace_timer_id")
+            self.reconnect_grace_timer_id = GLib.timeout_add(
+                int(grace_sec * 1000),
+                self._on_watch_reconnect_grace_timeout,
+            )
+            self.state["phase"] = "reconnecting"
+            self.state["message"] = f"刷牙中蓝牙闪断（已累计 {active_sec}s），正在自动重连续接…"
+            self.flush(force=True)
+            self.retry_timer_id = GLib.timeout_add(400, self.begin_scan)
+            return
+        if getattr(self, "cycle_reconnecting_brushing", False):
+            self._cancel_link_timers()
+            self.notify_active = False
+            self.device_path = None
+            self.ff02_path = None
+            self.gap_name_path = None
+            self.connected = False
+            self.connecting = False
+            self.settling_match = False
+            self.services_handled = False
+            self.direct_retried_for_current_adv = False
+            self.retry_timer_id = GLib.timeout_add(400, self.begin_scan)
+            return
+
         self.cancel_cycle_timers()
         if self.cycle_phase == "refreshing_pending":
             self._finish_pending_write_ok()
             return
-        if self.cycle_phase == "brushing" or (
-            self.cycle_running_started_at is not None and self.cycle_active_sec >= 10
+        if (
+            self.cycle_phase == "brushing"
+            or (getattr(self, "cycle_brushing_ever_started", False) and self.cycle_active_sec >= 10)
+            or (self.cycle_running_started_at is not None and self.cycle_active_sec >= 10)
         ):
             self._complete_brushing_cycle()
             return
@@ -2555,9 +2942,12 @@ class WatchSession(BaseBleSession):
         if running is True:
             self.cancel_timer("idle_release_timer_id")
             self.cancel_timer("sync_emit_timer_id")
+            ts = now_ms()
             if not self.cycle_last_running:
-                self.cycle_running_started_at = self.cycle_running_started_at or now_ms()
+                self.cycle_running_started_at = self.cycle_running_started_at or ts
+                self.cycle_segment_started_at = self.cycle_segment_started_at or ts
             self.cycle_last_running = True
+            self.cycle_brushing_ever_started = True
             self.cycle_phase = "brushing"
             self.state["phase"] = "brushing"
             self.state["message"] = "检测到正在刷牙，实时记录刷牙时长与状态…"
@@ -2619,11 +3009,45 @@ class WatchSession(BaseBleSession):
             return
 
         self.cancel_timer("status_wait_timer_id")
+        parsed_dur = parse_status_duration_sec(raw)
+        if parsed_dur is not None:
+            self.cycle_target_duration_sec = parsed_dur
         first_in_cycle = self.cycle_first_status_hex is None
         if first_in_cycle:
             self.cycle_first_status_hex = hex_str
         self.cycle_latest_status_hex = hex_str
         running = parse_status_running(raw)
+
+        if getattr(self, "cycle_reconnecting_brushing", False):
+            self.cycle_reconnecting_brushing = False
+            self.cancel_timer("reconnect_grace_timer_id")
+            ts = now_ms()
+            gap_start = self.cycle_disconnect_while_running_at
+            self.cycle_disconnect_while_running_at = None
+            if running is True:
+                if gap_start is not None:
+                    self.cycle_accumulated_ms = int(getattr(self, "cycle_accumulated_ms", 0) or 0) + max(0, ts - gap_start)
+                self.cycle_segment_started_at = ts
+                self.cycle_last_running = True
+                self.cycle_brushing_ever_started = True
+                self.cycle_active_sec = int(self._current_cycle_active_ms(ts) / 1000)
+                self.cycle_phase = "brushing"
+                self.state["phase"] = "brushing"
+                self.state["message"] = "已重连恢复刷牙监测，实时记录时长…"
+                self.flush(force=True)
+                return
+            self.cycle_last_running = False
+            self.cycle_active_sec = int(self._current_cycle_active_ms(ts) / 1000)
+            if self.cycle_active_sec >= 10:
+                self.cycle_phase = "brushing"
+                self.state["phase"] = "syncing"
+                self.state["message"] = f"重连后检测到已暂停（已刷 {self.cycle_active_sec}s），12 秒内恢复将继续累计…"
+                self.flush(force=True)
+                self.cancel_timer("grace_timer_id")
+                self.grace_timer_id = GLib.timeout_add(12000, self._on_brushing_idle_grace)
+            else:
+                self._after_status_synced(False)
+            return
 
         if first_in_cycle and self.cycle_phase == "waiting_status":
             pending = self._read_pending_patch()
@@ -2636,22 +3060,25 @@ class WatchSession(BaseBleSession):
         if running is True:
             self.cancel_timer("idle_release_timer_id")
             self.cancel_timer("grace_timer_id")
+            ts = now_ms()
             if not self.cycle_last_running:
-                self.cycle_running_started_at = self.cycle_running_started_at or now_ms()
+                self.cycle_running_started_at = self.cycle_running_started_at or ts
+                self.cycle_segment_started_at = ts
             self.cycle_last_running = True
+            self.cycle_brushing_ever_started = True
+            self.cycle_active_sec = int(self._current_cycle_active_ms(ts) / 1000)
             self.cycle_phase = "brushing"
             self.state["phase"] = "brushing"
             self.state["message"] = "检测到正在刷牙，实时记录刷牙时长与状态…"
             self.flush()
         elif running is False and self.cycle_last_running:
-            self.cycle_last_running = False
-            elapsed_sec = int((now_ms() - (self.cycle_running_started_at or now_ms())) / 1000)
-            self.cycle_active_sec = max(self.cycle_active_sec, elapsed_sec)
-            if elapsed_sec >= 10:
-                self.state["message"] = "检测到刷牙结束，正在归档打卡…"
+            ts = now_ms()
+            self._close_cycle_running_segment(ts)
+            if self.cycle_active_sec >= 10:
+                self.state["message"] = f"检测到暂停（已刷 {self.cycle_active_sec}s），12 秒内恢复将继续累计…"
                 self.flush(force=True)
                 self.cancel_timer("grace_timer_id")
-                self.grace_timer_id = GLib.timeout_add(1500, self._on_brushing_idle_grace)
+                self.grace_timer_id = GLib.timeout_add(12000, self._on_brushing_idle_grace)
             else:
                 self._after_status_synced(False)
 
@@ -2701,7 +3128,7 @@ def build_parser() -> argparse.ArgumentParser:
     mon_p = sub.add_parser("monitor")
     mon_p.add_argument("--state-file", required=True)
     mon_p.add_argument("--session-id", default="")
-    mon_p.add_argument("--timeout", type=float, default=180.0)
+    mon_p.add_argument("--timeout", type=float, default=360.0)
     mon_p.add_argument("--target-mac", default="")
     mon_p.add_argument("--name-prefix", default="LFTB")
     mon_p.add_argument("--adapter", default="")
@@ -2715,8 +3142,8 @@ def build_parser() -> argparse.ArgumentParser:
     watch_p.add_argument("--target-mac", default="")
     watch_p.add_argument("--name-prefix", default="LFTB")
     watch_p.add_argument("--adapter", default="")
-    watch_p.add_argument("--cooldown-sec", type=float, default=45.0)
-    watch_p.add_argument("--idle-hold-sec", type=float, default=6.0)
+    watch_p.add_argument("--cooldown-sec", type=float, default=15.0)
+    watch_p.add_argument("--idle-hold-sec", type=float, default=25.0)
 
     return parser
 

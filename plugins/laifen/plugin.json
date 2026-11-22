@@ -73,8 +73,8 @@
     {
       "name": "monitor-start",
       "label": "启动刷牙实时监听",
-      "description": "启动后台 BLE 监听守护会话（默认 180 秒），捕捉本次刷牙运行时长、档位、过压告警与耗电变化，结束后自动计入打卡记录。",
-      "defaultArgs": { "timeoutSec": 180 }
+      "description": "启动后台 BLE 监听守护会话（默认 360 秒，开始刷牙后自动延长且支持弱信号闪断重连），捕捉本次刷牙运行时长、档位、过压告警与耗电变化，结束后自动计入打卡记录。",
+      "defaultArgs": { "timeoutSec": 360 }
     },
     {
       "name": "monitor-status",

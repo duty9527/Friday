@@ -1028,6 +1028,9 @@ function getWatchStatus(dataDir, config, nowMs) {
     updatedAt: asInt(raw?.updatedAt) ?? null,
     lastSyncedAt: asInt(raw?.lastSyncedAt) ?? null,
     lastEventKind: raw?.lastEventKind ? String(raw.lastEventKind) : null,
+    activeBrushingSec: asInt(raw?.activeBrushingSec) ?? 0,
+    brushingActive: Boolean(raw?.brushingActive),
+    targetDurationSec: asInt(raw?.targetDurationSec) ?? null,
     error: raw?.error ? String(raw.error) : null,
   };
 }
@@ -1086,7 +1089,7 @@ function ingestWatchOutbox(db, dataDir, config, paths, nowMs) {
         highFrequency: latestParsed.highFrequency,
         reminder30s: latestParsed.reminder30s,
         airplaneMode: latestParsed.airplaneMode,
-        status: latestParsed.status,
+        status: ev.kind === 'session' ? 'Idle' : latestParsed.status,
         features: latestParsed.features,
         lastStatusHex: ev.latestStatusHex,
         lastInfoHex: ev.infoHex || infoParsed?.rawHex || prevState.lastInfoHex,
@@ -1131,6 +1134,8 @@ function ingestWatchOutbox(db, dataDir, config, paths, nowMs) {
   return currentCfg;
 }
 
+const ACTIVE_MONITOR_PHASES = ['scanning', 'connecting', 'monitoring', 'reconnecting'];
+
 function sanitizeLiveSession(raw) {
   if (!raw || typeof raw !== 'object') return null;
   return {
@@ -1143,11 +1148,17 @@ function sanitizeLiveSession(raw) {
     message: String(raw.message || ''),
     device: raw.device || null,
     activeBrushingSec: asInt(raw.activeBrushingSec) ?? 0,
+    accumulatedActiveSec: asInt(raw.accumulatedActiveSec) ?? 0,
+    brushingActive: Boolean(raw.brushingActive),
+    segmentStartedAt: asInt(raw.segmentStartedAt) ?? null,
+    targetDurationSec: asInt(raw.targetDurationSec) ?? null,
+    reconnectCount: asInt(raw.reconnectCount) ?? 0,
     overPressureEvents: asInt(raw.overPressureEvents) ?? 0,
     firstStatusHex: raw.firstStatusHex || null,
     latestStatusHex: raw.latestStatusHex || null,
     infoHex: raw.infoHex || null,
     runningStartedAt: asInt(raw.runningStartedAt) ?? null,
+    ingestedSessionId: raw.ingestedSessionId || null,
     error: raw.error || null,
   };
 }
@@ -1159,17 +1170,21 @@ function ingestMonitorSessionIfReady(db, dataDir, config, nowMs) {
   if (!raw || !raw.sessionId) return null;
 
   let mutated = false;
-  if (['scanning', 'connecting', 'monitoring'].includes(raw.phase)) {
+  let helperAlive = false;
+  if (ACTIVE_MONITOR_PHASES.includes(raw.phase)) {
     const pid = Number(raw.pid);
-    const staleByAge = nowMs - Number(raw.updatedAt || raw.startedAt || 0) > (Number(raw.timeoutSec || 180) + 15) * 1000;
+    const staleByAge = nowMs - Number(raw.updatedAt || raw.startedAt || 0) > (Number(raw.timeoutSec || 360) + 20) * 1000;
     const dead = pid > 0 ? !isPidAlive(pid) : staleByAge;
     if (dead) {
       raw.phase = raw.latestStatusHex ? 'completed' : 'timeout';
+      raw.brushingActive = false;
       raw.message = raw.latestStatusHex
         ? '蓝牙连接已结束并保留最新状态'
         : '蓝牙会话已结束，未收到牙刷状态';
       raw.updatedAt = nowMs;
       mutated = true;
+    } else {
+      helperAlive = true;
     }
   }
 
@@ -1183,7 +1198,45 @@ function ingestMonitorSessionIfReady(db, dataDir, config, nowMs) {
     const latestParsed = raw.latestStatusHex ? LaifenProtocol.parsePacket(raw.latestStatusHex, firstParsed || prevState) : null;
     const infoParsed = raw.infoHex ? LaifenProtocol.parsePacket(raw.infoHex) : null;
 
-    if (latestParsed && latestParsed.type === 'status' && !raw.stateSynced) {
+    if (helperAlive) {
+      // Never write to live-session.json while the helper owns it; sync SQLite read-model only on changes.
+      if (
+        latestParsed
+        && latestParsed.type === 'status'
+        && (
+          raw.latestStatusHex !== prevState.lastStatusHex
+          || !prevState.lastSyncedAt
+          || Number(raw.updatedAt || 0) > prevState.lastSyncedAt
+          || (raw.brushingActive === false && prevState.status === 'Running')
+        )
+      ) {
+        saveDeviceState(db, {
+          mac: raw.device?.address || config.targetMac,
+          address: raw.device?.address || config.targetMac,
+          name: raw.device?.name || prevState.name,
+          rssi: raw.device?.rssi,
+          protocol: latestParsed.protocol,
+          batteryPct: latestParsed.batteryPct,
+          activeMode: latestParsed.activeMode,
+          modes: latestParsed.modes,
+          durationSec: latestParsed.durationSec,
+          highFrequency: latestParsed.highFrequency,
+          reminder30s: latestParsed.reminder30s,
+          airplaneMode: latestParsed.airplaneMode,
+          status: raw.brushingActive === true ? 'Running' : latestParsed.status,
+          features: latestParsed.features,
+          lastStatusHex: raw.latestStatusHex,
+          lastInfoHex: raw.infoHex || infoParsed?.rawHex || prevState.lastInfoHex,
+        }, nowMs, { source: 'monitor', synced: true });
+      }
+      return sanitizeLiveSession(raw);
+    }
+
+    if (
+      latestParsed
+      && latestParsed.type === 'status'
+      && (!raw.finalStateSynced || prevState.lastStatusHex !== raw.latestStatusHex || prevState.status === 'Running')
+    ) {
       saveDeviceState(db, {
         mac: raw.device?.address || config.targetMac,
         address: raw.device?.address || config.targetMac,
@@ -1197,21 +1250,25 @@ function ingestMonitorSessionIfReady(db, dataDir, config, nowMs) {
         highFrequency: latestParsed.highFrequency,
         reminder30s: latestParsed.reminder30s,
         airplaneMode: latestParsed.airplaneMode,
-        status: latestParsed.status,
+        status: 'Idle',
         features: latestParsed.features,
         lastStatusHex: raw.latestStatusHex,
         lastInfoHex: raw.infoHex || infoParsed?.rawHex || prevState.lastInfoHex,
       }, nowMs, { source: 'monitor', synced: true });
       raw.stateSynced = true;
+      raw.finalStateSynced = true;
       mutated = true;
     }
 
     // Record brushing session when completed/stopped and active brushing >= 10s
     if ((raw.phase === 'completed' || raw.phase === 'stopped') && !raw.ingestedSessionId) {
       const activeSec = asInt(raw.activeBrushingSec) ?? 0;
-      const inferredSec = raw.runningStartedAt
-        ? Math.max(activeSec, Math.round((Number(raw.updatedAt || nowMs) - Number(raw.runningStartedAt)) / 1000))
-        : activeSec;
+      const hasSegmentedAccounting = raw.accumulatedActiveSec !== undefined || raw.brushingActive !== undefined;
+      const inferredSec = activeSec > 0
+        ? activeSec
+        : ((raw.runningStartedAt && (!hasSegmentedAccounting || raw.brushingActive === true))
+          ? Math.max(0, Math.round((Number(raw.updatedAt || nowMs) - Number(raw.runningStartedAt)) / 1000))
+          : 0);
       if (inferredSec >= 10) {
         /** @type {Record<string, any>} */
         const refState = latestParsed || firstParsed || getDeviceState(db) || {};
@@ -1452,7 +1509,7 @@ function clearStaleOneShotSession(sPath, sessionId, nowMs, errorMsg) {
     if (
       cur
       && cur.sessionId === sessionId
-      && ['scanning', 'connecting', 'monitoring'].includes(cur.phase)
+      && ACTIVE_MONITOR_PHASES.includes(cur.phase)
     ) {
       writeJsonAtomic(sPath, {
         ...cur,
@@ -2320,7 +2377,7 @@ async function handleMonitorStart(ctx) {
   if (process.platform !== 'linux' && !ctx.hasInjectedBleRunner && !ctx.hasInjectedSpawnMonitor && !ctx.hasInjectedSpawnWatch) {
     return disabledBleResult();
   }
-  const timeoutSec = clamp(asFiniteNumber(ctx.args.timeoutSec ?? ctx.args.timeout) ?? 180, 15, 600);
+  const timeoutSec = clamp(asFiniteNumber(ctx.args.timeoutSec ?? ctx.args.timeout) ?? 360, 15, 600);
   const targetMac = normalizeMac(ctx.args.targetMac ?? ctx.config.targetMac ?? DEFAULT_MAC);
   const namePrefix = String(ctx.args.namePrefix ?? ctx.config.namePrefix ?? DEFAULT_NAME_PREFIX).trim() || DEFAULT_NAME_PREFIX;
   const sPath = sessionFilePath(ctx.dataDir);
@@ -2358,7 +2415,12 @@ async function handleMonitorStart(ctx) {
         latestStatusHex: null,
         infoHex: null,
         runningStartedAt: null,
+        segmentStartedAt: null,
+        accumulatedActiveSec: 0,
         activeBrushingSec: 0,
+        brushingActive: false,
+        targetDurationSec: ctx.config.targetDurationSec ?? DEFAULT_DURATION_SEC,
+        reconnectCount: 0,
         overPressureEvents: 0,
         notifications: [],
         error: null,
@@ -2439,8 +2501,9 @@ async function handleMonitorStop(ctx) {
         await terminateBleHelperPid(Number(before.pid));
       }
       const latest = readJsonSafe(sPath, before) || before;
-      if (latest && ['scanning', 'connecting', 'monitoring'].includes(latest.phase)) {
+      if (latest && ACTIVE_MONITOR_PHASES.includes(latest.phase)) {
         latest.phase = 'stopped';
+        latest.brushingActive = false;
         latest.message = '已手动停止等待';
         latest.updatedAt = ctx.nowMs;
         writeJsonAtomic(sPath, latest);
@@ -2669,25 +2732,174 @@ export async function runAction(action, args = {}, deps = {}) {
   }
 }
 
-const LAIFEN_TRIGGER_RE = /(牙刷|徕芬|莱芬|刷头|刷牙|刷了几次牙|我刷完?牙了|手动打卡)/;
+const LAIFEN_TRIGGER_RE = /(牙刷|徕芬|莱芬|来分|刷头|刷牙|刷了几次牙|我刷完?牙了|手动打卡)/;
 const LAIFEN_REMINDER_EXCLUSION_RE = /(提醒我|定个?闹钟|设个?提醒|定时器)/;
 const LAIFEN_RESET_HEAD_RE = /(换了?新?刷头|重置刷头|刷头已更换|更新刷头)/;
-const LAIFEN_MANUAL_CHECKIN_RE = /(手动打卡|刷牙打卡|补录刷牙|记一?次刷牙|我刷完?牙了)/;
-const LAIFEN_MONITOR_STOP_RE = /(停止|结束|取消).*(刷牙监听|牙刷监听|监听)/;
-const LAIFEN_MONITOR_START_RE = /(开始|启动|打开).*(刷牙监听|牙刷监听|监听刷牙)/;
-const LAIFEN_SYNC_RE = /(同步|刷新|连接|读取).*(牙刷|徕芬|莱芬)/;
+const LAIFEN_MANUAL_CHECKIN_RE = /(手动打卡|刷牙打卡|补录刷牙|记一?次刷牙|我刷完?牙了|刚刷完?牙|补记刷牙)/;
+const LAIFEN_MONITOR_STOP_RE = /(停止|结束|取消).*(刷牙监听|牙刷监听|监听|刷牙监测|记录刷牙)/;
+const LAIFEN_MONITOR_START_GUARD_RE = /(几次|多久|多少|查看|查询|看看|刷了吗)/;
+const LAIFEN_MONITOR_START_RE = /(?:(?:开始|启动|打开|开启|帮我|给我)?(?:刷牙监听|牙刷监听|监听刷牙|监测刷牙|记录刷牙|刷牙监测)|(?:我?要|我去|我准备|准备|现在|去|开始)刷牙(?:了|吧)?(?:$|[，,。.！!]))/;
+const LAIFEN_SYNC_RE = /(同步|刷新|连接|读取).*(牙刷|徕芬|莱芬|来分)/;
 const LAIFEN_HEAD_QUERY_RE = /(刷头|换刷头).*(多久|几天|寿命|还剩|状态|能用|要换)/;
 const LAIFEN_TODAY_QUERY_RE = /(今天|今日|最近).*(刷牙|打卡|刷了几次|刷牙了吗)/;
 const LAIFEN_STATUS_QUERY_RE = /(电量|多少电|还有电|档位|模式|状态|情况|怎么样|几档)/;
 const LAIFEN_MODE_SET_RE = /(切|调|设|改|换).*(?:模式|档|柔和|日常|强劲|高频)/;
 
+function formatBrushDurationSpeech(durationSec) {
+  const sec = Math.max(0, Math.round(Number(durationSec) || 0));
+  const mins = Math.floor(sec / 60);
+  const rem = sec % 60;
+  if (mins > 0 && rem === 0) return `${mins} 分钟`;
+  if (mins > 0) return `${mins} 分 ${rem} 秒`;
+  return `${sec} 秒`;
+}
+
+function formatFastpathBrushSpeech(sessionRow, dashboard) {
+  const durText = formatBrushDurationSpeech(sessionRow?.durationSec ?? 0);
+  const modeText = sessionRow?.mode ? `，Mode ${sessionRow.mode}` : '';
+  const batt = sessionRow?.batteryAfter ?? dashboard?.batteryPct ?? dashboard?.device?.batteryPct;
+  const battText = batt !== null && batt !== undefined ? `，牙刷剩余电量百分之 ${batt}` : '';
+  const overText = Number(sessionRow?.overPressureCount || 0) > 0
+    ? `，期间过压提醒 ${sessionRow.overPressureCount} 次`
+    : '';
+  const st = dashboard?.stats;
+  const count = Number(st?.todayCount ?? 1);
+  const goal = Number(st?.dailyGoalCount ?? 2);
+  const streak = Number(st?.streakDays ?? 0);
+  const goalText = count >= goal
+    ? `今天已完成 ${count}/${goal} 次目标${streak > 1 ? `，已连续打卡 ${streak} 天` : ''}`
+    : `今天已完成 ${count}/${goal} 次`;
+  return `刷牙已记录，本次 ${durText}${modeText}${battText}${overText}，${goalText}。`;
+}
+
 /**
- * XiaoAI / IM voice fastpath handler for Laifen toothbrush.
+ * XiaoAI / IM voice fastpath handler for Laifen toothbrush
+ * plus internal `brushing_poll` / `assistant_reply` lifecycle hooks.
  * @param {import('../_shared/types.d.ts').VoiceFastpathRequest} request
  * @param {import('../_shared/types.d.ts').PluginExecutionContext} [context]
  * @returns {Promise<import('../_shared/types.d.ts').VoiceFastpathResult>}
  */
 export async function handleVoiceFastpath(request, context = {}) {
+  if (!request || typeof request !== 'object') {
+    return { handled: false };
+  }
+  const paths = resolveLaifenPaths({}, context);
+  const nowMs = typeof context?.nowFn === 'function' ? context.nowFn() : Date.now();
+  const sPath = sessionFilePath(paths.pluginDataDir);
+
+  if (request.sessionState?.event === 'brushing_poll') {
+    const live = readJsonSafe(sPath, null);
+    const watchId = request.sessionState.watchBrushSessionId;
+    if (!live || (watchId && live.sessionId !== watchId)) {
+      return {
+        handled: true,
+        plugin: 'laifen',
+        action: 'monitor-poll',
+        data: { phase: 'superseded' },
+      };
+    }
+    const staleDeadHelper = Boolean(
+      live.pid
+      && process.platform === 'linux'
+      && !isBleHelperPid(Number(live.pid))
+      && (nowMs - Number(live.updatedAt || live.startedAt || 0) > 1500),
+    );
+    if (ACTIVE_MONITOR_PHASES.includes(live.phase) && !staleDeadHelper) {
+      return {
+        handled: true,
+        plugin: 'laifen',
+        action: 'monitor-poll',
+        data: {
+          phase: live.phase,
+          sessionId: live.sessionId,
+          timeoutSec: Number(live.timeoutSec || 360),
+        },
+      };
+    }
+
+    const res = await runAction('monitor-status', {}, context);
+    const session = res.data?.session;
+    const dashboard = res.data?.dashboard ?? res.data;
+    const sessionsList = Array.isArray(dashboard?.sessions) ? dashboard.sessions : [];
+    const matched = (session?.ingestedSessionId
+      ? sessionsList.find(s => s.id === session.ingestedSessionId)
+      : undefined)
+      || sessionsList.find(s =>
+        s.source === 'ble_monitor'
+        && Number(s.brushedAt || 0) >= Number(session?.startedAt || 0) - 5000,
+      );
+
+    if ((session?.phase === 'completed' || session?.phase === 'stopped') && matched) {
+      return {
+        handled: true,
+        plugin: 'laifen',
+        action: 'monitor-completed',
+        ok: true,
+        speech: formatFastpathBrushSpeech(matched, dashboard),
+        data: {
+          phase: 'completed',
+          sessionId: session.sessionId,
+          ingestedSessionId: matched.id,
+        },
+      };
+    }
+    if (session?.phase === 'timeout') {
+      return {
+        handled: true,
+        plugin: 'laifen',
+        action: 'monitor-timeout',
+        ok: true,
+        speech: '刷牙监听已超时，本次没有检测到刷牙记录。',
+        data: { phase: 'timeout', sessionId: session.sessionId },
+      };
+    }
+    if (session?.phase === 'completed') {
+      return {
+        handled: true,
+        plugin: 'laifen',
+        action: 'monitor-ended',
+        ok: true,
+        speech: '牙刷状态已同步，但没有检测到有效刷牙时长，未计入打卡。',
+        data: { phase: 'ended', sessionId: session.sessionId },
+      };
+    }
+    return {
+      handled: true,
+      plugin: 'laifen',
+      action: 'monitor-ended',
+      ok: false,
+      data: {
+        phase: session?.phase || 'ended',
+        sessionId: session?.sessionId || live.sessionId,
+      },
+    };
+  }
+
+  if (request.sessionState?.event === 'assistant_reply') {
+    const live = readJsonSafe(sPath, null);
+    const startedAgeMs = live ? nowMs - Number(live.startedAt || 0) : Number.POSITIVE_INFINITY;
+    if (
+      live
+      && String(live.sessionId || '').startsWith('brush-')
+      && ACTIVE_MONITOR_PHASES.includes(live.phase)
+      && Number.isFinite(startedAgeMs)
+      && startedAgeMs >= 0
+      && startedAgeMs <= 20_000
+    ) {
+      return {
+        handled: true,
+        plugin: 'laifen',
+        action: 'monitor-watch',
+        followUp: false,
+        data: {
+          watchBrushSessionId: live.sessionId,
+          timeoutSec: Number(live.timeoutSec || 360),
+        },
+      };
+    }
+    return { handled: false };
+  }
+
   const text = String(request?.text || '').trim();
   if (!text || !LAIFEN_TRIGGER_RE.test(text) || LAIFEN_REMINDER_EXCLUSION_RE.test(text)) {
     return { handled: false };
@@ -2738,17 +2950,28 @@ export async function handleVoiceFastpath(request, context = {}) {
     };
   }
 
-  if (LAIFEN_MONITOR_START_RE.test(text)) {
+  if (LAIFEN_MONITOR_START_RE.test(text) && !LAIFEN_MONITOR_START_GUARD_RE.test(text)) {
     const res = await runAction('monitor-start', {}, context);
+    const sessionData = res.data?.session;
     return {
       handled: true,
       plugin: 'laifen',
       action: 'monitor-start',
       ok: Boolean(res.ok),
-      speech: res.ok ? '好，刷牙监听已启动，拿起牙刷开始刷牙就会自动记录。' : (res.message || '启动刷牙监听失败。'),
+      speech: res.ok
+        ? '好，刷牙监听已启动，拿起牙刷开始刷牙，刷完后我会播报本次时长。'
+        : (res.message || '启动刷牙监听失败。'),
       followUp: false,
       clearSessionState: true,
-      data: res.data,
+      data: {
+        ...(res.data && typeof res.data === 'object' ? res.data : {}),
+        ...(res.ok && sessionData?.sessionId
+          ? {
+              watchBrushSessionId: sessionData.sessionId,
+              timeoutSec: Number(sessionData.timeoutSec ?? 360),
+            }
+          : {}),
+      },
     };
   }
 
