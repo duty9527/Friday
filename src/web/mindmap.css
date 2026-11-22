@@ -452,6 +452,12 @@ a {
   touch-action:manipulation;
 }
 
+button,
+a,
+[role="tab"] {
+  -webkit-tap-highlight-color:transparent;
+}
+
 button {
   cursor:pointer;
 }

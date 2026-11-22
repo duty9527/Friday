@@ -1147,6 +1147,7 @@ test('isIosStandaloneClipped accurately isolates legacy iOS standalone clipped m
   };
 
   assert.equal(isIosStandaloneClipped(base), true);
+  assert.equal(isIosStandaloneClipped({ ...base, iosStandalone: false }), false);
   assert.equal(isIosStandaloneClipped({ ...base, layoutHeight: 912 }), false);
   assert.equal(isIosStandaloneClipped({ ...base, safeTop: 0, safeBottom: 0 }), false);
   assert.equal(isIosStandaloneClipped({ ...base, keyboardOpen: true }), false);
@@ -1234,6 +1235,14 @@ test('initMobileViewport creates safe-area probe, syncs clipped & keyboard class
     (env.documentMock as { activeElement: MockElement | null }).activeElement = inputEl;
     vvMock.dispatchEvent({ type: 'resize' });
     assert.equal(root.classList.contains('mobile-keyboard-open'), false, 'disposed controller must ignore subsequent events');
+
+    // Android Chrome standalone PWA (display-mode: standalone, no navigator.standalone) must keep safe-bottom intact
+    (env.documentMock as { activeElement: MockElement | null }).activeElement = null;
+    env.assign('navigator', {});
+    const androidCtrl = initMobileViewport();
+    assert.equal(root.classList.contains('pwa-standalone'), true);
+    assert.equal(root.classList.contains('ios-standalone-clipped'), false);
+    androidCtrl.dispose();
   } finally {
     env.restore();
   }
@@ -1263,29 +1272,58 @@ test('setUiTheme keeps meta theme-color and color-scheme aligned with mobile sur
     assert.equal(colorSchemeMeta.getAttribute('content'), 'dark');
     assert.equal(detachedThemeColorMeta.getAttribute('content'), '#111520');
 
-    // Attached-in-head path: theme-color meta node is replaced to force WebKit chrome repaint
+    // Attached-in-head path with light+dark media theme-color metas (Android Dark/Light + iOS WebKit repaint)
     const head = new MockElement('head');
-    const attachedThemeMeta = new MockElement('meta');
-    attachedThemeMeta.setAttribute('name', 'theme-color');
-    attachedThemeMeta.setAttribute('content', '#111520');
-    head.append(colorSchemeMeta, attachedThemeMeta);
-    (env.documentMock as { querySelector: (s: string) => MockElement | null }).querySelector = (selector: string) => {
+    const attachedLightMeta = new MockElement('meta');
+    attachedLightMeta.setAttribute('name', 'theme-color');
+    attachedLightMeta.setAttribute('media', '(prefers-color-scheme: light)');
+    attachedLightMeta.setAttribute('content', '#111520');
+    const attachedDarkMeta = new MockElement('meta');
+    attachedDarkMeta.setAttribute('name', 'theme-color');
+    attachedDarkMeta.setAttribute('media', '(prefers-color-scheme: dark)');
+    attachedDarkMeta.setAttribute('content', '#111520');
+    head.append(colorSchemeMeta, attachedLightMeta, attachedDarkMeta);
+
+    const mediaListeners: Array<() => void> = [];
+    Object.assign(env.windowMock, {
+      matchMedia: () => ({
+        matches: true,
+        addEventListener: (_type: string, fn: () => void) => { mediaListeners.push(fn); },
+      }),
+    });
+    const docMockWithAll = env.documentMock as unknown as {
+      querySelector: (s: string) => MockElement | null;
+      querySelectorAll: (s: string) => MockElement[];
+    };
+    docMockWithAll.querySelector = (selector: string) => {
       if (selector === 'meta[name="color-scheme"]') return head.children.find(c => c.getAttribute('name') === 'color-scheme') ?? null;
       if (selector === 'meta[name="theme-color"]') return head.children.find(c => c.getAttribute('name') === 'theme-color') ?? null;
       return null;
     };
+    docMockWithAll.querySelectorAll = (selector: string) => (
+      selector === 'meta[name="theme-color"]'
+        ? head.children.filter(c => c.getAttribute('name') === 'theme-color')
+        : []
+    );
 
     setUiTheme('industrial');
-    const industrialMeta = head.children.find(c => c.getAttribute('name') === 'theme-color');
-    assert.ok(industrialMeta);
-    assert.notEqual(industrialMeta, attachedThemeMeta, 'theme switch must replace attached <meta name="theme-color"> node');
-    assert.equal(industrialMeta.getAttribute('content'), '#f7f4ed');
+    const industrialMetas = head.children.filter(c => c.getAttribute('name') === 'theme-color');
+    assert.equal(industrialMetas.length, 2);
+    assert.equal(industrialMetas.some(m => m === attachedLightMeta || m === attachedDarkMeta), false, 'attached theme-color metas must be replaced');
+    assert.equal(industrialMetas.find(m => m.getAttribute('media') === '(prefers-color-scheme: light)')?.getAttribute('content'), '#f7f4ed');
+    assert.equal(industrialMetas.find(m => m.getAttribute('media') === '(prefers-color-scheme: dark)')?.getAttribute('content'), '#f7f4ed');
+
+    // OS prefers-color-scheme change listener keeps active industrial theme synced
+    for (const fn of mediaListeners) fn();
+    const resyncedMetas = head.children.filter(c => c.getAttribute('name') === 'theme-color');
+    assert.equal(resyncedMetas.length, 2);
+    assert.ok(resyncedMetas.every(m => m.getAttribute('content') === '#f7f4ed'));
 
     syncThemeChrome('spatial');
-    const spatialMeta = head.children.find(c => c.getAttribute('name') === 'theme-color');
-    assert.ok(spatialMeta);
-    assert.notEqual(spatialMeta, industrialMeta);
-    assert.equal(spatialMeta.getAttribute('content'), '#111520');
+    const spatialMetas = head.children.filter(c => c.getAttribute('name') === 'theme-color');
+    assert.equal(spatialMetas.length, 2);
+    assert.equal(spatialMetas.find(m => m.getAttribute('media') === '(prefers-color-scheme: light)')?.getAttribute('content'), '#111520');
+    assert.equal(spatialMetas.find(m => m.getAttribute('media') === '(prefers-color-scheme: dark)')?.getAttribute('content'), '#111520');
     assert.equal(colorSchemeMeta.getAttribute('content'), 'dark');
   } finally {
     env.restore();

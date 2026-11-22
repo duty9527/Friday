@@ -10,6 +10,10 @@ const LEFT_OPEN_LABEL = '◧ 任务舱';
 const LEFT_COLLAPSED_LABEL = '◨ 任务舱';
 const RIGHT_OPEN_LABEL = '执行链路 ◨';
 const RIGHT_COLLAPSED_LABEL = '执行链路 ◧';
+const THEME_COLOR_MEDIA_QUERIES = [
+  '(prefers-color-scheme: light)',
+  '(prefers-color-scheme: dark)',
+] as const;
 
 const themeListeners = new Set<(theme: UiTheme) => void>();
 const boundThemeButtons = new Map<HTMLButtonElement, UiTheme>();
@@ -57,10 +61,63 @@ function syncMetaTag(name: string, content: string, replaceNode: boolean): void 
   }
 }
 
+function appendThemeColorMeta(themeColor: string, media?: string): void {
+  if (!document.head || typeof document.createElement !== 'function') return;
+  const fresh = document.createElement('meta');
+  fresh.setAttribute('name', 'theme-color');
+  if (media) fresh.setAttribute('media', media);
+  fresh.setAttribute('content', themeColor);
+  document.head.appendChild(fresh);
+}
+
+function syncThemeColorMetas(themeColor: string, replaceNode: boolean): void {
+  if (typeof document === 'undefined') return;
+  let existingList: Element[] = [];
+  if (typeof document.querySelectorAll === 'function') {
+    existingList = Array.from(document.querySelectorAll('meta[name="theme-color"]'));
+  } else if (typeof document.querySelector === 'function') {
+    const single = document.querySelector('meta[name="theme-color"]');
+    if (single) existingList = [single];
+  }
+
+  if (existingList.length > 0) {
+    const seenMedia = new Set<string>();
+    let hasAttached = false;
+    for (const existing of existingList) {
+      const media = existing.getAttribute?.('media') ?? undefined;
+      if (media) seenMedia.add(media);
+      existing.setAttribute('content', themeColor);
+      if (existing.parentNode) {
+        hasAttached = true;
+        if (replaceNode && typeof document.createElement === 'function') {
+          const fresh = document.createElement('meta');
+          fresh.setAttribute('name', 'theme-color');
+          if (media) fresh.setAttribute('media', media);
+          fresh.setAttribute('content', themeColor);
+          existing.parentNode.insertBefore(fresh, existing);
+          existing.remove();
+        }
+      }
+    }
+    if (hasAttached && seenMedia.size > 0) {
+      for (const mq of THEME_COLOR_MEDIA_QUERIES) {
+        if (!seenMedia.has(mq)) {
+          appendThemeColorMeta(themeColor, mq);
+        }
+      }
+    }
+    return;
+  }
+
+  for (const mq of THEME_COLOR_MEDIA_QUERIES) {
+    appendThemeColorMeta(themeColor, mq);
+  }
+}
+
 export function syncThemeChrome(theme: UiTheme = getUiTheme()): void {
   const { scheme, themeColor } = getThemeMetaColors(theme);
   syncMetaTag('color-scheme', scheme, false);
-  syncMetaTag('theme-color', themeColor, true);
+  syncThemeColorMetas(themeColor, true);
 }
 
 function triggerThemeTransition(): void {
@@ -138,7 +195,7 @@ function applyThemeToDom(theme: UiTheme): void {
       chromeSyncRaf = requestAnimationFrame(() => {
         chromeSyncRaf = undefined;
         if (currentTheme === theme) {
-          syncMetaTag('theme-color', getThemeMetaColors(theme).themeColor, true);
+          syncThemeColorMetas(getThemeMetaColors(theme).themeColor, true);
         }
       });
     }
@@ -202,6 +259,26 @@ function ensureCrossTabSync(): void {
         handleExternalThemeUpdate(stored.ok ? stored.value : 'spatial');
       }
     });
+    window.addEventListener('pageshow', () => {
+      syncThemeChrome();
+    });
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) syncThemeChrome();
+      });
+    }
+    if (typeof window.matchMedia === 'function') {
+      try {
+        const mql = window.matchMedia('(prefers-color-scheme: dark)');
+        if (mql && typeof mql.addEventListener === 'function') {
+          mql.addEventListener('change', () => {
+            syncThemeChrome();
+          });
+        }
+      } catch {
+        // Ignore matchMedia listener errors in restricted environments.
+      }
+    }
   }
 }
 

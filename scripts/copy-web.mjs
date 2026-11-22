@@ -16,7 +16,7 @@ async function copyStaticTree(srcDir, dstDir) {
       await copyStaticTree(srcPath, dstPath);
       continue;
     }
-    if (!entry.isFile() || !ALLOWED_STATIC_ASSET.test(entry.name)) continue;
+    if (!entry.isFile() || (!ALLOWED_STATIC_ASSET.test(entry.name) && entry.name !== 'theme-boot.js')) continue;
     await mkdir(dirname(dstPath), { recursive: true });
     await copyFile(srcPath, dstPath);
   }

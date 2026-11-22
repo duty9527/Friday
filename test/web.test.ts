@@ -714,9 +714,19 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
     assert.doesNotMatch(mobileVpJs, /\.style\./);
     assert.doesNotMatch(mobileVpJs, /\.innerHTML\b/);
 
+    const themeBootRes = await fetch(`${f.base}/theme-boot.js`);
+    assert.equal(themeBootRes.status, 200);
+    assert.match(themeBootRes.headers.get('content-type') ?? '', /javascript/);
+    const themeBootJs = await themeBootRes.text();
+    assert.ok(themeBootJs.includes('friday.ui-theme'));
+    assert.doesNotMatch(themeBootJs, /\.style\./);
+    assert.doesNotMatch(themeBootJs, /\.innerHTML\b/);
+
     const indexHtml = await (await fetch(f.base)).text();
     assert.match(indexHtml, /<html[^>]+data-theme="spatial"/);
-    assert.match(indexHtml, /<meta\s+name="theme-color"\s+content="#111520">/);
+    assert.match(indexHtml, /<meta\s+name="theme-color"\s+content="#111520"\s+media="\(prefers-color-scheme: light\)">/);
+    assert.match(indexHtml, /<meta\s+name="theme-color"\s+content="#111520"\s+media="\(prefers-color-scheme: dark\)">/);
+    assert.match(indexHtml, /<script\s+src="\/theme-boot\.js"><\/script>/);
     assert.match(indexHtml, /viewport-fit=cover/);
     assert.match(indexHtml, /interactive-widget=resizes-content/);
     for (const marker of [
@@ -758,7 +768,9 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
 
     const mindmapHtml = await (await fetch(`${f.base}/mindmap`)).text();
     assert.match(mindmapHtml, /<html[^>]+data-theme="spatial"/);
-    assert.match(mindmapHtml, /<meta\s+name="theme-color"\s+content="#111520">/);
+    assert.match(mindmapHtml, /<meta\s+name="theme-color"\s+content="#111520"\s+media="\(prefers-color-scheme: light\)">/);
+    assert.match(mindmapHtml, /<meta\s+name="theme-color"\s+content="#111520"\s+media="\(prefers-color-scheme: dark\)">/);
+    assert.match(mindmapHtml, /<script\s+src="\/theme-boot\.js"><\/script>/);
     assert.match(mindmapHtml, /viewport-fit=cover/);
     assert.match(mindmapHtml, /id="mm-theme-spatial"/);
     assert.match(mindmapHtml, /id="mm-theme-industrial"/);

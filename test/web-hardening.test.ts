@@ -823,7 +823,7 @@ test('src/web and dist/web uphold zero inline styles and light-theme WCAG contra
     assert.ok(mindmapCss.includes(token), `mindmap.css must define ${token}`);
   }
 
-  const srcScripts = (await walkFiles(srcWebDir)).filter(f => f.endsWith('.ts'));
+  const srcScripts = (await walkFiles(srcWebDir)).filter(f => f.endsWith('.ts') || f.endsWith('.js'));
   for (const file of srcScripts) {
     const content = await readFile(file, 'utf8');
     assert.doesNotMatch(content, /\.style\./, `${file} must not use inline .style.`);

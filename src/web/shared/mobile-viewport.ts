@@ -1,5 +1,6 @@
 export interface MobileViewportMetrics {
   standalone: boolean;
+  iosStandalone?: boolean;
   narrowMobile: boolean;
   keyboardOpen: boolean;
   screenWidth: number;
@@ -54,7 +55,8 @@ function isEditableTextElement(el: Element | null): boolean {
 }
 
 export function isIosStandaloneClipped(metrics: MobileViewportMetrics): boolean {
-  if (!metrics.standalone || !metrics.narrowMobile || metrics.keyboardOpen) {
+  const iosStandalone = metrics.iosStandalone ?? metrics.standalone;
+  if (!iosStandalone || !metrics.narrowMobile || metrics.keyboardOpen) {
     return false;
   }
   const { screenWidth, screenHeight, layoutWidth, layoutHeight, safeTop, safeBottom } = metrics;
@@ -127,11 +129,15 @@ export function initMobileViewport(): MobileViewportController {
     return layoutW > 0 && layoutW <= 730;
   };
 
-  const isStandalone = (): boolean => {
+  const isIosStandalone = (): boolean => {
     const nav = typeof navigator !== 'undefined'
       ? (navigator as Navigator & { standalone?: boolean })
       : undefined;
-    if (nav?.standalone === true) return true;
+    return nav?.standalone === true;
+  };
+
+  const isStandalone = (): boolean => {
+    if (isIosStandalone()) return true;
     if (typeof window.matchMedia === 'function') {
       try {
         return Boolean(window.matchMedia(STANDALONE_MEDIA_QUERY)?.matches);
@@ -214,6 +220,7 @@ export function initMobileViewport(): MobileViewportController {
 
     const clipped = isIosStandaloneClipped({
       standalone,
+      iosStandalone: isIosStandalone(),
       narrowMobile,
       keyboardOpen,
       screenWidth: screenW,

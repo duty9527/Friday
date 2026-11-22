@@ -300,6 +300,9 @@ input,textarea {
 button,select,summary,input,textarea,a {
   touch-action:manipulation;
 }
+button,a,summary,[role="button"],[role="tab"] {
+  -webkit-tap-highlight-color:transparent;
+}
 button,select,summary {
   cursor:pointer;
 }
@@ -6874,6 +6877,8 @@ html[data-theme="industrial"] .fund-holding-row:hover {
     width:min(320px, 88vw);
     max-width:88vw;
     z-index:50;
+    border:0;
+    border-right:1px solid var(--border);
     border-radius:0 20px 20px 0;
     padding:calc(14px + var(--safe-top)) 14px calc(18px + var(--safe-bottom)) calc(14px + var(--safe-left));
     overscroll-behavior-y:contain;
@@ -6993,9 +6998,14 @@ html[data-theme="industrial"] .fund-holding-row:hover {
     display:flex;
     position:absolute;
     top:calc(100% + 6px);
-    right:10px;
+    right:calc(10px + var(--safe-right));
     z-index:35;
-    width:min(320px, calc(100vw - 20px));
+    width:min(320px, calc(100vw - 20px - var(--safe-left) - var(--safe-right)));
+    max-height:calc(100dvh - 88px - var(--safe-top) - var(--safe-bottom));
+    overflow-y:auto;
+    overscroll-behavior-y:contain;
+    touch-action:pan-y;
+    -webkit-overflow-scrolling:touch;
     margin-left:0;
     padding:10px;
     flex-wrap:wrap;
@@ -7080,6 +7090,12 @@ html[data-theme="industrial"] .fund-holding-row:hover {
   .composer {
     margin:0 auto calc(8px + var(--safe-bottom));
     touch-action:manipulation;
+  }
+  .bot-emote-tray {
+    max-width:calc(100vw - 24px - var(--safe-left) - var(--safe-right));
+    overscroll-behavior-y:contain;
+    touch-action:pan-y;
+    -webkit-overflow-scrolling:touch;
   }
   html.mobile-keyboard-open .composer {
     margin-bottom:8px;
