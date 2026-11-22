@@ -1,4 +1,13 @@
 import { element } from '../shared/dom.js';
+import {
+  bindDialogLightDismiss,
+  bindRovingTablist,
+  closeModalDialog,
+  isDialogOpen,
+  openModalDialog,
+  safeFocus,
+  syncRovingTablist,
+} from '../shared/ui-primitives.js';
 import { hooks } from '../state.js';
 import { initModelHub } from './model-hub.js';
 import { initUsageHub } from './usage-hub.js';
@@ -16,7 +25,7 @@ export interface SystemHubController {
 export function initSystemHub(): SystemHubController {
   const openSystemHubTop = element<HTMLButtonElement>('open-system-hub-top');
   const systemTopBadge = element<HTMLElement>('system-top-badge');
-  const systemHubBackdrop = element<HTMLElement>('system-hub-backdrop');
+  const systemHubDialog = element<HTMLElement>('system-hub-dialog');
   const systemModalClose = element<HTMLButtonElement>('system-modal-close');
   const systemHubTabs = element<HTMLElement>('system-hub-tabs');
   const modelsTabBtn = element<HTMLButtonElement>('system-tab-models');
@@ -25,6 +34,9 @@ export function initSystemHub(): SystemHubController {
   const modelsPanel = element<HTMLElement>('system-panel-models');
   const usagePanel = element<HTMLElement>('system-panel-usage');
   const servicesPanel = element<HTMLElement>('system-panel-services');
+
+  const lifecycleAc = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const signal = lifecycleAc?.signal;
 
   let activeTab: SystemHubTab = 'models';
   let modelSummary: { ready: boolean; badgeText: string; detailText: string } = {
@@ -58,7 +70,7 @@ export function initSystemHub(): SystemHubController {
   }
 
   const isVisible = (tab: SystemHubTab): boolean =>
-    !systemHubBackdrop.hidden && activeTab === tab;
+    isDialogOpen(systemHubDialog) && activeTab === tab;
 
   const modelHub = initModelHub({
     isVisible: () => isVisible('models'),
@@ -84,22 +96,27 @@ export function initSystemHub(): SystemHubController {
     },
   });
 
+  function tabButtonFor(tab: SystemHubTab): HTMLButtonElement {
+    if (tab === 'usage') return usageTabBtn;
+    if (tab === 'services') return servicesTabBtn;
+    return modelsTabBtn;
+  }
+
   function syncTabAttributes(): void {
     const isModels = activeTab === 'models';
     const isUsage = activeTab === 'usage';
     const isServices = activeTab === 'services';
 
     modelsTabBtn.classList.toggle('active', isModels);
-    modelsTabBtn.setAttribute('aria-selected', isModels ? 'true' : 'false');
     modelsPanel.hidden = !isModels;
 
     usageTabBtn.classList.toggle('active', isUsage);
-    usageTabBtn.setAttribute('aria-selected', isUsage ? 'true' : 'false');
     usagePanel.hidden = !isUsage;
 
     servicesTabBtn.classList.toggle('active', isServices);
-    servicesTabBtn.setAttribute('aria-selected', isServices ? 'true' : 'false');
     servicesPanel.hidden = !isServices;
+
+    syncRovingTablist(systemHubTabs, tabButtonFor(activeTab));
   }
 
   function switchTab(nextTab: SystemHubTab, focusProviderId?: string): void {
@@ -115,13 +132,16 @@ export function initSystemHub(): SystemHubController {
   }
 
   function openModal(tab: SystemHubTab = 'models', focusProviderId?: string): void {
-    hooks.closeAllHubModals();
-    systemHubBackdrop.hidden = false;
+    if (!isDialogOpen(systemHubDialog)) {
+      hooks.closeAllHubModals();
+      openModalDialog(systemHubDialog);
+    }
     switchTab(tab, focusProviderId);
+    safeFocus(tabButtonFor(activeTab));
   }
 
   function closeModal(): void {
-    systemHubBackdrop.hidden = true;
+    closeModalDialog(systemHubDialog);
   }
 
   function render(force = false): void {
@@ -130,22 +150,32 @@ export function initSystemHub(): SystemHubController {
     servicesHub.render(force);
   }
 
-  openSystemHubTop.addEventListener('click', () => openModal(activeTab));
-  systemModalClose.addEventListener('click', closeModal);
-  systemHubBackdrop.addEventListener('click', event => {
-    if (event.target === systemHubBackdrop) closeModal();
+  bindDialogLightDismiss(systemHubDialog, undefined, signal);
+  bindRovingTablist(systemHubTabs, {
+    onActivate: tabEl => {
+      const nextTab = tabEl.dataset.systemTab as SystemHubTab | undefined;
+      if (!nextTab || (nextTab === activeTab && isDialogOpen(systemHubDialog))) return;
+      switchTab(nextTab);
+    },
+    signal,
   });
-  systemHubTabs.addEventListener('click', event => {
-    const tabBtn = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-system-tab]');
-    const nextTab = tabBtn?.dataset.systemTab as SystemHubTab | undefined;
-    if (!nextTab || (nextTab === activeTab && !systemHubBackdrop.hidden)) return;
-    switchTab(nextTab);
-  });
+
+  const listenerOpts = signal ? { signal } : undefined;
+  openSystemHubTop.addEventListener('click', () => openModal(activeTab), listenerOpts);
+  systemModalClose.addEventListener('click', closeModal, listenerOpts);
+
+  if (typeof window !== 'undefined') {
+    window.addEventListener('pagehide', () => {
+      lifecycleAc?.abort();
+    }, listenerOpts);
+  }
+
+  syncTabAttributes();
 
   return {
     openModal,
     closeModal,
     render,
-    isOpen: () => !systemHubBackdrop.hidden,
+    isOpen: () => isDialogOpen(systemHubDialog),
   };
 }

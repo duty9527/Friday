@@ -8,6 +8,8 @@ import {
   createPluginIconSvg,
   createPluginPrefsSync,
   createUiIconSvg,
+  cssEscapeValue,
+  ensureInlineFormError,
   filterAndGroupPlugins,
   formatActionDefaultArgs,
   formatPlatformsLabel,
@@ -24,18 +26,38 @@ import {
   readPluginOrder,
   readSidebarCollapsed,
   reorderPluginList,
+  replaceChildrenPreservingFocus,
   resolvePluginActionLabel,
+  setInlineFormError,
   summarizePluginRunMessage,
+  wireHubForm,
   writePluginOrder,
   writeSidebarCollapsed,
   type PluginCatalogFilter,
 } from '../shared/plugin-catalog.js';
+import {
+  announceStatus,
+  bindDialogLightDismiss,
+  bindRovingTablist,
+  closeModalDialog,
+  confirmAction,
+  copyTextWithFeedback,
+  isDialogOpen,
+  isImeComposing,
+  moveElementPreservingState,
+  openModalDialog,
+  prefersReducedMotion,
+  safeFocus,
+  syncRovingTablist,
+} from '../shared/ui-primitives.js';
 import { api, appState, hooks } from '../state.js';
 
 export interface PluginSurfaceLifecycle {
-  activate: () => void;
+  activate: (signal?: AbortSignal) => void;
   deactivate: () => void;
-  refreshBadge: () => Promise<void>;
+  refreshBadge: (signal?: AbortSignal) => Promise<void>;
+  dispose?: () => void;
+  signal?: AbortSignal;
 }
 
 export interface PluginSurfaceRegistration {
@@ -124,10 +146,11 @@ function isTabletViewport(): boolean {
 export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPluginHubController {
   const timerTopBadge = element<HTMLElement>('timer-top-badge');
   const openTimerHubTop = element<HTMLButtonElement>('open-timer-hub-top');
-  const timerHubBackdrop = element<HTMLElement>('timer-hub-backdrop');
+  const timerHubDialog = element<HTMLElement>('timer-hub-dialog');
   const timerModalClose = element<HTMLButtonElement>('timer-modal-close');
   const timerKpiGrid = element<HTMLElement>('timer-kpi-grid');
   const timerAddDetails = element<HTMLDetailsElement>('timer-add-details');
+  const timerComposeForm = (typeof document !== 'undefined' ? document.getElementById('timer-compose-form') : null) as HTMLFormElement | null;
   const timerPresetBar = element<HTMLElement>('timer-preset-bar');
   const timerNameInput = element<HTMLInputElement>('timer-name-input');
   const timerDailyInput = element<HTMLInputElement>('timer-daily-input');
@@ -145,7 +168,7 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
   const pluginTopBadge = element<HTMLElement>('plugin-top-badge');
   const pluginCatalogBadge = element<HTMLElement>('plugin-catalog-badge');
   const openPluginHubTop = element<HTMLButtonElement>('open-plugin-hub-top');
-  const pluginHubBackdrop = element<HTMLElement>('plugin-hub-backdrop');
+  const pluginHubDialog = element<HTMLElement>('plugin-hub-dialog');
   const pluginModalClose = element<HTMLButtonElement>('plugin-modal-close');
   const pluginModalTitle = element<HTMLElement>('plugin-modal-title');
   const pluginMobileNavBtn = element<HTMLButtonElement>('plugin-mobile-nav-btn');
@@ -167,6 +190,12 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
   const pluginsList = element<HTMLElement>('plugins-list');
   const pluginStage = pluginPanelCatalog.parentElement;
 
+  const lifecycleAc = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const signal = lifecycleAc?.signal;
+  timerNameInput.required = true;
+  timerDailyInput.pattern = '^([01]\\d|2[0-3]):[0-5]\\d$';
+  const timerComposeErrorEl = ensureInlineFormError(timerComposeForm, 'timer-compose-error');
+
   const surfaces = (options.pluginSurfaces ?? []).map(reg => {
     const tabEl = element<HTMLButtonElement>(reg.tabId);
     const panelEl = element<HTMLElement>(reg.panelId);
@@ -185,6 +214,7 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
   const defaultSurfaceOrder = surfaces.map(entry => entry.reg.pluginName);
   const surfaceLoadPromises = new Map<string, Promise<PluginSurfaceLifecycle>>();
   const surfaceControllers = new Map<string, PluginSurfaceLifecycle>();
+  const surfaceAbortControllers = new Map<string, AbortController>();
   const surfaceBadgeSynced = new Set<string>();
   const liveBadges = new Map<string, LiveBadgeSnapshot>();
   const quickCheckStates = new Map<string, QuickCheckState>();
@@ -193,16 +223,18 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
   let pluginOrder: string[] = readPluginOrder();
   let activePluginTab = 'catalog';
   let activeSurfaceCtrl: PluginSurfaceLifecycle | undefined;
+  let activeSurfaceName: string | undefined;
   let tabSwitchSeq = 0;
 
   let catalogFilter: PluginCatalogFilter = 'all';
   let catalogQuery = '';
+  let searchDebounceTimer: ReturnType<typeof setTimeout> | undefined;
   let detailPluginName: string | undefined;
   let detailSubTab: 'overview' | 'dev' = 'overview';
   let detailInitialAction: string | undefined;
   let suppressClickUntil = 0;
-  let resizeDispatchTimer: ReturnType<typeof setTimeout> | undefined;
   let resetNavDragState = () => {};
+  let detailAc: AbortController | null = null;
 
   function resolveEffectiveCollapsed(): boolean {
     if (isMobileViewport()) return false;
@@ -210,31 +242,23 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
     return isTabletViewport();
   }
 
-  function dispatchStageResize(): void {
-    if (typeof window === 'undefined' || pluginHubBackdrop.hidden) return;
-    if (typeof requestAnimationFrame === 'function') {
-      requestAnimationFrame(() => {
-        window.dispatchEvent(new Event('resize'));
-      });
-    }
-    if (resizeDispatchTimer !== undefined) clearTimeout(resizeDispatchTimer);
-    resizeDispatchTimer = setTimeout(() => {
-      resizeDispatchTimer = undefined;
-      if (!pluginHubBackdrop.hidden) {
-        window.dispatchEvent(new Event('resize'));
-      }
-    }, 320);
-  }
-
-  function setMobileNavOpen(open: boolean): void {
+  function setMobileNavOpen(open: boolean, restoreFocus = false): void {
     const effective = open && isMobileViewport();
+    const wasOpen = pluginShell.classList.contains('is-mobile-nav-open');
     pluginShell.classList.toggle('is-mobile-nav-open', effective);
     pluginSidebarScrim.hidden = !effective;
     pluginMobileNavBtn.setAttribute('aria-expanded', String(effective));
+    if (effective && !wasOpen) {
+      const targetTab = activePluginTab === 'catalog'
+        ? pluginTabCatalog
+        : (surfaceByName.get(activePluginTab)?.tabEl ?? pluginTabCatalog);
+      safeFocus(targetTab);
+    } else if (!effective && wasOpen && restoreFocus) {
+      safeFocus(pluginMobileNavBtn);
+    }
   }
 
-  function applySidebarCollapsed(collapsed: boolean, emitResize = false): void {
-    const changed = pluginShell.classList.contains('is-sidebar-collapsed') !== collapsed;
+  function applySidebarCollapsed(collapsed: boolean): void {
     pluginShell.classList.toggle('is-sidebar-collapsed', collapsed);
     pluginSidebarToggle.setAttribute('aria-expanded', String(!collapsed));
     pluginSidebarToggle.setAttribute('aria-label', collapsed ? '展开侧边栏' : '收起侧边栏');
@@ -242,16 +266,39 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
     pluginSidebarToggle.replaceChildren(
       createUiIconSvg(collapsed ? 'sidebar-expand' : 'sidebar-collapse', 'plugin-ui-svg', 16),
     );
-    if (emitResize && changed) {
-      dispatchStageResize();
-    }
   }
 
-  function applySidebarOrder(): void {
+  function applySidebarOrder(animate = false): void {
     const ordered = mergePluginOrder(pluginOrder, defaultSurfaceOrder);
-    for (const name of ordered) {
-      const entry = surfaceByName.get(name);
-      if (entry) pluginNavSortable.append(entry.tabEl);
+    const canFlip = animate && isDialogOpen(pluginHubDialog) && !prefersReducedMotion();
+    const firstTops = new Map<HTMLElement, number>();
+    if (canFlip) {
+      for (const name of ordered) {
+        const el = surfaceByName.get(name)?.tabEl;
+        if (el && !el.hidden && typeof el.getBoundingClientRect === 'function') {
+          firstTops.set(el, el.getBoundingClientRect().top);
+        }
+      }
+    }
+    for (let i = 0; i < ordered.length; i++) {
+      const entry = surfaceByName.get(ordered[i]!);
+      if (!entry) continue;
+      const currentAtSlot = pluginNavSortable.children[i] ?? null;
+      if (currentAtSlot !== entry.tabEl) {
+        moveElementPreservingState(pluginNavSortable, entry.tabEl, currentAtSlot);
+      }
+    }
+    if (canFlip) {
+      for (const [el, firstTop] of firstTops) {
+        if (typeof el.getBoundingClientRect !== 'function' || typeof el.animate !== 'function') continue;
+        const dy = firstTop - el.getBoundingClientRect().top;
+        if (Math.abs(dy) >= 1) {
+          el.animate(
+            [{ transform: `translateY(${dy}px)` }, { transform: 'translateY(0)' }],
+            { duration: 160, easing: 'cubic-bezier(0.2, 0, 0, 1)' },
+          );
+        }
+      }
     }
     pluginOrderResetBtn.hidden = !isCustomOrder(pluginOrder, defaultSurfaceOrder);
   }
@@ -259,23 +306,35 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
   const prefsSync = createPluginPrefsSync({
     onCollapsed: next => {
       userCollapsedPref = next;
-      applySidebarCollapsed(resolveEffectiveCollapsed(), true);
+      applySidebarCollapsed(resolveEffectiveCollapsed());
     },
     onOrder: next => {
       pluginOrder = next;
-      applySidebarOrder();
-      if (!pluginHubBackdrop.hidden && activePluginTab === 'catalog' && !detailPluginName) {
+      applySidebarOrder(true);
+      if (isDialogOpen(pluginHubDialog) && activePluginTab === 'catalog' && !detailPluginName) {
         renderPlugins(true);
       }
     },
+    signal,
   });
 
-  function commitPluginOrder(nextOrder: string[]): void {
+  function commitPluginOrder(nextOrder: string[], movedName?: string): void {
     pluginOrder = nextOrder;
     writePluginOrder(nextOrder);
     prefsSync.broadcastOrder(nextOrder);
-    applySidebarOrder();
-    if (!pluginHubBackdrop.hidden && activePluginTab === 'catalog' && !detailPluginName) {
+    applySidebarOrder(true);
+    if (movedName) {
+      const visibleNames = surfaces
+        .filter(s => !s.tabEl.hidden)
+        .map(s => s.reg.pluginName);
+      const orderedVisible = mergePluginOrder(nextOrder, visibleNames);
+      const idx = orderedVisible.indexOf(movedName);
+      const label = surfaceByName.get(movedName)?.reg.label ?? movedName;
+      if (idx >= 0) {
+        announceStatus(`已将「${label}」移至第 ${idx + 1} 位`, 'polite');
+      }
+    }
+    if (isDialogOpen(pluginHubDialog) && activePluginTab === 'catalog' && !detailPluginName) {
       renderPlugins(true);
     }
   }
@@ -291,7 +350,7 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
     }
     liveBadges.set(entry.reg.pluginName, { text, tone });
 
-    const cardBadge = pluginsList.querySelector<HTMLElement>(`[data-live-badge="${entry.reg.pluginName}"]`);
+    const cardBadge = pluginsList.querySelector<HTMLElement>(`[data-live-badge="${cssEscapeValue(entry.reg.pluginName)}"]`);
     if (cardBadge) {
       cardBadge.textContent = text || '—';
       cardBadge.hidden = !hasMeaningfulValue;
@@ -309,16 +368,6 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
 
   for (const entry of surfaces) {
     syncSurfaceBadgeMeta(entry);
-    if (entry.badgeEl && typeof MutationObserver !== 'undefined') {
-      const observer = new MutationObserver(() => syncSurfaceBadgeMeta(entry));
-      observer.observe(entry.badgeEl, {
-        childList: true,
-        characterData: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ['class'],
-      });
-    }
   }
 
   function syncHeaderContext(): void {
@@ -365,22 +414,34 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
   }
 
   function deactivateActiveSurface(): void {
-    activeSurfaceCtrl?.deactivate();
+    const prevName = activeSurfaceName;
+    const prevCtrl = activeSurfaceCtrl;
+    if (prevName) {
+      surfaceAbortControllers.get(prevName)?.abort();
+      surfaceAbortControllers.delete(prevName);
+    }
+    prevCtrl?.deactivate();
     activeSurfaceCtrl = undefined;
+    activeSurfaceName = undefined;
+    if (prevName) {
+      const prevEntry = surfaceByName.get(prevName);
+      if (prevEntry) syncSurfaceBadgeMeta(prevEntry);
+    }
   }
 
   function syncPluginTabElements(): void {
     const isCatalog = activePluginTab === 'catalog';
     pluginTabCatalog.classList.toggle('active', isCatalog);
-    pluginTabCatalog.setAttribute('aria-selected', isCatalog ? 'true' : 'false');
     pluginPanelCatalog.hidden = !isCatalog;
 
+    let activeTabBtn: HTMLButtonElement = pluginTabCatalog;
     for (const entry of surfaces) {
       const selected = activePluginTab === entry.reg.pluginName;
       entry.tabEl.classList.toggle('active', selected);
-      entry.tabEl.setAttribute('aria-selected', selected ? 'true' : 'false');
       entry.panelEl.hidden = !selected;
+      if (selected) activeTabBtn = entry.tabEl;
     }
+    syncRovingTablist(pluginSurfaceTabs, activeTabBtn);
     syncHeaderContext();
   }
 
@@ -405,16 +466,22 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
     surfaceBadgeSynced.add(entry.reg.pluginName);
     void loadSurfaceController(entry.reg)
       .then(ctrl => {
-        if (seq !== tabSwitchSeq || pluginHubBackdrop.hidden || activePluginTab !== resolvedTab) {
+        if (seq !== tabSwitchSeq || !isDialogOpen(pluginHubDialog) || activePluginTab !== resolvedTab) {
           return;
         }
+        surfaceAbortControllers.get(entry.reg.pluginName)?.abort();
+        const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        if (ac) surfaceAbortControllers.set(entry.reg.pluginName, ac);
         activeSurfaceCtrl = ctrl;
-        ctrl.activate();
-        dispatchStageResize();
+        activeSurfaceName = entry.reg.pluginName;
+        ctrl.activate(ac?.signal);
+        syncSurfaceBadgeMeta(entry);
       })
       .catch(error => {
         if (seq !== tabSwitchSeq) return;
-        hooks.connection(`加载${entry.reg.label}面板失败：${errorText(error)}`, true);
+        const errMsg = `加载${entry.reg.label}面板失败：${errorText(error)}`;
+        hooks.connection(errMsg, true);
+        announceStatus(errMsg, 'assertive');
         activePluginTab = 'catalog';
         syncPluginTabElements();
         renderPlugins(true);
@@ -428,7 +495,8 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
       if (activePluginTab === entry.reg.pluginName || surfaceBadgeSynced.has(entry.reg.pluginName)) continue;
       surfaceBadgeSynced.add(entry.reg.pluginName);
       void loadSurfaceController(entry.reg)
-        .then(ctrl => ctrl.refreshBadge())
+        .then(ctrl => ctrl.refreshBadge(signal))
+        .then(() => syncSurfaceBadgeMeta(entry))
         .catch(() => {
           surfaceBadgeSynced.delete(entry.reg.pluginName);
         });
@@ -461,30 +529,46 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
     }
   }
 
-  async function toggleTimerFromUi(id: string, enabled: boolean) {
+  async function toggleTimerFromUi(id: string, enabled: boolean, name?: string) {
     try {
       await api<unknown>('/api/timer-toggle', { id, enabled });
+      announceStatus(`${enabled ? '已启用' : '已暂停'}定时任务「${name ?? id}」`, 'polite');
       await hooks.refreshView();
     } catch (error) {
-      hooks.connection(`切换定时器失败：${errorText(error)}`, true);
+      const msg = `切换定时器失败：${errorText(error)}`;
+      hooks.connection(msg, true);
+      announceStatus(msg, 'assertive');
     }
   }
 
-  async function completeTimerFromUi(id: string) {
+  async function completeTimerFromUi(id: string, name?: string) {
     try {
       await api<TimerView>('/api/timer-complete', { id });
+      announceStatus(`已标记定时目标「${name ?? id}」达成`, 'polite');
       await hooks.refreshView();
     } catch (error) {
-      hooks.connection(`标记定时目标达成失败：${errorText(error)}`, true);
+      const msg = `标记定时目标达成失败：${errorText(error)}`;
+      hooks.connection(msg, true);
+      announceStatus(msg, 'assertive');
     }
   }
 
-  async function removeTimerFromUi(id: string) {
+  async function removeTimerFromUi(id: string, name?: string) {
+    const confirmed = await confirmAction({
+      title: '删除定时任务',
+      message: `确定要删除定时任务「${name ?? id}」吗？删除后将不再按计划自动触发。`,
+      confirmLabel: '确认删除',
+      danger: true,
+    });
+    if (!confirmed || appState.authExpired || !appState.ready) return;
     try {
       await api<unknown>('/api/timer-remove', { id });
+      announceStatus(`已删除定时任务「${name ?? id}」`, 'polite');
       await hooks.refreshView();
     } catch (error) {
-      hooks.connection(`删除定时器失败：${errorText(error)}`, true);
+      const msg = `删除定时器失败：${errorText(error)}`;
+      hooks.connection(msg, true);
+      announceStatus(msg, 'assertive');
     }
   }
 
@@ -502,11 +586,37 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
       ? rawMaxFailures
       : undefined;
     const instruction = timerInstructionInput.value.trim();
-    if (once && goalCondition) {
-      hooks.connection('单次定时提醒与终态目标条件不可同时设置', true);
+    if (!name) {
+      setInlineFormError(timerComposeErrorEl, '请填写定时任务名称', [timerNameInput]);
+      safeFocus(timerNameInput);
       return;
     }
-    if (!name || (!instruction && !plugin) || (!dailyAt && (!Number.isFinite(intervalSeconds) || intervalSeconds < 5))) return;
+    if (once && goalCondition) {
+      setInlineFormError(timerComposeErrorEl, '单次定时提醒与终态目标条件不可同时设置', [timerOnceInput, timerGoalInput]);
+      hooks.connection('单次定时提醒与终态目标条件不可同时设置', true);
+      safeFocus(timerOnceInput);
+      return;
+    }
+    if (!instruction && !plugin) {
+      setInlineFormError(timerComposeErrorEl, '请填写执行指令或指定插件动作', [timerInstructionInput]);
+      safeFocus(timerInstructionInput);
+      return;
+    }
+    if (dailyAt && !/^([01]\d|2[0-3]):[0-5]\d$/.test(dailyAt)) {
+      setInlineFormError(timerComposeErrorEl, '每日定点时间格式应为 HH:mm（例如 09:30）', [timerDailyInput]);
+      safeFocus(timerDailyInput);
+      return;
+    }
+    if (!dailyAt && (!Number.isFinite(intervalSeconds) || intervalSeconds < 5 || intervalSeconds > 604800)) {
+      setInlineFormError(timerComposeErrorEl, '间隔秒数须为 5 ~ 604800 之间的数字', [timerIntervalInput]);
+      safeFocus(timerIntervalInput);
+      return;
+    }
+    setInlineFormError(
+      timerComposeErrorEl,
+      undefined,
+      [timerNameInput, timerInstructionInput, timerDailyInput, timerIntervalInput, timerOnceInput, timerGoalInput],
+    );
     timerSaveBtn.disabled = true;
     try {
       await api<TimerView>('/api/timer-add', {
@@ -529,9 +639,12 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
       timerMaxFailuresInput.value = '5';
       timerOnceInput.checked = false;
       timerInstructionInput.value = '';
+      announceStatus(`已创建定时任务「${name}」`, 'polite');
       await hooks.refreshView();
     } catch (error) {
-      hooks.connection(`创建定时器失败：${errorText(error)}`, true);
+      const errMsg = `创建定时器失败：${errorText(error)}`;
+      setInlineFormError(timerComposeErrorEl, errMsg);
+      hooks.connection(errMsg, true);
     } finally {
       timerSaveBtn.disabled = appState.authExpired || !appState.ready;
     }
@@ -555,7 +668,7 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
     timerTopBadge.textContent = timers.length ? `${activeCount}/${timers.length}` : '0';
     timerSaveBtn.disabled = appState.authExpired || !appState.ready;
 
-    if (timerHubBackdrop.hidden && !force) {
+    if (!isDialogOpen(timerHubDialog) && !force) {
       return;
     }
 
@@ -571,7 +684,7 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
     timerKpiGrid.replaceChildren(kpiFrag);
     timerListSubtitle.textContent = timers.length ? `${activeCount} / ${timers.length} 运行中` : '';
 
-    const sortedTimers = [...timers].sort((a, b) => timerStatusRank(a) - timerStatusRank(b) || b.createdAt - a.createdAt);
+    const sortedTimers = timers.toSorted((a, b) => timerStatusRank(a) - timerStatusRank(b) || b.createdAt - a.createdAt);
     const contents = document.createDocumentFragment();
     for (const timer of sortedTimers) {
       const isFatigue = Boolean(timer.fatiguePaused || timer.lastRunStatus === 'fatigue_paused');
@@ -633,26 +746,39 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
 
       const actions = node('div', '', 'timer-actions');
       if (timer.plugin) {
-        actions.append(button('📄 插件详情与调试', () => {
+        const detailBtn = button('📄 插件详情与调试', () => {
           openPluginModal(timer.plugin, true);
-        }, 'mini-button'));
+        }, 'mini-button');
+        detailBtn.dataset.focusKey = `timer-plugin:${timer.id}`;
+        detailBtn.setAttribute('aria-label', `查看 ${timer.name} 关联插件详情与调试`);
+        actions.append(detailBtn);
       }
       if (timer.activeTaskId) {
-        actions.append(button('⚡ 查看执行中工作', () => {
+        const taskBtn = button('⚡ 查看执行中工作', () => {
           hooks.closeAllHubModals();
           hooks.closeSidebar();
           hooks.selectTrace({ type: 'task', id: timer.activeTaskId!, label: timer.name });
           hooks.showPanel(true);
-        }, 'mini-button'));
+        }, 'mini-button');
+        taskBtn.dataset.focusKey = `timer-task:${timer.id}`;
+        taskBtn.setAttribute('aria-label', `查看 ${timer.name} 执行中工作`);
+        actions.append(taskBtn);
       }
       if (timer.goalCondition && !isGoalMet) {
-        const completeBtn = button('🎯 标记达成', () => { void completeTimerFromUi(timer.id); }, 'mini-button');
+        const completeBtn = button('🎯 标记达成', () => { void completeTimerFromUi(timer.id, timer.name); }, 'mini-button');
+        completeBtn.dataset.focusKey = `timer-complete:${timer.id}`;
+        completeBtn.setAttribute('aria-label', `标记定时目标 ${timer.name} 达成`);
         completeBtn.disabled = appState.authExpired || !appState.ready;
         actions.append(completeBtn);
       }
       const toggleLabel = timer.enabled ? '⏸ 暂停' : ((isFatigue || isGoalMet) ? '🔄 重新启用' : '▶️ 启用');
-      const toggleBtn = button(toggleLabel, () => { void toggleTimerFromUi(timer.id, !timer.enabled); }, 'mini-button');
-      const delBtn = button('🗑️ 删除', () => { void removeTimerFromUi(timer.id); }, 'mini-button danger-btn');
+      const toggleBtn = button(toggleLabel, () => { void toggleTimerFromUi(timer.id, !timer.enabled, timer.name); }, 'mini-button');
+      toggleBtn.dataset.focusKey = `timer-toggle:${timer.id}`;
+      toggleBtn.setAttribute('aria-pressed', String(timer.enabled));
+      toggleBtn.setAttribute('aria-label', `${timer.enabled ? '暂停' : '启用'}定时任务 ${timer.name}`);
+      const delBtn = button('🗑️ 删除', () => { void removeTimerFromUi(timer.id, timer.name); }, 'mini-button danger-btn');
+      delBtn.dataset.focusKey = `timer-del:${timer.id}`;
+      delBtn.setAttribute('aria-label', `删除定时任务 ${timer.name}`);
       toggleBtn.disabled = appState.authExpired || !appState.ready;
       delBtn.disabled = appState.authExpired || !appState.ready;
       actions.append(toggleBtn, delBtn);
@@ -704,7 +830,7 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
     if (!timers.length) {
       contents.append(node('p', '暂无定时任务', 'empty hub-empty-state'));
     }
-    timersList.replaceChildren(contents);
+    replaceChildrenPreservingFocus(timersList, contents, () => timerNameInput);
   }
 
   function renderFormattedRunResult(
@@ -731,13 +857,19 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
 
     if (res.data !== undefined) {
       const dataDetails = node('details', '', 'hub-accordion plugin-dev-subdrawer') as HTMLDetailsElement;
+      const pre = node('pre', '', 'hub-code-block');
+      pre.tabIndex = 0;
+      pre.setAttribute('role', 'region');
+      pre.setAttribute('aria-label', `${actionLabel} 结构化响应数据`);
+      pre.append(node('code', json(res.data)));
       dataDetails.append(
         node('summary', '查看原始结构化数据 (JSON)', 'hub-accordion-summary'),
-        node('pre', json(res.data), 'hub-code-block'),
+        pre,
       );
       frag.append(dataDetails);
     }
     container.replaceChildren(frag);
+    announceStatus(`${actionLabel}${res.ok ? '执行成功' : '返回异常'}：${msgText}`, res.ok ? 'polite' : 'assertive');
   }
 
   async function executeQuickCheck(plugin: PluginView): Promise<void> {
@@ -752,19 +884,23 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
         action: 'status',
         args: getPluginQuickCheckArgs(plugin.name),
       });
+      const summary = summarizePluginRunMessage(res.message);
       quickCheckStates.set(plugin.name, {
         busy: false,
         ok: res.ok,
-        summary: summarizePluginRunMessage(res.message),
+        summary,
       });
+      announceStatus(`${getPluginDisplayTitle(plugin)} 快速自检完成：${summary}`, res.ok ? 'polite' : 'assertive');
     } catch (err) {
+      const summary = `自检失败：${errorText(err)}`;
       quickCheckStates.set(plugin.name, {
         busy: false,
         ok: false,
-        summary: `自检失败：${errorText(err)}`,
+        summary,
       });
+      announceStatus(`${getPluginDisplayTitle(plugin)} ${summary}`, 'assertive');
     }
-    if (!pluginHubBackdrop.hidden && activePluginTab === 'catalog' && !detailPluginName) {
+    if (isDialogOpen(pluginHubDialog) && activePluginTab === 'catalog' && !detailPluginName) {
       renderPlugins(true);
     }
   }
@@ -785,6 +921,8 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
   }
 
   function closeCatalogDetail(): void {
+    detailAc?.abort();
+    detailAc = null;
     detailPluginName = undefined;
     detailSubTab = 'overview';
     detailInitialAction = undefined;
@@ -847,6 +985,8 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
       const openBtn = button('打开看板 →', () => {
         switchPluginTab(plugin.name);
       }, 'primary plugin-open-btn');
+      openBtn.dataset.focusKey = `plugin-open:${plugin.name}`;
+      openBtn.setAttribute('aria-label', `打开 ${getPluginDisplayTitle(plugin)} 看板`);
       openBtn.disabled = appState.authExpired || !appState.ready;
       headActions.append(livePill, openBtn);
     } else if (isEnabled && plugin.actions.includes('status')) {
@@ -855,6 +995,8 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
         () => { void executeQuickCheck(plugin); },
         'mini-button plugin-check-btn',
       );
+      checkBtn.dataset.focusKey = `plugin-check:${plugin.name}`;
+      checkBtn.setAttribute('aria-label', `快速自检 ${getPluginDisplayTitle(plugin)}`);
       checkBtn.disabled = Boolean(quickState?.busy) || appState.authExpired || !appState.ready;
       headActions.append(checkBtn);
     } else if (!isEnabled) {
@@ -930,11 +1072,14 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
 
     const footer = node('div', '', 'plugin-card-footer');
     const sourceText = `${plugin.isBuiltin === false ? '自定义插件' : '内置扩展'} · ${formatRuntimeLabel(plugin.runtime)} · ${classified.all.length} 项能力`;
+    const detailBtn = button('查看详情 →', () => {
+      openCatalogDetail(plugin.name, 'overview');
+    }, 'mini-button plugin-detail-trigger');
+    detailBtn.dataset.focusKey = `plugin-detail:${plugin.name}`;
+    detailBtn.setAttribute('aria-label', `查看 ${getPluginDisplayTitle(plugin)} 详情`);
     footer.append(
       node('span', sourceText, 'plugin-card-meta'),
-      button('查看详情 →', () => {
-        openCatalogDetail(plugin.name, 'overview');
-      }, 'mini-button plugin-detail-trigger'),
+      detailBtn,
     );
     card.append(footer);
 
@@ -942,6 +1087,9 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
   }
 
   function renderPluginDetail(): void {
+    detailAc?.abort();
+    detailAc = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const detailSignal = detailAc?.signal ?? signal;
     const plugins = appState.view?.plugins ?? [];
     const timers = appState.view?.timers ?? [];
     const plugin = plugins.find(p => p.name === detailPluginName);
@@ -981,19 +1129,38 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
     const rightGroup = node('div', '', 'plugin-detail-bar-right');
     const subTabs = node('div', '', 'hub-filter-pills');
     subTabs.setAttribute('role', 'tablist');
-    const overviewTabBtn = button('概览与能力', () => {
-      detailSubTab = 'overview';
-      renderPluginDetail();
-    }, `hub-filter-pill${detailSubTab === 'overview' ? ' active' : ''}`);
+    subTabs.setAttribute('aria-label', '插件详情分区');
+    subTabs.setAttribute('focusgroup', 'tablist nomemory');
+
+    const overviewTabBtn = node('button', '概览与能力', `hub-filter-pill${detailSubTab === 'overview' ? ' active' : ''}`);
+    overviewTabBtn.type = 'button';
+    overviewTabBtn.id = 'plugin-detail-tab-overview';
+    overviewTabBtn.dataset.subTab = 'overview';
+    overviewTabBtn.dataset.focusKey = 'detail-subtab:overview';
     overviewTabBtn.setAttribute('role', 'tab');
     overviewTabBtn.setAttribute('aria-selected', String(detailSubTab === 'overview'));
-    const devTabBtn = button('开发者调试与清单', () => {
-      detailSubTab = 'dev';
-      renderPluginDetail();
-    }, `hub-filter-pill${detailSubTab === 'dev' ? ' active' : ''}`);
+    overviewTabBtn.setAttribute('aria-controls', 'plugin-detail-tabpanel');
+
+    const devTabBtn = node('button', '开发者调试与清单', `hub-filter-pill${detailSubTab === 'dev' ? ' active' : ''}`);
+    devTabBtn.type = 'button';
+    devTabBtn.id = 'plugin-detail-tab-dev';
+    devTabBtn.dataset.subTab = 'dev';
+    devTabBtn.dataset.focusKey = 'detail-subtab:dev';
     devTabBtn.setAttribute('role', 'tab');
     devTabBtn.setAttribute('aria-selected', String(detailSubTab === 'dev'));
+    devTabBtn.setAttribute('aria-controls', 'plugin-detail-tabpanel');
+
     subTabs.append(overviewTabBtn, devTabBtn);
+    bindRovingTablist(subTabs, {
+      onActivate: tabEl => {
+        const nextSub = tabEl.dataset.subTab as 'overview' | 'dev' | undefined;
+        if (!nextSub || nextSub === detailSubTab) return;
+        detailSubTab = nextSub;
+        renderPluginDetail();
+      },
+      signal: detailSignal,
+    });
+    syncRovingTablist(subTabs, detailSubTab === 'overview' ? overviewTabBtn : devTabBtn);
     rightGroup.append(subTabs);
 
     if (surfaceEntry && isEnabled) {
@@ -1006,6 +1173,11 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
 
     topBar.append(leftGroup, rightGroup);
     frag.append(topBar);
+
+    const detailPanel = node('div', '', 'plugin-detail-tabpanel');
+    detailPanel.id = 'plugin-detail-tabpanel';
+    detailPanel.setAttribute('role', 'tabpanel');
+    detailPanel.setAttribute('aria-labelledby', detailSubTab === 'overview' ? overviewTabBtn.id : devTabBtn.id);
 
     if (detailSubTab === 'overview') {
       // Structured metadata strip
@@ -1037,7 +1209,7 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
         boundTimers.length ? `已绑定 ${boundTimers.length} 项定时巡检` : '暂未绑定定时巡检',
         boundTimers.length ? 'positive' : 'default',
       );
-      frag.append(metaGrid);
+      detailPanel.append(metaGrid);
 
       // Full human-readable description
       const cleanDesc = cleanPluginText(plugin.description || plugin.promptHint || '');
@@ -1047,7 +1219,7 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
           node('h4', '功能说明', 'plugin-detail-heading'),
           node('p', cleanDesc, 'plugin-detail-prose'),
         );
-        frag.append(descCard);
+        detailPanel.append(descCard);
       }
 
       // Bound timers section
@@ -1072,7 +1244,7 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
           timerList.append(row);
         }
         timerSection.append(timerList);
-        frag.append(timerSection);
+        detailPanel.append(timerSection);
       }
 
       // Shared formatted run result box for Overview quick-run buttons
@@ -1083,8 +1255,9 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
         const row = node('div', '', 'plugin-action-row');
         const info = node('div', '', 'plugin-action-row-main');
         const titleLine = node('div', '', 'hub-card-title-group');
+        const actDisplay = spec.label || resolvePluginActionLabel(classified.all, spec.name);
         titleLine.append(
-          node('strong', spec.label || resolvePluginActionLabel(classified.all, spec.name), 'plugin-action-label'),
+          node('strong', actDisplay, 'plugin-action-label'),
         );
         info.append(titleLine);
         if (spec.description) {
@@ -1109,7 +1282,7 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
               quickRunBtn.textContent = '执行中…';
               overviewRunBox.hidden = false;
               overviewRunBox.replaceChildren(
-                node('p', `正在执行「${spec.label || spec.name}」…`, 'meta'),
+                node('p', `正在执行「${actDisplay}」…`, 'meta'),
               );
               const args = spec.name === 'status'
                 ? { ...(spec.defaultArgs ?? {}), ...getPluginQuickCheckArgs(plugin.name) }
@@ -1122,13 +1295,17 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
                 });
                 renderFormattedRunResult(overviewRunBox, res, classified.all);
               } catch (err) {
-                overviewRunBox.replaceChildren(node('p', `❌ 执行失败：${errorText(err)}`, 'error'));
+                const errMsg = `❌ 执行失败：${errorText(err)}`;
+                overviewRunBox.replaceChildren(node('p', errMsg, 'error'));
+                announceStatus(errMsg, 'assertive');
               } finally {
                 quickRunBtn.disabled = appState.authExpired || !appState.ready;
                 quickRunBtn.textContent = '▶ 运行';
               }
             })();
           }, 'primary mini-button');
+          quickRunBtn.dataset.focusKey = `detail-run:${plugin.name}:${spec.name}`;
+          quickRunBtn.setAttribute('aria-label', `运行 ${actDisplay}`);
           quickRunBtn.disabled = appState.authExpired || !appState.ready;
           rowActions.append(quickRunBtn);
         }
@@ -1137,6 +1314,8 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
           detailInitialAction = spec.name;
           renderPluginDetail();
         }, 'mini-button');
+        debugBtn.dataset.focusKey = `detail-dbg:${plugin.name}:${spec.name}`;
+        debugBtn.setAttribute('aria-label', `调试 ${actDisplay} 参数`);
         rowActions.append(debugBtn);
 
         row.append(info, rowActions);
@@ -1152,7 +1331,7 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
         primaryList.append(buildActionRow(spec));
       }
       primarySection.append(primaryList, overviewRunBox);
-      frag.append(primarySection);
+      detailPanel.append(primarySection);
 
       if (classified.management.length) {
         const mgmtDetails = node('details', '', 'hub-accordion plugin-mgmt-accordion') as HTMLDetailsElement;
@@ -1164,12 +1343,13 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
           mgmtBody.append(buildActionRow(spec));
         }
         mgmtDetails.append(mgmtBody);
-        frag.append(mgmtDetails);
+        detailPanel.append(mgmtDetails);
       }
     } else {
       // Developer Debug & Raw Manifest sub-tab
       const specs = getPluginSpecs(plugin);
-      const runnerWrap = node('div', '', 'hub-form-card plugin-dev-runner');
+      const runnerWrap = node('form', '', 'hub-form-card plugin-dev-runner') as HTMLFormElement;
+      runnerWrap.noValidate = true;
       runnerWrap.append(
         node('strong', '动作与自定义参数调试台', 'hub-card-title'),
         node(
@@ -1191,18 +1371,27 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
       argsInput.placeholder = '执行参数 JSON 对象，例如 {} 或 {"refresh":true}';
 
       const specHint = node('p', '', 'meta plugin-dev-spec-hint');
-      const cmdPreview = node('div', '', 'hub-code-block meta');
+      const cmdPreviewRow = node('div', '', 'hub-endpoint-row');
+      const cmdPreview = node('code', '', 'hub-endpoint-code');
+      const copyCmdStatus = node('span', '', 'visually-hidden');
+      copyCmdStatus.setAttribute('role', 'status');
+      const copyCmdBtn = button('📋 复制命令', () => {
+        void copyTextWithFeedback(copyCmdBtn, cmdPreview.textContent ?? '', { statusEl: copyCmdStatus });
+      }, 'mini-button copy-mini-btn');
+      copyCmdBtn.setAttribute('aria-label', '复制 CLI 调试命令');
+      cmdPreviewRow.append(cmdPreview, copyCmdBtn, copyCmdStatus);
 
       const syncCmdPreview = () => {
         const act = actionSelect.value || 'status';
         const rawArgs = argsInput.value.trim() || '{}';
-        cmdPreview.textContent = `$ friday plugin run ${plugin.name} ${act} '${rawArgs}'`;
+        cmdPreview.textContent = `friday plugin run ${plugin.name} ${act} '${rawArgs}'`;
       };
 
       const selectSpec = (specName: string) => {
         actionSelect.value = specName;
         const matched = specs.find(s => s.name === specName);
         argsInput.value = JSON.stringify(matched?.defaultArgs ?? {});
+        argsInput.setAttribute('aria-invalid', 'false');
         specHint.textContent = matched?.description ? cleanPluginText(matched.description) : '无附加参数说明';
         syncCmdPreview();
       };
@@ -1213,10 +1402,13 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
       const argsField = node('label', '', 'hub-field hub-field-wide');
       argsField.append(node('span', '调试参数 (JSON 对象)'), argsInput);
       controlsRow.append(actField, argsField);
-      runnerWrap.append(controlsRow, specHint, cmdPreview);
+      runnerWrap.append(controlsRow, specHint, cmdPreviewRow);
 
       actionSelect.addEventListener('change', () => selectSpec(actionSelect.value));
-      argsInput.addEventListener('input', syncCmdPreview);
+      argsInput.addEventListener('input', () => {
+        argsInput.setAttribute('aria-invalid', 'false');
+        syncCmdPreview();
+      });
       const initialSpecName = (detailInitialAction && specs.some(s => s.name === detailInitialAction))
         ? detailInitialAction
         : (specs[0]?.name ?? 'status');
@@ -1226,8 +1418,12 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
       runResultBox.hidden = true;
 
       const runActionsRow = node('div', '', 'hub-form-actions');
-      const runBtn = button('▶ 立即运行该动作', () => {
+      const runBtn = node('button', '▶ 立即运行该动作', 'primary mini-button');
+      runBtn.type = 'submit';
+      runBtn.disabled = !isEnabled || appState.authExpired || !appState.ready;
+      const runDevAction = () => {
         void (async () => {
+          if (!isEnabled || appState.authExpired || !appState.ready) return;
           let parsedArgs: Record<string, unknown> = {};
           const raw = argsInput.value.trim();
           if (raw) {
@@ -1237,9 +1433,14 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
                 throw new Error('参数必须是 JSON 对象');
               }
               parsedArgs = parsed as Record<string, unknown>;
+              argsInput.setAttribute('aria-invalid', 'false');
             } catch (err) {
+              const errMsg = `❌ 参数 JSON 解析失败：${errorText(err)}`;
+              argsInput.setAttribute('aria-invalid', 'true');
               runResultBox.hidden = false;
-              runResultBox.replaceChildren(node('p', `❌ 参数 JSON 解析失败：${errorText(err)}`, 'error'));
+              runResultBox.replaceChildren(node('p', errMsg, 'error'));
+              announceStatus(errMsg, 'assertive');
+              safeFocus(argsInput);
               return;
             }
           }
@@ -1255,32 +1456,40 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
             });
             renderFormattedRunResult(runResultBox, res, specs);
           } catch (err) {
-            runResultBox.replaceChildren(node('p', `❌ 执行失败：${errorText(err)}`, 'error'));
+            const errMsg = `❌ 执行失败：${errorText(err)}`;
+            runResultBox.replaceChildren(node('p', errMsg, 'error'));
+            announceStatus(errMsg, 'assertive');
           } finally {
             runBtn.disabled = !isEnabled || appState.authExpired || !appState.ready;
             runBtn.textContent = '▶ 立即运行该动作';
           }
         })();
-      }, 'primary mini-button');
-      runBtn.disabled = !isEnabled || appState.authExpired || !appState.ready;
+      };
+      wireHubForm(runnerWrap, runBtn, runDevAction, detailSignal);
       runActionsRow.append(runBtn);
       if (!isEnabled) {
         runActionsRow.append(node('span', `当前不可执行：${statusInfo.detail}`, 'meta'));
       }
       runnerWrap.append(runActionsRow, runResultBox);
-      frag.append(runnerWrap);
+      detailPanel.append(runnerWrap);
 
       if (plugin.manifestJson) {
         const manifestDetails = node('details', '', 'hub-accordion plugin-dev-subdrawer') as HTMLDetailsElement;
+        const manifestPre = node('pre', '', 'hub-code-block');
+        manifestPre.tabIndex = 0;
+        manifestPre.setAttribute('role', 'region');
+        manifestPre.setAttribute('aria-label', `${plugin.name} 原始清单 plugin.json`);
+        manifestPre.append(node('code', plugin.manifestJson));
         manifestDetails.append(
           node('summary', '查看原始插件清单配置 (plugin.json)', 'hub-accordion-summary'),
-          node('pre', plugin.manifestJson, 'hub-code-block'),
+          manifestPre,
         );
-        frag.append(manifestDetails);
+        detailPanel.append(manifestDetails);
       }
     }
 
-    pluginCatalogDetail.replaceChildren(frag);
+    frag.append(detailPanel);
+    replaceChildrenPreservingFocus(pluginCatalogDetail, frag);
   }
 
   function syncCatalogFilterButtons(counts: {
@@ -1303,7 +1512,7 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
       btn.textContent = labels[key];
       const active = key === catalogFilter;
       btn.classList.toggle('active', active);
-      btn.setAttribute('aria-selected', String(active));
+      btn.setAttribute('aria-pressed', String(active));
     }
   }
 
@@ -1321,7 +1530,11 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
     pluginCatalogBadge.textContent = countText;
     pluginTabCatalog.title = `插件目录 · 共 ${plugins.length} 个`;
 
-    if ((pluginHubBackdrop.hidden || activePluginTab !== 'catalog') && !force) {
+    for (const entry of surfaces) {
+      syncSurfaceBadgeMeta(entry);
+    }
+
+    if ((!isDialogOpen(pluginHubDialog) || activePluginTab !== 'catalog') && !force) {
       return;
     }
 
@@ -1388,6 +1601,7 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
           catalogQuery = '';
           pluginCatalogSearch.value = '';
           renderPlugins(true);
+          safeFocus(pluginCatalogSearch);
         }, 'mini-button'),
       );
       contents.append(emptyBox);
@@ -1426,17 +1640,20 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
       contents.append(flatGrid);
     }
 
-    pluginsList.replaceChildren(contents);
+    replaceChildrenPreservingFocus(pluginsList, contents, () => pluginCatalogSearch);
   }
 
   function openTimerModal() {
-    hooks.closeAllHubModals();
-    timerHubBackdrop.hidden = false;
+    if (!isDialogOpen(timerHubDialog)) {
+      hooks.closeAllHubModals();
+      openModalDialog(timerHubDialog);
+    }
     renderTimers(true);
+    safeFocus(timerModalClose);
   }
 
   function closeTimerModal() {
-    timerHubBackdrop.hidden = true;
+    closeModalDialog(timerHubDialog);
   }
 
   function openPluginModal(
@@ -1444,8 +1661,10 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
     expandSource = false,
     mode: 'catalog' | 'surface' = 'catalog',
   ) {
-    hooks.closeAllHubModals();
-    pluginHubBackdrop.hidden = false;
+    if (!isDialogOpen(pluginHubDialog)) {
+      hooks.closeAllHubModals();
+      openModalDialog(pluginHubDialog);
+    }
     applySidebarOrder();
     applySidebarCollapsed(resolveEffectiveCollapsed());
     setMobileNavOpen(false);
@@ -1467,18 +1686,28 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
       switchPluginTab(activePluginTab);
     }
     refreshEnabledBadges();
+    const activeTabBtn = activePluginTab === 'catalog'
+      ? pluginTabCatalog
+      : (surfaceByName.get(activePluginTab)?.tabEl ?? pluginTabCatalog);
+    safeFocus(activeTabBtn);
   }
 
-  function closePluginModal() {
+  function handlePluginDialogClosed() {
+    detailAc?.abort();
+    detailAc = null;
     tabSwitchSeq++;
-    if (resizeDispatchTimer !== undefined) {
-      clearTimeout(resizeDispatchTimer);
-      resizeDispatchTimer = undefined;
+    if (searchDebounceTimer !== undefined) {
+      clearTimeout(searchDebounceTimer);
+      searchDebounceTimer = undefined;
     }
     resetNavDragState();
     deactivateActiveSurface();
     setMobileNavOpen(false);
-    pluginHubBackdrop.hidden = true;
+  }
+
+  function closePluginModal() {
+    handlePluginDialogClosed();
+    closeModalDialog(pluginHubDialog);
   }
 
   function syncPluginSurfaces(opts: {
@@ -1492,9 +1721,10 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
       if (!enabled) {
         surfaceBadgeSynced.delete(entry.reg.pluginName);
         if (activePluginTab === entry.reg.pluginName) {
-          if (pluginHubBackdrop.hidden) {
+          if (!isDialogOpen(pluginHubDialog)) {
             deactivateActiveSurface();
             activePluginTab = 'catalog';
+            syncPluginTabElements();
           } else {
             switchPluginTab('catalog');
           }
@@ -1509,14 +1739,16 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
         surfaceBadgeSynced.delete(entry.reg.pluginName);
       }
 
-      if (!pluginHubBackdrop.hidden && !appState.authExpired && !surfaceBadgeSynced.has(entry.reg.pluginName)) {
+      if (isDialogOpen(pluginHubDialog) && !appState.authExpired && !surfaceBadgeSynced.has(entry.reg.pluginName)) {
         surfaceBadgeSynced.add(entry.reg.pluginName);
         void loadSurfaceController(entry.reg)
-          .then(ctrl => ctrl.refreshBadge())
+          .then(ctrl => ctrl.refreshBadge(signal))
+          .then(() => syncSurfaceBadgeMeta(entry))
           .catch(() => {
             surfaceBadgeSynced.delete(entry.reg.pluginName);
           });
       }
+      syncSurfaceBadgeMeta(entry);
     }
     applySidebarOrder();
   }
@@ -1590,7 +1822,7 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
     suppressClickUntil = Date.now() + 160;
     if (target && target !== dragged) {
       const base = [...new Set([...pluginOrder, ...defaultSurfaceOrder])];
-      commitPluginOrder(reorderPluginList(base, dragged, target, pos));
+      commitPluginOrder(reorderPluginList(base, dragged, target, pos), dragged);
     }
   });
 
@@ -1661,7 +1893,7 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
     suppressClickUntil = Date.now() + 160;
     if (commit && target && target !== dragged) {
       const base = [...new Set([...pluginOrder, ...defaultSurfaceOrder])];
-      commitPluginOrder(reorderPluginList(base, dragged, target, pos));
+      commitPluginOrder(reorderPluginList(base, dragged, target, pos), dragged);
     }
   };
 
@@ -1673,26 +1905,39 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
   });
 
   // Keyboard accessibility: Alt + ArrowUp / ArrowDown reorders focused plugin tab
+  const pluginReorderHint = node('span', '可用 Alt 加向上或向下方向键调整专属看板顺序', 'visually-hidden');
+  pluginReorderHint.id = 'plugin-nav-reorder-hint';
+  pluginSurfaceTabs.parentElement?.append(pluginReorderHint);
+  pluginSurfaceTabs.setAttribute('aria-describedby', 'plugin-nav-reorder-hint');
+
   pluginNavSortable.addEventListener('keydown', event => {
     if (!event.altKey || (event.key !== 'ArrowUp' && event.key !== 'ArrowDown')) return;
     const item = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('.plugin-nav-item[data-plugin-tab]');
     const name = item?.dataset.pluginTab;
     if (!item || !name) return;
     event.preventDefault();
+    event.stopPropagation();
     const visibleNames = surfaces.filter(s => !s.tabEl.hidden).map(s => s.reg.pluginName);
     const delta: -1 | 1 = event.key === 'ArrowUp' ? -1 : 1;
     const next = movePluginStep([...new Set([...pluginOrder, ...defaultSurfaceOrder])], visibleNames, name, delta);
-    commitPluginOrder(next);
-    item.focus();
+    commitPluginOrder(next, name);
+    safeFocus(item);
   });
 
   // ---- Event Wiring ----
-  openTimerHubTop.addEventListener('click', openTimerModal);
-  timerModalClose.addEventListener('click', closeTimerModal);
-  timerHubBackdrop.addEventListener('click', event => {
-    if (event.target === timerHubBackdrop) closeTimerModal();
-  });
-  timerSaveBtn.addEventListener('click', () => { void addTimerFromUi(); });
+  const listenerOpts = signal ? { signal } : undefined;
+  bindDialogLightDismiss(timerHubDialog, undefined, signal);
+  bindDialogLightDismiss(pluginHubDialog, handlePluginDialogClosed, signal);
+  pluginHubDialog.addEventListener('cancel', event => {
+    if (pluginShell.classList.contains('is-mobile-nav-open')) {
+      event.preventDefault();
+      setMobileNavOpen(false, true);
+    }
+  }, listenerOpts);
+
+  openTimerHubTop.addEventListener('click', openTimerModal, listenerOpts);
+  timerModalClose.addEventListener('click', closeTimerModal, listenerOpts);
+  wireHubForm(timerComposeForm, timerSaveBtn, () => { void addTimerFromUi(); }, signal);
   timerPresetBar.addEventListener('click', event => {
     const chip = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-timer-name]');
     if (!chip) return;
@@ -1707,101 +1952,149 @@ export function initTimerPluginHub(options: TimerPluginHubOptions = {}): TimerPl
     timerOnceInput.checked = chip.dataset.timerOnce === 'true';
     timerMaxFailuresInput.value = chip.dataset.timerMaxFailures ?? '5';
     timerInstructionInput.value = chip.dataset.timerCmd ?? '';
+    setInlineFormError(
+      timerComposeErrorEl,
+      undefined,
+      [timerNameInput, timerInstructionInput, timerDailyInput, timerIntervalInput, timerOnceInput, timerGoalInput],
+    );
     timerAddDetails.open = true;
-    timerInstructionInput.focus();
-  });
-  timerHubBackdrop.addEventListener('click', event => {
+    safeFocus(timerInstructionInput);
+  }, listenerOpts);
+  (timerComposeForm ?? timerHubDialog).addEventListener('click', event => {
     const quickBtn = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-interval-sec]');
     if (!quickBtn) return;
     timerIntervalInput.value = quickBtn.dataset.intervalSec ?? '300';
-  });
+    timerIntervalInput.setAttribute('aria-invalid', 'false');
+  }, listenerOpts);
 
-  openPluginHubTop.addEventListener('click', () => openPluginModal());
-  pluginModalClose.addEventListener('click', closePluginModal);
-  pluginHubBackdrop.addEventListener('click', event => {
-    if (event.target === pluginHubBackdrop) closePluginModal();
-  });
+  openPluginHubTop.addEventListener('click', () => openPluginModal(), listenerOpts);
+  pluginModalClose.addEventListener('click', closePluginModal, listenerOpts);
   pluginSidebarToggle.addEventListener('click', () => {
     if (isMobileViewport()) {
-      setMobileNavOpen(false);
+      setMobileNavOpen(false, true);
       return;
     }
     const next = !resolveEffectiveCollapsed();
     userCollapsedPref = next;
     writeSidebarCollapsed(next);
     prefsSync.broadcastCollapsed(next);
-    applySidebarCollapsed(next, true);
-  });
+    applySidebarCollapsed(next);
+  }, listenerOpts);
   pluginMobileNavBtn.addEventListener('click', () => {
     const open = !pluginShell.classList.contains('is-mobile-nav-open');
-    setMobileNavOpen(open);
-  });
+    setMobileNavOpen(open, !open);
+  }, listenerOpts);
   pluginSidebarScrim.addEventListener('click', () => {
-    setMobileNavOpen(false);
-  });
+    setMobileNavOpen(false, true);
+  }, listenerOpts);
   pluginOrderResetBtn.addEventListener('click', () => {
     clearPluginOrder();
     pluginOrder = [];
     prefsSync.broadcastOrder([]);
-    applySidebarOrder();
-    if (!pluginHubBackdrop.hidden && activePluginTab === 'catalog' && !detailPluginName) {
+    applySidebarOrder(true);
+    announceStatus('已恢复插件默认展示顺序', 'polite');
+    if (isDialogOpen(pluginHubDialog) && activePluginTab === 'catalog' && !detailPluginName) {
       renderPlugins(true);
     }
-  });
-  pluginSurfaceTabs.addEventListener('click', event => {
-    if (Date.now() < suppressClickUntil) return;
-    const tabBtn = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-plugin-tab]');
-    const nextTab = tabBtn?.dataset.pluginTab;
-    if (!nextTab) return;
-    if (nextTab === 'catalog' && activePluginTab === 'catalog' && detailPluginName) {
-      closeCatalogDetail();
-      setMobileNavOpen(false);
-      return;
-    }
-    if (nextTab === activePluginTab) {
-      setMobileNavOpen(false);
-      return;
-    }
-    if (nextTab !== 'catalog') {
-      detailPluginName = undefined;
-      pluginCatalogDetail.hidden = true;
-      pluginCatalogHome.hidden = false;
-    }
-    switchPluginTab(nextTab);
+  }, listenerOpts);
+
+  bindRovingTablist(pluginSurfaceTabs, {
+    onActivate: tabEl => {
+      if (Date.now() < suppressClickUntil) {
+        syncPluginTabElements();
+        return;
+      }
+      const nextTab = tabEl.dataset.pluginTab;
+      if (!nextTab) return;
+      if (nextTab === 'catalog' && activePluginTab === 'catalog' && detailPluginName) {
+        closeCatalogDetail();
+        setMobileNavOpen(false);
+        return;
+      }
+      if (nextTab === activePluginTab) {
+        setMobileNavOpen(false);
+        return;
+      }
+      if (nextTab !== 'catalog') {
+        detailPluginName = undefined;
+        pluginCatalogDetail.hidden = true;
+        pluginCatalogHome.hidden = false;
+      }
+      switchPluginTab(nextTab);
+    },
+    signal,
   });
 
-  pluginCatalogSearch.addEventListener('input', () => {
+  pluginCatalogSearch.addEventListener('input', event => {
     catalogQuery = pluginCatalogSearch.value;
+    if ((event as { isComposing?: boolean }).isComposing) return;
+    if (searchDebounceTimer !== undefined) clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = setTimeout(() => {
+      searchDebounceTimer = undefined;
+      renderPlugins(true);
+    }, 150);
+  }, listenerOpts);
+  pluginCatalogSearch.addEventListener('search', () => {
+    catalogQuery = pluginCatalogSearch.value;
+    if (searchDebounceTimer !== undefined) {
+      clearTimeout(searchDebounceTimer);
+      searchDebounceTimer = undefined;
+    }
     renderPlugins(true);
-  });
+  }, listenerOpts);
+  pluginCatalogSearch.addEventListener('keydown', event => {
+    if (event.key === 'Enter' && !isImeComposing(event)) {
+      event.preventDefault();
+      catalogQuery = pluginCatalogSearch.value;
+      if (searchDebounceTimer !== undefined) {
+        clearTimeout(searchDebounceTimer);
+        searchDebounceTimer = undefined;
+      }
+      renderPlugins(true);
+    }
+  }, listenerOpts);
   pluginCatalogFilters.addEventListener('click', event => {
     const btn = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-catalog-filter]');
     const nextFilter = btn?.dataset.catalogFilter as PluginCatalogFilter | undefined;
     if (!nextFilter || nextFilter === catalogFilter) return;
     catalogFilter = nextFilter;
     renderPlugins(true);
-  });
+  }, listenerOpts);
 
   if (typeof window !== 'undefined') {
     window.addEventListener('resize', () => {
-      if (pluginHubBackdrop.hidden) return;
+      if (!isDialogOpen(pluginHubDialog)) return;
       if (!isMobileViewport() && pluginShell.classList.contains('is-mobile-nav-open')) {
         setMobileNavOpen(false);
       }
       applySidebarCollapsed(resolveEffectiveCollapsed());
-    });
+    }, listenerOpts);
     window.addEventListener('pagehide', () => {
-      if (resizeDispatchTimer !== undefined) {
-        clearTimeout(resizeDispatchTimer);
-        resizeDispatchTimer = undefined;
+      if (searchDebounceTimer !== undefined) {
+        clearTimeout(searchDebounceTimer);
+        searchDebounceTimer = undefined;
       }
+      for (const ac of surfaceAbortControllers.values()) ac.abort();
+      surfaceAbortControllers.clear();
+      for (const ctrl of surfaceControllers.values()) {
+        ctrl.deactivate();
+        ctrl.dispose?.();
+      }
+      surfaceControllers.clear();
+      surfaceLoadPromises.clear();
+      activeSurfaceCtrl = undefined;
+      activeSurfaceName = undefined;
+      detailAc?.abort();
+      detailAc = null;
       prefsSync.close();
-    });
+      lifecycleAc?.abort();
+    }, listenerOpts);
   }
 
   // Initial DOM alignment
   applySidebarOrder();
   applySidebarCollapsed(resolveEffectiveCollapsed());
+  syncPluginTabElements();
 
   return {
     openTimerModal,

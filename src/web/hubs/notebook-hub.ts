@@ -12,6 +12,17 @@ import { BOT_EXPRESSION_META } from '../shared/bot-expressions.js';
 import { button, element, isEditingWithin, node } from '../shared/dom.js';
 import { errorText, timestamp } from '../shared/format.js';
 import { renderMarkdownContent, type MarkdownRenderOptions } from '../shared/markdown.js';
+import { isDocumentHidden, replaceChildrenPreservingFocus } from '../shared/plugin-catalog.js';
+import {
+  announceStatus,
+  bindDialogLightDismiss,
+  closeModalDialog,
+  confirmAction,
+  isDialogOpen,
+  openModalDialog,
+  safeFocus,
+  syncRovingTablist,
+} from '../shared/ui-primitives.js';
 import { api, appState, hooks } from '../state.js';
 
 export type NotebookTab = 'notes' | 'diary';
@@ -36,6 +47,10 @@ interface DiaryListApiResponse {
 }
 
 const NOTEBOOK_SYNC_CHANNEL = 'friday.notebook-sync';
+
+const zhTagCollator = typeof Intl !== 'undefined'
+  ? new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' })
+  : null;
 
 const DIARY_MOOD_OPTIONS: ReadonlyArray<{ id: DiaryMood | 'all'; label: string }> = [
   { id: 'all', label: '全部' },
@@ -100,10 +115,10 @@ function preferredEditMode(): NoteViewMode {
 }
 
 export function initNotebookHub(): NotebookHubController {
-  const openNotebookHubTop = element<HTMLButtonElement>('open-notebook-hub-top');
-  const notebookTopBadge = element<HTMLElement>('notebook-top-badge');
-  const notebookHubBackdrop = element<HTMLElement>('notebook-hub-backdrop');
-  const notebookModalClose = element<HTMLButtonElement>('notebook-modal-close');
+  const memoryHubDialog = element<HTMLElement>('memory-hub-dialog');
+  const memoryHubTabs = (typeof document !== 'undefined' ? document.getElementById('memory-hub-tabs') : null) as HTMLElement | null;
+  const memoryTabMatrix = (typeof document !== 'undefined' ? document.getElementById('memory-tab-matrix') : null) as HTMLButtonElement | null;
+  const memoryPanelMatrix = (typeof document !== 'undefined' ? document.getElementById('memory-panel-matrix') : null) as HTMLElement | null;
   const notebookRoleHint = element<HTMLElement>('notebook-role-hint');
   const tabNotesBtn = element<HTMLButtonElement>('notebook-tab-notes');
   const tabDiaryBtn = element<HTMLButtonElement>('notebook-tab-diary');
@@ -156,6 +171,16 @@ export function initNotebookHub(): NotebookHubController {
   const diaryPromoteBtn = element<HTMLButtonElement>('diary-promote-btn');
   const diaryDeleteBtn = element<HTMLButtonElement>('diary-delete-btn');
 
+  const diaryStatusEl = node('span', '', 'meta');
+  diaryStatusEl.id = 'diary-action-status';
+  diaryStatusEl.hidden = true;
+  diaryPromoteBtn.parentElement?.insertBefore(diaryStatusEl, diaryPromoteBtn);
+
+  const lifecycleAc = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const signal = lifecycleAc?.signal;
+  let notesLoadAc: AbortController | null = null;
+  let diaryLoadAc: AbortController | null = null;
+
   const markdownOpts: MarkdownRenderOptions = {
     createEmote: expr => {
       const wrap = node('span', '', 'bot-inline-emote');
@@ -172,6 +197,7 @@ export function initNotebookHub(): NotebookHubController {
   };
 
   let activeTab: NotebookTab = 'notes';
+  let suppressingExternalTabSync = false;
   let lastSummarySig = '';
   let loadedNotesSig = '';
   let loadedDiarySig = '';
@@ -195,10 +221,9 @@ export function initNotebookHub(): NotebookHubController {
   let noteEditRev = 0;
   let editorContextSeq = 0;
   let autoSaveTimer: ReturnType<typeof setTimeout> | undefined;
+  let previewDebounceTimer: ReturnType<typeof setTimeout> | undefined;
   let searchDebounceTimer: ReturnType<typeof setTimeout> | undefined;
   let noteLoadToken = 0;
-  let confirmDeleteNoteTimer: ReturnType<typeof setTimeout> | undefined;
-  let armedDeleteNoteId: string | undefined;
   let suppressingInputSync = false;
 
   // Diary state
@@ -208,8 +233,6 @@ export function initNotebookHub(): NotebookHubController {
   let selectedDiaryId: string | undefined;
   let diarySearchTimer: ReturnType<typeof setTimeout> | undefined;
   let diaryLoadToken = 0;
-  let confirmDeleteDiaryTimer: ReturnType<typeof setTimeout> | undefined;
-  let armedDeleteDiaryId: string | undefined;
 
   let syncChannel: BroadcastChannel | undefined;
   try {
@@ -233,33 +256,38 @@ export function initNotebookHub(): NotebookHubController {
     const noteCount = summary?.noteCount ?? 0;
     const diaryCount = summary?.diaryCount ?? 0;
     const pinnedCount = summary?.pinnedNoteCount ?? 0;
-    notebookTopBadge.textContent = String(noteCount + diaryCount);
     notesTabBadge.textContent = String(noteCount);
     diaryTabBadge.textContent = String(diaryCount);
-    openNotebookHubTop.title = `笔记与日记 · 记事本 ${noteCount} 篇（置顶 ${pinnedCount}）· F.R.I.D.A.Y. 日记 ${diaryCount} 篇`;
+    tabNotesBtn.title = `记事本 ${noteCount} 篇（置顶 ${pinnedCount}）`;
+    tabDiaryBtn.title = `F.R.I.D.A.Y. 日记 ${diaryCount} 篇`;
   }
 
-  function setSaveStatus(label: string, tone: 'slate' | 'amber' | 'green' | 'red' = 'slate'): void {
+  function setSaveStatus(label: string, tone: 'slate' | 'amber' | 'green' | 'red' = 'slate', announce = false): void {
     noteSaveStatusEl.textContent = label;
     noteSaveStatusEl.className = `hub-status-pill badge-${tone}`;
+    if (announce) {
+      announceStatus(label, tone === 'red' ? 'assertive' : 'polite');
+    }
   }
 
-  function clearDeleteArming(): void {
-    if (confirmDeleteNoteTimer) {
-      clearTimeout(confirmDeleteNoteTimer);
-      confirmDeleteNoteTimer = undefined;
+  function setDiaryStatus(label?: string, tone: 'meta' | 'error' = 'meta'): void {
+    if (!label) {
+      diaryStatusEl.hidden = true;
+      diaryStatusEl.textContent = '';
+      diaryStatusEl.className = 'meta';
+      return;
     }
-    armedDeleteNoteId = undefined;
-    noteDeleteBtn.textContent = '删除';
+    diaryStatusEl.hidden = false;
+    diaryStatusEl.textContent = label;
+    diaryStatusEl.className = tone;
+    announceStatus(label, tone === 'error' ? 'assertive' : 'polite');
   }
 
-  function clearDiaryDeleteArming(): void {
-    if (confirmDeleteDiaryTimer) {
-      clearTimeout(confirmDeleteDiaryTimer);
-      confirmDeleteDiaryTimer = undefined;
+  function clearPreviewTimer(): void {
+    if (previewDebounceTimer) {
+      clearTimeout(previewDebounceTimer);
+      previewDebounceTimer = undefined;
     }
-    armedDeleteDiaryId = undefined;
-    diaryDeleteBtn.textContent = '删除';
   }
 
   function updateConflictBanner(): void {
@@ -268,10 +296,14 @@ export function initNotebookHub(): NotebookHubController {
 
   function syncNoteModeUI(): void {
     noteModePreviewBtn.classList.toggle('active', noteMode === 'preview');
+    noteModePreviewBtn.setAttribute('aria-pressed', String(noteMode === 'preview'));
     noteModeEditBtn.classList.toggle('active', noteMode === 'edit');
+    noteModeEditBtn.setAttribute('aria-pressed', String(noteMode === 'edit'));
     noteModeSplitBtn.classList.toggle('active', noteMode === 'split');
+    noteModeSplitBtn.setAttribute('aria-pressed', String(noteMode === 'split'));
     noteEditorBodyEl.className = `note-editor-body is-mode-${noteMode}`;
     noteMdToolbarEl.hidden = noteMode === 'preview';
+    clearPreviewTimer();
     if (noteMode !== 'edit') {
       renderNotePreview();
     }
@@ -296,16 +328,19 @@ export function initNotebookHub(): NotebookHubController {
     if (note) {
       notePinBtn.textContent = note.pinned ? '★ 已置顶' : '☆ 置顶';
       notePinBtn.classList.toggle('active', note.pinned);
+      notePinBtn.setAttribute('aria-pressed', String(note.pinned));
       notePromoteBtn.textContent = note.promotedMemoryId ? '🧠 同步更新记忆' : '🧠 转存记忆';
     } else {
       notePinBtn.textContent = '☆ 置顶';
       notePinBtn.classList.remove('active');
+      notePinBtn.setAttribute('aria-pressed', 'false');
       notePromoteBtn.textContent = '🧠 转存记忆';
     }
   }
 
   function populateNoteEditor(note: NoteItem, options?: { mode?: NoteViewMode }): void {
     ++editorContextSeq;
+    clearPreviewTimer();
     suppressingInputSync = true;
     try {
       selectedNoteId = note.id;
@@ -325,7 +360,6 @@ export function initNotebookHub(): NotebookHubController {
       if (options?.mode) noteMode = options.mode;
       noteEmptyStateEl.hidden = true;
       noteWorkspaceEl.hidden = false;
-      clearDeleteArming();
       updateConflictBanner();
       syncWorkspaceButtons(note);
       syncNoteModeUI();
@@ -337,6 +371,7 @@ export function initNotebookHub(): NotebookHubController {
 
   function startNewNoteDraft(): void {
     ++editorContextSeq;
+    clearPreviewTimer();
     if (autoSaveTimer) {
       clearTimeout(autoSaveTimer);
       autoSaveTimer = undefined;
@@ -358,17 +393,17 @@ export function initNotebookHub(): NotebookHubController {
     noteMode = preferredEditMode();
     noteEmptyStateEl.hidden = true;
     noteWorkspaceEl.hidden = false;
-    clearDeleteArming();
     updateConflictBanner();
     syncWorkspaceButtons(undefined);
     syncNoteModeUI();
     setSaveStatus('草稿', 'slate');
     renderNotesList();
-    noteTitleInput.focus();
+    safeFocus(noteTitleInput);
   }
 
   function clearNoteWorkspace(): void {
     ++editorContextSeq;
+    clearPreviewTimer();
     if (autoSaveTimer) {
       clearTimeout(autoSaveTimer);
       autoSaveTimer = undefined;
@@ -380,7 +415,6 @@ export function initNotebookHub(): NotebookHubController {
     pendingRemoteNote = undefined;
     noteWorkspaceEl.hidden = true;
     noteEmptyStateEl.hidden = false;
-    clearDeleteArming();
     updateConflictBanner();
   }
 
@@ -393,38 +427,47 @@ export function initNotebookHub(): NotebookHubController {
     noteTagChipsEl.hidden = false;
     const chips: HTMLElement[] = [];
     if (noteFilterTag) {
-      chips.push(button('✕ 清除标签', () => {
+      const clearBtn = button('✕ 清除标签', () => {
         noteFilterTag = '';
         void (async () => {
           if (noteDirty && !pendingRemoteNote) await flushPendingSave();
           await loadNotes(true);
         })();
-      }, 'hub-filter-pill'));
+      }, 'hub-filter-pill');
+      clearBtn.dataset.focusKey = 'note-tag:__clear__';
+      chips.push(clearBtn);
     }
     for (const item of noteTags.slice(0, 12)) {
+      const active = noteFilterTag.toLowerCase() === item.tag.toLowerCase();
       const btn = button(`#${item.tag} (${item.count})`, () => {
-        noteFilterTag = noteFilterTag.toLowerCase() === item.tag.toLowerCase() ? '' : item.tag;
+        noteFilterTag = active ? '' : item.tag;
         void (async () => {
           if (noteDirty && !pendingRemoteNote) await flushPendingSave();
           await loadNotes(true);
         })();
-      }, `hub-filter-pill${noteFilterTag.toLowerCase() === item.tag.toLowerCase() ? ' active' : ''}`);
+      }, `hub-filter-pill${active ? ' active' : ''}`);
+      btn.dataset.focusKey = `note-tag:${item.tag.toLowerCase()}`;
+      btn.setAttribute('aria-pressed', String(active));
       chips.push(btn);
     }
-    noteTagChipsEl.replaceChildren(...chips);
+    replaceChildrenPreservingFocus(noteTagChipsEl, chips, () => noteSearchInput);
   }
 
   function renderNotesList(): void {
     noteFilterAllBtn.classList.toggle('active', !noteFilterPinnedOnly);
+    noteFilterAllBtn.setAttribute('aria-pressed', String(!noteFilterPinnedOnly));
     noteFilterPinnedBtn.classList.toggle('active', noteFilterPinnedOnly);
+    noteFilterPinnedBtn.setAttribute('aria-pressed', String(noteFilterPinnedOnly));
 
     if (!notes.length) {
-      noteListEl.replaceChildren(
+      replaceChildrenPreservingFocus(
+        noteListEl,
         node(
           'p',
           noteQuery || noteFilterPinnedOnly || noteFilterTag ? '没有匹配的笔记。' : '暂无记事，可让 F.R.I.D.A.Y. 帮你记录或点击新建。',
           'empty',
         ),
+        () => noteNewBtn,
       );
       return;
     }
@@ -435,6 +478,8 @@ export function initNotebookHub(): NotebookHubController {
       card.type = 'button';
       card.className = `notebook-list-item${isSelected ? ' active' : ''}`;
       card.dataset.noteId = item.id;
+      card.dataset.focusKey = `note-item:${item.id}`;
+      card.setAttribute('aria-pressed', String(isSelected));
 
       const head = node('div', '', 'notebook-list-head');
       const titleWrap = node('div', '', 'notebook-list-title-wrap');
@@ -460,7 +505,7 @@ export function initNotebookHub(): NotebookHubController {
       });
       return card;
     });
-    noteListEl.replaceChildren(...items);
+    replaceChildrenPreservingFocus(noteListEl, items, () => noteNewBtn);
   }
 
   async function selectNote(id: string): Promise<void> {
@@ -477,9 +522,12 @@ export function initNotebookHub(): NotebookHubController {
     renderNotesList();
   }
 
-  async function loadNotes(selectFallback = false): Promise<void> {
+  async function loadNotes(selectFallback = false, background = false): Promise<void> {
     if (!appState.ready || appState.authExpired) return;
     const token = ++noteLoadToken;
+    notesLoadAc?.abort();
+    const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    notesLoadAc = ac;
     const params = new URLSearchParams();
     if (noteQuery.trim()) params.set('query', noteQuery.trim());
     if (noteFilterTag.trim()) params.set('tag', noteFilterTag.trim());
@@ -487,8 +535,15 @@ export function initNotebookHub(): NotebookHubController {
     const url = params.toString() ? `/api/notes?${params}` : '/api/notes';
 
     try {
-      const res = await api<NoteListApiResponse>(url);
-      if (token !== noteLoadToken) return;
+      const res = await api<NoteListApiResponse>(
+        url,
+        undefined,
+        {
+          ...(ac ? { signal: ac.signal } : {}),
+          ...(background ? { priority: 'low' as const } : {}),
+        },
+      );
+      if (token !== noteLoadToken || ac?.signal.aborted) return;
       notes = Array.isArray(res.items) ? res.items : [];
       noteTags = Array.isArray(res.tags) ? res.tags : [];
       notesLoaded = true;
@@ -508,7 +563,7 @@ export function initNotebookHub(): NotebookHubController {
             if (noteBaseUpdatedAt !== undefined && remote.updatedAt !== noteBaseUpdatedAt) {
               pendingRemoteNote = remote;
               updateConflictBanner();
-              setSaveStatus('冲突待处理', 'amber');
+              setSaveStatus('冲突待处理', 'amber', true);
             }
           } else if (remote.updatedAt !== noteBaseUpdatedAt) {
             populateNoteEditor(remote);
@@ -516,7 +571,6 @@ export function initNotebookHub(): NotebookHubController {
           }
           return;
         }
-        // Only clear if no active filter hid the selected item
         if (!noteQuery.trim() && !noteFilterPinnedOnly && !noteFilterTag.trim()) {
           clearNoteWorkspace();
         }
@@ -531,9 +585,30 @@ export function initNotebookHub(): NotebookHubController {
         clearNoteWorkspace();
       }
     } catch (err) {
-      if (token !== noteLoadToken) return;
-      setSaveStatus(`加载失败：${errorText(err)}`, 'red');
+      if (token !== noteLoadToken || ac?.signal.aborted) return;
+      setSaveStatus(`加载失败：${errorText(err)}`, 'red', true);
+    } finally {
+      if (notesLoadAc === ac) notesLoadAc = null;
     }
+  }
+
+  function buildPendingNotePayload(forceOverwrite = false): Record<string, unknown> | undefined {
+    if (!isNewDraft && !selectedNoteId) return undefined;
+    const title = noteTitleInput.value;
+    const content = noteContentInput.value;
+    if (isNewDraft && !selectedNoteId && !title.trim() && !content.trim()) return undefined;
+    const tags = parseTagsText(noteTagsInput.value);
+    return {
+      ...(selectedNoteId ? { id: selectedNoteId } : {}),
+      title,
+      content,
+      tags,
+      author: 'user',
+      updatedBy: 'user',
+      ...(!forceOverwrite && selectedNoteId && noteBaseUpdatedAt !== undefined
+        ? { expectedUpdatedAt: noteBaseUpdatedAt }
+        : {}),
+    };
   }
 
   async function saveCurrentNote(forceOverwrite = false): Promise<boolean> {
@@ -581,7 +656,7 @@ export function initNotebookHub(): NotebookHubController {
         const idx = notes.findIndex(item => item.id === saved.id);
         if (idx >= 0) notes[idx] = saved;
         else notes.unshift(saved);
-        notes.sort((a, b) => (a.pinned !== b.pinned ? (a.pinned ? -1 : 1) : b.updatedAt - a.updatedAt));
+        notes = notes.toSorted((a, b) => (a.pinned !== b.pinned ? (a.pinned ? -1 : 1) : b.updatedAt - a.updatedAt));
 
         if (res.summary) {
           applySummaryBadges(res.summary);
@@ -597,7 +672,9 @@ export function initNotebookHub(): NotebookHubController {
               else counts.set(key, { tag, count: 1 });
             }
           }
-          noteTags = [...counts.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag));
+          noteTags = [...counts.values()].toSorted(
+            (a, b) => b.count - a.count || (zhTagCollator ? zhTagCollator.compare(a.tag, b.tag) : a.tag.localeCompare(b.tag)),
+          );
           renderNoteTagChips();
         }
 
@@ -613,7 +690,7 @@ export function initNotebookHub(): NotebookHubController {
             if (suppressingInputSync === false && !noteTitleInput.value.trim()) {
               noteTitleInput.value = saved.title;
             }
-            setSaveStatus('已保存', 'green');
+            setSaveStatus('已保存', 'green', true);
           } else {
             noteDirty = true;
             setSaveStatus('未保存…', 'amber');
@@ -636,18 +713,18 @@ export function initNotebookHub(): NotebookHubController {
               if (ctxSeq === editorContextSeq) {
                 pendingRemoteNote = latest;
                 updateConflictBanner();
-                setSaveStatus('冲突待处理', 'amber');
+                setSaveStatus('冲突待处理', 'amber', true);
               }
             } catch {
               if (ctxSeq === editorContextSeq) {
-                setSaveStatus('保存冲突，请刷新重试', 'red');
+                setSaveStatus('保存冲突，请刷新重试', 'red', true);
               }
             }
           }
           return false;
         }
         if (ctxSeq === editorContextSeq) {
-          setSaveStatus(`保存失败：${errorText(err)}`, 'red');
+          setSaveStatus(`保存失败：${errorText(err)}`, 'red', true);
         }
         return false;
       } finally {
@@ -679,7 +756,13 @@ export function initNotebookHub(): NotebookHubController {
     ++noteEditRev;
     noteDirty = true;
     setSaveStatus('未保存…', 'amber');
-    if (noteMode !== 'edit') renderNotePreview();
+    if (noteMode !== 'edit') {
+      clearPreviewTimer();
+      previewDebounceTimer = setTimeout(() => {
+        previewDebounceTimer = undefined;
+        if (noteMode !== 'edit') renderNotePreview();
+      }, 150);
+    }
     if (autoSaveTimer) clearTimeout(autoSaveTimer);
     autoSaveTimer = setTimeout(() => {
       autoSaveTimer = undefined;
@@ -746,19 +829,25 @@ export function initNotebookHub(): NotebookHubController {
 
   // --- Diary helpers ---
   function renderDiaryMoodFilters(): void {
-    const pills = DIARY_MOOD_OPTIONS.map(opt => button(
-      opt.label,
-      () => {
-        diaryMoodFilter = opt.id;
-        void loadDiary(true);
-      },
-      `hub-filter-pill${diaryMoodFilter === opt.id ? ' active' : ''}`,
-    ));
-    diaryMoodFiltersEl.replaceChildren(...pills);
+    const pills = DIARY_MOOD_OPTIONS.map(opt => {
+      const active = diaryMoodFilter === opt.id;
+      const btn = button(
+        opt.label,
+        () => {
+          diaryMoodFilter = opt.id;
+          void loadDiary(true);
+        },
+        `hub-filter-pill${active ? ' active' : ''}`,
+      );
+      btn.dataset.focusKey = `diary-mood:${opt.id}`;
+      btn.setAttribute('aria-pressed', String(active));
+      return btn;
+    });
+    replaceChildrenPreservingFocus(diaryMoodFiltersEl, pills, () => diarySearchInput);
   }
 
   function renderDiaryReader(entry?: DiaryEntry): void {
-    clearDiaryDeleteArming();
+    setDiaryStatus(undefined);
     if (!entry) {
       selectedDiaryId = undefined;
       diaryReaderEl.hidden = true;
@@ -773,7 +862,7 @@ export function initNotebookHub(): NotebookHubController {
       createStaticBotSvg({
         size: 52,
         expr: entry.mood in BOT_EXPRESSION_META ? entry.mood : 'calm',
-        interactivePoke: true,
+        interactivePoke: false,
       }),
     );
     diaryDateDisplay.textContent = entry.date;
@@ -797,26 +886,32 @@ export function initNotebookHub(): NotebookHubController {
     diaryPromoteBtn.disabled = !appState.ready || appState.authExpired;
     diaryDeleteBtn.disabled = !appState.ready || appState.authExpired;
     diaryPromoteBtn.textContent = entry.promotedMemoryId ? '🧠 同步更新记忆' : '🧠 转存记忆';
+    diaryDeleteBtn.textContent = '删除';
   }
 
   function renderDiaryList(): void {
     renderDiaryMoodFilters();
     if (!diaryEntries.length) {
-      diaryListEl.replaceChildren(
+      replaceChildrenPreservingFocus(
+        diaryListEl,
         node(
           'p',
           diaryQuery || diaryMoodFilter !== 'all' ? '没有符合筛选条件的日记。' : 'F.R.I.D.A.Y. 还没有写下日记。',
           'empty',
         ),
+        () => diarySearchInput,
       );
       return;
     }
 
     const cards = diaryEntries.map(entry => {
+      const selected = entry.id === selectedDiaryId;
       const card = document.createElement('button');
       card.type = 'button';
-      card.className = `notebook-list-item diary-list-item${entry.id === selectedDiaryId ? ' active' : ''}`;
+      card.className = `notebook-list-item diary-list-item${selected ? ' active' : ''}`;
       card.dataset.diaryId = entry.id;
+      card.dataset.focusKey = `diary-item:${entry.id}`;
+      card.setAttribute('aria-pressed', String(selected));
 
       const head = node('div', '', 'notebook-list-head');
       const left = node('div', '', 'notebook-list-title-wrap');
@@ -840,20 +935,30 @@ export function initNotebookHub(): NotebookHubController {
       });
       return card;
     });
-    diaryListEl.replaceChildren(...cards);
+    replaceChildrenPreservingFocus(diaryListEl, cards, () => diarySearchInput);
   }
 
-  async function loadDiary(selectFallback = false): Promise<void> {
+  async function loadDiary(selectFallback = false, background = false): Promise<void> {
     if (!appState.ready || appState.authExpired) return;
     const token = ++diaryLoadToken;
+    diaryLoadAc?.abort();
+    const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    diaryLoadAc = ac;
     const params = new URLSearchParams();
     if (diaryQuery.trim()) params.set('query', diaryQuery.trim());
     if (diaryMoodFilter !== 'all') params.set('mood', diaryMoodFilter);
     const url = params.toString() ? `/api/diary?${params}` : '/api/diary';
 
     try {
-      const res = await api<DiaryListApiResponse>(url);
-      if (token !== diaryLoadToken) return;
+      const res = await api<DiaryListApiResponse>(
+        url,
+        undefined,
+        {
+          ...(ac ? { signal: ac.signal } : {}),
+          ...(background ? { priority: 'low' as const } : {}),
+        },
+      );
+      if (token !== diaryLoadToken || ac?.signal.aborted) return;
       diaryEntries = Array.isArray(res.items) ? res.items : [];
       diaryLoaded = true;
       if (res.summary) {
@@ -876,33 +981,54 @@ export function initNotebookHub(): NotebookHubController {
         renderDiaryReader(undefined);
       }
     } catch {
-      if (token !== diaryLoadToken) return;
+      if (token !== diaryLoadToken || ac?.signal.aborted) return;
       diaryListEl.replaceChildren(node('p', '读取 F.R.I.D.A.Y. 日记失败，请稍后重试。', 'error'));
+      announceStatus('读取 F.R.I.D.A.Y. 日记失败，请稍后重试。', 'assertive');
+    } finally {
+      if (diaryLoadAc === ac) diaryLoadAc = null;
     }
   }
 
-  // --- Tab & Modal switching ---
-  function syncTabState(): void {
+  // --- Tab & Modal switching (inside #memory-hub-dialog) ---
+  function syncTabState(broadcast = false): void {
     const isNotes = activeTab === 'notes';
+    memoryHubDialog.dataset.activeTab = activeTab;
+    memoryTabMatrix?.classList.remove('active');
+    if (memoryPanelMatrix) memoryPanelMatrix.hidden = true;
+
     tabNotesBtn.classList.toggle('active', isNotes);
-    tabNotesBtn.setAttribute('aria-selected', isNotes ? 'true' : 'false');
     panelNotes.hidden = !isNotes;
 
     tabDiaryBtn.classList.toggle('active', !isNotes);
-    tabDiaryBtn.setAttribute('aria-selected', !isNotes ? 'true' : 'false');
     panelDiary.hidden = isNotes;
 
+    notebookRoleHint.hidden = false;
     notebookRoleHint.textContent = isNotes
       ? 'F.R.I.D.A.Y. 替你记事 · 支持 Markdown 编辑、预览与按需转存记忆'
       : 'F.R.I.D.A.Y. 自己写的每日随笔与反思 · 纯净只读，记录与你的相处点滴';
+
+    if (memoryHubTabs) {
+      syncRovingTablist(memoryHubTabs, isNotes ? tabNotesBtn : tabDiaryBtn);
+    }
+
+    if (broadcast && !suppressingExternalTabSync) {
+      suppressingExternalTabSync = true;
+      try {
+        if (typeof Event === 'function' && typeof memoryHubDialog.dispatchEvent === 'function') {
+          memoryHubDialog.dispatchEvent(new Event('friday:memory-tab-change'));
+        }
+      } finally {
+        suppressingExternalTabSync = false;
+      }
+    }
   }
 
-  function switchTab(next: NotebookTab): void {
+  function switchTab(next: NotebookTab, broadcast = true): void {
     if (activeTab === 'notes' && next !== 'notes' && noteDirty && !pendingRemoteNote) {
       void flushPendingSave();
     }
     activeTab = next;
-    syncTabState();
+    syncTabState(broadcast);
     const currentSig = summarySignature(appState.view?.notebookSummary);
     if (next === 'notes') {
       if (!notesLoaded || loadedNotesSig !== currentSig) {
@@ -913,19 +1039,33 @@ export function initNotebookHub(): NotebookHubController {
     }
   }
 
+  function isNotebookOpen(tab?: NotebookTab): boolean {
+    if (!isDialogOpen(memoryHubDialog)) return false;
+    if (tab === 'notes') return !panelNotes.hidden;
+    if (tab === 'diary') return !panelDiary.hidden;
+    return !panelNotes.hidden || !panelDiary.hidden;
+  }
+
   function openModal(tab: NotebookTab = 'notes'): void {
-    hooks.closeAllHubModals();
-    notebookHubBackdrop.hidden = false;
+    if (!isDialogOpen(memoryHubDialog)) {
+      hooks.closeAllHubModals();
+      openModalDialog(memoryHubDialog);
+    }
     activeTab = tab;
-    syncTabState();
+    syncTabState(true);
     if (appState.ready && !appState.authExpired) {
       if (tab === 'notes') void loadNotes(true);
       else void loadDiary(true);
     }
+    safeFocus(tab === 'notes' ? tabNotesBtn : tabDiaryBtn);
   }
 
-  function closeModal(): void {
-    if (notebookHubBackdrop.hidden) return;
+  function handleDialogClosed(): void {
+    clearPreviewTimer();
+    if (autoSaveTimer) {
+      clearTimeout(autoSaveTimer);
+      autoSaveTimer = undefined;
+    }
     if (searchDebounceTimer) {
       clearTimeout(searchDebounceTimer);
       searchDebounceTimer = undefined;
@@ -937,9 +1077,13 @@ export function initNotebookHub(): NotebookHubController {
     if ((noteDirty && !pendingRemoteNote) || activeSavePromise) {
       void flushPendingSave();
     }
-    clearDeleteArming();
-    clearDiaryDeleteArming();
-    notebookHubBackdrop.hidden = true;
+  }
+
+  function closeModal(): void {
+    handleDialogClosed();
+    if (isDialogOpen(memoryHubDialog)) {
+      closeModalDialog(memoryHubDialog);
+    }
   }
 
   function render(force = false): void {
@@ -956,31 +1100,67 @@ export function initNotebookHub(): NotebookHubController {
       diaryDeleteBtn.disabled = true;
       return;
     }
-    if (notebookHubBackdrop.hidden) return;
+    if (!isNotebookOpen() && !force) return;
+    if (!isDialogOpen(memoryHubDialog)) return;
     if (activeTab === 'notes' && (force || sigChanged || !notesLoaded || loadedNotesSig !== nextSig)) {
-      void loadNotes(false);
+      void loadNotes(false, !force);
     } else if (activeTab === 'diary' && (force || sigChanged || !diaryLoaded || loadedDiarySig !== nextSig)) {
-      void loadDiary(false);
+      void loadDiary(false, !force);
     }
   }
 
   // --- Event wiring ---
-  openNotebookHubTop.addEventListener('click', () => openModal(activeTab));
-  notebookModalClose.addEventListener('click', closeModal);
-  notebookHubBackdrop.addEventListener('click', event => {
-    if (event.target === notebookHubBackdrop) closeModal();
-  });
+  const listenerOpts = signal ? { signal } : undefined;
+  if (memoryHubTabs?.dataset.rovingOwner === 'memory-hub') {
+    memoryHubDialog.addEventListener('close', handleDialogClosed, listenerOpts);
+  } else {
+    bindDialogLightDismiss(memoryHubDialog, handleDialogClosed, signal);
+  }
 
-  tabNotesBtn.addEventListener('click', () => switchTab('notes'));
-  tabDiaryBtn.addEventListener('click', () => switchTab('diary'));
+  memoryHubDialog.addEventListener('friday:memory-tab-change', () => {
+    if (suppressingExternalTabBroadcast()) return;
+    const extTab = memoryHubDialog.dataset.activeTab;
+    if (extTab === 'matrix') {
+      clearPreviewTimer();
+      if ((noteDirty && !pendingRemoteNote) || activeSavePromise) {
+        void flushPendingSave();
+      }
+      return;
+    }
+    if (extTab === 'notes' || extTab === 'diary') {
+      if (activeTab === 'notes' && extTab !== 'notes' && noteDirty && !pendingRemoteNote) {
+        void flushPendingSave();
+      }
+      activeTab = extTab;
+      const currentSig = summarySignature(appState.view?.notebookSummary);
+      if (extTab === 'notes') {
+        if (!notesLoaded || loadedNotesSig !== currentSig) void loadNotes(true);
+      } else if (!diaryLoaded || loadedDiarySig !== currentSig) {
+        void loadDiary(true);
+      }
+    }
+  }, listenerOpts);
+
+  function suppressingExternalTabBroadcast(): boolean {
+    return suppressingExternalTabSync;
+  }
+
+  tabNotesBtn.addEventListener('click', () => {
+    if (memoryHubTabs?.dataset.rovingOwner === 'memory-hub') return;
+    switchTab('notes', false);
+  }, listenerOpts);
+  tabDiaryBtn.addEventListener('click', () => {
+    if (memoryHubTabs?.dataset.rovingOwner === 'memory-hub') return;
+    switchTab('diary', false);
+  }, listenerOpts);
 
   noteNewBtn.addEventListener('click', () => {
     void (async () => {
       if ((noteDirty && !pendingRemoteNote) || activeSavePromise) await flushPendingSave();
       startNewNoteDraft();
     })();
-  });
-  noteEmptyNewBtn.addEventListener('click', startNewNoteDraft);
+  }, listenerOpts);
+  noteEmptyNewBtn.addEventListener('click', startNewNoteDraft, listenerOpts);
 
   noteSearchInput.addEventListener('input', () => {
     noteQuery = noteSearchInput.value;
@@ -992,7 +1172,7 @@ export function initNotebookHub(): NotebookHubController {
         await loadNotes(true);
       })();
     }, 220);
-  });
+  }, listenerOpts);
 
   noteFilterAllBtn.addEventListener('click', () => {
     if (!noteFilterPinnedOnly) return;
@@ -1001,7 +1181,7 @@ export function initNotebookHub(): NotebookHubController {
       if ((noteDirty && !pendingRemoteNote) || activeSavePromise) await flushPendingSave();
       await loadNotes(true);
     })();
-  });
+  }, listenerOpts);
   noteFilterPinnedBtn.addEventListener('click', () => {
     if (noteFilterPinnedOnly) return;
     noteFilterPinnedOnly = true;
@@ -1009,30 +1189,34 @@ export function initNotebookHub(): NotebookHubController {
       if ((noteDirty && !pendingRemoteNote) || activeSavePromise) await flushPendingSave();
       await loadNotes(true);
     })();
-  });
+  }, listenerOpts);
 
-  noteModePreviewBtn.addEventListener('click', () => { noteMode = 'preview'; syncNoteModeUI(); });
-  noteModeEditBtn.addEventListener('click', () => { noteMode = 'edit'; syncNoteModeUI(); noteContentInput.focus(); });
-  noteModeSplitBtn.addEventListener('click', () => { noteMode = 'split'; syncNoteModeUI(); noteContentInput.focus(); });
+  noteModePreviewBtn.addEventListener('click', () => { noteMode = 'preview'; syncNoteModeUI(); }, listenerOpts);
+  noteModeEditBtn.addEventListener('click', () => { noteMode = 'edit'; syncNoteModeUI(); safeFocus(noteContentInput); }, listenerOpts);
+  noteModeSplitBtn.addEventListener('click', () => { noteMode = 'split'; syncNoteModeUI(); safeFocus(noteContentInput); }, listenerOpts);
 
-  noteTitleInput.addEventListener('input', markNoteDirty);
-  noteTagsInput.addEventListener('input', markNoteDirty);
-  noteContentInput.addEventListener('input', markNoteDirty);
+  noteTitleInput.addEventListener('input', markNoteDirty, listenerOpts);
+  noteTagsInput.addEventListener('input', markNoteDirty, listenerOpts);
+  noteContentInput.addEventListener('input', markNoteDirty, listenerOpts);
 
   noteWorkspaceEl.addEventListener('keydown', event => {
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
       event.preventDefault();
       void saveCurrentNote(false);
     }
-  });
+  }, listenerOpts);
 
-  noteSaveNowBtn.addEventListener('click', () => { void saveCurrentNote(false); });
+  noteSaveNowBtn.addEventListener('click', () => { void saveCurrentNote(false); }, listenerOpts);
 
   for (const btn of noteMdToolbarEl.querySelectorAll<HTMLButtonElement>('[data-md-op]')) {
+    const labelHint = btn.getAttribute('aria-label') || btn.getAttribute('title') || btn.textContent?.trim() || '';
+    if (!btn.getAttribute('aria-label') && labelHint) {
+      btn.setAttribute('aria-label', labelHint);
+    }
     btn.addEventListener('click', () => {
       const op = btn.dataset.mdOp;
       if (op) applyMarkdownSnippet(op);
-    });
+    }, listenerOpts);
   }
 
   noteConflictLoadBtn.addEventListener('click', () => {
@@ -1042,7 +1226,7 @@ export function initNotebookHub(): NotebookHubController {
     if (idx >= 0) notes[idx] = latest;
     populateNoteEditor(latest);
     renderNotesList();
-  });
+  }, listenerOpts);
 
   noteConflictKeepBtn.addEventListener('click', () => {
     if (!pendingRemoteNote) return;
@@ -1050,7 +1234,7 @@ export function initNotebookHub(): NotebookHubController {
     pendingRemoteNote = undefined;
     updateConflictBanner();
     void saveCurrentNote(true);
-  });
+  }, listenerOpts);
 
   notePinBtn.addEventListener('click', () => {
     if (!selectedNoteId || !appState.ready || appState.authExpired) return;
@@ -1067,7 +1251,7 @@ export function initNotebookHub(): NotebookHubController {
         });
         const idx = notes.findIndex(item => item.id === res.note.id);
         if (idx >= 0) notes[idx] = res.note;
-        notes.sort((a, b) => (a.pinned !== b.pinned ? (a.pinned ? -1 : 1) : b.updatedAt - a.updatedAt));
+        notes = notes.toSorted((a, b) => (a.pinned !== b.pinned ? (a.pinned ? -1 : 1) : b.updatedAt - a.updatedAt));
         if (res.summary) {
           applySummaryBadges(res.summary);
           loadedNotesSig = summarySignature(res.summary);
@@ -1077,15 +1261,16 @@ export function initNotebookHub(): NotebookHubController {
           syncWorkspaceButtons(res.note);
         }
         renderNotesList();
+        announceStatus(res.note.pinned ? '已置顶笔记' : '已取消置顶', 'polite');
         broadcastSync('notes');
         void hooks.refreshView();
       } catch (err) {
         if (selectedNoteId === targetId) {
-          setSaveStatus(`置顶失败：${errorText(err)}`, 'red');
+          setSaveStatus(`置顶失败：${errorText(err)}`, 'red', true);
         }
       }
     })();
-  });
+  }, listenerOpts);
 
   notePromoteBtn.addEventListener('click', () => {
     if (!selectedNoteId || !appState.ready || appState.authExpired) return;
@@ -1109,41 +1294,51 @@ export function initNotebookHub(): NotebookHubController {
             noteBaseUpdatedAt = res.note.updatedAt;
             syncWorkspaceButtons(res.note);
           }
-          setSaveStatus('✓ 已转存至全息记忆', 'green');
+          setSaveStatus('✓ 已转存至全息记忆', 'green', true);
         }
         renderNotesList();
         broadcastSync('notes');
         void hooks.refreshView();
       } catch (err) {
         if (selectedNoteId === targetId) {
-          setSaveStatus(`转存失败：${errorText(err)}`, 'red');
+          setSaveStatus(`转存失败：${errorText(err)}`, 'red', true);
         }
       }
     })();
-  });
+  }, listenerOpts);
 
   noteDeleteBtn.addEventListener('click', () => {
     if (isNewDraft && !selectedNoteId) {
-      clearNoteWorkspace();
-      if (notes.length > 0) {
-        populateNoteEditor(notes[0]!, { mode: 'preview' });
-        renderNotesList();
-      }
+      const hasDraftText = Boolean(noteTitleInput.value.trim() || noteContentInput.value.trim());
+      void (async () => {
+        if (hasDraftText) {
+          const ok = await confirmAction({
+            title: '放弃新建草稿',
+            message: '当前草稿尚未保存，确定要放弃吗？',
+            confirmLabel: '放弃草稿',
+            danger: true,
+          });
+          if (!ok) return;
+        }
+        clearNoteWorkspace();
+        if (notes.length > 0) {
+          populateNoteEditor(notes[0]!, { mode: 'preview' });
+          renderNotesList();
+        }
+      })();
       return;
     }
     if (!selectedNoteId) return;
-    if (armedDeleteNoteId !== selectedNoteId) {
-      armedDeleteNoteId = selectedNoteId;
-      noteDeleteBtn.textContent = '确认删除？';
-      if (confirmDeleteNoteTimer) clearTimeout(confirmDeleteNoteTimer);
-      confirmDeleteNoteTimer = setTimeout(() => {
-        clearDeleteArming();
-      }, 3500);
-      return;
-    }
     const deleteId = selectedNoteId;
-    clearDeleteArming();
+    const titleLabel = noteTitleInput.value.trim() || '未命名笔记';
     void (async () => {
+      const ok = await confirmAction({
+        title: '删除笔记',
+        message: `确定要删除笔记「${titleLabel}」吗？此操作无法撤销。`,
+        confirmLabel: '确认删除',
+        danger: true,
+      });
+      if (!ok || !appState.ready || appState.authExpired) return;
       try {
         const res = await api<{ removed: boolean; summary: NotebookSummaryView }>('/api/note-remove', { id: deleteId });
         notes = notes.filter(item => item.id !== deleteId);
@@ -1158,15 +1353,16 @@ export function initNotebookHub(): NotebookHubController {
           }
         }
         renderNotesList();
+        announceStatus(`已删除笔记「${titleLabel}」`, 'polite');
         broadcastSync('notes');
         void hooks.refreshView();
       } catch (err) {
         if (selectedNoteId === deleteId) {
-          setSaveStatus(`删除失败：${errorText(err)}`, 'red');
+          setSaveStatus(`删除失败：${errorText(err)}`, 'red', true);
         }
       }
     })();
-  });
+  }, listenerOpts);
 
   diarySearchInput.addEventListener('input', () => {
     diaryQuery = diarySearchInput.value;
@@ -1175,13 +1371,14 @@ export function initNotebookHub(): NotebookHubController {
       diarySearchTimer = undefined;
       void loadDiary(true);
     }, 220);
-  });
+  }, listenerOpts);
 
   diaryPromoteBtn.addEventListener('click', () => {
     if (!selectedDiaryId || !appState.ready || appState.authExpired) return;
     const targetId = selectedDiaryId;
     diaryPromoteBtn.disabled = true;
     diaryPromoteBtn.textContent = '转存中…';
+    setDiaryStatus('正在转存至全息记忆…');
     void (async () => {
       try {
         const res = await api<{ entry: DiaryEntry; summary: NotebookSummaryView }>('/api/diary-promote-memory', { id: targetId });
@@ -1193,35 +1390,35 @@ export function initNotebookHub(): NotebookHubController {
         }
         if (selectedDiaryId === res.entry.id) {
           renderDiaryReader(res.entry);
-          diaryPromoteBtn.textContent = '✓ 已转存记忆';
+          setDiaryStatus('✓ 已转存至全息记忆');
         }
         renderDiaryList();
         broadcastSync('diary');
         void hooks.refreshView();
       } catch (err) {
         if (selectedDiaryId === targetId) {
-          diaryPromoteBtn.textContent = `转存失败：${errorText(err)}`;
+          const current = diaryEntries.find(item => item.id === targetId);
+          diaryPromoteBtn.textContent = current?.promotedMemoryId ? '🧠 同步更新记忆' : '🧠 转存记忆';
+          setDiaryStatus(`转存失败：${errorText(err)}`, 'error');
         }
       } finally {
         diaryPromoteBtn.disabled = !appState.ready || appState.authExpired;
       }
     })();
-  });
+  }, listenerOpts);
 
   diaryDeleteBtn.addEventListener('click', () => {
     if (!selectedDiaryId) return;
-    if (armedDeleteDiaryId !== selectedDiaryId) {
-      armedDeleteDiaryId = selectedDiaryId;
-      diaryDeleteBtn.textContent = '确认删除？';
-      if (confirmDeleteDiaryTimer) clearTimeout(confirmDeleteDiaryTimer);
-      confirmDeleteDiaryTimer = setTimeout(() => {
-        clearDiaryDeleteArming();
-      }, 3500);
-      return;
-    }
     const targetId = selectedDiaryId;
-    clearDiaryDeleteArming();
+    const titleLabel = diaryTitleDisplay.textContent || '这篇日记';
     void (async () => {
+      const ok = await confirmAction({
+        title: '删除日记',
+        message: `确定要删除日记「${titleLabel}」吗？此操作无法撤销。`,
+        confirmLabel: '确认删除',
+        danger: true,
+      });
+      if (!ok || !appState.ready || appState.authExpired) return;
       try {
         const res = await api<{ removed: boolean; summary: NotebookSummaryView }>('/api/diary-remove', { id: targetId });
         diaryEntries = diaryEntries.filter(item => item.id !== targetId);
@@ -1233,39 +1430,49 @@ export function initNotebookHub(): NotebookHubController {
           renderDiaryReader(diaryEntries[0]);
         }
         renderDiaryList();
+        announceStatus(`已删除日记「${titleLabel}」`, 'polite');
         broadcastSync('diary');
         void hooks.refreshView();
-      } catch {
+      } catch (err) {
         if (selectedDiaryId === targetId) {
-          diaryDeleteBtn.textContent = '删除失败';
+          setDiaryStatus(`删除失败：${errorText(err)}`, 'error');
         }
       }
     })();
-  });
+  }, listenerOpts);
 
   syncChannel?.addEventListener('message', event => {
     const payload = event.data as { type?: string; tab?: NotebookTab } | undefined;
     if (payload?.type !== 'changed') return;
     void hooks.refreshView();
-    if (notebookHubBackdrop.hidden || !appState.ready || appState.authExpired) return;
-    if (payload.tab === 'diary') void loadDiary(false);
-    else void loadNotes(false);
-  });
+    if (!isNotebookOpen() || !appState.ready || appState.authExpired) return;
+    if (payload.tab === 'diary') void loadDiary(false, true);
+    else void loadNotes(false, true);
+  }, listenerOpts);
 
   if (typeof document !== 'undefined') {
     document.addEventListener('visibilitychange', () => {
-      if (document.hidden || notebookHubBackdrop.hidden || !appState.ready || appState.authExpired) return;
-      if (activeTab === 'notes') void loadNotes(false);
-      else void loadDiary(false);
-    });
+      if (isDocumentHidden() || !isNotebookOpen() || !appState.ready || appState.authExpired) return;
+      if (activeTab === 'notes') void loadNotes(false, true);
+      else void loadDiary(false, true);
+    }, listenerOpts);
   }
 
   if (typeof window !== 'undefined') {
     window.addEventListener('pagehide', () => {
+      const shouldFlushDirty = Boolean((autoSaveTimer || noteDirty) && !pendingRemoteNote && appState.ready && !appState.authExpired);
       if (autoSaveTimer) {
         clearTimeout(autoSaveTimer);
         autoSaveTimer = undefined;
       }
+      if (shouldFlushDirty) {
+        const payload = buildPendingNotePayload(false);
+        if (payload) {
+          noteDirty = false;
+          void api('/api/note-save', payload, { keepalive: true }).catch(() => {});
+        }
+      }
+      clearPreviewTimer();
       if (searchDebounceTimer) {
         clearTimeout(searchDebounceTimer);
         searchDebounceTimer = undefined;
@@ -1274,10 +1481,11 @@ export function initNotebookHub(): NotebookHubController {
         clearTimeout(diarySearchTimer);
         diarySearchTimer = undefined;
       }
-      clearDeleteArming();
-      clearDiaryDeleteArming();
+      notesLoadAc?.abort();
+      diaryLoadAc?.abort();
+      lifecycleAc?.abort();
       syncChannel?.close();
-    });
+    }, listenerOpts);
   }
 
   renderDiaryMoodFilters();
@@ -1286,6 +1494,6 @@ export function initNotebookHub(): NotebookHubController {
     openModal,
     closeModal,
     render,
-    isOpen: () => !notebookHubBackdrop.hidden,
+    isOpen: isNotebookOpen,
   };
 }
