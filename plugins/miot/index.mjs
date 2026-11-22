@@ -27,6 +27,51 @@ import {
   shellQuote,
 } from '../_shared/ssh.mjs';
 import { handleMiotVoiceFastpath } from './fastpath.mjs';
+import {
+  CENTRAL_TOPIC_RE,
+  GEEK_URL_RE,
+  GRAPH_ID_RE,
+  VAR_IDENT_RE,
+  buildCentralMipsApiScript,
+  buildCentralOverviewScript,
+  buildSafeGeekUrl,
+  buildScheduleGeekGraph,
+  callCentralMipsApi,
+  decodeCentralJsonz,
+  defaultFetchCentralOverview,
+  parseAutoLocalLogs,
+  parseCentralOverviewOutput,
+  readCentralCache,
+  summarizeCloudScene,
+  summarizeGeekGraph,
+  validateGeekNodes,
+  validateGraphId,
+  validateVarIdentifier,
+  writeCentralCache,
+} from './central-hub.mjs';
+
+export {
+  CENTRAL_TOPIC_RE,
+  GEEK_URL_RE,
+  GRAPH_ID_RE,
+  VAR_IDENT_RE,
+  buildCentralMipsApiScript,
+  buildCentralOverviewScript,
+  buildSafeGeekUrl,
+  buildScheduleGeekGraph,
+  callCentralMipsApi,
+  decodeCentralJsonz,
+  defaultFetchCentralOverview,
+  parseAutoLocalLogs,
+  parseCentralOverviewOutput,
+  readCentralCache,
+  summarizeCloudScene,
+  summarizeGeekGraph,
+  validateGeekNodes,
+  validateGraphId,
+  validateVarIdentifier,
+  writeCentralCache,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -42,7 +87,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   udpTimeoutMs: 3500,
 });
 
-export const ACTIONS = ['status', 'devices', 'get', 'set', 'cook', 'action', 'command', 'config'];
+export const ACTIONS = ['status', 'dashboard', 'mesh', 'geek', 'scene', 'devices', 'get', 'set', 'cook', 'action', 'command', 'config'];
 
 const HUB_CENTRAL_DIR = '/data/other/central';
 export const HUB_TAR_COMMAND = `tar -C ${HUB_CENTRAL_DIR} -cf - share/custom/devInfo local/hotdatasync`;
@@ -184,6 +229,7 @@ function getRuntimePaths(deps = {}) {
   return resolvePluginPaths('miot', deps, {
     cachePath: 'hub-cache.json',
     tokenCachePath: 'hub-tokens.json',
+    centralCachePath: 'central-cache.json',
   });
 }
 
@@ -1107,6 +1153,7 @@ function makeCtx(args, deps) {
   const sleepFn = typeof safeDeps.sleepFn === 'function'
     ? safeDeps.sleepFn
     : (ms => delay(ms, undefined, safeDeps.signal ? { signal: safeDeps.signal } : undefined));
+  const getRouterTarget = () => parseSshSpec(cfg.routerSsh, 'router');
   return {
     args,
     deps: safeDeps,
@@ -1118,6 +1165,18 @@ function makeCtx(args, deps) {
     sleep: sleepFn,
     now: safeDeps.nowFn ?? Date.now,
     fetchRows: safeDeps.fetchHubRawRows ?? (opts => defaultFetchHubRawRows({ ...opts, homeDir: paths.homeDir, sshBinaryExec: sshBin })),
+    centralMipsCall: safeDeps.centralMipsCall ?? ((topic, payload = {}, opts = {}) => callCentralMipsApi({
+      target: getRouterTarget(),
+      sshBin,
+      topic,
+      payload,
+      ...opts,
+    })),
+    fetchCentralOverview: safeDeps.fetchCentralOverview ?? ((opts = {}) => defaultFetchCentralOverview({
+      target: getRouterTarget(),
+      sshText,
+      ...opts,
+    })),
     tvRun,
     snapshot: undefined,
   };
@@ -1313,6 +1372,13 @@ function invalidateHubCache(paths) {
       /* ignore */
     }
   }
+  if (paths.centralCachePath) {
+    try {
+      rmSync(paths.centralCachePath, { force: true });
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 /** Load the hub snapshot honouring cacheTtlMs (hotData) and topologyTtlMs (devInfo); falls back to stale cache on SSH failure. */
@@ -1501,6 +1567,41 @@ async function liveForDevices(ctx, devices) {
   return live;
 }
 
+function persistLiveStates(ctx, snap, live, isUnfiltered) {
+  const now = ctx.now();
+  let mergedAny = false;
+  const updatedDevices = snap.devices.map(dev => {
+    const l = live.get(dev.did);
+    if (dev.controlChannel === 'bt_mesh' && l && l.on !== undefined) {
+      const prevCached = dev.cachedState && typeof dev.cachedState === 'object' ? dev.cachedState : { properties: {} };
+      const prevProps = prevCached.properties && typeof prevCached.properties === 'object' ? prevCached.properties : {};
+      mergedAny = true;
+      return {
+        ...dev,
+        cachedState: {
+          ...prevCached,
+          properties: {
+            ...prevProps,
+            '2.1': { value: Boolean(l.on), ts: now },
+          },
+        },
+      };
+    }
+    return dev;
+  });
+  const anyLiveOk = live.size === 0 || [...live.values()].some(entry => entry && !entry.error);
+  if (mergedAny || (isUnfiltered && anyLiveOk)) {
+    const nextLiveFetchedAt = isUnfiltered && anyLiveOk ? now : snap.liveFetchedAt;
+    writeHubCache(ctx.paths, {
+      ...snap,
+      devices: updatedDevices,
+      ...(typeof nextLiveFetchedAt === 'number' ? { liveFetchedAt: nextLiveFetchedAt } : {}),
+    });
+    return { devices: updatedDevices, liveFetchedAt: nextLiveFetchedAt };
+  }
+  return { devices: snap.devices, liveFetchedAt: snap.liveFetchedAt };
+}
+
 async function handleDevices(ctx) {
   const { args } = ctx;
   const snap = await loadSnapshot(ctx, { refresh: args.refresh === true || args.refresh === 'true', needHotData: true });
@@ -1509,38 +1610,8 @@ async function handleDevices(ctx) {
   const live = wantLive ? await liveForDevices(ctx, filtered) : new Map();
   let liveFetchedAt = snap.liveFetchedAt;
   if (wantLive) {
-    const now = ctx.now();
     const isUnfiltered = !args.room && !args.category && !(args.controllableOnly === true || args.controllableOnly === 'true');
-    let mergedAny = false;
-    const updatedDevices = snap.devices.map(dev => {
-      const l = live.get(dev.did);
-      if (dev.controlChannel === 'bt_mesh' && l && l.on !== undefined) {
-        const prevCached = dev.cachedState && typeof dev.cachedState === 'object' ? dev.cachedState : { properties: {} };
-        const prevProps = prevCached.properties && typeof prevCached.properties === 'object' ? prevCached.properties : {};
-        mergedAny = true;
-        return {
-          ...dev,
-          cachedState: {
-            ...prevCached,
-            properties: {
-              ...prevProps,
-              '2.1': { value: Boolean(l.on), ts: now },
-            },
-          },
-        };
-      }
-      return dev;
-    });
-    const anyLiveOk = live.size === 0 || [...live.values()].some(entry => entry && !entry.error);
-    if (mergedAny || (isUnfiltered && anyLiveOk)) {
-      const nextLiveFetchedAt = isUnfiltered && anyLiveOk ? now : snap.liveFetchedAt;
-      writeHubCache(ctx.paths, {
-        ...snap,
-        devices: updatedDevices,
-        ...(typeof nextLiveFetchedAt === 'number' ? { liveFetchedAt: nextLiveFetchedAt } : {}),
-      });
-      liveFetchedAt = nextLiveFetchedAt;
-    }
+    liveFetchedAt = persistLiveStates(ctx, snap, live, isUnfiltered).liveFetchedAt;
   }
   const items = filtered.map(d => {
     const l = live.get(d.did);
@@ -2204,6 +2275,997 @@ async function handleCommand(ctx) {
   }
 }
 
+// ---- mesh / geek / scene / dashboard --------------------------------------
+
+function mergeWriteCentralCache(paths, patch) {
+  const prev = readCentralCache(paths?.centralCachePath) ?? {};
+  writeCentralCache(paths?.centralCachePath, { ...prev, ...patch });
+}
+
+async function loadSnapshotBestEffort(ctx, { refresh = false, needHotData = true } = {}) {
+  try {
+    return { snap: await loadSnapshot(ctx, { refresh, needHotData }), error: undefined };
+  } catch (err) {
+    const cached = readHubCache(ctx.paths);
+    if (cached) {
+      return {
+        snap: { ...cached, source: 'stale', ageMs: Math.max(0, ctx.now() - cached.fetchedAt) },
+        error: errMsg(err),
+      };
+    }
+    return {
+      snap: { homeId: '', fetchedAt: 0, hotDataFetchedAt: 0, devices: [], tokenByDid: {}, source: 'empty', ageMs: 0 },
+      error: errMsg(err),
+    };
+  }
+}
+
+function buildDevicesByDid(devices) {
+  return new Map((Array.isArray(devices) ? devices : []).map(d => [String(d.did), d]));
+}
+
+function buildDevicesView(ctx, devices, live = new Map()) {
+  return (Array.isArray(devices) ? devices : []).map(d => {
+    const l = live.get(d.did);
+    /** @type {Record<string, any>} */
+    const extra = {
+      protected: Boolean(findProtectedRuleForDevice(ctx.cfg, d)),
+    };
+    if (l?.fryer) extra.fryer = l.fryer;
+    if (l && l.on !== undefined) extra.state = { on: l.on, source: 'live' };
+    if (l?.error) extra.liveError = l.error;
+    return publicDevice(d, extra);
+  });
+}
+
+async function fetchVariablesForScopes(ctx, scopes) {
+  /** @type {any[]} */
+  const variables = [];
+  for (const rawScope of (Array.isArray(scopes) ? scopes : []).slice(0, 16)) {
+    const scope = String(rawScope ?? '').trim();
+    if (!scope || !VAR_IDENT_RE.test(scope)) continue;
+    try {
+      const listRes = await ctx.centralMipsCall('local/autoLocal/getVarList', { scope });
+      const rawList = Array.isArray(listRes)
+        ? listRes
+        : Array.isArray(listRes?.list)
+          ? listRes.list
+          : Array.isArray(listRes?.vars)
+            ? listRes.vars
+            : Array.isArray(listRes?.variables)
+              ? listRes.variables
+              : [];
+      for (const item of rawList) {
+        if (typeof item === 'string') {
+          const id = item.trim();
+          if (!id) continue;
+          let value;
+          try {
+            const valRes = await ctx.centralMipsCall('local/autoLocal/getVarValue', { scope, id });
+            value = valRes?.value ?? valRes?.result;
+          } catch {
+            value = undefined;
+          }
+          variables.push({ scope, id, type: typeof value === 'number' ? 'number' : 'string', value });
+        } else if (item && typeof item === 'object') {
+          const id = String(item.id ?? item.name ?? '').trim();
+          if (!id) continue;
+          let value = item.value;
+          if (value === undefined) {
+            try {
+              const valRes = await ctx.centralMipsCall('local/autoLocal/getVarValue', { scope, id });
+              value = valRes?.value ?? valRes?.result;
+            } catch {
+              value = undefined;
+            }
+          }
+          variables.push({
+            scope,
+            id,
+            type: String(item.type ?? item.varType ?? (typeof value === 'number' ? 'number' : 'string')),
+            value,
+          });
+        }
+      }
+    } catch {
+      // skip unreadable scope
+    }
+  }
+  return variables;
+}
+
+async function resolveSpeakerViewSafe(paths, args = {}) {
+  try {
+    const spk = await discoverSpeakerSsh({
+      speakerSsh: args.speakerSsh,
+      pluginDataDir: paths.pluginDataDir,
+      dataDir: paths.dataDir,
+      homeDir: paths.homeDir,
+    });
+    return {
+      configured: true,
+      id: spk.id,
+      userHost: spk.userHost,
+      ...(spk.port ? { port: spk.port } : {}),
+      source: spk.source,
+    };
+  } catch {
+    return { configured: false };
+  }
+}
+
+function parseArrayLikeArg(raw) {
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return [];
+    if (trimmed.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) return parsed;
+      } catch {
+        // fall through to comma split
+      }
+    }
+    return trimmed.split(/[,，、\n]/).map(s => s.trim()).filter(Boolean);
+  }
+  return undefined;
+}
+
+function summarizeGeekList(overview, devicesByDid) {
+  const bodies = overview?.geekGraphBodiesById ?? {};
+  return (Array.isArray(overview?.geekGraphs) ? overview.geekGraphs : []).map(cfg => {
+    const body = bodies[cfg.id] ?? { id: cfg.id, nodes: [] };
+    const summary = summarizeGeekGraph(body, cfg, devicesByDid);
+    return {
+      ...summary,
+      cfg,
+    };
+  });
+}
+
+function summarizeScenesList(overview, devicesByDid, cfg) {
+  const idSet = new Set([
+    ...(Array.isArray(overview?.actionGroupIds) ? overview.actionGroupIds : []),
+    ...Object.keys(overview?.cloudScenesById ?? {}),
+  ]);
+  const scenes = [];
+  for (const id of idSet) {
+    const decoded = overview?.cloudScenesById?.[id];
+    scenes.push(summarizeCloudScene(id, decoded, devicesByDid, dev => findProtectedRuleForDevice(cfg, dev)));
+  }
+  return scenes;
+}
+
+async function resolveGeekCfg(ctx, { id = undefined, name = undefined } = {}) {
+  const listRes = await ctx.centralMipsCall('local/autoLocal/getGraphList', {});
+  const list = Array.isArray(listRes) ? listRes : [];
+  const cleanId = id !== undefined && id !== null ? String(id).trim() : '';
+  const cleanName = name !== undefined && name !== null ? String(name).trim() : '';
+  if (cleanId) {
+    const hit = list.find(g => String(g?.id ?? '') === cleanId);
+    if (!hit) {
+      throw new MiotError(`未找到 ID 为 "${cleanId}" 的极客版规则。`, { code: 'GEEK_RULE_NOT_FOUND' });
+    }
+    return { cfg: hit, all: list };
+  }
+  if (!cleanName) {
+    throw new MiotError('请通过 id 或 name 指定极客版规则。', { code: 'GEEK_RULE_REQUIRED' });
+  }
+  const exact = list.filter(g => String(g?.userData?.name ?? '').trim() === cleanName);
+  if (exact.length === 1) return { cfg: exact[0], all: list };
+  if (exact.length > 1) {
+    throw new MiotError(`"${cleanName}" 匹配到多条同名规则，请使用 id 指定。`, { code: 'AMBIGUOUS_GEEK_RULE' });
+  }
+  const lower = cleanName.toLowerCase();
+  const fuzzy = list.filter(g => String(g?.userData?.name ?? '').trim().toLowerCase().includes(lower));
+  if (fuzzy.length === 1) return { cfg: fuzzy[0], all: list };
+  if (fuzzy.length > 1) {
+    throw new MiotError(`"${cleanName}" 匹配到多条规则：${fuzzy.map(g => `${g.userData?.name ?? g.id}(${g.id})`).join('、')}。请使用 id 指定。`, { code: 'AMBIGUOUS_GEEK_RULE' });
+  }
+  throw new MiotError(`未找到名称为 "${cleanName}" 的极客版规则。`, { code: 'GEEK_RULE_NOT_FOUND' });
+}
+
+async function handleMesh(ctx) {
+  const { args } = ctx;
+  const op = String(args.op ?? 'status').trim().toLowerCase();
+  const dryRun = isDry(args);
+  if (!['status', 'devices', 'batch'].includes(op)) {
+    return failure('Mesh 中枢操作失败', `不支持的 op "${op}"，可用：status、devices、batch。`);
+  }
+
+  try {
+    if (op === 'batch') {
+      const targetOn = parseBoolish(args.on);
+      if (typeof targetOn !== 'boolean') {
+        return failure('Mesh 批量控制失败', '请通过 on:true 或 on:false 指定批量开关目标。');
+      }
+      const snap = await loadSnapshot(ctx, { refresh: args.refresh === true || args.refresh === 'true', needHotData: false });
+      const meshPool = snap.devices.filter(d => d.controlChannel === 'bt_mesh' && d.controllable);
+      const roomFilter = args.room ? String(args.room).trim() : '';
+      const deviceQueries = parseArrayLikeArg(args.devices);
+
+      /** @type {any[]} */
+      let selected = [];
+      if (deviceQueries && deviceQueries.length > 0) {
+        const seen = new Set();
+        for (const q of deviceQueries) {
+          const dev = resolveDevice(meshPool, { device: q, room: roomFilter || undefined, customAliases: ctx.cfg.customAliases });
+          if (!seen.has(dev.did)) {
+            seen.add(dev.did);
+            selected.push(dev);
+          }
+        }
+      } else {
+        selected = roomFilter ? meshPool.filter(d => roomMatches(d, roomFilter)) : meshPool;
+      }
+
+      const includeProtected = args.includeProtected === true || args.includeProtected === 'true';
+      /** @type {any[]} */
+      const targets = [];
+      /** @type {any[]} */
+      const skipped = [];
+      for (const dev of selected) {
+        const rule = findProtectedRuleForDevice(ctx.cfg, dev);
+        if (rule && !includeProtected) {
+          skipped.push({ did: dev.did, name: fullName(dev), reason: 'protected_device', protectedRule: rule });
+        } else {
+          targets.push(dev);
+        }
+      }
+
+      if (targets.length === 0) {
+        if (skipped.length > 0) {
+          return failure(
+            'Mesh 批量控制受保护',
+            `匹配到的设备（${skipped.map(s => s.name).join('、')}）均已设为保护设备，已自动跳过（如需强行包含请传 includeProtected:true）。`,
+            { blocked: true, reason: 'protected_device', skipped },
+          );
+        }
+        return failure('Mesh 批量控制失败', '未匹配到可控制的蓝牙 Mesh 设备。');
+      }
+
+      const items = targets.map(d => ({ did: d.did, siid: 2, piid: 1, value: targetOn }));
+      const targetViews = targets.map(d => publicDevice(d, { protected: Boolean(findProtectedRuleForDevice(ctx.cfg, d)) }));
+      if (dryRun) {
+        return success(
+          'Mesh 批量控制（预演）',
+          `将批量${targetOn ? '打开' : '关闭'} ${targets.length} 台蓝牙 Mesh 设备：${targets.map(fullName).join('、')}${skipped.length ? `（跳过受保护：${skipped.map(s => s.name).join('、')}）` : ''}`,
+          { dryRun: true, transport: 'bt_mesh', on: targetOn, targets: targetViews, skipped, plan: { method: 'set_properties', params: items } },
+        );
+      }
+
+      const results = await bleSetProperties(ctx, items);
+      const succeeded = [];
+      const failed = [];
+      for (const dev of targets) {
+        const r = results.find(x => x.did === dev.did && x.siid === 2 && x.piid === 1);
+        if (r && (r.code === 0 || r.code === undefined)) {
+          succeeded.push({ did: dev.did, name: fullName(dev) });
+        } else {
+          failed.push({ did: dev.did, name: fullName(dev), code: r?.code ?? '无返回' });
+        }
+      }
+      const actionLabel = targetOn ? '打开' : '关闭';
+      const parts = [];
+      if (succeeded.length) parts.push(`已${actionLabel} ${succeeded.length} 台：${succeeded.map(s => s.name).join('、')}`);
+      if (failed.length) parts.push(`失败 ${failed.length} 台：${failed.map(f => `${f.name}(code=${f.code})`).join('、')}`);
+      if (skipped.length) parts.push(`跳过受保护 ${skipped.length} 台：${skipped.map(s => s.name).join('、')}`);
+      const ok = failed.length === 0;
+      return (ok ? success : failure)(
+        ok ? 'Mesh 批量控制' : 'Mesh 批量控制部分失败',
+        parts.join('；'),
+        { on: targetOn, succeeded, failed, skipped, results },
+      );
+    }
+
+    const wantRefresh = args.refresh === true || args.refresh === 'true';
+    const wantLive = args.live === true || args.live === 'true';
+    const snap = await loadSnapshot(ctx, { refresh: wantRefresh, needHotData: true });
+    const routerDev = snap.devices.find(d => d.category === 'router');
+    const overview = op === 'status'
+      ? await ctx.fetchCentralOverview({
+        routerDid: routerDev?.did ?? '',
+        includeLogs: false,
+        includeCloudScenes: false,
+        includeGraphContents: false,
+      })
+      : null;
+
+    const meshAll = snap.devices.filter(d => d.controlChannel === 'bt_mesh');
+    const meshFiltered = args.room ? meshAll.filter(d => roomMatches(d, args.room)) : meshAll;
+    const live = wantLive ? await liveForDevices(ctx, meshFiltered) : new Map();
+    if (wantLive) {
+      persistLiveStates(ctx, snap, live, !args.room);
+    }
+
+    const btDidSet = new Set(overview?.btMeshDids ?? []);
+    const items = meshFiltered.map(d => {
+      const l = live.get(d.did);
+      /** @type {Record<string, any>} */
+      const extra = {
+        protected: Boolean(findProtectedRuleForDevice(ctx.cfg, d)),
+        ...(btDidSet.size > 0 ? { inBtGateway: btDidSet.has(d.did) } : {}),
+      };
+      if (l && l.on !== undefined) extra.state = { on: l.on, source: 'live' };
+      if (l?.error) extra.liveError = l.error;
+      return publicDevice(d, extra);
+    });
+
+    if (overview) {
+      mergeWriteCentralCache(ctx.paths, {
+        fetchedAt: ctx.now(),
+        gateway: overview.gateway,
+        subGateways: overview.subGateways,
+        btService: overview.btService,
+        btMeshDids: overview.btMeshDids,
+        geekReady: overview.geekReady,
+        geekUrl: overview.geekUrl,
+      });
+    }
+
+    const devDesc = items.map(d => {
+      const st = d.state?.on !== undefined ? (d.state.on ? '开' : '关') : (d.online ? '在线' : '离线');
+      return `${d.fullName}(${st})`;
+    }).join('、') || '（无）';
+
+    if (op === 'devices') {
+      return success('蓝牙 Mesh 设备', `共 ${items.length} 台蓝牙 Mesh 设备${wantLive ? '（实时）' : ''}：${devDesc}`, {
+        op,
+        count: items.length,
+        live: wantLive,
+        devices: items,
+      });
+    }
+
+    const gw = overview?.gateway ?? {};
+    const gwLine = `${gw.roleLabel || '中枢网关'} ${gw.homeName ? `「${gw.homeName}」` : ''}${gw.ip ? `(${gw.ip})` : ''} · ${gw.online ? '在线' : '状态未知'} · bt_service ${overview?.btService?.version || '未知'} · 从网关 ${overview?.subGateways?.length ?? 0} 台`;
+    return success(
+      'BE6500 Pro Mesh 中枢',
+      `${gwLine}\n蓝牙 Mesh 设备 (${items.length})：${devDesc}`,
+      {
+        op,
+        gateway: overview?.gateway,
+        subGateways: overview?.subGateways ?? [],
+        btService: overview?.btService,
+        btMeshDids: overview?.btMeshDids ?? [],
+        geekReady: overview?.geekReady ?? false,
+        geekUrl: overview?.geekUrl ?? '',
+        count: items.length,
+        live: wantLive,
+        devices: items,
+      },
+    );
+  } catch (err) {
+    return failFromError('Mesh 中枢操作失败', err);
+  }
+}
+
+async function handleGeek(ctx) {
+  const { args } = ctx;
+  const op = String(args.op ?? 'list').trim().toLowerCase();
+  const dryRun = isDry(args);
+  const supported = [
+    'list', 'get', 'enable', 'disable', 'toggle',
+    'create-schedule', 'save', 'delete',
+    'logs', 'nodes',
+    'vars', 'var-get', 'var-set', 'var-create', 'var-delete',
+    'url',
+  ];
+  if (!supported.includes(op)) {
+    return failure('极客自动化操作失败', `不支持的 op "${op}"，可用：${supported.join('、')}。`);
+  }
+
+  try {
+    if (op === 'url') {
+      const overview = await ctx.fetchCentralOverview({
+        includeLogs: false,
+        includeCloudScenes: false,
+        includeGraphContents: false,
+      });
+      if (!overview.geekUrl) {
+        return failure('获取极客版入口失败', '未能从 BE6500 Pro 获取有效的极客版服务地址。', { geekReady: overview.geekReady });
+      }
+      return success('米家自动化极客版入口', `极客版画布地址：${overview.geekUrl}（${overview.geekReady ? '引擎已就绪' : '引擎未就绪'}）`, {
+        geekUrl: overview.geekUrl,
+        geekReady: overview.geekReady,
+        port: overview.gateway?.geekPort,
+      });
+    }
+
+    if (op === 'nodes') {
+      const res = await ctx.centralMipsCall('local/autoLocal/getNodeVersion', {});
+      const nodes = Array.isArray(res?.nodes) ? res.nodes : [];
+      return success(
+        '极客版节点目录',
+        `autoLocal 引擎 v${res?.version ?? '未知'}，支持 ${nodes.length} 种节点：${nodes.map(n => n.name).join('、')}`,
+        { version: res?.version, nodes },
+      );
+    }
+
+    if (op === 'list') {
+      const { snap } = await loadSnapshotBestEffort(ctx, { refresh: false, needHotData: false });
+      const routerDev = snap.devices.find(d => d.category === 'router');
+      const devicesByDid = buildDevicesByDid(snap.devices);
+      const overview = await ctx.fetchCentralOverview({
+        routerDid: routerDev?.did ?? '',
+        includeLogs: false,
+        includeCloudScenes: false,
+        includeGraphContents: true,
+      });
+      const graphs = summarizeGeekList(overview, devicesByDid);
+      const enabledCount = graphs.filter(g => g.enable).length;
+      mergeWriteCentralCache(ctx.paths, {
+        fetchedAt: ctx.now(),
+        gateway: overview.gateway,
+        geekReady: overview.geekReady,
+        geekUrl: overview.geekUrl,
+        geekGraphs: graphs,
+        varScopes: overview.varScopes,
+      });
+      const lines = graphs.map(g => `• [${g.enable ? '启用' : '停用'}] ${g.name} (id=${g.id})：${g.summary}`);
+      return success(
+        '米家自动化极客版',
+        graphs.length
+          ? `共 ${graphs.length} 条极客规则（${enabledCount} 条运行中）：\n${lines.join('\n')}`
+          : '当前没有本地极客版自动化规则。',
+        {
+          geekReady: overview.geekReady,
+          geekUrl: overview.geekUrl,
+          count: graphs.length,
+          enabledCount,
+          graphs,
+        },
+      );
+    }
+
+    if (op === 'get') {
+      const { snap } = await loadSnapshotBestEffort(ctx, { refresh: false, needHotData: false });
+      const devicesByDid = buildDevicesByDid(snap.devices);
+      const { cfg } = await resolveGeekCfg(ctx, { id: args.id, name: args.name });
+      const graph = await ctx.centralMipsCall('local/autoLocal/getGraph', { id: cfg.id });
+      const summary = summarizeGeekGraph(graph, cfg, devicesByDid);
+      return success('极客规则详情', `规则「${summary.name}」[${summary.enable ? '启用' : '停用'}]：${summary.summary}`, {
+        id: cfg.id,
+        cfg,
+        graph,
+        summary,
+      });
+    }
+
+    if (op === 'enable' || op === 'disable' || op === 'toggle') {
+      const { cfg } = await resolveGeekCfg(ctx, { id: args.id, name: args.name });
+      const nextEnable = op === 'enable' ? true : op === 'disable' ? false : !cfg.enable;
+      const ruleName = String(cfg.userData?.name ?? cfg.id);
+      const payload = {
+        id: cfg.id,
+        enable: nextEnable,
+        uiType: typeof cfg.uiType === 'string' && cfg.uiType ? cfg.uiType : 'test',
+        userData: {
+          transform: { x: 0, y: 0, scale: 1, rotate: 0 },
+          version: 0,
+          ...(cfg.userData && typeof cfg.userData === 'object' ? cfg.userData : {}),
+          name: ruleName,
+          lastUpdateTime: ctx.now(),
+        },
+      };
+      if (dryRun) {
+        return success('极客规则控制（预演）', `将${nextEnable ? '启用' : '停用'}极客规则「${ruleName}」`, {
+          dryRun: true,
+          topic: 'local/autoLocal/changeGraphConfig',
+          payload,
+          id: cfg.id,
+          name: ruleName,
+          previousEnable: Boolean(cfg.enable),
+          enable: nextEnable,
+        });
+      }
+      await ctx.centralMipsCall('local/autoLocal/changeGraphConfig', payload);
+      return success('极客规则控制', `已${nextEnable ? '启用' : '停用'}极客规则「${ruleName}」`, {
+        id: cfg.id,
+        name: ruleName,
+        previousEnable: Boolean(cfg.enable),
+        enable: nextEnable,
+      });
+    }
+
+    if (op === 'create-schedule') {
+      const snap = await loadSnapshot(ctx, { refresh: args.refresh === true || args.refresh === 'true', needHotData: false });
+      const devicesByDid = buildDevicesByDid(snap.devices);
+      let rules = parseArrayLikeArg(args.rules);
+      if ((!rules || rules.length === 0) && args.time !== undefined) {
+        const onVal = parseBoolish(args.on);
+        rules = [{
+          time: args.time,
+          device: args.device,
+          did: args.did,
+          room: args.room,
+          ...(typeof onVal === 'boolean' ? { on: onVal } : {}),
+          ...(args.siid !== undefined ? { siid: args.siid } : {}),
+          ...(args.piid !== undefined ? { piid: args.piid } : {}),
+          ...(args.value !== undefined ? { value: args.value } : {}),
+          ...(args.days !== undefined ? { days: args.days } : {}),
+        }];
+      }
+      const enable = args.enable === undefined ? true : (args.enable === true || args.enable === 'true');
+      const built = buildScheduleGeekGraph({
+        id: args.id ? String(args.id).trim() : undefined,
+        name: args.name,
+        enable,
+        rules: rules ?? [],
+        resolveDeviceFn: rule => resolveDevice(snap.devices, {
+          device: rule.device ?? args.device,
+          did: rule.did ?? args.did,
+          room: rule.room ?? args.room,
+          customAliases: ctx.cfg.customAliases,
+        }),
+        nowMs: ctx.now(),
+      });
+      const summary = summarizeGeekGraph(built, built.cfg, devicesByDid);
+      if (dryRun) {
+        return success('创建定时极客规则（预演）', `将创建极客规则「${summary.name}」：${summary.summary}`, {
+          dryRun: true,
+          topic: 'local/autoLocal/setGraph',
+          payload: built,
+          summary,
+        });
+      }
+      await ctx.centralMipsCall('local/autoLocal/setGraph', built);
+      return success(
+        '极客规则已创建',
+        `已创建并${enable ? '启用' : '保存'}极客规则「${summary.name}」：${summary.summary}`,
+        { id: built.id, cfg: built.cfg, graph: { id: built.id, nodes: built.nodes }, summary },
+      );
+    }
+
+    if (op === 'save') {
+      let rawNodes = args.nodes;
+      if (typeof rawNodes === 'string') {
+        try { rawNodes = JSON.parse(rawNodes); } catch { /* validated below */ }
+      }
+      const nodes = validateGeekNodes(rawNodes);
+      const graphId = args.id ? validateGraphId(args.id) : String(Math.floor(ctx.now()));
+      const prevCfg = args.id
+        ? await ctx.centralMipsCall('local/autoLocal/getGraphList', {})
+          .then(list => (Array.isArray(list) ? list.find(g => String(g?.id ?? '') === graphId) : undefined))
+          .catch(() => undefined)
+        : undefined;
+      const name = String(args.name ?? args.cfg?.userData?.name ?? prevCfg?.userData?.name ?? graphId).trim();
+      if (!name) return failure('保存极客规则失败', '规则名称不能为空。');
+      const enable = args.enable !== undefined
+        ? (args.enable === true || args.enable === 'true')
+        : (args.cfg?.enable ?? prevCfg?.enable ?? true);
+      const uiType = String(args.uiType ?? args.cfg?.uiType ?? prevCfg?.uiType ?? 'test').trim() || 'test';
+      const payload = {
+        id: graphId,
+        nodes,
+        cfg: {
+          id: graphId,
+          userData: {
+            transform: { x: 0, y: 0, scale: 1, rotate: 0 },
+            version: 0,
+            ...(prevCfg?.userData && typeof prevCfg.userData === 'object' ? prevCfg.userData : {}),
+            ...(args.userData && typeof args.userData === 'object' ? args.userData : {}),
+            name,
+            lastUpdateTime: ctx.now(),
+          },
+          uiType,
+          enable: Boolean(enable),
+        },
+      };
+      if (dryRun) {
+        return success('保存极客规则（预演）', `将写入极客规则「${name}」(id=${graphId}, ${nodes.length} 个节点)`, {
+          dryRun: true,
+          topic: 'local/autoLocal/setGraph',
+          payload,
+        });
+      }
+      await ctx.centralMipsCall('local/autoLocal/setGraph', payload);
+      return success('极客规则已保存', `已保存极客规则「${name}」(id=${graphId})`, {
+        id: graphId,
+        cfg: payload.cfg,
+        nodeCount: nodes.length,
+      });
+    }
+
+    if (op === 'delete') {
+      const { cfg } = await resolveGeekCfg(ctx, { id: args.id, name: args.name });
+      const ruleName = String(cfg.userData?.name ?? cfg.id);
+      if (dryRun) {
+        return success('删除极客规则（预演）', `将删除极客规则「${ruleName}」(id=${cfg.id})`, {
+          dryRun: true,
+          topic: 'local/autoLocal/deleteGraph',
+          payload: { id: cfg.id },
+          id: cfg.id,
+          name: ruleName,
+        });
+      }
+      await ctx.centralMipsCall('local/autoLocal/deleteGraph', { id: cfg.id });
+      return success('极客规则已删除', `已删除极客规则「${ruleName}」(id=${cfg.id})`, {
+        id: cfg.id,
+        name: ruleName,
+      });
+    }
+
+    if (op === 'logs') {
+      const limit = clampInt(args.limit, 1, 200) ?? 30;
+      const overview = await ctx.fetchCentralOverview({
+        includeLogs: true,
+        logLimit: Math.max(limit * 4, 120),
+        includeCloudScenes: false,
+        includeGraphContents: false,
+      });
+      const graphNameById = new Map((overview.geekGraphs ?? []).map(g => [String(g.id), String(g.userData?.name ?? g.id)]));
+      let graphId = args.graphId ? String(args.graphId).trim() : (args.id ? String(args.id).trim() : '');
+      if (!graphId && args.name) {
+        const needle = String(args.name).trim();
+        const match = (overview.geekGraphs ?? []).find(g => String(g.userData?.name ?? '').trim() === needle);
+        if (match) graphId = String(match.id);
+      }
+      const logs = parseAutoLocalLogs(overview.rawLogText, { graphNameById, graphId, limit });
+      const lines = logs.slice(0, 12).map(l => `• [${new Date(l.ts).toLocaleTimeString('zh-CN', { hour12: false })}] ${l.graphName}：${l.summary}`);
+      return success(
+        '极客版执行日志',
+        logs.length ? `最近 ${logs.length} 条记录：\n${lines.join('\n')}` : '暂无极客版执行日志。',
+        { count: logs.length, ...(graphId ? { graphId } : {}), logs },
+      );
+    }
+
+    if (op === 'vars') {
+      let scopes;
+      if (args.scope !== undefined && String(args.scope).trim() !== '') {
+        scopes = [validateVarIdentifier(args.scope, '变量作用域')];
+      } else {
+        const scopeRes = await ctx.centralMipsCall('local/autoLocal/getVarScopeList', {});
+        scopes = Array.isArray(scopeRes?.scopes) ? scopeRes.scopes.map(s => String(s)) : [];
+      }
+      const variables = await fetchVariablesForScopes(ctx, scopes);
+      return success(
+        '极客版自定义变量',
+        variables.length
+          ? `共 ${scopes.length} 个作用域、${variables.length} 个变量：${variables.map(v => `${v.scope}.${v.id}=${JSON.stringify(v.value)}`).join('、')}`
+          : `当前共有 ${scopes.length} 个变量作用域，暂无自定义变量。`,
+        { scopes, count: variables.length, variables },
+      );
+    }
+
+    if (op === 'var-get') {
+      const scope = validateVarIdentifier(args.scope, '变量作用域');
+      const id = validateVarIdentifier(args.id, '变量 ID');
+      const res = await ctx.centralMipsCall('local/autoLocal/getVarValue', { scope, id });
+      const value = res?.value ?? res?.result ?? res;
+      return success('极客版变量读取', `${scope}.${id} = ${JSON.stringify(value)}`, { scope, id, value });
+    }
+
+    if (op === 'var-set') {
+      const scope = validateVarIdentifier(args.scope, '变量作用域');
+      const id = validateVarIdentifier(args.id, '变量 ID');
+      if (args.value === undefined) return failure('极客版变量更新失败', '请提供要写入的 value。');
+      const value = coerceValue(args.value);
+      const payload = { scope, id, value };
+      if (dryRun) {
+        return success('极客版变量更新（预演）', `将设置 ${scope}.${id} = ${JSON.stringify(value)}`, {
+          dryRun: true,
+          topic: 'local/autoLocal/setVarValue',
+          payload,
+        });
+      }
+      await ctx.centralMipsCall('local/autoLocal/setVarValue', payload);
+      return success('极客版变量已更新', `已将 ${scope}.${id} 设为 ${JSON.stringify(value)}`, { scope, id, value });
+    }
+
+    if (op === 'var-create') {
+      const scope = validateVarIdentifier(args.scope, '变量作用域');
+      const id = validateVarIdentifier(args.id, '变量 ID');
+      const type = String(args.type ?? 'number').trim().toLowerCase();
+      if (!['number', 'string'].includes(type)) {
+        return failure('极客版变量创建失败', 'type 只能为 number 或 string。');
+      }
+      let value;
+      if (type === 'number') {
+        const coerced = args.value === undefined || args.value === null || args.value === '' ? 0 : coerceValue(args.value);
+        if (typeof coerced !== 'number' || !Number.isFinite(coerced)) {
+          return failure('极客版变量创建失败', `number 类型变量需要有效数字，收到 "${String(args.value ?? '')}"。`);
+        }
+        value = coerced;
+      } else {
+        value = String(args.value ?? '');
+      }
+      const payload = { scope, id, type, value };
+      if (dryRun) {
+        return success('极客版变量创建（预演）', `将创建 ${type} 变量 ${scope}.${id} = ${JSON.stringify(value)}`, {
+          dryRun: true,
+          topic: 'local/autoLocal/createVar',
+          payload,
+        });
+      }
+      await ctx.centralMipsCall('local/autoLocal/createVar', payload);
+      return success('极客版变量已创建', `已创建变量 ${scope}.${id} (${type}) = ${JSON.stringify(value)}`, payload);
+    }
+
+    // var-delete
+    const scope = validateVarIdentifier(args.scope, '变量作用域');
+    const id = validateVarIdentifier(args.id, '变量 ID');
+    if (dryRun) {
+      return success('极客版变量删除（预演）', `将删除变量 ${scope}.${id}`, {
+        dryRun: true,
+        topic: 'local/autoLocal/deleteVar',
+        payload: { scope, id },
+      });
+    }
+    await ctx.centralMipsCall('local/autoLocal/deleteVar', { scope, id });
+    return success('极客版变量已删除', `已删除变量 ${scope}.${id}`, { scope, id });
+  } catch (err) {
+    return failFromError('极客自动化操作失败', err);
+  }
+}
+
+async function handleScene(ctx) {
+  const { args } = ctx;
+  const op = String(args.op ?? 'list').trim().toLowerCase();
+  const dryRun = isDry(args);
+  if (!['list', 'run'].includes(op)) {
+    return failure('米家本地场景操作失败', `不支持的 op "${op}"，可用：list、run。`);
+  }
+
+  try {
+    const { snap } = await loadSnapshotBestEffort(ctx, { refresh: false, needHotData: false });
+    const routerDev = snap.devices.find(d => d.category === 'router');
+    const devicesByDid = buildDevicesByDid(snap.devices);
+    const overview = await ctx.fetchCentralOverview({
+      routerDid: routerDev?.did ?? '',
+      includeLogs: false,
+      includeCloudScenes: true,
+      includeGraphContents: false,
+    });
+    const scenes = summarizeScenesList(overview, devicesByDid, ctx.cfg);
+
+    if (op === 'list') {
+      mergeWriteCentralCache(ctx.paths, {
+        fetchedAt: ctx.now(),
+        scenes,
+      });
+      const lines = scenes.map(s => `• ${s.id}：${s.summary}${s.turnsOffProtected ? ' [含关闭保护设备]' : ''}`);
+      return success(
+        '米家本地场景',
+        scenes.length ? `共 ${scenes.length} 个中枢本地场景：\n${lines.join('\n')}` : '当前没有本地化的米家手动场景。',
+        { count: scenes.length, scenes },
+      );
+    }
+
+    const id = String(args.id ?? '').trim();
+    if (!id) return failure('米家场景执行失败', '请提供要执行的本地场景 id。');
+    if (!GRAPH_ID_RE.test(id)) return failure('米家场景执行失败', `场景 ID "${id}" 格式无效。`);
+    const sceneInfo = scenes.find(s => s.id === id);
+    if (!sceneInfo) {
+      return failure('米家场景执行失败', `未找到本地场景 "${id}"。可用场景：${scenes.map(s => `${s.id}(${s.summary})`).join('、') || '（无）'}。`);
+    }
+    const confirmProtected = args.confirmProtected === true || args.confirmProtected === 'true';
+    if (sceneInfo.turnsOffProtected && !confirmProtected) {
+      return failure(
+        '米家场景受保护拦截',
+        `场景「${sceneInfo.summary}」包含关闭保护设备的操作，已拦截。如需确认执行，请传 confirmProtected:true。`,
+        { blocked: true, reason: 'protected_device', scene: sceneInfo },
+      );
+    }
+    const payload = { id, operation: 'user.click' };
+    if (dryRun) {
+      return success('米家场景执行（预演）', `将触发本地场景 ${id}：${sceneInfo.summary}`, {
+        dryRun: true,
+        topic: 'local/automation/execMijiaActionGroup',
+        payload,
+        scene: sceneInfo,
+      });
+    }
+    await ctx.centralMipsCall('local/automation/execMijiaActionGroup', payload);
+    return success('米家场景已触发', `已执行本地场景：${sceneInfo.summary}`, { id, scene: sceneInfo });
+  } catch (err) {
+    return failFromError('米家本地场景操作失败', err);
+  }
+}
+
+async function handleDashboard(ctx) {
+  const { args } = ctx;
+  const cacheOnly = args.cacheOnly === true || args.cacheOnly === 'true';
+  const wantRefresh = args.refresh === true || args.refresh === 'true';
+  const wantLive = args.live === true || args.live === 'true';
+  const logLimit = clampInt(args.logLimit, 5, 100) ?? 30;
+  const speaker = await resolveSpeakerViewSafe(ctx.paths, args);
+  const configured = Boolean(ctx.cfg.routerSsh);
+
+  if (cacheOnly) {
+    const hubCache = readHubCache(ctx.paths);
+    const centralCache = readCentralCache(ctx.paths.centralCachePath);
+    const devices = buildDevicesView(ctx, hubCache?.devices ?? []);
+    const counts = {};
+    for (const d of devices) counts[d.category] = (counts[d.category] ?? 0) + 1;
+    const geekGraphs = Array.isArray(centralCache?.geekGraphs) ? centralCache.geekGraphs : [];
+    const geekLogs = Array.isArray(centralCache?.geekLogs) ? centralCache.geekLogs : [];
+    const scenes = Array.isArray(centralCache?.scenes) ? centralCache.scenes : [];
+    const varScopes = Array.isArray(centralCache?.varScopes) ? centralCache.varScopes : [];
+    const variables = Array.isArray(centralCache?.variables) ? centralCache.variables : [];
+    const gateway = centralCache?.gateway ?? null;
+    const meshCount = devices.filter(d => d.controlChannel === 'bt_mesh').length;
+    return success(
+      '米家中枢看板（缓存）',
+      configured
+        ? `缓存快照：${devices.length} 台设备（${meshCount} 台蓝牙 Mesh）、${geekGraphs.length} 条极客规则、${scenes.length} 个本地场景`
+        : '尚未配置 BE6500 Pro 路由器 SSH 地址（routerSsh）。',
+      {
+        fromCache: true,
+        configured,
+        degraded: false,
+        routerSsh: ctx.cfg.routerSsh,
+        devices,
+        counts,
+        gateway,
+        subGateways: Array.isArray(centralCache?.subGateways) ? centralCache.subGateways : [],
+        btService: centralCache?.btService ?? null,
+        btMeshDids: Array.isArray(centralCache?.btMeshDids) ? centralCache.btMeshDids : [],
+        geekReady: centralCache?.geekReady === true,
+        geekUrl: typeof centralCache?.geekUrl === 'string' ? centralCache.geekUrl : '',
+        geekGraphs,
+        geekLogs,
+        varScopes,
+        variables,
+        scenes,
+        fetchedAt: hubCache?.fetchedAt ?? null,
+        hotDataFetchedAt: hubCache?.hotDataFetchedAt ?? null,
+        liveFetchedAt: hubCache?.liveFetchedAt ?? null,
+        centralFetchedAt: centralCache?.fetchedAt ?? null,
+        speaker,
+        config: ctx.cfg,
+      },
+    );
+  }
+
+  if (!configured) {
+    return success('米家中枢未配置', '尚未配置 BE6500 Pro 路由器 SSH 地址（routerSsh），请先在配置中填写。', {
+      fromCache: false,
+      configured: false,
+      degraded: false,
+      routerSsh: '',
+      devices: [],
+      counts: {},
+      gateway: null,
+      subGateways: [],
+      btService: null,
+      btMeshDids: [],
+      geekReady: false,
+      geekUrl: '',
+      geekGraphs: [],
+      geekLogs: [],
+      varScopes: [],
+      variables: [],
+      scenes: [],
+      fetchedAt: null,
+      hotDataFetchedAt: null,
+      liveFetchedAt: null,
+      centralFetchedAt: null,
+      speaker,
+      config: ctx.cfg,
+    });
+  }
+
+  const { snap, error: hubError } = await loadSnapshotBestEffort(ctx, { refresh: wantRefresh, needHotData: true });
+  let live = new Map();
+  let liveFetchedAt = snap.liveFetchedAt ?? null;
+  if (wantLive && snap.devices.length > 0) {
+    live = await liveForDevices(ctx, snap.devices);
+    liveFetchedAt = persistLiveStates(ctx, snap, live, true).liveFetchedAt ?? liveFetchedAt;
+  }
+
+  const routerDev = snap.devices.find(d => d.category === 'router');
+  let overview = null;
+  let centralError;
+  try {
+    overview = await ctx.fetchCentralOverview({
+      routerDid: routerDev?.did ?? '',
+      includeLogs: true,
+      logLimit,
+      includeCloudScenes: true,
+      includeGraphContents: true,
+    });
+  } catch (err) {
+    centralError = errMsg(err);
+  }
+
+  const devicesByDid = buildDevicesByDid(snap.devices);
+  const devices = buildDevicesView(ctx, snap.devices, live);
+  const counts = {};
+  for (const d of devices) counts[d.category] = (counts[d.category] ?? 0) + 1;
+
+  const prevCentral = readCentralCache(ctx.paths.centralCachePath);
+  if (overview) {
+    const geekGraphs = summarizeGeekList(overview, devicesByDid);
+    const graphNameById = new Map(geekGraphs.map(g => [String(g.id), String(g.name || g.id)]));
+    const geekLogs = parseAutoLocalLogs(overview.rawLogText, { graphNameById, limit: logLimit });
+    const scenes = summarizeScenesList(overview, devicesByDid, ctx.cfg);
+    const variables = overview.varScopes.length > 0
+      ? await fetchVariablesForScopes(ctx, overview.varScopes.slice(0, 8))
+      : [];
+    const centralFetchedAt = ctx.now();
+    const centralPayload = {
+      fetchedAt: centralFetchedAt,
+      gateway: overview.gateway,
+      subGateways: overview.subGateways,
+      btService: overview.btService,
+      btMeshDids: overview.btMeshDids,
+      geekReady: overview.geekReady,
+      geekUrl: overview.geekUrl,
+      geekGraphs,
+      geekLogs,
+      varScopes: overview.varScopes,
+      variables,
+      scenes,
+    };
+    writeCentralCache(ctx.paths.centralCachePath, centralPayload);
+
+    const meshCount = devices.filter(d => d.controlChannel === 'bt_mesh').length;
+    const enabledRules = geekGraphs.filter(g => g.enable).length;
+    const degraded = Boolean(hubError);
+    return success(
+      '米家中枢看板',
+      `${overview.gateway.roleLabel}「${overview.gateway.homeName || 'BE6500 Pro'}」：${devices.length} 台设备（${meshCount} 台蓝牙 Mesh）、${enabledRules}/${geekGraphs.length} 条极客规则运行中、${scenes.length} 个本地场景${degraded ? `（设备库降级：${hubError}）` : ''}`,
+      {
+        fromCache: false,
+        configured: true,
+        degraded,
+        ...(hubError ? { hubError } : {}),
+        routerSsh: ctx.cfg.routerSsh,
+        devices,
+        counts,
+        ...centralPayload,
+        centralFetchedAt,
+        fetchedAt: snap.fetchedAt || null,
+        hotDataFetchedAt: snap.hotDataFetchedAt || null,
+        liveFetchedAt,
+        speaker,
+        config: ctx.cfg,
+      },
+    );
+  }
+
+  const fallbackGateway = prevCentral?.gateway ?? null;
+  const fallbackGraphs = Array.isArray(prevCentral?.geekGraphs) ? prevCentral.geekGraphs : [];
+  const fallbackLogs = Array.isArray(prevCentral?.geekLogs) ? prevCentral.geekLogs : [];
+  const fallbackScenes = Array.isArray(prevCentral?.scenes) ? prevCentral.scenes : [];
+  const fallbackScopes = Array.isArray(prevCentral?.varScopes) ? prevCentral.varScopes : [];
+  const fallbackVars = Array.isArray(prevCentral?.variables) ? prevCentral.variables : [];
+
+  return success(
+    '米家中枢看板（降级缓存）',
+    `中枢实时读取失败（${centralError}），已回退本地缓存：${devices.length} 台设备、${fallbackGraphs.length} 条极客规则`,
+    {
+      fromCache: Boolean(prevCentral),
+      configured: true,
+      degraded: true,
+      ...(hubError ? { hubError } : {}),
+      ...(centralError ? { centralError } : {}),
+      routerSsh: ctx.cfg.routerSsh,
+      devices,
+      counts,
+      gateway: fallbackGateway,
+      subGateways: Array.isArray(prevCentral?.subGateways) ? prevCentral.subGateways : [],
+      btService: prevCentral?.btService ?? null,
+      btMeshDids: Array.isArray(prevCentral?.btMeshDids) ? prevCentral.btMeshDids : [],
+      geekReady: prevCentral?.geekReady === true,
+      geekUrl: typeof prevCentral?.geekUrl === 'string' ? prevCentral.geekUrl : '',
+      geekGraphs: fallbackGraphs,
+      geekLogs: fallbackLogs,
+      varScopes: fallbackScopes,
+      variables: fallbackVars,
+      scenes: fallbackScenes,
+      fetchedAt: snap.fetchedAt || null,
+      hotDataFetchedAt: snap.hotDataFetchedAt || null,
+      liveFetchedAt,
+      centralFetchedAt: prevCentral?.fetchedAt ?? null,
+      speaker,
+      config: ctx.cfg,
+    },
+  );
+}
+
 // ---- config ---------------------------------------------------------------
 
 async function handleConfig(ctx) {
@@ -2310,6 +3372,10 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
     const ctx = makeCtx(safeArgs, deps);
     switch (name) {
       case 'status': result = await handleStatus(ctx); break;
+      case 'dashboard': result = await handleDashboard(ctx); break;
+      case 'mesh': result = await handleMesh(ctx); break;
+      case 'geek': result = await handleGeek(ctx); break;
+      case 'scene': result = await handleScene(ctx); break;
       case 'devices': result = await handleDevices(ctx); break;
       case 'get': result = await handleGet(ctx); break;
       case 'set': result = await handleSet(ctx); break;

@@ -57,6 +57,7 @@ test('Web usage and Telegram UI files strictly adhere to CSP and zero inline sty
   const timerPluginHubTs = await readFile(join(webRoot, 'hubs', 'timer-plugin-hub.ts'), 'utf8');
   const imVoiceHubTs = await readFile(join(webRoot, 'hubs', 'im-voice-hub.ts'), 'utf8');
   const appleUiTs = await readFile(join(webRoot, 'plugins', 'apple-devices-ui.ts'), 'utf8');
+  const miotUiTs = await readFile(join(webRoot, 'plugins', 'miot-ui.ts'), 'utf8');
   const ninebotUiTs = await readFile(join(webRoot, 'plugins', 'ninebot-ui.ts'), 'utf8');
   const clientTs = await readFile(join(webRoot, 'client.ts'), 'utf8');
   const styleCss = await readFile(join(webRoot, 'style.css'), 'utf8');
@@ -95,6 +96,7 @@ test('Web usage and Telegram UI files strictly adhere to CSP and zero inline sty
     ['timer-plugin-hub.ts', timerPluginHubTs],
     ['im-voice-hub.ts', imVoiceHubTs],
     ['apple-devices-ui.ts', appleUiTs],
+    ['miot-ui.ts', miotUiTs],
     ['ninebot-ui.ts', ninebotUiTs],
     ['client.ts', clientTs],
   ] as const) {

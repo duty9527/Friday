@@ -34,6 +34,7 @@ const laifenSurfacePanel = element<HTMLElement>('plugin-panel-laifen');
 const ninebotSurfacePanel = element<HTMLElement>('plugin-panel-ninebot');
 const netleaSurfacePanel = element<HTMLElement>('plugin-panel-netlea');
 const appleSurfacePanel = element<HTMLElement>('plugin-panel-apple-devices');
+const miotSurfacePanel = element<HTMLElement>('plugin-panel-miot');
 const messagesEl = element('messages');
 const worksEl = element('works');
 const companionEl = element('companion-avatar');
@@ -234,6 +235,17 @@ const pluginSurfaces: PluginSurfaceRegistration[] = [
     load: () => import('./plugins/apple-devices-ui.js').then(mod =>
       mod.initAppleDevicesUi({
         isVisible: () => !pluginHubBackdrop.hidden && !appleSurfacePanel.hidden,
+      })),
+  },
+  {
+    pluginName: 'miot',
+    tabId: 'plugin-tab-miot',
+    panelId: 'plugin-panel-miot',
+    label: '米家中枢',
+    messageTrigger: /米家|中枢|蓝牙\s*Mesh|极客版|自动化|空气炸锅|空调|miot/i,
+    load: () => import('./plugins/miot-ui.js').then(mod =>
+      mod.initMiotUi({
+        isVisible: () => !pluginHubBackdrop.hidden && !miotSurfacePanel.hidden,
       })),
   },
 ];

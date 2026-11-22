@@ -7,35 +7,51 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { deflateRawSync } from 'node:zlib';
 import {
   ACTIONS,
+  CENTRAL_TOPIC_RE,
   DEFAULT_CONFIG,
   FRYER_STATUS_MAP,
+  GEEK_URL_RE,
   PRESET_RECIPES,
+  VAR_IDENT_RE,
   buildAcInstructions,
+  buildCentralMipsApiScript,
+  buildCentralOverviewScript,
   buildFryerGetParams,
   buildFryerStartInputs,
   buildMibrainCommand,
   buildMipsRemoteScript,
+  buildSafeGeekUrl,
+  buildScheduleGeekGraph,
   buildSshArgs,
   classifyCategory,
+  decodeCentralJsonz,
   decryptMiioPacket,
   defaultFetchHubRawRows,
   discoverSpeakerSsh,
   encryptMiioPacket,
   handleVoiceFastpath,
   packMipsFrame,
+  parseAutoLocalLogs,
+  parseCentralOverviewOutput,
   parseHubSnapshot,
   parseSshSpec,
   parseSshTargets,
+  readCentralCache,
   resolveDevice,
   resolveRecipe,
   runAction,
   sanitizeOutput,
+  summarizeCloudScene,
   summarizeFryerProps,
+  summarizeGeekGraph,
   udpCall,
   unpackMipsFrame,
   unquoteDbVal,
+  validateGeekNodes,
+  validateVarIdentifier,
 } from '../plugins/miot/index.mjs';
 import { listPlugins, runPlugin, runPluginInProcess } from '../src/plugin.js';
 
@@ -1758,5 +1774,459 @@ test('38. devices with live:true persists BLE Mesh on state and liveFetchedAt to
     const cache2 = JSON.parse(await readFile(cachePath, 'utf8'));
     assert.equal(cache2.hotDataFetchedAt, 1_700_000_060_000);
     assert.equal(cache2.liveFetchedAt, 1_700_000_000_000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 12. BE6500 Pro Central Mesh, Geek Edition (autoLocal), Scenes & Dashboard
+// ---------------------------------------------------------------------------
+
+function makeJsonzBuffer(obj: unknown): Buffer {
+  const jsonBuf = Buffer.from(JSON.stringify(obj), 'utf8');
+  const deflated = deflateRawSync(jsonBuf);
+  const header = Buffer.alloc(4);
+  header.writeUInt32LE(jsonBuf.length, 0);
+  return Buffer.concat([header, deflated]);
+}
+
+test('39. Central hub pure helpers decode .jsonz safely, parse logs, summarize Geek graphs, and build schedules', () => {
+  // 1. decodeCentralJsonz valid & guardrails
+  const sampleGraph = {
+    id: 'g100',
+    nodes: [
+      { id: 'a1', type: 'alarmClock', props: { type: 'periodicAlarm', isSunset: false, hour: 16, minute: 0, second: 0, filter: {} }, outputs: { output: ['o1.trigger'] } },
+      { id: 'o1', type: 'deviceOutput', props: { did: '110022001', siid: 2, piid: 1, value: true }, inputs: { trigger: null }, outputs: { output: [] } },
+      { id: 'a2', type: 'alarmClock', props: { type: 'periodicAlarm', isSunset: false, hour: 22, minute: 30, second: 0, filter: {} }, outputs: { output: ['o2.trigger'] } },
+      { id: 'o2', type: 'deviceOutput', props: { did: '110022001', siid: 2, piid: 1, value: false }, inputs: { trigger: null }, outputs: { output: [] } },
+    ],
+  };
+  const jsonz = makeJsonzBuffer(sampleGraph);
+  assert.deepEqual(decodeCentralJsonz(jsonz), sampleGraph);
+  assert.deepEqual(decodeCentralJsonz(jsonz.toString('base64')), sampleGraph);
+
+  assert.throws(() => decodeCentralJsonz(Buffer.from([1, 2, 3])), /不足 5 字节/);
+  const oversized = Buffer.alloc(10);
+  oversized.writeUInt32LE(50 * 1024 * 1024, 0);
+  assert.throws(() => decodeCentralJsonz(oversized), /声明长度/);
+
+  // 2. summarizeGeekGraph with device mapping
+  const devMap = new Map([
+    ['110022001', { did: '110022001', room_name: '客厅', dev_name: '鱼缸灯' }],
+    ['110022003', { did: '110022003', room_name: '卧室', dev_name: '卧室灯' }],
+  ]);
+  const summarized = summarizeGeekGraph(sampleGraph, { id: 'g100', userData: { name: '鱼缸灯管理', lastUpdateTime: 1700 }, enable: true, uiType: 'test' }, devMap);
+  assert.equal(summarized.name, '鱼缸灯管理');
+  assert.equal(summarized.enable, true);
+  assert.match(summarized.summary, /每天 16:00 → 打开客厅鱼缸灯/);
+  assert.match(summarized.summary, /每天 22:30 → 关闭客厅鱼缸灯/);
+
+  // 3. parseAutoLocalLogs (newest first + graph filter)
+  const rawLogs = [
+    '3|1795161600434|l|g100|a1.output|o1.trigger|null',
+    '3|1795161600442|i|g100|o1|success',
+    '3|1795321166604|r|g200|{"enable":false}',
+  ].join('\n');
+  const logsAll = parseAutoLocalLogs(rawLogs, { graphNameById: new Map([['g100', '鱼缸灯管理'], ['g200', '乌龟灯管理']]) });
+  assert.equal(logsAll.length, 3);
+  assert.equal(logsAll[0]!.graphName, '乌龟灯管理');
+  assert.equal(logsAll[0]!.summary, '停用自动化规则');
+  assert.equal(logsAll[1]!.ok, true);
+  assert.equal(parseAutoLocalLogs(rawLogs, { graphId: 'g100' }).length, 2);
+
+  // 4. buildScheduleGeekGraph & validators
+  const built = buildScheduleGeekGraph({
+    id: 'sched1',
+    name: '卧室晚安定时',
+    enable: true,
+    rules: [
+      { time: '22:15', device: '卧室灯', on: false, days: [1, 2, 3, 4, 5] },
+    ],
+    resolveDeviceFn: () => ({ did: '110022003', urn: 'urn:miot-spec-v2:device:switch:0000A003:isa-kg01hl:1', room_name: '卧室', dev_name: '卧室灯' }),
+    nowMs: 1_700_000_000_000,
+  });
+  assert.equal(built.id, 'sched1');
+  assert.equal(built.cfg.id, 'sched1');
+  assert.equal(built.cfg.userData.name, '卧室晚安定时');
+  assert.equal(built.nodes.length, 2);
+  assert.equal(built.nodes[0]!.type, 'alarmClock');
+  assert.deepEqual(built.nodes[0]!.props.filter, { day: [1, 2, 3, 4, 5] });
+  assert.equal(built.nodes[1]!.type, 'deviceOutput');
+  assert.equal(built.nodes[1]!.props.value, false);
+  assert.ok(validateGeekNodes(built.nodes).length === 2);
+
+  assert.throws(() => buildScheduleGeekGraph({ name: 'bad', rules: [{ time: '25:99', on: true }], resolveDeviceFn: () => ({}) }), /时间/);
+  assert.throws(() => validateVarIdentifier('bad-scope'), /只能包含/);
+  assert.equal(buildSafeGeekUrl('192.0.2.1', 8086), 'http://192.0.2.1:8086');
+  assert.equal(buildSafeGeekUrl('javascript:alert(1)', 80), '');
+  assert.ok(GEEK_URL_RE.test('http://192.0.2.1:8086'));
+  assert.ok(CENTRAL_TOPIC_RE.test('local/autoLocal/setGraph'));
+  assert.ok(VAR_IDENT_RE.test('fridayMode1'));
+
+  // 5. buildCentralMipsApiScript & buildCentralOverviewScript + parseCentralOverviewOutput
+  const apiScript = buildCentralMipsApiScript('local/autoLocal/getGraphList', 3000);
+  assert.match(apiScript, /chroot "\$ROOT" \/usr\/bin\/mips_callapi --topic 'local\/autoLocal\/getGraphList'/);
+  assert.throws(() => buildCentralMipsApiScript('bad topic; rm -rf /'), /无效的 MIPS topic/);
+
+  const overviewScript = buildCentralOverviewScript({ routerDid: 'miwifi.be6500pro', includeCloudScenes: true, includeGraphContents: true, includeLogs: true });
+  assert.match(overviewScript, /__FRIDAY_SEC_GW__/);
+  assert.match(overviewScript, /__FRIDAY_SEC_CLOUD_GRAPHS__/);
+  assert.match(overviewScript, /__FRIDAY_SEC_GEEK_GRAPHS__/);
+
+  const cloudSceneJsonz = makeJsonzBuffer({
+    id: 'sc1',
+    nodes: [
+      { id: '1', type: 'hyperLinkTarget', props: { signature: 'user.click_sc1' }, outputs: { next: ['0.trigger'] } },
+      { id: '0', type: 'legacyRPC', props: { method: 'set_properties', did: '110022001', params: [{ did: '110022001', siid: 2, piid: 1, value: false }] } },
+    ],
+    cfg: { ts: 1794475166, mijiaActionGroup: true },
+  });
+  const parsedOverview = parseCentralOverviewOutput([
+    '__FRIDAY_SEC_PID__',
+    '20588',
+    '__FRIDAY_SEC_GW__',
+    JSON.stringify({ result: { bindStatus: true, online: true, homeid: '778899', homeName: 'Test Home', linkType: 0, ip: '192.0.2.1' } }),
+    '__FRIDAY_SEC_ROLE__',
+    JSON.stringify({ result: 1 }),
+    '__FRIDAY_SEC_GWLIST__',
+    JSON.stringify({ result: { list: [] } }),
+    '__FRIDAY_SEC_BTSTATUS__',
+    JSON.stringify({ id: 1, version: '3.1.7' }),
+    '__FRIDAY_SEC_BTDEVS__',
+    JSON.stringify({ id: 2, devices: { '110022001': {}, '110022003': {} } }),
+    '__FRIDAY_SEC_PORT__',
+    '8086',
+    '__FRIDAY_SEC_GEEK_READY__',
+    JSON.stringify({ result: true }),
+    '__FRIDAY_SEC_GEEK_LIST__',
+    JSON.stringify([{ id: 'g100', userData: { name: '鱼缸灯管理', lastUpdateTime: 1700 }, uiType: 'test', enable: true }]),
+    '__FRIDAY_SEC_VAR_SCOPES__',
+    JSON.stringify({ scopes: ['friday'] }),
+    '__FRIDAY_SEC_SCENES__',
+    JSON.stringify({ result: ['sc1'] }),
+    '__FRIDAY_SEC_CLOUD_GRAPHS__',
+    'FILE:sc1.jsonz',
+    cloudSceneJsonz.toString('base64'),
+    '__FRIDAY_SEC_GEEK_GRAPHS__',
+    'FILE:g100.jsonz',
+    jsonz.toString('base64'),
+    '__FRIDAY_SEC_LOGS__',
+    rawLogs,
+  ].join('\n'));
+  assert.equal(parsedOverview.centralPid, 20588);
+  assert.equal(parsedOverview.gateway.roleLabel, '主中枢');
+  assert.equal(parsedOverview.geekUrl, 'http://192.0.2.1:8086');
+  assert.equal(parsedOverview.btService.version, '3.1.7');
+  assert.equal(parsedOverview.btMeshDids.length, 2);
+  assert.ok(parsedOverview.geekGraphBodiesById['g100']);
+  assert.ok(parsedOverview.cloudScenesById['sc1']);
+
+  const scSummary = summarizeCloudScene('sc1', parsedOverview.cloudScenesById['sc1'], devMap, d => (d.did === '110022001' ? '鱼缸灯' : null));
+  assert.equal(scSummary.touchesProtected, true);
+  assert.equal(scSummary.turnsOffProtected, true);
+  assert.match(scSummary.summary, /关闭客厅鱼缸灯/);
+});
+
+test('40. mesh action reports central status and executes batch control while skipping protectedDevices by default', async () => {
+  await withTmp(async dir => {
+    const h = createMockHarness({
+      dir,
+      protectedDevices: ['水草补光灯'],
+      bleProps: { '110022001': true, '110022002': false, '110022003': false },
+    });
+    const mipsCalls: Array<{ topic: string; payload: any }> = [];
+    const customDeps = {
+      ...h.deps,
+      fetchCentralOverview: async () => ({
+        centralPid: 20588,
+        gateway: { online: true, bindStatus: true, homeId: '778899', homeName: 'Test Home', ip: '192.0.2.1', role: 1, roleLabel: '主中枢', geekPort: 8086, geekUrl: 'http://192.0.2.1:8086' },
+        subGateways: [],
+        btService: { version: '3.1.7' },
+        btMeshDids: ['110022001', '110022002', '110022003'],
+        geekReady: true,
+        geekUrl: 'http://192.0.2.1:8086',
+        geekGraphs: [],
+        geekGraphBodiesById: {},
+        varScopes: [],
+        actionGroupIds: [],
+        cloudScenesById: {},
+        rawLogText: '',
+      }),
+      centralMipsCall: async (topic: string, payload: any) => {
+        mipsCalls.push({ topic, payload });
+        return {};
+      },
+    };
+
+    const st = await runAction('mesh', { op: 'status', live: true }, customDeps);
+    assert.equal(st.ok, true);
+    assert.equal(st.data.gateway.roleLabel, '主中枢');
+    assert.equal(st.data.btService.version, '3.1.7');
+    assert.equal(st.data.count, 3);
+    assertNoTokenLeak(st, 'mesh status');
+
+    // Batch off skips protected device 水草补光灯 (110022001) by default
+    const batchDry = await runAction('mesh', { op: 'batch', on: false, dryRun: true }, customDeps);
+    assert.equal(batchDry.ok, true);
+    assert.equal(batchDry.data.dryRun, true);
+    assert.equal(batchDry.data.targets.length, 2);
+    assert.equal(batchDry.data.skipped.length, 1);
+    assert.equal(batchDry.data.skipped[0].did, '110022001');
+
+    const batchOff = await runAction('mesh', { op: 'batch', on: false }, customDeps);
+    assert.equal(batchOff.ok, true);
+    assert.equal(batchOff.data.succeeded.length, 2);
+    assert.equal(batchOff.data.skipped.length, 1);
+    assert.equal(h.bleState['110022001'], true);
+    assert.equal(h.bleState['110022002'], false);
+    assert.equal(h.bleState['110022003'], false);
+    assertNoTokenLeak(batchOff, 'mesh batch');
+
+    // includeProtected: true includes all 3
+    const batchAllOn = await runAction('mesh', { op: 'batch', on: true, includeProtected: true }, customDeps);
+    assert.equal(batchAllOn.ok, true);
+    assert.equal(batchAllOn.data.succeeded.length, 3);
+    assert.equal(h.bleState['110022002'], true);
+    assert.equal(h.bleState['110022003'], true);
+    assert.equal(mipsCalls.length, 0);
+  });
+});
+
+test('41. geek & scene actions handle list/get/toggle/create-schedule/delete/logs/vars/scenes and protected blocking', async () => {
+  await withTmp(async dir => {
+    const h = createMockHarness({ dir, protectedDevices: ['水草补光灯'] });
+    const graphs = new Map<string, { cfg: any; graph: any }>([
+      [
+        'g1',
+        {
+          cfg: { id: 'g1', userData: { name: '鱼缸自动化', transform: { x: 0, y: 0, scale: 1, rotate: 0 }, lastUpdateTime: 1000, version: 0 }, uiType: 'test', enable: true },
+          graph: {
+            id: 'g1',
+            nodes: [
+              { id: 'n1', type: 'alarmClock', props: { type: 'periodicAlarm', isSunset: false, hour: 9, minute: 0, second: 0, filter: {} }, outputs: { output: ['n2.trigger'] } },
+              { id: 'n2', type: 'deviceOutput', props: { did: '110022001', siid: 2, piid: 1, value: true }, inputs: { trigger: null }, outputs: { output: [] } },
+            ],
+          },
+        },
+      ],
+    ]);
+    const vars = new Map<string, { scope: string; id: string; type: string; value: unknown }>([
+      ['friday.mode', { scope: 'friday', id: 'mode', type: 'number', value: 1 }],
+    ]);
+    const executedScenes: Array<any> = [];
+
+    const customDeps = {
+      ...h.deps,
+      fetchCentralOverview: async () => ({
+        centralPid: 20588,
+        gateway: { online: true, bindStatus: true, homeId: '778899', homeName: 'Test Home', ip: '192.0.2.1', role: 1, roleLabel: '主中枢', geekPort: 8086, geekUrl: 'http://192.0.2.1:8086' },
+        subGateways: [],
+        btService: { version: '3.1.7' },
+        btMeshDids: ['110022001', '110022003'],
+        geekReady: true,
+        geekUrl: 'http://192.0.2.1:8086',
+        geekGraphs: [...graphs.values()].map(v => v.cfg),
+        geekGraphBodiesById: Object.fromEntries([...graphs.entries()].map(([k, v]) => [k, v.graph])),
+        varScopes: [...new Set([...vars.values()].map(v => v.scope))],
+        actionGroupIds: ['sc_prot', 'sc_safe'],
+        cloudScenesById: {
+          sc_prot: {
+            id: 'sc_prot',
+            nodes: [
+              { id: '1', type: 'hyperLinkTarget', props: { signature: 'user.click_sc_prot' }, outputs: { next: ['0.trigger'] } },
+              { id: '0', type: 'legacyRPC', props: { method: 'set_properties', did: '110022001', params: [{ did: '110022001', siid: 2, piid: 1, value: false }] } },
+            ],
+            cfg: { ts: 1794475166, mijiaActionGroup: true },
+          },
+          sc_safe: {
+            id: 'sc_safe',
+            nodes: [
+              { id: '1', type: 'hyperLinkTarget', props: { signature: 'user.click_sc_safe' }, outputs: { next: ['0.trigger'] } },
+              { id: '0', type: 'legacyRPC', props: { method: 'set_properties', did: '110022003', params: [{ did: '110022003', siid: 2, piid: 1, value: true }] } },
+            ],
+            cfg: { ts: 1794475167, mijiaActionGroup: true },
+          },
+        },
+        rawLogText: '3|1795161600434|i|g1|n2|success\n',
+      }),
+      centralMipsCall: async (topic: string, payload: any = {}) => {
+        if (topic === 'local/autoLocal/getGraphList') return [...graphs.values()].map(v => v.cfg);
+        if (topic === 'local/autoLocal/getGraph') return graphs.get(payload.id)?.graph ?? { error: { code: -10004, message: 'not found' } };
+        if (topic === 'local/autoLocal/changeGraphConfig') {
+          const entry = graphs.get(payload.id);
+          if (!entry) throw new Error('missing graph');
+          entry.cfg = { ...entry.cfg, enable: payload.enable, uiType: payload.uiType, userData: payload.userData };
+          return {};
+        }
+        if (topic === 'local/autoLocal/setGraph') {
+          graphs.set(payload.id, { cfg: payload.cfg, graph: { id: payload.id, nodes: payload.nodes } });
+          return {};
+        }
+        if (topic === 'local/autoLocal/deleteGraph') {
+          graphs.delete(payload.id);
+          return {};
+        }
+        if (topic === 'local/autoLocal/getNodeVersion') {
+          return { version: '2.0.4', nodes: [{ name: 'alarmClock', version: 1 }, { name: 'deviceOutput', version: 1 }] };
+        }
+        if (topic === 'local/autoLocal/getVarScopeList') {
+          return { scopes: [...new Set([...vars.values()].map(v => v.scope))] };
+        }
+        if (topic === 'local/autoLocal/getVarList') {
+          return { list: [...vars.values()].filter(v => v.scope === payload.scope) };
+        }
+        if (topic === 'local/autoLocal/getVarValue') {
+          const hit = vars.get(`${payload.scope}.${payload.id}`);
+          return { value: hit?.value };
+        }
+        if (topic === 'local/autoLocal/setVarValue') {
+          const hit = vars.get(`${payload.scope}.${payload.id}`);
+          if (hit) hit.value = payload.value;
+          return {};
+        }
+        if (topic === 'local/autoLocal/createVar') {
+          vars.set(`${payload.scope}.${payload.id}`, { scope: payload.scope, id: payload.id, type: payload.type, value: payload.value });
+          return {};
+        }
+        if (topic === 'local/autoLocal/deleteVar') {
+          vars.delete(`${payload.scope}.${payload.id}`);
+          return {};
+        }
+        if (topic === 'local/automation/execMijiaActionGroup') {
+          executedScenes.push(payload);
+          return {};
+        }
+        return {};
+      },
+    };
+
+    const listRes = await runAction('geek', { op: 'list' }, customDeps);
+    assert.equal(listRes.ok, true);
+    assert.equal(listRes.data.count, 1);
+    assert.match(listRes.data.graphs[0].summary, /打开客厅水草补光灯/);
+
+    const toggleRes = await runAction('geek', { op: 'toggle', name: '鱼缸自动化' }, customDeps);
+    assert.equal(toggleRes.ok, true);
+    assert.equal(toggleRes.data.enable, false);
+    assert.equal(graphs.get('g1')!.cfg.enable, false);
+    assert.equal(graphs.get('g1')!.cfg.userData.name, '鱼缸自动化');
+
+    const schedRes = await runAction('geek', {
+      op: 'create-schedule',
+      name: '卧室晚安灯',
+      rules: [{ time: '22:30', device: '卧室灯', on: false }],
+    }, customDeps);
+    assert.equal(schedRes.ok, true);
+    assert.equal(graphs.size, 2);
+
+    const logsRes = await runAction('geek', { op: 'logs', limit: 10 }, customDeps);
+    assert.equal(logsRes.ok, true);
+    assert.equal(logsRes.data.logs[0].graphName, '鱼缸自动化');
+
+    const delRes = await runAction('geek', { op: 'delete', id: schedRes.data.id }, customDeps);
+    assert.equal(delRes.ok, true);
+    assert.equal(graphs.size, 1);
+
+    const varCreate = await runAction('geek', { op: 'var-create', scope: 'friday', id: 'nightMode', type: 'number', value: '2' }, customDeps);
+    assert.equal(varCreate.ok, true);
+    const varBad = await runAction('geek', { op: 'var-create', scope: 'bad-scope', id: 'x', type: 'number', value: 1 }, customDeps);
+    assert.equal(varBad.ok, false);
+    const varsList = await runAction('geek', { op: 'vars' }, customDeps);
+    assert.equal(varsList.ok, true);
+    assert.equal(varsList.data.count, 2);
+
+    // Scene protected check
+    const sceneList = await runAction('scene', { op: 'list' }, customDeps);
+    assert.equal(sceneList.ok, true);
+    assert.equal(sceneList.data.count, 2);
+
+    const blockedScene = await runAction('scene', { op: 'run', id: 'sc_prot' }, customDeps);
+    assert.equal(blockedScene.ok, false);
+    assert.equal(blockedScene.data.blocked, true);
+    assert.equal(executedScenes.length, 0);
+
+    const allowedScene = await runAction('scene', { op: 'run', id: 'sc_prot', confirmProtected: true }, customDeps);
+    assert.equal(allowedScene.ok, true);
+    assert.deepEqual(executedScenes[0], { id: 'sc_prot', operation: 'user.click' });
+
+    const safeScene = await runAction('scene', { op: 'run', id: 'sc_safe' }, customDeps);
+    assert.equal(safeScene.ok, true);
+    assert.equal(executedScenes.length, 2);
+    assertNoTokenLeak(sceneList, 'scene list');
+  });
+});
+
+test('42. dashboard writes sanitized central-cache.json, supports cacheOnly zero-SSH reads, and degrades cleanly on router failure', async () => {
+  await withTmp(async dir => {
+    const h = createMockHarness({ dir, protectedDevices: ['水草补光灯'] });
+    let failCentral = false;
+    let fetchCentralCalls = 0;
+    const customDeps = {
+      ...h.deps,
+      fetchCentralOverview: async () => {
+        fetchCentralCalls++;
+        if (failCentral) throw new Error('router SSH timeout');
+        return {
+          centralPid: 20588,
+          gateway: { online: true, bindStatus: true, homeId: '778899', homeName: 'Test Home', ip: '192.0.2.1', role: 1, roleLabel: '主中枢', geekPort: 8086, geekUrl: 'http://192.0.2.1:8086' },
+          subGateways: [],
+          btService: { version: '3.1.7' },
+          btMeshDids: ['110022001', '110022002', '110022003'],
+          geekReady: true,
+          geekUrl: 'http://192.0.2.1:8086',
+          geekGraphs: [{ id: 'g1', userData: { name: '鱼缸管理', lastUpdateTime: 1200 }, uiType: 'test', enable: true }],
+          geekGraphBodiesById: {
+            g1: {
+              id: 'g1',
+              nodes: [
+                { id: 'a', type: 'alarmClock', props: { isSunset: false, hour: 8, minute: 0, second: 0, filter: {} }, outputs: { output: ['b.trigger'] } },
+                { id: 'b', type: 'deviceOutput', props: { did: '110022001', siid: 2, piid: 1, value: true }, outputs: { output: [] } },
+              ],
+            },
+          },
+          varScopes: [],
+          actionGroupIds: ['s1'],
+          cloudScenesById: { s1: { id: 's1', nodes: [], cfg: { ts: 1700000000 } } },
+          rawLogText: '3|1795161600434|i|g1|b|success\n',
+        };
+      },
+    };
+
+    const dash1 = await runAction('dashboard', { refresh: true }, customDeps);
+    assert.equal(dash1.ok, true);
+    assert.equal(dash1.data.configured, true);
+    assert.equal(dash1.data.degraded, false);
+    assert.equal(dash1.data.geekGraphs.length, 1);
+    assert.equal(dash1.data.scenes.length, 1);
+    assertNoTokenLeak(dash1, 'dashboard live');
+
+    const centralCachePath = join(dir, 'plugins', 'miot', 'central-cache.json');
+    const cachedCentral = readCentralCache(centralCachePath);
+    assert.ok(cachedCentral);
+    assert.equal(cachedCentral.geekGraphs.length, 1);
+    assertNoTokenLeak(cachedCentral, 'central-cache.json');
+
+    // cacheOnly must not trigger SSH or hub fetches
+    const callsBeforeCacheOnly = fetchCentralCalls;
+    const hubCountBefore = h.getFetchHubCount();
+    const dashCached = await runAction('dashboard', { cacheOnly: true }, customDeps);
+    assert.equal(dashCached.ok, true);
+    assert.equal(dashCached.data.fromCache, true);
+    assert.equal(dashCached.data.geekGraphs.length, 1);
+    assert.equal(fetchCentralCalls, callsBeforeCacheOnly);
+    assert.equal(h.getFetchHubCount(), hubCountBefore);
+
+    // Degrades cleanly if central overview SSH fails
+    failCentral = true;
+    const dashDegraded = await runAction('dashboard', {}, customDeps);
+    assert.equal(dashDegraded.ok, true);
+    assert.equal(dashDegraded.data.degraded, true);
+    assert.equal(dashDegraded.data.geekGraphs.length, 1);
+    assert.match(dashDegraded.data.centralError, /timeout/);
+
+    // Unconfigured routerSsh returns clean configured: false without failing
+    await runAction('config', { routerSsh: '' }, customDeps);
+    const dashUnconf = await runAction('dashboard', {}, customDeps);
+    assert.equal(dashUnconf.ok, true);
+    assert.equal(dashUnconf.data.configured, false);
   });
 });

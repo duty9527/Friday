@@ -82,6 +82,9 @@ const INTERNAL_ACTION_NAMES: ReadonlySet<string> = new Set([
 const SAFE_QUICK_RUN_ACTIONS: ReadonlySet<string> = new Set([
   'status',
   'dashboard',
+  'mesh',
+  'geek',
+  'scene',
   'devices',
   'keys',
   'vehicles',
@@ -95,6 +98,9 @@ const SAFE_QUICK_RUN_ACTIONS: ReadonlySet<string> = new Set([
 const ACTION_FALLBACK_LABELS: Record<string, string> = {
   status: '实时状态',
   dashboard: '看板概览',
+  mesh: 'Mesh 中枢',
+  geek: '极客自动化',
+  scene: '本地场景',
   patrol: '安全巡检',
   remind: '准点提醒',
   noon: '午间估值',
@@ -183,6 +189,10 @@ const PARAM_KEY_LABELS: Record<string, string> = {
   minDiskFreeGb: '磁盘余量下限',
   siid: '服务 ID',
   aiid: '动作 ID',
+  graphId: '规则 ID',
+  scope: '作用域',
+  confirmProtected: '确认保护设备',
+  includeProtected: '包含保护设备',
 };
 
 const PLATFORM_LABELS: Record<string, string> = {
@@ -235,9 +245,9 @@ export const PLUGIN_PRESENTATION: Record<string, PluginPresentationMeta> = {
     quickCheckArgs: { cacheOnly: true },
   },
   miot: {
-    shortTitle: '全屋米家控制',
+    shortTitle: '米家中枢 · Mesh & 极客版',
     domain: '智能家居',
-    summary: '本地直控全屋米家灯具、插座、开关、空气炸锅与空调，支持房间筛选、实时状态与语音快车道。',
+    summary: 'BE6500 Pro 蓝牙 Mesh 中枢直控、全屋设备状态、米家自动化极客版规则/日志/变量与本地场景管理。',
     quickCheckArgs: {},
   },
   'tv-agent': {

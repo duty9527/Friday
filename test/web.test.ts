@@ -198,6 +198,7 @@ test('every nested module the page or mindmap imports is served and path escapes
     assert.ok(visited.has('/plugins/ninebot-ui.js'), 'lazy ninebot plugin UI module must be reached and served');
     assert.ok(visited.has('/plugins/netlea-ui.js'), 'lazy netlea plugin UI module must be reached and served');
     assert.ok(visited.has('/plugins/apple-devices-ui.js'), 'lazy apple-devices plugin UI module must be reached and served');
+    assert.ok(visited.has('/plugins/miot-ui.js'), 'lazy miot plugin UI module must be reached and served');
     assert.equal((await fetch(`${f.base}/../src/agent.ts`)).status, 404, 'path escape must return 404');
     assert.equal((await fetch(`${f.base}/shared/%2e%2e/%2e%2e/package.json`)).status, 404, 'encoded traversal must return 404');
     assert.equal((await fetch(`${f.base}/client.ts`)).status, 404, 'non-allowlisted extension must return 404');
@@ -563,6 +564,10 @@ test('Web console lazy-loads health-scale UI, serves redacted PluginView metadat
     assert.match(html, /id="plugin-tab-apple-devices"/);
     assert.match(html, /id="plugin-panel-apple-devices"/);
     assert.match(html, /id="apple-devices-grid"/);
+    assert.match(html, /id="plugin-tab-miot"/);
+    assert.match(html, /id="plugin-panel-miot"/);
+    assert.match(html, /id="miot-devices-grid"/);
+    assert.match(html, /id="miot-geek-list"/);
     assert.doesNotMatch(html, /id="open-health-hub-top"/, 'health surface must live inside M3 plugin hub');
     assert.doesNotMatch(html, /id="open-fund-hub-top"/, 'fund surface must live inside M3 plugin hub');
     assert.doesNotMatch(html, /\sstyle="/i);
@@ -578,6 +583,7 @@ test('Web console lazy-loads health-scale UI, serves redacted PluginView metadat
     assert.match(clientJs, /import\(\s*['"]\.\/plugins\/ninebot-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load ninebot-ui.js');
     assert.match(clientJs, /import\(\s*['"]\.\/plugins\/netlea-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load netlea-ui.js');
     assert.match(clientJs, /import\(\s*['"]\.\/plugins\/apple-devices-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load apple-devices-ui.js');
+    assert.match(clientJs, /import\(\s*['"]\.\/plugins\/miot-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load miot-ui.js');
 
     const healthUiJs = await (await fetch(`${f.base}/plugins/health-scale-ui.js`)).text();
     assert.match(healthUiJs, /initHealthScaleUi/);
@@ -598,6 +604,9 @@ test('Web console lazy-loads health-scale UI, serves redacted PluginView metadat
     const appleUiJs = await (await fetch(`${f.base}/plugins/apple-devices-ui.js`)).text();
     assert.match(appleUiJs, /initAppleDevicesUi/);
     assert.doesNotMatch(appleUiJs, /\.style\.|setAttribute\(\s*['"]style['"]/, 'apple-devices-ui must obey strict CSP without inline style mutations');
+    const miotUiJs = await (await fetch(`${f.base}/plugins/miot-ui.js`)).text();
+    assert.match(miotUiJs, /initMiotUi/);
+    assert.doesNotMatch(miotUiJs, /\.style\.|setAttribute\(\s*['"]style['"]|\.innerHTML\b/, 'miot-ui must obey strict CSP without inline style or innerHTML mutations');
     const pluginCatalogJs = await (await fetch(`${f.base}/shared/plugin-catalog.js`)).text();
     assert.match(pluginCatalogJs, /mergePluginOrder/);
     assert.doesNotMatch(pluginCatalogJs, /\.style\.|setAttribute\(\s*['"]style['"]|\.innerHTML\b/, 'plugin-catalog.js must obey strict CSP');

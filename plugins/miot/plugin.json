@@ -1,18 +1,42 @@
 {
   "name": "miot",
-  "title": "全屋米家设备发现与控制 (BE6500 Pro 中枢 + 局域网 MiIO)",
-  "description": "通过小米 BE6500 Pro 路由器中枢（SSH 读取 central 设备库 devInfo.db / hot_data_v2.db）发现全屋米家设备与缓存状态，并用三条本地通道直控：① 蓝牙 Mesh 灯/开关/插座经中枢内部 MIPS MQTT 总线（local/bt/rpcReq）读写；② Wi-Fi 设备（如空气炸锅 careli.fryer.maf01）经局域网 MiIO UDP :54321 加密直连，支持定温定时烹饪；③ 红外虚拟空调经 LX06 小爱 mibrain 静默 NLP 指令，电视电源委托 tv-agent。所有设备 token 仅保存在本机 0600 缓存中，绝不出现在任何输出里。",
+  "title": "全屋米家控制 & BE6500 Pro Mesh 中枢 / 极客版",
+  "description": "通过小米 BE6500 Pro 路由器中枢（SSH 读取 central 设备库 devInfo.db / hot_data_v2.db 与 MIPS 总线）管理蓝牙 Mesh 中枢网关、米家自动化极客版规则/日志/变量、本地手动场景与全屋智能设备：① 蓝牙 Mesh 灯/开关/插座经中枢 MIPS 总线（local/bt/rpcReq）单控与批量开关；② 极客版自动化规则（autoLocal_service）查询、启停、创建定时联动、变量读写、执行日志查看及官方 8086 画布入口发现；③ 本地米家场景（automation_service）解码与触发；④ Wi-Fi 设备（空气炸锅）局域网 MiIO 直控，红外空调经小爱 mibrain 静默执行，电视委托 tv-agent。所有 token 仅保存于本机 0600 缓存，绝不出现在输出中。",
   "entry": "index.mjs",
   "runtime": "in-process",
   "voiceFastpath": true,
-  "promptHint": "本地控制小米智能家居设备：通过路由器中枢与局域网 MiIO / MiPS / 小爱语音控制灯、插座、开关、空气炸锅、空调及电视（电视委托 tv-agent），支持 config.json 中的 protectedDevices 语音防误关保护与 customAliases 自定义别名。",
-  "actions": ["status", "devices", "get", "set", "cook", "action", "command", "config"],
+  "promptHint": "本地控制小米智能家居与 BE6500 Pro 中枢：支持蓝牙 Mesh 中枢状态与批量开关（mesh）、米家自动化极客版规则/定时/变量/日志与 8086 入口（geek）、本地米家场景触发（scene）、设备直控（set/get/devices/cook/command）及 protectedDevices 防误关保护。",
+  "actions": ["status", "dashboard", "mesh", "geek", "scene", "devices", "get", "set", "cook", "action", "command", "config"],
   "actionSpecs": [
     {
       "name": "status",
       "label": "检查中枢与音箱连通性",
       "description": "探测路由器中枢 SSH（并确认 central_service 进程）与 LX06 小爱音箱 SSH（确认 mibrain 可用），并返回本机设备缓存的数量与新鲜度及当前配置。不读取设备库、不控制任何设备。",
       "defaultArgs": {}
+    },
+    {
+      "name": "dashboard",
+      "label": "中枢综合看板",
+      "description": "聚合 BE6500 Pro 中枢状态、蓝牙 Mesh 设备、米家自动化极客版规则与执行日志、自定义变量、本地场景及音箱配置，供 Web 控制台或全量巡检使用。cacheOnly=true 时零 SSH 仅读本地缓存；live=true 时实时读取蓝牙 Mesh 开关与空气炸锅状态。",
+      "defaultArgs": { "cacheOnly": false }
+    },
+    {
+      "name": "mesh",
+      "label": "蓝牙 Mesh 中枢与批量控制",
+      "description": "op=status（默认）查看 BE6500 Pro 主/从网关角色、Home 信息、bt_service 版本、从网关列表、极客版 8086 地址及蓝牙 Mesh 设备列表；op=devices 筛选蓝牙 Mesh 设备；op=batch 批量开关全屋或指定房间（room）/设备列表（devices）的蓝牙 Mesh 灯/插座，必须传 on:true/false，默认自动跳过 protectedDevices（仅传 includeProtected:true 时才包含），支持 dryRun:true。",
+      "defaultArgs": { "op": "status" }
+    },
+    {
+      "name": "geek",
+      "label": "米家自动化极客版管理",
+      "description": "管理 BE6500 Pro 本机 autoLocal_service 极客版引擎：op=list（默认，列出规则与人类可读摘要）、get（读取节点图，传 id 或 name）、enable/disable/toggle（启停规则，传 id 或 name）、create-schedule（快速生成定时规则，传 name 与 rules:[{time,device/did/room,on,days?}]）、save（写入完整 nodes/cfg 节点图）、delete（删除规则）、logs（读取 autoLocal 执行日志，可选 graphId/limit）、nodes（查询支持的节点版本目录）、vars/var-get/var-set/var-create/var-delete（读写自定义变量，scope/id 仅限字母数字）、url（返回官方极客版 8086 画布地址）。写操作均支持 dryRun:true。",
+      "defaultArgs": { "op": "list" }
+    },
+    {
+      "name": "scene",
+      "label": "米家本地手动场景",
+      "description": "op=list（默认）读取并解码 BE6500 Pro 中枢本地化的米家手动场景（cloudGraphs/*.jsonz）及动作内容；op=run 触发指定 id 的本地场景（若场景包含关闭 protectedDevices 的动作则默认拦截，需传 confirmProtected:true 放行），支持 dryRun:true。",
+      "defaultArgs": { "op": "list" }
     },
     {
       "name": "devices",

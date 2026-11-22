@@ -605,6 +605,13 @@
                   <span id="apple-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
                   <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
                 </button>
+                <button id="plugin-tab-miot" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-miot" data-plugin-tab="miot" draggable="true" title="米家中枢" hidden>
+                  <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span>
+                  <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V20a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9.5"/><path d="M9.5 15a3.5 3.5 0 0 1 5 0"/><circle cx="12" cy="17.5" r="0.8"/></svg></span>
+                  <span class="plugin-nav-label">米家中枢</span>
+                  <span id="miot-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
+                  <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
+                </button>
               </div>
             </div>
             <div class="plugin-sidebar-footer">
@@ -1953,6 +1960,205 @@
                 </div>
               </div>
             </details>
+          </section>
+        </div>
+
+        <div id="plugin-panel-miot" class="hub-tab-panel" role="tabpanel" aria-labelledby="plugin-tab-miot" hidden>
+          <div class="plugin-surface-bar">
+            <div>
+              <h3>🏠 米家中枢 · BE6500 Pro Mesh &amp; 自动化极客版</h3>
+            </div>
+            <div class="health-header-actions">
+              <span id="miot-hub-pill" class="hub-badge badge-slate">未连接</span>
+              <a id="miot-open-geek-link" class="mini-button" target="_blank" rel="noopener noreferrer" hidden>🧩 极客版画布 ↗</a>
+              <button id="miot-live-refresh-btn" class="primary" type="button">🔄 实时状态</button>
+              <button id="miot-refresh-btn" class="mini-button" type="button">↻ 刷新中枢</button>
+            </div>
+          </div>
+          <p id="miot-action-status" class="health-status-banner" hidden></p>
+
+          <div id="miot-kpi-grid" class="hub-kpi-grid"></div>
+
+          <div class="modal-row-head">
+            <div id="miot-workspace-tabs" class="hub-filter-pills" role="tablist" aria-label="米家中枢功能视图">
+              <button class="hub-filter-pill active" type="button" role="tab" aria-selected="true" data-miot-view="mesh">📡 设备与 Mesh 中枢</button>
+              <button class="hub-filter-pill" type="button" role="tab" aria-selected="false" data-miot-view="geek">⚡ 自动化极客版</button>
+              <button class="hub-filter-pill" type="button" role="tab" aria-selected="false" data-miot-view="scenes">🎬 本地场景与变量</button>
+              <button class="hub-filter-pill" type="button" role="tab" aria-selected="false" data-miot-view="config">⚙️ 中枢与保护配置</button>
+            </div>
+          </div>
+
+          <section id="miot-view-mesh" class="model-modal-section" aria-label="设备与蓝牙 Mesh 中枢">
+            <div id="miot-gateway-card" class="hub-form-card miot-gateway-card"></div>
+
+            <div class="modal-row-head miot-filter-bar">
+              <div id="miot-room-pills" class="hub-filter-pills" role="group" aria-label="按房间筛选设备"></div>
+              <div class="modal-btn-group">
+                <div id="miot-channel-pills" class="hub-filter-pills" role="group" aria-label="按控制通道筛选">
+                  <button class="hub-filter-pill active" type="button" data-miot-channel="all">全部通道</button>
+                  <button class="hub-filter-pill" type="button" data-miot-channel="bt_mesh">蓝牙 Mesh</button>
+                  <button class="hub-filter-pill" type="button" data-miot-channel="miio_udp">Wi-Fi MiIO</button>
+                  <button class="hub-filter-pill" type="button" data-miot-channel="xiaoai_nlp">小爱红外</button>
+                  <button class="hub-filter-pill" type="button" data-miot-channel="tv_agent">智能电视</button>
+                </div>
+                <button id="miot-batch-on-btn" class="mini-button" type="button">💡 Mesh 全开</button>
+                <button id="miot-batch-off-btn" class="mini-button" type="button">🌑 Mesh 全关</button>
+              </div>
+            </div>
+
+            <div id="miot-devices-grid" class="hub-cards-grid miot-devices-grid">
+              <p class="empty">正在读取中枢设备清单…</p>
+            </div>
+          </section>
+
+          <section id="miot-view-geek" class="model-modal-section" aria-label="米家自动化极客版" hidden>
+            <div class="modal-row-head">
+              <div>
+                <h3>⚡ 本地极客版规则（autoLocal_service）</h3>
+                <span id="miot-geek-subtitle" class="meta">由 BE6500 Pro 本机离线执行的节点流规则。</span>
+              </div>
+              <div class="modal-btn-group">
+                <a id="miot-open-geek-link-2" class="mini-button" target="_blank" rel="noopener noreferrer" hidden>🧩 打开官方 8086 画布 ↗</a>
+                <button id="miot-geek-new-toggle" class="primary" type="button">＋ 新建定时规则</button>
+                <button id="miot-geek-refresh-btn" class="mini-button" type="button">↻ 刷新规则与日志</button>
+              </div>
+            </div>
+
+            <div id="miot-geek-create-box" class="hub-form-card miot-geek-create-box" hidden>
+              <div class="modal-row-head">
+                <strong>⏱️ 快速生成极客版每日定时规则</strong>
+                <span class="meta">写入后可直接生效，也可在官方 8086 画布继续扩展节点</span>
+              </div>
+              <div class="modal-form-grid">
+                <label>规则名称
+                  <input id="miot-geek-new-name" type="text" placeholder="例如：客厅自动开关灯">
+                </label>
+                <label>目标蓝牙 Mesh 设备
+                  <select id="miot-geek-new-device"></select>
+                </label>
+                <label>每日开启时间（留空则不设开启节点）
+                  <input id="miot-geek-new-on-time" type="time" value="08:00">
+                </label>
+                <label>每日关闭时间（留空则不设关闭节点）
+                  <input id="miot-geek-new-off-time" type="time" value="22:00">
+                </label>
+                <label class="wechat-inline-check">
+                  <input id="miot-geek-new-enable" type="checkbox" checked>
+                  <span>创建后立即启用</span>
+                </label>
+              </div>
+              <div class="modal-row-head">
+                <span></span>
+                <div class="modal-btn-group">
+                  <button id="miot-geek-cancel-btn" class="mini-button" type="button">取消</button>
+                  <button id="miot-geek-create-btn" class="primary" type="button">💾 写入中枢引擎</button>
+                </div>
+              </div>
+            </div>
+
+            <div id="miot-geek-list" class="miot-geek-list">
+              <p class="empty">暂无极客版规则。</p>
+            </div>
+
+            <div class="hub-form-card miot-logs-card">
+              <div class="modal-row-head">
+                <div>
+                  <h4>📜 极客引擎运行日志</h4>
+                  <span class="meta">来自 /data/other/central/local/autoLocal/log/0.log</span>
+                </div>
+                <label class="miot-inline-row">
+                  <span class="meta">筛选规则</span>
+                  <select id="miot-log-filter">
+                    <option value="">全部规则</option>
+                  </select>
+                </label>
+              </div>
+              <div id="miot-geek-logs" class="miot-log-list">
+                <p class="empty">暂无执行日志。</p>
+              </div>
+            </div>
+          </section>
+
+          <section id="miot-view-scenes" class="model-modal-section" aria-label="本地场景与自定义变量" hidden>
+            <div class="modal-row-head">
+              <div>
+                <h3>🎬 中枢本地化手动场景</h3>
+                <span class="meta">来自 automation_service cloudGraphs 的离线一键场景，含防误关保护校验。</span>
+              </div>
+              <button id="miot-scenes-refresh-btn" class="mini-button" type="button">↻ 刷新场景与变量</button>
+            </div>
+            <div id="miot-scenes-list" class="hub-cards-grid miot-scenes-grid">
+              <p class="empty">暂无本地场景。</p>
+            </div>
+
+            <div class="hub-form-card miot-vars-card">
+              <div class="modal-row-head">
+                <div>
+                  <h3>🔢 极客版自定义变量（双向联动）</h3>
+                  <span class="meta">Friday 可实时写入或读取极客版变量（scope 与 id 仅限英文字母与数字）。</span>
+                </div>
+              </div>
+              <div class="modal-form-grid">
+                <label>作用域（Scope）
+                  <input id="miot-var-scope" type="text" placeholder="例如 friday">
+                </label>
+                <label>变量 ID
+                  <input id="miot-var-id" type="text" placeholder="例如 awayMode">
+                </label>
+                <label>类型
+                  <select id="miot-var-type">
+                    <option value="number">数字 (number)</option>
+                    <option value="string">字符串 (string)</option>
+                  </select>
+                </label>
+                <label>初始值
+                  <input id="miot-var-value" type="text" placeholder="0 或文本">
+                </label>
+              </div>
+              <div class="modal-row-head">
+                <span></span>
+                <button id="miot-var-create-btn" class="primary" type="button">＋ 创建变量</button>
+              </div>
+              <div id="miot-vars-list" class="miot-vars-list">
+                <p class="empty">暂无极客版自定义变量。</p>
+              </div>
+            </div>
+          </section>
+
+          <section id="miot-view-config" class="model-modal-section" aria-label="中枢与设备保护配置" hidden>
+            <div id="miot-config-card" class="hub-form-card">
+              <div class="modal-row-head">
+                <h3>⚙️ BE6500 Pro 中枢连接与防误关保护</h3>
+                <span class="meta">保存后立即持久化到插件本地安全配置</span>
+              </div>
+              <div class="modal-form-grid">
+                <label>路由器中枢 SSH（routerSsh）
+                  <input id="miot-cfg-router" type="text" placeholder="例如 root@192.0.2.1">
+                </label>
+                <label>小爱音箱 SSH（speakerSsh，留空自动发现）
+                  <input id="miot-cfg-speaker" type="text" placeholder="例如 lx06=root@192.0.2.10">
+                </label>
+                <label>保护设备列表（逗号分隔，防批量/语音误关）
+                  <input id="miot-cfg-protected" type="text" placeholder="例如：水族箱灯, 加湿器">
+                </label>
+                <label>设备自定义别名（每行：设备名=别名1,别名2）
+                  <textarea id="miot-cfg-aliases" rows="2" placeholder="水族箱灯=水草灯,补光灯"></textarea>
+                </label>
+                <label>热数据缓存 TTL（毫秒）
+                  <input id="miot-cfg-cache-ttl" type="number" min="0" max="3600000" value="15000">
+                </label>
+                <label>拓扑缓存 TTL（毫秒）
+                  <input id="miot-cfg-topo-ttl" type="number" min="0" max="3600000" value="600000">
+                </label>
+                <label>局域网 UDP 超时（毫秒）
+                  <input id="miot-cfg-udp-timeout" type="number" min="300" max="30000" value="3500">
+                </label>
+              </div>
+              <div class="modal-row-head">
+                <span></span>
+                <button id="miot-cfg-save-btn" class="primary" type="button">💾 保存中枢配置</button>
+              </div>
+            </div>
           </section>
         </div>
         </div>

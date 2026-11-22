@@ -17,6 +17,7 @@ type WebModules = {
   initFundTrackerUi: typeof import('../src/web/plugins/fund-tracker-ui.js').initFundTrackerUi;
   initHealthScaleUi: typeof import('../src/web/plugins/health-scale-ui.js').initHealthScaleUi;
   initLaifenUi: typeof import('../src/web/plugins/laifen-ui.js').initLaifenUi;
+  initMiotUi: typeof import('../src/web/plugins/miot-ui.js').initMiotUi;
   initNetleaUi: typeof import('../src/web/plugins/netlea-ui.js').initNetleaUi;
   initNinebotUi: typeof import('../src/web/plugins/ninebot-ui.js').initNinebotUi;
   appState: typeof import('../src/web/state.js').appState;
@@ -41,6 +42,7 @@ async function getWebModules(): Promise<WebModules> {
         fund,
         health,
         laifen,
+        miot,
         netlea,
         ninebot,
         state,
@@ -57,6 +59,7 @@ async function getWebModules(): Promise<WebModules> {
         import('../src/web/plugins/fund-tracker-ui.js'),
         import('../src/web/plugins/health-scale-ui.js'),
         import('../src/web/plugins/laifen-ui.js'),
+        import('../src/web/plugins/miot-ui.js'),
         import('../src/web/plugins/netlea-ui.js'),
         import('../src/web/plugins/ninebot-ui.js'),
         import('../src/web/state.js'),
@@ -74,6 +77,7 @@ async function getWebModules(): Promise<WebModules> {
         initFundTrackerUi: fund.initFundTrackerUi,
         initHealthScaleUi: health.initHealthScaleUi,
         initLaifenUi: laifen.initLaifenUi,
+        initMiotUi: miot.initMiotUi,
         initNetleaUi: netlea.initNetleaUi,
         initNinebotUi: ninebot.initNinebotUi,
         appState: state.appState,
@@ -2110,5 +2114,116 @@ test('netlea-ui catches refreshAfterMutation errors, protects busy banner, shift
     }
 
     netlea.deactivate();
+  });
+});
+
+test('miot-ui renders Mesh/Geek/Scenes, prevents stale refreshBadge overwrite, rejects unsafe geekUrl, and preserves mutation status', async () => {
+  await withWebHarness(async ctx => {
+    const { initMiotUi } = ctx.mods;
+    const badgeDeferred = deferred<Response>();
+    let dashCount = 0;
+
+    ctx.setFetchHandler(async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { action?: string; args?: Record<string, unknown> };
+      if (body.action === 'dashboard') {
+        dashCount++;
+        if (dashCount === 1) return badgeDeferred.promise;
+        return jsonResponse({
+          ok: true,
+          message: 'ok',
+          data: {
+            configured: true,
+            gateway: { online: true, roleLabel: '主中枢', homeName: 'Demo Home', ip: '192.0.2.1', geekPort: 8086 },
+            btService: { version: '3.1.7' },
+            geekReady: true,
+            geekUrl: 'http://192.0.2.1:8086',
+            devices: [
+              { did: 'd1', name: '卧室灯', room: '卧室', fullName: '卧室灯', category: 'light', categories: ['light'], controlChannel: 'bt_mesh', controllable: true, online: true, model: 'test.light', state: { on: true, source: 'live' } },
+            ],
+            geekGraphs: [
+              { id: 'g1', name: '晚间定时', enable: true, nodeCount: 2, nodeTypes: ['alarmClock', 'deviceOutput'], summary: '每天 22:00 → 关闭卧室灯' },
+            ],
+            geekLogs: [
+              { ts: 1_700_000_000_000, type: 'node', graphId: 'g1', graphName: '晚间定时', ok: true, summary: '节点 n2 执行成功' },
+            ],
+            scenes: [
+              { id: 's1', summary: '打开卧室灯', turnsOffProtected: false },
+            ],
+            variables: [
+              { scope: 'friday', id: 'mode1', type: 'number', value: 1 },
+            ],
+            config: {
+              routerSsh: 'root@192.0.2.1',
+              speakerSsh: '',
+              protectedDevices: [],
+              customAliases: {},
+              cacheTtlMs: 15000,
+              topologyTtlMs: 600000,
+              udpTimeoutMs: 3500,
+            },
+          },
+        });
+      }
+      if (body.action === 'config') {
+        return jsonResponse({ ok: true, message: '配置已保存到本地' });
+      }
+      return jsonResponse({ ok: true, message: 'ok' });
+    });
+
+    const visible = { flag: false };
+    const ctrl = initMiotUi({ isVisible: () => visible.flag });
+
+    // Start slow cacheOnly refreshBadge while inactive, then activate & resolve stale badge later.
+    const badgePromise = ctrl.refreshBadge();
+    visible.flag = true;
+    ctrl.activate();
+    await flushMicrotasks();
+
+    badgeDeferred.resolve(jsonResponse({
+      ok: true,
+      data: {
+        configured: true,
+        devices: Array.from({ length: 99 }, (_, idx) => ({
+          did: `old-${idx}`, name: 'Old', room: '客厅', fullName: 'Old', category: 'light', categories: ['light'],
+          controlChannel: 'bt_mesh', controllable: true, online: true, model: 'm',
+        })),
+      },
+    }));
+    await badgePromise;
+    await flushMicrotasks();
+
+    assert.equal(ctx.doc.getElementById('miot-top-badge')!.textContent, '1 Mesh');
+    assert.equal(ctx.doc.getElementById('miot-open-geek-link')!.href, 'http://192.0.2.1:8086');
+    assert.equal(ctx.doc.getElementById('miot-open-geek-link')!.hidden, false);
+    assert.equal(ctx.doc.getElementById('miot-geek-list')!.querySelectorAll('.miot-geek-card').length, 1);
+
+    // Config save preserves banner message instead of clearing it during reload.
+    ctx.doc.getElementById('miot-cfg-save-btn')!.click();
+    await flushMicrotasks();
+    assert.equal(ctx.doc.getElementById('miot-action-status')!.textContent, '配置已保存到本地');
+
+    ctrl.deactivate();
+  });
+});
+
+test('miot-ui rejects unsafe javascript: geekUrl', async () => {
+  await withWebHarness(async ctx => {
+    const { initMiotUi } = ctx.mods;
+    ctx.setFetchHandler(async () => jsonResponse({
+      ok: true,
+      data: {
+        configured: true,
+        geekUrl: 'javascript:alert(1)',
+        devices: [],
+        geekGraphs: [],
+      },
+    }));
+    const ctrl = initMiotUi({ isVisible: () => true });
+    ctrl.activate();
+    await flushMicrotasks();
+    const link = ctx.doc.getElementById('miot-open-geek-link')!;
+    assert.equal(link.hidden, true);
+    assert.equal(link.getAttribute('href'), null);
+    ctrl.deactivate();
   });
 });
