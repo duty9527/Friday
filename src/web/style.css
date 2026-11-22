@@ -103,7 +103,6 @@ html[data-theme="spatial"] {
   --safe-right:env(safe-area-inset-right, 0px);
   --safe-bottom:env(safe-area-inset-bottom, 0px);
   --safe-left:env(safe-area-inset-left, 0px);
-  --mobile-vh:100%;
 
   font-family:"IBM Plex Sans",system-ui,sans-serif;
   color:var(--text);
@@ -202,25 +201,8 @@ html[data-theme="industrial"] {
   visibility:hidden;
   contain:strict;
 }
-html.ios-standalone-short-top {
-  --mobile-vh:calc(100% + var(--safe-top));
-}
-html.ios-standalone-short-bottom {
-  --mobile-vh:calc(100% + var(--safe-bottom));
-}
-html.ios-standalone-short-both {
-  --mobile-vh:calc(100% + var(--safe-top) + var(--safe-bottom));
-}
-@supports (height: 100lvh) {
-  html.ios-standalone-short-top {
-    --mobile-vh:max(100lvh, calc(100% + var(--safe-top)));
-  }
-  html.ios-standalone-short-bottom {
-    --mobile-vh:max(100lvh, calc(100% + var(--safe-bottom)));
-  }
-  html.ios-standalone-short-both {
-    --mobile-vh:max(100lvh, calc(100% + var(--safe-top) + var(--safe-bottom)));
-  }
+html.ios-standalone-clipped {
+  --safe-bottom:0px;
 }
 
 /* Smooth dual-skin transition triggered only during active theme switch */
@@ -6679,18 +6661,15 @@ html[data-theme="industrial"] .fund-holding-row:hover {
 
 @media(max-width:730px) {
   html {
-    height:var(--mobile-vh);
+    height:100%;
     overflow:hidden;
     overscroll-behavior:none;
   }
   body {
     position:fixed;
-    top:0;
-    left:0;
-    right:0;
-    bottom:auto;
+    inset:0;
     width:100%;
-    height:var(--mobile-vh);
+    height:100%;
     min-height:0;
     overflow:hidden;
     overscroll-behavior:none;

@@ -708,7 +708,7 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
     assert.equal(mobileVpRes.status, 200);
     assert.match(mobileVpRes.headers.get('content-type') ?? '', /javascript/);
     const mobileVpJs = await mobileVpRes.text();
-    for (const sym of ['detectIosStandaloneShortMode', 'initMobileViewport']) {
+    for (const sym of ['isIosStandaloneClipped', 'initMobileViewport']) {
       assert.ok(mobileVpJs.includes(sym), `shared/mobile-viewport.js must export ${sym}`);
     }
     assert.doesNotMatch(mobileVpJs, /\.style\./);
@@ -744,6 +744,8 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
       'id="te-oled-strip"',
       '与 F.R.I.D.A.Y. 对话',
       'Enter 发送 · Shift+Enter 换行',
+      'black-translucent',
+      'apple-mobile-web-app-capable',
     ]) {
       assert.ok(!indexHtml.includes(removed), `index.html must not include ${removed}`);
     }
@@ -754,6 +756,8 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
     assert.match(mindmapHtml, /viewport-fit=cover/);
     assert.match(mindmapHtml, /id="mm-theme-spatial"/);
     assert.match(mindmapHtml, /id="mm-theme-industrial"/);
+    assert.doesNotMatch(mindmapHtml, /black-translucent/);
+    assert.doesNotMatch(mindmapHtml, /apple-mobile-web-app-capable/);
     assert.doesNotMatch(mindmapHtml, /\sstyle="/i);
 
     const styleCss = await (await fetch(`${f.base}/style.css`)).text();
@@ -761,16 +765,18 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
     assert.ok(styleCss.includes('html[data-theme="industrial"]'));
     assert.ok(styleCss.includes('(pointer: coarse)'));
     assert.ok(styleCss.includes('font-size:16px'));
-    for (const marker of ['--safe-top', '--safe-bottom', '.safe-area-probe', 'ios-standalone-short-top']) {
+    for (const marker of ['--safe-top', '--safe-bottom', '.safe-area-probe', 'ios-standalone-clipped']) {
       assert.ok(styleCss.includes(marker), `style.css must include ${marker}`);
     }
+    assert.doesNotMatch(styleCss, /ios-standalone-short-/);
 
     const mindmapCss = await (await fetch(`${f.base}/mindmap.css`)).text();
     assert.ok(mindmapCss.includes('html[data-theme="spatial"]'));
     assert.ok(mindmapCss.includes('html[data-theme="industrial"]'));
-    for (const marker of ['--safe-top', '--safe-bottom', '.safe-area-probe', 'ios-standalone-short-top']) {
+    for (const marker of ['--safe-top', '--safe-bottom', '.safe-area-probe', 'ios-standalone-clipped']) {
       assert.ok(mindmapCss.includes(marker), `mindmap.css must include ${marker}`);
     }
+    assert.doesNotMatch(mindmapCss, /ios-standalone-short-/);
   } finally {
     await f.close();
   }

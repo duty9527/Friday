@@ -9,7 +9,7 @@ import { socketPath } from '../src/protocol.js';
 import type { ChatMessage, TraceEvent } from '../src/view.js';
 import { summarizeSystemNotice } from '../src/web/shared/chat-view.js';
 import { renderMarkdownContent } from '../src/web/shared/markdown.js';
-import { detectIosStandaloneShortMode, initMobileViewport } from '../src/web/shared/mobile-viewport.js';
+import { initMobileViewport, isIosStandaloneClipped } from '../src/web/shared/mobile-viewport.js';
 import { createSharedSseHub, type BroadcastChannelLike, type SseUpdateBatch } from '../src/web/shared/sse-hub.js';
 import { buildExecutionChain } from '../src/web/trace-chain.js';
 import type { MindmapSnapshot, MindmapTaskFlow } from '../src/web/mindmap-data.js';
@@ -976,6 +976,18 @@ test('initChatPanel clears draftTyping on confirmed send error, guards loadOlder
     const allowed = env.documentMock.dispatchEvent(touchMoveEv);
     assert.equal(allowed, true, 'notebook-modal-body vertical scroll must not be blocked on <=730px viewports');
     assert.notEqual(touchMoveEv.defaultPrevented, true);
+
+    notebookBody.scrollTop = 300;
+    env.documentMock.dispatchEvent({ type: 'touchstart', touches: [{ clientX: 0, clientY: 120 }] });
+    const touchMoveAtBottomEv: Record<string, unknown> = {
+      type: 'touchmove',
+      target: notebookBody,
+      touches: [{ clientX: 0, clientY: 80 }],
+      cancelable: true,
+    };
+    const allowedAtBottom = env.documentMock.dispatchEvent(touchMoveAtBottomEv);
+    assert.equal(allowedAtBottom, true, 'upward touchmove at bottom boundary must not be prevented on iOS');
+    assert.notEqual(touchMoveAtBottomEv.defaultPrevented, true);
   } finally {
     env.restore();
   }
@@ -1121,7 +1133,7 @@ test('mindmap preserves #mm-inspector scrollTop across refreshes and drops stale
   }
 });
 
-test('detectIosStandaloneShortMode accurately isolates iOS standalone shortfall variants', () => {
+test('isIosStandaloneClipped accurately isolates legacy iOS standalone clipped mode', () => {
   const base = {
     standalone: true,
     narrowMobile: true,
@@ -1134,18 +1146,15 @@ test('detectIosStandaloneShortMode accurately isolates iOS standalone shortfall 
     safeBottom: 34,
   };
 
-  assert.equal(detectIosStandaloneShortMode(base), 'top');
-  assert.equal(detectIosStandaloneShortMode({ ...base, layoutHeight: 878 }), 'bottom');
-  assert.equal(detectIosStandaloneShortMode({ ...base, layoutHeight: 810 }), 'both');
-  assert.equal(detectIosStandaloneShortMode({ ...base, safeTop: 44, safeBottom: 34, layoutHeight: 868 }), 'top');
-  assert.equal(detectIosStandaloneShortMode({ ...base, layoutHeight: 912 }), 'none');
-  assert.equal(detectIosStandaloneShortMode({ ...base, safeTop: 0, safeBottom: 0 }), 'none');
-  assert.equal(detectIosStandaloneShortMode({ ...base, keyboardOpen: true }), 'none');
-  assert.equal(detectIosStandaloneShortMode({ ...base, standalone: false }), 'none');
-  assert.equal(detectIosStandaloneShortMode({ ...base, screenWidth: 820, screenHeight: 1180, layoutWidth: 500, layoutHeight: 1112 }), 'none');
+  assert.equal(isIosStandaloneClipped(base), true);
+  assert.equal(isIosStandaloneClipped({ ...base, layoutHeight: 912 }), false);
+  assert.equal(isIosStandaloneClipped({ ...base, safeTop: 0, safeBottom: 0 }), false);
+  assert.equal(isIosStandaloneClipped({ ...base, keyboardOpen: true }), false);
+  assert.equal(isIosStandaloneClipped({ ...base, standalone: false }), false);
+  assert.equal(isIosStandaloneClipped({ ...base, screenWidth: 820, screenHeight: 1180, layoutWidth: 500, layoutHeight: 1112 }), false);
 });
 
-test('initMobileViewport creates safe-area probe, syncs standalone & keyboard classes, resets blur scroll, and disposes cleanly', async () => {
+test('initMobileViewport creates safe-area probe, syncs clipped & keyboard classes, resets blur scroll, and disposes cleanly', async () => {
   const env = createDomEnv();
   try {
     let scrollCalls = 0;
@@ -1199,7 +1208,7 @@ test('initMobileViewport creates safe-area probe, syncs standalone & keyboard cl
 
     const root = env.documentMock.documentElement;
     assert.equal(root.classList.contains('pwa-standalone'), true);
-    assert.equal(root.classList.contains('ios-standalone-short-top'), true);
+    assert.equal(root.classList.contains('ios-standalone-clipped'), true);
     assert.equal(root.classList.contains('mobile-keyboard-open'), false);
 
     const inputEl = new MockElement('input');
@@ -1208,7 +1217,7 @@ test('initMobileViewport creates safe-area probe, syncs standalone & keyboard cl
     vvHeight = 520;
     env.documentMock.dispatchEvent({ type: 'focusin' });
     assert.equal(root.classList.contains('mobile-keyboard-open'), true);
-    assert.equal(root.classList.contains('ios-standalone-short-top'), false);
+    assert.equal(root.classList.contains('ios-standalone-clipped'), false);
 
     (env.documentMock as { activeElement: MockElement | null }).activeElement = null;
     vvHeight = 844;
@@ -1218,7 +1227,7 @@ test('initMobileViewport creates safe-area probe, syncs standalone & keyboard cl
 
     assert.equal(scrollCalls, 1, 'focusout on narrow mobile must reset window scroll');
     assert.equal(root.classList.contains('mobile-keyboard-open'), false);
-    assert.equal(root.classList.contains('ios-standalone-short-top'), true);
+    assert.equal(root.classList.contains('ios-standalone-clipped'), true);
 
     ctrl.dispose();
     vvHeight = 500;

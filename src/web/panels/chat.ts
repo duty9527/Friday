@@ -1661,15 +1661,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
   });
 
   if (typeof window !== 'undefined' && window.visualViewport) {
-    window.visualViewport.addEventListener('scroll', () => {
-      if (window.scrollY !== 0 || window.scrollX !== 0) {
-        window.scrollTo(0, 0);
-      }
-    }, { passive: true });
     window.visualViewport.addEventListener('resize', () => {
-      if (window.scrollY !== 0 || window.scrollX !== 0) {
-        window.scrollTo(0, 0);
-      }
       if (resizePinned) scrollEl.scrollTop = scrollEl.scrollHeight;
       syncScrollBottomButton();
     }, { passive: true });
@@ -1706,9 +1698,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
         if (horizontal) {
           if (cursor.scrollWidth > cursor.clientWidth + 1) return;
         } else if (cursor.scrollHeight > cursor.clientHeight + 1) {
-          const atTop = cursor.scrollTop <= 0 && dy > 0;
-          const atBottom = cursor.scrollTop + cursor.clientHeight >= cursor.scrollHeight - 1 && dy < 0;
-          if (!atTop && !atBottom) return;
+          return;
         }
       }
       cursor = cursor.parentElement;

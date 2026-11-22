@@ -185,7 +185,6 @@ html[data-theme="spatial"] {
   --safe-right:env(safe-area-inset-right, 0px);
   --safe-bottom:env(safe-area-inset-bottom, 0px);
   --safe-left:env(safe-area-inset-left, 0px);
-  --mobile-vh:100dvh;
 
   font-family:"IBM Plex Sans",system-ui,-apple-system,sans-serif;
   color:var(--mm-text);
@@ -369,25 +368,8 @@ html[data-theme="industrial"] {
   visibility:hidden;
   contain:strict;
 }
-html.ios-standalone-short-top {
-  --mobile-vh:calc(100% + var(--safe-top));
-}
-html.ios-standalone-short-bottom {
-  --mobile-vh:calc(100% + var(--safe-bottom));
-}
-html.ios-standalone-short-both {
-  --mobile-vh:calc(100% + var(--safe-top) + var(--safe-bottom));
-}
-@supports (height: 100lvh) {
-  html.ios-standalone-short-top {
-    --mobile-vh:max(100lvh, calc(100% + var(--safe-top)));
-  }
-  html.ios-standalone-short-bottom {
-    --mobile-vh:max(100lvh, calc(100% + var(--safe-bottom)));
-  }
-  html.ios-standalone-short-both {
-    --mobile-vh:max(100lvh, calc(100% + var(--safe-top) + var(--safe-bottom)));
-  }
+html.ios-standalone-clipped {
+  --safe-bottom:0px;
 }
 
 /* Smooth dual-skin transition triggered only during active theme switch */
@@ -2131,7 +2113,7 @@ html[data-theme="industrial"] .mm-turn-link-chip {
 @media (max-width:920px) {
   body {
     height:auto;
-    min-height:var(--mobile-vh);
+    min-height:100dvh;
     padding-bottom:var(--safe-bottom);
     overflow-y:auto;
   }

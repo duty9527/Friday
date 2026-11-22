@@ -1,5 +1,3 @@
-export type IosStandaloneShortMode = 'none' | 'top' | 'bottom' | 'both';
-
 export interface MobileViewportMetrics {
   standalone: boolean;
   narrowMobile: boolean;
@@ -20,11 +18,7 @@ export interface MobileViewportController {
 const PROBE_ID = 'safe-area-probe';
 const MOBILE_MEDIA_QUERY = '(max-width: 730px)';
 const STANDALONE_MEDIA_QUERY = '(display-mode: standalone)';
-const SHORT_MODE_CLASSES: Record<Exclude<IosStandaloneShortMode, 'none'>, string> = {
-  top: 'ios-standalone-short-top',
-  bottom: 'ios-standalone-short-bottom',
-  both: 'ios-standalone-short-both',
-};
+const CLIPPED_CLASS = 'ios-standalone-clipped';
 const NON_TEXT_INPUT_TYPES = new Set([
   'button',
   'checkbox',
@@ -59,9 +53,9 @@ function isEditableTextElement(el: Element | null): boolean {
   return contentEditable === '' || contentEditable === 'true' || (el as HTMLElement).isContentEditable === true;
 }
 
-export function detectIosStandaloneShortMode(metrics: MobileViewportMetrics): IosStandaloneShortMode {
+export function isIosStandaloneClipped(metrics: MobileViewportMetrics): boolean {
   if (!metrics.standalone || !metrics.narrowMobile || metrics.keyboardOpen) {
-    return 'none';
+    return false;
   }
   const { screenWidth, screenHeight, layoutWidth, layoutHeight, safeTop, safeBottom } = metrics;
   if (
@@ -72,40 +66,23 @@ export function detectIosStandaloneShortMode(metrics: MobileViewportMetrics): Io
     || !Number.isFinite(safeTop)
     || !Number.isFinite(safeBottom)
   ) {
-    return 'none';
+    return false;
   }
 
   const portrait = layoutWidth <= layoutHeight;
   const expectedW = portrait ? Math.min(screenWidth, screenHeight) : Math.max(screenWidth, screenHeight);
   const expectedH = portrait ? Math.max(screenWidth, screenHeight) : Math.min(screenWidth, screenHeight);
 
-  // Guard against desktop PWAs or iPad Split View windows whose width does not match the device screen.
   if (Math.abs(expectedW - layoutWidth) > 16) {
-    return 'none';
+    return false;
   }
 
   const shortfall = expectedH - layoutHeight;
-  if (shortfall < 16 || shortfall > 140) {
-    return 'none';
+  if (shortfall < 40 || shortfall > 120) {
+    return false;
   }
 
-  const candidates: Array<{ mode: Exclude<IosStandaloneShortMode, 'none'>; diff: number }> = [];
-  if (safeTop >= 16) {
-    const diff = Math.abs(shortfall - safeTop);
-    if (diff <= 16) candidates.push({ mode: 'top', diff });
-  }
-  if (safeBottom >= 12) {
-    const diff = Math.abs(shortfall - safeBottom);
-    if (diff <= 14) candidates.push({ mode: 'bottom', diff });
-  }
-  if (safeTop >= 16 && safeBottom >= 12) {
-    const diff = Math.abs(shortfall - (safeTop + safeBottom));
-    if (diff <= 16) candidates.push({ mode: 'both', diff });
-  }
-
-  if (candidates.length === 0) return 'none';
-  candidates.sort((a, b) => a.diff - b.diff);
-  return candidates[0]!.mode;
+  return safeTop >= 16 && Math.abs(shortfall - safeTop) <= 16;
 }
 
 function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
@@ -182,6 +159,7 @@ export function initMobileViewport(): MobileViewportController {
 
   const resetScrollIfNeeded = (narrowMobile: boolean): void => {
     if (!narrowMobile || typeof window.scrollTo !== 'function') return;
+    if (isEditableTextElement(document.activeElement)) return;
     if ((window.scrollY || 0) !== 0 || (window.scrollX || 0) !== 0) {
       window.scrollTo(0, 0);
     }
@@ -234,7 +212,7 @@ export function initMobileViewport(): MobileViewportController {
         )
       );
 
-    const shortMode = detectIosStandaloneShortMode({
+    const clipped = isIosStandaloneClipped({
       standalone,
       narrowMobile,
       keyboardOpen,
@@ -248,9 +226,7 @@ export function initMobileViewport(): MobileViewportController {
 
     root.classList.toggle('pwa-standalone', standalone);
     root.classList.toggle('mobile-keyboard-open', keyboardOpen);
-    root.classList.toggle(SHORT_MODE_CLASSES.top, shortMode === 'top');
-    root.classList.toggle(SHORT_MODE_CLASSES.bottom, shortMode === 'bottom');
-    root.classList.toggle(SHORT_MODE_CLASSES.both, shortMode === 'both');
+    root.classList.toggle(CLIPPED_CLASS, clipped);
   };
 
   const scheduleDelayedSync = (delayMs: number, resetScroll = false): void => {
@@ -305,15 +281,7 @@ export function initMobileViewport(): MobileViewportController {
   });
 
   if (window.visualViewport) {
-    const onVisualViewportChange = () => {
-      const layoutW = isFinitePositive(window.innerWidth)
-        ? window.innerWidth
-        : (document.documentElement?.clientWidth || 0);
-      resetScrollIfNeeded(isNarrowMobile(layoutW));
-      sync();
-    };
-    listen(window.visualViewport, 'resize', onVisualViewportChange, { passive: true });
-    listen(window.visualViewport, 'scroll', onVisualViewportChange, { passive: true });
+    listen(window.visualViewport, 'resize', sync, { passive: true });
   }
 
   sync();
