@@ -698,7 +698,7 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
     assert.equal(themeRes.status, 200);
     assert.match(themeRes.headers.get('content-type') ?? '', /javascript/);
     const themeJs = await themeRes.text();
-    for (const sym of ['getUiTheme', 'setUiTheme', 'bindThemeButtons', 'initDesktopDrawers']) {
+    for (const sym of ['getUiTheme', 'setUiTheme', 'bindThemeButtons', 'initDesktopDrawers', 'syncThemeChrome']) {
       assert.ok(themeJs.includes(sym), `shared/theme.js must export ${sym}`);
     }
     assert.doesNotMatch(themeJs, /\.style\./);
@@ -779,9 +779,12 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
       'overflow-anchor:none',
       'color-scheme:dark',
       'var(--surface-solid)',
+      'html[data-theme="industrial"]',
+      'visibility:hidden',
     ]) {
       assert.ok(styleCss.includes(marker), `style.css must include ${marker}`);
     }
+    assert.match(styleCss, /@media\(max-width:730px\)[\s\S]*html\[data-theme="industrial"\][\s\S]*html\.theme-transitioning body/);
     assert.doesNotMatch(styleCss, /ios-standalone-short-/);
 
     const mindmapCss = await (await fetch(`${f.base}/mindmap.css`)).text();

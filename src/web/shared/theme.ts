@@ -20,6 +20,48 @@ let boundWindow: (Window & typeof globalThis) | undefined;
 let boundRightBtn: HTMLButtonElement | null = null;
 let lastWriteSucceeded = true;
 let themeTransitionTimer: ReturnType<typeof setTimeout> | undefined;
+let chromeSyncRaf: number | undefined;
+
+function getThemeMetaColors(theme: UiTheme): { scheme: 'light' | 'dark'; themeColor: string } {
+  return theme === 'industrial'
+    ? { scheme: 'light', themeColor: '#f7f4ed' }
+    : { scheme: 'dark', themeColor: '#111520' };
+}
+
+function syncMetaTag(name: string, content: string, replaceNode: boolean): void {
+  if (typeof document === 'undefined') return;
+  const existing = typeof document.querySelector === 'function'
+    ? document.querySelector(`meta[name="${name}"]`)
+    : null;
+  if (existing) {
+    if (replaceNode && existing.parentNode && typeof document.createElement === 'function') {
+      const fresh = document.createElement('meta');
+      fresh.setAttribute('name', name);
+      fresh.setAttribute('content', content);
+      if (typeof existing.replaceWith === 'function') {
+        existing.replaceWith(fresh);
+      } else {
+        existing.parentNode.insertBefore(fresh, existing);
+        existing.remove();
+      }
+      return;
+    }
+    existing.setAttribute('content', content);
+    return;
+  }
+  if (document.head && typeof document.createElement === 'function') {
+    const fresh = document.createElement('meta');
+    fresh.setAttribute('name', name);
+    fresh.setAttribute('content', content);
+    document.head.appendChild(fresh);
+  }
+}
+
+export function syncThemeChrome(theme: UiTheme = getUiTheme()): void {
+  const { scheme, themeColor } = getThemeMetaColors(theme);
+  syncMetaTag('color-scheme', scheme, false);
+  syncMetaTag('theme-color', themeColor, true);
+}
 
 function triggerThemeTransition(): void {
   if (typeof document === 'undefined') return;
@@ -88,18 +130,17 @@ function applyThemeToDom(theme: UiTheme): void {
       if (root.dataset) root.dataset.theme = theme;
       else if (typeof root.setAttribute === 'function') root.setAttribute('data-theme', theme);
     }
-    const scheme = theme === 'industrial' ? 'light' : 'dark';
-    const meta = typeof document.querySelector === 'function'
-      ? document.querySelector('meta[name="color-scheme"]')
-      : null;
-    if (meta) {
-      meta.setAttribute('content', scheme);
-    }
-    const themeColorMeta = typeof document.querySelector === 'function'
-      ? document.querySelector('meta[name="theme-color"]')
-      : null;
-    if (themeColorMeta) {
-      themeColorMeta.setAttribute('content', theme === 'industrial' ? '#f7f4ed' : '#111520');
+    syncThemeChrome(theme);
+    if (typeof requestAnimationFrame === 'function') {
+      if (chromeSyncRaf !== undefined && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(chromeSyncRaf);
+      }
+      chromeSyncRaf = requestAnimationFrame(() => {
+        chromeSyncRaf = undefined;
+        if (currentTheme === theme) {
+          syncMetaTag('theme-color', getThemeMetaColors(theme).themeColor, true);
+        }
+      });
     }
   }
   syncThemeButtons(theme);

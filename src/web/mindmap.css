@@ -2183,8 +2183,10 @@ html[data-theme="industrial"] .mm-turn-link-chip {
 
 @media (max-width:730px) {
   html,
-  body,
-  .mm-topbar {
+  html[data-theme="spatial"],
+  html[data-theme="spatial"] body,
+  html[data-theme="spatial"] .mm-topbar {
+    background:var(--mm-ground);
     background-color:var(--mm-ground);
   }
   html[data-theme="industrial"],
@@ -2192,6 +2194,9 @@ html[data-theme="industrial"] .mm-turn-link-chip {
   html[data-theme="industrial"] .mm-topbar {
     background:#f7f4ed;
     background-color:#f7f4ed;
+  }
+  html.theme-transitioning body {
+    transition:none;
   }
 }
 

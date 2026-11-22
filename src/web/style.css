@@ -6694,7 +6694,9 @@ html[data-theme="industrial"] .fund-holding-row:hover {
 }
 
 @media(max-width:730px) {
-  html {
+  html,
+  html[data-theme="spatial"],
+  html[data-theme="industrial"] {
     height:100%;
     overflow:hidden;
     overscroll-behavior:none;
@@ -6719,6 +6721,9 @@ html[data-theme="industrial"] .fund-holding-row:hover {
     background-color:var(--surface-solid);
     background-image:none;
     box-shadow:none;
+  }
+  html.theme-transitioning body {
+    transition:none;
   }
   .mobile-only-btn {
     display:inline-flex;
@@ -7103,12 +7108,15 @@ html[data-theme="industrial"] .fund-holding-row:hover {
     z-index:36;
     background:var(--backdrop-bg);
     opacity:0;
+    visibility:hidden;
     pointer-events:none;
-    transition:opacity var(--dur-base) var(--ease-out);
+    transition:opacity var(--dur-base) var(--ease-out), visibility 0s linear var(--dur-base);
   }
   .panels.trace-visible .mobile-trace-scrim {
     opacity:1;
+    visibility:visible;
     pointer-events:auto;
+    transition:opacity var(--dur-base) var(--ease-out), visibility 0s;
   }
   .trace,
   html[data-theme="industrial"] .trace {

@@ -7,7 +7,7 @@ import {
 import { createSharedSseHub, type SseUpdateBatch } from './shared/sse-hub.js';
 import { element, node } from './shared/dom.js';
 import { errorText } from './shared/format.js';
-import { bindThemeButtons, initDesktopDrawers } from './shared/theme.js';
+import { bindThemeButtons, initDesktopDrawers, syncThemeChrome } from './shared/theme.js';
 import { initMobileViewport } from './shared/mobile-viewport.js';
 import { initChatPanel } from './panels/chat.js';
 import { initTracePanel } from './panels/trace.js';
@@ -50,6 +50,9 @@ function setMobileNavOpen(open: boolean): void {
   document.body.classList.toggle('mobile-nav-open', open);
   if (mobileNavScrim) mobileNavScrim.hidden = !open;
   mobileNavBtn?.setAttribute('aria-expanded', String(open));
+  if (!open) {
+    syncThemeChrome();
+  }
 }
 
 bindThemeButtons(themeSpatialBtn, themeIndustrialBtn);

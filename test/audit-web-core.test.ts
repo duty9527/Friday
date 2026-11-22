@@ -1245,23 +1245,48 @@ test('setUiTheme keeps meta theme-color and color-scheme aligned with mobile sur
     const colorSchemeMeta = new MockElement('meta');
     colorSchemeMeta.setAttribute('name', 'color-scheme');
     colorSchemeMeta.setAttribute('content', 'dark');
-    const themeColorMeta = new MockElement('meta');
-    themeColorMeta.setAttribute('name', 'theme-color');
-    themeColorMeta.setAttribute('content', '#111520');
+    const detachedThemeColorMeta = new MockElement('meta');
+    detachedThemeColorMeta.setAttribute('name', 'theme-color');
+    detachedThemeColorMeta.setAttribute('content', '#111520');
     (env.documentMock as { querySelector: (s: string) => MockElement | null }).querySelector = (selector: string) => {
       if (selector === 'meta[name="color-scheme"]') return colorSchemeMeta;
-      if (selector === 'meta[name="theme-color"]') return themeColorMeta;
+      if (selector === 'meta[name="theme-color"]') return detachedThemeColorMeta;
       return null;
     };
 
-    const { setUiTheme } = await import('../src/web/shared/theme.js');
+    const { setUiTheme, syncThemeChrome } = await import('../src/web/shared/theme.js');
     setUiTheme('industrial');
     assert.equal(colorSchemeMeta.getAttribute('content'), 'light');
-    assert.equal(themeColorMeta.getAttribute('content'), '#f7f4ed');
+    assert.equal(detachedThemeColorMeta.getAttribute('content'), '#f7f4ed');
 
     setUiTheme('spatial');
     assert.equal(colorSchemeMeta.getAttribute('content'), 'dark');
-    assert.equal(themeColorMeta.getAttribute('content'), '#111520');
+    assert.equal(detachedThemeColorMeta.getAttribute('content'), '#111520');
+
+    // Attached-in-head path: theme-color meta node is replaced to force WebKit chrome repaint
+    const head = new MockElement('head');
+    const attachedThemeMeta = new MockElement('meta');
+    attachedThemeMeta.setAttribute('name', 'theme-color');
+    attachedThemeMeta.setAttribute('content', '#111520');
+    head.append(colorSchemeMeta, attachedThemeMeta);
+    (env.documentMock as { querySelector: (s: string) => MockElement | null }).querySelector = (selector: string) => {
+      if (selector === 'meta[name="color-scheme"]') return head.children.find(c => c.getAttribute('name') === 'color-scheme') ?? null;
+      if (selector === 'meta[name="theme-color"]') return head.children.find(c => c.getAttribute('name') === 'theme-color') ?? null;
+      return null;
+    };
+
+    setUiTheme('industrial');
+    const industrialMeta = head.children.find(c => c.getAttribute('name') === 'theme-color');
+    assert.ok(industrialMeta);
+    assert.notEqual(industrialMeta, attachedThemeMeta, 'theme switch must replace attached <meta name="theme-color"> node');
+    assert.equal(industrialMeta.getAttribute('content'), '#f7f4ed');
+
+    syncThemeChrome('spatial');
+    const spatialMeta = head.children.find(c => c.getAttribute('name') === 'theme-color');
+    assert.ok(spatialMeta);
+    assert.notEqual(spatialMeta, industrialMeta);
+    assert.equal(spatialMeta.getAttribute('content'), '#111520');
+    assert.equal(colorSchemeMeta.getAttribute('content'), 'dark');
   } finally {
     env.restore();
   }
