@@ -816,6 +816,15 @@ ap_geo_dump = json.dumps(ap_geo_w, ensure_ascii=False)
 for raw_geo in ("latitude", "longitude", "31.2305", "121.4738", "31.2988", "121.5299"):
     assert raw_geo not in ap_geo_dump, (raw_geo, ap_geo_dump)
 
+# Verify expired session surfaces expired warning even while stale devices-cache.json still has entries
+(apple_dir / "session.json").write_text(json.dumps({"state": "expired"}), encoding="utf-8")
+hub._collect_apple_devices(apple_cache, connected=False)
+ap_exp_w = hub.get_widget("apple-devices")
+assert ap_exp_w["ok"] is False and ap_exp_w["empty"] is False, ap_exp_w
+assert ap_exp_w["authState"] == "expired" and ap_exp_w["headline"] == "会话已过期", ap_exp_w
+assert ap_exp_w["total"] == 2 and "重新登录" in ap_exp_w["subline"], ap_exp_w
+(apple_dir / "session.json").write_text(json.dumps({"state": "authenticated"}), encoding="utf-8")
+
 # 4. FakeCairo smoke render across ALL 15 built-in cards + plugin:demo-custom, all 4 sizes, both grid_rows, and Chinese HUD checks
 rmod.cairo = fake_cairo
 try:
@@ -909,6 +918,12 @@ try:
     wrapped_joined = "".join(t for t in ap_texts if t.startswith("张三的 MacBook") or t == "作室主力机")
     assert wrapped_joined == ap_long_name_2, (ap_texts, wrapped_joined)
     assert not any("…" in t and "MacBook" in t for t in ap_texts), ap_texts
+
+    exp_mark_idx = len(_Ctx.shown_texts)
+    r_fc._card_apple_devices(_Ctx(_Surf(0, 800, 1280)), ap_cards[0], ap_exp_w)
+    exp_texts = _Ctx.shown_texts[exp_mark_idx:]
+    assert any("已过期" in t for t in exp_texts), exp_texts
+    assert any("重新登录" in t for t in exp_texts), exp_texts
 
     # Render all HUD states (incl. REM sleep + auto_task_overlay) and verify pure Chinese badges & labels
     for st_id, (badge_lbl, _) in rmod.STATE_BADGES.items():

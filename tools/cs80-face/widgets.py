@@ -2801,6 +2801,8 @@ class WidgetDataHub:
                     data = d2
                     auth_state = str(data.get("authState") or auth_state)
                     fetched_ms = float(data.get("fetchedAt") or 0.0)
+                elif isinstance(d2, dict) and d2.get("authState") in ("expired", "unauthenticated", "pending_2fa"):
+                    auth_state = str(d2["authState"])
             except Exception:
                 pass
 
@@ -2863,26 +2865,29 @@ class WidgetDataHub:
         final_devices = [item[2] for item in devices_out]
         total = len(final_devices)
 
-        if total == 0:
+        if auth_state in ("expired", "unauthenticated", "pending_2fa") or total == 0:
             if auth_state == "pending_2fa":
                 headline = "待完成验证"
+                subline = "请在「苹果设备」输入验证码"
             elif auth_state == "expired":
                 headline = "会话已过期"
+                subline = "会话已过期，请在「苹果设备」重新登录"
             elif auth_state == "authenticated":
                 headline = "暂无设备缓存"
+                subline = "请在「苹果设备」面板刷新"
             else:
                 headline = "待绑定苹果账号"
-            subline = "请在「苹果设备」面板刷新" if auth_state == "authenticated" else "请在「苹果设备」完成登录"
+                subline = "请在「苹果设备」完成登录"
             self._store_widget(
                 "apple-devices",
                 {
                     "ok": False,
-                    "empty": True,
+                    "empty": total == 0,
                     "authState": auth_state,
-                    "total": 0,
-                    "online": 0,
-                    "lowCount": 0,
-                    "devices": [],
+                    "total": total,
+                    "online": online_cnt,
+                    "lowCount": low_cnt,
+                    "devices": final_devices,
                     "updatedHm": updated_hm,
                     "headline": headline,
                     "subline": subline,

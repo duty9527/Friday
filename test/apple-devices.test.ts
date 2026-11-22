@@ -44,6 +44,12 @@ interface MockAppleServerOptions {
     userInfo?: Record<string, unknown>;
     serverContext?: Record<string, unknown>;
   };
+  validateHandler?: (reqHeaders: Record<string, string>) => Response | Promise<Response>;
+  accountLoginHandler?: (reqBody: any, reqHeaders: Record<string, string>) => Response | Promise<Response>;
+  initClientHandler?: (reqBody: any, reqHeaders: Record<string, string>) => Response | Promise<Response>;
+  refreshClientHandler?: (reqBody: any, reqHeaders: Record<string, string>) => Response | Promise<Response>;
+  playSoundHandler?: (reqBody: any, reqHeaders: Record<string, string>) => Response | Promise<Response>;
+  signinCompleteHandler?: (reqBody: any, reqHeaders: Record<string, string>) => Response | Promise<Response>;
 }
 
 function createMockAppleFetch(opts: MockAppleServerOptions) {
@@ -123,6 +129,9 @@ function createMockAppleFetch(opts: MockAppleServerOptions) {
       if (!verified.ok) {
         return makeMockResponse(401, { serviceErrors: [{ message: 'Invalid credentials' }] });
       }
+      if (opts.signinCompleteHandler) {
+        return await opts.signinCompleteHandler(reqBody, reqHeaders);
+      }
       const trustHeader = reqBody.trustTokens?.[0];
       if (opts.require2fa === false || trustHeader === 'trusted-token-xyz') {
         return makeMockResponse(200, { authType: 'hsa2' }, {
@@ -180,7 +189,31 @@ function createMockAppleFetch(opts: MockAppleServerOptions) {
       });
     }
 
+    if (parsed.hostname === expectedSetupHost && parsed.pathname === '/setup/ws/1/validate') {
+      if (opts.validateHandler) {
+        return await opts.validateHandler(reqHeaders);
+      }
+      if (!(reqHeaders.cookie ?? '').includes('X-APPLE-WEBAUTH-TOKEN=')) {
+        return makeMockResponse(421, { success: false, error: 'Missing X-APPLE-WEBAUTH-TOKEN cookie' });
+      }
+      return makeMockResponse(200, {
+        hsaTrustedBrowser: true,
+        dsInfo: { appleId: opts.appleId, dsid: '123456789' },
+        webservices: {
+          findme: { url: `https://${expectedFindmeHost}:443`, status: 'active' },
+        },
+      }, {
+        'set-cookie': [
+          'X-APPLE-WEBAUTH-USER=USER_SECRET_COOKIE; Domain=.icloud.com.cn; Path=/; HttpOnly',
+          'X-APPLE-WEBAUTH-TOKEN=TOKEN_SECRET_COOKIE; Domain=.icloud.com.cn; Path=/; HttpOnly',
+        ],
+      });
+    }
+
     if (parsed.hostname === expectedSetupHost && parsed.pathname === '/setup/ws/1/accountLogin') {
+      if (opts.accountLoginHandler) {
+        return await opts.accountLoginHandler(reqBody, reqHeaders);
+      }
       assert.ok(reqBody.dsWebAuthToken);
       assert.equal(reqBody.extended_login, true);
       return makeMockResponse(200, {
@@ -202,6 +235,12 @@ function createMockAppleFetch(opts: MockAppleServerOptions) {
       && (parsed.pathname === '/fmipservice/client/web/initClient'
         || parsed.pathname === '/fmipservice/client/web/refreshClient')
     ) {
+      if (parsed.pathname === '/fmipservice/client/web/initClient' && opts.initClientHandler) {
+        return await opts.initClientHandler(reqBody, reqHeaders);
+      }
+      if (parsed.pathname === '/fmipservice/client/web/refreshClient' && opts.refreshClientHandler) {
+        return await opts.refreshClientHandler(reqBody, reqHeaders);
+      }
       if (opts.expireFirstFmipWith450 && !expiredOnce) {
         expiredOnce = true;
         return makeMockResponse(450, { error: 'Session expired' });
@@ -215,6 +254,7 @@ function createMockAppleFetch(opts: MockAppleServerOptions) {
         serverContext: {
           serverTimestamp: 1_760_000_000_000,
           callbackIntervalInMS: 2000,
+          sessionLifespan: 900_000,
           theftLoss: { info: 'strip-me' },
           ...(custom?.serverContext ?? {}),
         },
@@ -224,6 +264,9 @@ function createMockAppleFetch(opts: MockAppleServerOptions) {
     }
 
     if (parsed.hostname === expectedFindmeHost && parsed.pathname === '/fmipservice/client/web/playSound') {
+      if (opts.playSoundHandler) {
+        return await opts.playSoundHandler(reqBody, reqHeaders);
+      }
       assert.equal(parsed.searchParams.get('dsid'), '123456789');
       return makeMockResponse(200, { statusCode: '200' });
     }
@@ -1150,5 +1193,361 @@ test('9. System Base AMap regeo converts WGS-84->GCJ-02, shares 22m grid cache, 
     assert.equal(amapCalls.length, 2, 'cached status/locate must reuse shared geo-cache.sqlite without extra AMap requests');
   } finally {
     rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+test('10. FMiP recovery after 15m sessionLifespan, /setup/ws/1/validate renewal, transient error preservation, expiry logging, playSound recovery, and DES trust cookie persistence', async () => {
+  const sampleDev = {
+    id: 'RAW-APPLE-RECOVERY-001',
+    name: '主力 iPhone',
+    deviceDisplayName: 'iPhone 17 Pro',
+    rawDeviceModel: 'iPhone18,4',
+    deviceClass: 'iPhone',
+    deviceStatus: '200',
+    batteryLevel: 0.85,
+    batteryStatus: 'NotCharging',
+    features: { SND: true, LOC: true },
+  };
+
+  // 10a. Proactive FMiP re-init after 15m sessionLifespan & reactive /refreshClient 450 -> /initClient 200 recovery
+  {
+    const dataDir = mkdtempSync(join(tmpdir(), 'friday-apple-proactive-'));
+    let now = 1_760_200_000_000;
+    let rejectNextRefresh = false;
+    try {
+      const mock = createMockAppleFetch({
+        appleId: 'recover@icloud.com',
+        password: 'Password123!',
+        require2fa: false,
+        devices: [sampleDev],
+        initClientHandler: (_body, headers) => {
+          assert.equal((headers.cookie ?? '').includes('X-APPLE-WEBAUTH-FMIP='), false, 'stale FMIP cookie must be cleared before /initClient');
+          return makeMockResponse(200, {
+            statusCode: '200',
+            serverContext: { serverTimestamp: now, callbackIntervalInMS: 2000, sessionLifespan: 900_000 },
+            content: [sampleDev],
+          }, {
+            'set-cookie': ['X-APPLE-WEBAUTH-FMIP=FMIP_COOKIE_FRESH; Domain=.icloud.com.cn; Path=/; HttpOnly'],
+          });
+        },
+        refreshClientHandler: (_body, headers) => {
+          if (rejectNextRefresh) {
+            rejectNextRefresh = false;
+            return makeMockResponse(450, { error: 'FMiP subsession expired' });
+          }
+          assert.ok((headers.cookie ?? '').includes('X-APPLE-WEBAUTH-FMIP=FMIP_COOKIE_FRESH'));
+          return makeMockResponse(200, {
+            statusCode: '200',
+            serverContext: { serverTimestamp: now, callbackIntervalInMS: 2000, sessionLifespan: 900_000 },
+            content: [sampleDev],
+          });
+        },
+      });
+
+      const loginRes = await runAppleAction('auth-login', {
+        appleId: 'recover@icloud.com',
+        password: 'Password123!',
+      }, { dataDir, fetchFn: mock.fetchFn, nowFn: () => now });
+      assert.equal(loginRes.ok, true);
+
+      // Advance +60 min (past 15m sessionLifespan) -> proactively clears FMIP cookie and calls /initClient directly
+      const callsBefore = mock.calls.length;
+      now += 3_600_000;
+      const proactiveRes = await runAppleAction('status', { refresh: true }, { dataDir, fetchFn: mock.fetchFn, nowFn: () => now });
+      assert.equal(proactiveRes.ok, true);
+      assert.equal(proactiveRes.data.authState, 'authenticated');
+      const proactiveSlice = mock.calls.slice(callsBefore);
+      assert.ok(proactiveSlice.some(c => c.url.includes('/initClient')), 'must proactively call /initClient after sessionLifespan');
+      assert.equal(proactiveSlice.some(c => c.url.includes('/accountLogin')), false, 'must NOT hit /accountLogin when /initClient succeeds');
+
+      // Within 5 min (<15m) reactive /refreshClient 450 recovers directly via /initClient without calling /accountLogin
+      now += 360_000;
+      rejectNextRefresh = true;
+      const callsBeforeReactive = mock.calls.length;
+      const reactiveRes = await runAppleAction('devices', { refresh: true }, { dataDir, fetchFn: mock.fetchFn, nowFn: () => now });
+      assert.equal(reactiveRes.ok, true);
+      assert.equal(reactiveRes.data.authState, 'authenticated');
+      const reactiveSlice = mock.calls.slice(callsBeforeReactive);
+      assert.ok(reactiveSlice.some(c => c.url.includes('/refreshClient')));
+      assert.ok(reactiveSlice.some(c => c.url.includes('/initClient')));
+      assert.equal(reactiveSlice.some(c => c.url.includes('/accountLogin')), false);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  }
+
+  // 10b. Production 196 scenario: /refreshClient 450 -> /initClient 450 -> /validate 200 -> /initClient 200 while /accountLogin returns 421
+  {
+    const dataDir = mkdtempSync(join(tmpdir(), 'friday-apple-validate-'));
+    let now = 1_760_300_000_000;
+    let failUntilValidated = false;
+    try {
+      const mock = createMockAppleFetch({
+        appleId: 'prod196@icloud.com',
+        password: 'Password123!',
+        require2fa: false,
+        devices: [sampleDev],
+        accountLoginHandler: (reqBody) => {
+          // Allow initial login; reject any subsequent renewal attempt (simulating short-lived dsWebAuthToken expiry!)
+          if (failUntilValidated) {
+            return makeMockResponse(421, { error: 'dsWebAuthToken expired' });
+          }
+          assert.ok(reqBody.dsWebAuthToken);
+          return makeMockResponse(200, {
+            hsaTrustedBrowser: true,
+            dsInfo: { appleId: 'prod196@icloud.com', dsid: '123456789' },
+            webservices: { findme: { url: 'https://p123-fmipweb.icloud.com.cn:443', status: 'active' } },
+          }, {
+            'set-cookie': [
+              'X-APPLE-WEBAUTH-USER=USER_1; Domain=.icloud.com.cn; Path=/; HttpOnly',
+              'X-APPLE-WEBAUTH-TOKEN=WEBAUTH_INITIAL; Domain=.icloud.com.cn; Path=/; HttpOnly',
+            ],
+          });
+        },
+        validateHandler: (headers) => {
+          assert.ok((headers.cookie ?? '').includes('X-APPLE-WEBAUTH-TOKEN=WEBAUTH_INITIAL'));
+          failUntilValidated = false;
+          return makeMockResponse(200, {
+            hsaTrustedBrowser: true,
+            dsInfo: { appleId: 'prod196@icloud.com', dsid: '123456789' },
+            webservices: { findme: { url: 'https://p205-fmipweb.icloud.com.cn:443', status: 'active' } },
+          }, {
+            'set-cookie': ['X-APPLE-WEBAUTH-TOKEN=WEBAUTH_RENEWED; Domain=.icloud.com.cn; Path=/; HttpOnly'],
+          });
+        },
+        initClientHandler: () => {
+          if (failUntilValidated) return makeMockResponse(450, { error: 'Need validate' });
+          return makeMockResponse(200, {
+            statusCode: '200',
+            serverContext: { serverTimestamp: now, callbackIntervalInMS: 2000, sessionLifespan: 900_000 },
+            content: [sampleDev],
+          });
+        },
+        refreshClientHandler: () => {
+          if (failUntilValidated) return makeMockResponse(450, { error: 'FMiP expired' });
+          return makeMockResponse(200, {
+            statusCode: '200',
+            serverContext: { serverTimestamp: now, callbackIntervalInMS: 2000, sessionLifespan: 900_000 },
+            content: [sampleDev],
+          });
+        },
+      });
+      // Also allow p205 host in validate scenario by handling it cleanly via custom fetch wrapper
+      const p205Fetch: typeof fetch = async (input, init) => {
+        const u = String(input);
+        if (u.startsWith('https://p205-fmipweb.icloud.com.cn/')) {
+          return makeMockResponse(200, {
+            statusCode: '200',
+            serverContext: { serverTimestamp: now, callbackIntervalInMS: 2000, sessionLifespan: 900_000 },
+            content: [sampleDev],
+          });
+        }
+        return mock.fetchFn(input, init);
+      };
+
+      await runAppleAction('auth-login', {
+        appleId: 'prod196@icloud.com',
+        password: 'Password123!',
+      }, { dataDir, fetchFn: p205Fetch, nowFn: () => now });
+
+      // Simulate legacy session (without fmipContextUpdatedAt) + short-lived dsWebAuthToken already dead
+      const sessPath = join(dataDir, 'session.json');
+      const savedSess = JSON.parse(readFileSync(sessPath, 'utf8'));
+      delete savedSess.fmipContextUpdatedAt;
+      savedSess.lastError = { at: now, action: 'devices', stage: 'fmip_refresh', code: 'OLD', status: 450, message: 'old' };
+      const { writeFileSync } = await import('node:fs');
+      writeFileSync(sessPath, JSON.stringify(savedSess), { mode: 0o600 });
+
+      now += 3_600_000;
+      failUntilValidated = true;
+      const recovered = await runAppleAction('status', { refresh: true }, { dataDir, fetchFn: p205Fetch, nowFn: () => now });
+      assert.equal(recovered.ok, true);
+      assert.equal(recovered.data.authState, 'authenticated');
+      assert.equal(recovered.data.devices.length, 1);
+      assert.ok(mock.calls.some(c => c.url.includes('/setup/ws/1/validate')), 'must recover via /setup/ws/1/validate');
+      const postSess = JSON.parse(readFileSync(sessPath, 'utf8'));
+      assert.equal(postSess.state, 'authenticated');
+      assert.equal(postSess.findmeUrl, 'https://p205-fmipweb.icloud.com.cn');
+      assert.equal(postSess.cookies['X-APPLE-WEBAUTH-TOKEN'], 'WEBAUTH_RENEWED');
+      assert.equal(postSess.lastError, undefined);
+      assert.equal(typeof postSess.fmipContextUpdatedAt, 'number');
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  }
+
+  // 10c. Transient 503 on /validate must NOT mark session expired; confirmed 421 on both /validate and /accountLogin marks expired + writes redacted error.log
+  {
+    const dataDir = mkdtempSync(join(tmpdir(), 'friday-apple-expiry-'));
+    let now = 1_760_400_000_000;
+    let mode: 'ok' | 'transient503' | 'dead421' = 'ok';
+    try {
+      const mock = createMockAppleFetch({
+        appleId: 'secretuser99@icloud.com',
+        password: 'Password123!',
+        require2fa: false,
+        devices: [sampleDev],
+        validateHandler: () => {
+          if (mode === 'transient503') return makeMockResponse(503, { error: 'Apple temporarily unavailable secretuser99@icloud.com' });
+          if (mode === 'dead421') return makeMockResponse(421, { error: 'Missing X-APPLE-WEBAUTH-TOKEN for secretuser99@icloud.com' });
+          return makeMockResponse(200, {
+            hsaTrustedBrowser: true,
+            dsInfo: { appleId: 'secretuser99@icloud.com', dsid: '123456789' },
+            webservices: { findme: { url: 'https://p123-fmipweb.icloud.com.cn:443', status: 'active' } },
+          });
+        },
+        accountLoginHandler: (reqBody) => {
+          if (mode === 'dead421') return makeMockResponse(421, { error: 'Session expired' });
+          assert.ok(reqBody.dsWebAuthToken);
+          return makeMockResponse(200, {
+            hsaTrustedBrowser: true,
+            dsInfo: { appleId: 'secretuser99@icloud.com', dsid: '123456789' },
+            webservices: { findme: { url: 'https://p123-fmipweb.icloud.com.cn:443', status: 'active' } },
+          }, {
+            'set-cookie': ['X-APPLE-WEBAUTH-TOKEN=TOKEN_SECRET_COOKIE; Domain=.icloud.com.cn; Path=/; HttpOnly'],
+          });
+        },
+        initClientHandler: () => {
+          if (mode !== 'ok') return makeMockResponse(450, { error: 'FMiP expired' });
+          return makeMockResponse(200, {
+            statusCode: '200',
+            serverContext: { serverTimestamp: now, callbackIntervalInMS: 2000, sessionLifespan: 900_000 },
+            content: [sampleDev],
+          });
+        },
+        refreshClientHandler: () => {
+          if (mode !== 'ok') return makeMockResponse(450, { error: 'FMiP expired' });
+          return makeMockResponse(200, {
+            statusCode: '200',
+            serverContext: { serverTimestamp: now, callbackIntervalInMS: 2000, sessionLifespan: 900_000 },
+            content: [sampleDev],
+          });
+        },
+      });
+
+      await runAppleAction('auth-login', {
+        appleId: 'secretuser99@icloud.com',
+        password: 'Password123!',
+      }, { dataDir, fetchFn: mock.fetchFn, nowFn: () => now });
+
+      // Transient 503 during renewal keeps state=authenticated
+      now += 3_600_000;
+      mode = 'transient503';
+      const transientRes = await runAppleAction('status', { refresh: true }, { dataDir, fetchFn: mock.fetchFn, nowFn: () => now });
+      assert.equal(transientRes.ok, false);
+      assert.equal(transientRes.data.authState, 'authenticated', '503 must NOT permanently mark session expired');
+      assert.ok(transientRes.data.lastError);
+      assert.equal(transientRes.data.lastError.stage, 'validate');
+      assert.equal(transientRes.data.lastError.status, 503);
+
+      // Confirmed 421 on both /validate and /accountLogin marks expired + records expiredAt & redacted error.log
+      now += 60_000;
+      mode = 'dead421';
+      const deadRes = await runAppleAction('status', { refresh: true }, { dataDir, fetchFn: mock.fetchFn, nowFn: () => now });
+      assert.equal(deadRes.ok, false);
+      assert.equal(deadRes.data.authState, 'expired');
+      assert.equal(deadRes.data.expiredAt, now);
+
+      const errLogPath = join(dataDir, 'error.log');
+      assert.equal(existsSync(errLogPath), true);
+      assert.equal(statSync(errLogPath).mode & 0o777, 0o600);
+      const logContent = readFileSync(errLogPath, 'utf8');
+      assert.match(logContent, /\[apple-devices\].*action=devices.*stage=validate.*http=503/);
+      assert.match(logContent, /\[apple-devices\].*action=devices.*code=AUTH_EXPIRED/);
+      assert.equal(logContent.includes('secretuser99@icloud.com'), false, 'raw email must be redacted in error.log');
+      assert.equal(logContent.includes(dataDir), false, 'raw dataDir path must be redacted in error.log');
+      assert.equal(logContent.includes('TOKEN_SECRET_COOKIE'), false, 'raw cookies must never appear in error.log');
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  }
+
+  // 10d. play-sound recovers from FMiP 450 via /initClient + /validate and retries with fresh serverContext
+  {
+    const dataDir = mkdtempSync(join(tmpdir(), 'friday-apple-playsound-'));
+    let now = 1_760_500_000_000;
+    let playAttempts = 0;
+    let initVersion = 1;
+    try {
+      const mock = createMockAppleFetch({
+        appleId: 'ring@icloud.com',
+        password: 'Password123!',
+        require2fa: false,
+        devices: [sampleDev],
+        initClientHandler: () => {
+          const ver = initVersion++;
+          return makeMockResponse(200, {
+            statusCode: '200',
+            serverContext: { serverTimestamp: now, callbackIntervalInMS: 2000, sessionLifespan: 900_000, gen: ver },
+            content: [sampleDev],
+          });
+        },
+        playSoundHandler: (reqBody) => {
+          playAttempts += 1;
+          if (playAttempts === 1) {
+            return makeMockResponse(450, { error: 'FMiP playSound expired' });
+          }
+          assert.equal(reqBody.serverContext?.gen, 2, 'retry playSound must send refreshed serverContext');
+          return makeMockResponse(200, { statusCode: '200' });
+        },
+      });
+
+      const loginRes = await runAppleAction('auth-login', {
+        appleId: 'ring@icloud.com',
+        password: 'Password123!',
+      }, { dataDir, fetchFn: mock.fetchFn, nowFn: () => now });
+      const devId = loginRes.data.devices[0].id;
+
+      now += 60_000;
+      const ringRes = await runAppleAction('play-sound', { device: devId }, { dataDir, fetchFn: mock.fetchFn, nowFn: () => now });
+      assert.equal(ringRes.ok, true);
+      assert.equal(playAttempts, 2);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  }
+
+  // 10e. startAppleLogin preserves existing DES* trust cookies when re-logging in with trustToken
+  {
+    const dataDir = mkdtempSync(join(tmpdir(), 'friday-apple-descookie-'));
+    try {
+      let seenTrustCookieOnSignin = false;
+      const mock = createMockAppleFetch({
+        appleId: 'trustcookie@icloud.com',
+        password: 'Password123!',
+        require2fa: false,
+        devices: [sampleDev],
+        signinCompleteHandler: (reqBody, reqHeaders) => {
+          const cookie = reqHeaders.cookie ?? '';
+          if (reqBody.trustTokens?.[0] === 'trusted-token-xyz' && cookie.includes('DES5162f8ffe76c=TRUST_COOKIE_VAL')) {
+            seenTrustCookieOnSignin = true;
+          }
+          return makeMockResponse(200, { authType: 'hsa2' }, {
+            scnt: 'scnt-ok',
+            'x-apple-id-session-id': 'session-id-1',
+            'x-apple-session-token': 'session-token-abc',
+            'x-apple-twosv-trust-token': 'trusted-token-xyz',
+            'set-cookie': [
+              'DES5162f8ffe76c=TRUST_COOKIE_VAL; Path=/; HttpOnly',
+              'X-APPLE-WEBAUTH-TOKEN=TOKEN_SECRET_COOKIE; Path=/; HttpOnly',
+            ],
+          });
+        },
+      });
+
+      await runAppleAction('auth-login', {
+        appleId: 'trustcookie@icloud.com',
+        password: 'Password123!',
+      }, { dataDir, fetchFn: mock.fetchFn });
+
+      await runAppleAction('auth-login', {
+        appleId: 'trustcookie@icloud.com',
+        password: 'Password123!',
+      }, { dataDir, fetchFn: mock.fetchFn });
+
+      assert.equal(seenTrustCookieOnSignin, true, 're-login for same account must preserve DES* trust cookies');
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   }
 });

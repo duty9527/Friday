@@ -11,13 +11,32 @@ export class AppleClientError extends Error {
    * @param {string} message
    * @param {string} [code]
    * @param {number} [status]
+   * @param {string} [stage]
    */
-  constructor(message, code = 'APPLE_API_ERROR', status) {
+  constructor(message, code = 'APPLE_API_ERROR', status, stage) {
     super(message);
     this.name = 'AppleClientError';
     this.code = code;
     this.status = status;
+    this.stage = stage;
   }
+}
+
+const WEBAUTH_COOKIE_KEYS = [
+  'X-APPLE-WEBAUTH-TOKEN',
+  'X-APPLE-WEBAUTH-VALIDATE',
+  'X-APPLE-WEBAUTH-LOGIN',
+];
+
+/**
+ * Return true when session cookies contain a live Apple WebAuth cookie suitable for `/setup/ws/1/validate`.
+ * @param {unknown} cookies
+ * @returns {boolean}
+ */
+function hasWebAuthCookies(cookies) {
+  if (!cookies || typeof cookies !== 'object' || Array.isArray(cookies)) return false;
+  const jar = /** @type {Record<string, unknown>} */ (cookies);
+  return WEBAUTH_COOKIE_KEYS.some(k => typeof jar[k] === 'string' && jar[k].trim().length > 0);
 }
 
 /**
@@ -383,18 +402,67 @@ function absorbAuthResponse(session, headers, setCookies) {
 }
 
 /**
+ * Validate and refresh existing iCloud WebAuth cookies via `/setup/ws/1/validate`.
+ * Allows long-lived sessions (30-60 days) to recover after short-lived `dsWebAuthToken` expiry.
+ * @param {{
+ *   session: Record<string, any>;
+ *   fetchFn?: typeof fetch;
+ *   signal?: AbortSignal;
+ *   nowFn?: () => number;
+ * }} params
+ */
+export async function validateAccountSession({ session, fetchFn = fetch, signal, nowFn = Date.now }) {
+  const endpoints = resolveRegionEndpoints(session.region);
+  if (!serializeCookies(session.cookies)) {
+    throw new AppleClientError('缺少 iCloud 会话 Cookie，无法校验会话', 'AUTH_EXPIRED', 401, 'validate');
+  }
+  const url = `${endpoints.setupBase}/validate?${buildSetupQuery(session)}`;
+  const resp = await httpJson(fetchFn, url, {
+    method: 'POST',
+    headers: buildIcloudHeaders(endpoints, session),
+    body: null,
+    signal,
+  });
+  session.cookies = mergeCookies(session.cookies, resp.setCookies);
+  if (!resp.ok) {
+    const isAuthErr = resp.status === 401 || resp.status === 421 || resp.status === 450;
+    throw new AppleClientError(
+      extractAppleServiceError(resp.data, `iCloud 会话校验失败 (HTTP ${resp.status})`),
+      isAuthErr ? 'AUTH_EXPIRED' : 'VALIDATE_FAILED',
+      resp.status,
+      'validate',
+    );
+  }
+  if (resp.data?.dsInfo?.dsid) {
+    session.dsid = String(resp.data.dsInfo.dsid);
+  }
+  if (resp.data?.hsaTrustedBrowser !== undefined) {
+    session.trustedSession = Boolean(resp.data.hsaTrustedBrowser);
+  }
+  if (resp.data?.webservices?.findme?.url) {
+    session.findmeUrl = validateFindMeUrl(resp.data.webservices.findme.url);
+  }
+  session.state = 'authenticated';
+  session.validatedAt = nowFn();
+  session.expiredAt = undefined;
+  session.lastError = undefined;
+  return session;
+}
+
+/**
  * Exchange `sessionToken` + optional `trustToken` at `/setup/ws/1/accountLogin` to obtain
  * `findme` regional host URL, `dsid`, and iCloud webauth cookies.
  * @param {{
  *   session: Record<string, any>;
  *   fetchFn?: typeof fetch;
  *   signal?: AbortSignal;
+ *   nowFn?: () => number;
  * }} params
  */
-export async function completeAccountLogin({ session, fetchFn = fetch, signal }) {
+export async function completeAccountLogin({ session, fetchFn = fetch, signal, nowFn = Date.now }) {
   const endpoints = resolveRegionEndpoints(session.region);
   if (!session.sessionToken) {
-    throw new AppleClientError('缺少 X-Apple-Session-Token，无法完成 iCloud 登录', 'AUTH_EXPIRED', 401);
+    throw new AppleClientError('缺少 X-Apple-Session-Token，无法完成 iCloud 登录', 'AUTH_EXPIRED', 401, 'account_login');
   }
   const url = `${endpoints.setupBase}/accountLogin?${buildSetupQuery(session)}`;
   const resp = await httpJson(fetchFn, url, {
@@ -415,6 +483,7 @@ export async function completeAccountLogin({ session, fetchFn = fetch, signal })
       extractAppleServiceError(resp.data, `iCloud 会话建权失败 (HTTP ${resp.status})`),
       code,
       resp.status,
+      'account_login',
     );
   }
   if (resp.data?.dsInfo?.dsid) {
@@ -425,7 +494,9 @@ export async function completeAccountLogin({ session, fetchFn = fetch, signal })
   const findmeUrl = validateFindMeUrl(rawFindme);
   session.findmeUrl = findmeUrl;
   session.state = 'authenticated';
-  session.authenticatedAt = Date.now();
+  session.authenticatedAt = nowFn();
+  session.expiredAt = undefined;
+  session.lastError = undefined;
   session.trustedPhones = undefined;
   return session;
 }
@@ -533,10 +604,12 @@ async function fetchTrustedPhones({ session, fetchFn = fetch, signal }) {
  *   password: string;
  *   region?: string;
  *   existingTrustToken?: string;
+ *   existingTrustCookies?: Record<string, string>;
  *   clientId?: string;
  *   pause2FA?: boolean;
  *   fetchFn?: typeof fetch;
  *   signal?: AbortSignal;
+ *   nowFn?: () => number;
  * }} params
  */
 export async function startAppleLogin({
@@ -544,23 +617,34 @@ export async function startAppleLogin({
   password,
   region = 'cn',
   existingTrustToken,
+  existingTrustCookies,
   clientId,
   pause2FA = false,
   fetchFn = fetch,
   signal,
+  nowFn = Date.now,
 }) {
   const cleanId = String(appleId ?? '').trim();
   const cleanPass = String(password ?? '');
   if (!cleanId || !cleanPass) {
-    throw new AppleClientError('请输入 Apple ID 账号与密码', 'INVALID_CREDENTIALS');
+    throw new AppleClientError('请输入 Apple ID 账号与密码', 'INVALID_CREDENTIALS', undefined, 'authorize');
   }
   const endpoints = resolveRegionEndpoints(region);
   const resolvedClientId = normalizeClientId(clientId);
+  /** @type {Record<string, string>} */
+  const seedCookies = {};
+  if (existingTrustToken && existingTrustCookies && typeof existingTrustCookies === 'object' && !Array.isArray(existingTrustCookies)) {
+    for (const [k, v] of Object.entries(existingTrustCookies)) {
+      if (/^DES[0-9a-f]+$/i.test(k) && typeof v === 'string' && v.trim().length > 0) {
+        seedCookies[k] = v;
+      }
+    }
+  }
   const session = /** @type {Record<string, any>} */ ({
     region: endpoints.region,
     appleId: cleanId,
     clientId: resolvedClientId,
-    cookies: {},
+    cookies: seedCookies,
     ...(existingTrustToken ? { trustToken: existingTrustToken } : {}),
   });
 
@@ -583,13 +667,14 @@ export async function startAppleLogin({
   });
   absorbAuthResponse(session, authorizeResp.headers, authorizeResp.setCookies);
   if (authorizeResp.status === 429 || authorizeResp.status === 503) {
-    throw new AppleClientError(`苹果认证预检限流或不可用 (HTTP ${authorizeResp.status})，请稍后再试`, 'RATE_LIMITED', authorizeResp.status);
+    throw new AppleClientError(`苹果认证预检限流或不可用 (HTTP ${authorizeResp.status})，请稍后再试`, 'RATE_LIMITED', authorizeResp.status, 'authorize');
   }
   if (!authorizeResp.ok) {
     throw new AppleClientError(
       extractAppleServiceError(authorizeResp.data, `苹果 OAuth 登录初始化失败 (HTTP ${authorizeResp.status})`),
       'AUTH_BOOTSTRAP_FAILED',
       authorizeResp.status,
+      'authorize',
     );
   }
 
@@ -608,13 +693,14 @@ export async function startAppleLogin({
   absorbAuthResponse(session, initResp.headers, initResp.setCookies);
 
   if (initResp.status === 429 || initResp.status === 503) {
-    throw new AppleClientError(`苹果认证服务当前限流或不可用 (HTTP ${initResp.status})，请稍后再试`, 'RATE_LIMITED', initResp.status);
+    throw new AppleClientError(`苹果认证服务当前限流或不可用 (HTTP ${initResp.status})，请稍后再试`, 'RATE_LIMITED', initResp.status, 'srp_init');
   }
   if (!initResp.ok) {
     throw new AppleClientError(
       extractAppleServiceError(initResp.data, `初始化 SRP 登录失败 (HTTP ${initResp.status})`),
       'SRP_INIT_FAILED',
       initResp.status,
+      'srp_init',
     );
   }
 
@@ -625,7 +711,7 @@ export async function startAppleLogin({
   const cToken = String(initResp.data?.c ?? '');
 
   if (!protocol || !saltBase64 || !bBase64 || !Number.isInteger(iterations) || iterations < 1 || !cToken) {
-    throw new AppleClientError('苹果服务器返回的 SRP 参数不完整或不支持的协议', 'INVALID_SRP_CHALLENGE', initResp.status);
+    throw new AppleClientError('苹果服务器返回的 SRP 参数不完整或不支持的协议', 'INVALID_SRP_CHALLENGE', initResp.status, 'srp_init');
   }
 
   // 3. SRP-6a client proof & complete
@@ -656,21 +742,21 @@ export async function startAppleLogin({
   absorbAuthResponse(session, completeResp.headers, completeResp.setCookies);
 
   if (completeResp.status === 200) {
-    await completeAccountLogin({ session, fetchFn, signal });
+    await completeAccountLogin({ session, fetchFn, signal, nowFn });
     return session;
   }
 
   if (completeResp.status === 409) {
     if (pause2FA && session.sessionToken) {
       try {
-        await completeAccountLogin({ session, fetchFn, signal });
+        await completeAccountLogin({ session, fetchFn, signal, nowFn });
         return session;
       } catch {
         // Fall through to standard 2FA flow if one-factor Find My setup wasn't accepted
       }
     }
     session.state = 'pending_2fa';
-    session.pending2faAt = Date.now();
+    session.pending2faAt = nowFn();
     session.trustedPhones = await fetchTrustedPhones({ session, fetchFn, signal });
     return session;
   }
@@ -682,6 +768,7 @@ export async function startAppleLogin({
       `Apple ID 或密码不正确（HTTP ${completeResp.status}${suffix}；注意必须使用 Apple ID 主密码，不能使用 App 专用密码）`,
       'INVALID_CREDENTIALS',
       completeResp.status,
+      'srp_complete',
     );
   }
   if (completeResp.status === 412) {
@@ -689,6 +776,7 @@ export async function startAppleLogin({
       '账号需要先在苹果官网或设备上确认隐私条款/安全提示后才能登录 (HTTP 412)',
       'PRECONDITION_REQUIRED',
       412,
+      'srp_complete',
     );
   }
   if (completeResp.status === 429 || completeResp.status === 503) {
@@ -696,12 +784,14 @@ export async function startAppleLogin({
       `苹果认证服务当前限流或繁忙 (HTTP ${completeResp.status})，请稍后重试`,
       'RATE_LIMITED',
       completeResp.status,
+      'srp_complete',
     );
   }
   throw new AppleClientError(
     extractAppleServiceError(completeResp.data, `SRP 校验失败 (HTTP ${completeResp.status})`),
     'SRP_COMPLETE_FAILED',
     completeResp.status,
+    'srp_complete',
   );
 }
 
@@ -716,7 +806,7 @@ export async function startAppleLogin({
  */
 export async function requestSmsCode({ session, phoneId, fetchFn = fetch, signal }) {
   if (!session || session.state !== 'pending_2fa') {
-    throw new AppleClientError('当前不在等待 2FA 验证状态，请先执行 auth-login', 'NOT_PENDING_2FA');
+    throw new AppleClientError('当前不在等待 2FA 验证状态，请先执行 auth-login', 'NOT_PENDING_2FA', undefined, 'sms_send');
   }
   const endpoints = resolveRegionEndpoints(session.region);
   const targetPhoneId = Number.isInteger(phoneId) && Number(phoneId) > 0
@@ -737,6 +827,7 @@ export async function requestSmsCode({ session, phoneId, fetchFn = fetch, signal
       extractAppleServiceError(resp.data, `发送短信验证码失败 (HTTP ${resp.status})`),
       'SMS_SEND_FAILED',
       resp.status,
+      'sms_send',
     );
   }
   session.lastSmsPhoneId = targetPhoneId;
@@ -750,16 +841,17 @@ export async function requestSmsCode({ session, phoneId, fetchFn = fetch, signal
  *   session: Record<string, any>;
  *   fetchFn?: typeof fetch;
  *   signal?: AbortSignal;
+ *   nowFn?: () => number;
  * }} params
  */
-export async function bypass2faForFindMy({ session, fetchFn = fetch, signal }) {
+export async function bypass2faForFindMy({ session, fetchFn = fetch, signal, nowFn = Date.now }) {
   if (!session || (session.state !== 'pending_2fa' && session.state !== 'expired')) {
-    throw new AppleClientError('当前没有可直通的待验证会话，请先使用账号密码发起登录', 'NOT_PENDING_2FA');
+    throw new AppleClientError('当前没有可直通的待验证会话，请先使用账号密码发起登录', 'NOT_PENDING_2FA', undefined, 'bypass_2fa');
   }
   if (!session.sessionToken) {
-    throw new AppleClientError('当前会话缺少临时 Token，无法使用免码直通，请提交 6 位验证码', 'MISSING_SESSION_TOKEN', 401);
+    throw new AppleClientError('当前会话缺少临时 Token，无法使用免码直通，请提交 6 位验证码', 'MISSING_SESSION_TOKEN', 401, 'bypass_2fa');
   }
-  await completeAccountLogin({ session, fetchFn, signal });
+  await completeAccountLogin({ session, fetchFn, signal, nowFn });
   return session;
 }
 
@@ -790,6 +882,7 @@ function isAccepted2faResponse(verifyResp) {
  *   phoneId?: number;
  *   fetchFn?: typeof fetch;
  *   signal?: AbortSignal;
+ *   nowFn?: () => number;
  * }} params
  */
 export async function verify2faCode({
@@ -799,13 +892,14 @@ export async function verify2faCode({
   phoneId,
   fetchFn = fetch,
   signal,
+  nowFn = Date.now,
 }) {
   if (!session || session.state !== 'pending_2fa') {
-    throw new AppleClientError('当前没有待验证的 2FA 登录会话，请先使用账号密码发起登录', 'NOT_PENDING_2FA');
+    throw new AppleClientError('当前没有待验证的 2FA 登录会话，请先使用账号密码发起登录', 'NOT_PENDING_2FA', undefined, '2fa_verify');
   }
   const cleanCode = String(code ?? '').replace(/\s+/g, '');
   if (!/^\d{6}$/.test(cleanCode)) {
-    throw new AppleClientError('请输入 6 位数字双重认证验证码', 'INVALID_2FA_FORMAT');
+    throw new AppleClientError('请输入 6 位数字双重认证验证码', 'INVALID_2FA_FORMAT', undefined, '2fa_verify');
   }
   const endpoints = resolveRegionEndpoints(session.region);
   const isSms = mode === 'sms';
@@ -836,6 +930,7 @@ export async function verify2faCode({
         : extractAppleServiceError(verifyResp.data, `2FA 验证失败 (HTTP ${verifyResp.status})`),
       invalidCode ? 'INVALID_2FA_CODE' : 'TWO_FA_FAILED',
       verifyResp.status,
+      '2fa_verify',
     );
   }
 
@@ -850,10 +945,11 @@ export async function verify2faCode({
       extractAppleServiceError(trustResp.data, `建立受信任会话失败 (HTTP ${trustResp.status})`),
       'TRUST_FAILED',
       trustResp.status,
+      '2sv_trust',
     );
   }
 
-  await completeAccountLogin({ session, fetchFn, signal });
+  await completeAccountLogin({ session, fetchFn, signal, nowFn });
   return session;
 }
 
@@ -948,7 +1044,106 @@ export function normalizeFmipDevice(raw) {
 }
 
 /**
- * Call an FMiP endpoint with setup query params and automatic 1-time `accountLogin` renewal on `401` / `450`.
+ * Clear short-lived Find My subsession context and FMIP cookie so `/initClient` creates a fresh subsession.
+ * @param {Record<string, any>} session
+ */
+function clearFmipSubsession(session) {
+  session.fmipServerContext = undefined;
+  session.fmipContextUpdatedAt = undefined;
+  if (session.cookies && typeof session.cookies === 'object' && !Array.isArray(session.cookies)) {
+    delete session.cookies['X-APPLE-WEBAUTH-FMIP'];
+  }
+}
+
+/**
+ * Mark an Apple session as definitively expired (requiring fresh login/2FA) and throw `AUTH_EXPIRED`.
+ * @param {Record<string, any>} session
+ * @param {() => number} nowFn
+ * @param {string} message
+ * @param {number | undefined} status
+ * @param {string} stage
+ * @returns {never}
+ */
+function markSessionExpired(session, nowFn, message, status, stage) {
+  session.state = 'expired';
+  clearFmipSubsession(session);
+  session.expiredAt = nowFn();
+  throw new AppleClientError(message, 'AUTH_EXPIRED', status, stage);
+}
+
+/**
+ * Renew iCloud setup/WebAuth session using existing WebAuth cookies (`/validate`) first,
+ * falling back to `sessionToken` (`/accountLogin`) only when WebAuth cookies are missing or rejected.
+ * Transient network/5xx/429 errors are re-thrown without marking the session as expired.
+ * @param {{
+ *   session: Record<string, any>;
+ *   fetchFn?: typeof fetch;
+ *   signal?: AbortSignal;
+ *   nowFn?: () => number;
+ * }} params
+ * @returns {Promise<'validate' | 'accountLogin'>}
+ */
+async function renewIcloudWebSession({ session, fetchFn = fetch, signal, nowFn = Date.now }) {
+  let hasAuthRejection = false;
+  /** @type {number | undefined} */
+  let authRejectedStatus;
+  let authRejectedStage = 'validate';
+
+  if (hasWebAuthCookies(session.cookies)) {
+    try {
+      await validateAccountSession({ session, fetchFn, signal, nowFn });
+      return 'validate';
+    } catch (err) {
+      if (err instanceof AppleClientError) {
+        if (err.status === 401 || err.status === 421 || err.status === 450) {
+          hasAuthRejection = true;
+          authRejectedStatus = err.status;
+          authRejectedStage = err.stage || 'validate';
+        } else if (err.status === 404) {
+          if (!session.sessionToken) {
+            throw err;
+          }
+        } else {
+          throw err;
+        }
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  if (session.sessionToken) {
+    try {
+      await completeAccountLogin({ session, fetchFn, signal, nowFn });
+      return 'accountLogin';
+    } catch (err) {
+      if (err instanceof AppleClientError && err.code === 'AUTH_EXPIRED') {
+        markSessionExpired(
+          session,
+          nowFn,
+          'Apple 会话已过期（约 30～60 天需重新完成一次 2FA 授权），请重新登录绑定',
+          err.status,
+          err.stage || 'account_login',
+        );
+      }
+      throw err;
+    }
+  }
+
+  if (hasAuthRejection || !hasWebAuthCookies(session.cookies)) {
+    markSessionExpired(
+      session,
+      nowFn,
+      'Apple 会话已过期（约 30～60 天需重新完成一次 2FA 授权），请重新登录绑定',
+      authRejectedStatus ?? 401,
+      authRejectedStage,
+    );
+  }
+  throw new AppleClientError('iCloud 会话校验失败', 'VALIDATE_FAILED', 404, 'validate');
+}
+
+/**
+ * Perform a raw FMiP JSON POST against `findmeUrl` and absorb rotated cookies without throwing on HTTP errors.
  * @param {{
  *   session: Record<string, any>;
  *   path: string;
@@ -957,46 +1152,86 @@ export function normalizeFmipDevice(raw) {
  *   signal?: AbortSignal;
  * }} params
  */
-async function postFmipWithRefresh({ session, path, body, fetchFn = fetch, signal }) {
-  if (!session || session.state !== 'authenticated' || !session.findmeUrl) {
-    throw new AppleClientError('尚未登录或尚未完成 2FA 验证，请先绑定 Apple ID', 'NOT_AUTHENTICATED', 401);
-  }
+async function postFmipRaw({ session, path, body, fetchFn = fetch, signal }) {
   const endpoints = resolveRegionEndpoints(session.region);
-  const makeCall = async () => {
-    const base = validateFindMeUrl(session.findmeUrl);
-    return httpJson(fetchFn, `${base}${path}?${buildSetupQuery(session)}`, {
-      method: 'POST',
-      headers: buildIcloudHeaders(endpoints, session),
-      body,
+  const base = validateFindMeUrl(session.findmeUrl);
+  const resp = await httpJson(fetchFn, `${base}${path}?${buildSetupQuery(session)}`, {
+    method: 'POST',
+    headers: buildIcloudHeaders(endpoints, session),
+    body,
+    signal,
+  });
+  session.cookies = mergeCookies(session.cookies, resp.setCookies);
+  return resp;
+}
+
+/**
+ * Initialize a fresh FMiP web subsession via `/fmipservice/client/web/initClient`,
+ * recovering transparently via `/setup/ws/1/validate` (or `/accountLogin`) on 401/450.
+ * @param {{
+ *   session: Record<string, any>;
+ *   baseClientContext: Record<string, unknown>;
+ *   locate: boolean;
+ *   includeFamily: boolean;
+ *   fetchFn?: typeof fetch;
+ *   signal?: AbortSignal;
+ *   nowFn?: () => number;
+ * }} params
+ */
+async function initFmipSession({
+  session,
+  baseClientContext,
+  locate,
+  includeFamily,
+  fetchFn = fetch,
+  signal,
+  nowFn = Date.now,
+}) {
+  const makeInitBody = () => ({
+    clientContext: {
+      ...baseClientContext,
+      ...(locate ? { shouldLocate: true, selectedDevice: 'all' } : {}),
+    },
+  });
+
+  let resp = await postFmipRaw({
+    session,
+    path: '/fmipservice/client/web/initClient',
+    body: makeInitBody(),
+    fetchFn,
+    signal,
+  });
+
+  if (resp.status === 401 || resp.status === 450) {
+    await renewIcloudWebSession({ session, fetchFn, signal, nowFn });
+    clearFmipSubsession(session);
+    resp = await postFmipRaw({
+      session,
+      path: '/fmipservice/client/web/initClient',
+      body: makeInitBody(),
+      fetchFn,
       signal,
     });
-  };
-
-  let resp = await makeCall();
-  session.cookies = mergeCookies(session.cookies, resp.setCookies);
-
-  if ((resp.status === 401 || resp.status === 450) && session.sessionToken) {
-    await completeAccountLogin({ session, fetchFn, signal });
-    resp = await makeCall();
-    session.cookies = mergeCookies(session.cookies, resp.setCookies);
   }
 
   if (resp.status === 401 || resp.status === 450) {
-    session.state = 'expired';
-    session.fmipServerContext = undefined;
-    throw new AppleClientError(
+    markSessionExpired(
+      session,
+      nowFn,
       'Apple 会话已过期（约 30～60 天需重新完成一次 2FA 授权），请重新登录绑定',
-      'AUTH_EXPIRED',
       resp.status,
+      'fmip_init',
     );
   }
   if (!resp.ok) {
     throw new AppleClientError(
-      extractAppleServiceError(resp.data, `iCloud Find My 请求失败 (HTTP ${resp.status})`),
+      extractAppleServiceError(resp.data, `iCloud Find My 初始化失败 (HTTP ${resp.status})`),
       'FMIP_REQUEST_FAILED',
       resp.status,
+      'fmip_init',
     );
   }
+  storeFmipServerContext(session, resp.data, includeFamily, nowFn);
   return resp.data;
 }
 
@@ -1087,12 +1322,14 @@ function collectUnsettledState(payload, includeFamily) {
  * @param {Record<string, any>} session
  * @param {any} payload
  * @param {boolean} [includeFamily]
+ * @param {() => number} [nowFn]
  */
-function storeFmipServerContext(session, payload, includeFamily) {
+function storeFmipServerContext(session, payload, includeFamily, nowFn = Date.now) {
   if (payload?.serverContext && typeof payload.serverContext === 'object') {
     const ctx = { ...payload.serverContext };
     if ('theftLoss' in ctx) ctx.theftLoss = null;
     session.fmipServerContext = ctx;
+    session.fmipContextUpdatedAt = nowFn();
     if (includeFamily !== undefined) {
       session.fmipIncludeFamily = Boolean(includeFamily);
     }
@@ -1100,8 +1337,28 @@ function storeFmipServerContext(session, payload, includeFamily) {
 }
 
 /**
+ * Determine whether the cached `fmipServerContext` has approached or exceeded Apple's `sessionLifespan` (default 15m).
+ * @param {Record<string, any>} session
+ * @param {number} nowMs
+ * @returns {boolean}
+ */
+function isFmipContextStale(session, nowMs) {
+  if (!session?.fmipServerContext || typeof session.fmipServerContext !== 'object') {
+    return true;
+  }
+  const updatedAt = session.fmipContextUpdatedAt;
+  if (typeof updatedAt !== 'number' || !Number.isFinite(updatedAt) || nowMs < updatedAt) {
+    return false;
+  }
+  const lifespanMs = Number(session.fmipServerContext.sessionLifespan);
+  const effectiveLifespan = Number.isFinite(lifespanMs) && lifespanMs > 0 ? lifespanMs : 900_000;
+  const staleThresholdMs = Math.max(60_000, effectiveLifespan - 60_000);
+  return (nowMs - updatedAt) >= staleThresholdMs;
+}
+
+/**
  * Fetch and normalize Find My devices, calling `/initClient` first when no `serverContext` is cached
- * (or when `includeFamily` setting changed), then `/refreshClient` with bounded wake-settling polls.
+ * (or when `includeFamily` setting changed or `sessionLifespan` elapsed), then `/refreshClient` with bounded wake-settling polls.
  * @param {{
  *   session: Record<string, any>;
  *   locate?: boolean;
@@ -1109,6 +1366,7 @@ function storeFmipServerContext(session, payload, includeFamily) {
  *   locatePollDelayMs?: number;
  *   maxLocatePolls?: number;
  *   fetchFn?: typeof fetch;
+ *   nowFn?: () => number;
  *   signal?: AbortSignal;
  * }} params
  */
@@ -1119,15 +1377,21 @@ export async function fetchFindMyDevices({
   locatePollDelayMs,
   maxLocatePolls = 2,
   fetchFn = fetch,
+  nowFn = Date.now,
   signal,
 }) {
+  if (!session || session.state !== 'authenticated' || !session.findmeUrl) {
+    throw new AppleClientError('尚未登录或尚未完成 2FA 验证，请先绑定 Apple ID', 'NOT_AUTHENTICATED', 401, 'fmip_refresh');
+  }
+
   const wantFamily = Boolean(includeFamily);
-  if (
+  const familyChanged = Boolean(
     session.fmipServerContext
     && ((session.fmipIncludeFamily !== undefined && session.fmipIncludeFamily !== wantFamily)
-      || (session.fmipIncludeFamily === undefined && wantFamily))
-  ) {
-    session.fmipServerContext = undefined;
+      || (session.fmipIncludeFamily === undefined && wantFamily)),
+  );
+  if (familyChanged || isFmipContextStale(session, nowFn())) {
+    clearFmipSubsession(session);
   }
 
   const baseClientContext = {
@@ -1140,60 +1404,87 @@ export async function fetchFindMyDevices({
     inactiveTime: 0,
   };
 
-  let payload;
-  if (!session.fmipServerContext) {
-    const initPayload = await postFmipWithRefresh({
-      session,
-      path: '/fmipservice/client/web/initClient',
-      body: {
-        clientContext: {
-          ...baseClientContext,
-          ...(locate ? { shouldLocate: true, selectedDevice: 'all' } : {}),
-        },
-      },
-      fetchFn,
-      signal,
-    });
-    storeFmipServerContext(session, initPayload, wantFamily);
-    payload = initPayload;
-
-    if (locate && session.fmipServerContext) {
-      const refreshed = await postFmipWithRefresh({
-        session,
-        path: '/fmipservice/client/web/refreshClient',
-        body: {
-          clientContext: {
-            ...baseClientContext,
-            shouldLocate: true,
-            selectedDevice: 'all',
-          },
-          serverContext: session.fmipServerContext,
-          isUpdatingAllLocations: true,
-        },
-        fetchFn,
-        signal,
-      });
-      storeFmipServerContext(session, refreshed, wantFamily);
-      if (Array.isArray(refreshed?.content) && refreshed.content.length > 0) {
-        payload = refreshed;
-      }
-    }
-  } else {
-    payload = await postFmipWithRefresh({
+  /**
+   * @param {boolean} allowReinit
+   * @param {boolean} forceLocate
+   */
+  const runRefreshClient = async (allowReinit, forceLocate) => {
+    const resp = await postFmipRaw({
       session,
       path: '/fmipservice/client/web/refreshClient',
       body: {
         clientContext: {
           ...baseClientContext,
-          ...(locate ? { shouldLocate: true, selectedDevice: 'all' } : {}),
+          ...(forceLocate ? { shouldLocate: true, selectedDevice: 'all' } : {}),
         },
         serverContext: session.fmipServerContext,
-        ...(locate ? { isUpdatingAllLocations: true } : {}),
+        ...(forceLocate ? { isUpdatingAllLocations: true } : {}),
       },
       fetchFn,
       signal,
     });
-    storeFmipServerContext(session, payload, wantFamily);
+    if (resp.status === 401 || resp.status === 450) {
+      if (!allowReinit) {
+        markSessionExpired(
+          session,
+          nowFn,
+          'Apple 会话已过期（约 30～60 天需重新完成一次 2FA 授权），请重新登录绑定',
+          resp.status,
+          'fmip_refresh',
+        );
+      }
+      clearFmipSubsession(session);
+      const reinitPayload = await initFmipSession({
+        session,
+        baseClientContext,
+        locate: forceLocate,
+        includeFamily: wantFamily,
+        fetchFn,
+        signal,
+        nowFn,
+      });
+      return { payload: reinitPayload, reinitialized: true };
+    }
+    if (!resp.ok) {
+      throw new AppleClientError(
+        extractAppleServiceError(resp.data, `iCloud Find My 请求失败 (HTTP ${resp.status})`),
+        'FMIP_REQUEST_FAILED',
+        resp.status,
+        'fmip_refresh',
+      );
+    }
+    storeFmipServerContext(session, resp.data, wantFamily, nowFn);
+    return { payload: resp.data, reinitialized: false };
+  };
+
+  let payload;
+  if (!session.fmipServerContext) {
+    const initPayload = await initFmipSession({
+      session,
+      baseClientContext,
+      locate,
+      includeFamily: wantFamily,
+      fetchFn,
+      signal,
+      nowFn,
+    });
+    payload = initPayload;
+
+    if (locate && session.fmipServerContext) {
+      const refreshed = await runRefreshClient(true, true);
+      if (Array.isArray(refreshed.payload?.content) && refreshed.payload.content.length > 0) {
+        payload = refreshed.payload;
+      }
+    }
+  } else {
+    const first = await runRefreshClient(true, locate);
+    payload = first.payload;
+    if (first.reinitialized && locate && session.fmipServerContext) {
+      const followUp = await runRefreshClient(false, true);
+      if (Array.isArray(followUp.payload?.content) && followUp.payload.content.length > 0) {
+        payload = followUp.payload;
+      }
+    }
   }
 
   if (locate && maxLocatePolls > 0 && session.fmipServerContext) {
@@ -1201,6 +1492,7 @@ export async function fetchFindMyDevices({
     let prevPendingIds = null;
     /** @type {Set<string> | null} */
     let prevLoadingMembers = null;
+    let reinitUsedInLoop = false;
     for (let poll = 0; poll < maxLocatePolls; poll += 1) {
       const state = collectUnsettledState(payload, wantFamily);
       if (
@@ -1235,24 +1527,10 @@ export async function fetchFindMyDevices({
 
       await sleepWithSignal(delayMs, signal);
 
-      const refreshed = await postFmipWithRefresh({
-        session,
-        path: '/fmipservice/client/web/refreshClient',
-        body: {
-          clientContext: {
-            ...baseClientContext,
-            shouldLocate: true,
-            selectedDevice: 'all',
-          },
-          serverContext: session.fmipServerContext,
-          isUpdatingAllLocations: true,
-        },
-        fetchFn,
-        signal,
-      });
-      storeFmipServerContext(session, refreshed, wantFamily);
-      if (Array.isArray(refreshed?.content) && refreshed.content.length > 0) {
-        payload = refreshed;
+      const refreshed = await runRefreshClient(!reinitUsedInLoop, true);
+      if (refreshed.reinitialized) reinitUsedInLoop = true;
+      if (Array.isArray(refreshed.payload?.content) && refreshed.payload.content.length > 0) {
+        payload = refreshed.payload;
       }
     }
   }
@@ -1264,7 +1542,7 @@ export async function fetchFindMyDevices({
     if (normalized) entries.push(normalized);
   }
   return {
-    fetchedAt: Date.now(),
+    fetchedAt: nowFn(),
     serverTimestamp: typeof payload?.serverContext?.serverTimestamp === 'number' ? payload.serverContext.serverTimestamp : null,
     entries,
   };
@@ -1277,31 +1555,99 @@ export async function fetchFindMyDevices({
  *   rawDeviceId: string;
  *   subject?: string;
  *   fetchFn?: typeof fetch;
+ *   nowFn?: () => number;
  *   signal?: AbortSignal;
  * }} params
  */
-export async function playFindMySound({ session, rawDeviceId, subject, fetchFn = fetch, signal }) {
+export async function playFindMySound({ session, rawDeviceId, subject, fetchFn = fetch, nowFn = Date.now, signal }) {
   if (!rawDeviceId) {
-    throw new AppleClientError('缺少目标设备内部 ID，请先刷新设备列表', 'MISSING_DEVICE_ID');
+    throw new AppleClientError('缺少目标设备内部 ID，请先刷新设备列表', 'MISSING_DEVICE_ID', undefined, 'fmip_play_sound');
   }
-  const payload = await postFmipWithRefresh({
+  if (!session || session.state !== 'authenticated' || !session.findmeUrl) {
+    throw new AppleClientError('尚未登录或尚未完成 2FA 验证，请先绑定 Apple ID', 'NOT_AUTHENTICATED', 401, 'fmip_play_sound');
+  }
+
+  const baseClientContext = {
+    appName: 'iCloud Find (Web)',
+    appVersion: '2.0',
+    apiVersion: '3.0',
+    deviceListVersion: 1,
+    fmly: session.fmipIncludeFamily ?? true,
+    timezone: 'Asia/Shanghai',
+    inactiveTime: 0,
+  };
+
+  if (isFmipContextStale(session, nowFn())) {
+    clearFmipSubsession(session);
+    await initFmipSession({
+      session,
+      baseClientContext,
+      locate: false,
+      includeFamily: session.fmipIncludeFamily ?? true,
+      fetchFn,
+      signal,
+      nowFn,
+    });
+  }
+
+  const makePlayBody = () => ({
+    device: rawDeviceId,
+    subject: String(subject || 'F.R.I.D.A.Y. 查找设备提醒').trim().slice(0, 120),
+    clientContext: {
+      appName: 'iCloud Find (Web)',
+      appVersion: '2.0',
+      fmly: true,
+    },
+    ...(session.fmipServerContext ? { serverContext: session.fmipServerContext } : {}),
+  });
+
+  let resp = await postFmipRaw({
     session,
     path: '/fmipservice/client/web/playSound',
-    body: {
-      device: rawDeviceId,
-      subject: String(subject || 'F.R.I.D.A.Y. 查找设备提醒').trim().slice(0, 120),
-      clientContext: {
-        appName: 'iCloud Find (Web)',
-        appVersion: '2.0',
-        fmly: true,
-      },
-      ...(session.fmipServerContext ? { serverContext: session.fmipServerContext } : {}),
-    },
+    body: makePlayBody(),
     fetchFn,
     signal,
   });
+
+  if (resp.status === 401 || resp.status === 450) {
+    clearFmipSubsession(session);
+    await initFmipSession({
+      session,
+      baseClientContext,
+      locate: false,
+      includeFamily: session.fmipIncludeFamily ?? true,
+      fetchFn,
+      signal,
+      nowFn,
+    });
+    resp = await postFmipRaw({
+      session,
+      path: '/fmipservice/client/web/playSound',
+      body: makePlayBody(),
+      fetchFn,
+      signal,
+    });
+  }
+
+  if (resp.status === 401 || resp.status === 450) {
+    markSessionExpired(
+      session,
+      nowFn,
+      'Apple 会话已过期（约 30～60 天需重新完成一次 2FA 授权），请重新登录绑定',
+      resp.status,
+      'fmip_play_sound',
+    );
+  }
+  if (!resp.ok) {
+    throw new AppleClientError(
+      extractAppleServiceError(resp.data, `iCloud Find My 请求失败 (HTTP ${resp.status})`),
+      'FMIP_REQUEST_FAILED',
+      resp.status,
+      'fmip_play_sound',
+    );
+  }
   return {
-    statusCode: String(payload?.statusCode ?? '200'),
+    statusCode: String(resp.data?.statusCode ?? '200'),
     ok: true,
   };
 }

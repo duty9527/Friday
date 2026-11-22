@@ -1,6 +1,15 @@
 #!/usr/bin/env node
-import { existsSync, unlinkSync } from 'node:fs';
-import { resolve } from 'node:path';
+import {
+  appendFileSync,
+  chmodSync,
+  existsSync,
+  lstatSync,
+  readFileSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   clampInt,
@@ -86,6 +95,109 @@ export function maskAppleId(appleId) {
   }
   if (raw.length <= 4) return '***';
   return `${raw.slice(0, 2)}***${raw.slice(-2)}`;
+}
+
+const MAX_ERROR_LOG_BYTES = 131_072;
+const KEEP_ERROR_LOG_BYTES = 32_768;
+
+/**
+ * Sanitize diagnostic error text by redacting local paths, emails, phone numbers, and auth secrets.
+ * @param {unknown} raw
+ * @param {string[]} [pathsToRedact]
+ * @param {number} [maxLen]
+ * @returns {string}
+ */
+function sanitizeAppleDiagnosticText(raw, pathsToRedact = [], maxLen = 240) {
+  let cleanMsg = String(raw ?? '').replace(/[\r\n]+/g, ' ').trim();
+  const sortedPaths = pathsToRedact
+    .filter(p => typeof p === 'string' && p.trim().length > 0)
+    .sort((a, b) => b.length - a.length);
+  for (const p of sortedPaths) {
+    cleanMsg = cleanMsg.split(p).join('<redacted-path>');
+  }
+  cleanMsg = cleanMsg
+    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, m => maskAppleId(m))
+    .replace(/\b(1[3-9]\d)\d{4}(\d{4})\b/g, '$1****$2')
+    .replace(/\b(Bearer)\s+[A-Za-z0-9._~+/=-]+/gi, '$1 <redacted>')
+    .replace(/\b(password|pass|trustToken|sessionToken|dsWebAuthToken|scnt|cookie|X-Apple-[A-Za-z0-9-]+)\s*[:=]\s*\S+/gi, '$1=<redacted>');
+  if (cleanMsg.length > maxLen) {
+    cleanMsg = `${cleanMsg.slice(0, Math.max(0, maxLen - 3))}...`;
+  }
+  return cleanMsg;
+}
+
+/**
+ * Build a sanitized `lastError` object suitable for persisting onto `session.json` and public auth summaries.
+ * @param {string} action
+ * @param {unknown} err
+ * @param {number} [nowMs]
+ * @param {string[]} [pathsToRedact]
+ */
+function buildSanitizedLastError(action, err, nowMs = Date.now(), pathsToRedact = []) {
+  const code = err && typeof err === 'object' && 'code' in err && err.code ? String(err.code) : 'ERR';
+  const statusRaw = err && typeof err === 'object' && 'status' in err ? Number(err.status) : NaN;
+  const status = Number.isInteger(statusRaw) && statusRaw > 0 ? statusRaw : null;
+  const stage = err && typeof err === 'object' && 'stage' in err && err.stage ? String(err.stage) : null;
+  const message = sanitizeAppleDiagnosticText(errMsg(err), pathsToRedact, 200);
+  return {
+    at: nowMs,
+    action,
+    stage,
+    code,
+    status,
+    message,
+  };
+}
+
+/**
+ * Append a strictly redacted error line to `console.error` (journald) and `<pluginDataDir>/error.log`.
+ * @param {string} pluginDataDir
+ * @param {string} action
+ * @param {unknown} err
+ * @param {string[]} [pathsToRedact]
+ * @param {number} [nowMs]
+ */
+function logAppleError(pluginDataDir, action, err, pathsToRedact = [], nowMs = Date.now()) {
+  const info = buildSanitizedLastError(action, err, nowMs, pathsToRedact);
+  const cleanMsg = sanitizeAppleDiagnosticText(errMsg(err), pathsToRedact, 240);
+  const line = `[apple-devices] ${new Date(nowMs).toISOString()} action=${action}${info.stage ? ` stage=${info.stage}` : ''}${info.status ? ` http=${info.status}` : ''} code=${info.code} msg=${cleanMsg}`;
+  console.error(line);
+
+  try {
+    const logPath = join(pluginDataDir, 'error.log');
+    try {
+      const st = lstatSync(logPath);
+      if (st.isSymbolicLink()) return;
+    } catch (statErr) {
+      if (/** @type {NodeJS.ErrnoException} */ (statErr)?.code !== 'ENOENT') return;
+    }
+
+    let size = 0;
+    try {
+      size = statSync(logPath).size;
+    } catch {
+      size = 0;
+    }
+    if (size > MAX_ERROR_LOG_BYTES) {
+      const buf = readFileSync(logPath);
+      let tail = buf.subarray(Math.max(0, buf.length - KEEP_ERROR_LOG_BYTES));
+      const firstNl = tail.indexOf(10);
+      if (firstNl >= 0 && firstNl + 1 < tail.length) {
+        tail = tail.subarray(firstNl + 1);
+      }
+      const nextContent = `${tail.toString('utf8')}${line}\n`;
+      writeFileSync(logPath, nextContent, { encoding: 'utf8', mode: 0o600 });
+    } else {
+      appendFileSync(logPath, `${line}\n`, { encoding: 'utf8', mode: 0o600 });
+    }
+    try {
+      chmodSync(logPath, 0o600);
+    } catch {
+      // ignore chmod errors
+    }
+  } catch {
+    // logging must never fail plugin execution
+  }
 }
 
 /**
@@ -348,6 +460,8 @@ function buildPublicAuthSummary(session, config) {
           pushMode: String(p.pushMode ?? 'sms'),
         }))
       : [],
+    ...(typeof session?.expiredAt === 'number' ? { expiredAt: session.expiredAt } : {}),
+    ...(session?.lastError && typeof session.lastError === 'object' ? { lastError: session.lastError } : {}),
   };
 }
 
@@ -683,8 +797,11 @@ async function getDevicesWithCache(opts) {
       includeFamily: config.includeFamily,
       locatePollDelayMs,
       fetchFn,
+      nowFn,
       signal,
     });
+    session.lastError = undefined;
+    session.expiredAt = undefined;
     const stampedAt = nowFn();
     const mergedEntries = mergeEntriesWithPreviousCache(live.entries, cache?.entries, stampedAt, cache?.fetchedAt);
     const enriched = await enrichDeviceEntriesGeo(mergedEntries, {
@@ -714,9 +831,12 @@ async function getDevicesWithCache(opts) {
       geoConfigured: enriched.configured,
     };
   } catch (err) {
+    const errAt = nowFn();
+    session.lastError = buildSanitizedLastError('devices', err, errAt, [paths.pluginDataDir, paths.homeDir]);
     await withFileLock(paths.sessionPath, () => {
       if (existsSync(paths.sessionPath)) saveSession(paths.sessionPath, session);
     });
+    logAppleError(paths.pluginDataDir, 'devices', err, [paths.pluginDataDir, paths.homeDir], errAt);
     return {
       ok: false,
       errorCode: err instanceof AppleClientError ? err.code : 'FMIP_ERROR',
@@ -849,8 +969,14 @@ export async function runAction(action = 'status', rawArgs = {}, rawDeps = {}) {
     }
 
     const existingSession = loadSession(paths.sessionPath);
-    const existingTrustToken = existingSession?.appleId === appleId && typeof existingSession?.trustToken === 'string'
+    const isSameAccount = Boolean(existingSession?.appleId && String(existingSession.appleId).toLowerCase() === appleId.toLowerCase());
+    const existingTrustToken = isSameAccount && typeof existingSession?.trustToken === 'string'
       ? existingSession.trustToken
+      : undefined;
+    const existingTrustCookies = isSameAccount && existingTrustToken && existingSession?.cookies && typeof existingSession.cookies === 'object'
+      ? Object.fromEntries(
+          Object.entries(existingSession.cookies).filter(([k, v]) => /^DES[0-9a-f]+$/i.test(k) && typeof v === 'string' && v.trim().length > 0),
+        )
       : undefined;
 
     try {
@@ -860,10 +986,12 @@ export async function runAction(action = 'status', rawArgs = {}, rawDeps = {}) {
         password,
         region,
         existingTrustToken,
+        existingTrustCookies,
         clientId: existingSession?.clientId,
         pause2FA,
         fetchFn,
         signal,
+        nowFn,
       });
       await withFileLock(paths.sessionPath, () => saveSession(paths.sessionPath, session));
       if (args.region !== undefined && region !== config.region) {
@@ -892,6 +1020,7 @@ export async function runAction(action = 'status', rawArgs = {}, rawDeps = {}) {
           includeFamily: config.includeFamily,
           locatePollDelayMs,
           fetchFn,
+          nowFn,
           signal,
         });
         fetchedAt = nowFn();
@@ -910,8 +1039,8 @@ export async function runAction(action = 'status', rawArgs = {}, rawDeps = {}) {
           entries: enriched.entries,
         }, { mode: 0o600 }));
         devices = enriched.entries.map(e => sanitizeDeviceForOutput(e.device, config.places));
-      } catch {
-        // Login still succeeded even if initial FMiP pull hits a transient error
+      } catch (pullErr) {
+        logAppleError(paths.pluginDataDir, 'auth-login-devices', pullErr, [paths.pluginDataDir, paths.homeDir], nowFn());
       }
       return {
         ok: true,
@@ -921,6 +1050,7 @@ export async function runAction(action = 'status', rawArgs = {}, rawDeps = {}) {
         data: { ...auth, requires2fa: false, fetchedAt, devices, geoConfigured },
       };
     } catch (err) {
+      logAppleError(paths.pluginDataDir, 'auth-login', err, [paths.pluginDataDir, paths.homeDir], nowFn());
       return {
         ok: false,
         notify: true,
@@ -954,6 +1084,7 @@ export async function runAction(action = 'status', rawArgs = {}, rawDeps = {}) {
         data: auth,
       };
     } catch (err) {
+      logAppleError(paths.pluginDataDir, 'auth-sms', err, [paths.pluginDataDir, paths.homeDir], nowFn());
       return {
         ok: false,
         notify: true,
@@ -976,12 +1107,12 @@ export async function runAction(action = 'status', rawArgs = {}, rawDeps = {}) {
     }
     try {
       if (bypass2fa) {
-        await bypass2faForFindMy({ session, fetchFn, signal });
+        await bypass2faForFindMy({ session, fetchFn, signal, nowFn });
       } else {
         const code = String(args.code ?? args.securityCode ?? '').trim();
         const mode = String(args.mode ?? 'trusted_device').trim().toLowerCase() === 'sms' ? 'sms' : 'trusted_device';
         const phoneId = clampInt(args.phoneId, 1, 999);
-        await verify2faCode({ session, code, mode, phoneId, fetchFn, signal });
+        await verify2faCode({ session, code, mode, phoneId, fetchFn, signal, nowFn });
       }
       await withFileLock(paths.sessionPath, () => saveSession(paths.sessionPath, session));
       const auth = buildPublicAuthSummary(session, config);
@@ -994,6 +1125,7 @@ export async function runAction(action = 'status', rawArgs = {}, rawDeps = {}) {
           includeFamily: config.includeFamily,
           locatePollDelayMs,
           fetchFn,
+          nowFn,
           signal,
         });
         fetchedAt = nowFn();
@@ -1012,8 +1144,8 @@ export async function runAction(action = 'status', rawArgs = {}, rawDeps = {}) {
           entries: enriched.entries,
         }, { mode: 0o600 }));
         devices = enriched.entries.map(e => sanitizeDeviceForOutput(e.device, config.places));
-      } catch {
-        // Ignore transient initial device pull errors
+      } catch (pullErr) {
+        logAppleError(paths.pluginDataDir, 'auth-verify-devices', pullErr, [paths.pluginDataDir, paths.homeDir], nowFn());
       }
       return {
         ok: true,
@@ -1025,6 +1157,7 @@ export async function runAction(action = 'status', rawArgs = {}, rawDeps = {}) {
         data: { ...auth, fetchedAt, devices, geoConfigured },
       };
     } catch (err) {
+      logAppleError(paths.pluginDataDir, 'auth-verify', err, [paths.pluginDataDir, paths.homeDir], nowFn());
       return {
         ok: false,
         notify: true,
@@ -1366,8 +1499,11 @@ export async function runAction(action = 'status', rawArgs = {}, rawDeps = {}) {
         rawDeviceId: match.entry.rawId,
         subject,
         fetchFn,
+        nowFn,
         signal,
       });
+      session.lastError = undefined;
+      session.expiredAt = undefined;
       await withFileLock(paths.sessionPath, () => {
         if (existsSync(paths.sessionPath)) saveSession(paths.sessionPath, session);
       });
@@ -1382,9 +1518,12 @@ export async function runAction(action = 'status', rawArgs = {}, rawDeps = {}) {
         data: { dryRun: false, device: targetDev, subject },
       };
     } catch (err) {
+      const errAt = nowFn();
+      session.lastError = buildSanitizedLastError('play-sound', err, errAt, [paths.pluginDataDir, paths.homeDir]);
       await withFileLock(paths.sessionPath, () => {
         if (existsSync(paths.sessionPath)) saveSession(paths.sessionPath, session);
       });
+      logAppleError(paths.pluginDataDir, 'play-sound', err, [paths.pluginDataDir, paths.homeDir], errAt);
       return {
         ok: false,
         notify: true,
