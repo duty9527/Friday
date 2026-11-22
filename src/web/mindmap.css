@@ -577,7 +577,7 @@ svg:focus-visible,
   position:relative;
   display:inline-flex;
   align-items:center;
-  min-block-size:max(var(--target-size), 29px);
+  min-block-size:29px;
   padding:4px 10px;
   border:1px solid var(--mm-control);
   border-radius:var(--mm-radius-ctrl);
@@ -664,7 +664,7 @@ svg:focus-visible,
 }
 
 .mm-tab-btn {
-  min-block-size:var(--target-size);
+  min-block-size:28px;
   border:1px solid transparent;
   background:transparent;
   padding:4px 10px;
@@ -746,7 +746,7 @@ svg:focus-visible,
 
 .mm-mini-btn {
   position:relative;
-  min-block-size:max(var(--target-size), 29px);
+  min-block-size:29px;
   padding:3px 8px;
   border:1px solid var(--mm-control);
   border-radius:var(--mm-radius-ctrl);
@@ -811,7 +811,7 @@ svg:focus-visible,
 
 .mm-theme-btn {
   position:relative;
-  min-block-size:var(--target-size);
+  min-block-size:26px;
   padding:2px 8px;
   font-size:0.71875rem;
   font-weight:600;
@@ -2543,10 +2543,18 @@ html[data-theme="spatial"] .fc-edge.fc-edge-loopback {
 @media (pointer: coarse) {
   .mm-mode-btn,
   .mm-filter-btn,
-  .fc-toggle-btn,
-  button,
-  select {
-    min-block-size:var(--target-size);
+  .fc-toggle-btn {
+    position:relative;
+  }
+  .mm-mini-btn::after,
+  .mm-mode-btn::after,
+  .mm-filter-btn::after,
+  .fc-toggle-btn::after,
+  .mm-theme-btn::after {
+    content:"";
+    position:absolute;
+    inset-block:min(0px, calc((var(--target-size) - 100%) / -2));
+    inset-inline:0;
   }
 }
 }

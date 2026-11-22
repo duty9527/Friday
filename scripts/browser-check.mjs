@@ -87,6 +87,47 @@ async function launchBrowserAdapter() {
       const isPng = String(path).toLowerCase().endsWith('.png');
       await pwPage.screenshot({ path, ...(isPng ? {} : { type: 'jpeg', quality }) });
     },
+    async checkCoarseTouch() {
+      const tok = await pwPage.evaluate(() => sessionStorage.getItem('friday.local-access-token') ?? sessionStorage.getItem('super-agent.local-access-token'));
+      const touchCtx = await pwBrowser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 3 });
+      try {
+        const touchPage = await touchCtx.newPage();
+        touchPage.on('console', msg => { if (msg.type() === 'error') consoleErrors.push(msg.text()); });
+        touchPage.on('pageerror', err => consoleErrors.push(err instanceof Error ? err.message : String(err)));
+        const base = new URL(pwPage.url());
+        await touchPage.goto(tok ? `${base.origin}/#token=${tok}` : base.origin, { waitUntil: 'domcontentloaded' });
+        await until(() => touchPage.evaluate(() => !document.querySelector('#draft')?.disabled && document.querySelectorAll('#messages .message').length > 0), 'touch mobile hydration');
+        await touchPage.evaluate(() => {
+          const detailBtn = document.querySelector('#conv-detail-mode-btn');
+          if (detailBtn && detailBtn.getAttribute('aria-pressed') !== 'true') detailBtn.click();
+        });
+        await until(() => touchPage.evaluate(() => document.querySelectorAll('.route-expand-btn').length > 0), 'coarse touch .route-expand-btn visible in audit detail mode');
+        const touchMetrics = await touchPage.evaluate(() => {
+          const coarse = window.matchMedia('(pointer: coarse)').matches;
+          const expandBtns = [...document.querySelectorAll('.route-expand-btn')].map(el => Math.round(el.getBoundingClientRect().height));
+          const msgBtns = [...document.querySelectorAll('.message-actions button')].map(el => Math.round(el.getBoundingClientRect().height));
+          const avatar = document.querySelector('#companion-avatar')?.getBoundingClientRect();
+          const pokes = [...document.querySelectorAll('.bot-poke-btn')].map(el => {
+            const r = el.getBoundingClientRect();
+            return { w: Math.round(r.width), h: Math.round(r.height) };
+          });
+          return {
+            coarse,
+            expandBtns,
+            msgBtns,
+            avatar: avatar ? { w: Math.round(avatar.width), h: Math.round(avatar.height) } : null,
+            pokes,
+          };
+        });
+        assert.equal(touchMetrics.coarse, true, 'touch emulation must match (pointer: coarse)');
+        assert.ok(touchMetrics.expandBtns.length > 0 && touchMetrics.expandBtns.every(h => h <= 32), `coarse .route-expand-btn heights must be <=32px, got ${JSON.stringify(touchMetrics.expandBtns)}`);
+        assert.ok(touchMetrics.msgBtns.length > 0 && touchMetrics.msgBtns.every(h => h <= 32), `coarse .message-actions button heights must be <=32px, got ${JSON.stringify(touchMetrics.msgBtns)}`);
+        assert.ok(touchMetrics.avatar && touchMetrics.avatar.h <= 34 && Math.abs(touchMetrics.avatar.w - touchMetrics.avatar.h) <= 2, `coarse #companion-avatar must stay square <=34px, got ${JSON.stringify(touchMetrics.avatar)}`);
+        assert.ok(touchMetrics.pokes.length > 0 && touchMetrics.pokes.every(p => p.w <= 32 && p.h <= 32), `coarse .bot-poke-btn must stay <=32px, got ${JSON.stringify(touchMetrics.pokes)}`);
+      } finally {
+        await touchCtx.close();
+      }
+    },
   };
   return {
     browser: { close: () => pwBrowser.close() },
@@ -468,6 +509,11 @@ try {
     }
   }
   checks.push('system/spatial/industrial themes across 1440x900, 768x1024, 390x844 (mobile nav inert + focus restore, chat, trace, inspector, work drawer + Escape) with zero page overflow');
+
+  if (typeof page.checkCoarseTouch === 'function') {
+    await page.checkCoarseTouch();
+    checks.push('touch-emulated coarse pointer mobile keeps .route-expand-btn, .message-actions buttons, #companion-avatar, and .bot-poke-btn compact');
+  }
 
   await page.eval(() => document.querySelector('#theme-spatial-btn')?.click());
   await page.setViewport({ width: 1440, height: 900, mobile: false });

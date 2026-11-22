@@ -392,7 +392,7 @@ button,select,summary {
   cursor:pointer;
 }
 button {
-  min-height:max(var(--target-size), 32px);
+  min-height:32px;
   padding:4px 11px;
   border:1px solid var(--control);
   border-radius:8px;
@@ -805,8 +805,9 @@ svg.hub-svg-icon,
   box-shadow:inset 0 1px 2px rgba(24, 24, 27, 0.12);
 }
 .theme-switch-btn {
-  min-block-size:var(--target-size);
-  min-height:var(--target-size);
+  position:relative;
+  min-block-size:24px;
+  min-height:24px;
   padding:2px 6px;
   border:1px solid transparent;
   border-radius:999px;
@@ -1021,7 +1022,8 @@ svg.hub-svg-icon,
 }
 .conv-active-works-btn {
   position:relative;
-  min-block-size:var(--target-size);
+  min-block-size:24px;
+  min-height:24px;
   padding:1px 8px;
   border-radius:999px;
   font-size:0.6875rem;
@@ -1807,7 +1809,8 @@ svg.hub-svg-icon,
 .system-notice-toggle,
 .system-notice-trace {
   position:relative;
-  min-block-size:var(--target-size);
+  min-block-size:24px;
+  min-height:24px;
   padding:1px 7px;
   font-size:0.6875rem;
 }
@@ -1835,6 +1838,7 @@ svg.hub-svg-icon,
   pointer-events:auto;
 }
 .message-actions button {
+  position:relative;
   font-size:0.6875rem;
   min-height:24px;
   padding:1px 7px;
@@ -1956,7 +1960,8 @@ svg.hub-svg-icon,
 }
 .route-expand-btn {
   position:relative;
-  min-block-size:var(--target-size);
+  min-block-size:24px;
+  min-height:24px;
   padding:1px 7px;
   font-size:0.6875rem;
   border-radius:999px;
@@ -2196,7 +2201,8 @@ svg.hub-svg-icon,
 }
 .md-code-copy {
   position:relative;
-  min-block-size:var(--target-size);
+  min-block-size:24px;
+  min-height:24px;
   padding:1px 8px;
   font-size:0.6875rem;
   color:#e2e8f0;
@@ -3890,7 +3896,8 @@ details.references[open] > :not(summary) {
 }
 .copy-mini-btn {
   position:relative;
-  min-block-size:var(--target-size);
+  min-block-size:24px;
+  min-height:24px;
   padding:1px 7px;
   font-size:0.65625rem;
   font-weight:600;
@@ -4333,7 +4340,7 @@ dialog.confirm-dialog {
   max-width:100%;
 }
 .hub-modal-tabs [role="tab"] {
-  min-block-size:max(var(--target-size), 28px);
+  min-block-size:28px;
   padding:4px 12px;
   border-radius:999px;
   border:1px solid transparent;
@@ -5012,7 +5019,8 @@ dialog.confirm-dialog {
 }
 .hub-synapse-chip {
   position:relative;
-  min-block-size:var(--target-size);
+  min-block-size:24px;
+  min-height:24px;
   padding:1px 8px;
   font-size:0.6875rem;
   border-radius:999px;
@@ -7088,7 +7096,8 @@ dialog.confirm-dialog {
 }
 .cs80-size-btn {
   position:relative;
-  min-block-size:var(--target-size);
+  min-block-size:24px;
+  min-height:24px;
   padding:2px 7px;
   font-size:0.6875rem;
   line-height:1.3;
@@ -7110,7 +7119,8 @@ dialog.confirm-dialog {
 }
 .cs80-editor-card .mini-button {
   position:relative;
-  min-block-size:var(--target-size);
+  min-block-size:24px;
+  min-height:24px;
   padding:1px 7px;
 }
 .cs80-custom-opts {
@@ -10068,7 +10078,37 @@ dialog.confirm-dialog {
     touch-action:pan-y;
   }
   button,select,summary {
-    min-height:max(var(--target-size), 40px);
+    min-height:40px;
+  }
+  .companion-avatar,
+  :where(html[data-theme="industrial"]) .companion-avatar {
+    width:30px;
+    height:30px;
+    min-width:30px;
+    min-height:30px;
+    min-block-size:30px;
+    padding:0;
+  }
+  .bot-poke-btn,
+  :where(html[data-theme="industrial"]) .bot-poke-btn {
+    width:28px;
+    height:28px;
+    min-width:28px;
+    min-height:28px;
+    min-block-size:28px;
+    padding:0;
+  }
+  .route-expand-btn,
+  .system-notice-toggle,
+  .system-notice-trace,
+  .conv-active-works-btn {
+    min-height:26px;
+    min-block-size:26px;
+    padding:2px 9px;
+  }
+  .route-pill-stop {
+    min-height:20px;
+    min-block-size:20px;
   }
   .mobile-header-icon-btn {
     position:relative;
@@ -10109,6 +10149,7 @@ dialog.confirm-dialog {
   }
   .mini-button,
   .copy-mini-btn,
+  .md-code-copy,
   .inspector-nav-group button,
   .hub-filter-pill,
   .hub-preset-chip,
@@ -10117,6 +10158,7 @@ dialog.confirm-dialog {
   .brain-synapse-jump,
   .hub-synapse-chip {
     min-height:28px;
+    min-block-size:28px;
   }
   .work-doc-details > summary,
   .trace-inspector-pane summary {
@@ -10129,6 +10171,7 @@ dialog.confirm-dialog {
   .conv-channel-chip,
   .conv-ctrl-chip {
     min-height:28px;
+    min-block-size:28px;
   }
   .work-row-main {
     min-height:0;
@@ -10780,37 +10823,11 @@ html.mobile-keyboard-open {
   background:var(--err-bg);
 }
 @media (pointer: coarse) {
-  .mini-button,
-  .work-stop-btn,
-  .older,
-  .message-actions button,
-  .hub-filter-pill,
-  .hub-preset-chip,
-  .hub-surface-tab,
-  .modal-close-btn,
-  .inspector-nav-group button,
-  .brain-ctrl-btn,
-  .brain-synapse-jump,
-  .brain-action-btn,
-  .plugin-mobile-nav-btn,
-  .plugin-sidebar-toggle,
-  .plugin-order-reset-btn,
-  .plugin-open-btn,
-  .plugin-check-btn,
-  .mobile-drawer-close,
-  .trace-inspector-pane summary,
-  .conv-ctrl-chip,
-  .connection-bar button,
-  .bot-emote-item,
-  .md-code-expand-btn,
-  .source-reference,
-  .route-target,
-  .hub-pill-btn,
-  .desktop-fold-btn {
-    min-block-size:var(--target-size);
-  }
   .route-pill-stop::after,
   .route-expand-btn::after,
+  .system-notice-toggle::after,
+  .system-notice-trace::after,
+  .message-actions button::after,
   .md-code-copy::after,
   .copy-mini-btn::after,
   .conv-active-works-btn::after,
@@ -10830,6 +10847,9 @@ html.mobile-keyboard-open {
   }
   .bot-poke-btn::after {
     inset:-8px;
+  }
+  .companion-avatar::after {
+    inset:-7px;
   }
 }
 }
