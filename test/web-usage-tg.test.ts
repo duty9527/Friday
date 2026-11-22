@@ -64,8 +64,10 @@ test('Web usage and Telegram UI files strictly adhere to CSP and zero inline sty
 
   assert.match(indexHtml, /id="open-system-hub-top"/);
   assert.match(indexHtml, /id="system-top-badge"/);
-  assert.match(indexHtml, /id="system-hub-backdrop"/);
-  assert.match(indexHtml, /id="system-hub-modal"/);
+  assert.match(indexHtml, /<dialog[^>]+id="system-hub-dialog"[^>]+closedby="any"/);
+  assert.doesNotMatch(indexHtml, /id="system-hub-backdrop"/);
+  assert.doesNotMatch(indexHtml, /id="open-notebook-hub-top"/);
+  assert.doesNotMatch(indexHtml, /id="notebook-hub-backdrop"/);
   assert.match(indexHtml, /id="system-tab-models"/);
   assert.match(indexHtml, /id="system-tab-usage"/);
   assert.match(indexHtml, /id="system-tab-services"/);

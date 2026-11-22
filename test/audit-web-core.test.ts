@@ -29,6 +29,11 @@ class MockElement {
   hidden = false;
   disabled = false;
   open = false;
+  returnValue = '';
+  closedBy = '';
+  inert = false;
+  popover: string | null = null;
+  isPopoverOpen = false;
   readOnly = false;
   scrollHeight = 0;
   scrollTop = 0;
@@ -113,14 +118,41 @@ class MockElement {
   };
 
   setAttribute(name: string, val: string): void {
-    this.attributes.set(name, String(val));
-    if (name === 'id') this.id = String(val);
-    if (name === 'class') this.className = String(val);
+    const lower = name.toLowerCase();
+    const str = String(val);
+    this.attributes.set(lower, str);
+    if (lower === 'id') this.id = str;
+    if (lower === 'class') this.className = str;
+    if (lower === 'hidden') this.hidden = true;
+    if (lower === 'disabled') this.disabled = true;
+    if (lower === 'open') this.open = true;
+    if (lower === 'inert') this.inert = true;
+    if (lower === 'closedby') this.closedBy = str;
+    if (lower === 'popover') this.popover = str;
   }
 
   getAttribute(name: string): string | null {
-    if (name === 'id') return this.id || null;
-    return this.attributes.get(name) ?? null;
+    const lower = name.toLowerCase();
+    if (lower === 'id') return this.id || null;
+    if (lower === 'hidden') return this.hidden ? '' : null;
+    if (lower === 'disabled') return this.disabled ? '' : null;
+    if (lower === 'open') return this.open ? '' : null;
+    if (lower === 'inert') return this.inert ? '' : null;
+    return this.attributes.get(lower) ?? null;
+  }
+
+  removeAttribute(name: string): void {
+    const lower = name.toLowerCase();
+    this.attributes.delete(lower);
+    if (lower === 'hidden') this.hidden = false;
+    if (lower === 'disabled') this.disabled = false;
+    if (lower === 'open') this.open = false;
+    if (lower === 'inert') this.inert = false;
+    if (lower === 'popover') this.popover = null;
+  }
+
+  hasAttribute(name: string): boolean {
+    return this.getAttribute(name) !== null;
   }
 
   append(...items: Array<MockElement | string>): void {
@@ -203,15 +235,25 @@ class MockElement {
   }
 
   dispatchEvent(event: Record<string, unknown>): boolean {
-    event.target ??= this;
-    let prevented = false;
-    event.preventDefault ??= () => {
-      if (event.cancelable !== false) {
-        prevented = true;
-        event.defaultPrevented = true;
+    if (event.target == null) {
+      try {
+        event.target = this;
+      } catch {
+        // Native Event objects expose a getter-only target property.
       }
-    };
-    event.stopPropagation ??= () => {};
+    }
+    let prevented = false;
+    if (typeof event.preventDefault !== 'function') {
+      event.preventDefault = () => {
+        if (event.cancelable !== false) {
+          prevented = true;
+          event.defaultPrevented = true;
+        }
+      };
+    }
+    if (typeof event.stopPropagation !== 'function') {
+      event.stopPropagation = () => {};
+    }
     let cur: MockElement | null = this;
     while (cur) {
       for (const entry of [...(cur.listeners.get(String(event.type)) ?? [])]) {
@@ -219,20 +261,29 @@ class MockElement {
       }
       cur = cur.parentElement;
     }
-    return !prevented;
+    return !prevented && event.defaultPrevented !== true;
   }
 
   matches(selector: string): boolean {
     const parts = selector.split(',').map(s => s.trim()).filter(Boolean);
     return parts.some(part => {
-      const tokens = part.match(/(?:#[^\s.#[\]]+|\.[^\s.#[\]]+|\[[^\]]+\]|^[a-zA-Z0-9_-]+)/g);
-      if (!tokens || tokens.join('') !== part) return false;
+      const needsPopoverOpen = part.includes(':popover-open');
+      if (needsPopoverOpen && !this.isPopoverOpen) return false;
+      const cleanPart = part.replace(/:popover-open/g, '');
+      if (!cleanPart) return needsPopoverOpen;
+      const tokens = cleanPart.match(/(?:#[^\s.#[\]]+|\.[^\s.#[\]]+|\[[^\]]+\]|^[a-zA-Z0-9_-]+)/g);
+      if (!tokens || tokens.join('') !== cleanPart) return false;
       return tokens.every(tok => {
         if (tok.startsWith('#')) return this.id === tok.slice(1);
         if (tok.startsWith('.')) return this.classes.has(tok.slice(1));
         if (tok.startsWith('[')) {
-          const inner = tok.slice(1, -1).split('=')[0]!;
-          return this.attributes.has(inner);
+          const expr = tok.slice(1, -1);
+          const eqIdx = expr.indexOf('=');
+          if (eqIdx === -1) return this.hasAttribute(expr.trim());
+          const attrName = expr.slice(0, eqIdx).trim();
+          const rawVal = expr.slice(eqIdx + 1).trim();
+          const expectedVal = rawVal.replace(/^(['"])(.*)\1$/, '$2');
+          return this.getAttribute(attrName) === expectedVal;
         }
         return this.tagName === tok.toUpperCase();
       });
@@ -275,6 +326,39 @@ class MockElement {
 
   focus(): void {}
   scrollTo(): void {}
+  getContext(): null { return null; }
+  showModal(): void {
+    this.hidden = false;
+    this.open = true;
+    this.setAttribute('open', '');
+  }
+  close(returnValue?: string): void {
+    if (returnValue !== undefined) this.returnValue = returnValue;
+    const wasOpen = this.open;
+    this.open = false;
+    this.removeAttribute('open');
+    if (wasOpen) {
+      this.dispatchEvent({ type: 'close', bubbles: false, cancelable: false });
+    }
+  }
+  showPopover(): void {
+    this.hidden = false;
+    this.isPopoverOpen = true;
+    this.dispatchEvent({ type: 'toggle', newState: 'open', oldState: 'closed', bubbles: false });
+  }
+  hidePopover(): void {
+    const wasOpen = this.isPopoverOpen;
+    this.isPopoverOpen = false;
+    if (wasOpen) {
+      this.dispatchEvent({ type: 'toggle', newState: 'closed', oldState: 'open', bubbles: false });
+    }
+  }
+  togglePopover(force?: boolean): boolean {
+    const next = force !== undefined ? force : !this.isPopoverOpen;
+    if (next) this.showPopover();
+    else this.hidePopover();
+    return next;
+  }
   setSelectionRange(start: number, end: number): void {
     this.selectionStart = start;
     this.selectionEnd = end;
@@ -288,16 +372,17 @@ function createDomEnv(initialHash = `#token=${'a'.repeat(64)}`) {
   const saved: Record<string, PropertyDescriptor | undefined> = {};
   const keys = [
     'window', 'document', 'location', 'history', 'sessionStorage', 'localStorage',
-    'fetch', 'Node', 'Element', 'HTMLElement', 'navigator', 'performance', 'requestAnimationFrame',
+    'fetch', 'Node', 'Element', 'HTMLElement', 'ResizeObserver', 'navigator', 'performance', 'requestAnimationFrame',
     'cancelAnimationFrame',
   ];
   for (const key of keys) {
     saved[key] = Object.getOwnPropertyDescriptor(globalThis, key);
   }
 
+  const rootHead = new MockElement('head');
   const rootBody = new MockElement('body');
   const docEl = new MockElement('html');
-  docEl.appendChild(rootBody);
+  docEl.append(rootHead, rootBody);
   const byId = new Map<string, MockElement>();
   const getOrCreateEl = (id: string): MockElement => {
     let el = byId.get(id);
@@ -322,6 +407,7 @@ function createDomEnv(initialHash = `#token=${'a'.repeat(64)}`) {
   const documentMock = {
     hidden: false,
     cookie: '',
+    head: rootHead,
     body: rootBody,
     documentElement: docEl,
     activeElement: null,
@@ -330,7 +416,8 @@ function createDomEnv(initialHash = `#token=${'a'.repeat(64)}`) {
     createElementNS: (_ns: string, tag: string) => new MockElement(tag),
     createTextNode: (text: string) => new MockElement('#text', 3, text),
     createDocumentFragment: () => new MockElement('#fragment', 11),
-    querySelector: () => null,
+    querySelector: (selector: string) => docEl.querySelector(selector),
+    querySelectorAll: (selector: string) => docEl.querySelectorAll(selector),
     addEventListener: (type: string, fn: (ev: unknown) => void) => {
       const list = docListeners.get(type) ?? [];
       list.push({ fn });
@@ -387,6 +474,12 @@ function createDomEnv(initialHash = `#token=${'a'.repeat(64)}`) {
     Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
   };
 
+  class MockResizeObserver {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+
   assign('window', windowMock);
   assign('document', documentMock);
   assign('location', { hash: initialHash, pathname: '/', search: '' });
@@ -396,6 +489,7 @@ function createDomEnv(initialHash = `#token=${'a'.repeat(64)}`) {
   assign('Node', MockElement);
   assign('Element', MockElement);
   assign('HTMLElement', MockElement);
+  assign('ResizeObserver', MockResizeObserver);
 
   const restore = () => {
     for (const key of keys) {
@@ -405,10 +499,12 @@ function createDomEnv(initialHash = `#token=${'a'.repeat(64)}`) {
   };
 
   return {
+    rootHead,
     rootBody,
     getOrCreateEl,
     documentMock,
     windowMock,
+    getDocListenerCount: (type: string) => docListeners.get(type)?.length ?? 0,
     assign,
     restore,
   };
@@ -958,7 +1054,8 @@ test('initChatPanel clears draftTyping on confirmed send error, guards loadOlder
     await new Promise(resolve => setTimeout(resolve, 25));
     assert.equal(appState.messages.has('m-stale-pre-reset'), false, 'stale pre-reset history must not pollute post-reset state');
 
-    // 4. Mobile touchmove allows scrolling inside newly added modal/stage containers
+    // 4. No global document touchmove hijacker is registered; mobile touchmove allows scrolling inside modal/stage containers
+    assert.equal(env.getDocListenerCount('touchmove'), 0, 'initChatPanel must not register a global document touchmove hijacker');
     const notebookBody = new MockElement('div');
     notebookBody.className = 'notebook-modal-body';
     notebookBody.scrollHeight = 600;
@@ -1155,11 +1252,17 @@ test('isIosStandaloneClipped accurately isolates legacy iOS standalone clipped m
   assert.equal(isIosStandaloneClipped({ ...base, screenWidth: 820, screenHeight: 1180, layoutWidth: 500, layoutHeight: 1112 }), false);
 });
 
-test('initMobileViewport creates safe-area probe, syncs clipped & keyboard classes, resets blur scroll, and disposes cleanly', async () => {
+test('initMobileViewport short-circuits desktop, avoids pwa-standalone, syncs clipped & keyboard classes, resets blur scroll, and disposes cleanly', async () => {
   const env = createDomEnv();
+  let desktopCtrl: ReturnType<typeof initMobileViewport> | undefined;
+  let ctrl: ReturnType<typeof initMobileViewport> | undefined;
+  let androidCtrl: ReturnType<typeof initMobileViewport> | undefined;
   try {
     let scrollCalls = 0;
+    let computedStyleCalls = 0;
     let vvHeight = 844;
+    let narrowMobileMatches = false;
+    let standaloneMatches = true;
     const vvListeners = new Map<string, ListenerEntry[]>();
     const vvMock = {
       get height() { return vvHeight; },
@@ -1181,18 +1284,21 @@ test('initMobileViewport creates safe-area probe, syncs clipped & keyboard class
     };
 
     Object.assign(env.windowMock, {
-      innerWidth: 420,
-      innerHeight: 844,
-      screen: { width: 420, height: 912 },
+      innerWidth: 1280,
+      innerHeight: 900,
+      screen: { width: 1280, height: 900 },
       visualViewport: vvMock,
       matchMedia: (query: string) => ({
-        matches: query.includes('max-width: 730px') || query.includes('display-mode: standalone'),
+        matches: query.includes('max-width: 730px')
+          ? narrowMobileMatches
+          : (query.includes('display-mode: standalone') ? standaloneMatches : false),
       }),
-      getComputedStyle: (el: MockElement) => (
-        el.id === 'safe-area-probe'
+      getComputedStyle: (el: MockElement) => {
+        computedStyleCalls += 1;
+        return el.id === 'safe-area-probe'
           ? { paddingTop: '68px', paddingBottom: '34px' }
-          : { paddingTop: '0px', paddingBottom: '0px' }
-      ),
+          : { paddingTop: '0px', paddingBottom: '0px' };
+      },
       scrollTo: () => {
         scrollCalls += 1;
         env.windowMock.scrollX = 0;
@@ -1201,14 +1307,31 @@ test('initMobileViewport creates safe-area probe, syncs clipped & keyboard class
     });
     env.assign('navigator', { standalone: true });
 
-    const ctrl = initMobileViewport();
+    // Desktop viewport short-circuits before creating #safe-area-probe or calling getComputedStyle
+    const root = env.documentMock.documentElement;
+    desktopCtrl = initMobileViewport();
+    assert.equal(env.rootBody.querySelector('#safe-area-probe'), null, 'desktop must not create safe-area-probe');
+    assert.equal(computedStyleCalls, 0, 'desktop must short-circuit before getComputedStyle');
+    assert.equal(root.classList.contains('pwa-standalone'), false);
+    assert.equal(root.classList.contains('ios-standalone-clipped'), false);
+    desktopCtrl.dispose();
+    desktopCtrl = undefined;
+
+    // Narrow mobile iOS standalone creates probe & tracks clipped/keyboard classes without legacy pwa-standalone
+    narrowMobileMatches = true;
+    Object.assign(env.windowMock, {
+      innerWidth: 420,
+      innerHeight: 844,
+      screen: { width: 420, height: 912 },
+    });
+    ctrl = initMobileViewport();
     const probe = env.rootBody.querySelector('#safe-area-probe');
-    assert.ok(probe, 'safe-area probe must be appended to document.body');
+    assert.ok(probe, 'safe-area probe must be appended to document.body on iOS standalone mobile');
     assert.equal(probe.classList.contains('safe-area-probe'), true);
     assert.equal(probe.getAttribute('aria-hidden'), 'true');
+    assert.ok(computedStyleCalls >= 1);
 
-    const root = env.documentMock.documentElement;
-    assert.equal(root.classList.contains('pwa-standalone'), true);
+    assert.equal(root.classList.contains('pwa-standalone'), false, 'legacy pwa-standalone class must not be toggled');
     assert.equal(root.classList.contains('ios-standalone-clipped'), true);
     assert.equal(root.classList.contains('mobile-keyboard-open'), false);
 
@@ -1231,49 +1354,34 @@ test('initMobileViewport creates safe-area probe, syncs clipped & keyboard class
     assert.equal(root.classList.contains('ios-standalone-clipped'), true);
 
     ctrl.dispose();
+    ctrl = undefined;
     vvHeight = 500;
     (env.documentMock as { activeElement: MockElement | null }).activeElement = inputEl;
     vvMock.dispatchEvent({ type: 'resize' });
     assert.equal(root.classList.contains('mobile-keyboard-open'), false, 'disposed controller must ignore subsequent events');
 
-    // Android Chrome standalone PWA (display-mode: standalone, no navigator.standalone) must keep safe-bottom intact
+    // Android Chrome standalone PWA (display-mode: standalone, no navigator.standalone) keeps safe-bottom intact without pwa-standalone
     (env.documentMock as { activeElement: MockElement | null }).activeElement = null;
     env.assign('navigator', {});
-    const androidCtrl = initMobileViewport();
-    assert.equal(root.classList.contains('pwa-standalone'), true);
+    androidCtrl = initMobileViewport();
+    assert.equal(root.classList.contains('pwa-standalone'), false);
     assert.equal(root.classList.contains('ios-standalone-clipped'), false);
     androidCtrl.dispose();
+    androidCtrl = undefined;
   } finally {
+    desktopCtrl?.dispose();
+    ctrl?.dispose();
+    androidCtrl?.dispose();
     env.restore();
   }
 });
 
-test('setUiTheme keeps meta theme-color and color-scheme aligned with mobile surfaces', async () => {
+test('setUiTheme updates single meta theme-color & color-scheme in place and supports system/spatial/industrial preferences', async () => {
   const env = createDomEnv();
   try {
     const colorSchemeMeta = new MockElement('meta');
     colorSchemeMeta.setAttribute('name', 'color-scheme');
-    colorSchemeMeta.setAttribute('content', 'dark');
-    const detachedThemeColorMeta = new MockElement('meta');
-    detachedThemeColorMeta.setAttribute('name', 'theme-color');
-    detachedThemeColorMeta.setAttribute('content', '#111520');
-    (env.documentMock as { querySelector: (s: string) => MockElement | null }).querySelector = (selector: string) => {
-      if (selector === 'meta[name="color-scheme"]') return colorSchemeMeta;
-      if (selector === 'meta[name="theme-color"]') return detachedThemeColorMeta;
-      return null;
-    };
-
-    const { setUiTheme, syncThemeChrome } = await import('../src/web/shared/theme.js');
-    setUiTheme('industrial');
-    assert.equal(colorSchemeMeta.getAttribute('content'), 'light');
-    assert.equal(detachedThemeColorMeta.getAttribute('content'), '#f7f4ed');
-
-    setUiTheme('spatial');
-    assert.equal(colorSchemeMeta.getAttribute('content'), 'dark');
-    assert.equal(detachedThemeColorMeta.getAttribute('content'), '#111520');
-
-    // Attached-in-head path with light+dark media theme-color metas (Android Dark/Light + iOS WebKit repaint)
-    const head = new MockElement('head');
+    colorSchemeMeta.setAttribute('content', 'dark light');
     const attachedLightMeta = new MockElement('meta');
     attachedLightMeta.setAttribute('name', 'theme-color');
     attachedLightMeta.setAttribute('media', '(prefers-color-scheme: light)');
@@ -1282,49 +1390,61 @@ test('setUiTheme keeps meta theme-color and color-scheme aligned with mobile sur
     attachedDarkMeta.setAttribute('name', 'theme-color');
     attachedDarkMeta.setAttribute('media', '(prefers-color-scheme: dark)');
     attachedDarkMeta.setAttribute('content', '#111520');
-    head.append(colorSchemeMeta, attachedLightMeta, attachedDarkMeta);
+    env.rootHead.append(colorSchemeMeta, attachedLightMeta, attachedDarkMeta);
 
+    let osPrefersLight = false;
     const mediaListeners: Array<() => void> = [];
     Object.assign(env.windowMock, {
-      matchMedia: () => ({
-        matches: true,
+      matchMedia: (query: string) => ({
+        matches: query.includes('prefers-color-scheme: light') ? osPrefersLight : false,
         addEventListener: (_type: string, fn: () => void) => { mediaListeners.push(fn); },
       }),
     });
-    const docMockWithAll = env.documentMock as unknown as {
-      querySelector: (s: string) => MockElement | null;
-      querySelectorAll: (s: string) => MockElement[];
-    };
-    docMockWithAll.querySelector = (selector: string) => {
-      if (selector === 'meta[name="color-scheme"]') return head.children.find(c => c.getAttribute('name') === 'color-scheme') ?? null;
-      if (selector === 'meta[name="theme-color"]') return head.children.find(c => c.getAttribute('name') === 'theme-color') ?? null;
-      return null;
-    };
-    docMockWithAll.querySelectorAll = (selector: string) => (
-      selector === 'meta[name="theme-color"]'
-        ? head.children.filter(c => c.getAttribute('name') === 'theme-color')
-        : []
-    );
 
+    const { getUiTheme, getUiThemePreference, setUiTheme, syncThemeChrome } = await import('../src/web/shared/theme.js');
+
+    // Switching to industrial updates primary meta in place, strips media attribute, and deduplicates legacy metas down to 1
     setUiTheme('industrial');
-    const industrialMetas = head.children.filter(c => c.getAttribute('name') === 'theme-color');
-    assert.equal(industrialMetas.length, 2);
-    assert.equal(industrialMetas.some(m => m === attachedLightMeta || m === attachedDarkMeta), false, 'attached theme-color metas must be replaced');
-    assert.equal(industrialMetas.find(m => m.getAttribute('media') === '(prefers-color-scheme: light)')?.getAttribute('content'), '#f7f4ed');
-    assert.equal(industrialMetas.find(m => m.getAttribute('media') === '(prefers-color-scheme: dark)')?.getAttribute('content'), '#f7f4ed');
+    assert.equal(getUiThemePreference(), 'industrial');
+    assert.equal(getUiTheme(), 'industrial');
+    assert.equal(env.documentMock.documentElement.dataset.theme, 'industrial');
+    assert.equal(env.documentMock.documentElement.dataset.themePref, 'industrial');
+    assert.equal(globalThis.localStorage.getItem('friday.ui-theme'), 'industrial');
+    assert.equal(colorSchemeMeta.getAttribute('content'), 'light');
+    const industrialMetas = env.rootHead.children.filter(c => c.getAttribute('name') === 'theme-color');
+    assert.equal(industrialMetas.length, 1, 'theme-color must converge to a single in-place meta element');
+    assert.equal(industrialMetas[0], attachedLightMeta, 'primary theme-color meta must be updated in place');
+    assert.equal(industrialMetas[0]!.getAttribute('content'), '#f7f4ed');
+    assert.equal(industrialMetas[0]!.getAttribute('media'), null);
 
-    // OS prefers-color-scheme change listener keeps active industrial theme synced
-    for (const fn of mediaListeners) fn();
-    const resyncedMetas = head.children.filter(c => c.getAttribute('name') === 'theme-color');
-    assert.equal(resyncedMetas.length, 2);
-    assert.ok(resyncedMetas.every(m => m.getAttribute('content') === '#f7f4ed'));
-
-    syncThemeChrome('spatial');
-    const spatialMetas = head.children.filter(c => c.getAttribute('name') === 'theme-color');
-    assert.equal(spatialMetas.length, 2);
-    assert.equal(spatialMetas.find(m => m.getAttribute('media') === '(prefers-color-scheme: light)')?.getAttribute('content'), '#111520');
-    assert.equal(spatialMetas.find(m => m.getAttribute('media') === '(prefers-color-scheme: dark)')?.getAttribute('content'), '#111520');
+    // Switching to spatial updates the same meta node in place
+    setUiTheme('spatial');
+    assert.equal(getUiThemePreference(), 'spatial');
+    assert.equal(getUiTheme(), 'spatial');
+    assert.equal(env.documentMock.documentElement.dataset.theme, 'spatial');
+    assert.equal(globalThis.localStorage.getItem('friday.ui-theme'), 'spatial');
     assert.equal(colorSchemeMeta.getAttribute('content'), 'dark');
+    assert.equal(attachedLightMeta.getAttribute('content'), '#111520');
+
+    // Switching to system removes localStorage override, sets color-scheme "light dark", and follows OS prefers-color-scheme changes
+    setUiTheme('system');
+    assert.equal(getUiThemePreference(), 'system');
+    assert.equal(globalThis.localStorage.getItem('friday.ui-theme'), null);
+    assert.equal(env.documentMock.documentElement.dataset.themePref, 'system');
+    assert.equal(env.documentMock.documentElement.dataset.theme, 'spatial');
+    assert.equal(colorSchemeMeta.getAttribute('content'), 'light dark');
+    assert.equal(attachedLightMeta.getAttribute('content'), '#111520');
+
+    osPrefersLight = true;
+    for (const fn of mediaListeners) fn();
+    assert.equal(getUiTheme(), 'industrial');
+    assert.equal(env.documentMock.documentElement.dataset.theme, 'industrial');
+    assert.equal(colorSchemeMeta.getAttribute('content'), 'light dark');
+    assert.equal(attachedLightMeta.getAttribute('content'), '#f7f4ed');
+
+    syncThemeChrome('spatial', 'spatial');
+    assert.equal(colorSchemeMeta.getAttribute('content'), 'dark');
+    assert.equal(attachedLightMeta.getAttribute('content'), '#111520');
   } finally {
     env.restore();
   }
@@ -1425,13 +1545,13 @@ test('initChatPanel auto-loads older history on scroll-to-top, skips programmati
     scrollEl.scrollTop = 50;
     panel.renderMessages();
     scrollEl.dispatchEvent({ type: 'scroll' });
-    await new Promise(resolve => setTimeout(resolve, 25));
+    await new Promise(resolve => setTimeout(resolve, 145));
     assert.equal(historyCalls.length, 0, 'programmatic scrollTop update during render must not auto-trigger /api/history');
 
-    // User scrolls up to 60px -> must auto-load /api/history and preserve scrollTop (+500px delta)
+    // User scrolls up to 60px -> onScrollEnd (>120ms debounce) auto-loads /api/history and preserves scrollTop (+500px delta)
     scrollEl.scrollTop = 60;
     scrollEl.dispatchEvent({ type: 'scroll' });
-    await new Promise(resolve => setTimeout(resolve, 25));
+    await new Promise(resolve => setTimeout(resolve, 145));
     assert.equal(historyCalls.length, 1);
     assert.equal(appState.messages.has('m-auto-10'), true);
     assert.equal(scrollEl.scrollTop, 560, 'scrollTop must shift by prepended content height (60 + 500)');
@@ -1442,7 +1562,7 @@ test('initChatPanel auto-loads older history on scroll-to-top, skips programmati
     historyMode = 'fail';
     scrollEl.scrollTop = 40;
     scrollEl.dispatchEvent({ type: 'scroll' });
-    await new Promise(resolve => setTimeout(resolve, 25));
+    await new Promise(resolve => setTimeout(resolve, 145));
     assert.equal(historyCalls.length, 2);
     assert.equal(olderBtn.textContent, '加载失败，点击重试');
     assert.match(historyErrorEl.textContent, /更早消息读取失败/);
@@ -1450,7 +1570,7 @@ test('initChatPanel auto-loads older history on scroll-to-top, skips programmati
     // Subsequent scroll near top while paused must NOT keep firing errors
     scrollEl.scrollTop = 20;
     scrollEl.dispatchEvent({ type: 'scroll' });
-    await new Promise(resolve => setTimeout(resolve, 25));
+    await new Promise(resolve => setTimeout(resolve, 145));
     assert.equal(historyCalls.length, 2, 'paused auto-load must wait for user scroll-away or manual click retry');
 
     // Manual retry via button click recovers
@@ -1461,6 +1581,145 @@ test('initChatPanel auto-loads older history on scroll-to-top, skips programmati
     assert.equal(olderBtn.textContent, '上滑自动加载更早消息');
     assert.equal(historyErrorEl.textContent, '');
   } finally {
+    env.restore();
+  }
+});
+
+test('memory-hub guards #memory-search-input Enter during IME composition (isComposing & keyCode 229)', async () => {
+  const env = createDomEnv();
+  const { appState, hooks } = await import('../src/web/state.js');
+  const savedAppState = {
+    ready: appState.ready,
+    authExpired: appState.authExpired,
+    view: appState.view,
+  };
+  const savedHooks = { ...hooks };
+  try {
+    appState.ready = true;
+    appState.authExpired = false;
+    appState.view = undefined;
+    Object.assign(hooks, {
+      connection: () => {},
+      closeAllHubModals: () => {},
+      refreshView: async () => {},
+    });
+
+    const requestedUrls: string[] = [];
+    env.assign('fetch', (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      requestedUrls.push(url);
+      return Promise.resolve(new Response('[]', { status: 200, headers: { 'content-type': 'application/json' } }));
+    });
+
+    const { initMemoryHub } = await import('../src/web/hubs/memory-hub.js');
+    initMemoryHub();
+
+    const searchInput = env.getOrCreateEl('memory-search-input');
+    searchInput.value = '架构规范';
+
+    const imeComposing = { type: 'keydown', key: 'Enter', isComposing: true, keyCode: 13, cancelable: true };
+    searchInput.dispatchEvent(imeComposing);
+    await new Promise(resolve => setTimeout(resolve, 15));
+    assert.equal(requestedUrls.length, 0, 'isComposing Enter must not submit memory search');
+
+    const safariImeConfirm = { type: 'keydown', key: 'Enter', isComposing: false, keyCode: 229, cancelable: true };
+    searchInput.dispatchEvent(safariImeConfirm);
+    await new Promise(resolve => setTimeout(resolve, 15));
+    assert.equal(requestedUrls.length, 0, 'Safari keyCode 229 Enter must not submit memory search');
+
+    const realEnter = { type: 'keydown', key: 'Enter', isComposing: false, keyCode: 13, cancelable: true };
+    searchInput.dispatchEvent(realEnter);
+    await new Promise(resolve => setTimeout(resolve, 15));
+    assert.equal(requestedUrls.length, 1);
+    assert.match(requestedUrls[0]!, /\/api\/memories\?query=/);
+  } finally {
+    env.windowMock.dispatchEvent({ type: 'pagehide' });
+    Object.assign(appState, savedAppState);
+    Object.assign(hooks, savedHooks);
+    env.restore();
+  }
+});
+
+test('notebook-hub flushes dirty note on pagehide with keepalive: true', async () => {
+  const env = createDomEnv();
+  const { appState, hooks } = await import('../src/web/state.js');
+  const savedAppState = {
+    ready: appState.ready,
+    authExpired: appState.authExpired,
+    view: appState.view,
+  };
+  const savedHooks = { ...hooks };
+  try {
+    appState.ready = true;
+    appState.authExpired = false;
+    appState.view = undefined;
+    Object.assign(hooks, {
+      connection: () => {},
+      closeAllHubModals: () => {},
+      refreshView: async () => {},
+    });
+
+    const noteSaveCalls: Array<{ url: string; init?: RequestInit }> = [];
+    env.assign('fetch', (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.startsWith('/api/notes')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          items: [{
+            id: 'n-keepalive',
+            title: 'Keepalive 测试',
+            content: '初始内容',
+            tags: [],
+            pinned: false,
+            author: 'user',
+            updatedBy: 'user',
+            createdAt: 100,
+            updatedAt: 100,
+          }],
+          tags: [],
+          summary: { noteCount: 1, pinnedNoteCount: 0, diaryCount: 0 },
+        }), { status: 200, headers: { 'content-type': 'application/json' } }));
+      }
+      if (url.endsWith('/api/note-save')) {
+        noteSaveCalls.push({ url, init });
+        return Promise.resolve(new Response(JSON.stringify({
+          note: {
+            id: 'n-keepalive',
+            title: 'Keepalive 测试',
+            content: '未保存草稿内容',
+            tags: [],
+            pinned: false,
+            author: 'user',
+            updatedBy: 'user',
+            createdAt: 100,
+            updatedAt: 200,
+          },
+          summary: { noteCount: 1, pinnedNoteCount: 0, diaryCount: 0 },
+        }), { status: 200, headers: { 'content-type': 'application/json' } }));
+      }
+      return Promise.resolve(new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+    });
+
+    const { initNotebookHub } = await import('../src/web/hubs/notebook-hub.js');
+    const nb = initNotebookHub();
+    nb.openModal('notes');
+    await new Promise(resolve => setTimeout(resolve, 25));
+
+    const contentInput = env.getOrCreateEl('note-content-input');
+    contentInput.value = '未保存草稿内容';
+    contentInput.dispatchEvent({ type: 'input' });
+
+    env.windowMock.dispatchEvent({ type: 'pagehide' });
+    await new Promise(resolve => setTimeout(resolve, 25));
+
+    assert.equal(noteSaveCalls.length, 1);
+    assert.equal(noteSaveCalls[0]!.init?.keepalive, true);
+    const savedPayload = JSON.parse(String(noteSaveCalls[0]!.init?.body ?? '{}')) as { id?: string; content?: string };
+    assert.equal(savedPayload.id, 'n-keepalive');
+    assert.equal(savedPayload.content, '未保存草稿内容');
+  } finally {
+    env.windowMock.dispatchEvent({ type: 'pagehide' });
+    Object.assign(appState, savedAppState);
+    Object.assign(hooks, savedHooks);
     env.restore();
   }
 });

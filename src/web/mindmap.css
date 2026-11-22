@@ -380,7 +380,7 @@ html[data-theme="industrial"] {
 
 @layer reset {
 * { box-sizing:border-box; }
-[hidden] { display:none!important; }
+[hidden]:not([hidden="until-found"]) { display:none!important; }
 }
 
 @layer base {
@@ -1266,10 +1266,13 @@ svg:focus-visible,
   height:100%;
   display:block;
   cursor:grab;
+  touch-action:none;
+  -webkit-user-select:none;
   user-select:none;
 }
 
-.mm-svg:active {
+.mm-svg:active,
+.mm-svg.dragging {
   cursor:grabbing;
 }
 
@@ -2512,6 +2515,16 @@ html[data-theme="spatial"] .fc-edge.fc-edge-loopback {
   height:0;
   overflow:hidden;
   pointer-events:none;
+}
+:is(.mm-copy-btn, .copy-mini-btn, .mm-mini-btn, button):is([data-copied], [data-copied="true"]) {
+  color:var(--st-ok-fg);
+  border-color:var(--st-ok-bd);
+  background:var(--st-ok-bg);
+}
+:is(.mm-copy-btn, .copy-mini-btn, .mm-mini-btn, button):is([data-failed], [data-failed="true"]) {
+  color:var(--st-err-fg);
+  border-color:var(--st-err-bd);
+  background:var(--st-err-bg);
 }
 @media (pointer: coarse) {
   .mm-mode-btn,

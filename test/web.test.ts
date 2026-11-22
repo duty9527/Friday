@@ -61,10 +61,38 @@ test('Web is authenticated, same-origin and loopback only with restrictive stati
     assert.match(f.base, /^http:\/\/127\.0\.0\.1:\d+$/);
     const page = await fetch(f.base);
     assert.equal(page.status, 200);
-    assert.match(page.headers.get('content-security-policy')!, /frame-ancestors 'none'/);
-    assert.match(page.headers.get('content-security-policy')!, /manifest-src 'self'/);
+    const pageCsp = page.headers.get('content-security-policy')!;
+    assert.match(pageCsp, /frame-ancestors 'none'/);
+    assert.match(pageCsp, /manifest-src 'self'/);
+    assert.match(pageCsp, /object-src 'none'/);
+    assert.match(pageCsp, /require-trusted-types-for 'script'/);
+    assert.match(pageCsp, /trusted-types 'none'/);
+    assert.equal(page.headers.get('x-frame-options'), 'DENY');
+    assert.match(page.headers.get('permissions-policy') ?? '', /camera=\(\)/);
+    assert.match(page.headers.get('permissions-policy') ?? '', /microphone=\(\)/);
     assert.equal(page.headers.get('referrer-policy'), 'no-referrer');
+    assert.equal(page.headers.get('cache-control'), 'no-cache');
+    assert.equal(page.headers.get('vary'), 'Accept-Encoding');
+    assert.match(page.headers.get('etag') ?? '', /^"[^"]+"$/);
     assert.doesNotMatch(await page.text(), new RegExp(f.home));
+    const brAsset = await raw(`${f.base}/style.css`, { host: new URL(f.base).host, 'accept-encoding': 'br, gzip' });
+    assert.equal(brAsset.status, 200);
+    assert.equal(brAsset.headers['content-encoding'], 'br');
+    assert.equal(brAsset.headers['cache-control'], 'no-cache');
+    assert.equal(brAsset.headers.vary, 'Accept-Encoding');
+    const brEtag = String(brAsset.headers.etag ?? '');
+    assert.match(brEtag, /^"[^"]+-br"$/);
+    const gzipAsset = await raw(`${f.base}/style.css`, { host: new URL(f.base).host, 'accept-encoding': 'gzip' });
+    assert.equal(gzipAsset.status, 200);
+    assert.equal(gzipAsset.headers['content-encoding'], 'gzip');
+    assert.notEqual(gzipAsset.headers.etag, brEtag);
+    const notModified = await raw(`${f.base}/style.css`, {
+      host: new URL(f.base).host,
+      'accept-encoding': 'br, gzip',
+      'if-none-match': brEtag,
+    });
+    assert.equal(notModified.status, 304);
+    assert.equal(notModified.text, '');
     for (const icon of [
       '/logo.png',
       '/favicon.ico',
@@ -96,6 +124,9 @@ test('Web is authenticated, same-origin and loopback only with restrictive stati
     const authorized = await fetch(`${f.base}/api/view`, { headers: f.headers });
     assert.equal(authorized.status, 200);
     assert.equal(authorized.headers.get('access-control-allow-origin'), null);
+    assert.equal(authorized.headers.get('cache-control'), 'no-store');
+    assert.equal(authorized.headers.get('x-frame-options'), 'DENY');
+    assert.match(authorized.headers.get('vary') ?? '', /Sec-Fetch-Dest.*Sec-Fetch-Mode.*Sec-Fetch-Site/);
     assert.equal((await fetch(`${f.base}/api/shutdown`, { method: 'POST', headers: f.headers, body: '{}' })).status, 404);
     assert.equal((await fetch(`${f.base}/api/chat`, { method: 'POST', headers: { authorization: f.headers.authorization }, body: '{}' })).status, 415);
     const huge = await fetch(`${f.base}/api/chat`, { method: 'POST', headers: f.headers, body: JSON.stringify({ text: 'x'.repeat(70000) }) });
@@ -524,7 +555,33 @@ test('Web console lazy-loads health-scale UI, serves redacted PluginView metadat
   try {
     const html = await (await fetch(f.base)).text();
     assert.match(html, /id="open-plugin-hub-top"/);
-    assert.match(html, /id="plugin-hub-modal"/);
+    assert.doesNotMatch(html, /id="open-notebook-hub-top"/, 'M5 notebook entry must be merged into M1');
+    assert.doesNotMatch(html, /id="notebook-hub-backdrop"/, 'legacy notebook backdrop must be removed');
+    assert.doesNotMatch(html, /id="plugin-hub-backdrop"/, 'legacy plugin backdrop must be removed');
+    assert.doesNotMatch(html, /id="plugin-hub-modal"/, 'legacy plugin modal must be replaced by native dialog');
+    for (const dialogId of [
+      'memory-hub-dialog',
+      'timer-hub-dialog',
+      'im-hub-dialog',
+      'plugin-hub-dialog',
+      'system-hub-dialog',
+      'app-confirm-dialog',
+    ]) {
+      assert.match(html, new RegExp(`<dialog[^>]+id="${dialogId}"[^>]+closedby="any"`), `${dialogId} must be a native <dialog closedby="any">`);
+    }
+    const m1Start = html.indexOf('<dialog id="memory-hub-dialog"');
+    const m1End = html.indexOf('</dialog>', m1Start);
+    assert.ok(m1Start >= 0 && m1End > m1Start);
+    const m1Html = html.slice(m1Start, m1End);
+    for (const marker of [
+      'id="memory-hub-tabs"',
+      'id="notebook-tab-notes"',
+      'id="notebook-tab-diary"',
+      'id="notebook-panel-notes"',
+      'id="notebook-panel-diary"',
+    ]) {
+      assert.ok(m1Html.includes(marker), `#memory-hub-dialog must contain ${marker}`);
+    }
     assert.match(html, /id="plugin-shell"/);
     assert.match(html, /id="plugin-sidebar"/);
     assert.match(html, /id="plugin-sidebar-toggle"/);
@@ -707,7 +764,7 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
     assert.equal(themeRes.status, 200);
     assert.match(themeRes.headers.get('content-type') ?? '', /javascript/);
     const themeJs = await themeRes.text();
-    for (const sym of ['getUiTheme', 'setUiTheme', 'bindThemeButtons', 'initDesktopDrawers', 'syncThemeChrome']) {
+    for (const sym of ['getUiTheme', 'getUiThemePreference', 'setUiTheme', 'bindThemeButtons', 'initDesktopDrawers', 'syncThemeChrome']) {
       assert.ok(themeJs.includes(sym), `shared/theme.js must export ${sym}`);
     }
     assert.doesNotMatch(themeJs, /\.style\./);
@@ -733,12 +790,14 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
 
     const indexHtml = await (await fetch(f.base)).text();
     assert.match(indexHtml, /<html[^>]+data-theme="spatial"/);
-    assert.match(indexHtml, /<meta\s+name="theme-color"\s+content="#111520"\s+media="\(prefers-color-scheme: light\)">/);
-    assert.match(indexHtml, /<meta\s+name="theme-color"\s+content="#111520"\s+media="\(prefers-color-scheme: dark\)">/);
+    assert.equal(indexHtml.match(/<meta\s+name="theme-color"[^>]*>/g)?.length, 1, 'index.html must contain a single theme-color meta tag');
+    assert.match(indexHtml, /<meta\s+name="theme-color"\s+content="#111520">/);
+    assert.match(indexHtml, /<meta\s+name="color-scheme"\s+content="dark light">/);
     assert.match(indexHtml, /<script\s+src="\/theme-boot\.js"><\/script>/);
     assert.match(indexHtml, /viewport-fit=cover/);
     assert.match(indexHtml, /interactive-widget=resizes-content/);
     for (const marker of [
+      'id="theme-system-btn"',
       'id="theme-spatial-btn"',
       'id="theme-industrial-btn"',
       'id="desktop-work-fold"',
@@ -777,10 +836,12 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
 
     const mindmapHtml = await (await fetch(`${f.base}/mindmap`)).text();
     assert.match(mindmapHtml, /<html[^>]+data-theme="spatial"/);
-    assert.match(mindmapHtml, /<meta\s+name="theme-color"\s+content="#111520"\s+media="\(prefers-color-scheme: light\)">/);
-    assert.match(mindmapHtml, /<meta\s+name="theme-color"\s+content="#111520"\s+media="\(prefers-color-scheme: dark\)">/);
+    assert.equal(mindmapHtml.match(/<meta\s+name="theme-color"[^>]*>/g)?.length, 1, 'mindmap.html must contain a single theme-color meta tag');
+    assert.match(mindmapHtml, /<meta\s+name="theme-color"\s+content="#111520">/);
+    assert.match(mindmapHtml, /<meta\s+name="color-scheme"\s+content="dark light">/);
     assert.match(mindmapHtml, /<script\s+src="\/theme-boot\.js"><\/script>/);
     assert.match(mindmapHtml, /viewport-fit=cover/);
+    assert.match(mindmapHtml, /id="mm-theme-system"/);
     assert.match(mindmapHtml, /id="mm-theme-spatial"/);
     assert.match(mindmapHtml, /id="mm-theme-industrial"/);
     assert.doesNotMatch(mindmapHtml, /black-translucent/);
@@ -802,6 +863,7 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
       'var(--surface-solid)',
       'html[data-theme="industrial"]',
       'visibility:hidden',
+      '[hidden]:not([hidden="until-found"])',
     ]) {
       assert.ok(styleCss.includes(marker), `style.css must include ${marker}`);
     }
@@ -811,7 +873,18 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
     const mindmapCss = await (await fetch(`${f.base}/mindmap.css`)).text();
     assert.ok(mindmapCss.includes('html[data-theme="spatial"]'));
     assert.ok(mindmapCss.includes('html[data-theme="industrial"]'));
-    for (const marker of ['--safe-top', '--safe-bottom', '.safe-area-probe', 'ios-standalone-clipped']) {
+    for (const marker of [
+      '--safe-top',
+      '--safe-bottom',
+      '.safe-area-probe',
+      'ios-standalone-clipped',
+      '[hidden]:not([hidden="until-found"])',
+      'touch-action:none',
+      '-webkit-user-select:none',
+      '.mm-svg.dragging',
+      '[data-copied="true"]',
+      '[data-failed="true"]',
+    ]) {
       assert.ok(mindmapCss.includes(marker), `mindmap.css must include ${marker}`);
     }
     assert.doesNotMatch(mindmapCss, /ios-standalone-short-/);

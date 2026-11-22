@@ -427,12 +427,23 @@ test('Daemon RPC, Web REST API (with 409 conflict & promote-to-memory), CLI, and
       const token = new URLSearchParams(entry.hash.slice(1)).get('token')!;
       const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
 
-      // 1. Static HTML & JS asset hygiene
+      // 1. Static HTML & JS asset hygiene (M1 merged into #memory-hub-dialog; standalone M5 removed)
       const html = await (await fetch(base)).text();
-      assert.ok(html.includes('id="open-notebook-hub-top"'));
-      assert.ok(html.includes('id="notebook-hub-backdrop"'));
-      assert.ok(html.includes('id="notebook-tab-notes"'));
-      assert.ok(html.includes('id="notebook-tab-diary"'));
+      assert.equal(html.includes('id="open-notebook-hub-top"'), false);
+      assert.equal(html.includes('id="notebook-hub-backdrop"'), false);
+      const m1Start = html.indexOf('<dialog id="memory-hub-dialog"');
+      const m1End = html.indexOf('</dialog>', m1Start);
+      assert.ok(m1Start >= 0 && m1End > m1Start, 'index.html must define native #memory-hub-dialog');
+      const m1Html = html.slice(m1Start, m1End);
+      for (const marker of [
+        'id="memory-hub-tabs"',
+        'id="notebook-tab-notes"',
+        'id="notebook-tab-diary"',
+        'id="notebook-panel-notes"',
+        'id="notebook-panel-diary"',
+      ]) {
+        assert.ok(m1Html.includes(marker), `#memory-hub-dialog must contain ${marker}`);
+      }
       assert.doesNotMatch(html, /\sstyle="/i);
 
       const hubJsRes = await fetch(`${base}/hubs/notebook-hub.js`);

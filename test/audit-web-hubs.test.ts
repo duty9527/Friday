@@ -342,9 +342,15 @@ function matchesSimpleSelector(el: FakeElement, selector: string): boolean {
 }
 
 function matchesSingleCompound(el: FakeElement, compound: string): boolean {
-  const attrMatches = [...compound.matchAll(/\[([^\]=]+)(?:="([^"]*)")?\]/g)];
-  const stripped = compound.replace(/\[[^\]]+\]/g, '');
-  const dotParts = stripped.split('.');
+  const needsPopoverOpen = compound.includes(':popover-open');
+  if (needsPopoverOpen && !el.isPopoverOpen) return false;
+  const withoutPseudo = compound.replace(/:popover-open/g, '');
+  const attrMatches = [...withoutPseudo.matchAll(/\[([^\]=]+)(?:="([^"]*)")?\]/g)];
+  const stripped = withoutPseudo.replace(/\[[^\]]+\]/g, '');
+  const idMatch = stripped.match(/#([^\s.#]+)/);
+  if (idMatch && el.id !== idMatch[1]) return false;
+  const withoutId = stripped.replace(/#[^\s.#]+/g, '');
+  const dotParts = withoutId.split('.');
   const tagPart = dotParts[0]?.trim();
   const classParts = dotParts.slice(1).filter(Boolean);
 
@@ -376,10 +382,15 @@ class FakeElement extends FakeNode {
   private _selected = false;
   private _rect = { left: 0, top: 0, width: 0, height: 0 };
   private _scrollCount = 0;
+  private _popoverOpen = false;
 
   hidden = false;
   disabled = false;
   open = false;
+  returnValue = '';
+  closedBy = '';
+  inert = false;
+  popover: string | null = null;
   checked = false;
   type = '';
   src = '';
@@ -394,6 +405,10 @@ class FakeElement extends FakeNode {
   selectionStart = 0;
   selectionEnd = 0;
   max = '';
+
+  get isPopoverOpen(): boolean {
+    return this._popoverOpen;
+  }
 
   constructor(tagName: string, doc: FakeDocument) {
     super();
@@ -499,6 +514,12 @@ class FakeElement extends FakeNode {
       this.disabled = true;
     } else if (lower === 'open') {
       this.open = true;
+    } else if (lower === 'inert') {
+      this.inert = true;
+    } else if (lower === 'closedby') {
+      this.closedBy = str;
+    } else if (lower === 'popover') {
+      this.popover = str;
     } else if (lower === 'checked') {
       this.checked = true;
     } else if (lower === 'type') {
@@ -522,6 +543,8 @@ class FakeElement extends FakeNode {
     const lower = name.toLowerCase();
     if (lower === 'hidden') return this.hidden ? '' : null;
     if (lower === 'disabled') return this.disabled ? '' : null;
+    if (lower === 'open') return this.open ? '' : null;
+    if (lower === 'inert') return this.inert ? '' : null;
     if (lower === 'class') return this._className || null;
     if (lower === 'src') return this.src || null;
     if (lower === 'href') return this.href || null;
@@ -533,6 +556,9 @@ class FakeElement extends FakeNode {
     this.attrs.delete(lower);
     if (lower === 'hidden') this.hidden = false;
     else if (lower === 'disabled') this.disabled = false;
+    else if (lower === 'open') this.open = false;
+    else if (lower === 'inert') this.inert = false;
+    else if (lower === 'popover') this.popover = null;
     else if (lower === 'src') this.src = '';
     else if (lower === 'href') this.href = '';
   }
@@ -614,9 +640,63 @@ class FakeElement extends FakeNode {
     return !ev.defaultPrevented;
   }
 
+  showModal(): void {
+    this.hidden = false;
+    this.open = true;
+    this.setAttribute('open', '');
+  }
+
+  close(returnValue?: string): void {
+    if (returnValue !== undefined) this.returnValue = returnValue;
+    const wasOpen = this.open;
+    this.open = false;
+    this.removeAttribute('open');
+    if (wasOpen) {
+      this.dispatchEvent(new FakeEvent('close'));
+    }
+  }
+
+  showPopover(): void {
+    this.hidden = false;
+    this._popoverOpen = true;
+    this.dispatchEvent(new FakeEvent('toggle', { newState: 'open', oldState: 'closed' }));
+  }
+
+  hidePopover(): void {
+    const wasOpen = this._popoverOpen;
+    this._popoverOpen = false;
+    if (wasOpen) {
+      this.dispatchEvent(new FakeEvent('toggle', { newState: 'closed', oldState: 'open' }));
+    }
+  }
+
+  togglePopover(force?: boolean): boolean {
+    const next = force !== undefined ? force : !this._popoverOpen;
+    if (next) this.showPopover();
+    else this.hidePopover();
+    return next;
+  }
+
+  requestSubmit(submitter?: FakeElement): void {
+    if (this.tagName !== 'FORM') return;
+    const ev = new FakeEvent('submit', { submitter: submitter ?? null });
+    const allowed = this.dispatchEvent(ev);
+    if (allowed && this.getAttribute('method')?.toLowerCase() === 'dialog') {
+      const dlg = this.closest('dialog');
+      if (dlg) {
+        const rv = submitter?.getAttribute('value') ?? submitter?.value;
+        dlg.close(rv !== null && rv !== undefined ? rv : undefined);
+      }
+    }
+  }
+
   click(): void {
     if (this.disabled) return;
-    this.dispatchEvent(new FakeEvent('click'));
+    const allowed = this.dispatchEvent(new FakeEvent('click'));
+    if (allowed && this.tagName === 'BUTTON' && (!this.type || this.type === 'submit')) {
+      const form = this.closest('form');
+      if (form) form.requestSubmit(this);
+    }
   }
 
   focus(): void {
@@ -803,6 +883,7 @@ interface HarnessContext {
   doc: FakeDocument;
   winListeners: Map<string, Set<(ev: FakeEvent) => void>>;
   dispatchWindowEvent: (type: string, init?: Record<string, unknown>) => void;
+  triggerResizeObservers: () => void;
   setFetchHandler: (fn: (url: string, init?: RequestInit) => Promise<Response>) => void;
   setClipboardImpl: (fn: (text: string) => Promise<void>) => void;
   setPromptImpl: (fn: (msg?: string, def?: string) => string | null) => void;
@@ -850,6 +931,7 @@ async function withWebHarness(run: (ctx: HarnessContext) => Promise<void>): Prom
   const origSessionStorage = g.sessionStorage;
   const origMatchMedia = g.matchMedia;
   const origMutationObserver = g.MutationObserver;
+  const origResizeObserver = g.ResizeObserver;
   const origBroadcastChannel = g.BroadcastChannel;
   const origSetInterval = globalThis.setInterval;
   const origClearInterval = globalThis.clearInterval;
@@ -881,6 +963,30 @@ async function withWebHarness(run: (ctx: HarnessContext) => Promise<void>): Prom
   class MockMutationObserver {
     observe() {}
     disconnect() {}
+  }
+  const activeResizeObservers = new Set<MockResizeObserver>();
+  class MockResizeObserver {
+    private readonly cb: (entries: unknown[], observer: MockResizeObserver) => void;
+    private readonly targets = new Set<FakeElement>();
+    constructor(cb: (entries: unknown[], observer: MockResizeObserver) => void) {
+      this.cb = cb;
+      activeResizeObservers.add(this);
+    }
+    observe(target: FakeElement) {
+      this.targets.add(target);
+    }
+    unobserve(target: FakeElement) {
+      this.targets.delete(target);
+    }
+    disconnect() {
+      this.targets.clear();
+      activeResizeObservers.delete(this);
+    }
+    trigger() {
+      if (this.targets.size === 0) return;
+      const entries = [...this.targets].map(target => ({ target, contentRect: target.getBoundingClientRect() }));
+      this.cb(entries, this);
+    }
   }
 
   const fakeLocation = {
@@ -951,6 +1057,7 @@ async function withWebHarness(run: (ctx: HarnessContext) => Promise<void>): Prom
   g.sessionStorage = fakeSessionStorage;
   g.Event = FakeEvent;
   g.MutationObserver = MockMutationObserver;
+  g.ResizeObserver = MockResizeObserver;
   g.BroadcastChannel = undefined;
   g.matchMedia = () => ({
     matches: false,
@@ -1003,6 +1110,9 @@ async function withWebHarness(run: (ctx: HarnessContext) => Promise<void>): Prom
   const dispatchWindowEvent = (type: string, init: Record<string, unknown> = {}) => {
     fakeWindow.dispatchEvent(new FakeEvent(type, init));
   };
+  const triggerResizeObservers = () => {
+    for (const obs of [...activeResizeObservers]) obs.trigger();
+  };
 
   try {
     await run({
@@ -1010,6 +1120,7 @@ async function withWebHarness(run: (ctx: HarnessContext) => Promise<void>): Prom
       doc,
       winListeners,
       dispatchWindowEvent,
+      triggerResizeObservers,
       setFetchHandler: fn => { fetchHandler = fn; },
       setClipboardImpl: fn => { clipboardImpl = fn; },
       setPromptImpl: fn => { promptImpl = fn; },
@@ -1019,6 +1130,7 @@ async function withWebHarness(run: (ctx: HarnessContext) => Promise<void>): Prom
   } finally {
     // Trigger pagehide so hubs clean up BroadcastChannel / timers cleanly before teardown.
     dispatchWindowEvent('pagehide');
+    activeResizeObservers.clear();
     for (const id of trackedIntervals) {
       origClearInterval(id);
     }
@@ -1042,6 +1154,7 @@ async function withWebHarness(run: (ctx: HarnessContext) => Promise<void>): Prom
     g.sessionStorage = origSessionStorage;
     g.matchMedia = origMatchMedia;
     g.MutationObserver = origMutationObserver;
+    g.ResizeObserver = origResizeObserver;
     g.BroadcastChannel = origBroadcastChannel;
     Object.assign(mods.appState, savedAppState);
     Object.assign(mods.hooks, savedHooks);
@@ -1514,6 +1627,11 @@ test('notebook-hub serializes overlapping saves, preserves mid-flight edits, and
     const nb = initNotebookHub();
     nb.openModal('notes');
     await flushMicrotasks();
+    assert.equal(ctx.doc.getElementById('open-notebook-hub-top'), null);
+    assert.equal(ctx.doc.getElementById('notebook-hub-backdrop'), null);
+    assert.equal(ctx.doc.getElementById('memory-hub-dialog')!.open, true);
+    assert.equal(ctx.doc.getElementById('notebook-panel-notes')!.hidden, false);
+    assert.equal(ctx.doc.getElementById('notebook-panel-diary')!.hidden, true);
 
     // Type edit 1 and trigger Save Now -> blocks on save1Deferred.
     const contentEl = ctx.doc.getElementById('note-content-input')!;
@@ -1595,10 +1713,33 @@ test('timer-plugin-hub keeps run/save buttons disabled on authExpired and cleans
     assert.ok(detailBtns.length > 0);
     assert.ok(detailBtns.every(b => b.disabled === true));
 
+    // Strict M1~M4 + SYS native <dialog closedby="any"> contract & clean close state.
+    assert.equal(ctx.doc.getElementById('plugin-hub-backdrop'), null);
+    assert.equal(ctx.doc.getElementById('open-notebook-hub-top'), null);
+    assert.equal(ctx.doc.getElementById('notebook-hub-backdrop'), null);
+    for (const dialogId of [
+      'memory-hub-dialog',
+      'timer-hub-dialog',
+      'im-hub-dialog',
+      'plugin-hub-dialog',
+      'system-hub-dialog',
+      'app-confirm-dialog',
+    ]) {
+      const dlg = ctx.doc.getElementById(dialogId)!;
+      assert.equal(dlg.tagName, 'DIALOG');
+      assert.equal(dlg.getAttribute('closedby'), 'any');
+    }
+    const memoryDialog = ctx.doc.getElementById('memory-hub-dialog')!;
+    for (const childId of ['memory-hub-tabs', 'notebook-tab-notes', 'notebook-tab-diary', 'notebook-panel-notes', 'notebook-panel-diary']) {
+      assert.ok(memoryDialog.contains(ctx.doc.getElementById(childId)!), `#memory-hub-dialog must contain #${childId}`);
+    }
+    const pluginDialog = ctx.doc.getElementById('plugin-hub-dialog')!;
+    assert.equal(pluginDialog.open, true);
+
     // Safe when document.elementFromPoint is unavailable + close resets state cleanly.
     ctx.doc.elementFromPointImpl = undefined;
     hub.closePluginModal();
-    assert.equal(ctx.doc.getElementById('plugin-hub-backdrop')!.hidden, true);
+    assert.equal(pluginDialog.open, false);
   });
 });
 
@@ -1656,9 +1797,23 @@ test('apple-devices-ui preserves logout/config status messages and prevents stal
     await flushMicrotasks();
     assert.notEqual(ctx.doc.getElementById('apple-top-badge')!.textContent, '12%');
 
-    // Logout must preserve logout message rather than overwriting with "已加载本地缓存快照".
+    // Logout is gated by #app-confirm-dialog: cancel leaves session intact; confirm executes & preserves logout banner.
+    const statusBeforeLogout = ctx.doc.getElementById('apple-action-status')!.textContent;
     ctx.doc.getElementById('apple-logout-btn')!.click();
     await flushMicrotasks();
+    const confirmDialog = ctx.doc.getElementById('app-confirm-dialog')!;
+    assert.equal(confirmDialog.open, true);
+    ctx.doc.getElementById('app-confirm-cancel-btn')!.click();
+    await flushMicrotasks();
+    assert.equal(confirmDialog.open, false);
+    assert.equal(ctx.doc.getElementById('apple-action-status')!.textContent, statusBeforeLogout);
+
+    ctx.doc.getElementById('apple-logout-btn')!.click();
+    await flushMicrotasks();
+    assert.equal(confirmDialog.open, true);
+    ctx.doc.getElementById('app-confirm-ok-btn')!.click();
+    await flushMicrotasks();
+    assert.equal(confirmDialog.open, false);
     assert.equal(ctx.doc.getElementById('apple-action-status')!.textContent, '已退出当前 Apple ID 会话');
 
     // Save config must preserve config save message rather than clearing banner.
@@ -1903,10 +2058,14 @@ test('ninebot-ui, fund-tracker-ui, and health-scale-ui avoid canvas DPR width ex
     const ninebot = initNinebotUi({ isVisible: () => true });
     ninebot.activate();
     await flushMicrotasks();
-    // Width must stay 520 * dpr(2) = 1040 across repeated resizes, NOT 1040 * 2 = 2080 -> 4160!
+    // Width must stay 520 * dpr(2) = 1040 across repeated ResizeObserver / resize events, NOT 1040 * 2 = 2080 -> 4160!
     assert.equal(ninebotCanvas.width, 1040);
+    ctx.triggerResizeObservers();
     ctx.dispatchWindowEvent('resize');
+    await new Promise(resolve => setTimeout(resolve, 15));
+    ctx.triggerResizeObservers();
     ctx.dispatchWindowEvent('resize');
+    await new Promise(resolve => setTimeout(resolve, 15));
     assert.equal(ninebotCanvas.width, 1040);
     ninebot.deactivate();
 
@@ -1997,8 +2156,12 @@ test('ninebot-ui, fund-tracker-ui, and health-scale-ui avoid canvas DPR width ex
     health.activate();
     await flushMicrotasks();
     assert.equal(healthCanvas.width, 1800);
+    ctx.triggerResizeObservers();
     ctx.dispatchWindowEvent('resize');
+    await new Promise(resolve => setTimeout(resolve, 15));
+    ctx.triggerResizeObservers();
     ctx.dispatchWindowEvent('resize');
+    await new Promise(resolve => setTimeout(resolve, 15));
     assert.equal(healthCanvas.width, 1800);
     health.deactivate();
   });
@@ -2085,11 +2248,25 @@ test('netlea-ui catches refreshAfterMutation errors, protects busy banner, shift
     netlea.activate();
     await flushMicrotasks();
 
-    // Deleting trip 0 while editing trip 1 must shift editingTripIndex to 0 so applying overwrites T1 instead of appending.
+    // Deleting trip 0 is gated by #app-confirm-dialog; cancel leaves 2 trips intact, confirm shifts editingTripIndex to 0 so applying overwrites T1.
     const editButtons = ctx.doc.getElementById('netlea-trip-list')!.querySelectorAll('button').filter(b => b.textContent.includes('编辑'));
     editButtons[1]!.click();
     const deleteButtons = ctx.doc.getElementById('netlea-trip-list')!.querySelectorAll('button').filter(b => b.textContent.includes('删除'));
+    const confirmDialog = ctx.doc.getElementById('app-confirm-dialog')!;
     deleteButtons[0]!.click();
+    await flushMicrotasks();
+    assert.equal(confirmDialog.open, true);
+    ctx.doc.getElementById('app-confirm-cancel-btn')!.click();
+    await flushMicrotasks();
+    assert.equal(ctx.doc.getElementById('netlea-trip-list')!.querySelectorAll('.netlea-trip-card').length, 2);
+
+    const deleteButtonsAfterCancel = ctx.doc.getElementById('netlea-trip-list')!.querySelectorAll('button').filter(b => b.textContent.includes('删除'));
+    deleteButtonsAfterCancel[0]!.click();
+    await flushMicrotasks();
+    assert.equal(confirmDialog.open, true);
+    ctx.doc.getElementById('app-confirm-ok-btn')!.click();
+    await flushMicrotasks();
+    assert.equal(confirmDialog.open, false);
     ctx.doc.getElementById('netlea-trip-apply-btn')!.click();
     assert.equal(ctx.doc.getElementById('netlea-trip-list')!.querySelectorAll('.netlea-trip-card').length, 1);
 

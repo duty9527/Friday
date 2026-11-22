@@ -145,17 +145,27 @@ function isSidebarDrawerViewport(): boolean {
 
 function runWithViewTransition(updateDom: () => void, afterFinish?: () => void): void {
   const docWithVt = typeof document !== 'undefined'
-    ? (document as Document & { startViewTransition?: (cb: () => void) => { finished?: Promise<void> } })
+    ? (document as Document & {
+        startViewTransition?: (cb: () => void) => {
+          ready?: Promise<void>;
+          updateCallbackDone?: Promise<void>;
+          finished?: Promise<void>;
+        };
+      })
     : undefined;
   if (docWithVt && typeof docWithVt.startViewTransition === 'function' && !prefersReducedMotion()) {
     try {
       const vt = docWithVt.startViewTransition(updateDom);
-      if (afterFinish) {
-        if (vt?.finished && typeof vt.finished.then === 'function') {
-          void vt.finished.then(afterFinish, afterFinish);
-        } else {
-          afterFinish();
-        }
+      if (vt?.ready && typeof vt.ready.catch === 'function') {
+        void vt.ready.catch(() => {});
+      }
+      if (vt?.updateCallbackDone && typeof vt.updateCallbackDone.catch === 'function') {
+        void vt.updateCallbackDone.catch(() => {});
+      }
+      if (vt?.finished && typeof vt.finished.then === 'function') {
+        void (afterFinish ? vt.finished.then(afterFinish, afterFinish) : vt.finished.catch(() => {}));
+      } else {
+        afterFinish?.();
       }
       return;
     } catch {

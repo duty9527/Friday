@@ -258,7 +258,7 @@ html.theme-transitioning .health-chart-shell {
 * {
   box-sizing:border-box;
 }
-[hidden] {
+[hidden]:not([hidden="until-found"]) {
   display:none!important;
 }
 search {
@@ -539,7 +539,7 @@ label {
 .error:empty {
   display:none;
 }
-[hidden] {
+[hidden]:not([hidden="until-found"]) {
   display:none!important;
 }
 

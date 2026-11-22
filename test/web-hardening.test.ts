@@ -830,3 +830,51 @@ test('src/web and dist/web uphold zero inline styles and light-theme WCAG contra
     assert.doesNotMatch(content, /\.innerHTML/, `${file} must not use .innerHTML`);
   }
 });
+
+test('Static assets & API routes enforce Trusted Types CSP, security headers, compression, ETag/304, and Cache-Control split', async () => {
+  const f = await fixture();
+  try {
+    const host = new URL(f.base).host;
+    const htmlRes = await rawHttp(`${f.base}/`, { host, 'accept-encoding': 'identity' });
+    assert.equal(htmlRes.status, 200);
+    const csp = String(htmlRes.headers['content-security-policy'] ?? '');
+    assert.match(csp, /require-trusted-types-for 'script'/);
+    assert.match(csp, /trusted-types 'none'/);
+    assert.match(csp, /object-src 'none'/);
+    assert.equal(htmlRes.headers['x-frame-options'], 'DENY');
+    assert.match(String(htmlRes.headers['permissions-policy'] ?? ''), /camera=\(\)/);
+    assert.match(String(htmlRes.headers['permissions-policy'] ?? ''), /geolocation=\(\)/);
+    assert.equal(htmlRes.headers['cache-control'], 'no-cache');
+    assert.equal(htmlRes.headers.vary, 'Accept-Encoding');
+    const idEtag = String(htmlRes.headers.etag ?? '');
+    assert.match(idEtag, /^"[^"]+"$/);
+
+    const brRes = await rawHttp(`${f.base}/`, { host, 'accept-encoding': 'br, gzip' });
+    assert.equal(brRes.status, 200);
+    assert.equal(brRes.headers['content-encoding'], 'br');
+    assert.notEqual(brRes.headers.etag, idEtag);
+
+    const gzRes = await rawHttp(`${f.base}/`, { host, 'accept-encoding': 'gzip' });
+    assert.equal(gzRes.status, 200);
+    assert.equal(gzRes.headers['content-encoding'], 'gzip');
+    assert.notEqual(gzRes.headers.etag, idEtag);
+    assert.notEqual(gzRes.headers.etag, brRes.headers.etag);
+
+    const revalRes = await rawHttp(`${f.base}/`, { host, 'accept-encoding': 'br', 'if-none-match': String(brRes.headers.etag) });
+    assert.equal(revalRes.status, 304);
+    assert.equal(revalRes.text, '');
+
+    const fontRes = await rawHttp(`${f.base}/plex-sans.woff2`, { host, 'accept-encoding': 'identity' });
+    assert.equal(fontRes.status, 200);
+    assert.equal(fontRes.headers['cache-control'], 'public, max-age=604800');
+
+    const apiRes = await rawHttp(`${f.base}/api/view`, { host, authorization: f.headers.authorization });
+    assert.equal(apiRes.status, 200);
+    assert.equal(apiRes.headers['cache-control'], 'no-store');
+    assert.equal(apiRes.headers['x-frame-options'], 'DENY');
+    assert.match(String(apiRes.headers['permissions-policy'] ?? ''), /microphone=\(\)/);
+    assert.equal(apiRes.headers.vary, 'Sec-Fetch-Dest, Sec-Fetch-Mode, Sec-Fetch-Site');
+  } finally {
+    await f.close();
+  }
+});

@@ -142,8 +142,33 @@ try {
   assert.equal(await page.eval('location.hash'), '', 'the token fragment is cleared from the address bar');
   assert.equal(await page.eval("document.querySelector('input[type=file]') === null"), true, 'no upload control exists');
   assert.doesNotMatch(await page.eval('document.body.innerText'), /新建对话|切换会话/);
+  assert.doesNotMatch(await page.eval("document.querySelector('meta[name=\"viewport\"]')?.getAttribute('content') ?? ''"), /maximum-scale\s*=\s*1/i, 'viewport meta must not set maximum-scale=1');
+  assert.equal(await page.eval("document.querySelectorAll('h1').length"), 1, 'page must have a single <h1>');
+  assert.equal(await page.eval("document.querySelector('.skip-link')?.getAttribute('href')"), '#main-content', '.skip-link must target #main-content');
+  assert.equal(await page.eval("document.querySelector('#open-notebook-hub-top') === null"), true, 'M5 standalone #open-notebook-hub-top must not exist');
+  assert.equal(await page.eval("document.querySelector('#notebook-hub-backdrop') === null"), true, 'legacy #notebook-hub-backdrop must not exist');
+  assert.equal(await page.eval("['#open-memory-hub-top','#open-timer-hub-top','#open-plugin-hub-top','#open-im-hub-top','#open-system-hub-top'].every(s => document.querySelector(s) !== null)"), true, 'strict M1~M4 + SYS topbar hubs must exist');
+  assert.equal(await page.eval("document.querySelector('.trace-tabs')?.getAttribute('role')"), 'group', '.trace-tabs filter bar must have role="group"');
   await page.screenshot({ path: `${outDir}/empty-desktop.jpg`, quality: 85 });
-  checks.push('authenticated empty screen, fragment removal, no session manager or upload control');
+  checks.push('authenticated empty screen, fragment removal, accessibility landmarks, strict M1~M4+SYS topbar, and no session manager or upload control');
+
+  // Verify M1 native <dialog closedby="any"> + merged Notes/Diary roving tablist + Escape focus restoration
+  await page.eval(() => {
+    const trigger = document.querySelector('#open-memory-hub-top');
+    trigger?.focus();
+    trigger?.click();
+  });
+  await until(() => page.eval("document.querySelector('#memory-hub-dialog')?.open === true"), 'M1 memory-hub dialog opens');
+  assert.equal(await page.eval("document.querySelector('#memory-tab-matrix')?.getAttribute('aria-selected')"), 'true');
+  await page.eval(() => document.querySelector('#memory-tab-matrix')?.focus());
+  await page.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'ArrowRight', code: 'ArrowRight', windowsVirtualKeyCode: 39 });
+  await until(() => page.eval("document.querySelector('#notebook-tab-notes')?.getAttribute('aria-selected') === 'true' && document.querySelector('#notebook-panel-notes')?.hidden === false"), 'ArrowRight switches M1 to Notes tab');
+  await page.eval(() => document.querySelector('#notebook-tab-diary')?.click());
+  await until(() => page.eval("document.querySelector('#notebook-tab-diary')?.getAttribute('aria-selected') === 'true' && document.querySelector('#notebook-panel-diary')?.hidden === false"), 'click switches M1 to Diary tab');
+  await page.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+  await until(() => page.eval("document.querySelector('#memory-hub-dialog')?.open === false"), 'M1 memory-hub dialog closes on Escape');
+  assert.equal(await page.eval("document.activeElement?.id"), 'open-memory-hub-top', 'Escape on M1 dialog must restore focus to #open-memory-hub-top');
+  checks.push('M1 native dialog opens, switches to Notes (keyboard ArrowRight) & Diary (click), closes via Escape, and restores focus');
 
   const before = await count();
   await fill('我们始终在同一个对话中');
@@ -151,7 +176,7 @@ try {
   await sleep(250);
   assert.equal(await count(), before, 'an IME composition Enter must not send');
   await pressEnter();
-  await until(() => page.eval("[...document.querySelectorAll('#messages .router-message .message-text')].some(x => x.innerText.includes('我们始终在同一个对话中'))"), 'ordinary reply');
+  await until(() => page.eval("[...document.querySelectorAll('#messages .router-message .message-text')].some(x => x.textContent.includes('我们始终在同一个对话中'))"), 'ordinary reply');
   await until(() => page.eval("document.querySelector('#trace-scope').innerText.includes('我们始终在同一个对话中')"), 'the process follows the newest round');
   checks.push('ordinary conversation without files, IME Enter suppressed, process follows the newest round');
 
@@ -179,7 +204,7 @@ try {
 
   await fill('<img src=x onerror="window.__xss=1">');
   await pressEnter();
-  await until(() => page.eval("[...document.querySelectorAll('#messages .router-message .message-text')].some(x => x.innerText.includes('onerror'))"), 'literal reply');
+  await until(() => page.eval("[...document.querySelectorAll('#messages .router-message .message-text')].some(x => x.textContent.includes('onerror'))"), 'literal reply');
   assert.equal(await page.eval('window.__xss'), undefined, 'model/user text is never executed');
   assert.equal(await page.eval("document.querySelectorAll('#messages img').length"), 0);
   checks.push('user and model text is rendered as text, never as HTML');
@@ -201,7 +226,7 @@ try {
   }
   await until(() => page.eval(`document.querySelectorAll('#messages .user-message').length === ${usersBefore + 1}`), 'the submitted task message');
   await until(() => page.eval("document.querySelectorAll('.work-row').length > 0"), 'background work');
-  await until(() => page.eval("[...document.querySelectorAll('.work-row')].some(x => x.innerText.includes('已完成'))"), 'work completion');
+  await until(() => page.eval("[...document.querySelectorAll('.work-row')].some(x => x.textContent.includes('已完成'))"), 'work completion');
 
   // Collapse the right drawer first to verify clicking a task auto-opens it
   await page.eval(() => document.querySelector('#desktop-trace-fold')?.click());
@@ -258,7 +283,7 @@ try {
   if (sample) {
     assert.ok(chainSnapshot.cards.some(c => c.classes.includes('cat-tool') && c.title.includes('读取文件副本')), 'chain contains tool execution node');
   }
-  assert.match(await page.eval("document.querySelector('#messages').innerText"), /新建工作/);
+  assert.match(await page.eval("document.querySelector('#messages').textContent"), /新建工作/);
   checks.push('auto-opened drawer, task overview card, chronological execution chain with offsets and SVG waterfalls');
 
   // Verify direction / category filters
@@ -293,7 +318,7 @@ try {
   }
 
   await page.eval(() => document.querySelector('#trace-content .chain-card.cat-llm')?.click());
-  await until(() => page.eval("document.querySelector('#event-detail').hidden === false && document.querySelector('#event-detail').innerText.includes('模型与 Token 消耗')"), 'LLM inspector rendered');
+  await until(() => page.eval("document.querySelector('#event-detail').hidden === false && /模型与\\s*token\\s*消耗/i.test(document.querySelector('#event-detail').innerText)"), 'LLM inspector rendered');
   const llmInspector = await page.eval(() => ({
     text: document.querySelector('#event-detail')?.innerText ?? '',
     hasDecisionBtn: Boolean(document.querySelector('#event-detail .tool-decision-btn:not(:disabled)')),
@@ -306,23 +331,22 @@ try {
   }
   // Test wide toggle and inspector close button
   await page.eval(() => document.querySelector('#trace-wide-toggle')?.click());
-  assert.equal(await page.eval("document.querySelector('#panels').classList.contains('trace-wide')"), true, 'wide toggle expands studio');
+  await until(() => page.eval("document.querySelector('#panels').classList.contains('trace-wide')"), 'wide toggle expands studio');
   await page.eval(() => document.querySelector('#trace-wide-toggle')?.click());
-  assert.equal(await page.eval("document.querySelector('#panels').classList.contains('trace-wide')"), false, 'wide toggle restores width');
+  await until(() => page.eval("!document.querySelector('#panels').classList.contains('trace-wide')"), 'wide toggle restores width');
   await page.eval(() => document.querySelector('#event-detail .inspector-close-btn')?.click());
-  await sleep(100);
-  assert.equal(await page.eval("document.querySelector('#event-detail').hidden"), true, 'inspector close button hides detail pane');
+  await until(() => page.eval("document.querySelector('#event-detail').hidden === true"), 'inspector close button hides detail pane');
   checks.push('semantic inspector renders Chinese tool/LLM details, tool jump navigation, wide toggle, and zero raw JSON');
 
   const beforeSelection = await count();
-  await page.eval(() => document.querySelector('.work-row')?.click());
+  await page.eval(() => document.querySelector('.work-row .work-row-main')?.click());
   await sleep(150);
   assert.equal(await count(), beforeSelection, 'selecting a work must not change the conversation');
 
   // A per-run marker keeps this check independent of whatever an earlier run left in the fixture.
   const burstTag = `连续消息-${Date.now().toString(36)}`;
   await burst(Array.from({ length: 12 }, (_, index) => `${burstTag} ${index}`));
-  await until(() => page.eval(`[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('${burstTag}')).length === 12`), 'burst hydration');
+  await until(() => page.eval(`[...document.querySelectorAll('#messages .user-message')].filter(x => x.textContent.includes('${burstTag}')).length === 12`), 'burst hydration');
   checks.push('a burst larger than one history page is fully hydrated from the event stream');
 
   const orphans = await page.eval(() => {
@@ -331,13 +355,13 @@ try {
     return articles.filter(item => item.dataset.replyTo && index.has(item.dataset.replyTo) && index.get(item.dataset.replyTo) > index.get(item.dataset.messageId)).length;
   });
   assert.equal(orphans, 0, 'no reply may appear before the user message it belongs to');
-  assert.doesNotMatch(await page.eval("[...document.querySelectorAll('#trace-content .chain-card .chain-title')].map(item => item.innerText).join(' ')"), /关联后台工作/,
+  assert.doesNotMatch(await page.eval("[...document.querySelectorAll('#trace-content .chain-card .chain-title')].map(item => item.textContent).join(' ')"), /关联后台工作/,
     'bookkeeping events stay out of the readable execution chain');
   assert.doesNotMatch(await page.eval("document.querySelector('#trace-scope').innerText"), new RegExp(burstTag),
     'a scope the reader opened stays put instead of jumping to a burst of new messages');
   checks.push('every shown reply carries its user message; a pinned scope holds while bookkeeping stays out');
 
-  const beforeReload = await page.eval(`[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('${burstTag}')).length`);
+  const beforeReload = await page.eval(`[...document.querySelectorAll('#messages .user-message')].filter(x => x.textContent.includes('${burstTag}')).length`);
   await page.goto(new URL(entryUrl).origin, { settleMs: 300 });
   await until(() => page.eval("!document.querySelector('#draft').disabled"), 'sessionStorage refresh authentication');
   for (let round = 0; round < 8; round++) {
@@ -345,17 +369,17 @@ try {
     await page.eval(() => document.querySelector('#older').click());
     await sleep(200);
   }
-  assert.equal(await page.eval(`[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('${burstTag}')).length`), beforeReload);
+  assert.equal(await page.eval(`[...document.querySelectorAll('#messages .user-message')].filter(x => x.textContent.includes('${burstTag}')).length`), beforeReload);
   checks.push('refresh keeps the same main history and load-older restores it');
 
   // Toggle audit detail mode to verify settled markers and toggle channel/system filters cleanly
   await page.eval(() => document.querySelector('#conv-detail-mode-btn')?.click());
-  await until(() => page.eval(`[...document.querySelectorAll('#messages .user-message')].filter(x => x.innerText.includes('${burstTag}')).every(x => x.querySelector('.speaker').innerText.includes('F.R.I.D.A.Y. 已处理'))`), 'burst replies settled in detail mode');
+  await until(() => page.eval(`[...document.querySelectorAll('#messages .user-message')].filter(x => x.textContent.includes('${burstTag}')).every(x => x.querySelector('.speaker').textContent.includes('F.R.I.D.A.Y. 已处理'))`), 'burst replies settled in detail mode');
   const order = await page.eval(() => [...document.querySelectorAll('#messages article')].map(item => Number(item.dataset.seq)));
   assert.ok(order.every((seq, index) => index === 0 || order[index - 1] < seq), 'persisted insertion order survives hydration, refresh and paging');
   assert.equal(await page.eval("document.querySelectorAll('#messages .router-message .source-reference').length > 0"), true, 'replies carry clickable source references');
   await page.eval(() => {
-    const btns = [...document.querySelectorAll('#messages .user-message .message-actions button')].filter(b => b.innerText.includes('路由'));
+    const btns = [...document.querySelectorAll('#messages .user-message .message-actions button')].filter(b => b.textContent.includes('路由'));
     btns.at(-1)?.click();
   });
   await page.eval(() => { const facts = document.querySelector('#routing-detail details.routing-facts'); if (facts) facts.open = true; });
@@ -371,10 +395,18 @@ try {
   await page.eval(() => document.querySelector('.work-row .work-row-main')?.click());
   await until(() => page.eval("document.querySelectorAll('#trace-content .chain-card').length >= 4"), 'task chain reloaded after refresh');
 
+  await page.eval(() => document.querySelector('#theme-system-btn')?.click());
+  await sleep(120);
+  assert.equal(await page.eval("document.documentElement.getAttribute('data-theme-pref')"), 'system', 'theme preference switched to system');
+  assert.equal(await page.eval("document.querySelector('#theme-system-btn')?.getAttribute('aria-pressed')"), 'true', '#theme-system-btn aria-pressed=true');
+  assert.equal(await page.eval("document.querySelector('meta[name=\"color-scheme\"]')?.getAttribute('content')"), 'light dark', 'system theme sets color-scheme="light dark"');
+  assert.equal(await page.eval("document.querySelectorAll('meta[name=\"theme-color\"]').length"), 1, 'single meta[name="theme-color"] maintained');
+
   for (const [themeName, themeBtn] of [['spatial', '#theme-spatial-btn'], ['industrial', '#theme-industrial-btn']]) {
     await page.eval(({ themeBtn }) => document.querySelector(themeBtn)?.click(), { themeBtn });
     await sleep(120);
     assert.equal(await page.eval("document.documentElement.getAttribute('data-theme')"), themeName, `theme switched to ${themeName}`);
+    assert.equal(await page.eval(`document.querySelector('${themeBtn}')?.getAttribute('aria-pressed')`), 'true', `${themeBtn} aria-pressed=true`);
 
     await page.setViewport({ width: 1440, height: 900, mobile: false });
     await sleep(200);
@@ -386,6 +418,20 @@ try {
       await sleep(250);
       if (themeName === 'spatial') await page.screenshot({ path: `${outDir}/${name}-chat.jpg`, quality: 85 });
       assert.equal(await page.eval('document.documentElement.scrollWidth <= innerWidth'), true, `${name} (${themeName}) chat: no horizontal page overflow`);
+
+      if (width === 390) {
+        await page.eval(() => {
+          const navBtn = document.querySelector('#mobile-nav-btn');
+          navBtn?.focus();
+          navBtn?.click();
+        });
+        await until(() => page.eval("document.body.classList.contains('mobile-nav-open') && document.querySelector('#mobile-nav-btn')?.getAttribute('aria-expanded') === 'true'"), `mobile nav drawer opens (${themeName})`);
+        assert.equal(await page.eval("document.querySelector('#main-content')?.inert === true"), true, `mobile nav drawer sets inert on #main-content (${themeName})`);
+        await page.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+        await until(() => page.eval("!document.body.classList.contains('mobile-nav-open')"), `mobile nav drawer closes on Escape (${themeName})`);
+        assert.equal(await page.eval("document.querySelector('#main-content')?.inert === false"), true, `mobile nav drawer clears inert on close (${themeName})`);
+        assert.equal(await page.eval("document.activeElement?.id"), 'mobile-nav-btn', `mobile nav drawer restores focus to #mobile-nav-btn (${themeName})`);
+      }
 
       await page.eval(() => document.querySelector('#show-trace').click());
       await sleep(250);
@@ -403,7 +449,7 @@ try {
       assert.equal(await page.eval("document.querySelector('#work-toggle').getAttribute('aria-expanded')"), 'false');
     }
   }
-  checks.push('spatial & industrial themes across 1440x900, 768x1024, 390x844 (chat, trace, inspector, work drawer + Escape) with zero page overflow');
+  checks.push('system/spatial/industrial themes across 1440x900, 768x1024, 390x844 (mobile nav inert + focus restore, chat, trace, inspector, work drawer + Escape) with zero page overflow');
 
   await page.eval(() => document.querySelector('#theme-spatial-btn')?.click());
   await page.setViewport({ width: 1440, height: 900, mobile: false });
