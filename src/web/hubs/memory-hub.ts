@@ -2,21 +2,55 @@ import type { ContextSearchHit, MainView, MemoryCard } from '../../view.js';
 import { GoldenBrainStage, type BrainMemoryItem } from '../brain.js';
 import { button, element, kpiCard, node } from '../shared/dom.js';
 import { errorText, synapseRelationNames, timestamp } from '../shared/format.js';
+import {
+  ensureInlineFormError,
+  replaceChildrenPreservingFocus,
+  setInlineFormError,
+  wireHubForm,
+} from '../shared/plugin-catalog.js';
+import {
+  announceStatus,
+  bindDialogLightDismiss,
+  bindRovingTablist,
+  closeModalDialog,
+  confirmAction,
+  isDialogOpen,
+  isImeComposing,
+  onReducedMotionChange,
+  openModalDialog,
+  prefersReducedMotion,
+  safeFocus,
+  syncRovingTablist,
+} from '../shared/ui-primitives.js';
 import { api, appState, hooks } from '../state.js';
 
+export type MemoryHubTab = 'matrix' | 'notes' | 'diary';
+
+export interface MemoryHubOptions {
+  onTabChange?: (tab: MemoryHubTab) => void;
+}
+
 export interface MemoryHubController {
-  openModal: () => void;
+  openModal: (tab?: MemoryHubTab) => void;
   closeModal: () => void;
   render: (force?: boolean) => void;
   isImmersive: () => boolean;
   exitImmersive: () => void;
 }
 
-export function initMemoryHub(): MemoryHubController {
+export function initMemoryHub(options: MemoryHubOptions = {}): MemoryHubController {
   const memoryTopBadge = element<HTMLElement>('memory-top-badge');
   const openMemoryHubTop = element<HTMLButtonElement>('open-memory-hub-top');
-  const memoryHubBackdrop = element<HTMLElement>('memory-hub-backdrop');
+  const memoryHubDialog = element<HTMLElement>('memory-hub-dialog');
   const memoryModalClose = element<HTMLButtonElement>('memory-modal-close');
+  const memoryHubTabs = (typeof document !== 'undefined' ? document.getElementById('memory-hub-tabs') : null) as HTMLElement | null;
+  const memoryTabMatrix = (typeof document !== 'undefined' ? document.getElementById('memory-tab-matrix') : null) as HTMLButtonElement | null;
+  const notebookTabNotes = (typeof document !== 'undefined' ? document.getElementById('notebook-tab-notes') : null) as HTMLButtonElement | null;
+  const notebookTabDiary = (typeof document !== 'undefined' ? document.getElementById('notebook-tab-diary') : null) as HTMLButtonElement | null;
+  const memoryPanelMatrix = (typeof document !== 'undefined' ? document.getElementById('memory-panel-matrix') : null) as HTMLElement | null;
+  const notebookPanelNotes = (typeof document !== 'undefined' ? document.getElementById('notebook-panel-notes') : null) as HTMLElement | null;
+  const notebookPanelDiary = (typeof document !== 'undefined' ? document.getElementById('notebook-panel-diary') : null) as HTMLElement | null;
+  const notebookRoleHint = (typeof document !== 'undefined' ? document.getElementById('notebook-role-hint') : null) as HTMLElement | null;
   const memoryBrainViewport = element<HTMLElement>('memory-brain-viewport');
   const memoryBrainCanvas = element<HTMLCanvasElement>('memory-brain-canvas');
   const memoryBrainSpinBtn = element<HTMLButtonElement>('memory-brain-spin-btn');
@@ -32,6 +66,7 @@ export function initMemoryHub(): MemoryHubController {
   const memoryFilterPinned = element<HTMLButtonElement>('memory-filter-pinned');
   const memoryFilterSynapse = element<HTMLButtonElement>('memory-filter-synapse');
   const memoryAddDetails = element<HTMLDetailsElement>('memory-add-details');
+  const memoryComposeForm = (typeof document !== 'undefined' ? document.getElementById('memory-compose-form') : null) as HTMLFormElement | null;
   const memoryTopicInput = element<HTMLInputElement>('memory-topic-input');
   const memoryTagsInput = element<HTMLInputElement>('memory-tags-input');
   const memoryContentInput = element<HTMLTextAreaElement>('memory-content-input');
@@ -41,8 +76,20 @@ export function initMemoryHub(): MemoryHubController {
   const memoryListSubtitle = element<HTMLElement>('memory-list-subtitle');
   const memoriesList = element<HTMLElement>('memories-list');
 
+  const lifecycleAc = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const signal = lifecycleAc?.signal;
+  let fullFetchAc: AbortController | null = null;
+  let searchAc: AbortController | null = null;
+
+  memoryTopicInput.required = true;
+  memoryContentInput.required = true;
+  const memoryComposeErrorEl = ensureInlineFormError(memoryComposeForm, 'memory-compose-error');
+
+  let activeTab: MemoryHubTab = 'matrix';
+  let suppressingExternalTabSync = false;
   let fullMemoriesCache: MemoryCard[] | undefined;
   let fullMemoriesSig: string | undefined;
+  let lastBrainDataSig: string | undefined;
   let fullMemoriesBusy = false;
   let memorySaving = false;
   let searchSeq = 0;
@@ -50,6 +97,7 @@ export function initMemoryHub(): MemoryHubController {
   let editingMemoryId: string | undefined;
   let searchMatchedMemoryIds: Set<string> | undefined;
   let enteredNativeFullscreen = false;
+  let userSpinOverride: boolean | undefined;
 
   function directorySignature(dir: MainView['memoryDirectory'] | undefined): string {
     if (!dir) return '';
@@ -73,6 +121,21 @@ export function initMemoryHub(): MemoryHubController {
     return undefined;
   }
 
+  function syncSpinButtonUi(spinning: boolean) {
+    memoryBrainSpinBtn.classList.toggle('active', spinning);
+    memoryBrainSpinBtn.setAttribute('aria-pressed', String(spinning));
+    memoryBrainSpinBtn.textContent = spinning ? '⟳ 自转中' : '⏸ 已定格';
+  }
+
+  function applySpinPreference(reduced: boolean) {
+    if (userSpinOverride !== undefined) return;
+    const nextSpin = !reduced;
+    if (brainStage.isAutoRotating() !== nextSpin) {
+      brainStage.setAutoRotate(nextSpin);
+    }
+    syncSpinButtonUi(brainStage.isAutoRotating());
+  }
+
   function editMemoryFromUi(item: {
     id: string;
     topic: string;
@@ -88,8 +151,9 @@ export function initMemoryHub(): MemoryHubController {
     memoryPinnedInput.checked = Boolean(item.pinned);
     memoryCancelEditBtn.hidden = false;
     memorySaveBtn.textContent = '💾 更新记忆神经元';
+    setInlineFormError(memoryComposeErrorEl, undefined, [memoryTopicInput, memoryContentInput]);
     memoryAddDetails.open = true;
-    memoryTopicInput.focus();
+    safeFocus(memoryTopicInput);
   }
 
   function resetMemoryForm() {
@@ -100,15 +164,26 @@ export function initMemoryHub(): MemoryHubController {
     memoryPinnedInput.checked = false;
     memoryCancelEditBtn.hidden = true;
     memorySaveBtn.textContent = '💾 刻印到全息记忆';
+    setInlineFormError(memoryComposeErrorEl, undefined, [memoryTopicInput, memoryContentInput]);
   }
 
   async function fetchFullMemories() {
     if (!appState.ready || appState.authExpired || fullMemoriesBusy) return;
     const sig = directorySignature(appState.view?.memoryDirectory);
     fullMemoriesBusy = true;
+    fullFetchAc?.abort();
+    const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    fullFetchAc = ac;
     try {
-      const list = await api<MemoryCard[]>('/api/memories');
-      if (appState.authExpired || !appState.ready) return;
+      const list = await api<MemoryCard[]>(
+        '/api/memories',
+        undefined,
+        {
+          ...(ac ? { signal: ac.signal } : {}),
+          priority: 'low',
+        },
+      );
+      if (appState.authExpired || !appState.ready || ac?.signal.aborted) return;
       if (Array.isArray(list)) {
         fullMemoriesCache = list;
         fullMemoriesSig = sig;
@@ -117,6 +192,7 @@ export function initMemoryHub(): MemoryHubController {
     } catch {
       /* fallback to view.memoryDirectory */
     } finally {
+      if (fullFetchAc === ac) fullFetchAc = null;
       fullMemoriesBusy = false;
     }
   }
@@ -126,7 +202,18 @@ export function initMemoryHub(): MemoryHubController {
     const content = memoryContentInput.value.trim();
     const tags = memoryTagsInput.value.split(/[,，\s]+/).map(t => t.trim()).filter(Boolean);
     const pinned = memoryPinnedInput.checked;
-    if (!topic || !content || memorySaving || appState.authExpired || !appState.ready) return;
+    if (!topic) {
+      setInlineFormError(memoryComposeErrorEl, '请填写记忆主题', [memoryTopicInput]);
+      safeFocus(memoryTopicInput);
+      return;
+    }
+    if (!content) {
+      setInlineFormError(memoryComposeErrorEl, '请填写记忆内容', [memoryContentInput]);
+      safeFocus(memoryContentInput);
+      return;
+    }
+    setInlineFormError(memoryComposeErrorEl, undefined, [memoryTopicInput, memoryContentInput]);
+    if (memorySaving || appState.authExpired || !appState.ready) return;
     memorySaving = true;
     memorySaveBtn.disabled = true;
     try {
@@ -137,39 +224,56 @@ export function initMemoryHub(): MemoryHubController {
         ...(tags.length ? { tags } : {}),
         pinned,
       });
+      const wasEditing = Boolean(editingMemoryId);
       resetMemoryForm();
       memoryAddDetails.open = false;
+      announceStatus(wasEditing ? `已更新记忆「${topic}」` : `已保存记忆「${topic}」`, 'polite');
       await hooks.refreshView();
       await fetchFullMemories();
     } catch (error) {
-      hooks.connection(`保存记忆失败：${errorText(error)}`, true);
+      const errMsg = `保存记忆失败：${errorText(error)}`;
+      setInlineFormError(memoryComposeErrorEl, errMsg);
+      hooks.connection(errMsg, true);
     } finally {
       memorySaving = false;
       memorySaveBtn.disabled = appState.authExpired || !appState.ready;
     }
   }
 
-  async function pinMemoryFromUi(id: string, pinned: boolean) {
+  async function pinMemoryFromUi(id: string, pinned: boolean, topic?: string) {
     try {
       await api<MemoryCard>('/api/memory-pin', { id, pinned });
+      announceStatus(pinned ? `已置顶记忆「${topic ?? id}」` : `已取消置顶「${topic ?? id}」`, 'polite');
       await hooks.refreshView();
       await fetchFullMemories();
     } catch (error) {
-      hooks.connection(`置顶记忆失败：${errorText(error)}`, true);
+      const errMsg = `置顶记忆失败：${errorText(error)}`;
+      hooks.connection(errMsg, true);
+      announceStatus(errMsg, 'assertive');
     }
   }
 
-  async function removeMemoryFromUi(id: string) {
+  async function removeMemoryFromUi(id: string, topic?: string) {
+    const confirmed = await confirmAction({
+      title: '遗忘记忆神经元',
+      message: `确定要永久删除记忆「${topic ?? id}」吗？此操作无法撤销。`,
+      confirmLabel: '确认遗忘',
+      danger: true,
+    });
+    if (!confirmed || appState.authExpired || !appState.ready) return;
     try {
       await api<unknown>('/api/memory-remove', { id });
       if (editingMemoryId === id) {
         resetMemoryForm();
         memoryAddDetails.open = false;
       }
+      announceStatus(`已遗忘记忆「${topic ?? id}」`, 'polite');
       await hooks.refreshView();
       await fetchFullMemories();
     } catch (error) {
-      hooks.connection(`移除记忆失败：${errorText(error)}`, true);
+      const errMsg = `移除记忆失败：${errorText(error)}`;
+      hooks.connection(errMsg, true);
+      announceStatus(errMsg, 'assertive');
     }
   }
 
@@ -222,14 +326,15 @@ export function initMemoryHub(): MemoryHubController {
       synSec.append(node('span', `⚡ 突触共振网络 (${item.synapses.length}) · 点击跃迁聚焦`, 'brain-synapse-heading'));
       const synList = node('div', '', 'brain-synapse-list');
       const basePool = fullMemoriesCache ?? appState.view?.memoryDirectory?.items ?? [];
+      const basePoolMap = new Map(basePool.map(m => [m.id, m]));
       for (const syn of item.synapses.slice(0, 8)) {
-        const targetMem = basePool.find(m => m.id === syn.targetId);
+        const targetMem = basePoolMap.get(syn.targetId);
         const targetTitle = syn.targetTopic ?? targetMem?.topic ?? '关联记忆';
         const relText = synapseRelationNames[syn.relation] ?? syn.relation;
         synList.append(button(
           `⚡ ${targetTitle} · ${Math.round(syn.weight * 100)}% (${relText})`,
           () => {
-            if (basePool.some(m => m.id === syn.targetId)) {
+            if (basePoolMap.has(syn.targetId)) {
               brainStage.focusMemory(syn.targetId, true);
             } else {
               memorySearchInput.value = targetTitle;
@@ -245,12 +350,16 @@ export function initMemoryHub(): MemoryHubController {
     frag.append(scrollBody);
 
     const actions = node('div', '', 'brain-insp-actions');
-    const pinBtn = button(item.pinned ? '取消置顶' : '★ 置顶', () => { void pinMemoryFromUi(item.id, !item.pinned); }, 'brain-action-btn');
+    const pinBtn = button(item.pinned ? '取消置顶' : '★ 置顶', () => { void pinMemoryFromUi(item.id, !item.pinned, item.topic); }, 'brain-action-btn');
+    pinBtn.setAttribute('aria-pressed', String(Boolean(item.pinned)));
+    pinBtn.setAttribute('aria-label', `${item.pinned ? '取消置顶' : '置顶'}记忆 ${item.topic}`);
     const editBtn = button('✏️ 编辑', () => { editMemoryFromUi(item); }, 'brain-action-btn');
+    editBtn.setAttribute('aria-label', `编辑记忆 ${item.topic}`);
     const locateBtn = button('↓ 定位卡片', () => {
-      findMemoryCardEl(item.id)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      findMemoryCardEl(item.id)?.scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth', block: 'nearest' });
     }, 'brain-action-btn');
-    const forgetBtn = button('🗑️ 遗忘', () => { void removeMemoryFromUi(item.id); }, 'brain-action-btn danger');
+    const forgetBtn = button('🗑️ 遗忘', () => { void removeMemoryFromUi(item.id, item.topic); }, 'brain-action-btn danger');
+    forgetBtn.setAttribute('aria-label', `遗忘记忆 ${item.topic}`);
     pinBtn.disabled = appState.authExpired || !appState.ready;
     editBtn.disabled = appState.authExpired || !appState.ready;
     forgetBtn.disabled = appState.authExpired || !appState.ready;
@@ -268,6 +377,7 @@ export function initMemoryHub(): MemoryHubController {
   function setBrainImmersive(active: boolean, syncBrowserFullscreen = true) {
     memoryBrainViewport.classList.toggle('is-immersive', active);
     memoryBrainFullscreenBtn.classList.toggle('active', active);
+    memoryBrainFullscreenBtn.setAttribute('aria-pressed', String(active));
     memoryBrainFullscreenBtn.textContent = active ? '✕ 退出全屏' : '⛶ 全屏大脑';
     brainStage.setImmersive(active);
     if (!syncBrowserFullscreen) return;
@@ -297,7 +407,7 @@ export function initMemoryHub(): MemoryHubController {
     memorySaveBtn.disabled = blocked || memorySaving;
     memorySearchBtn.disabled = blocked;
 
-    if (memoryHubBackdrop.hidden && !force) {
+    if ((!isDialogOpen(memoryHubDialog) || activeTab !== 'matrix') && !force) {
       return;
     }
     if (!fullMemoriesCache && !fullMemoriesBusy && appState.ready && !appState.authExpired) {
@@ -330,8 +440,13 @@ export function initMemoryHub(): MemoryHubController {
       : memoryFilterMode !== 'all'
         ? filtered.map(i => i.id)
         : undefined;
-    brainStage.setData(baseItems, highlightedIds, hasFilterOrSearch);
+    const nextBrainSig = `${dirSig}|full:${fullMemoriesSig ?? ''}|n:${baseItems.length}|hl:${highlightedIds ? highlightedIds.join(',') : ''}|f:${hasFilterOrSearch ? 1 : 0}`;
+    if (nextBrainSig !== lastBrainDataSig) {
+      lastBrainDataSig = nextBrainSig;
+      brainStage.setData(baseItems, highlightedIds, hasFilterOrSearch);
+    }
 
+    const baseItemsMap = new Map(baseItems.map(m => [m.id, m]));
     const activeBrainId = brainStage.getSelectedId();
     const contents = document.createDocumentFragment();
     for (const item of filtered) {
@@ -352,11 +467,20 @@ export function initMemoryHub(): MemoryHubController {
       const actions = node('div', '', 'timer-actions');
       const focusBtn = button('🎯 全息聚焦', () => {
         brainStage.focusMemory(item.id, true);
-        memoryBrainCanvas.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        memoryBrainCanvas.scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth', block: 'nearest' });
       }, 'mini-button');
-      const pinBtn = button(item.pinned ? '取消置顶' : '★ 置顶', () => { void pinMemoryFromUi(item.id, !item.pinned); }, 'mini-button');
+      focusBtn.dataset.focusKey = `mem-focus:${item.id}`;
+      focusBtn.setAttribute('aria-label', `全息聚焦 ${item.topic}`);
+      const pinBtn = button(item.pinned ? '取消置顶' : '★ 置顶', () => { void pinMemoryFromUi(item.id, !item.pinned, item.topic); }, 'mini-button');
+      pinBtn.dataset.focusKey = `mem-pin:${item.id}`;
+      pinBtn.setAttribute('aria-pressed', String(Boolean(item.pinned)));
+      pinBtn.setAttribute('aria-label', `${item.pinned ? '取消置顶' : '置顶'} ${item.topic}`);
       const editBtn = button('✏️ 编辑', () => { editMemoryFromUi(item); }, 'mini-button');
-      const forgetBtn = button('🗑️ 遗忘', () => { void removeMemoryFromUi(item.id); }, 'mini-button danger-btn');
+      editBtn.dataset.focusKey = `mem-edit:${item.id}`;
+      editBtn.setAttribute('aria-label', `编辑 ${item.topic}`);
+      const forgetBtn = button('🗑️ 遗忘', () => { void removeMemoryFromUi(item.id, item.topic); }, 'mini-button danger-btn');
+      forgetBtn.dataset.focusKey = `mem-forget:${item.id}`;
+      forgetBtn.setAttribute('aria-label', `遗忘 ${item.topic}`);
       pinBtn.disabled = appState.authExpired || !appState.ready;
       editBtn.disabled = appState.authExpired || !appState.ready;
       forgetBtn.disabled = appState.authExpired || !appState.ready;
@@ -383,7 +507,7 @@ export function initMemoryHub(): MemoryHubController {
         const synBox = node('div', '', 'hub-synapse-box');
         synBox.append(node('span', `⚡ 突触连接 (${item.synapses.length})：`, 'hub-synapse-label'));
         for (const syn of item.synapses.slice(0, 6)) {
-          const targetTitle = syn.targetTopic ?? baseItems.find(m => m.id === syn.targetId)?.topic ?? '关联记忆';
+          const targetTitle = syn.targetTopic ?? baseItemsMap.get(syn.targetId)?.topic ?? '关联记忆';
           const relText = synapseRelationNames[syn.relation] ?? syn.relation;
           const chip = button(
             `🔗 ${targetTitle} · ${Math.round(syn.weight * 100)}% (${relText})`,
@@ -393,6 +517,7 @@ export function initMemoryHub(): MemoryHubController {
             },
             'hub-synapse-chip',
           );
+          chip.dataset.focusKey = `mem-syn:${item.id}:${syn.targetId}`;
           synBox.append(chip);
         }
         card.append(synBox);
@@ -406,7 +531,7 @@ export function initMemoryHub(): MemoryHubController {
         : '未连接';
       contents.append(node('p', emptyMsg, 'empty hub-empty-state'));
     }
-    memoriesList.replaceChildren(contents);
+    replaceChildrenPreservingFocus(memoriesList, contents, () => memorySearchInput);
   }
 
   async function searchMemories() {
@@ -414,21 +539,28 @@ export function initMemoryHub(): MemoryHubController {
     const scope = memorySearchScope.value || 'all';
     if (!query) {
       ++searchSeq;
+      searchAc?.abort();
       searchMatchedMemoryIds = undefined;
       memorySearchResults.hidden = true;
       memorySearchResults.replaceChildren();
       render();
+      announceStatus('已清空记忆检索条件', 'polite');
       return;
     }
     if (appState.authExpired || !appState.ready) return;
     const seq = ++searchSeq;
+    searchAc?.abort();
+    const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    searchAc = ac;
     memorySearchResults.hidden = false;
     memorySearchResults.replaceChildren(node('p', '⏳ 正在执行全息图谱检索与 1-Hop 突触扩散激活…', 'meta'));
     try {
       const res = await api<{ hits?: ContextSearchHit[] } | ContextSearchHit[]>(
         `/api/memories?${new URLSearchParams({ query, scope })}`,
+        undefined,
+        ac ? { signal: ac.signal } : undefined,
       );
-      if (seq !== searchSeq) return;
+      if (seq !== searchSeq || ac?.signal.aborted) return;
       const hits = Array.isArray(res) ? res : (res.hits ?? []);
       const matchedIds = hits
         .filter(h => h.kind === 'memory')
@@ -445,11 +577,13 @@ export function initMemoryHub(): MemoryHubController {
         node('strong', `🔍 联想检索命中 ${hits.length} 条结果`, 'hub-card-title'),
         button('✕ 清空检索', () => {
           ++searchSeq;
+          searchAc?.abort();
           memorySearchInput.value = '';
           searchMatchedMemoryIds = undefined;
           memorySearchResults.hidden = true;
           memorySearchResults.replaceChildren();
           render();
+          safeFocus(memorySearchInput);
         }, 'mini-button'),
       );
       frag.append(header);
@@ -470,7 +604,7 @@ export function initMemoryHub(): MemoryHubController {
           const memId = hit.memoryId ?? hit.id;
           hitHead.append(button('🎯 全息聚焦', () => {
             brainStage.focusMemory(memId, true);
-            memoryBrainCanvas.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            memoryBrainCanvas.scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth', block: 'nearest' });
           }, 'mini-button'));
         } else if (hit.kind === 'message' && hit.messageId) {
           hitHead.append(button('↗ 定位到此对话', () => {
@@ -497,9 +631,14 @@ export function initMemoryHub(): MemoryHubController {
       if (!hits.length) listWrap.append(node('p', '未找到匹配的记忆、工作或对话。', 'empty hub-empty-state'));
       frag.append(listWrap);
       memorySearchResults.replaceChildren(frag);
+      announceStatus(`联想检索完成，命中 ${hits.length} 条结果`, 'polite');
     } catch (error) {
-      if (seq !== searchSeq) return;
-      memorySearchResults.replaceChildren(node('p', `搜索失败：${errorText(error)}`, 'error'));
+      if (seq !== searchSeq || ac?.signal.aborted) return;
+      const errMsg = `搜索失败：${errorText(error)}`;
+      memorySearchResults.replaceChildren(node('p', errMsg, 'error'));
+      announceStatus(errMsg, 'assertive');
+    } finally {
+      if (searchAc === ac) searchAc = null;
     }
   }
 
@@ -510,65 +649,161 @@ export function initMemoryHub(): MemoryHubController {
       ['pinned', memoryFilterPinned],
       ['synapse', memoryFilterSynapse],
     ] as const) {
-      btn.classList.toggle('active', key === mode);
+      const active = key === mode;
+      btn.classList.toggle('active', active);
+      btn.setAttribute('aria-pressed', String(active));
     }
     render();
   }
 
-  function openModal() {
-    hooks.closeAllHubModals();
-    memoryHubBackdrop.hidden = false;
-    render(true);
-    brainStage.start();
-    void fetchFullMemories();
+  function tabButtonFor(tab: MemoryHubTab): HTMLButtonElement | null {
+    if (tab === 'notes') return notebookTabNotes;
+    if (tab === 'diary') return notebookTabDiary;
+    return memoryTabMatrix;
   }
 
-  function closeModal() {
+  function syncTabPanels(tab: MemoryHubTab): void {
+    activeTab = tab;
+    memoryHubDialog.dataset.activeTab = tab;
+    memoryTabMatrix?.classList.toggle('active', tab === 'matrix');
+    notebookTabNotes?.classList.toggle('active', tab === 'notes');
+    notebookTabDiary?.classList.toggle('active', tab === 'diary');
+    if (memoryPanelMatrix) memoryPanelMatrix.hidden = tab !== 'matrix';
+    if (notebookPanelNotes) notebookPanelNotes.hidden = tab !== 'notes';
+    if (notebookPanelDiary) notebookPanelDiary.hidden = tab !== 'diary';
+    if (notebookRoleHint) {
+      notebookRoleHint.hidden = tab === 'matrix';
+      if (tab === 'notes') {
+        notebookRoleHint.textContent = 'F.R.I.D.A.Y. 替你记事 · 支持 Markdown 编辑、预览与按需转存记忆';
+      } else if (tab === 'diary') {
+        notebookRoleHint.textContent = 'F.R.I.D.A.Y. 自己写的每日随笔与反思 · 纯净只读，记录与你的相处点滴';
+      }
+    }
+    const activeTabEl = tabButtonFor(tab);
+    if (memoryHubTabs && activeTabEl) {
+      syncRovingTablist(memoryHubTabs, activeTabEl);
+    }
+  }
+
+  function switchTab(tab: MemoryHubTab, broadcast = true): void {
+    syncTabPanels(tab);
+    if (tab === 'matrix') {
+      if (isDialogOpen(memoryHubDialog)) {
+        render(true);
+        applySpinPreference(prefersReducedMotion());
+        brainStage.start();
+        void fetchFullMemories();
+      }
+    } else {
+      if (brainStage.isImmersive()) setBrainImmersive(false);
+      brainStage.stop();
+    }
+    if (broadcast && !suppressingExternalTabSync) {
+      suppressingExternalTabSync = true;
+      try {
+        if (typeof Event === 'function' && typeof memoryHubDialog.dispatchEvent === 'function') {
+          memoryHubDialog.dispatchEvent(new Event('friday:memory-tab-change'));
+        }
+        options.onTabChange?.(tab);
+      } finally {
+        suppressingExternalTabSync = false;
+      }
+    }
+  }
+
+  function handleDialogClosed(): void {
     if (brainStage.isImmersive()) setBrainImmersive(false);
-    memoryHubBackdrop.hidden = true;
     brainStage.stop();
   }
 
-  openMemoryHubTop.addEventListener('click', openModal);
-  memoryModalClose.addEventListener('click', closeModal);
-  memoryHubBackdrop.addEventListener('click', event => {
-    if (event.target === memoryHubBackdrop) closeModal();
-  });
-  memorySearchBtn.addEventListener('click', () => { void searchMemories(); });
+  function openModal(tab: MemoryHubTab = 'matrix') {
+    if (!isDialogOpen(memoryHubDialog)) {
+      hooks.closeAllHubModals();
+      openModalDialog(memoryHubDialog);
+    }
+    switchTab(tab);
+    safeFocus(tabButtonFor(tab) ?? memoryModalClose);
+  }
+
+  function closeModal() {
+    handleDialogClosed();
+    closeModalDialog(memoryHubDialog);
+  }
+
+  bindDialogLightDismiss(memoryHubDialog, handleDialogClosed, signal);
+  if (memoryHubTabs) {
+    memoryHubTabs.dataset.rovingOwner = 'memory-hub';
+    bindRovingTablist(memoryHubTabs, {
+      onActivate: tabEl => {
+        const next = tabEl.dataset.memoryTab as MemoryHubTab | undefined;
+        if (!next) return;
+        switchTab(next);
+      },
+      signal,
+    });
+  }
+
+  const listenerOpts = signal ? { signal } : undefined;
+  memoryHubDialog.addEventListener('friday:memory-tab-change', () => {
+    if (suppressingExternalTabSync) return;
+    const extTab = memoryHubDialog.dataset.activeTab as MemoryHubTab | undefined;
+    if (extTab === 'matrix' || extTab === 'notes' || extTab === 'diary') {
+      switchTab(extTab, false);
+    }
+  }, listenerOpts);
+
+  openMemoryHubTop.addEventListener('click', () => openModal('matrix'), listenerOpts);
+  memoryModalClose.addEventListener('click', closeModal, listenerOpts);
+  memorySearchBtn.addEventListener('click', () => { void searchMemories(); }, listenerOpts);
   memorySearchInput.addEventListener('keydown', event => {
-    if (event.key === 'Enter') {
+    if (event.key === 'Enter' && !isImeComposing(event)) {
       event.preventDefault();
       void searchMemories();
     }
-  });
-  memoryFilterAll.addEventListener('click', () => setMemoryFilter('all'));
-  memoryFilterPinned.addEventListener('click', () => setMemoryFilter('pinned'));
-  memoryFilterSynapse.addEventListener('click', () => setMemoryFilter('synapse'));
+  }, listenerOpts);
+  memoryFilterAll.addEventListener('click', () => setMemoryFilter('all'), listenerOpts);
+  memoryFilterPinned.addEventListener('click', () => setMemoryFilter('pinned'), listenerOpts);
+  memoryFilterSynapse.addEventListener('click', () => setMemoryFilter('synapse'), listenerOpts);
   memoryCancelEditBtn.addEventListener('click', () => {
     resetMemoryForm();
     memoryAddDetails.open = false;
-  });
-  memorySaveBtn.addEventListener('click', () => { void saveMemoryFromUi(); });
+  }, listenerOpts);
+  wireHubForm(memoryComposeForm, memorySaveBtn, () => { void saveMemoryFromUi(); }, signal);
   memoryBrainSpinBtn.addEventListener('click', () => {
     const spinning = brainStage.setAutoRotate(!brainStage.isAutoRotating());
-    memoryBrainSpinBtn.classList.toggle('active', spinning);
-    memoryBrainSpinBtn.textContent = spinning ? '⟳ 自转中' : '⏸ 已定格';
-  });
+    userSpinOverride = spinning;
+    syncSpinButtonUi(spinning);
+  }, listenerOpts);
   memoryBrainResetBtn.addEventListener('click', () => {
     brainStage.resetView();
-    memoryBrainSpinBtn.classList.add('active');
-    memoryBrainSpinBtn.textContent = '⟳ 自转中';
-  });
+    userSpinOverride = undefined;
+    applySpinPreference(prefersReducedMotion());
+  }, listenerOpts);
   memoryBrainFullscreenBtn.addEventListener('click', () => {
     setBrainImmersive(!brainStage.isImmersive());
-  });
-  document.addEventListener('fullscreenchange', () => {
-    if (!document.fullscreenElement && enteredNativeFullscreen) {
-      enteredNativeFullscreen = false;
-      setBrainImmersive(false, false);
-    }
-  });
-  window.addEventListener('pagehide', () => brainStage.dispose());
+  }, listenerOpts);
+  onReducedMotionChange(reduced => {
+    applySpinPreference(reduced);
+  }, signal);
+  if (typeof document !== 'undefined') {
+    document.addEventListener('fullscreenchange', () => {
+      if (!document.fullscreenElement && enteredNativeFullscreen) {
+        enteredNativeFullscreen = false;
+        setBrainImmersive(false, false);
+      }
+    }, listenerOpts);
+  }
+  if (typeof window !== 'undefined') {
+    window.addEventListener('pagehide', () => {
+      fullFetchAc?.abort();
+      searchAc?.abort();
+      lifecycleAc?.abort();
+      brainStage.dispose();
+    }, listenerOpts);
+  }
+
+  applySpinPreference(prefersReducedMotion());
+  syncTabPanels('matrix');
 
   return {
     openModal,

@@ -1,6 +1,7 @@
 import { button, element, isEditingWithin, kpiCard, node, svgNode } from '../shared/dom.js';
 import { errorText, json, timestamp } from '../shared/format.js';
-import { api, appState } from '../state.js';
+import { announceStatus, attachDelayedFormValidation, safeFocus } from '../shared/ui-primitives.js';
+import { api, appState, type ApiRequestOptions } from '../state.js';
 
 export interface HealthScaleUiOptions {
   isVisible: () => boolean;
@@ -10,6 +11,7 @@ export interface HealthScaleUiController {
   activate: () => void;
   deactivate: () => void;
   refreshBadge: () => Promise<void>;
+  dispose: () => void;
 }
 
 interface HealthProfile {
@@ -213,6 +215,44 @@ type HealthSourceFilterKey = 'all' | 'live' | 'history' | 'manual';
 
 const HEALTH_ACTIVE_PHASES = new Set(['scanning', 'connecting', 'measuring']);
 
+function isDocHidden(): boolean {
+  return typeof document !== 'undefined' && Boolean(document.hidden);
+}
+
+function listenEvent(
+  target: EventTarget,
+  type: string,
+  handler: EventListenerOrEventListenerObject,
+  signal?: AbortSignal,
+): void {
+  if (signal?.aborted) return;
+  target.addEventListener(type, handler, signal ? { signal } : undefined);
+  if (signal) {
+    signal.addEventListener('abort', () => {
+      target.removeEventListener(type, handler);
+    }, { once: true });
+  }
+}
+
+function bindFormSubmission(
+  form: HTMLFormElement,
+  submitBtn: HTMLButtonElement,
+  onSubmit: () => void,
+  signal?: AbortSignal,
+): void {
+  attachDelayedFormValidation(form, signal);
+  listenEvent(form, 'submit', e => {
+    e.preventDefault();
+    onSubmit();
+  }, signal);
+  listenEvent(submitBtn, 'click', e => {
+    if (typeof form.requestSubmit !== 'function') {
+      e.preventDefault();
+      onSubmit();
+    }
+  }, signal);
+}
+
 export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiController {
   const healthTopBadge = element<HTMLElement>('health-top-badge');
   const healthProfileSelect = element<HTMLSelectElement>('health-profile-select');
@@ -247,7 +287,9 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
   const healthMetricsGrid = element<HTMLElement>('health-metrics-grid');
   const healthRawGrid = element<HTMLElement>('health-raw-grid');
   const healthRawJson = element<HTMLElement>('health-raw-json');
+  const healthRawDetails = healthRawJson.closest<HTMLDetailsElement>('details');
   const healthProfileDetails = element<HTMLDetailsElement>('health-profile-details');
+  const healthProfileForm = element<HTMLFormElement>('health-profile-form');
   const healthProfilesBar = element<HTMLElement>('health-profiles-bar');
   const healthProfileId = element<HTMLInputElement>('health-profile-id');
   const healthProfileName = element<HTMLInputElement>('health-profile-name');
@@ -260,6 +302,7 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
   const healthProfileNewBtn = element<HTMLButtonElement>('health-profile-new-btn');
   const healthProfileSaveBtn = element<HTMLButtonElement>('health-profile-save-btn');
   const healthManualDetails = element<HTMLDetailsElement>('health-manual-details');
+  const healthManualForm = element<HTMLFormElement>('health-manual-form');
   const healthManualWeight = element<HTMLInputElement>('health-manual-weight');
   const healthManualUnit = element<HTMLSelectElement>('health-manual-unit');
   const healthManualImpedance = element<HTMLInputElement>('health-manual-impedance');
@@ -270,6 +313,17 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
   const healthSourceFilters = element<HTMLElement>('health-source-filters');
   const healthRecordsSubtitle = element<HTMLElement>('health-records-subtitle');
   const healthRecordsList = element<HTMLElement>('health-records-list');
+
+  healthTrendCanvas.setAttribute('aria-describedby', 'health-trend-caption');
+
+  const lifecycleAc = new AbortController();
+  let activeAc: AbortController | null = null;
+  let pollAc: AbortController | null = null;
+  let badgeAc: AbortController | null = null;
+  let resizeObserver: ResizeObserver | null = null;
+  let resizeRafId: number | null = null;
+  let active = false;
+  let disposed = false;
 
   const healthRecordDeleteArmed = new Map<string, number>();
   const healthRecordDeleteTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -283,13 +337,15 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
   let healthTrendLimit = 30;
   let healthSourceFilter: HealthSourceFilterKey = 'all';
   let healthInspectedRecordId: string | null = null;
-  let healthPollTimer: number | undefined;
+  let healthPollTimer: ReturnType<typeof setTimeout> | undefined;
   let healthBusy = false;
   let healthLastSessionPhase = '';
   let healthHoveredPointIdx: number | null = null;
   let healthPlottedPoints: HealthTrendPoint[] = [];
   let healthChartCssW = 900;
   let healthChartCssH = 220;
+  let lastActionStatusText = '';
+  let badgeSeq = 0;
 
   function clearArmedDeleteEntry(
     armedMap: Map<string, number>,
@@ -331,29 +387,38 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
 
   function stopHealthMeasurePoll() {
     if (healthPollTimer !== undefined) {
-      window.clearTimeout(healthPollTimer);
+      clearTimeout(healthPollTimer);
       healthPollTimer = undefined;
     }
+    pollAc?.abort();
+    pollAc = null;
   }
 
   function scheduleHealthMeasurePoll(delayMs = 850) {
     stopHealthMeasurePoll();
-    if (!options.isVisible() || appState.authExpired) return;
-    healthPollTimer = window.setTimeout(() => {
+    if (disposed || !active || !options.isVisible() || isDocHidden() || appState.authExpired) return;
+    healthPollTimer = setTimeout(() => {
+      healthPollTimer = undefined;
       void pollHealthMeasureOnce();
     }, delayMs);
   }
 
   function setHealthActionStatus(text = '', tone: 'ok' | 'warn' | 'err' | '' = '') {
+    const trimmed = text.trim();
     if (!text) {
       healthActionStatus.textContent = '';
       healthActionStatus.className = 'health-status-banner';
       healthActionStatus.hidden = true;
+      lastActionStatusText = '';
       return;
     }
     healthActionStatus.textContent = text;
     healthActionStatus.className = `health-status-banner${tone ? ` tone-${tone}` : ''}`;
     healthActionStatus.hidden = false;
+    if (trimmed && trimmed !== lastActionStatusText && options.isVisible()) {
+      announceStatus(trimmed, tone === 'err' ? 'assertive' : 'polite');
+    }
+    lastActionStatusText = trimmed;
   }
 
   function formatWeightVal(weightKg: number, unit: 'kg' | 'jin' = healthUnit, digits = 2): string {
@@ -391,12 +456,16 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
     }
   }
 
-  async function runHealthPlugin<T>(action: string, args: Record<string, unknown> = {}): Promise<HealthPluginResponse<T>> {
+  async function runHealthPlugin<T>(
+    action: string,
+    args: Record<string, unknown> = {},
+    reqOpts?: ApiRequestOptions,
+  ): Promise<HealthPluginResponse<T>> {
     return api<HealthPluginResponse<T>>('/api/plugin-run', {
       plugin: 'health-scale',
       action,
       args,
-    });
+    }, reqOpts);
   }
 
   function resetHealthProfileForm() {
@@ -475,14 +544,19 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
 
   let dashboardFetchSeq = 0;
 
-  async function refreshHealthDashboard(opts: { profileId?: string; quiet?: boolean } = {}) {
+  async function refreshHealthDashboard(opts: { profileId?: string; quiet?: boolean; background?: boolean } = {}) {
+    if (disposed || appState.authExpired) return;
     const seq = ++dashboardFetchSeq;
     const targetProfileId = opts.profileId ?? healthDashboard?.activeProfileId ?? undefined;
     const args: Record<string, unknown> = {};
     if (targetProfileId) args.profileId = targetProfileId;
+    const reqOpts: ApiRequestOptions = {
+      ...(opts.background ? { priority: 'low' } : {}),
+      signal: lifecycleAc.signal,
+    };
     try {
-      const res = await runHealthPlugin<HealthDashboardData>('dashboard', args);
-      if (seq !== dashboardFetchSeq) return;
+      const res = await runHealthPlugin<HealthDashboardData>('dashboard', args, reqOpts);
+      if (disposed || seq !== dashboardFetchSeq || appState.authExpired) return;
       if (!res.ok || !res.data) {
         if (!opts.quiet) setHealthActionStatus(res.message || '读取健康看板失败', 'err');
         return;
@@ -490,21 +564,29 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
       applyHealthDashboard(res.data);
       const phase = res.data.liveSession?.phase || '';
       healthLastSessionPhase = phase;
-      if (options.isVisible() && HEALTH_ACTIVE_PHASES.has(phase)) {
+      if (active && options.isVisible() && !isDocHidden() && HEALTH_ACTIVE_PHASES.has(phase)) {
         scheduleHealthMeasurePoll(750);
       }
     } catch (err) {
-      if (seq !== dashboardFetchSeq) return;
+      if (lifecycleAc.signal.aborted || (err instanceof Error && err.name === 'AbortError')) return;
+      if (disposed || seq !== dashboardFetchSeq || appState.authExpired) return;
       if (!opts.quiet) setHealthActionStatus(`读取健康数据失败：${errorText(err)}`, 'err');
     }
   }
 
   async function pollHealthMeasureOnce() {
-    if (!options.isVisible() || appState.authExpired) return;
+    if (disposed || !active || !options.isVisible() || isDocHidden() || appState.authExpired) return;
     const seq = ++dashboardFetchSeq;
+    pollAc?.abort();
+    const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    pollAc = ac;
     try {
-      const res = await runHealthPlugin<{ session: HealthLiveSession | null; dashboard: HealthDashboardData }>('measure-status', {});
-      if (seq !== dashboardFetchSeq) return;
+      const res = await runHealthPlugin<{ session: HealthLiveSession | null; dashboard: HealthDashboardData }>(
+        'measure-status',
+        {},
+        { priority: 'low', ...(ac ? { signal: ac.signal } : {}) },
+      );
+      if (disposed || !active || seq !== dashboardFetchSeq || appState.authExpired) return;
       if (!res.ok || !res.data) {
         scheduleHealthMeasurePoll(1200);
         return;
@@ -532,15 +614,18 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
         }
       }
     } catch (err) {
-      if (seq !== dashboardFetchSeq || appState.authExpired) return;
+      if (ac?.signal.aborted || (err instanceof Error && err.name === 'AbortError')) return;
+      if (disposed || !active || seq !== dashboardFetchSeq || appState.authExpired) return;
       setHealthActionStatus(`轮询测量状态失败：${errorText(err)}`, 'warn');
       scheduleHealthMeasurePoll(1500);
+    } finally {
+      if (pollAc === ac) pollAc = null;
     }
   }
 
   function renderHealthHeader() {
     if (!healthDashboard) return;
-    if (document.activeElement !== healthProfileSelect) {
+    if (typeof document === 'undefined' || document.activeElement !== healthProfileSelect) {
       const selectFrag = document.createDocumentFragment();
       if (healthDashboard.profiles.length === 0) {
         const emptyOpt = document.createElement('option');
@@ -560,7 +645,9 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
       healthProfileSelect.replaceChildren(selectFrag);
     }
     healthUnitKg.classList.toggle('active', healthUnit === 'kg');
+    healthUnitKg.setAttribute('aria-pressed', String(healthUnit === 'kg'));
     healthUnitJin.classList.toggle('active', healthUnit === 'jin');
+    healthUnitJin.setAttribute('aria-pressed', String(healthUnit === 'jin'));
   }
 
   function renderHealthScoreRing(score: number | null, label: string) {
@@ -767,10 +854,14 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
 
   function renderHealthTrendControls() {
     for (const btn of healthTrendMetrics.querySelectorAll<HTMLButtonElement>('button[data-metric]')) {
-      btn.classList.toggle('active', btn.dataset.metric === healthTrendMetric);
+      const isActive = btn.dataset.metric === healthTrendMetric;
+      btn.classList.toggle('active', isActive);
+      btn.setAttribute('aria-pressed', String(isActive));
     }
     for (const btn of healthTrendRanges.querySelectorAll<HTMLButtonElement>('button[data-range]')) {
-      btn.classList.toggle('active', Number(btn.dataset.range) === healthTrendLimit);
+      const isActive = Number(btn.dataset.range) === healthTrendLimit;
+      btn.classList.toggle('active', isActive);
+      btn.setAttribute('aria-pressed', String(isActive));
     }
   }
 
@@ -808,7 +899,8 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
     const cssH = Math.max(180, Math.round(rect.height || canvas.clientHeight || 220));
     healthChartCssW = cssW;
     healthChartCssH = cssH;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const rawDpr = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
+    const dpr = Math.min(rawDpr, 2);
     if (canvas.width !== cssW * dpr || canvas.height !== cssH * dpr) {
       canvas.width = cssW * dpr;
       canvas.height = cssH * dpr;
@@ -816,7 +908,7 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cssW, cssH);
 
-    const rawRecords = (healthDashboard?.records ?? []).slice(0, healthTrendLimit).slice().reverse();
+    const rawRecords = (healthDashboard?.records ?? []).slice(0, healthTrendLimit).toReversed();
     const series: Array<{ rec: HealthRecord; value: number; unit: string; label: string }> = [];
     for (const r of rawRecords) {
       const ext = extractTrendValue(r, healthTrendMetric);
@@ -824,8 +916,12 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
     }
     healthPlottedPoints = [];
 
+    const isIndustrial = typeof document !== 'undefined' && document.documentElement?.dataset?.theme === 'industrial';
+    const axisTextCol = isIndustrial ? '#52525b' : '#94a3b8';
+    const gridStrokeCol = isIndustrial ? 'rgba(24, 24, 27, 0.12)' : 'rgba(148, 163, 184, 0.16)';
+
     if (series.length === 0) {
-      ctx.fillStyle = '#94a3b8';
+      ctx.fillStyle = axisTextCol;
       ctx.font = '13px sans-serif';
       ctx.textAlign = 'center';
       ctx.fillText('暂无该指标的历史趋势数据，完成测量或补录后自动绘制', cssW / 2, cssH / 2);
@@ -833,9 +929,11 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
       return;
     }
 
-    const isIndustrial = document.documentElement.dataset.theme === 'industrial';
-    const focusAccent = isIndustrial ? '#ff6b1a' : '#fbbf24';
-    const focusCrosshair = isIndustrial ? 'rgba(255, 107, 26, 0.50)' : 'rgba(251, 191, 36, 0.45)';
+    const focusAccent = isIndustrial ? '#c2410c' : '#fbbf24';
+    const focusCrosshair = isIndustrial ? 'rgba(194, 65, 12, 0.50)' : 'rgba(251, 191, 36, 0.45)';
+    const pointOutline = isIndustrial ? '#f7f4ed' : '#090b10';
+    const lineColor = isIndustrial ? '#0284c7' : '#38bdf8';
+    const activePointFill = isIndustrial ? '#0ea5e9' : '#7dd3fc';
 
     const firstSeries = series[0];
     if (!firstSeries) return;
@@ -875,12 +973,12 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
     for (let i = 0; i <= gridSteps; i++) {
       const val = minV + (vRange * (gridSteps - i)) / gridSteps;
       const y = padT + (plotH * i) / gridSteps;
-      ctx.strokeStyle = 'rgba(148, 163, 184, 0.16)';
+      ctx.strokeStyle = gridStrokeCol;
       ctx.beginPath();
       ctx.moveTo(padL, y);
       ctx.lineTo(cssW - padR, y);
       ctx.stroke();
-      ctx.fillStyle = '#94a3b8';
+      ctx.fillStyle = axisTextCol;
       const valStr = healthTrendMetric === 'bmr' || healthTrendMetric === 'impedance'
         ? Math.round(val).toString()
         : val.toFixed(1);
@@ -932,13 +1030,13 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
           const p = pts[i];
           if (p) ctx.lineTo(p.x, p.y);
         }
-        ctx.strokeStyle = '#38bdf8';
+        ctx.strokeStyle = lineColor;
         ctx.lineWidth = 2.4;
         ctx.stroke();
       }
     }
 
-    ctx.fillStyle = '#94a3b8';
+    ctx.fillStyle = axisTextCol;
     ctx.font = '11px sans-serif';
     ctx.textAlign = 'center';
     const tickCount = Math.min(pts.length, 5);
@@ -973,9 +1071,9 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
       }
       ctx.beginPath();
       ctx.arc(p.x, p.y, isActive ? 5.2 : 3.2, 0, Math.PI * 2);
-      ctx.fillStyle = isSelected ? focusAccent : i === activeHoverIdx ? '#7dd3fc' : '#38bdf8';
+      ctx.fillStyle = isSelected ? focusAccent : i === activeHoverIdx ? activePointFill : lineColor;
       ctx.fill();
-      ctx.strokeStyle = '#090b10';
+      ctx.strokeStyle = pointOutline;
       ctx.lineWidth = 1.5;
       ctx.stroke();
     }
@@ -1097,10 +1195,36 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
     healthMetricsGrid.replaceChildren(frag);
   }
 
+  function setRawJsonText(text: string) {
+    let codeEl = healthRawJson.querySelector?.('code') ?? null;
+    if (!codeEl && typeof document !== 'undefined' && typeof document.createElement === 'function') {
+      codeEl = document.createElement('code');
+      healthRawJson.replaceChildren(codeEl);
+    }
+    if (codeEl) {
+      codeEl.textContent = text;
+    } else {
+      healthRawJson.textContent = text;
+    }
+  }
+
+  function renderHealthRawJson(inspected: HealthRecord | null) {
+    if (healthRawDetails && !healthRawDetails.open) return;
+    if (!inspected) {
+      setRawJsonText(json({ device: healthDashboard?.device ?? null, liveSession: healthDashboard?.liveSession ?? null }));
+      return;
+    }
+    setRawJsonText(json({
+      record: { ...inspected, metrics: undefined },
+      device: healthDashboard?.device ?? null,
+      liveSession: healthDashboard?.liveSession ?? null,
+    }));
+  }
+
   function renderHealthRawTelemetry(inspected: HealthRecord | null) {
     if (!inspected) {
       healthRawGrid.replaceChildren(node('p', '暂无单次记录原始遥测帧。', 'empty'));
-      healthRawJson.textContent = json({ device: healthDashboard?.device ?? null, liveSession: healthDashboard?.liveSession ?? null });
+      renderHealthRawJson(null);
       return;
     }
 
@@ -1126,11 +1250,7 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
       frag.append(cell);
     }
     healthRawGrid.replaceChildren(frag);
-    healthRawJson.textContent = json({
-      record: { ...inspected, metrics: undefined },
-      device: healthDashboard?.device ?? null,
-      liveSession: healthDashboard?.liveSession ?? null,
-    });
+    renderHealthRawJson(inspected);
   }
 
   function renderHealthProfilesBar() {
@@ -1139,10 +1259,15 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
       healthProfilesBar.replaceChildren(node('p', '暂无成员档案，请在下方表单保存您的首位成员。', 'empty'));
       return;
     }
+    const focusedProfileKey = typeof document !== 'undefined' && healthProfilesBar.contains?.(document.activeElement)
+      ? ((document.activeElement as HTMLElement | null)?.dataset?.profileFocusKey ?? null)
+      : null;
+
     const now = Date.now();
     const frag = document.createDocumentFragment();
     for (const p of healthDashboard.profiles) {
-      const chip = node('div', '', `health-profile-chip${p.id === healthDashboard.activeProfileId ? ' active' : ''}`);
+      const isSelected = p.id === healthDashboard.activeProfileId;
+      const chip = node('div', '', `health-profile-chip${isSelected ? ' active' : ''}`);
       const selectBtn = button(
         `${p.name}${p.isDefault ? ' ★默认' : ''} (${p.sex === 'male' ? '男' : '女'} ${p.heightCm}cm ${p.age}岁)`,
         () => {
@@ -1151,6 +1276,9 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
         },
         'mini-button',
       );
+      selectBtn.setAttribute('aria-pressed', String(isSelected));
+      selectBtn.setAttribute('aria-label', `切换至成员档案 ${p.name}`);
+      selectBtn.dataset.profileFocusKey = `${p.id}:select`;
       chip.append(selectBtn);
 
       if (!p.isDefault && healthDashboard.profiles.length > 1) {
@@ -1167,16 +1295,25 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
           renderHealthProfilesBar();
           void deleteHealthProfileFromUi(p.id);
         }, 'mini-button danger-btn');
+        delBtn.setAttribute('aria-label', isArmed ? `确认删除成员档案 ${p.name}` : `删除成员档案 ${p.name}`);
+        delBtn.dataset.profileFocusKey = `${p.id}:del`;
         chip.append(delBtn);
       }
       frag.append(chip);
     }
     healthProfilesBar.replaceChildren(frag);
+    if (focusedProfileKey) {
+      const targetBtn = Array.from(healthProfilesBar.querySelectorAll<HTMLButtonElement>('button[data-profile-focus-key]'))
+        .find(b => b.dataset.profileFocusKey === focusedProfileKey);
+      if (targetBtn) safeFocus(targetBtn, { preventScroll: true });
+    }
   }
 
   function renderHealthRecordsList() {
     for (const btn of healthSourceFilters.querySelectorAll<HTMLButtonElement>('button[data-source]')) {
-      btn.classList.toggle('active', btn.dataset.source === healthSourceFilter);
+      const isActive = btn.dataset.source === healthSourceFilter;
+      btn.classList.toggle('active', isActive);
+      btn.setAttribute('aria-pressed', String(isActive));
     }
     const all = healthDashboard?.records ?? [];
     const filtered = healthSourceFilter === 'all' ? all : all.filter(r => r.source === healthSourceFilter);
@@ -1189,6 +1326,10 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
       return;
     }
 
+    const focusedRecordKey = typeof document !== 'undefined' && healthRecordsList.contains?.(document.activeElement)
+      ? ((document.activeElement as HTMLElement | null)?.dataset?.recordFocusKey ?? null)
+      : null;
+
     const now = Date.now();
     const frag = document.createDocumentFragment();
     for (const rec of filtered) {
@@ -1197,15 +1338,22 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
       const srcInfo = healthSourceLabel(rec.source);
       const m = rec.metrics;
       const row = node('div', '', `health-record-row${isSelected ? ' selected' : ''}`);
-      row.addEventListener('click', () => {
+      const timeLabel = timestamp(rec.measuredAt);
+      const weightLabel = formatWeightWithUnit(rec.weightKg, healthUnit, 2);
+
+      const mainBtn = node('button', '', 'work-row-main health-record-main') as HTMLButtonElement;
+      mainBtn.type = 'button';
+      mainBtn.setAttribute('aria-pressed', String(isSelected));
+      mainBtn.setAttribute('aria-label', `检视 ${weightLabel} 测量记录（${timeLabel}，${srcInfo.text}）`);
+      mainBtn.dataset.recordFocusKey = `${rec.id}:inspect`;
+      mainBtn.addEventListener('click', () => {
         healthInspectedRecordId = rec.id;
         renderHealthModal();
       });
 
-      const mainCol = node('div', '', 'health-record-main');
-      const titleRow = node('div', '', 'health-record-title');
+      const titleRow = node('span', '', 'health-record-title');
       titleRow.append(
-        node('strong', formatWeightWithUnit(rec.weightKg, healthUnit, 2), 'health-record-weight'),
+        node('strong', weightLabel, 'health-record-weight'),
         node('span', srcInfo.text, `hub-badge ${srcInfo.cls}`),
       );
       if (rec.deltaFromPrevKg !== null) {
@@ -1215,12 +1363,12 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
       if (rec.primaryOhm !== null) {
         titleRow.append(node('span', `BIA ${rec.primaryOhm} Ω`, 'hub-badge badge-teal'));
       }
-      titleRow.append(node('span', timestamp(rec.measuredAt), 'meta'));
+      titleRow.append(node('span', timeLabel, 'meta'));
 
       const subText = m
         ? `BMI ${m.bmi} (${m.bmiCategory}) · 体脂 ${m.bodyFatPercent}% · 骨骼肌 ${m.skeletalMusclePercent}% · 水分 ${m.waterPercent}% · 内脏脂肪 ${m.visceralFatLevel} 级 · 评分 ${m.bodyScore}${rec.note ? ` · ${rec.note}` : ''}`
         : (rec.note || '无扩展成分');
-      mainCol.append(titleRow, node('div', subText, 'hint'));
+      mainBtn.append(titleRow, node('span', subText, 'hint'));
 
       const actionsCol = node('div', '', 'health-record-actions');
       const armedAt = healthRecordDeleteArmed.get(rec.id) ?? 0;
@@ -1236,13 +1384,22 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
         renderHealthRecordsList();
         void deleteHealthRecordFromUi(rec.id);
       }, 'mini-button danger-btn');
-      delBtn.addEventListener('click', e => e.stopPropagation());
+      delBtn.setAttribute(
+        'aria-label',
+        isArmed ? `确认删除 ${timeLabel} 的体重记录` : `删除 ${timeLabel} 的体重记录`,
+      );
+      delBtn.dataset.recordFocusKey = `${rec.id}:del`;
       actionsCol.append(delBtn);
 
-      row.append(mainCol, actionsCol);
+      row.append(mainBtn, actionsCol);
       frag.append(row);
     }
     healthRecordsList.replaceChildren(frag);
+    if (focusedRecordKey) {
+      const targetBtn = Array.from(healthRecordsList.querySelectorAll<HTMLButtonElement>('button[data-record-focus-key]'))
+        .find(b => b.dataset.recordFocusKey === focusedRecordKey);
+      if (targetBtn) safeFocus(targetBtn, { preventScroll: true });
+    }
   }
 
   function renderHealthModal() {
@@ -1344,30 +1501,37 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
   }
 
   async function saveHealthProfileFromUi() {
-    if (appState.authExpired) return;
+    if (disposed || appState.authExpired) return;
+    for (const f of [healthProfileName, healthProfileAge, healthProfileHeight, healthProfileTarget]) {
+      f.setAttribute('aria-invalid', 'false');
+    }
     const name = healthProfileName.value.trim();
     if (!name) {
+      healthProfileName.setAttribute('aria-invalid', 'true');
       setHealthActionStatus('请填写成员昵称', 'warn');
-      healthProfileName.focus();
+      safeFocus(healthProfileName);
       return;
     }
     const age = Number(healthProfileAge.value.trim());
     if (!Number.isFinite(age) || age < 5 || age > 120) {
+      healthProfileAge.setAttribute('aria-invalid', 'true');
       setHealthActionStatus('请填写有效年龄（5 ~ 120 岁）', 'warn');
-      healthProfileAge.focus();
+      safeFocus(healthProfileAge);
       return;
     }
     const heightCm = Number(healthProfileHeight.value.trim());
     if (!Number.isFinite(heightCm) || heightCm < 80 || heightCm > 230) {
+      healthProfileHeight.setAttribute('aria-invalid', 'true');
       setHealthActionStatus('请填写有效身高（80 ~ 230 cm）', 'warn');
-      healthProfileHeight.focus();
+      safeFocus(healthProfileHeight);
       return;
     }
     const targetRaw = healthProfileTarget.value.trim();
     const targetWeightKg = targetRaw === '' ? null : Number(targetRaw);
     if (targetWeightKg !== null && (!Number.isFinite(targetWeightKg) || targetWeightKg < 20 || targetWeightKg > 250)) {
+      healthProfileTarget.setAttribute('aria-invalid', 'true');
       setHealthActionStatus('目标体重需在 20 ~ 250 kg 之间', 'warn');
-      healthProfileTarget.focus();
+      safeFocus(healthProfileTarget);
       return;
     }
 
@@ -1425,17 +1589,20 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
   }
 
   async function addManualHealthRecordFromUi() {
-    if (appState.authExpired) return;
+    if (disposed || appState.authExpired) return;
+    healthManualWeight.setAttribute('aria-invalid', 'false');
+    healthManualTime.setAttribute('aria-invalid', 'false');
     if (!healthDashboard?.activeProfile) {
       setHealthActionStatus('请先创建并保存成员档案后再补录记录。', 'warn');
       healthProfileDetails.open = true;
-      healthProfileName.focus();
+      safeFocus(healthProfileName);
       return;
     }
     const rawWeight = Number(healthManualWeight.value);
     if (!Number.isFinite(rawWeight) || rawWeight <= 0) {
+      healthManualWeight.setAttribute('aria-invalid', 'true');
       setHealthActionStatus('请输入有效的体重数值', 'warn');
-      healthManualWeight.focus();
+      safeFocus(healthManualWeight);
       return;
     }
     ++dashboardFetchSeq;
@@ -1455,8 +1622,9 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
       if (timeRaw !== '') {
         const parsedAt = new Date(timeRaw).getTime();
         if (!Number.isFinite(parsedAt)) {
+          healthManualTime.setAttribute('aria-invalid', 'true');
           setHealthActionStatus('请输入有效的测量时间格式', 'warn');
-          healthManualTime.focus();
+          safeFocus(healthManualTime);
           return;
         }
         args.measuredAt = parsedAt;
@@ -1505,7 +1673,7 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
     }
   }
 
-  function handleHealthCanvasPointer(event: MouseEvent, selectPoint: boolean) {
+  function handleHealthCanvasPointer(event: PointerEvent | MouseEvent, selectPoint: boolean) {
     if (!healthPlottedPoints.length) return;
     const rect = healthTrendCanvas.getBoundingClientRect();
     const scaleX = rect.width > 0 ? healthChartCssW / rect.width : 1;
@@ -1538,17 +1706,70 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
     }
   }
 
+  function scheduleHealthChartRedraw() {
+    if (!options.isVisible()) return;
+    if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+      if (resizeRafId !== null) window.cancelAnimationFrame(resizeRafId);
+      resizeRafId = window.requestAnimationFrame(() => {
+        resizeRafId = null;
+        if (options.isVisible()) renderHealthTrendChart();
+      });
+    } else {
+      renderHealthTrendChart();
+    }
+  }
+
   function activate() {
+    if (disposed) return;
+    active = true;
+    ++badgeSeq;
+    badgeAc?.abort();
+    badgeAc = null;
     setHealthActionStatus();
     healthScanBtn.disabled = appState.authExpired;
     healthMeasureStopBtn.disabled = appState.authExpired;
     healthProfileSaveBtn.disabled = appState.authExpired;
     healthManualAddBtn.disabled = appState.authExpired;
+
+    activeAc?.abort();
+    activeAc = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    if (activeAc) {
+      if (typeof window !== 'undefined') {
+        listenEvent(window, 'friday:themechange', () => {
+          if (options.isVisible()) renderHealthTrendChart();
+        }, activeAc.signal);
+      }
+      if (typeof document !== 'undefined') {
+        listenEvent(document, 'visibilitychange', () => {
+          if (!active || !options.isVisible() || appState.authExpired) return;
+          if (isDocHidden()) {
+            stopHealthMeasurePoll();
+          } else if (HEALTH_ACTIVE_PHASES.has(healthLastSessionPhase)) {
+            scheduleHealthMeasurePoll(200);
+          }
+        }, activeAc.signal);
+      }
+    }
+
+    resizeObserver?.disconnect();
+    resizeObserver = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      const target = healthTrendCanvas.parentElement ?? healthTrendCanvas;
+      resizeObserver = new ResizeObserver(() => {
+        scheduleHealthChartRedraw();
+      });
+      resizeObserver.observe(target);
+    }
+
     if (healthDashboard) {
       renderHealthModal();
-      window.requestAnimationFrame(() => {
-        if (options.isVisible()) renderHealthTrendChart();
-      });
+      if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+        window.requestAnimationFrame(() => {
+          if (options.isVisible()) renderHealthTrendChart();
+        });
+      } else {
+        renderHealthTrendChart();
+      }
     }
     if (!appState.authExpired) {
       void refreshHealthDashboard();
@@ -1556,35 +1777,44 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
   }
 
   function deactivate() {
+    active = false;
+    activeAc?.abort();
+    activeAc = null;
+    resizeObserver?.disconnect();
+    resizeObserver = null;
+    if (resizeRafId !== null && typeof window !== 'undefined' && typeof window.cancelAnimationFrame === 'function') {
+      window.cancelAnimationFrame(resizeRafId);
+      resizeRafId = null;
+    }
     stopHealthMeasurePoll();
     clearAllHealthDeleteArms();
   }
 
-  healthRefreshBtn.addEventListener('click', () => void refreshHealthDashboard());
-  healthProfileSelect.addEventListener('change', () => {
+  listenEvent(healthRefreshBtn, 'click', () => void refreshHealthDashboard(), lifecycleAc.signal);
+  listenEvent(healthProfileSelect, 'change', () => {
     const nextId = healthProfileSelect.value;
     if (!nextId) return;
     healthInspectedRecordId = null;
     void refreshHealthDashboard({ profileId: nextId });
-  });
-  healthUnitKg.addEventListener('click', () => {
+  }, lifecycleAc.signal);
+  listenEvent(healthUnitKg, 'click', () => {
     healthUnit = 'kg';
     renderHealthTopBadge();
     renderHealthModal();
-  });
-  healthUnitJin.addEventListener('click', () => {
+  }, lifecycleAc.signal);
+  listenEvent(healthUnitJin, 'click', () => {
     healthUnit = 'jin';
     renderHealthTopBadge();
     renderHealthModal();
-  });
-  healthMeasureStartBtn.addEventListener('click', () => void startHealthMeasureFromUi());
-  healthMeasureStopBtn.addEventListener('click', () => void stopHealthMeasureFromUi());
-  healthScanBtn.addEventListener('click', () => void scanHealthScaleFromUi());
-  healthInspectLatestBtn.addEventListener('click', () => {
+  }, lifecycleAc.signal);
+  listenEvent(healthMeasureStartBtn, 'click', () => void startHealthMeasureFromUi(), lifecycleAc.signal);
+  listenEvent(healthMeasureStopBtn, 'click', () => void stopHealthMeasureFromUi(), lifecycleAc.signal);
+  listenEvent(healthScanBtn, 'click', () => void scanHealthScaleFromUi(), lifecycleAc.signal);
+  listenEvent(healthInspectLatestBtn, 'click', () => {
     healthInspectedRecordId = null;
     renderHealthModal();
-  });
-  healthTrendMetrics.addEventListener('click', event => {
+  }, lifecycleAc.signal);
+  listenEvent(healthTrendMetrics, 'click', event => {
     const target = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-metric]');
     const metric = target?.dataset.metric as HealthTrendMetricKey | undefined;
     if (!metric) return;
@@ -1592,8 +1822,8 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
     healthHoveredPointIdx = null;
     renderHealthTrendControls();
     renderHealthTrendChart();
-  });
-  healthTrendRanges.addEventListener('click', event => {
+  }, lifecycleAc.signal);
+  listenEvent(healthTrendRanges, 'click', event => {
     const target = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-range]');
     const range = Number(target?.dataset.range);
     if (!Number.isFinite(range) || range <= 0) return;
@@ -1601,39 +1831,73 @@ export function initHealthScaleUi(options: HealthScaleUiOptions): HealthScaleUiC
     healthHoveredPointIdx = null;
     renderHealthTrendControls();
     renderHealthTrendChart();
-  });
-  healthTrendCanvas.addEventListener('mousemove', event => handleHealthCanvasPointer(event, false));
-  healthTrendCanvas.addEventListener('click', event => handleHealthCanvasPointer(event, true));
-  healthTrendCanvas.addEventListener('mouseleave', () => {
+  }, lifecycleAc.signal);
+  listenEvent(healthTrendCanvas, 'pointermove', event => {
+    const pe = event as PointerEvent;
+    if (pe.pointerType === 'touch') return;
+    handleHealthCanvasPointer(pe, false);
+  }, lifecycleAc.signal);
+  listenEvent(healthTrendCanvas, 'pointerdown', event => {
+    handleHealthCanvasPointer(event as PointerEvent, false);
+  }, lifecycleAc.signal);
+  listenEvent(healthTrendCanvas, 'click', event => handleHealthCanvasPointer(event as MouseEvent, true), lifecycleAc.signal);
+  const clearHealthCanvasHover = () => {
     if (healthHoveredPointIdx !== null) {
       healthHoveredPointIdx = null;
       renderHealthTrendChart();
     }
-  });
-  healthSourceFilters.addEventListener('click', event => {
+  };
+  listenEvent(healthTrendCanvas, 'pointerleave', clearHealthCanvasHover, lifecycleAc.signal);
+  listenEvent(healthTrendCanvas, 'pointercancel', clearHealthCanvasHover, lifecycleAc.signal);
+  listenEvent(healthSourceFilters, 'click', event => {
     const target = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('button[data-source]');
     const src = target?.dataset.source as HealthSourceFilterKey | undefined;
     if (!src) return;
     healthSourceFilter = src;
     renderHealthRecordsList();
-  });
-  healthProfileNewBtn.addEventListener('click', clearHealthProfileFormForNew);
-  healthProfileSaveBtn.addEventListener('click', () => void saveHealthProfileFromUi());
-  healthManualAddBtn.addEventListener('click', () => void addManualHealthRecordFromUi());
-  window.addEventListener('resize', () => {
-    if (options.isVisible()) {
-      renderHealthTrendChart();
-    }
-  });
-  window.addEventListener('friday:themechange', () => {
-    if (options.isVisible()) {
-      renderHealthTrendChart();
-    }
-  });
+  }, lifecycleAc.signal);
+  if (healthRawDetails) {
+    listenEvent(healthRawDetails, 'toggle', () => {
+      if (healthRawDetails.open && healthDashboard) {
+        renderHealthRawJson(getInspectedHealthRecord());
+      }
+    }, lifecycleAc.signal);
+  }
+  listenEvent(healthProfileNewBtn, 'click', clearHealthProfileFormForNew, lifecycleAc.signal);
+  bindFormSubmission(healthProfileForm, healthProfileSaveBtn, () => void saveHealthProfileFromUi(), lifecycleAc.signal);
+  bindFormSubmission(healthManualForm, healthManualAddBtn, () => void addManualHealthRecordFromUi(), lifecycleAc.signal);
 
   return {
     activate,
     deactivate,
-    refreshBadge: () => (appState.authExpired ? Promise.resolve() : refreshHealthDashboard({ quiet: true })),
+    refreshBadge: async () => {
+      if (disposed || active || appState.authExpired) return;
+      const bSeq = ++badgeSeq;
+      badgeAc?.abort();
+      const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      badgeAc = ac;
+      try {
+        const res = await runHealthPlugin<HealthDashboardData>('dashboard', {}, {
+          priority: 'low',
+          ...(ac ? { signal: ac.signal } : {}),
+        });
+        if (disposed || active || bSeq !== badgeSeq || appState.authExpired) return;
+        if (res.ok && res.data) {
+          applyHealthDashboard(res.data);
+        }
+      } catch {
+        // Silent badge refresh failure
+      } finally {
+        if (badgeAc === ac) badgeAc = null;
+      }
+    },
+    dispose: () => {
+      if (disposed) return;
+      disposed = true;
+      deactivate();
+      badgeAc?.abort();
+      badgeAc = null;
+      lifecycleAc.abort();
+    },
   };
 }

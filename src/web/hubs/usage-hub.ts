@@ -10,10 +10,12 @@ import type {
 } from '../../view.js';
 import { button, element, isEditingWithin, kpiCard, node, svgNode } from '../shared/dom.js';
 import { errorText, timestamp } from '../shared/format.js';
+import { replaceChildrenPreservingFocus, wireHubForm } from '../shared/plugin-catalog.js';
+import { announceStatus, isImeComposing, safeFocus } from '../shared/ui-primitives.js';
 import { api, appState, hooks } from '../state.js';
 
 export interface UsageHubOptions {
-  isVisible: () => boolean;
+  isVisible?: () => boolean;
   onBadgeChange?: (summary: { calls: number; badgeText: string; moneyText: string; detailText: string }) => void;
 }
 
@@ -21,6 +23,25 @@ export interface UsageHubController {
   activate: () => void;
   render: (force?: boolean) => void;
 }
+
+const zhIntFormatter = typeof Intl !== 'undefined'
+  ? new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 0 })
+  : null;
+const zhCompact1Formatter = typeof Intl !== 'undefined'
+  ? new Intl.NumberFormat('zh-CN', { minimumFractionDigits: 1, maximumFractionDigits: 1 })
+  : null;
+const zhFixed2Formatter = typeof Intl !== 'undefined'
+  ? new Intl.NumberFormat('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  : null;
+const zhFixed4Formatter = typeof Intl !== 'undefined'
+  ? new Intl.NumberFormat('zh-CN', { minimumFractionDigits: 4, maximumFractionDigits: 4 })
+  : null;
+const zhPercentFormatter = typeof Intl !== 'undefined'
+  ? new Intl.NumberFormat('zh-CN', { style: 'percent', minimumFractionDigits: 1, maximumFractionDigits: 1 })
+  : null;
+const zhDatePartsFormatter = typeof Intl !== 'undefined'
+  ? new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' })
+  : null;
 
 const ACTOR_ORDER: readonly UsageActor[] = [
   'router',
@@ -61,23 +82,33 @@ const COST_SOURCE_META: Record<UsageCostSource, { label: string; badgeClass: str
 
 function formatInt(value: number): string {
   if (!Number.isFinite(value)) return '0';
-  return Math.round(value).toLocaleString('zh-CN');
+  const rounded = Math.round(value);
+  return zhIntFormatter ? zhIntFormatter.format(rounded) : String(rounded);
 }
 
 function formatCompact(value: number): string {
   if (!Number.isFinite(value) || value === 0) return '0';
   const abs = Math.abs(value);
-  if (abs >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
-  if (abs >= 10_000) return `${(value / 1_000).toFixed(1)}K`;
-  if (abs >= 1_000) return `${(value / 1_000).toFixed(2)}K`;
+  if (abs >= 1_000_000) {
+    const num = value / 1_000_000;
+    return `${zhFixed2Formatter ? zhFixed2Formatter.format(num) : num.toFixed(2)}M`;
+  }
+  if (abs >= 10_000) {
+    const num = value / 1_000;
+    return `${zhCompact1Formatter ? zhCompact1Formatter.format(num) : num.toFixed(1)}K`;
+  }
+  if (abs >= 1_000) {
+    const num = value / 1_000;
+    return `${zhFixed2Formatter ? zhFixed2Formatter.format(num) : num.toFixed(2)}K`;
+  }
   return formatInt(value);
 }
 
 function formatMoneyAmount(value: number, symbol: '¥' | '$'): string {
   if (!Number.isFinite(value) || value === 0) return `${symbol}0.00`;
   const abs = Math.abs(value);
-  if (abs >= 0.01) return `${symbol}${value.toFixed(2)}`;
-  if (abs >= 0.0001) return `${symbol}${value.toFixed(4)}`;
+  if (abs >= 0.01) return `${symbol}${zhFixed2Formatter ? zhFixed2Formatter.format(value) : value.toFixed(2)}`;
+  if (abs >= 0.0001) return `${symbol}${zhFixed4Formatter ? zhFixed4Formatter.format(value) : value.toFixed(4)}`;
   return `< ${symbol}0.0001`;
 }
 
@@ -102,12 +133,13 @@ function formatPrimarySavings(
 
 function formatPercent(ratio: number): string {
   if (!Number.isFinite(ratio) || ratio <= 0) return '0.0%';
-  return `${Math.min(100, Math.max(0, ratio * 100)).toFixed(1)}%`;
+  const clamped = Math.min(1, Math.max(0, ratio));
+  return zhPercentFormatter ? zhPercentFormatter.format(clamped) : `${(clamped * 100).toFixed(1)}%`;
 }
 
 function formatUnitRate(usdPer1M: number): string {
   if (!Number.isFinite(usdPer1M) || usdPer1M <= 0) return '$0';
-  if (usdPer1M >= 1) return `$${usdPer1M.toFixed(2)}`;
+  if (usdPer1M >= 1) return `$${zhFixed2Formatter ? zhFixed2Formatter.format(usdPer1M) : usdPer1M.toFixed(2)}`;
   return `$${Number(usdPer1M.toFixed(4))}`;
 }
 
@@ -121,13 +153,25 @@ function formatTimezoneChip(tzOffsetMin: number): string {
 
 function localTodayDateString(): string {
   const now = new Date();
+  if (zhDatePartsFormatter) {
+    try {
+      const parts = zhDatePartsFormatter.formatToParts(now);
+      const y = parts.find(p => p.type === 'year')?.value;
+      const m = parts.find(p => p.type === 'month')?.value;
+      const d = parts.find(p => p.type === 'day')?.value;
+      if (y && m && d) return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
+    } catch {
+      // Fall back to manual date parts
+    }
+  }
   const y = now.getFullYear();
   const m = String(now.getMonth() + 1).padStart(2, '0');
   const d = String(now.getDate()).padStart(2, '0');
   return `${y}-${m}-${d}`;
 }
 
-export function initUsageHub(options: UsageHubOptions): UsageHubController {
+export function initUsageHub(options: UsageHubOptions = {}): UsageHubController {
+  const isVisible = () => Boolean(options?.isVisible?.());
   const usageTopBadge = element<HTMLElement>('usage-top-badge');
   const usagePanelEl = element<HTMLElement>('system-panel-usage');
   const usageRefreshBtn = element<HTMLButtonElement>('usage-refresh-btn');
@@ -144,6 +188,7 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
   const usageTzChip = element<HTMLElement>('usage-tz-chip');
   const currCnyBtn = element<HTMLButtonElement>('usage-curr-cny');
   const currUsdBtn = element<HTMLButtonElement>('usage-curr-usd');
+  const usageRateForm = (typeof document !== 'undefined' ? document.getElementById('usage-rate-form') : null) as HTMLFormElement | null;
   const usageRateInput = element<HTMLInputElement>('usage-rate-input');
   const usageRateSaveBtn = element<HTMLButtonElement>('usage-rate-save-btn');
   const usageStatusBanner = element<HTMLElement>('usage-status-banner');
@@ -158,12 +203,24 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
   const usageModelsList = element<HTMLElement>('usage-models-list');
   const usageActorsGrid = element<HTMLElement>('usage-actors-grid');
 
+  const lifecycleAc = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const signal = lifecycleAc?.signal;
+  let fetchAc: AbortController | null = null;
+
   let granularity: UsageGranularity = 'day';
   let anchorDate: string | undefined;
   let report: UsageReportView | undefined;
+  let renderedReportRef: UsageReportView | undefined;
+  let lastFetchedTodaySig = '';
   let loading = false;
   let prefsBusy = false;
   let fetchSeq = 0;
+
+  function todaySignature(): string {
+    const today = appState.view?.usageToday;
+    if (!today) return '';
+    return `${today.date}:${today.calls}:${today.totalTokens}:${today.costUsd}:${today.currency}:${today.usdToCnyRate}`;
+  }
 
   function setStatusError(message?: string) {
     if (!message) {
@@ -173,6 +230,7 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
     }
     usageStatusBanner.hidden = false;
     usageStatusBanner.textContent = message;
+    announceStatus(message, 'assertive');
   }
 
   function updateToolbarControls() {
@@ -187,13 +245,15 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
     for (const [btn, key] of granButtons) {
       const active = granularity === key;
       btn.classList.toggle('active', active);
-      btn.setAttribute('aria-selected', active ? 'true' : 'false');
+      btn.setAttribute('aria-pressed', active ? 'true' : 'false');
       btn.disabled = disabled || prefsBusy;
     }
 
-    const activeCurrency: UsageCurrency = report?.prefs.currency ?? appState.view?.usageToday?.currency ?? 'CNY';
+    const activeCurrency: UsageCurrency = report?.prefs?.currency ?? appState.view?.usageToday?.currency ?? 'CNY';
     currCnyBtn.classList.toggle('active', activeCurrency === 'CNY');
+    currCnyBtn.setAttribute('aria-pressed', activeCurrency === 'CNY' ? 'true' : 'false');
     currUsdBtn.classList.toggle('active', activeCurrency === 'USD');
+    currUsdBtn.setAttribute('aria-pressed', activeCurrency === 'USD' ? 'true' : 'false');
     currCnyBtn.disabled = busy;
     currUsdBtn.disabled = busy;
 
@@ -254,7 +314,8 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
       viewBox: `0 0 ${vbWidth} ${vbHeight}`,
       class: 'usage-chart-svg',
       role: 'img',
-      'aria-label': usageChartTitle.textContent ?? '模型用量趋势图',
+      'aria-label': `${usageChartTitle.textContent ?? '模型用量趋势图'}（共 ${buckets.length} 个时段，总调用 ${formatInt(current.totals.calls)} 次）`,
+      'aria-describedby': 'usage-chart-sr-summary',
     });
 
     const formatAxisTick = (val: number): string => {
@@ -357,7 +418,40 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
       svg.append(group);
     });
 
-    usageChartShell.replaceChildren(svg);
+    const srSummary = node('div', '', 'visually-hidden');
+    srSummary.id = 'usage-chart-sr-summary';
+    const peakBucket = buckets.reduce((best, cur) => (valueOf(cur) > valueOf(best) ? cur : best), buckets[0]!);
+    srSummary.append(
+      node(
+        'p',
+        `${usageChartTitle.textContent ?? '趋势'}，${usageChartSubtitle.textContent ?? ''}。总计调用 ${formatInt(current.totals.calls)} 次，消耗 ${formatInt(current.totals.totalTokens)} Token，金额 ${formatPrimaryMoney(current.totals, currency)}；峰值时段 ${peakBucket.label}（${formatInt(peakBucket.calls)} 次）。`,
+      ),
+    );
+    const srTable = node('table');
+    const srCaption = node('caption', `${usageChartTitle.textContent ?? '趋势'}明细表`);
+    const thead = node('thead');
+    const headRow = node('tr');
+    for (const col of ['时段', '调用次数', 'Token', '金额']) {
+      const th = node('th', col);
+      th.setAttribute('scope', 'col');
+      headRow.append(th);
+    }
+    thead.append(headRow);
+    const tbody = node('tbody');
+    for (const bucket of buckets) {
+      const tr = node('tr');
+      tr.append(
+        node('td', bucket.label),
+        node('td', `${formatInt(bucket.calls)} 次`),
+        node('td', formatInt(bucket.totalTokens)),
+        node('td', formatPrimaryMoney(bucket, currency)),
+      );
+      tbody.append(tr);
+    }
+    srTable.append(srCaption, thead, tbody);
+    srSummary.append(srTable);
+
+    usageChartShell.replaceChildren(svg, srSummary);
   }
 
   function renderRecentPeriods(current: UsageReportView) {
@@ -366,7 +460,7 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
     else usageRecentTitle.textContent = '近 6 个月汇总';
 
     if (!current.recentPeriods.length) {
-      usageRecentGrid.replaceChildren(node('p', '暂无历史对比数据。', 'empty hub-empty-state'));
+      replaceChildrenPreservingFocus(usageRecentGrid, node('p', '暂无历史对比数据。', 'empty hub-empty-state'));
       return;
     }
 
@@ -378,6 +472,9 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
         anchorDate = period.anchorDate;
         void fetchReport();
       }, cls);
+      card.dataset.focusKey = `period:${period.anchorDate}`;
+      card.setAttribute('aria-pressed', String(selected));
+      if (period.isCurrent) card.setAttribute('aria-current', 'date');
 
       const top = node('div', '', 'usage-period-card-head');
       top.append(node('span', period.label, 'usage-period-card-label'));
@@ -390,7 +487,7 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
       card.append(top, amount, meta);
       frag.append(card);
     }
-    usageRecentGrid.replaceChildren(frag);
+    replaceChildrenPreservingFocus(usageRecentGrid, frag);
   }
 
   function renderModelCard(item: UsageModelBreakdownView, current: UsageReportView): HTMLElement {
@@ -426,7 +523,12 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
     const bar = document.createElement('progress');
     bar.className = 'usage-share-progress';
     bar.max = 100;
-    bar.value = Math.max(0, Math.min(100, Number(sharePct.toFixed(1))));
+    const boundedPct = Math.max(0, Math.min(100, Number(sharePct.toFixed(1))));
+    bar.value = boundedPct;
+    bar.setAttribute(
+      'aria-label',
+      `${item.provider} ${item.model} ${current.totals.costUsd > 0 ? '费用' : 'Token'}占比 ${boundedPct.toFixed(1)}%`,
+    );
     progressWrap.append(progressHead, bar);
     card.append(progressWrap);
 
@@ -595,15 +697,16 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
     renderChart(current);
     renderRecentPeriods(current);
 
+    renderedReportRef = current;
     usageModelsSubtitle.textContent = byModel.length ? `共 ${byModel.length} 款模型` : '';
     if (!byModel.length) {
-      usageModelsList.replaceChildren(node('p', '当前周期暂无模型调用记录。', 'empty hub-empty-state'));
+      replaceChildrenPreservingFocus(usageModelsList, node('p', '当前周期暂无模型调用记录。', 'empty hub-empty-state'));
     } else {
       const modelsFrag = document.createDocumentFragment();
       for (const item of byModel) {
         modelsFrag.append(renderModelCard(item, current));
       }
-      usageModelsList.replaceChildren(modelsFrag);
+      replaceChildrenPreservingFocus(usageModelsList, modelsFrag);
     }
 
     renderActors(current);
@@ -613,6 +716,9 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
   async function fetchReport(silent = false) {
     if (appState.authExpired || !appState.ready) return;
     const seq = ++fetchSeq;
+    fetchAc?.abort();
+    const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    fetchAc = ac;
     loading = true;
     if (!silent) {
       setStatusError(undefined);
@@ -625,16 +731,27 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
         tzOffsetMin: String(tzOffsetMin),
       });
       if (anchorDate) params.set('anchorDate', anchorDate);
-      const data = await api<UsageReportView>(`/api/usage?${params.toString()}`);
-      if (seq !== fetchSeq) return;
+      const data = await api<UsageReportView>(
+        `/api/usage?${params.toString()}`,
+        undefined,
+        {
+          ...(ac ? { signal: ac.signal } : {}),
+          ...(silent ? { priority: 'low' as const } : {}),
+        },
+      );
+      if (seq !== fetchSeq || ac?.signal.aborted) return;
       report = data;
       anchorDate = data.anchorDate;
+      if (data.granularity === 'day' && data.anchorDate === data.todayDate) {
+        lastFetchedTodaySig = todaySignature();
+      }
       setStatusError(undefined);
       renderReport(data);
     } catch (error) {
-      if (seq !== fetchSeq) return;
+      if (seq !== fetchSeq || ac?.signal.aborted) return;
       if (!silent) setStatusError(`加载模型用量统计失败：${errorText(error)}`);
     } finally {
+      if (fetchAc === ac) fetchAc = null;
       if (seq === fetchSeq) {
         loading = false;
         updateToolbarControls();
@@ -664,6 +781,12 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
       render(true);
       await fetchReport(true);
       await hooks.refreshView();
+      announceStatus(
+        patch.currency
+          ? `已切换显示币种为 ${patch.currency === 'USD' ? '美元' : '人民币'}`
+          : `已更新汇率为 1 USD = ${updated.usdToCnyRate} CNY`,
+        'polite',
+      );
     } catch (error) {
       setStatusError(`保存偏好设置失败：${errorText(error)}`);
     } finally {
@@ -675,10 +798,12 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
   function submitExchangeRate() {
     const raw = Number(usageRateInput.value);
     if (!Number.isFinite(raw) || raw < 0.1 || raw > 100) {
+      usageRateInput.setAttribute('aria-invalid', 'true');
       setStatusError('汇率须为 0.1 ~ 100 之间的有效数字（例如 7.25）。');
-      usageRateInput.focus();
+      safeFocus(usageRateInput);
       return;
     }
+    usageRateInput.setAttribute('aria-invalid', 'false');
     void savePreferences({ usdToCnyRate: raw });
   }
 
@@ -686,7 +811,7 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
     const today = appState.view?.usageToday;
     if (!today || today.calls <= 0) {
       usageTopBadge.textContent = '0';
-      options.onBadgeChange?.({
+      options?.onBadgeChange?.({
         calls: 0,
         badgeText: '0',
         moneyText: '',
@@ -699,7 +824,7 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
       const cacheBadgeDetail = (today.cacheReadTokens ?? 0) > 0
         ? ` · 缓存命中 ${formatPercent(today.cacheHitRate ?? 0)}${(today.cacheSavingsUsd ?? 0) > 0 ? ` (净省 ${formatPrimarySavings({ cacheSavingsUsd: today.cacheSavingsUsd ?? 0, cacheSavingsCny: today.cacheSavingsCny ?? 0 }, today.currency)})` : ''}`
         : '';
-      options.onBadgeChange?.({
+      options?.onBadgeChange?.({
         calls: today.calls,
         badgeText,
         moneyText: primary,
@@ -707,27 +832,31 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
       });
     }
 
-    if (!options.isVisible() && !force) {
+    if (!isVisible() && !force) {
       return;
     }
 
     updateToolbarControls();
-    if (report) {
-      renderReport(report);
-    }
 
     const todayStr = report?.todayDate ?? today?.date ?? localTodayDateString();
     const isViewingToday = !anchorDate || anchorDate === todayStr;
-    if (
+    const currentTodaySig = todaySignature();
+    const shouldFetchToday =
       !force
-      && options.isVisible()
+      && isVisible()
       && isViewingToday
       && !loading
       && !prefsBusy
       && !appState.authExpired
       && appState.ready
       && !isEditingWithin(usagePanelEl)
-    ) {
+      && (!report || currentTodaySig !== lastFetchedTodaySig || report.anchorDate !== todayStr);
+
+    if (report && (force || (renderedReportRef !== report && !shouldFetchToday))) {
+      renderReport(report);
+    }
+
+    if (shouldFetchToday) {
       void fetchReport(true);
     }
   }
@@ -746,7 +875,8 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
     void fetchReport();
   }
 
-  usageRefreshBtn.addEventListener('click', () => { void fetchReport(); });
+  const listenerOpts = signal ? { signal } : undefined;
+  usageRefreshBtn.addEventListener('click', () => { void fetchReport(); }, listenerOpts);
 
   for (const [btn, nextGran] of [
     [granDayBtn, 'day'],
@@ -758,7 +888,7 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
       granularity = nextGran;
       updateToolbarControls();
       void fetchReport();
-    });
+    }, listenerOpts);
   }
 
   usagePrevBtn.addEventListener('click', () => {
@@ -766,31 +896,42 @@ export function initUsageHub(options: UsageHubOptions): UsageHubController {
       anchorDate = report.prevAnchorDate;
       void fetchReport();
     }
-  });
+  }, listenerOpts);
   usageNextBtn.addEventListener('click', () => {
     if (report?.nextAnchorDate) {
       anchorDate = report.nextAnchorDate;
       void fetchReport();
     }
-  });
+  }, listenerOpts);
   usageTodayBtn.addEventListener('click', () => {
     anchorDate = undefined;
     void fetchReport();
-  });
+  }, listenerOpts);
   usageDateInput.addEventListener('change', () => {
     anchorDate = usageDateInput.value || undefined;
     void fetchReport();
-  });
+  }, listenerOpts);
 
-  currCnyBtn.addEventListener('click', () => { void savePreferences({ currency: 'CNY' }); });
-  currUsdBtn.addEventListener('click', () => { void savePreferences({ currency: 'USD' }); });
-  usageRateSaveBtn.addEventListener('click', submitExchangeRate);
+  currCnyBtn.addEventListener('click', () => { void savePreferences({ currency: 'CNY' }); }, listenerOpts);
+  currUsdBtn.addEventListener('click', () => { void savePreferences({ currency: 'USD' }); }, listenerOpts);
+  wireHubForm(usageRateForm, usageRateSaveBtn, submitExchangeRate, signal);
   usageRateInput.addEventListener('keydown', event => {
-    if (event.key === 'Enter' && !event.isComposing) {
+    if (event.key === 'Enter' && !isImeComposing(event)) {
       event.preventDefault();
-      submitExchangeRate();
+      if (usageRateForm && typeof (usageRateForm as { requestSubmit?: unknown }).requestSubmit === 'function') {
+        usageRateForm.requestSubmit();
+      } else {
+        submitExchangeRate();
+      }
     }
-  });
+  }, listenerOpts);
+
+  if (typeof window !== 'undefined') {
+    window.addEventListener('pagehide', () => {
+      fetchAc?.abort();
+      lifecycleAc?.abort();
+    }, listenerOpts);
+  }
 
   return {
     activate,

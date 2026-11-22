@@ -1,5 +1,6 @@
 import type { PluginActionSpec, PluginView, TimerView } from '../../view.js';
-import { svgNode } from './dom.js';
+import { node, svgNode } from './dom.js';
+import { announceStatus, attachDelayedFormValidation, safeFocus } from './ui-primitives.js';
 
 export const PLUGIN_SIDEBAR_COLLAPSED_KEY = 'friday.plugin-sidebar-collapsed';
 export const PLUGIN_ORDER_STORAGE_KEY = 'friday.plugin-order';
@@ -356,9 +357,10 @@ export interface PluginPrefsSyncHandle {
 export function createPluginPrefsSync(handlers: {
   onCollapsed?: (collapsed: boolean) => void;
   onOrder?: (order: string[]) => void;
+  signal?: AbortSignal;
 }): PluginPrefsSyncHandle {
   let channel: BroadcastChannel | undefined;
-  if (typeof BroadcastChannel === 'function') {
+  if (typeof BroadcastChannel === 'function' && !handlers.signal?.aborted) {
     try {
       const bc = new BroadcastChannel(PLUGIN_PREFS_CHANNEL_NAME);
       const unref = (bc as unknown as { unref?: () => void }).unref;
@@ -391,9 +393,26 @@ export function createPluginPrefsSync(handlers: {
       handlers.onOrder?.(readPluginOrder());
     }
   };
-  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
-    window.addEventListener('storage', onStorage);
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function' && !handlers.signal?.aborted) {
+    if (handlers.signal) {
+      window.addEventListener('storage', onStorage, { signal: handlers.signal });
+    } else {
+      window.addEventListener('storage', onStorage);
+    }
   }
+
+  const close = () => {
+    if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+      window.removeEventListener('storage', onStorage);
+    }
+    try {
+      channel?.close();
+    } catch {
+      // Ignore close errors.
+    }
+    channel = undefined;
+  };
+  handlers.signal?.addEventListener('abort', close, { once: true });
 
   return {
     broadcastCollapsed(collapsed: boolean) {
@@ -410,17 +429,7 @@ export function createPluginPrefsSync(handlers: {
         // Ignore closed channel errors.
       }
     },
-    close() {
-      if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
-        window.removeEventListener('storage', onStorage);
-      }
-      try {
-        channel?.close();
-      } catch {
-        // Ignore close errors.
-      }
-      channel = undefined;
-    },
+    close,
   };
 }
 
@@ -895,4 +904,156 @@ export function createUiIconSvg(
 ): SVGSVGElement {
   const shapes = UI_ICON_SHAPES[kind] ?? UI_ICON_SHAPES['sidebar-collapse']!;
   return buildSvgFromShapes(shapes, className, size);
+}
+
+/**
+ * Escapes arbitrary strings for CSS attribute selectors in both real browsers and FakeDOM.
+ */
+export function cssEscapeValue(value: string): string {
+  if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
+    return CSS.escape(value);
+  }
+  return value.replace(/["\\]/g, '\\$&');
+}
+
+/**
+ * Safely checks `document.hidden` across real browsers and Node environments.
+ */
+export function isDocumentHidden(): boolean {
+  return typeof document !== 'undefined' && Boolean(document.hidden);
+}
+
+function isFocusableCandidate(el: HTMLElement): boolean {
+  if ((el as { hidden?: unknown }).hidden === true || el.hasAttribute?.('hidden')) return false;
+  if ((el as { disabled?: unknown }).disabled === true || el.hasAttribute?.('disabled')) return false;
+  if (el.getAttribute?.('tabindex') === '-1') return false;
+  return true;
+}
+
+/**
+ * Replaces `container`'s children while preserving keyboard focus by `data-focus-key` or `id`,
+ * falling back to the nearest surviving control or `fallbackFocus` if the focused node was removed.
+ */
+export function replaceChildrenPreservingFocus(
+  container: HTMLElement,
+  content: Node | readonly (Node | string)[],
+  fallbackFocus?: () => HTMLElement | null | undefined,
+): void {
+  const hasDoc = typeof document !== 'undefined' && document !== null;
+  const active = hasDoc ? document.activeElement : null;
+  const hadFocus = Boolean(active && container.contains?.(active));
+  let focusKey = '';
+  let prevIdx = -1;
+
+  if (hadFocus && active) {
+    const activeEl = active as HTMLElement;
+    focusKey = activeEl.getAttribute?.('data-focus-key') ?? activeEl.dataset?.focusKey ?? activeEl.id ?? '';
+    const beforeControls = Array.from(
+      container.querySelectorAll?.('button, input, select, textarea, a') ?? [],
+    ).filter((el): el is HTMLElement => isFocusableCandidate(el as HTMLElement));
+    prevIdx = beforeControls.indexOf(activeEl);
+  }
+
+  if (Array.isArray(content)) {
+    container.replaceChildren(...(content as Array<Node | string>));
+  } else {
+    container.replaceChildren(content as Node);
+  }
+
+  if (!hadFocus) return;
+
+  if (focusKey) {
+    const keyed = Array.from(container.querySelectorAll?.('[data-focus-key]') ?? []) as HTMLElement[];
+    const match = keyed.find(el =>
+      (el.getAttribute?.('data-focus-key') ?? el.dataset?.focusKey) === focusKey && isFocusableCandidate(el),
+    );
+    if (match) {
+      safeFocus(match, { preventScroll: true });
+      return;
+    }
+    const byId = hasDoc ? document.getElementById?.(focusKey) : null;
+    if (byId && container.contains?.(byId) && isFocusableCandidate(byId)) {
+      safeFocus(byId, { preventScroll: true });
+      return;
+    }
+  }
+
+  const afterControls = Array.from(
+    container.querySelectorAll?.('button, input, select, textarea, a') ?? [],
+  ).filter((el): el is HTMLElement => isFocusableCandidate(el as HTMLElement));
+  if (afterControls.length > 0) {
+    const targetIdx = prevIdx >= 0 ? Math.min(prevIdx, afterControls.length - 1) : 0;
+    safeFocus(afterControls[targetIdx], { preventScroll: true });
+    return;
+  }
+
+  const fallback = fallbackFocus?.();
+  if (fallback && isFocusableCandidate(fallback)) {
+    safeFocus(fallback, { preventScroll: true });
+  }
+}
+
+/**
+ * Ensures an inline form error banner `<p>` exists inside `form` for visible modal validation errors.
+ */
+export function ensureInlineFormError(form: HTMLFormElement | null, errorId: string): HTMLElement | null {
+  if (!form || typeof document === 'undefined') return null;
+  const existing = document.getElementById?.(errorId);
+  if (existing) return existing;
+  const p = node('p', '', 'error hub-error-banner');
+  p.id = errorId;
+  p.setAttribute('role', 'alert');
+  p.hidden = true;
+  form.append(p);
+  return p;
+}
+
+/**
+ * Displays or clears an inline modal form validation error, syncing `aria-invalid` and live announcements.
+ */
+export function setInlineFormError(
+  errorEl: HTMLElement | null,
+  message?: string,
+  invalidFields: readonly (HTMLElement | null | undefined)[] = [],
+): void {
+  const clean = (message ?? '').trim();
+  if (errorEl) {
+    errorEl.hidden = !clean;
+    errorEl.textContent = clean;
+  }
+  for (const field of invalidFields) {
+    if (!field) continue;
+    field.setAttribute?.('aria-invalid', clean ? 'true' : 'false');
+  }
+  if (clean) {
+    announceStatus(clean, 'assertive');
+  }
+}
+
+/**
+ * Binds `<form>` `submit` (`preventDefault()` + delayed validation) with a FakeDOM click fallback
+ * when `form.requestSubmit` is unavailable on synthetic test elements.
+ */
+export function wireHubForm(
+  form: HTMLFormElement | null,
+  submitBtn: HTMLButtonElement | null,
+  onSubmit: () => void,
+  signal?: AbortSignal,
+): void {
+  if (signal?.aborted) return;
+  const opts = signal ? { signal } : undefined;
+  if (form) {
+    attachDelayedFormValidation(form, signal);
+    form.addEventListener('submit', event => {
+      event.preventDefault();
+      onSubmit();
+    }, opts);
+  }
+  if (submitBtn) {
+    submitBtn.addEventListener('click', () => {
+      if (!form || typeof (form as { requestSubmit?: unknown }).requestSubmit !== 'function') {
+        onSubmit();
+      }
+    }, opts);
+  }
 }

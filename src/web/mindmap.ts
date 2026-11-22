@@ -1,6 +1,9 @@
 import {
-  buildOverviewFlowchart,
-  buildSessionFlowchart,
+  buildOverviewFlowchartAsync,
+  buildSessionFlowchartAsync,
+  compareTextLocale,
+  formatClockShort,
+  formatCount,
   formatDuration,
   formatTimeShort,
   getEffectiveSessions,
@@ -23,12 +26,49 @@ import {
   type MindmapWorkerPhase,
   type MindmapWorkerStep,
 } from './mindmap-data.js';
-import { ApiError, createHttpClient, resolveBootstrapToken } from './shared/auth-http.js';
+import { ApiError, createHttpClient, resolveBootstrapToken, type ApiRequestOptions, type FetchPriority } from './shared/auth-http.js';
 import { createSharedSseHub, type SseUpdateBatch } from './shared/sse-hub.js';
 import { bindThemeButtons } from './shared/theme.js';
 import { initMobileViewport } from './shared/mobile-viewport.js';
+import {
+  announceStatus,
+  bindRovingTablist,
+  copyTextWithFeedback,
+  isImeComposing,
+  onReducedMotionChange,
+  prefersReducedMotion,
+  safeFocus,
+  syncRovingTablist,
+  yieldToMain,
+} from './shared/ui-primitives.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
+const DOM_DELTA_LINE = typeof WheelEvent !== 'undefined' && typeof WheelEvent.DOM_DELTA_LINE === 'number' ? WheelEvent.DOM_DELTA_LINE : 1;
+const DOM_DELTA_PAGE = typeof WheelEvent !== 'undefined' && typeof WheelEvent.DOM_DELTA_PAGE === 'number' ? WheelEvent.DOM_DELTA_PAGE : 2;
+
+function nowMs(): number {
+  return typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now()
+    : Date.now();
+}
+
+function scrollElementIntoViewRespectingMotion(target: Element): void {
+  const scrollFn = (target as { scrollIntoView?: (arg?: ScrollIntoViewOptions | boolean) => void }).scrollIntoView;
+  if (typeof scrollFn !== 'function') return;
+  try {
+    scrollFn.call(target, {
+      block: 'nearest',
+      inline: 'nearest',
+      behavior: prefersReducedMotion() ? 'auto' : 'smooth',
+    });
+  } catch {
+    try {
+      scrollFn.call(target, { block: 'nearest' });
+    } catch {
+      // Ignore scroll errors in minimal stubs
+    }
+  }
+}
 
 type ViewMode = 'session' | 'overview' | 'list';
 type SidebarMode = 'sessions' | 'turns';
@@ -90,22 +130,43 @@ let panX = 24;
 let panY = 18;
 let zoom = 1;
 let viewportAnimRaf = 0;
+let viewportRenderRaf = 0;
 let viewportTargetPanX = panX;
 let viewportTargetPanY = panY;
 let viewportTargetZoom = zoom;
 let isDragging = false;
 let dragMoved = false;
+let suppressNextClick = false;
+let lastDragEndedAt = 0;
 let dragStartX = 0;
 let dragStartY = 0;
 let dragPanStartX = 0;
 let dragPanStartY = 0;
+const activePointers = new Map<number, { x: number; y: number }>();
+let pinchStartDist = 0;
+let pinchStartZoom = 1;
+let pinchStartPanX = 0;
+let pinchStartPanY = 0;
+let pinchStartMidX = 0;
+let pinchStartMidY = 0;
 let lastRenderedInspectorKey = '';
+let sidebarRenderSeq = 0;
+let canvasBuildSeq = 0;
+let canvasRenderSeq = 0;
+let listRenderSeq = 0;
+let searchDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+let isSearchComposing = false;
+let pendingSidebarRefit = false;
+let lastConnAnnouncement = '';
 
 const workspaceEl = el<HTMLElement>('mm-canvas-panel').parentElement!;
 const toggleSidebarBtn = el<HTMLButtonElement>('mm-toggle-sidebar');
 const viewSessionBtn = el<HTMLButtonElement>('view-session-btn');
 const viewOverviewBtn = el<HTMLButtonElement>('view-overview-btn');
 const viewListBtn = el<HTMLButtonElement>('view-list-btn');
+const viewTabsEl = (typeof document !== 'undefined' && typeof document.querySelector === 'function'
+  ? document.querySelector<HTMLElement>('.mm-view-tabs')
+  : null) ?? viewSessionBtn.parentElement;
 const searchInput = el<HTMLInputElement>('mm-search-input');
 const searchClearBtn = el<HTMLButtonElement>('mm-search-clear');
 const expandAllBtn = el<HTMLButtonElement>('mm-expand-all');
@@ -118,7 +179,11 @@ const fitBtn = el<HTMLButtonElement>('mm-fit-btn');
 const refreshBtn = el<HTMLButtonElement>('mm-refresh-btn');
 const connPillEl = el<HTMLSpanElement>('mm-conn-pill');
 const canvasControlsEl = el<HTMLElement>('mm-canvas-controls');
-bindThemeButtons(el<HTMLButtonElement>('mm-theme-spatial'), el<HTMLButtonElement>('mm-theme-industrial'));
+bindThemeButtons(
+  el<HTMLButtonElement>('mm-theme-spatial'),
+  el<HTMLButtonElement>('mm-theme-industrial'),
+  el<HTMLButtonElement>('mm-theme-system'),
+);
 initMobileViewport();
 
 const kpiSessionsEl = el<HTMLElement>('kpi-sessions');
@@ -146,6 +211,7 @@ const matrixGridEl = el<HTMLElement>('mm-matrix-grid');
 const authBannerEl = el<HTMLElement>('mm-auth-banner');
 
 const svgElRoot = el<SVGSVGElement>('mm-svg');
+svgElRoot.setAttribute('aria-description', '使用方向键平移画布，加号或等号放大，减号缩小，数字键 0 重置视图');
 const viewportEl = el<SVGGElement>('mm-viewport');
 const framesLayerEl = el<SVGGElement>('mm-frames');
 const edgesLayerEl = el<SVGGElement>('mm-edges');
@@ -171,13 +237,22 @@ const http = createHttpClient({
   missingTokenMessage: 'Unauthorized',
 });
 
-async function apiGet<T>(path: string): Promise<T> {
-  return http.api<T>(path);
+async function apiGet<T>(path: string, init?: ApiRequestOptions): Promise<T> {
+  return http.api<T>(path, undefined, init);
 }
 
 function setConnState(state: 'live' | 'error' | 'loading', label: string) {
   connPillEl.textContent = label;
   connPillEl.className = `mm-conn-pill${state === 'live' ? ' live' : state === 'error' ? ' error' : ''}`;
+  if (state === 'error' && label !== lastConnAnnouncement) {
+    lastConnAnnouncement = label;
+    announceStatus(label, authExpired ? 'assertive' : 'polite');
+  } else if (state === 'live' && lastConnAnnouncement && lastConnAnnouncement !== '已连接实时库') {
+    lastConnAnnouncement = '已连接实时库';
+    announceStatus(label, 'polite');
+  } else if (state === 'live' && !lastConnAnnouncement) {
+    lastConnAnnouncement = '已连接实时库';
+  }
 }
 
 function flowMatchesSearchText(flow: MindmapTaskFlow, q: string): boolean {
@@ -227,10 +302,44 @@ function getFilteredFlows(): MindmapTaskFlow[] {
   return loadedFlows.filter(flowMatchesFilter);
 }
 
+async function filterFlowsChunked(shouldAbort: () => boolean): Promise<MindmapTaskFlow[] | null> {
+  const out: MindmapTaskFlow[] = [];
+  let deadline = nowMs() + 50;
+  for (let i = 0; i < loadedFlows.length; i += 1) {
+    const flow = loadedFlows[i]!;
+    if (flowMatchesFilter(flow)) out.push(flow);
+    if (i < loadedFlows.length - 1 && nowMs() >= deadline) {
+      await yieldToMain();
+      if (shouldAbort()) return null;
+      deadline = nowMs() + 50;
+    }
+  }
+  return out;
+}
+
 function getAllSessions(): { all: MindmapSession[]; filtered: MindmapSession[]; flowsById: Map<string, MindmapTaskFlow> } {
   const flowsById = new Map(loadedFlows.map(f => [f.id, f]));
   const all = getEffectiveSessions(snapshot, loadedFlows);
   const filtered = all.filter(s => sessionMatchesFilter(s, flowsById));
+  return { all, filtered, flowsById };
+}
+
+async function getAllSessionsAsync(
+  shouldAbort: () => boolean,
+): Promise<{ all: MindmapSession[]; filtered: MindmapSession[]; flowsById: Map<string, MindmapTaskFlow> } | null> {
+  const flowsById = new Map(loadedFlows.map(f => [f.id, f]));
+  const all = getEffectiveSessions(snapshot, loadedFlows);
+  const filtered: MindmapSession[] = [];
+  let deadline = nowMs() + 50;
+  for (let i = 0; i < all.length; i += 1) {
+    const s = all[i]!;
+    if (sessionMatchesFilter(s, flowsById)) filtered.push(s);
+    if (i < all.length - 1 && nowMs() >= deadline) {
+      await yieldToMain();
+      if (shouldAbort()) return null;
+      deadline = nowMs() + 50;
+    }
+  }
   return { all, filtered, flowsById };
 }
 
@@ -243,10 +352,16 @@ function applyViewportTransform() {
   zoomLabelEl.textContent = `${Math.round(zoom * 100)}%`;
 }
 
-function prefersReducedMotion(): boolean {
-  return typeof window !== 'undefined'
-    && typeof window.matchMedia === 'function'
-    && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+function scheduleViewportRender(): void {
+  if (typeof requestAnimationFrame !== 'function') {
+    applyViewportTransform();
+    return;
+  }
+  if (viewportRenderRaf) return;
+  viewportRenderRaf = requestAnimationFrame(() => {
+    viewportRenderRaf = 0;
+    applyViewportTransform();
+  });
 }
 
 function cancelViewportAnimation(): void {
@@ -254,7 +369,21 @@ function cancelViewportAnimation(): void {
     cancelAnimationFrame(viewportAnimRaf);
   }
   viewportAnimRaf = 0;
+  if (viewportRenderRaf && typeof cancelAnimationFrame === 'function') {
+    cancelAnimationFrame(viewportRenderRaf);
+  }
+  viewportRenderRaf = 0;
 }
+
+onReducedMotionChange(reduced => {
+  if (reduced && viewportAnimRaf) {
+    cancelViewportAnimation();
+    panX = viewportTargetPanX;
+    panY = viewportTargetPanY;
+    zoom = viewportTargetZoom;
+    applyViewportTransform();
+  }
+});
 
 function springEase(t: number): number {
   if (t <= 0) return 0;
@@ -282,7 +411,7 @@ function animateViewportTo(targetPanX: number, targetPanY: number, targetZoom: n
   const startPanX = panX;
   const startPanY = panY;
   const startZoom = zoom;
-  const startAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  const startAt = nowMs();
   const step = (now: number) => {
     const elapsed = now - startAt;
     const t = Math.min(1, Math.max(0, elapsed / durationMs));
@@ -341,40 +470,92 @@ function renderKpis() {
   const { all } = getAllSessions();
   const totalSessions = s.totalSessions ?? all.length;
   const multiTurn = s.multiTurnSessions ?? all.filter(sess => sess.turnCount >= 2).length;
-  kpiSessionsEl.textContent = multiTurn > 0 ? `${totalSessions} (${multiTurn} 多轮)` : String(totalSessions);
-  kpiFlowsEl.textContent = String(s.totalFlows);
-  kpiWechatEl.textContent = String(s.wechatFlows);
-  kpiLocalEl.textContent = String(s.localFlows);
-  kpiTimerEl.textContent = String(s.timerFlows);
-  kpiTasksEl.textContent = String(s.totalTasks);
-  kpiJevEl.textContent = String(s.jevCalls);
-  kpiMemoriesEl.textContent = String(s.totalMemories);
+  kpiSessionsEl.textContent = multiTurn > 0 ? `${formatCount(totalSessions)} (${formatCount(multiTurn)} 多轮)` : formatCount(totalSessions);
+  kpiFlowsEl.textContent = formatCount(s.totalFlows);
+  kpiWechatEl.textContent = formatCount(s.wechatFlows);
+  kpiLocalEl.textContent = formatCount(s.localFlows);
+  kpiTimerEl.textContent = formatCount(s.timerFlows);
+  kpiTasksEl.textContent = formatCount(s.totalTasks);
+  kpiJevEl.textContent = formatCount(s.jevCalls);
+  kpiMemoriesEl.textContent = formatCount(s.totalMemories);
   kpiModelBadgeEl.textContent = `主控: ${s.routerProvider}/${s.routerModel} · 决策: ${s.decisionModel}${s.decisionConfigured ? ' ✓' : ' (启发式)'}`;
 }
 
-function renderSidebar() {
-  const { all, filtered, flowsById } = getAllSessions();
-  const filteredFlows = getFilteredFlows();
+function getFocusedSidebarKey(): { kind: 'session' | 'flow'; id: string } | null {
+  if (typeof document === 'undefined') return null;
+  const active = document.activeElement as Element | null;
+  if (!active || !flowListEl.contains?.(active)) return null;
+  const item = typeof active.closest === 'function' ? active.closest('.mm-flow-item') : active;
+  if (!item) return null;
+  const sid = item.getAttribute?.('data-session-id');
+  if (sid) return { kind: 'session', id: sid };
+  const fid = item.getAttribute?.('data-flow-id');
+  if (fid) return { kind: 'flow', id: fid };
+  return null;
+}
+
+function restoreSidebarFocus(key: { kind: 'session' | 'flow'; id: string } | null): void {
+  if (!key) return;
+  const attr = key.kind === 'session' ? 'data-session-id' : 'data-flow-id';
+  let fallback: HTMLElement | null = null;
+  for (const child of flowListEl.children) {
+    if (!fallback && child.tagName === 'BUTTON') fallback = child as HTMLElement;
+    if (child.getAttribute?.(attr) === key.id) {
+      safeFocus(child as HTMLElement, { preventScroll: true });
+      return;
+    }
+  }
+  if (fallback) safeFocus(fallback, { preventScroll: true });
+}
+
+function syncSidebarSelectionInPlace(): void {
+  for (const child of flowListEl.children) {
+    const sid = child.getAttribute?.('data-session-id') ?? '';
+    const fid = child.getAttribute?.('data-flow-id') ?? '';
+    const active = sidebarMode === 'sessions'
+      ? Boolean(sid && sid === selectedSessionId)
+      : Boolean(fid && fid === selectedFlowId);
+    child.classList?.toggle('active', active);
+    if (active) child.setAttribute?.('aria-current', 'true');
+    else child.removeAttribute?.('aria-current');
+  }
+}
+
+async function renderSidebar(announceSummary = false): Promise<void> {
+  const seq = ++sidebarRenderSeq;
+  const shouldAbort = () => seq !== sidebarRenderSeq;
+  const sessionData = await getAllSessionsAsync(shouldAbort);
+  if (!sessionData || shouldAbort()) return;
+  const { all, filtered, flowsById } = sessionData;
+  const filteredFlows = await filterFlowsChunked(shouldAbort);
+  if (!filteredFlows || shouldAbort()) return;
 
   if (sidebarMode === 'sessions') {
     const multiCount = filtered.filter(s => s.turnCount >= 2).length;
     sidebarCountEl.textContent = snapshot
-      ? `显示 ${filtered.length} 个会话 (多轮 ${multiCount}) / 已载 ${all.length} 会话`
+      ? `显示 ${formatCount(filtered.length)} 个会话 (多轮 ${formatCount(multiCount)}) / 已载 ${formatCount(all.length)} 会话`
       : '等待数据…';
   } else {
     sidebarCountEl.textContent = snapshot
-      ? `显示 ${filteredFlows.length} / 已加载 ${loadedFlows.length} (全库 ${snapshot.summary.totalFlows} 条)`
+      ? `显示 ${formatCount(filteredFlows.length)} / 已加载 ${formatCount(loadedFlows.length)} (全库 ${formatCount(snapshot.summary.totalFlows)} 条)`
       : '等待数据…';
   }
   loadMoreWrapEl.hidden = !snapshot?.hasMore;
 
-  flowListEl.replaceChildren();
+  const focusedKey = getFocusedSidebarKey();
+  const nextChildren: Element[] = [];
+  let deadline = nowMs() + 50;
+
   if (sidebarMode === 'sessions') {
     if (!filtered.length) {
-      flowListEl.appendChild(domEl('p', 'mm-muted', '当前筛选条件下没有匹配的 AI 会话。'));
+      const emptyEl = domEl('p', 'mm-muted', '当前筛选条件下没有匹配的 AI 会话。');
+      emptyEl.setAttribute('role', 'status');
+      flowListEl.replaceChildren(emptyEl);
+      if (announceSummary) announceStatus('当前筛选条件下没有匹配的 AI 会话。');
       return;
     }
-    for (const session of filtered) {
+    for (let i = 0; i < filtered.length; i += 1) {
+      const session = filtered[i]!;
       const turns = resolveSessionTurns(session, flowsById);
       const first = turns[0]!;
       const last = turns[turns.length - 1]!;
@@ -383,12 +564,15 @@ function renderSidebar() {
         : session.kind === 'timer'
           ? 'src-timer'
           : 'src-local';
-      const item = domEl('button', `mm-flow-item ${srcClass}${session.id === selectedSessionId ? ' active' : ''}`);
+      const isActive = session.id === selectedSessionId;
+      const item = domEl('button', `mm-flow-item ${srcClass}${isActive ? ' active' : ''}`);
       item.type = 'button';
+      item.setAttribute('data-session-id', session.id);
+      if (isActive) item.setAttribute('aria-current', 'true');
 
       const top = domEl('div', 'mm-flow-item-top');
       const timeRange = session.turnCount > 1
-        ? `${sourceIcon(first.ingress.sourceKind)} ${formatTimeShort(session.startedAt)} ~ ${formatTimeShort(session.updatedAt).slice(6)}`
+        ? `${sourceIcon(first.ingress.sourceKind)} ${formatTimeShort(session.startedAt)} ~ ${formatClockShort(session.updatedAt)}`
         : `${sourceIcon(first.ingress.sourceKind)} #${first.seq || '后台'} · ${formatTimeShort(session.startedAt)}`;
       top.appendChild(domEl('span', undefined, timeRange));
       const badgeGroup = domEl('div', 'mm-insp-badges');
@@ -427,30 +611,47 @@ function renderSidebar() {
         selectedSessionId = session.id;
         selectedFlowId = last.id;
         selectedNodeId = '';
-        renderSidebar();
+        syncSidebarSelectionInPlace();
         if (viewMode === 'list') {
-          renderListMatrix();
+          void renderListMatrix();
           renderInspectorForPayload({ flow: last, snapshot: snapshot ?? undefined, session });
         } else if (viewMode === 'overview') {
-          rebuildAndRenderCanvas(false);
-          scrollToFrame(`ov-frame:${session.id}`);
+          void rebuildAndRenderCanvas(false).then(() => {
+            scrollToFrame(`ov-frame:${session.id}`);
+          });
         } else {
-          rebuildAndRenderCanvas(true);
+          void rebuildAndRenderCanvas(true);
         }
       });
-      flowListEl.appendChild(item);
+      nextChildren.push(item);
+
+      if (i < filtered.length - 1 && nowMs() >= deadline) {
+        await yieldToMain();
+        if (shouldAbort()) return;
+        deadline = nowMs() + 50;
+      }
     }
+    flowListEl.replaceChildren(...nextChildren);
+    restoreSidebarFocus(focusedKey);
+    if (announceSummary && snapshot) announceStatus(sidebarCountEl.textContent ?? '');
     return;
   }
 
   // Turn-by-turn fallback sidebar mode
   if (!filteredFlows.length) {
-    flowListEl.appendChild(domEl('p', 'mm-muted', '当前筛选条件下没有匹配的消息记录。'));
+    const emptyEl = domEl('p', 'mm-muted', '当前筛选条件下没有匹配的消息记录。');
+    emptyEl.setAttribute('role', 'status');
+    flowListEl.replaceChildren(emptyEl);
+    if (announceSummary) announceStatus('当前筛选条件下没有匹配的消息记录。');
     return;
   }
-  for (const flow of filteredFlows) {
-    const item = domEl('button', `mm-flow-item src-${flow.ingress.sourceKind}${flow.id === selectedFlowId ? ' active' : ''}`);
+  for (let i = 0; i < filteredFlows.length; i += 1) {
+    const flow = filteredFlows[i]!;
+    const isActive = flow.id === selectedFlowId;
+    const item = domEl('button', `mm-flow-item src-${flow.ingress.sourceKind}${isActive ? ' active' : ''}`);
     item.type = 'button';
+    item.setAttribute('data-flow-id', flow.id);
+    if (isActive) item.setAttribute('aria-current', 'true');
 
     const top = domEl('div', 'mm-flow-item-top');
     const turnTag = flow.turnCount && flow.turnCount > 1 ? ` · 第${flow.turnIndex}/${flow.turnCount}轮` : '';
@@ -474,17 +675,27 @@ function renderSidebar() {
       if (owner) selectedSessionId = owner.id;
       selectedFlowId = flow.id;
       selectedNodeId = `${flow.id}:fc:ingress`;
-      renderSidebar();
+      syncSidebarSelectionInPlace();
       if (viewMode === 'list') {
-        renderListMatrix();
+        void renderListMatrix();
         renderInspectorForPayload({ flow, snapshot: snapshot ?? undefined, session: owner });
       } else {
-        rebuildAndRenderCanvas(false);
-        scrollToFrame(viewMode === 'overview' && owner ? `ov-frame:${owner.id}` : `frame:${flow.id}`);
+        void rebuildAndRenderCanvas(false).then(() => {
+          scrollToFrame(viewMode === 'overview' && owner ? `ov-frame:${owner.id}` : `frame:${flow.id}`);
+        });
       }
     });
-    flowListEl.appendChild(item);
+    nextChildren.push(item);
+
+    if (i < filteredFlows.length - 1 && nowMs() >= deadline) {
+      await yieldToMain();
+      if (shouldAbort()) return;
+      deadline = nowMs() + 50;
+    }
   }
+  flowListEl.replaceChildren(...nextChildren);
+  restoreSidebarFocus(focusedKey);
+  if (announceSummary && snapshot) announceStatus(sidebarCountEl.textContent ?? '');
 }
 
 function pointsToRoundedOrthogonalPath(pts: Array<{ x: number; y: number }>, radius = 8): string {
@@ -520,6 +731,12 @@ function pointsToRoundedOrthogonalPath(pts: Array<{ x: number; y: number }>, rad
 }
 
 function renderFlowchartNodeShape(g: SVGGElement, n: FlowchartNode) {
+  const titleEl = svgEl('title');
+  const fullMetric = n.metric ? ` · ${n.metric}` : '';
+  const fullStatus = n.status ? ` [${statusLabel(n.status)}]` : '';
+  titleEl.textContent = `${n.badge}：${n.title}\n${n.subtitle}${fullMetric}${fullStatus}`;
+  g.appendChild(titleEl);
+
   const { w, h, shape } = n;
   if (shape === 'pill') {
     g.appendChild(svgEl('rect', { x: 0, y: 0, width: w, height: h, rx: Math.round(h / 2), ry: Math.round(h / 2), class: 'mm-node-box fc-shape-pill' }));
@@ -577,19 +794,118 @@ function renderFlowchartNodeShape(g: SVGGElement, n: FlowchartNode) {
   g.append(titleText, subText);
 }
 
-function renderFlowchartCanvas() {
-  if (!currentGraph) return;
-  framesLayerEl.replaceChildren();
-  edgesLayerEl.replaceChildren();
-  nodesLayerEl.replaceChildren();
+function bindSvgButtonActivation(target: SVGElement, onActivate: (ev: Event) => void): void {
+  let spacePressed = false;
+  target.addEventListener('keydown', ev => {
+    const ke = ev as KeyboardEvent;
+    if (ke.key === 'Enter') {
+      if (isImeComposing(ke) || ke.isComposing || ke.keyCode === 229) return;
+      ke.preventDefault();
+      ke.stopPropagation();
+      onActivate(ev);
+    } else if (ke.key === ' ') {
+      ke.preventDefault();
+      ke.stopPropagation();
+      spacePressed = true;
+    } else if (ke.key === 'Escape') {
+      ke.stopPropagation();
+      safeFocus(svgElRoot as unknown as HTMLElement);
+    }
+  });
+  target.addEventListener('keyup', ev => {
+    const ke = ev as KeyboardEvent;
+    if (ke.key === ' ') {
+      ke.preventDefault();
+      ke.stopPropagation();
+      if (spacePressed) {
+        spacePressed = false;
+        onActivate(ev);
+      }
+    }
+  });
+  target.addEventListener('blur', () => {
+    spacePressed = false;
+  });
+}
 
-  const { all } = getAllSessions();
+function getFocusedCanvasKey(): string {
+  if (typeof document === 'undefined') return '';
+  const active = document.activeElement as Element | null;
+  if (!active || active === svgElRoot || !svgElRoot.contains?.(active)) return '';
+  return active.getAttribute?.('data-focus-key') ?? '';
+}
+
+function restoreCanvasFocus(focusKey: string): void {
+  if (!focusKey) return;
+  const candidates = svgElRoot.querySelectorAll?.('[data-focus-key]') ?? [];
+  for (const elNode of candidates) {
+    if (elNode.getAttribute?.('data-focus-key') === focusKey) {
+      safeFocus(elNode as unknown as HTMLElement, { preventScroll: true });
+      return;
+    }
+  }
+  safeFocus(svgElRoot as unknown as HTMLElement, { preventScroll: true });
+}
+
+function selectNodeInPlace(n: FlowchartNode): void {
+  const prevNodeId = selectedNodeId;
+  const prevSessionId = selectedSessionId;
+  const prevFlowId = selectedFlowId;
+  selectedNodeId = n.id;
+  if (n.flowId) selectedFlowId = n.flowId;
+  if (n.sessionId) selectedSessionId = n.sessionId;
+  else {
+    const { all } = getAllSessions();
+    const owner = findSessionForFlow(n.flowId, all);
+    if (owner) selectedSessionId = owner.id;
+  }
+
+  if (prevNodeId !== selectedNodeId) {
+    for (const child of nodesLayerEl.children) {
+      const gid = child.getAttribute?.('data-node-id') ?? '';
+      const isSel = gid === selectedNodeId;
+      child.classList?.toggle('node-selected', isSel);
+      const hitEl = child.querySelector?.('.mm-node-hit') ?? child;
+      if (isSel) hitEl.setAttribute?.('aria-current', 'true');
+      else hitEl.removeAttribute?.('aria-current');
+    }
+  }
+
+  if (prevSessionId !== selectedSessionId || prevFlowId !== selectedFlowId) {
+    syncSidebarSelectionInPlace();
+  }
+
+  renderInspectorForNode(n);
+  announceStatus(`已选中节点：${n.title}`);
+}
+
+async function renderFlowchartCanvas(): Promise<void> {
+  if (!currentGraph) return;
+  const seq = ++canvasRenderSeq;
+  const shouldAbort = () => seq !== canvasRenderSeq;
+  const focusedKey = getFocusedCanvasKey();
   const anyMatch = Boolean(searchTerm && currentGraph.nodes.some(n => n.match));
 
+  const frameEls: SVGElement[] = [];
+  const edgeEls: SVGElement[] = [];
+  const nodeEls: SVGElement[] = [];
+  let deadline = nowMs() + 50;
+
   // 1) Frames (Turn or Session swimlane containers)
-  for (const frame of currentGraph.frames) {
+  for (let fIdx = 0; fIdx < currentGraph.frames.length; fIdx += 1) {
+    const frame = currentGraph.frames[fIdx]!;
     const fg = svgEl('g', { class: `fc-turn-frame st-${frame.status}` });
-    fg.appendChild(svgEl('rect', {
+    const frameHitG = svgEl('g', {
+      class: 'fc-frame-hit',
+      role: 'button',
+      tabindex: '0',
+      'data-focus-key': `frame:${frame.id}`,
+      'aria-label': `${frame.title}，${frame.subtitle}，状态 ${statusLabel(frame.status)}`,
+    });
+    const frameTitle = svgEl('title');
+    frameTitle.textContent = `${frame.title}\n${frame.subtitle} (${frame.badge})`;
+    frameHitG.appendChild(frameTitle);
+    frameHitG.appendChild(svgEl('rect', {
       x: frame.x,
       y: frame.y,
       width: frame.w,
@@ -597,7 +913,7 @@ function renderFlowchartCanvas() {
       rx: 12,
       class: 'fc-frame-box',
     }));
-    fg.appendChild(svgEl('rect', {
+    frameHitG.appendChild(svgEl('rect', {
       x: frame.x,
       y: frame.y,
       width: frame.w,
@@ -617,28 +933,9 @@ function renderFlowchartCanvas() {
       class: 'fc-frame-badge',
     });
     bText.textContent = shortText(frame.badge, 36);
-    fg.append(tText, sText, bText);
+    frameHitG.append(tText, sText, bText);
 
-    if (frame.toggleKey) {
-      const btnG = svgEl('g', {
-        transform: `translate(${frame.x + frame.w - 84}, ${frame.y + 10})`,
-        class: 'mm-toggle-btn',
-      });
-      btnG.appendChild(svgEl('rect', { x: 0, y: 0, width: 70, height: 22, rx: 6, class: 'fc-frame-toggle-rect' }));
-      const btnLabel = svgEl('text', { x: 35, y: 11, class: 'fc-frame-toggle-text' });
-      btnLabel.textContent = frame.collapsed ? '展开本轮' : '收起本轮';
-      btnG.appendChild(btnLabel);
-      btnG.addEventListener('click', ev => {
-        ev.stopPropagation();
-        if (dragMoved) return;
-        collapseOverride.set(frame.toggleKey!, !frame.collapsed);
-        rebuildAndRenderCanvas(false);
-      });
-      fg.appendChild(btnG);
-    }
-
-    fg.addEventListener('click', () => {
-      if (dragMoved) return;
+    const activateFrame = () => {
       if (currentGraph?.mode === 'overview') {
         selectedSessionId = frame.sessionId;
         switchViewMode('session');
@@ -648,19 +945,57 @@ function renderFlowchartCanvas() {
         selectedFlowId = frame.flowId;
         const foundNode = currentGraph?.nodes.find(n => n.flowId === frame.flowId);
         if (foundNode) {
-          selectedNodeId = foundNode.id;
-          renderFlowchartCanvas();
-          renderInspectorForPayload(foundNode.inspector);
+          selectNodeInPlace(foundNode);
         }
       }
+    };
+    frameHitG.addEventListener('click', () => {
+      if (dragMoved) return;
+      activateFrame();
     });
+    bindSvgButtonActivation(frameHitG, activateFrame);
+    fg.appendChild(frameHitG);
 
-    framesLayerEl.appendChild(fg);
+    if (frame.toggleKey) {
+      const btnG = svgEl('g', {
+        transform: `translate(${frame.x + frame.w - 84}, ${frame.y + 10})`,
+        class: 'mm-toggle-btn',
+        role: 'button',
+        tabindex: '0',
+        'aria-expanded': String(!frame.collapsed),
+        'aria-label': frame.collapsed ? `展开${frame.title}` : `收起${frame.title}`,
+        'data-focus-key': `frame-toggle:${frame.toggleKey}`,
+      });
+      btnG.appendChild(svgEl('rect', { x: 0, y: 0, width: 70, height: 22, rx: 6, class: 'fc-frame-toggle-rect' }));
+      const btnLabel = svgEl('text', { x: 35, y: 11, class: 'fc-frame-toggle-text' });
+      btnLabel.textContent = frame.collapsed ? '展开本轮' : '收起本轮';
+      btnG.appendChild(btnLabel);
+      const toggleFrame = () => {
+        collapseOverride.set(frame.toggleKey!, !frame.collapsed);
+        announceStatus(frame.collapsed ? `已展开${frame.title}` : `已收起${frame.title}`);
+        void rebuildAndRenderCanvas(false);
+      };
+      btnG.addEventListener('click', ev => {
+        ev.stopPropagation();
+        if (dragMoved) return;
+        toggleFrame();
+      });
+      bindSvgButtonActivation(btnG, toggleFrame);
+      fg.appendChild(btnG);
+    }
+
+    frameEls.push(fg);
+    if (fIdx < currentGraph.frames.length - 1 && nowMs() >= deadline) {
+      await yieldToMain();
+      if (shouldAbort()) return;
+      deadline = nowMs() + 50;
+    }
   }
 
   // 2) Edges (orthogonal rounded arrows + pill labels)
   const nodesById = new Map(currentGraph.nodes.map(n => [n.id, n]));
-  for (const edge of currentGraph.edges) {
+  for (let eIdx = 0; eIdx < currentGraph.edges.length; eIdx += 1) {
+    const edge = currentGraph.edges[eIdx]!;
     const fromN = nodesById.get(edge.fromId);
     const toN = nodesById.get(edge.toId);
     const dim = anyMatch && !fromN?.match && !toN?.match;
@@ -673,7 +1008,7 @@ function renderFlowchartCanvas() {
       d: pointsToRoundedOrthogonalPath(edge.points, 8),
       class: `fc-edge tone-${edge.tone}${kindClass}${dim ? ' edge-dim' : ''}`,
     });
-    edgesLayerEl.appendChild(path);
+    edgeEls.push(path);
 
     if (edge.label && edge.labelX !== undefined && edge.labelY !== undefined) {
       const estW = Math.min(276, Math.max(74, edge.label.length * 10.5 + 22));
@@ -686,82 +1021,124 @@ function renderFlowchartCanvas() {
       const lt = svgEl('text', { x: estW / 2, y: hPill / 2, class: 'fc-edge-label-text' });
       lt.textContent = shortText(edge.label, 28);
       lg.appendChild(lt);
-      edgesLayerEl.appendChild(lg);
+      edgeEls.push(lg);
+    }
+
+    if (eIdx < currentGraph.edges.length - 1 && nowMs() >= deadline) {
+      await yieldToMain();
+      if (shouldAbort()) return;
+      deadline = nowMs() + 50;
     }
   }
 
   // 3) Flowchart Shape Nodes
-  for (const n of currentGraph.nodes) {
+  for (let nIdx = 0; nIdx < currentGraph.nodes.length; nIdx += 1) {
+    const n = currentGraph.nodes[nIdx]!;
     const selected = n.id === selectedNodeId;
     const dim = anyMatch && !n.match;
     const g = svgEl('g', {
       transform: `translate(${n.x},${n.y})`,
+      'data-node-id': n.id,
       class: `mm-node-group cat-${n.category}${selected ? ' node-selected' : ''}${n.match ? ' node-match' : ''}${dim ? ' node-dim' : ''}`,
     });
-    renderFlowchartNodeShape(g, n);
+    const nodeHitG = svgEl('g', {
+      class: 'mm-node-hit',
+      role: 'button',
+      tabindex: '0',
+      'data-focus-key': `node:${n.id}`,
+      'aria-label': `${n.badge}：${n.title}，${n.subtitle}${n.status ? `，状态 ${statusLabel(n.status)}` : ''}`,
+      ...(n.kind === 'worker_more' ? { 'aria-expanded': 'false' } : {}),
+      ...(selected ? { 'aria-current': 'true' } : {}),
+    });
+    renderFlowchartNodeShape(nodeHitG, n);
 
-    if (n.toggleKey && n.kind !== 'worker_more') {
-      const btnW = n.collapsed ? 64 : 52;
-      const tg = svgEl('g', {
-        transform: `translate(${n.w - btnW - 10}, ${n.h - 11})`,
-        class: 'mm-toggle-btn',
-      });
-      tg.appendChild(svgEl('rect', { x: 0, y: 0, width: btnW, height: 20, rx: 10, class: 'mm-toggle-pill-rect' }));
-      const tt = svgEl('text', { x: btnW / 2, y: 10, class: 'mm-toggle-text' });
-      tt.textContent = n.collapsed ? `展开 +${n.hiddenCount ?? 0}` : '收起 −';
-      tg.appendChild(tt);
-      tg.addEventListener('click', ev => {
-        ev.stopPropagation();
-        if (dragMoved) return;
-        collapseOverride.set(n.toggleKey!, !n.collapsed);
-        selectedNodeId = n.id;
-        renderSidebar();
-        rebuildAndRenderCanvas(false);
-      });
-      g.appendChild(tg);
-    }
-
-    g.addEventListener('click', ev => {
-      ev.stopPropagation();
-      if (dragMoved) return;
+    const activateNode = () => {
       if (n.kind === 'worker_more' && n.toggleKey) {
         collapseOverride.set(n.toggleKey, false);
-        rebuildAndRenderCanvas(false);
+        announceStatus(`已展开剩余 ${n.hiddenCount ?? 0} 个执行步骤`);
+        void rebuildAndRenderCanvas(false);
         return;
       }
-      selectedNodeId = n.id;
-      if (n.flowId) selectedFlowId = n.flowId;
-      if (n.sessionId) selectedSessionId = n.sessionId;
-      else {
-        const owner = findSessionForFlow(n.flowId, all);
-        if (owner) selectedSessionId = owner.id;
-      }
-      renderSidebar();
-      renderFlowchartCanvas();
-      renderInspectorForNode(n);
-    });
+      selectNodeInPlace(n);
+    };
 
-    g.addEventListener('dblclick', ev => {
+    nodeHitG.addEventListener('click', ev => {
+      ev.stopPropagation();
+      if (dragMoved) return;
+      activateNode();
+    });
+    nodeHitG.addEventListener('dblclick', ev => {
       ev.stopPropagation();
       if (viewMode === 'overview' && n.sessionId) {
         selectedSessionId = n.sessionId;
         switchViewMode('session');
       }
     });
+    bindSvgButtonActivation(nodeHitG, activateNode);
+    g.appendChild(nodeHitG);
 
-    nodesLayerEl.appendChild(g);
+    if (n.toggleKey && n.kind !== 'worker_more') {
+      const btnW = n.collapsed ? 64 : 52;
+      const tg = svgEl('g', {
+        transform: `translate(${n.w - btnW - 10}, ${n.h - 11})`,
+        class: 'mm-toggle-btn',
+        role: 'button',
+        tabindex: '0',
+        'aria-expanded': String(!n.collapsed),
+        'aria-label': n.collapsed
+          ? `展开${n.title}的 ${n.hiddenCount ?? 0} 个隐藏项`
+          : `收起${n.title}的展开项`,
+        'data-focus-key': `node-toggle:${n.toggleKey}`,
+      });
+      tg.appendChild(svgEl('rect', { x: 0, y: 0, width: btnW, height: 20, rx: 10, class: 'mm-toggle-pill-rect' }));
+      const tt = svgEl('text', { x: btnW / 2, y: 10, class: 'mm-toggle-text' });
+      tt.textContent = n.collapsed ? `展开 +${n.hiddenCount ?? 0}` : '收起 −';
+      tg.appendChild(tt);
+      const toggleNode = () => {
+        collapseOverride.set(n.toggleKey!, !n.collapsed);
+        selectedNodeId = n.id;
+        announceStatus(n.collapsed ? `已展开${n.title}` : `已收起${n.title}`);
+        void rebuildAndRenderCanvas(false);
+      };
+      tg.addEventListener('click', ev => {
+        ev.stopPropagation();
+        if (dragMoved) return;
+        toggleNode();
+      });
+      bindSvgButtonActivation(tg, toggleNode);
+      g.appendChild(tg);
+    }
+
+    nodeEls.push(g);
+    if (nIdx < currentGraph.nodes.length - 1 && nowMs() >= deadline) {
+      await yieldToMain();
+      if (shouldAbort()) return;
+      deadline = nowMs() + 50;
+    }
   }
+
+  if (shouldAbort()) return;
+  framesLayerEl.replaceChildren(...frameEls);
+  edgesLayerEl.replaceChildren(...edgeEls);
+  nodesLayerEl.replaceChildren(...nodeEls);
+  restoreCanvasFocus(focusedKey);
 }
 
-function rebuildAndRenderCanvas(shouldFit: boolean) {
+async function rebuildAndRenderCanvas(shouldFit: boolean): Promise<void> {
   if (!snapshot) return;
-  const { all, filtered, flowsById } = getAllSessions();
+  const seq = ++canvasBuildSeq;
+  const shouldAbort = () => seq !== canvasBuildSeq;
+  const sessionData = await getAllSessionsAsync(shouldAbort);
+  if (!sessionData || shouldAbort()) return;
+  const { all, filtered, flowsById } = sessionData;
   if (!filtered.length) {
     currentGraph = null;
     framesLayerEl.replaceChildren();
     edgesLayerEl.replaceChildren();
     nodesLayerEl.replaceChildren();
-    inspectorBodyEl.replaceChildren(domEl('p', 'mm-muted', '暂无匹配的 AI 会话或任务流。'));
+    const emptyEl = domEl('p', 'mm-muted', '暂无匹配的 AI 会话或任务流。');
+    emptyEl.setAttribute('role', 'status');
+    inspectorBodyEl.replaceChildren(emptyEl);
     return;
   }
 
@@ -771,18 +1148,19 @@ function rebuildAndRenderCanvas(shouldFit: boolean) {
   }
 
   const activeSession = filtered.find(s => s.id === selectedSessionId) ?? all.find(s => s.id === selectedSessionId) ?? filtered[0]!;
-  if (viewMode === 'overview') {
-    currentGraph = buildOverviewFlowchart(filtered, flowsById, snapshot, searchTerm);
-  } else {
-    currentGraph = buildSessionFlowchart(activeSession, flowsById, snapshot, collapseOverride, searchTerm);
-  }
+  const nextGraph = viewMode === 'overview'
+    ? await buildOverviewFlowchartAsync(filtered, flowsById, snapshot, searchTerm, shouldAbort)
+    : await buildSessionFlowchartAsync(activeSession, flowsById, snapshot, collapseOverride, searchTerm, shouldAbort);
+  if (!nextGraph || shouldAbort()) return;
+  currentGraph = nextGraph;
 
   const prevSelected = selectedNodeId;
   const prevScrollTop = inspectorEl.scrollTop;
   const activeNode = (selectedNodeId && currentGraph.nodes.find(n => n.id === selectedNodeId)) ?? currentGraph.nodes[0];
   if (activeNode) selectedNodeId = activeNode.id;
 
-  renderFlowchartCanvas();
+  await renderFlowchartCanvas();
+  if (shouldAbort()) return;
   if (shouldFit) fitWidthTop();
   if (activeNode) {
     renderInspectorForNode(activeNode);
@@ -790,15 +1168,23 @@ function rebuildAndRenderCanvas(shouldFit: boolean) {
   }
 }
 
-function renderListMatrix() {
-  const { filtered, flowsById } = getAllSessions();
-  matrixSubtitleEl.textContent = `共筛选出 ${filtered.length} 个 AI 会话`;
-  matrixGridEl.replaceChildren();
+async function renderListMatrix(): Promise<void> {
+  const seq = ++listRenderSeq;
+  const shouldAbort = () => seq !== listRenderSeq;
+  const sessionData = await getAllSessionsAsync(shouldAbort);
+  if (!sessionData || shouldAbort()) return;
+  const { filtered, flowsById } = sessionData;
+  matrixSubtitleEl.textContent = `共筛选出 ${formatCount(filtered.length)} 个 AI 会话`;
   if (!filtered.length) {
-    matrixGridEl.appendChild(domEl('p', 'mm-muted', '暂无匹配的会话。'));
+    const emptyEl = domEl('p', 'mm-muted', '暂无匹配的会话。');
+    emptyEl.setAttribute('role', 'status');
+    matrixGridEl.replaceChildren(emptyEl);
     return;
   }
-  for (const session of filtered) {
+  const cards: Element[] = [];
+  let deadline = nowMs() + 50;
+  for (let sIdx = 0; sIdx < filtered.length; sIdx += 1) {
+    const session = filtered[sIdx]!;
     const turns = resolveSessionTurns(session, flowsById);
     const card = domEl('article', 'mm-matrix-card');
     const head = domEl('div', 'mm-matrix-card-head');
@@ -834,8 +1220,16 @@ function renderListMatrix() {
 
     stepsGrid.append(box1, box2, box3, box4);
     card.append(head, stepsGrid);
-    matrixGridEl.appendChild(card);
+    cards.push(card);
+
+    if (sIdx < filtered.length - 1 && nowMs() >= deadline) {
+      await yieldToMain();
+      if (shouldAbort()) return;
+      deadline = nowMs() + 50;
+    }
   }
+  if (shouldAbort()) return;
+  matrixGridEl.replaceChildren(...cards);
 }
 
 /* ==================== 右侧详情检视器 ==================== */
@@ -860,8 +1254,71 @@ function makeProgressRow(label: string, valueText: string, pct: number, tone?: '
   bar.className = `mm-progress${tone ? ` ${tone}` : ''}`;
   bar.max = 100;
   bar.value = Math.max(0, Math.min(100, Math.round(pct)));
+  bar.setAttribute('aria-label', `${label}: ${valueText}`);
   row.append(head, bar);
   return row;
+}
+
+interface CodePayloadBlock {
+  headerEl: HTMLElement;
+  pre: HTMLPreElement;
+  code: HTMLElement;
+  setText: (next: string) => void;
+  appendTo: (container: HTMLElement) => void;
+}
+
+function createCodePayloadBlock(
+  titleLabel: string,
+  regionLabel: string,
+  initialText: string,
+): CodePayloadBlock {
+  const headerEl = domEl('div', 'mm-sub-card-head');
+  headerEl.appendChild(domEl('span', 'mm-kv-k', titleLabel));
+  const actionWrap = domEl('span', 'mm-insp-actions');
+  const copyBtn = domEl('button', 'mm-mini-btn', '复制');
+  copyBtn.type = 'button';
+  copyBtn.setAttribute('aria-label', `复制${regionLabel}`);
+  const statusEl = domEl('span', 'visually-hidden');
+  statusEl.setAttribute('role', 'status');
+  actionWrap.append(copyBtn, statusEl);
+  headerEl.appendChild(actionWrap);
+
+  const pre = domEl('pre', 'mm-pre');
+  pre.setAttribute('tabindex', '0');
+  pre.setAttribute('role', 'region');
+  pre.setAttribute('aria-label', regionLabel);
+  const code = domEl('code', undefined, initialText);
+  pre.appendChild(code);
+
+  copyBtn.addEventListener('click', () => {
+    void copyTextWithFeedback(copyBtn, code.textContent ?? '', {
+      statusEl,
+      defaultLabel: '复制',
+      successLabel: '已复制',
+      failLabel: '复制失败',
+    });
+  });
+
+  return {
+    headerEl,
+    pre,
+    code,
+    setText(next: string) {
+      code.textContent = next;
+    },
+    appendTo(container: HTMLElement) {
+      container.append(headerEl, pre);
+    },
+  };
+}
+
+function moveFocusBeforeRemovingButton(btn: HTMLButtonElement, targetEl: HTMLElement, statusMsg: string): void {
+  const wasFocused = typeof document !== 'undefined' && document.activeElement === btn;
+  btn.remove();
+  if (wasFocused) {
+    safeFocus(targetEl, { preventScroll: true });
+  }
+  announceStatus(statusMsg);
 }
 
 function appendJevRouteSections(container: HTMLElement, jr: MindmapJevRouteInfo) {
@@ -975,8 +1432,12 @@ function appendIngressSection(container: HTMLElement, flow: MindmapTaskFlow) {
 
   const ingressCacheKey = flow.ingress.messageId ? `ingress:${flow.ingress.messageId}` : '';
   const cachedIngressText = ingressCacheKey ? expandedTextCache.get(ingressCacheKey) : undefined;
-  const pre = domEl('pre', 'mm-pre', cachedIngressText ?? flow.ingress.text);
-  sec.appendChild(pre);
+  const ingressBlock = createCodePayloadBlock(
+    '原始消息正文：',
+    '老板原始消息正文',
+    cachedIngressText ?? flow.ingress.text,
+  );
+  ingressBlock.appendTo(sec);
 
   if (flow.ingress.textTruncated && flow.ingress.messageId && cachedIngressText === undefined) {
     const loadFullBtn = domEl('button', 'mm-mini-btn', '查看未截断原始消息全文');
@@ -987,8 +1448,8 @@ function appendIngressSection(container: HTMLElement, flow: MindmapTaskFlow) {
       try {
         const full = await apiGet<{ text: string }>(`/api/message?messageId=${encodeURIComponent(flow.ingress.messageId!)}`);
         rememberExpandedText(ingressCacheKey, full.text);
-        pre.textContent = full.text;
-        loadFullBtn.remove();
+        ingressBlock.setText(full.text);
+        moveFocusBeforeRemovingButton(loadFullBtn, ingressBlock.pre, '已加载原始消息全文');
       } catch {
         loadFullBtn.disabled = false;
         loadFullBtn.textContent = '加载失败，重试';
@@ -1016,9 +1477,9 @@ function appendMemorySection(container: HTMLElement, flow: MindmapTaskFlow, focu
         card.appendChild(domEl('p', 'mm-muted', `⚡ 赫布突触扩散激活：经「${hit.activatedVia.topic}」(权重 ${hit.activatedVia.weight}, 关系 ${hit.activatedVia.relation})`));
       }
       if (hit.tags?.length) {
-        card.appendChild(domEl('p', 'mm-muted', `标签: ${hit.tags.join(', ')}`));
+        card.appendChild(domEl('p', 'mm-muted', `标签: ${hit.tags.toSorted(compareTextLocale).join(', ')}`));
       }
-      card.appendChild(domEl('pre', 'mm-pre', hit.snippet));
+      createCodePayloadBlock('记忆片段：', `记忆内容：${hit.title}`, hit.snippet).appendTo(card);
       list.appendChild(card);
     }
     sec.appendChild(list);
@@ -1036,7 +1497,7 @@ function appendWorkerStepSection(container: HTMLElement, task: MindmapTaskDetail
     ['开始时间', formatTimeShort(step.at)],
     ['耗时', step.durationMs ? formatDuration(step.durationMs) : undefined],
     ['停止原因', step.stopReason],
-    ['Token 消耗', step.usage ? `输入 ${step.usage.input} / 缓存读取 ${step.usage.cacheRead} / 推理 ${step.usage.reasoning} / 输出 ${step.usage.output} (总 ${step.usage.totalTokens})` : undefined],
+    ['Token 消耗', step.usage ? `输入 ${formatCount(step.usage.input)} / 缓存读取 ${formatCount(step.usage.cacheRead)} / 推理 ${formatCount(step.usage.reasoning)} / 输出 ${formatCount(step.usage.output)} (总 ${formatCount(step.usage.totalTokens)})` : undefined],
   ];
   const grid = domEl('div', 'mm-kv-grid');
   for (const [k, v] of pairs) {
@@ -1046,15 +1507,17 @@ function appendWorkerStepSection(container: HTMLElement, task: MindmapTaskDetail
   sec.appendChild(grid);
 
   if (step.inputPreview) {
-    sec.appendChild(domEl('strong', 'mm-kv-k', '调用入参 / 命令：'));
-    sec.appendChild(domEl('pre', 'mm-pre', step.inputPreview));
+    createCodePayloadBlock('调用入参 / 命令：', `Worker 工具调用入参：${step.toolName ?? step.title}`, step.inputPreview).appendTo(sec);
   }
   const opCacheKey = step.operationId ? `op:${task.id}:${step.operationId}` : '';
   const cachedOpOut = opCacheKey ? expandedTextCache.get(opCacheKey) : undefined;
-  const outPre = domEl('pre', 'mm-pre', cachedOpOut ?? step.outputPreview ?? '（无文本输出）');
+  const outBlock = createCodePayloadBlock(
+    '执行结果输出：',
+    `Worker 工具执行结果：${step.toolName ?? step.title}`,
+    cachedOpOut ?? step.outputPreview ?? '（无文本输出）',
+  );
   if (cachedOpOut !== undefined || step.outputPreview) {
-    sec.appendChild(domEl('strong', 'mm-kv-k', '执行结果输出：'));
-    sec.appendChild(outPre);
+    outBlock.appendTo(sec);
   }
   if (step.operationId && step.hasFullOperation && cachedOpOut === undefined) {
     const btn = domEl('button', 'mm-mini-btn', '从后台拉取完整工具原始输出');
@@ -1066,12 +1529,11 @@ function appendWorkerStepSection(container: HTMLElement, task: MindmapTaskDetail
         const op = await apiGet<{ result?: string; error?: string }>(`/api/operation?taskId=${encodeURIComponent(task.id)}&operationId=${encodeURIComponent(step.operationId!)}`);
         const text = op.result ?? op.error ?? '（空）';
         rememberExpandedText(opCacheKey, text);
-        outPre.textContent = text;
+        outBlock.setText(text);
         if (!step.outputPreview) {
-          sec.appendChild(domEl('strong', 'mm-kv-k', '执行结果输出：'));
-          sec.appendChild(outPre);
+          outBlock.appendTo(sec);
         }
-        btn.remove();
+        moveFocusBeforeRemovingButton(btn, outBlock.pre, '已加载完整工具输出');
       } catch {
         btn.disabled = false;
         btn.textContent = '拉取失败，重试';
@@ -1103,8 +1565,12 @@ function appendDeliverySection(container: HTMLElement, flow: MindmapTaskFlow, fo
       card.appendChild(head);
       const delCacheKey = `del:${del.messageId}`;
       const cachedDel = expandedTextCache.get(delCacheKey);
-      const pre = domEl('pre', 'mm-pre', cachedDel ?? (del.text || del.reason || '（空）'));
-      card.appendChild(pre);
+      const delBlock = createCodePayloadBlock(
+        '回复内容：',
+        `第 ${del.seq} 条公开回复正文`,
+        cachedDel ?? (del.text || del.reason || '（空）'),
+      );
+      delBlock.appendTo(card);
       if (del.textTruncated && cachedDel === undefined) {
         const btn = domEl('button', 'mm-mini-btn', '查看完整回复正文');
         btn.type = 'button';
@@ -1113,8 +1579,8 @@ function appendDeliverySection(container: HTMLElement, flow: MindmapTaskFlow, fo
           try {
             const full = await apiGet<{ text: string }>(`/api/message?messageId=${encodeURIComponent(del.messageId)}`);
             rememberExpandedText(delCacheKey, full.text);
-            pre.textContent = full.text;
-            btn.remove();
+            delBlock.setText(full.text);
+            moveFocusBeforeRemovingButton(btn, delBlock.pre, '已加载完整回复正文');
           } catch {
             btn.disabled = false;
             btn.textContent = '加载失败，重试';
@@ -1138,14 +1604,16 @@ function appendTaskOverviewSection(container: HTMLElement, task: MindmapTaskDeta
     ['编译上下文', task.contextBrief],
     ['状态说明', task.reason],
   ]);
-  sec.appendChild(domEl('strong', 'mm-kv-k', '下发给 Worker 的任务指令：'));
-  sec.appendChild(domEl('pre', 'mm-pre', task.prompt));
+  createCodePayloadBlock('下发给 Worker 的任务指令：', 'Worker 任务指令', task.prompt).appendTo(sec);
   if (task.reportPreview) {
-    sec.appendChild(domEl('strong', 'mm-kv-k', 'Worker 提交的成果报告：'));
     const workCacheKey = `work:${task.id}`;
     const cachedReport = expandedTextCache.get(workCacheKey);
-    const repPre = domEl('pre', 'mm-pre', cachedReport ?? task.reportPreview);
-    sec.appendChild(repPre);
+    const repBlock = createCodePayloadBlock(
+      'Worker 提交的成果报告：',
+      'Worker 成果报告',
+      cachedReport ?? task.reportPreview,
+    );
+    repBlock.appendTo(sec);
     if (task.reportTruncated && cachedReport === undefined) {
       const btn = domEl('button', 'mm-mini-btn', '查看未截断 Worker 完整报告');
       btn.type = 'button';
@@ -1155,9 +1623,9 @@ function appendTaskOverviewSection(container: HTMLElement, task: MindmapTaskDeta
           const full = await apiGet<{ report?: string }>(`/api/work?taskId=${encodeURIComponent(task.id)}`);
           if (full.report) {
             rememberExpandedText(workCacheKey, full.report);
-            repPre.textContent = full.report;
+            repBlock.setText(full.report);
           }
-          btn.remove();
+          moveFocusBeforeRemovingButton(btn, repBlock.pre, '已加载完整 Worker 报告');
         } catch {
           btn.disabled = false;
           btn.textContent = '加载失败，重试';
@@ -1174,8 +1642,10 @@ function appendSessionTimelineSection(container: HTMLElement, session: MindmapSe
   sec.appendChild(domEl('h3', 'mm-section-title', `🗂️ AI 会话上下文脉络 (${session.turnCount} 轮)`));
   const list = domEl('div', 'mm-card-list');
   session.turnSummaries.forEach((ts, idx) => {
-    const btn = domEl('button', `mm-session-turn-card${ts.flowId === activeFlowId ? ' active' : ''}`);
+    const isActive = ts.flowId === activeFlowId;
+    const btn = domEl('button', `mm-session-turn-card${isActive ? ' active' : ''}`);
     btn.type = 'button';
+    if (isActive) btn.setAttribute('aria-current', 'true');
     if (ts.link) {
       const linkText = ts.link.source === 'gemini-decision-1'
         ? `${ts.link.label} [gemini-decision-1]`
@@ -1192,8 +1662,13 @@ function appendSessionTimelineSection(container: HTMLElement, session: MindmapSe
     btn.addEventListener('click', () => {
       selectedSessionId = session.id;
       selectedFlowId = ts.flowId;
-      if (viewMode !== 'session') switchViewMode('session');
-      scrollToFrame(`frame:${ts.flowId}`);
+      if (viewMode !== 'session') {
+        void switchViewMode('session').then(() => {
+          scrollToFrame(`frame:${ts.flowId}`);
+        });
+      } else {
+        scrollToFrame(`frame:${ts.flowId}`);
+      }
     });
     list.appendChild(btn);
   });
@@ -1218,8 +1693,7 @@ function appendWorkerPhaseSection(container: HTMLElement, task: MindmapTaskDetai
   }
   sec.appendChild(grid);
   if (phase.followupPrompt) {
-    sec.appendChild(domEl('strong', 'mm-kv-k', '本阶段补充指令：'));
-    sec.appendChild(domEl('pre', 'mm-pre', phase.followupPrompt));
+    createCodePayloadBlock('本阶段补充指令：', `Worker 阶段 #${phase.index} 补充指令`, phase.followupPrompt).appendTo(sec);
   }
   const steps = task.workerSteps.filter(s => s.phaseIndex === phase.index && s.kind !== 'followup');
   if (steps.length) {
@@ -1227,8 +1701,12 @@ function appendWorkerPhaseSection(container: HTMLElement, task: MindmapTaskDetai
     for (const st of steps) {
       const card = domEl('div', 'mm-sub-card');
       card.appendChild(domEl('div', 'mm-sub-card-head', `${st.title} (${formatDuration(st.durationMs)})`));
-      if (st.inputPreview) card.appendChild(domEl('pre', 'mm-pre', st.inputPreview));
-      if (st.outputPreview) card.appendChild(domEl('pre', 'mm-pre', st.outputPreview));
+      if (st.inputPreview) {
+        createCodePayloadBlock('调用入参：', `${st.title} 调用入参`, st.inputPreview).appendTo(card);
+      }
+      if (st.outputPreview) {
+        createCodePayloadBlock('执行输出：', `${st.title} 执行输出`, st.outputPreview).appendTo(card);
+      }
       list.appendChild(card);
     }
     sec.appendChild(list);
@@ -1268,7 +1746,7 @@ function renderInspectorForNode(node: FlowchartNode) {
   try {
     renderInspectorNodeContents(node);
   } finally {
-    if (switched) {
+    if (switched && !prefersReducedMotion()) {
       for (const child of inspectorBodyEl.children) {
         child.classList.add('mm-insp-enter');
       }
@@ -1359,8 +1837,12 @@ function renderInspectorNodeContents(node: FlowchartNode) {
             ['调用时间', formatTimeShort(tl.at)],
             ['耗时', tl.durationMs ? formatDuration(tl.durationMs) : undefined],
           ]);
-          if (tl.inputPreview) { tSec.appendChild(domEl('strong', 'mm-kv-k', '调用入参：')); tSec.appendChild(domEl('pre', 'mm-pre', tl.inputPreview)); }
-          if (tl.outputPreview) { tSec.appendChild(domEl('strong', 'mm-kv-k', '工具返回：')); tSec.appendChild(domEl('pre', 'mm-pre', tl.outputPreview)); }
+          if (tl.inputPreview) {
+            createCodePayloadBlock('调用入参：', `${tl.toolName} 调用入参`, tl.inputPreview).appendTo(tSec);
+          }
+          if (tl.outputPreview) {
+            createCodePayloadBlock('工具返回：', `${tl.toolName} 工具返回`, tl.outputPreview).appendTo(tSec);
+          }
           inspectorBodyEl.appendChild(tSec);
         } else if (rt.tools.length) {
           const sec = domEl('section', 'mm-section');
@@ -1368,8 +1850,12 @@ function renderInspectorNodeContents(node: FlowchartNode) {
           for (const tl of rt.tools) {
             const c = domEl('div', 'mm-sub-card');
             c.appendChild(domEl('div', 'mm-sub-card-head', `${tl.toolName} (${statusLabel(tl.status)})`));
-            if (tl.inputPreview) c.appendChild(domEl('pre', 'mm-pre', tl.inputPreview));
-            if (tl.outputPreview) c.appendChild(domEl('pre', 'mm-pre', tl.outputPreview));
+            if (tl.inputPreview) {
+              createCodePayloadBlock('调用入参：', `${tl.toolName} 调用入参`, tl.inputPreview).appendTo(c);
+            }
+            if (tl.outputPreview) {
+              createCodePayloadBlock('工具返回：', `${tl.toolName} 工具返回`, tl.outputPreview).appendTo(c);
+            }
             sec.appendChild(c);
           }
           inspectorBodyEl.appendChild(sec);
@@ -1418,8 +1904,8 @@ function renderInspectorNodeContents(node: FlowchartNode) {
       for (const m of mems) {
         const card = domEl('div', 'mm-sub-card');
         card.appendChild(domEl('div', 'mm-sub-card-head', `${m.pinned ? '📌 ' : ''}${m.topic} (${m.synapseCount} 突触)`));
-        card.appendChild(domEl('p', 'mm-muted', `标签: ${m.tags.join(', ')} · ${formatTimeShort(m.createdAt)}`));
-        card.appendChild(domEl('pre', 'mm-pre', m.contentPreview));
+        card.appendChild(domEl('p', 'mm-muted', `标签: ${m.tags.toSorted(compareTextLocale).join(', ')} · ${formatTimeShort(m.createdAt)}`));
+        createCodePayloadBlock('记忆正文：', `沉淀记忆内容：${m.topic}`, m.contentPreview).appendTo(card);
         sec.appendChild(card);
       }
       inspectorBodyEl.appendChild(sec);
@@ -1443,21 +1929,26 @@ function renderInspectorNodeContents(node: FlowchartNode) {
   }
 }
 
-function switchViewMode(next: ViewMode) {
+async function switchViewMode(next: ViewMode): Promise<void> {
   viewMode = next;
   viewSessionBtn.classList.toggle('active', next === 'session');
   viewOverviewBtn.classList.toggle('active', next === 'overview');
   viewListBtn.classList.toggle('active', next === 'list');
-  viewSessionBtn.setAttribute('aria-selected', String(next === 'session'));
-  viewOverviewBtn.setAttribute('aria-selected', String(next === 'overview'));
-  viewListBtn.setAttribute('aria-selected', String(next === 'list'));
+  const nextTabBtn = next === 'overview' ? viewOverviewBtn : next === 'list' ? viewListBtn : viewSessionBtn;
+  if (viewTabsEl && typeof viewTabsEl.querySelectorAll === 'function') {
+    syncRovingTablist(viewTabsEl, nextTabBtn);
+  } else {
+    viewSessionBtn.setAttribute('aria-selected', String(next === 'session'));
+    viewOverviewBtn.setAttribute('aria-selected', String(next === 'overview'));
+    viewListBtn.setAttribute('aria-selected', String(next === 'list'));
+  }
 
   canvasPanelEl.hidden = next === 'list';
   listPanelEl.hidden = next !== 'list';
   canvasControlsEl.hidden = next === 'list';
 
   if (next === 'list') {
-    renderListMatrix();
+    await renderListMatrix();
     const { filtered, flowsById } = getAllSessions();
     const activeSession = filtered.find(s => s.id === selectedSessionId) ?? filtered[0];
     if (activeSession) {
@@ -1466,7 +1957,7 @@ function switchViewMode(next: ViewMode) {
     }
   } else {
     selectedNodeId = '';
-    rebuildAndRenderCanvas(true);
+    await rebuildAndRenderCanvas(true);
   }
 }
 
@@ -1477,7 +1968,7 @@ const sseHub = createSharedSseHub({
   onConnected: viaLeader => {
     if (!snapshot) return;
     const sessCount = snapshot.summary.totalSessions ?? getEffectiveSessions(snapshot, loadedFlows).length;
-    setConnState('live', `已连接实时库${viaLeader ? '（共享流）' : ''} (${sessCount} 会话 · ${snapshot.summary.totalFlows} 句)`);
+    setConnState('live', `已连接实时库${viaLeader ? '（共享流）' : ''} (${formatCount(sessCount)} 会话 · ${formatCount(snapshot.summary.totalFlows)} 句)`);
   },
   onError: err => {
     if (authExpired) return;
@@ -1495,33 +1986,73 @@ const sseHub = createSharedSseHub({
       dbEpoch += 1;
       sseCursor = batch.cursor;
       if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = undefined; }
-      void refreshMindmap(false);
+      void refreshMindmap(false, 'low');
       return;
     }
     if (typeof batch.cursor === 'number') {
       sseCursor = Math.max(sseCursor, batch.cursor);
     }
     if (refreshTimer) clearTimeout(refreshTimer);
-    refreshTimer = window.setTimeout(() => {
+    refreshTimer = setTimeout(() => {
       refreshTimer = undefined;
-      void refreshMindmap(false);
-    }, 450);
+      void refreshMindmap(false, 'low');
+    }, 450) as unknown as number;
   },
 });
 
-window.addEventListener('pagehide', () => {
+let sidebarRefitSettleTimer: ReturnType<typeof setTimeout> | undefined;
+let lastObservedCanvasWidth = 0;
+const canvasResizeObserver = typeof ResizeObserver === 'function'
+  ? new ResizeObserver(entries => {
+      const entry = entries[0];
+      const nextWidth = entry ? entry.contentRect.width : canvasPanelEl.getBoundingClientRect().width;
+      if (!pendingSidebarRefit || nextWidth <= 0) {
+        lastObservedCanvasWidth = nextWidth;
+        return;
+      }
+      if (Math.abs(nextWidth - lastObservedCanvasWidth) < 1) return;
+      lastObservedCanvasWidth = nextWidth;
+      if (viewMode !== 'list') {
+        fitWidthTop(false);
+      }
+      if (sidebarRefitSettleTimer !== undefined) clearTimeout(sidebarRefitSettleTimer);
+      sidebarRefitSettleTimer = setTimeout(() => {
+        sidebarRefitSettleTimer = undefined;
+        pendingSidebarRefit = false;
+      }, 120);
+    })
+  : null;
+canvasResizeObserver?.observe(canvasPanelEl);
+
+window.addEventListener('pagehide', ev => {
   if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = undefined; }
-  sseHub.stop();
+  if (searchDebounceTimer !== undefined) { clearTimeout(searchDebounceTimer); searchDebounceTimer = undefined; }
+  if (sidebarRefitSettleTimer !== undefined) { clearTimeout(sidebarRefitSettleTimer); sidebarRefitSettleTimer = undefined; }
+  cancelViewportAnimation();
+  const persisted = (ev as PageTransitionEvent).persisted;
+  if (persisted) {
+    sseHub.pause();
+  } else {
+    canvasResizeObserver?.disconnect();
+    sseHub.stop();
+  }
 });
 
-async function refreshMindmap(fitOnFirst = false) {
+window.addEventListener('pageshow', ev => {
+  const persisted = (ev as PageTransitionEvent).persisted;
+  if (persisted && !authExpired && sseStarted) {
+    sseHub.resume();
+  }
+});
+
+async function refreshMindmap(fitOnFirst = false, priority: FetchPriority = 'auto') {
   if (authExpired) return;
   const seq = ++refreshSeq;
   const hadPendingReset = pendingDbReset;
   const epochAtStart = dbEpoch;
   try {
     setConnState('loading', '同步中…');
-    const data = await apiGet<MindmapSnapshot>('/api/mindmap?limit=120');
+    const data = await apiGet<MindmapSnapshot>('/api/mindmap?limit=120', { priority });
     if (seq !== refreshSeq || authExpired) return;
     if (hadPendingReset && dbEpoch === epochAtStart) {
       pendingDbReset = false;
@@ -1559,11 +2090,12 @@ async function refreshMindmap(fitOnFirst = false) {
     }
 
     const sessCount = data.summary.totalSessions ?? getEffectiveSessions(snapshot, loadedFlows).length;
-    setConnState('live', `已连接实时库 (${sessCount} 会话 · ${data.summary.totalFlows} 句)`);
+    setConnState('live', `已连接实时库 (${formatCount(sessCount)} 会话 · ${formatCount(data.summary.totalFlows)} 句)`);
     renderKpis();
-    renderSidebar();
-    if (viewMode === 'list') renderListMatrix();
-    else rebuildAndRenderCanvas(fitOnFirst);
+    await renderSidebar();
+    if (seq !== refreshSeq || authExpired) return;
+    if (viewMode === 'list') await renderListMatrix();
+    else await rebuildAndRenderCanvas(fitOnFirst);
     ensureSseConnected(data.cursor);
   } catch (err) {
     if (seq !== refreshSeq) return;
@@ -1592,9 +2124,11 @@ async function loadMoreFlows() {
       hasMore: older.hasMore,
       beforeSeq: older.beforeSeq,
     };
-    renderSidebar();
-    if (viewMode === 'list') renderListMatrix();
-    else rebuildAndRenderCanvas(false);
+    await renderSidebar();
+    if (epoch !== dbEpoch) return;
+    if (viewMode === 'list') await renderListMatrix();
+    else await rebuildAndRenderCanvas(false);
+    announceStatus(`已加载更多历史，当前共 ${formatCount(loadedFlows.length)} 条消息记录`);
   } catch (err) {
     if (!(err instanceof ApiError && err.status === 401)) {
       setConnState('error', '加载历史失败');
@@ -1618,56 +2152,127 @@ function ensureSseConnected(initialCursor: number) {
 
 /* ==================== 交互事件绑定 ==================== */
 
+toggleSidebarBtn.setAttribute('aria-expanded', String(!workspaceEl.classList.contains('sidebar-collapsed')));
 toggleSidebarBtn.addEventListener('click', () => {
-  workspaceEl.classList.toggle('sidebar-collapsed');
-  window.setTimeout(() => { if (viewMode !== 'list') fitWidthTop(true); }, 430);
+  const collapsed = workspaceEl.classList.toggle('sidebar-collapsed');
+  toggleSidebarBtn.setAttribute('aria-expanded', String(!collapsed));
+  if (canvasResizeObserver) {
+    pendingSidebarRefit = true;
+  } else if (viewMode !== 'list') {
+    fitWidthTop(false);
+  }
 });
+
+sidebarModeSessionsBtn.setAttribute('aria-pressed', 'true');
+sidebarModeTurnsBtn.setAttribute('aria-pressed', 'false');
 
 sidebarModeSessionsBtn.addEventListener('click', () => {
   sidebarMode = 'sessions';
   sidebarModeSessionsBtn.classList.add('active');
   sidebarModeTurnsBtn.classList.remove('active');
-  renderSidebar();
+  sidebarModeSessionsBtn.setAttribute('aria-pressed', 'true');
+  sidebarModeTurnsBtn.setAttribute('aria-pressed', 'false');
+  void renderSidebar(true);
 });
 
 sidebarModeTurnsBtn.addEventListener('click', () => {
   sidebarMode = 'turns';
   sidebarModeTurnsBtn.classList.add('active');
   sidebarModeSessionsBtn.classList.remove('active');
-  renderSidebar();
+  sidebarModeTurnsBtn.setAttribute('aria-pressed', 'true');
+  sidebarModeSessionsBtn.setAttribute('aria-pressed', 'false');
+  void renderSidebar(true);
 });
 
-viewSessionBtn.addEventListener('click', () => switchViewMode('session'));
-viewOverviewBtn.addEventListener('click', () => switchViewMode('overview'));
-viewListBtn.addEventListener('click', () => switchViewMode('list'));
+if (viewTabsEl && typeof viewTabsEl.querySelectorAll === 'function') {
+  bindRovingTablist(viewTabsEl, {
+    onActivate: tab => {
+      const next: ViewMode = tab === viewOverviewBtn ? 'overview' : tab === viewListBtn ? 'list' : 'session';
+      if (next !== viewMode) void switchViewMode(next);
+    },
+  });
+} else {
+  viewSessionBtn.addEventListener('click', () => { void switchViewMode('session'); });
+  viewOverviewBtn.addEventListener('click', () => { void switchViewMode('overview'); });
+  viewListBtn.addEventListener('click', () => { void switchViewMode('list'); });
+}
+
+for (const elBtn of filterPillsEl.querySelectorAll<HTMLButtonElement>('button[data-filter]')) {
+  const isInitActive = (elBtn.dataset.filter ?? 'all') === filterKind;
+  elBtn.setAttribute('aria-pressed', String(isInitActive));
+}
 
 filterPillsEl.addEventListener('click', ev => {
-  const btn = (ev.target as HTMLElement).closest<HTMLButtonElement>('button[data-filter]');
+  const btn = (ev.target as HTMLElement | null)?.closest?.<HTMLButtonElement>('button[data-filter]');
   if (!btn) return;
   filterKind = (btn.dataset.filter as FilterKind) ?? 'all';
   for (const elBtn of filterPillsEl.querySelectorAll<HTMLButtonElement>('button[data-filter]')) {
-    elBtn.classList.toggle('active', elBtn === btn);
+    const active = elBtn === btn;
+    elBtn.classList.toggle('active', active);
+    elBtn.setAttribute('aria-pressed', String(active));
   }
-  renderSidebar();
-  if (viewMode === 'list') renderListMatrix();
-  else rebuildAndRenderCanvas(true);
+  void applySearchOrFilterUpdate(true, true);
 });
 
-searchInput.addEventListener('input', () => {
-  searchTerm = searchInput.value.trim();
-  searchClearBtn.hidden = !searchTerm;
-  renderSidebar();
-  if (viewMode === 'list') renderListMatrix();
-  else rebuildAndRenderCanvas(false);
+async function applySearchOrFilterUpdate(shouldFit: boolean, announceSummary: boolean): Promise<void> {
+  await renderSidebar(announceSummary);
+  if (viewMode === 'list') await renderListMatrix();
+  else await rebuildAndRenderCanvas(shouldFit);
+}
+
+function scheduleSearchApply(immediate = false): void {
+  if (searchDebounceTimer !== undefined) {
+    clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = undefined;
+  }
+  const apply = () => {
+    searchDebounceTimer = undefined;
+    searchTerm = searchInput.value.trim();
+    searchClearBtn.hidden = !searchTerm;
+    void applySearchOrFilterUpdate(false, true);
+  };
+  if (immediate) {
+    apply();
+    return;
+  }
+  searchDebounceTimer = setTimeout(apply, 150);
+}
+
+searchInput.addEventListener('compositionstart', () => {
+  isSearchComposing = true;
+});
+
+searchInput.addEventListener('compositionend', () => {
+  isSearchComposing = false;
+  scheduleSearchApply(false);
+});
+
+searchInput.addEventListener('input', ev => {
+  const rawValue = searchInput.value.trim();
+  searchClearBtn.hidden = !rawValue;
+  if (isSearchComposing || (ev as InputEvent).isComposing) return;
+  scheduleSearchApply(false);
+});
+
+searchInput.addEventListener('keydown', ev => {
+  const ke = ev as KeyboardEvent;
+  if (ke.key !== 'Enter') return;
+  if (isImeComposing(ke) || isSearchComposing) return;
+  ke.preventDefault();
+  scheduleSearchApply(true);
 });
 
 searchClearBtn.addEventListener('click', () => {
+  if (searchDebounceTimer !== undefined) {
+    clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = undefined;
+  }
+  isSearchComposing = false;
   searchInput.value = '';
   searchTerm = '';
   searchClearBtn.hidden = true;
-  renderSidebar();
-  if (viewMode === 'list') renderListMatrix();
-  else rebuildAndRenderCanvas(true);
+  void applySearchOrFilterUpdate(true, true);
+  safeFocus(searchInput, { preventScroll: true });
 });
 
 expandAllBtn.addEventListener('click', () => {
@@ -1678,7 +2283,8 @@ expandAllBtn.addEventListener('click', () => {
   for (const node of currentGraph.nodes) {
     if (node.toggleKey) collapseOverride.set(node.toggleKey, false);
   }
-  rebuildAndRenderCanvas(false);
+  announceStatus('已展开当前流程图全部折叠节点');
+  void rebuildAndRenderCanvas(false);
 });
 
 collapseAllBtn.addEventListener('click', () => {
@@ -1689,10 +2295,11 @@ collapseAllBtn.addEventListener('click', () => {
   for (const node of currentGraph.nodes) {
     if (node.toggleKey && node.kind !== 'worker_more') collapseOverride.set(node.toggleKey, true);
   }
-  rebuildAndRenderCanvas(true);
+  announceStatus('已收起至流程主干视图');
+  void rebuildAndRenderCanvas(true);
 });
 
-function zoomAroundCenter(factor: number) {
+function zoomAroundCenter(factor: number, announce = false) {
   const baseZoom = viewportAnimRaf ? viewportTargetZoom : zoom;
   const basePanX = viewportAnimRaf ? viewportTargetPanX : panX;
   const basePanY = viewportAnimRaf ? viewportTargetPanY : panY;
@@ -1711,65 +2318,259 @@ function zoomAroundCenter(factor: number) {
   } else {
     animateViewportTo(basePanX, basePanY, nextZoom, 320);
   }
+  if (announce) {
+    announceStatus(`画布缩放至 ${Math.round(nextZoom * 100)}%`);
+  }
 }
 
-zoomOutBtn.addEventListener('click', () => zoomAroundCenter(0.85));
-zoomInBtn.addEventListener('click', () => zoomAroundCenter(1.18));
-fitWidthBtn.addEventListener('click', () => fitWidthTop(true));
-fitBtn.addEventListener('click', () => fitToCanvas(true));
+zoomOutBtn.addEventListener('click', () => zoomAroundCenter(0.85, true));
+zoomInBtn.addEventListener('click', () => zoomAroundCenter(1.18, true));
+fitWidthBtn.addEventListener('click', () => {
+  fitWidthTop(true);
+  announceStatus(`画布已适宽置顶 (${Math.round(viewportTargetZoom * 100)}%)`);
+});
+fitBtn.addEventListener('click', () => {
+  fitToCanvas(true);
+  announceStatus(`画布已适应全图 (${Math.round(viewportTargetZoom * 100)}%)`);
+});
 refreshBtn.addEventListener('click', () => { void refreshMindmap(false); });
 loadMoreBtn.addEventListener('click', () => { void loadMoreFlows(); });
 
-svgElRoot.addEventListener('mousedown', ev => {
-  if (ev.button !== 0) return;
-  cancelViewportAnimation();
-  isDragging = true;
-  dragMoved = false;
-  dragStartX = ev.clientX;
-  dragStartY = ev.clientY;
-  dragPanStartX = panX;
-  dragPanStartY = panY;
-});
+svgElRoot.addEventListener('keydown', ev => {
+  const ke = ev as KeyboardEvent;
+  if (ke.ctrlKey || ke.metaKey || ke.altKey) return;
+  const onCanvasRoot = ke.target === svgElRoot || ke.target === viewportEl;
+  const step = ke.shiftKey ? 120 : 60;
 
-window.addEventListener('mousemove', ev => {
-  if (!isDragging) return;
-  const dx = ev.clientX - dragStartX;
-  const dy = ev.clientY - dragStartY;
-  if (Math.abs(dx) > 3 || Math.abs(dy) > 3) dragMoved = true;
-  panX = dragPanStartX + dx;
-  panY = dragPanStartY + dy;
-  applyViewportTransform();
-});
+  if (onCanvasRoot) {
+    if (ke.key === 'ArrowUp') {
+      ke.preventDefault();
+      cancelViewportAnimation();
+      panY += step;
+      scheduleViewportRender();
+      announceStatus('画布向上平移');
+      return;
+    }
+    if (ke.key === 'ArrowDown') {
+      ke.preventDefault();
+      cancelViewportAnimation();
+      panY -= step;
+      scheduleViewportRender();
+      announceStatus('画布向下平移');
+      return;
+    }
+    if (ke.key === 'ArrowLeft') {
+      ke.preventDefault();
+      cancelViewportAnimation();
+      panX += step;
+      scheduleViewportRender();
+      announceStatus('画布向左平移');
+      return;
+    }
+    if (ke.key === 'ArrowRight') {
+      ke.preventDefault();
+      cancelViewportAnimation();
+      panX -= step;
+      scheduleViewportRender();
+      announceStatus('画布向右平移');
+      return;
+    }
+  }
 
-window.addEventListener('mouseup', () => {
-  isDragging = false;
-  if (dragMoved) {
-    window.setTimeout(() => { dragMoved = false; }, 0);
+  if (ke.key === '+' || ke.key === '=') {
+    ke.preventDefault();
+    zoomAroundCenter(1.18, true);
+  } else if (ke.key === '-' || ke.key === '_') {
+    ke.preventDefault();
+    zoomAroundCenter(0.85, true);
+  } else if (ke.key === '0') {
+    ke.preventDefault();
+    fitWidthTop(true);
+    announceStatus(`画布视图已重置 (${Math.round(viewportTargetZoom * 100)}%)`);
   }
 });
-window.addEventListener('blur', () => {
+
+svgElRoot.addEventListener('click', ev => {
+  if (suppressNextClick && nowMs() - lastDragEndedAt < 400) {
+    suppressNextClick = false;
+    ev.preventDefault();
+    ev.stopPropagation();
+    return;
+  }
+  suppressNextClick = false;
+}, true);
+
+function resetPointerDragState(): void {
+  activePointers.clear();
   isDragging = false;
   dragMoved = false;
+  pinchStartDist = 0;
+  svgElRoot.classList?.remove('dragging');
+}
+
+function finishPointerInteraction(ev: PointerEvent, isCancel: boolean): void {
+  const pointerId = ev.pointerId ?? 0;
+  const hadPointer = activePointers.delete(pointerId);
+  try {
+    if (svgElRoot.hasPointerCapture?.(pointerId)) {
+      svgElRoot.releasePointerCapture?.(pointerId);
+    }
+  } catch {
+    // Ignore pointer capture release errors on synthetic events
+  }
+  if (!hadPointer && activePointers.size === 0) return;
+
+  if (activePointers.size === 1) {
+    const remaining = activePointers.values().next().value;
+    if (remaining) {
+      dragStartX = remaining.x;
+      dragStartY = remaining.y;
+      dragPanStartX = panX;
+      dragPanStartY = panY;
+      isDragging = true;
+    }
+    pinchStartDist = 0;
+    return;
+  }
+
+  if (activePointers.size === 0) {
+    if (dragMoved && !isCancel) {
+      suppressNextClick = true;
+      lastDragEndedAt = nowMs();
+    } else {
+      suppressNextClick = false;
+    }
+    resetPointerDragState();
+  }
+}
+
+svgElRoot.addEventListener('pointerdown', ev => {
+  const pe = ev as PointerEvent;
+  if (pe.pointerType === 'mouse' && pe.button !== 0) return;
+  if (typeof pe.button === 'number' && pe.button > 0) return;
+
+  cancelViewportAnimation();
+  suppressNextClick = false;
+  const pointerId = pe.pointerId ?? 0;
+  activePointers.set(pointerId, { x: pe.clientX, y: pe.clientY });
+
+  const targetClosest = (pe.target as { closest?: (sel: string) => unknown } | null)?.closest?.bind(pe.target);
+  const hitInteractiveChild = Boolean(targetClosest?.('.mm-node-hit, .fc-frame-hit, .mm-toggle-btn'));
+
+  if (activePointers.size === 1) {
+    isDragging = true;
+    dragMoved = false;
+    dragStartX = pe.clientX;
+    dragStartY = pe.clientY;
+    dragPanStartX = panX;
+    dragPanStartY = panY;
+    if (!hitInteractiveChild) {
+      try { svgElRoot.setPointerCapture?.(pointerId); } catch {}
+    }
+  } else if (activePointers.size === 2) {
+    dragMoved = true;
+    svgElRoot.classList?.add('dragging');
+    for (const pid of activePointers.keys()) {
+      try {
+        if (!svgElRoot.hasPointerCapture?.(pid)) svgElRoot.setPointerCapture?.(pid);
+      } catch {}
+    }
+    const pts = Array.from(activePointers.values());
+    const p1 = pts[0]!;
+    const p2 = pts[1]!;
+    const rect = svgElRoot.getBoundingClientRect();
+    pinchStartDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+    pinchStartMidX = (p1.x + p2.x) / 2 - rect.left;
+    pinchStartMidY = (p1.y + p2.y) / 2 - rect.top;
+    pinchStartZoom = zoom;
+    pinchStartPanX = panX;
+    pinchStartPanY = panY;
+  }
+});
+
+svgElRoot.addEventListener('pointermove', ev => {
+  const pe = ev as PointerEvent;
+  const pointerId = pe.pointerId ?? 0;
+  if (!activePointers.has(pointerId)) return;
+  activePointers.set(pointerId, { x: pe.clientX, y: pe.clientY });
+
+  if (activePointers.size >= 2 && pinchStartDist > 0) {
+    const pts = Array.from(activePointers.values());
+    const p1 = pts[0]!;
+    const p2 = pts[1]!;
+    const dist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+    if (dist <= 0) return;
+    const rect = svgElRoot.getBoundingClientRect();
+    const midX = (p1.x + p2.x) / 2 - rect.left;
+    const midY = (p1.y + p2.y) / 2 - rect.top;
+    const nextZoom = Math.max(0.22, Math.min(2.4, pinchStartZoom * (dist / pinchStartDist)));
+    const worldX = (pinchStartMidX - pinchStartPanX) / pinchStartZoom;
+    const worldY = (pinchStartMidY - pinchStartPanY) / pinchStartZoom;
+    panX = midX - worldX * nextZoom;
+    panY = midY - worldY * nextZoom;
+    zoom = nextZoom;
+    scheduleViewportRender();
+    return;
+  }
+
+  if (!isDragging) return;
+  const dx = pe.clientX - dragStartX;
+  const dy = pe.clientY - dragStartY;
+  if (!dragMoved && Math.hypot(dx, dy) >= 4) {
+    dragMoved = true;
+    svgElRoot.classList?.add('dragging');
+    try {
+      if (!svgElRoot.hasPointerCapture?.(pointerId)) svgElRoot.setPointerCapture?.(pointerId);
+    } catch {}
+  }
+  if (dragMoved) {
+    panX = dragPanStartX + dx;
+    panY = dragPanStartY + dy;
+    scheduleViewportRender();
+  }
+});
+
+svgElRoot.addEventListener('pointerup', ev => finishPointerInteraction(ev as PointerEvent, false));
+svgElRoot.addEventListener('pointercancel', ev => finishPointerInteraction(ev as PointerEvent, true));
+svgElRoot.addEventListener('lostpointercapture', ev => finishPointerInteraction(ev as PointerEvent, true));
+
+window.addEventListener('blur', () => {
+  suppressNextClick = false;
+  resetPointerDragState();
 });
 
 svgElRoot.addEventListener('wheel', ev => {
   ev.preventDefault();
   cancelViewportAnimation();
+  const rect = svgElRoot.getBoundingClientRect();
+  const containerHeight = rect.height > 0 ? rect.height : 600;
+  const scaleMultiplier = ev.deltaMode === DOM_DELTA_LINE
+    ? 16
+    : ev.deltaMode === DOM_DELTA_PAGE
+      ? containerHeight
+      : 1;
+  const deltaX = ev.deltaX * scaleMultiplier;
+  const deltaY = ev.deltaY * scaleMultiplier;
+
   if (ev.ctrlKey || ev.metaKey) {
-    const rect = svgElRoot.getBoundingClientRect();
     const mx = ev.clientX - rect.left;
     const my = ev.clientY - rect.top;
-    const factor = ev.deltaY < 0 ? 1.12 : 0.89;
-    const nextZoom = Math.max(0.22, Math.min(2.4, zoom * factor));
-    const scaleChange = nextZoom / zoom;
-    panX = mx - (mx - panX) * scaleChange;
-    panY = my - (my - panY) * scaleChange;
-    zoom = nextZoom;
+    const clampedY = Math.max(-120, Math.min(120, deltaY));
+    if (clampedY !== 0) {
+      const factor = clampedY < 0
+        ? Math.min(1.25, 1 + (-clampedY / 450))
+        : Math.max(0.8, 1 - (clampedY / 500));
+      const nextZoom = Math.max(0.22, Math.min(2.4, zoom * factor));
+      const scaleChange = nextZoom / zoom;
+      panX = mx - (mx - panX) * scaleChange;
+      panY = my - (my - panY) * scaleChange;
+      zoom = nextZoom;
+    }
   } else {
-    panX -= ev.deltaX;
-    panY -= ev.deltaY;
+    panX -= deltaX;
+    panY -= deltaY;
   }
-  applyViewportTransform();
+  scheduleViewportRender();
 }, { passive: false });
 
 if (!accessToken) {
