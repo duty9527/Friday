@@ -1,5 +1,5 @@
 import type { ChatMessage, MainView, TraceEvent, VoiceprintStatusView } from '../view.js';
-import { createHttpClient, resolveBootstrapToken } from './shared/auth-http.js';
+import { createHttpClient, resolveBootstrapToken, type ApiRequestOptions } from './shared/auth-http.js';
 
 export type Selection = { type: 'all' } | { type: 'task' | 'message'; id: string; label: string };
 
@@ -107,14 +107,15 @@ export const http = createHttpClient({
 
 export const api = http.api;
 export const request = http.request;
+export type { ApiRequestOptions };
 
-export async function fetchMessagesBatch(ids: readonly string[]): Promise<ChatMessage[]> {
+export async function fetchMessagesBatch(ids: readonly string[], init?: ApiRequestOptions): Promise<ChatMessage[]> {
   const unique = [...new Set(ids.filter(Boolean))];
   if (!unique.length) return [];
   const items: ChatMessage[] = [];
   for (let offset = 0; offset < unique.length; offset += 50) {
     const params = new URLSearchParams({ ids: unique.slice(offset, offset + 50).join(',') });
-    const res = await api<{ items?: ChatMessage[] }>(`/api/messages?${params}`);
+    const res = await api<{ items?: ChatMessage[] }>(`/api/messages?${params}`, undefined, init);
     if (Array.isArray(res.items)) items.push(...res.items);
   }
   return items;

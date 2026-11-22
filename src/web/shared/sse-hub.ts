@@ -30,6 +30,8 @@ export interface SharedSseHub {
   start: (initialCursor: number) => void;
   reconnect: (cursor: number) => void;
   setCursor: (cursor: number) => void;
+  pause: () => void;
+  resume: () => void;
   stop: () => void;
   isLeader: () => boolean;
 }
@@ -95,9 +97,12 @@ function messageErrorText(error: unknown): string {
 export function createSharedSseHub(options: SharedSseHubOptions): SharedSseHub {
   const tabId = options.tabId ?? makeTabId();
   const channelFactory = options.createChannel ?? defaultCreateChannel;
-  const channel = channelFactory(`friday.sse-stream.v1:${safeChannelTag(options.token)}`);
+  const channelName = `friday.sse-stream.v1:${safeChannelTag(options.token)}`;
+  let channel = channelFactory(channelName);
 
   let active = false;
+  let paused = false;
+  let stopped = false;
   let role: 'stopped' | 'electing' | 'leader' | 'follower' = 'stopped';
   let currentLeaderId: string | undefined;
   let localCursor = 0;
@@ -173,9 +178,15 @@ export function createSharedSseHub(options: SharedSseHubOptions): SharedSseHub {
       await consumeSseStream(response, {
         shouldContinue: () => active && role === 'leader' && generation === streamGeneration && !options.isStopped(),
         disconnectMessage: options.disconnectMessage,
+        signal: controller.signal,
         onEvent: async (eventName, rawData) => {
           if (eventName !== 'updates' || !active || role !== 'leader' || generation !== streamGeneration) return;
-          const batch = JSON.parse(rawData) as SseUpdateBatch;
+          let batch: SseUpdateBatch;
+          try {
+            batch = JSON.parse(rawData) as SseUpdateBatch;
+          } catch (cause) {
+            throw new Error('事件流消息格式错误', { cause });
+          }
           const cursorReset = Boolean(batch.reset) || (typeof batch.cursor === 'number' && batch.cursor < localCursor);
           if (cursorReset) localCursor = 0;
           if (typeof batch.cursor === 'number') {
@@ -287,8 +298,9 @@ export function createSharedSseHub(options: SharedSseHubOptions): SharedSseHub {
     }
   }
 
-  if (channel) {
-    channel.onmessage = event => {
+  function bindChannel(ch: BroadcastChannelLike | undefined): void {
+    if (!ch) return;
+    ch.onmessage = event => {
       if (!active || options.isStopped()) return;
       const raw = event.data;
       if (!raw || typeof raw !== 'object' || !('type' in raw)) return;
@@ -371,7 +383,7 @@ export function createSharedSseHub(options: SharedSseHubOptions): SharedSseHub {
           if (msg.connected) {
             options.onConnected?.(true);
           } else {
-            options.onError?.(new Error(msg.errorText ?? '事件流已断开'));
+            options.onError?.(new Error(msg.errorText ?? '事件流已断开', { cause: msg }));
           }
           break;
         }
@@ -379,8 +391,34 @@ export function createSharedSseHub(options: SharedSseHubOptions): SharedSseHub {
     };
   }
 
+  bindChannel(channel);
+
+  function ensureChannelOpen(): void {
+    if (!channel) {
+      channel = channelFactory(channelName);
+      bindChannel(channel);
+    }
+  }
+
+  function suspendTransport(): void {
+    const wasLeader = role === 'leader';
+    active = false;
+    role = 'stopped';
+    clearLeaderTimers();
+    clearElectionAndFollowerTimers();
+    abortStream();
+    if (wasLeader) {
+      post({ type: 'leader-bye', leaderId: tabId });
+    }
+    channel?.close();
+    channel = undefined;
+  }
+
   return {
     start(initialCursor: number) {
+      if (stopped) return;
+      paused = false;
+      ensureChannelOpen();
       localCursor = initialCursor;
       active = true;
       if (role === 'leader') {
@@ -398,6 +436,9 @@ export function createSharedSseHub(options: SharedSseHubOptions): SharedSseHub {
       startElection(ELECTION_DELAY_MS);
     },
     reconnect(cursor: number) {
+      if (stopped) return;
+      paused = false;
+      ensureChannelOpen();
       localCursor = cursor;
       active = true;
       retryDelay = 500;
@@ -424,17 +465,23 @@ export function createSharedSseHub(options: SharedSseHubOptions): SharedSseHub {
     setCursor(cursor: number) {
       localCursor = cursor;
     },
+    pause() {
+      if (stopped || paused) return;
+      paused = true;
+      suspendTransport();
+    },
+    resume() {
+      if (stopped || !paused || options.isStopped()) return;
+      paused = false;
+      ensureChannelOpen();
+      active = true;
+      retryDelay = 500;
+      startElection(ELECTION_DELAY_MS);
+    },
     stop() {
-      const wasLeader = role === 'leader';
-      active = false;
-      role = 'stopped';
-      clearLeaderTimers();
-      clearElectionAndFollowerTimers();
-      abortStream();
-      if (wasLeader) {
-        post({ type: 'leader-bye', leaderId: tabId });
-      }
-      channel?.close();
+      stopped = true;
+      paused = false;
+      suspendTransport();
     },
     isLeader() {
       return role === 'leader';

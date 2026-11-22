@@ -69,10 +69,30 @@ export function resolveBootstrapToken(): BootstrapTokenState {
 }
 
 export class ApiError extends Error {
-  constructor(message: string, readonly status: number) {
-    super(message);
+  constructor(message: string, readonly status: number, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'ApiError';
   }
 }
+
+export type FetchPriority = 'high' | 'low' | 'auto';
+
+export interface ApiRequestOptions {
+  signal?: AbortSignal;
+  priority?: FetchPriority;
+  timeoutMs?: number;
+  keepalive?: boolean;
+  headers?: HeadersInit;
+}
+
+export type HttpRequestInit = RequestInit & {
+  priority?: FetchPriority;
+  timeoutMs?: number;
+};
+
+type FetchInitWithPriority = RequestInit & {
+  priority?: FetchPriority;
+};
 
 export interface HttpClientOptions {
   token: string;
@@ -82,8 +102,73 @@ export interface HttpClientOptions {
 }
 
 export interface HttpClient {
-  request: (path: string, init?: RequestInit) => Promise<Response>;
-  api: <T>(path: string, body?: unknown) => Promise<T>;
+  request: (path: string, init?: HttpRequestInit) => Promise<Response>;
+  api: <T>(path: string, body?: unknown, init?: ApiRequestOptions) => Promise<T>;
+}
+
+function buildComposedSignal(signal?: AbortSignal, timeoutMs?: number): {
+  signal: AbortSignal | undefined;
+  cleanup: () => void;
+} {
+  const hasTimeout = timeoutMs !== undefined && Number.isFinite(timeoutMs) && timeoutMs > 0;
+  if (!hasTimeout) {
+    return { signal, cleanup: () => {} };
+  }
+
+  const supportsTimeout = typeof AbortSignal !== 'undefined'
+    && 'timeout' in AbortSignal
+    && typeof AbortSignal.timeout === 'function';
+  const supportsAny = typeof AbortSignal !== 'undefined'
+    && 'any' in AbortSignal
+    && typeof AbortSignal.any === 'function';
+
+  if (supportsTimeout) {
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    if (!signal) return { signal: timeoutSignal, cleanup: () => {} };
+    if (supportsAny) return { signal: AbortSignal.any([signal, timeoutSignal]), cleanup: () => {} };
+    if (typeof AbortController === 'undefined') return { signal, cleanup: () => {} };
+    const ac = new AbortController();
+    const forward = (src: AbortSignal) => () => ac.abort(src.reason);
+    if (signal.aborted) {
+      ac.abort(signal.reason);
+      return { signal: ac.signal, cleanup: () => {} };
+    }
+    const onUserAbort = forward(signal);
+    const onTimeout = forward(timeoutSignal);
+    signal.addEventListener('abort', onUserAbort, { once: true });
+    timeoutSignal.addEventListener('abort', onTimeout, { once: true });
+    return {
+      signal: ac.signal,
+      cleanup: () => {
+        signal.removeEventListener('abort', onUserAbort);
+        timeoutSignal.removeEventListener('abort', onTimeout);
+      },
+    };
+  }
+
+  if (typeof AbortController === 'undefined') {
+    return { signal, cleanup: () => {} };
+  }
+  const ac = new AbortController();
+  if (signal?.aborted) {
+    ac.abort(signal.reason);
+    return { signal: ac.signal, cleanup: () => {} };
+  }
+  const timer = setTimeout(() => {
+    const err = typeof DOMException !== 'undefined'
+      ? new DOMException('The operation timed out.', 'TimeoutError')
+      : new Error('The operation timed out.');
+    ac.abort(err);
+  }, timeoutMs);
+  const onUserAbort = () => ac.abort(signal?.reason);
+  signal?.addEventListener('abort', onUserAbort, { once: true });
+  return {
+    signal: ac.signal,
+    cleanup: () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onUserAbort);
+    },
+  };
 }
 
 /**
@@ -92,25 +177,49 @@ export interface HttpClient {
 export function createHttpClient(options: HttpClientOptions): HttpClient {
   const missingMessage = options.missingTokenMessage ?? '请使用当前服务生成的本地启动链接进入。';
 
-  async function request(path: string, init: RequestInit = {}): Promise<Response> {
+  async function request(path: string, init: HttpRequestInit = {}): Promise<Response> {
     if (!options.token || options.isExpired?.()) throw new ApiError(missingMessage, 401);
     const headers = new Headers(init.headers);
     if (!(options.token === OPEN_AUTH_SENTINEL_TOKEN && hasOpenAuthCookie())) {
       headers.set('Authorization', `Bearer ${options.token}`);
     }
     if (init.body !== undefined) headers.set('Content-Type', 'application/json');
-    const response = await fetch(path, { ...init, headers, credentials: 'omit', cache: 'no-store' });
-    if (!response.ok) {
-      const body: unknown = await response.json().catch(() => ({}));
-      if (response.status === 401) options.onAuthExpired?.();
-      const message = record(body).error;
-      throw new ApiError(typeof message === 'string' ? message : `本机服务返回 ${response.status}`, response.status);
+
+    const { timeoutMs, priority, signal: userSignal, ...restInit } = init;
+    const { signal, cleanup } = buildComposedSignal(userSignal ?? undefined, timeoutMs);
+    const fetchInit: FetchInitWithPriority = {
+      ...restInit,
+      headers,
+      credentials: 'omit',
+      cache: 'no-store',
+      ...(signal ? { signal } : {}),
+      ...(priority !== undefined ? { priority } : {}),
+    };
+
+    try {
+      const response = await fetch(path, fetchInit);
+      if (!response.ok) {
+        const body: unknown = await response.json().catch(() => ({}));
+        if (response.status === 401) options.onAuthExpired?.();
+        const message = record(body).error;
+        throw new ApiError(typeof message === 'string' ? message : `本机服务返回 ${response.status}`, response.status);
+      }
+      return response;
+    } finally {
+      cleanup();
     }
-    return response;
   }
 
-  async function api<T>(path: string, body?: unknown): Promise<T> {
-    const response = await request(path, body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) });
+  async function api<T>(path: string, body?: unknown, init?: ApiRequestOptions): Promise<T> {
+    const reqInit: HttpRequestInit = {
+      ...(body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) }),
+      ...(init?.signal ? { signal: init.signal } : {}),
+      ...(init?.priority !== undefined ? { priority: init.priority } : {}),
+      ...(init?.timeoutMs !== undefined ? { timeoutMs: init.timeoutMs } : {}),
+      ...(init?.keepalive !== undefined ? { keepalive: init.keepalive } : {}),
+      ...(init?.headers !== undefined ? { headers: init.headers } : {}),
+    };
+    const response = await request(path, reqInit);
     return response.json() as Promise<T>;
   }
 
@@ -122,6 +231,7 @@ export interface SseStreamOptions {
   onEvent: (eventName: string, rawData: string) => void | Promise<void>;
   maxBufferBytes?: number;
   disconnectMessage?: string;
+  signal?: AbortSignal;
 }
 
 /**
@@ -157,28 +267,57 @@ export async function consumeSseStream(response: Response, options: SseStreamOpt
     await options.onEvent(name, raw);
   }
 
+  const processLine = async (line: string): Promise<void> => {
+    if (!line) {
+      await dispatch();
+    } else if (line.startsWith('event:')) {
+      eventName = line.slice(6).trim();
+    } else if (line.startsWith('data:')) {
+      data.push(line.slice(5).replace(/^ /, ''));
+    }
+    // SSE comments are heartbeats, not activity or invented counters.
+  };
+  const onAbort = () => {
+    void reader.cancel().catch(() => {});
+  };
+  options.signal?.addEventListener('abort', onAbort, { once: true });
   try {
-    while (options.shouldContinue()) {
+    while (options.shouldContinue() && !options.signal?.aborted) {
       const { value, done } = await reader.read();
-      if (done) break;
+      if (done) {
+        const trailing = decoder.decode();
+        if (trailing) {
+          buffer += trailing;
+          if (buffer.length > maxBufferBytes) throw new Error('事件流记录超过可处理长度');
+        }
+        let newline: number;
+        while ((newline = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, newline).replace(/\r$/, '');
+          buffer = buffer.slice(newline + 1);
+          await processLine(line);
+        }
+        if (buffer.length > 0) {
+          const residual = buffer.replace(/\r$/, '');
+          buffer = '';
+          await processLine(residual);
+        }
+        if (data.length > 0) await dispatch();
+        break;
+      }
       buffer += decoder.decode(value, { stream: true });
       if (buffer.length > maxBufferBytes) throw new Error('事件流记录超过可处理长度');
       let newline: number;
       while ((newline = buffer.indexOf('\n')) !== -1) {
         const line = buffer.slice(0, newline).replace(/\r$/, '');
         buffer = buffer.slice(newline + 1);
-        if (!line) {
-          await dispatch();
-        } else if (line.startsWith('event:')) {
-          eventName = line.slice(6).trim();
-        } else if (line.startsWith('data:')) {
-          data.push(line.slice(5).replace(/^ /, ''));
-        }
-        // SSE comments are heartbeats, not activity or invented counters.
+        await processLine(line);
       }
     }
-    if (options.shouldContinue()) throw new Error(options.disconnectMessage ?? '事件流已断开');
+    if (options.shouldContinue() && !options.signal?.aborted) {
+      throw new Error(options.disconnectMessage ?? '事件流已断开');
+    }
   } finally {
+    options.signal?.removeEventListener('abort', onAbort);
     await reader.cancel().catch(() => {});
     reader.releaseLock();
   }

@@ -117,6 +117,22 @@ function pad2(n: number): string {
   return String(n).padStart(2, '0');
 }
 
+const zhTimeFormatter = typeof Intl !== 'undefined'
+  ? new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
+  : null;
+
+const zhMonthDayFormatter = typeof Intl !== 'undefined'
+  ? new Intl.DateTimeFormat('zh-CN', { month: 'long', day: 'numeric' })
+  : null;
+
+const zhYearDateFormatter = typeof Intl !== 'undefined'
+  ? new Intl.DateTimeFormat('zh-CN', { dateStyle: 'long' })
+  : null;
+
+function formatClockPair(d: Date): string {
+  return zhTimeFormatter ? zhTimeFormatter.format(d) : `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
 /**
  * Returns true when a time separator should precede `curr`.
  */
@@ -135,14 +151,18 @@ export function formatTimeDivider(at: number, now = Date.now()): string {
   const target = new Date(at);
   if (Number.isNaN(target.getTime())) return '—';
   const ref = new Date(now);
-  const hhmm = `${pad2(target.getHours())}:${pad2(target.getMinutes())}`;
+  const hhmm = formatClockPair(target);
   if (sameLocalDay(target, ref)) return `今天 ${hhmm}`;
   const yesterday = new Date(ref.getFullYear(), ref.getMonth(), ref.getDate() - 1);
   if (sameLocalDay(target, yesterday)) return `昨天 ${hhmm}`;
   if (target.getFullYear() === ref.getFullYear()) {
-    return `${target.getMonth() + 1}月${target.getDate()}日 ${hhmm}`;
+    const md = zhMonthDayFormatter ? zhMonthDayFormatter.format(target) : `${target.getMonth() + 1}月${target.getDate()}日`;
+    return `${md} ${hhmm}`;
   }
-  return `${target.getFullYear()}年${target.getMonth() + 1}月${target.getDate()}日 ${hhmm}`;
+  const ymd = zhYearDateFormatter
+    ? zhYearDateFormatter.format(target)
+    : `${target.getFullYear()}年${target.getMonth() + 1}月${target.getDate()}日`;
+  return `${ymd} ${hhmm}`;
 }
 
 /**
@@ -152,7 +172,7 @@ export function formatShortClock(at: number): string {
   if (!Number.isFinite(at)) return '—';
   const d = new Date(at);
   if (Number.isNaN(d.getTime())) return '—';
-  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  return formatClockPair(d);
 }
 
 /**

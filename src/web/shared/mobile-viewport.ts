@@ -171,17 +171,42 @@ export function initMobileViewport(): MobileViewportController {
     }
   };
 
+  const scheduleSync = (): void => {
+    if (disposed) return;
+    if (typeof requestAnimationFrame !== 'function') {
+      sync();
+      return;
+    }
+    if (rafId !== undefined) return;
+    rafId = requestAnimationFrame(() => {
+      rafId = undefined;
+      sync();
+    });
+  };
+
   const sync = (): void => {
     if (disposed) return;
     const root = document.documentElement;
     if (!root?.classList) return;
 
-    const probe = ensureProbe();
-    const { safeTop, safeBottom } = readSafeInsets(probe);
-
     const layoutW = isFinitePositive(window.innerWidth)
       ? window.innerWidth
       : (root.clientWidth || 0);
+    const narrowMobile = isNarrowMobile(layoutW);
+    if (!narrowMobile) {
+      root.classList.toggle('mobile-keyboard-open', false);
+      root.classList.toggle(CLIPPED_CLASS, false);
+      return;
+    }
+
+    const iosStandalone = isIosStandalone();
+    let safeTop = 0;
+    let safeBottom = 0;
+    if (iosStandalone) {
+      const probe = ensureProbe();
+      ({ safeTop, safeBottom } = readSafeInsets(probe));
+    }
+
     const layoutH = isFinitePositive(window.innerHeight)
       ? window.innerHeight
       : (root.clientHeight || 0);
@@ -192,8 +217,7 @@ export function initMobileViewport(): MobileViewportController {
       ? window.screen.height
       : 0;
 
-    const standalone = isStandalone();
-    const narrowMobile = isNarrowMobile(layoutW);
+    const standalone = iosStandalone || isStandalone();
 
     const vv = window.visualViewport;
     const vvH = vv && isFinitePositive(vv.height) ? vv.height : layoutH;
@@ -220,7 +244,7 @@ export function initMobileViewport(): MobileViewportController {
 
     const clipped = isIosStandaloneClipped({
       standalone,
-      iosStandalone: isIosStandalone(),
+      iosStandalone,
       narrowMobile,
       keyboardOpen,
       screenWidth: screenW,
@@ -231,7 +255,6 @@ export function initMobileViewport(): MobileViewportController {
       safeBottom,
     });
 
-    root.classList.toggle('pwa-standalone', standalone);
     root.classList.toggle('mobile-keyboard-open', keyboardOpen);
     root.classList.toggle(CLIPPED_CLASS, clipped);
   };
@@ -269,15 +292,15 @@ export function initMobileViewport(): MobileViewportController {
     });
   };
 
-  listen(window, 'resize', sync, { passive: true });
+  listen(window, 'resize', scheduleSync, { passive: true });
   listen(window, 'orientationchange', () => {
-    sync();
+    scheduleSync();
     scheduleDelayedSync(120);
   }, { passive: true });
-  listen(window, 'pageshow', sync, { passive: true });
+  listen(window, 'pageshow', scheduleSync, { passive: true });
 
   listen(document, 'visibilitychange', () => {
-    if (!document.hidden) sync();
+    if (!document.hidden) scheduleSync();
   });
   listen(document, 'focusin', () => {
     sync();
@@ -288,16 +311,11 @@ export function initMobileViewport(): MobileViewportController {
   });
 
   if (window.visualViewport) {
-    listen(window.visualViewport, 'resize', sync, { passive: true });
+    listen(window.visualViewport, 'resize', scheduleSync, { passive: true });
   }
 
   sync();
-  if (typeof requestAnimationFrame === 'function') {
-    rafId = requestAnimationFrame(() => {
-      rafId = undefined;
-      sync();
-    });
-  }
+  scheduleSync();
   scheduleDelayedSync(120);
   scheduleDelayedSync(450);
 

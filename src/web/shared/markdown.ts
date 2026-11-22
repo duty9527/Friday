@@ -1,4 +1,5 @@
 import { tokenizeBotMessageText, type BotExpression } from './bot-expressions.js';
+import { copyTextWithFeedback } from './ui-primitives.js';
 
 export type TableAlign = 'left' | 'center' | 'right' | 'none';
 
@@ -578,34 +579,12 @@ function appendInlineDom(parent: Node, tokens: readonly InlineToken[], opts: Mar
   }
 }
 
-const copyResetTimers = new WeakMap<HTMLButtonElement, ReturnType<typeof setTimeout>>();
-
-function defaultCopyCode(code: string, btn: HTMLButtonElement): void {
-  const original = '复制';
-  const scheduleReset = (delayMs: number, clearCopiedClass: boolean) => {
-    const prevTimer = copyResetTimers.get(btn);
-    if (prevTimer !== undefined) clearTimeout(prevTimer);
-    const timer = setTimeout(() => {
-      copyResetTimers.delete(btn);
-      if (clearCopiedClass) btn.classList.remove('is-copied');
-      btn.textContent = original;
-    }, delayMs);
-    copyResetTimers.set(btn, timer);
-  };
-  if (typeof navigator === 'undefined' || !navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
-    btn.classList.remove('is-copied');
-    btn.textContent = '不可复制';
-    scheduleReset(1400, false);
-    return;
-  }
-  void navigator.clipboard.writeText(code).then(() => {
-    btn.classList.add('is-copied');
-    btn.textContent = '✓ 已复制';
-    scheduleReset(1500, true);
-  }).catch(() => {
-    btn.classList.remove('is-copied');
-    btn.textContent = '复制失败';
-    scheduleReset(1400, false);
+function defaultCopyCode(code: string, btn: HTMLButtonElement, statusEl?: HTMLElement | null): void {
+  void copyTextWithFeedback(btn, code, {
+    statusEl,
+    successLabel: '✓ 已复制',
+    failLabel: '复制失败',
+    defaultLabel: '复制',
   });
 }
 
@@ -613,7 +592,8 @@ function renderBlocksInto(container: Node, blocks: readonly MarkdownBlock[], opt
   for (const block of blocks) {
     switch (block.kind) {
       case 'heading': {
-        const tag = `h${block.level}` as 'h1' | 'h2' | 'h3' | 'h4';
+        const domLevel = Math.min(6, block.level + 2) as 3 | 4 | 5 | 6;
+        const tag = `h${domLevel}` as 'h3' | 'h4' | 'h5' | 'h6';
         const h = doc.createElement(tag);
         h.className = `md-h md-h${block.level}`;
         appendInlineDom(h, parseInlineTokens(block.text), opts, doc);
@@ -655,6 +635,10 @@ function renderBlocksInto(container: Node, blocks: readonly MarkdownBlock[], opt
             box.setAttribute('aria-hidden', 'true');
             box.textContent = item.checked ? '✓' : '';
             li.appendChild(box);
+            const srState = doc.createElement('span');
+            srState.className = 'visually-hidden';
+            srState.textContent = item.checked ? '已完成 ' : '未完成 ';
+            li.appendChild(srState);
           }
           const bodySpan = doc.createElement('span');
           bodySpan.className = 'md-li-body';
@@ -671,12 +655,16 @@ function renderBlocksInto(container: Node, blocks: readonly MarkdownBlock[], opt
       case 'table': {
         const wrap = doc.createElement('div');
         wrap.className = 'md-table-wrap';
+        wrap.setAttribute('tabindex', '0');
+        wrap.setAttribute('role', 'region');
+        wrap.setAttribute('aria-label', '数据表');
         const table = doc.createElement('table');
         table.className = 'md-table';
         const thead = doc.createElement('thead');
         const headTr = doc.createElement('tr');
         for (let col = 0; col < block.headers.length; col++) {
           const th = doc.createElement('th');
+          th.setAttribute('scope', 'col');
           const align = block.aligns[col] ?? 'none';
           if (align !== 'none') th.className = `align-${align}`;
           appendInlineDom(th, parseInlineTokens(block.headers[col] ?? ''), opts, doc);
@@ -719,24 +707,36 @@ function renderBlocksInto(container: Node, blocks: readonly MarkdownBlock[], opt
         metaEl.className = 'md-code-lines meta';
         metaEl.textContent = block.closed ? `${lineCount} 行` : `${lineCount} 行 · 输出中`;
 
+        const codeLabel = `${block.lang || '代码'}代码块`;
+        const copyWrap = doc.createElement('span');
+        copyWrap.className = 'md-copy-wrap';
         const copyBtn = doc.createElement('button');
         copyBtn.type = 'button';
         copyBtn.className = 'md-code-copy mini-button';
         copyBtn.textContent = '复制';
+        copyBtn.setAttribute('aria-label', `复制${codeLabel}`);
+        const copyStatus = doc.createElement('span');
+        copyStatus.className = 'md-copy-status visually-hidden';
+        copyStatus.setAttribute('role', 'status');
         copyBtn.addEventListener('click', () => {
           if (opts.onCopyCode) opts.onCopyCode(block.code, copyBtn);
-          else defaultCopyCode(block.code, copyBtn);
+          else defaultCopyCode(block.code, copyBtn, copyStatus);
         });
+        copyWrap.appendChild(copyBtn);
+        copyWrap.appendChild(copyStatus);
 
         const headLeft = doc.createElement('div');
         headLeft.className = 'md-code-head-left';
         headLeft.appendChild(langEl);
         headLeft.appendChild(metaEl);
         head.appendChild(headLeft);
-        head.appendChild(copyBtn);
+        head.appendChild(copyWrap);
 
         const pre = doc.createElement('pre');
         pre.className = 'md-code-pre';
+        pre.setAttribute('tabindex', '0');
+        pre.setAttribute('role', 'region');
+        pre.setAttribute('aria-label', codeLabel);
         const codeEl = doc.createElement('code');
         codeEl.className = 'md-code';
         codeEl.textContent = block.code;
@@ -749,9 +749,11 @@ function renderBlocksInto(container: Node, blocks: readonly MarkdownBlock[], opt
           const toggleBtn = doc.createElement('button');
           toggleBtn.type = 'button';
           toggleBtn.className = 'md-code-expand-btn mini-button';
+          toggleBtn.setAttribute('aria-expanded', 'false');
           toggleBtn.textContent = `展开全部 ${lineCount} 行`;
           toggleBtn.addEventListener('click', () => {
             const expanded = shell.classList.toggle('is-expanded');
+            toggleBtn.setAttribute('aria-expanded', String(expanded));
             toggleBtn.textContent = expanded ? '收起代码' : `展开全部 ${lineCount} 行`;
           });
           shell.appendChild(toggleBtn);

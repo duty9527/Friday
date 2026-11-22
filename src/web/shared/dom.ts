@@ -39,10 +39,16 @@ export function kpiCard(label: string, value: string, sub = '', tone: 'default' 
  * used to prevent SSE background refreshes from interrupting typing or wiping unsaved form state.
  */
 export function isEditingWithin(container: Element): boolean {
+  if (typeof document === 'undefined' || !container) return false;
   const activeEl = document.activeElement;
-  if (!(activeEl instanceof HTMLElement) || !container.contains(activeEl)) return false;
-  return activeEl instanceof HTMLInputElement
-    || activeEl instanceof HTMLTextAreaElement
-    || activeEl instanceof HTMLSelectElement
-    || activeEl.isContentEditable;
+  if (!activeEl || !container.contains?.(activeEl)) return false;
+  if (typeof HTMLElement !== 'undefined' && activeEl instanceof HTMLElement && activeEl.isContentEditable) {
+    return true;
+  }
+  const isInput = typeof HTMLInputElement !== 'undefined' && activeEl instanceof HTMLInputElement;
+  const isTextArea = typeof HTMLTextAreaElement !== 'undefined' && activeEl instanceof HTMLTextAreaElement;
+  const isSelect = typeof HTMLSelectElement !== 'undefined' && activeEl instanceof HTMLSelectElement;
+  if (isInput || isTextArea || isSelect) return true;
+  const tag = (activeEl as { tagName?: string }).tagName?.toUpperCase();
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
 }
