@@ -9,6 +9,7 @@ import { socketPath } from '../src/protocol.js';
 import type { ChatMessage, TraceEvent } from '../src/view.js';
 import { summarizeSystemNotice } from '../src/web/shared/chat-view.js';
 import { renderMarkdownContent } from '../src/web/shared/markdown.js';
+import { detectIosStandaloneShortMode, initMobileViewport } from '../src/web/shared/mobile-viewport.js';
 import { createSharedSseHub, type BroadcastChannelLike, type SseUpdateBatch } from '../src/web/shared/sse-hub.js';
 import { buildExecutionChain } from '../src/web/trace-chain.js';
 import type { MindmapSnapshot, MindmapTaskFlow } from '../src/web/mindmap-data.js';
@@ -1115,6 +1116,115 @@ test('mindmap preserves #mm-inspector scrollTop across refreshes and drops stale
 
     env.windowMock.dispatchEvent({ type: 'pagehide' });
     resolveStream?.();
+  } finally {
+    env.restore();
+  }
+});
+
+test('detectIosStandaloneShortMode accurately isolates iOS standalone shortfall variants', () => {
+  const base = {
+    standalone: true,
+    narrowMobile: true,
+    keyboardOpen: false,
+    screenWidth: 420,
+    screenHeight: 912,
+    layoutWidth: 420,
+    layoutHeight: 844,
+    safeTop: 68,
+    safeBottom: 34,
+  };
+
+  assert.equal(detectIosStandaloneShortMode(base), 'top');
+  assert.equal(detectIosStandaloneShortMode({ ...base, layoutHeight: 878 }), 'bottom');
+  assert.equal(detectIosStandaloneShortMode({ ...base, layoutHeight: 810 }), 'both');
+  assert.equal(detectIosStandaloneShortMode({ ...base, safeTop: 44, safeBottom: 34, layoutHeight: 868 }), 'top');
+  assert.equal(detectIosStandaloneShortMode({ ...base, layoutHeight: 912 }), 'none');
+  assert.equal(detectIosStandaloneShortMode({ ...base, safeTop: 0, safeBottom: 0 }), 'none');
+  assert.equal(detectIosStandaloneShortMode({ ...base, keyboardOpen: true }), 'none');
+  assert.equal(detectIosStandaloneShortMode({ ...base, standalone: false }), 'none');
+  assert.equal(detectIosStandaloneShortMode({ ...base, screenWidth: 820, screenHeight: 1180, layoutWidth: 500, layoutHeight: 1112 }), 'none');
+});
+
+test('initMobileViewport creates safe-area probe, syncs standalone & keyboard classes, resets blur scroll, and disposes cleanly', async () => {
+  const env = createDomEnv();
+  try {
+    let scrollCalls = 0;
+    let vvHeight = 844;
+    const vvListeners = new Map<string, ListenerEntry[]>();
+    const vvMock = {
+      get height() { return vvHeight; },
+      addEventListener: (type: string, fn: (ev: unknown) => void) => {
+        const list = vvListeners.get(type) ?? [];
+        list.push({ fn });
+        vvListeners.set(type, list);
+      },
+      removeEventListener: (type: string, fn: (ev: unknown) => void) => {
+        const list = vvListeners.get(type);
+        if (list) vvListeners.set(type, list.filter(item => item.fn !== fn));
+      },
+      dispatchEvent: (event: Record<string, unknown>) => {
+        for (const entry of [...(vvListeners.get(String(event.type)) ?? [])]) {
+          entry.fn(event);
+        }
+        return true;
+      },
+    };
+
+    Object.assign(env.windowMock, {
+      innerWidth: 420,
+      innerHeight: 844,
+      screen: { width: 420, height: 912 },
+      visualViewport: vvMock,
+      matchMedia: (query: string) => ({
+        matches: query.includes('max-width: 730px') || query.includes('display-mode: standalone'),
+      }),
+      getComputedStyle: (el: MockElement) => (
+        el.id === 'safe-area-probe'
+          ? { paddingTop: '68px', paddingBottom: '34px' }
+          : { paddingTop: '0px', paddingBottom: '0px' }
+      ),
+      scrollTo: () => {
+        scrollCalls += 1;
+        env.windowMock.scrollX = 0;
+        env.windowMock.scrollY = 0;
+      },
+    });
+    env.assign('navigator', { standalone: true });
+
+    const ctrl = initMobileViewport();
+    const probe = env.rootBody.querySelector('#safe-area-probe');
+    assert.ok(probe, 'safe-area probe must be appended to document.body');
+    assert.equal(probe.classList.contains('safe-area-probe'), true);
+    assert.equal(probe.getAttribute('aria-hidden'), 'true');
+
+    const root = env.documentMock.documentElement;
+    assert.equal(root.classList.contains('pwa-standalone'), true);
+    assert.equal(root.classList.contains('ios-standalone-short-top'), true);
+    assert.equal(root.classList.contains('mobile-keyboard-open'), false);
+
+    const inputEl = new MockElement('input');
+    inputEl.type = 'text';
+    (env.documentMock as { activeElement: MockElement | null }).activeElement = inputEl;
+    vvHeight = 520;
+    env.documentMock.dispatchEvent({ type: 'focusin' });
+    assert.equal(root.classList.contains('mobile-keyboard-open'), true);
+    assert.equal(root.classList.contains('ios-standalone-short-top'), false);
+
+    (env.documentMock as { activeElement: MockElement | null }).activeElement = null;
+    vvHeight = 844;
+    env.windowMock.scrollY = 44;
+    env.documentMock.dispatchEvent({ type: 'focusout' });
+    await new Promise(resolve => setTimeout(resolve, 90));
+
+    assert.equal(scrollCalls, 1, 'focusout on narrow mobile must reset window scroll');
+    assert.equal(root.classList.contains('mobile-keyboard-open'), false);
+    assert.equal(root.classList.contains('ios-standalone-short-top'), true);
+
+    ctrl.dispose();
+    vvHeight = 500;
+    (env.documentMock as { activeElement: MockElement | null }).activeElement = inputEl;
+    vvMock.dispatchEvent({ type: 'resize' });
+    assert.equal(root.classList.contains('mobile-keyboard-open'), false, 'disposed controller must ignore subsequent events');
   } finally {
     env.restore();
   }

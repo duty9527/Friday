@@ -704,6 +704,16 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
     assert.doesNotMatch(themeJs, /\.style\./);
     assert.doesNotMatch(themeJs, /\.innerHTML\b/);
 
+    const mobileVpRes = await fetch(`${f.base}/shared/mobile-viewport.js`);
+    assert.equal(mobileVpRes.status, 200);
+    assert.match(mobileVpRes.headers.get('content-type') ?? '', /javascript/);
+    const mobileVpJs = await mobileVpRes.text();
+    for (const sym of ['detectIosStandaloneShortMode', 'initMobileViewport']) {
+      assert.ok(mobileVpJs.includes(sym), `shared/mobile-viewport.js must export ${sym}`);
+    }
+    assert.doesNotMatch(mobileVpJs, /\.style\./);
+    assert.doesNotMatch(mobileVpJs, /\.innerHTML\b/);
+
     const indexHtml = await (await fetch(f.base)).text();
     assert.match(indexHtml, /<html[^>]+data-theme="spatial"/);
     assert.match(indexHtml, /viewport-fit=cover/);
@@ -751,10 +761,16 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
     assert.ok(styleCss.includes('html[data-theme="industrial"]'));
     assert.ok(styleCss.includes('(pointer: coarse)'));
     assert.ok(styleCss.includes('font-size:16px'));
+    for (const marker of ['--safe-top', '--safe-bottom', '.safe-area-probe', 'ios-standalone-short-top']) {
+      assert.ok(styleCss.includes(marker), `style.css must include ${marker}`);
+    }
 
     const mindmapCss = await (await fetch(`${f.base}/mindmap.css`)).text();
     assert.ok(mindmapCss.includes('html[data-theme="spatial"]'));
     assert.ok(mindmapCss.includes('html[data-theme="industrial"]'));
+    for (const marker of ['--safe-top', '--safe-bottom', '.safe-area-probe', 'ios-standalone-short-top']) {
+      assert.ok(mindmapCss.includes(marker), `mindmap.css must include ${marker}`);
+    }
   } finally {
     await f.close();
   }

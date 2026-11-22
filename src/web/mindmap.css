@@ -181,6 +181,12 @@ html[data-theme="spatial"] {
   --mm-dur-spring:420ms;
   --mm-dur-panel:420ms;
 
+  --safe-top:env(safe-area-inset-top, 0px);
+  --safe-right:env(safe-area-inset-right, 0px);
+  --safe-bottom:env(safe-area-inset-bottom, 0px);
+  --safe-left:env(safe-area-inset-left, 0px);
+  --mobile-vh:100dvh;
+
   font-family:"IBM Plex Sans",system-ui,-apple-system,sans-serif;
   color:var(--mm-text);
   background:var(--mm-ground);
@@ -352,6 +358,38 @@ html[data-theme="industrial"] {
   --mm-dur-panel:340ms;
 }
 
+.safe-area-probe {
+  position:fixed;
+  top:0;
+  left:0;
+  width:0;
+  height:0;
+  padding:var(--safe-top) var(--safe-right) var(--safe-bottom) var(--safe-left);
+  pointer-events:none;
+  visibility:hidden;
+  contain:strict;
+}
+html.ios-standalone-short-top {
+  --mobile-vh:calc(100% + var(--safe-top));
+}
+html.ios-standalone-short-bottom {
+  --mobile-vh:calc(100% + var(--safe-bottom));
+}
+html.ios-standalone-short-both {
+  --mobile-vh:calc(100% + var(--safe-top) + var(--safe-bottom));
+}
+@supports (height: 100lvh) {
+  html.ios-standalone-short-top {
+    --mobile-vh:max(100lvh, calc(100% + var(--safe-top)));
+  }
+  html.ios-standalone-short-bottom {
+    --mobile-vh:max(100lvh, calc(100% + var(--safe-bottom)));
+  }
+  html.ios-standalone-short-both {
+    --mobile-vh:max(100lvh, calc(100% + var(--safe-top) + var(--safe-bottom)));
+  }
+}
+
 /* Smooth dual-skin transition triggered only during active theme switch */
 html.theme-transitioning body,
 html.theme-transitioning .mm-topbar,
@@ -464,7 +502,7 @@ svg:focus-visible {
   justify-content:space-between;
   flex-wrap:wrap;
   gap:8px 12px;
-  padding:8px 14px;
+  padding:calc(8px + var(--safe-top)) calc(14px + var(--safe-right)) 8px calc(14px + var(--safe-left));
   background:var(--mm-topbar-bg);
   backdrop-filter:var(--mm-glass-blur);
   -webkit-backdrop-filter:var(--mm-glass-blur);
@@ -2093,11 +2131,12 @@ html[data-theme="industrial"] .mm-turn-link-chip {
 @media (max-width:920px) {
   body {
     height:auto;
-    min-height:100dvh;
+    min-height:var(--mobile-vh);
+    padding-bottom:var(--safe-bottom);
     overflow-y:auto;
   }
   .mm-topbar {
-    padding:8px 10px;
+    padding:calc(8px + var(--safe-top)) calc(10px + var(--safe-right)) 8px calc(10px + var(--safe-left));
   }
   .mm-kpi-strip {
     padding:6px 10px;

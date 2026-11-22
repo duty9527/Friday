@@ -8,6 +8,7 @@ import { createSharedSseHub, type SseUpdateBatch } from './shared/sse-hub.js';
 import { element, node } from './shared/dom.js';
 import { errorText } from './shared/format.js';
 import { bindThemeButtons, initDesktopDrawers } from './shared/theme.js';
+import { initMobileViewport } from './shared/mobile-viewport.js';
 import { initChatPanel } from './panels/chat.js';
 import { initTracePanel } from './panels/trace.js';
 import { initMemoryHub } from './hubs/memory-hub.js';
@@ -52,6 +53,7 @@ function setMobileNavOpen(open: boolean): void {
 }
 
 bindThemeButtons(themeSpatialBtn, themeIndustrialBtn);
+initMobileViewport();
 initDesktopDrawers({
   leftBtn: desktopWorkFoldBtn,
   rightBtn: desktopTraceFoldBtn,
