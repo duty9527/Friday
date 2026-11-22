@@ -1238,3 +1238,166 @@ test('initMobileViewport creates safe-area probe, syncs clipped & keyboard class
     env.restore();
   }
 });
+
+test('setUiTheme keeps meta theme-color and color-scheme aligned with mobile surfaces', async () => {
+  const env = createDomEnv();
+  try {
+    const colorSchemeMeta = new MockElement('meta');
+    colorSchemeMeta.setAttribute('name', 'color-scheme');
+    colorSchemeMeta.setAttribute('content', 'dark');
+    const themeColorMeta = new MockElement('meta');
+    themeColorMeta.setAttribute('name', 'theme-color');
+    themeColorMeta.setAttribute('content', '#111520');
+    (env.documentMock as { querySelector: (s: string) => MockElement | null }).querySelector = (selector: string) => {
+      if (selector === 'meta[name="color-scheme"]') return colorSchemeMeta;
+      if (selector === 'meta[name="theme-color"]') return themeColorMeta;
+      return null;
+    };
+
+    const { setUiTheme } = await import('../src/web/shared/theme.js');
+    setUiTheme('industrial');
+    assert.equal(colorSchemeMeta.getAttribute('content'), 'light');
+    assert.equal(themeColorMeta.getAttribute('content'), '#f7f4ed');
+
+    setUiTheme('spatial');
+    assert.equal(colorSchemeMeta.getAttribute('content'), 'dark');
+    assert.equal(themeColorMeta.getAttribute('content'), '#111520');
+  } finally {
+    env.restore();
+  }
+});
+
+test('initChatPanel auto-loads older history on scroll-to-top, skips programmatic scroll, anchors scrollTop, and pauses on failure', async () => {
+  const env = createDomEnv();
+  try {
+    const { appState, hooks } = await import('../src/web/state.js');
+    const { initChatPanel } = await import('../src/web/panels/chat.js');
+    appState.messages.clear();
+    appState.ready = true;
+    appState.authExpired = false;
+    appState.sending = false;
+    appState.uncertain = false;
+    appState.pending = undefined;
+    appState.cursor = 40;
+    appState.historyBefore = 20;
+    appState.historyHasMore = true;
+    appState.historyBusy = false;
+    appState.selection = { type: 'all' };
+    appState.selectionPinned = false;
+    appState.stopRequests.clear();
+
+    const olderBtn = env.getOrCreateEl('older');
+    const historyErrorEl = env.getOrCreateEl('history-error');
+    const messagesEl = env.getOrCreateEl('messages');
+    const scrollEl = env.getOrCreateEl('messages-scroll');
+    scrollEl.clientHeight = 400;
+    scrollEl.scrollHeight = 1200;
+    scrollEl.scrollTop = 900;
+
+    Object.assign(hooks, {
+      connection: () => {},
+      selectTrace: () => {},
+      showPanel: () => {},
+      scheduleRefresh: () => {},
+      stopWork: async () => {},
+    });
+
+    const historyCalls: string[] = [];
+    let historyMode: 'ok' | 'fail' = 'ok';
+    const olderMsg: ChatMessage = {
+      id: 'm-auto-10',
+      seq: 10,
+      version: 1,
+      at: 900,
+      role: 'assistant',
+      text: '更早一页的历史消息',
+      status: 'completed',
+      mode: 'offline',
+      paths: [],
+      taskIds: [],
+    };
+    const recentMsg: ChatMessage = {
+      id: 'm-auto-20',
+      seq: 20,
+      version: 1,
+      at: 1200,
+      role: 'user',
+      text: '当前页消息',
+      status: 'completed',
+      mode: 'offline',
+      paths: [],
+      taskIds: [],
+    };
+
+    env.assign('fetch', (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes('/api/history')) {
+        historyCalls.push(url);
+        if (historyMode === 'fail') {
+          return Promise.resolve(new Response(JSON.stringify({ error: 'temporary failure' }), {
+            status: 500,
+            headers: { 'content-type': 'application/json' },
+          }));
+        }
+        return Promise.resolve(new Response(JSON.stringify({ items: [olderMsg], before: 10, hasMore: true }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }));
+      }
+      return Promise.resolve(new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+    });
+
+    const baseInsertBefore = messagesEl.insertBefore.bind(messagesEl);
+    messagesEl.insertBefore = (newNode: MockElement, refNode: MockElement | null) => {
+      const res = baseInsertBefore(newNode, refNode);
+      if (newNode.dataset.messageId === 'm-auto-10') {
+        scrollEl.scrollHeight += 500;
+      }
+      return res;
+    };
+
+    const panel = initChatPanel();
+    panel.mergeMessages([recentMsg]);
+    // Set scrollTop inside top threshold cleanly, then renderMessages (nearBottom=false -> programmatic keep at 50)
+    scrollEl.scrollTop = 50;
+    panel.renderMessages();
+    scrollEl.dispatchEvent({ type: 'scroll' });
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.equal(historyCalls.length, 0, 'programmatic scrollTop update during render must not auto-trigger /api/history');
+
+    // User scrolls up to 60px -> must auto-load /api/history and preserve scrollTop (+500px delta)
+    scrollEl.scrollTop = 60;
+    scrollEl.dispatchEvent({ type: 'scroll' });
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.equal(historyCalls.length, 1);
+    assert.equal(appState.messages.has('m-auto-10'), true);
+    assert.equal(scrollEl.scrollTop, 560, 'scrollTop must shift by prepended content height (60 + 500)');
+    assert.equal(olderBtn.textContent, '上滑自动加载更早消息');
+
+    // Simulate failure: first auto-load after cooldown pauses further auto-loads until user scrolls away or clicks retry
+    await new Promise(resolve => setTimeout(resolve, 370));
+    historyMode = 'fail';
+    scrollEl.scrollTop = 40;
+    scrollEl.dispatchEvent({ type: 'scroll' });
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.equal(historyCalls.length, 2);
+    assert.equal(olderBtn.textContent, '加载失败，点击重试');
+    assert.match(historyErrorEl.textContent, /更早消息读取失败/);
+
+    // Subsequent scroll near top while paused must NOT keep firing errors
+    scrollEl.scrollTop = 20;
+    scrollEl.dispatchEvent({ type: 'scroll' });
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.equal(historyCalls.length, 2, 'paused auto-load must wait for user scroll-away or manual click retry');
+
+    // Manual retry via button click recovers
+    historyMode = 'ok';
+    olderBtn.dispatchEvent({ type: 'click' });
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.equal(historyCalls.length, 3);
+    assert.equal(olderBtn.textContent, '上滑自动加载更早消息');
+    assert.equal(historyErrorEl.textContent, '');
+  } finally {
+    env.restore();
+  }
+});

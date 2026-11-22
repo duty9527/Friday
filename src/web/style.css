@@ -282,6 +282,21 @@ button,textarea,select,input {
   font:inherit;
   color:inherit;
 }
+html[data-theme="spatial"] body,
+html[data-theme="spatial"] input,
+html[data-theme="spatial"] textarea,
+html[data-theme="spatial"] select {
+  color-scheme:dark;
+}
+html[data-theme="industrial"] body,
+html[data-theme="industrial"] input,
+html[data-theme="industrial"] textarea,
+html[data-theme="industrial"] select {
+  color-scheme:light;
+}
+input,textarea {
+  caret-color:var(--accent);
+}
 button,select,summary,input,textarea,a {
   touch-action:manipulation;
 }
@@ -1253,6 +1268,7 @@ html[data-theme="industrial"] .work-stop-btn {
   flex:1;
   min-height:0;
   overflow:auto;
+  overflow-anchor:none;
   padding:12px var(--chat-gutter) 18px;
   display:flex;
   flex-direction:column;
@@ -1265,7 +1281,25 @@ html[data-theme="industrial"] .work-stop-btn {
 }
 .older {
   display:block;
-  margin:0 auto 18px;
+  margin:0 auto 14px;
+  min-height:28px;
+  padding:4px 12px;
+  border-radius:999px;
+  border:1px solid var(--rule);
+  background:transparent;
+  color:var(--muted);
+  font-size:12px;
+  line-height:1.4;
+  box-shadow:none;
+}
+.older:hover:not(:disabled) {
+  border-color:var(--border);
+  background:var(--raised);
+  color:var(--text);
+}
+.older.is-loading {
+  opacity:0.75;
+  cursor:default;
 }
 .time-divider {
   display:flex;
@@ -6664,6 +6698,8 @@ html[data-theme="industrial"] .fund-holding-row:hover {
     height:100%;
     overflow:hidden;
     overscroll-behavior:none;
+    background:var(--surface-solid);
+    background-color:var(--surface-solid);
   }
   body {
     position:fixed;
@@ -6673,7 +6709,16 @@ html[data-theme="industrial"] .fund-holding-row:hover {
     min-height:0;
     overflow:hidden;
     overscroll-behavior:none;
+    background-color:var(--surface-solid);
+    background-image:
+      radial-gradient(640px circle at 92% 88%, rgba(99, 102, 241, 0.12), transparent 62%),
+      radial-gradient(520px circle at 8% 76%, rgba(245, 158, 11, 0.08), transparent 58%);
     background-attachment:scroll;
+  }
+  html[data-theme="industrial"] body {
+    background-color:var(--surface-solid);
+    background-image:none;
+    box-shadow:none;
   }
   .mobile-only-btn {
     display:inline-flex;
@@ -6873,6 +6918,9 @@ html[data-theme="industrial"] .fund-holding-row:hover {
     min-height:0;
     border:0;
     border-radius:0;
+    background:transparent;
+    backdrop-filter:none;
+    -webkit-backdrop-filter:none;
     box-shadow:none;
     overflow:hidden;
   }
@@ -6892,7 +6940,8 @@ html[data-theme="industrial"] .fund-holding-row:hover {
   html[data-theme="industrial"] .panels:not(.trace-visible) .user-message.is-trace-selected .user-bubble {
     border-color:rgba(255, 85, 0, 0.34);
   }
-  .conv-dock {
+  .conv-dock,
+  html[data-theme="industrial"] .conv-dock {
     position:relative;
     z-index:25;
     flex-wrap:nowrap;
@@ -6900,6 +6949,8 @@ html[data-theme="industrial"] .fund-holding-row:hover {
     gap:8px;
     padding:calc(8px + var(--safe-top)) calc(10px + var(--safe-right)) 8px calc(10px + var(--safe-left));
     min-height:calc(48px + var(--safe-top));
+    background:var(--surface-solid);
+    background-color:var(--surface-solid);
     touch-action:manipulation;
   }
   .conv-identity {
@@ -7032,11 +7083,16 @@ html[data-theme="industrial"] .fund-holding-row:hover {
     min-height:40px;
     padding:3px 4px 3px 5px;
     border-radius:20px;
+    background:#0b0f19;
+  }
+  html[data-theme="industrial"] .composer-row {
+    background:var(--input-bg);
   }
   .composer-row #draft {
     min-height:24px;
     line-height:1.35;
     padding:3px 2px;
+    color-scheme:inherit;
     overscroll-behavior-y:contain;
     touch-action:pan-y;
   }

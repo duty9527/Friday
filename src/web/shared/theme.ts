@@ -99,7 +99,7 @@ function applyThemeToDom(theme: UiTheme): void {
       ? document.querySelector('meta[name="theme-color"]')
       : null;
     if (themeColorMeta) {
-      themeColorMeta.setAttribute('content', theme === 'industrial' ? '#ddd7ca' : '#06070b');
+      themeColorMeta.setAttribute('content', theme === 'industrial' ? '#f7f4ed' : '#111520');
     }
   }
   syncThemeButtons(theme);

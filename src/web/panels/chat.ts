@@ -58,6 +58,9 @@ const STORAGE_KEY_CHANNEL = 'friday.chat-channel-filter';
 const STORAGE_KEY_HIDE_SYSTEM = 'friday.chat-hide-system';
 const STORAGE_KEY_DETAIL_MODE = 'friday.chat-detail-mode';
 const LONG_MESSAGE_COLLAPSE_CHARS = 4800;
+const AUTO_LOAD_OLDER_THRESHOLD_PX = 140;
+const AUTO_LOAD_OLDER_COOLDOWN_MS = 350;
+const PULL_TO_LOAD_MIN_DY_PX = 56;
 const MOBILE_SCROLLABLE_SELECTOR = [
   '.messages-scroll',
   '#draft',
@@ -246,6 +249,32 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
   let resizePinned = true;
   let hasRenderedMessages = false;
   let emptyStateNotice: HTMLElement | undefined;
+  let programmaticScrollTop: number | undefined;
+  let programmaticScrollUntil = 0;
+  let suppressAutoLoadUntil = 0;
+  let historyAutoLoadPaused = false;
+  let lastOlderAutoLoadAt = 0;
+
+  function setScrollTopProgrammatic(nextTop: number): void {
+    scrollEl.scrollTop = nextTop;
+    programmaticScrollTop = scrollEl.scrollTop;
+    programmaticScrollUntil = Date.now() + 150;
+  }
+
+  function syncOlderButton(state: 'idle' | 'loading' | 'error' = 'idle'): void {
+    olderBtn.hidden = !appState.historyHasMore;
+    if (state === 'loading' || appState.historyBusy) {
+      olderBtn.disabled = true;
+      olderBtn.textContent = '正在加载更早消息…';
+      olderBtn.classList.add('is-loading');
+      return;
+    }
+    olderBtn.disabled = false;
+    olderBtn.classList.remove('is-loading');
+    olderBtn.textContent = state === 'error' || historyAutoLoadPaused
+      ? '加载失败，点击重试'
+      : '上滑自动加载更早消息';
+  }
 
   const liveMessageAvatars = new Map<string, BotAvatarController>();
   const knownMessageIds = new Set<string>();
@@ -439,7 +468,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
         writeStoredString(STORAGE_KEY_CHANNEL, ch);
         unreadWhileScrolledUp = 0;
         renderMessages();
-        scrollEl.scrollTop = scrollEl.scrollHeight;
+        setScrollTopProgrammatic(scrollEl.scrollHeight);
         syncScrollBottomButton();
       }, `conv-channel-chip mini-button${channelFilter === ch ? ' active' : ''}`);
       btn.setAttribute('aria-pressed', String(channelFilter === ch));
@@ -513,9 +542,10 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
   scrollBottomBtn.addEventListener('click', () => {
     unreadWhileScrolledUp = 0;
     if (typeof scrollEl.scrollTo === 'function') {
+      suppressAutoLoadUntil = Date.now() + 700;
       scrollEl.scrollTo({ top: scrollEl.scrollHeight, behavior: 'smooth' });
     } else {
-      scrollEl.scrollTop = scrollEl.scrollHeight;
+      setScrollTopProgrammatic(scrollEl.scrollHeight);
     }
     syncScrollBottomButton();
   });
@@ -1399,17 +1429,17 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       }
     }
 
-    olderBtn.hidden = !appState.historyHasMore;
+    syncOlderButton();
     if (focus) {
       const replacement = [...messagesEl.querySelectorAll<HTMLButtonElement>('button')].find(item => item.dataset.actionKey === focus);
       replacement?.focus({ preventScroll: true });
     }
 
     if (nearBottom) {
-      scrollEl.scrollTop = scrollEl.scrollHeight;
+      setScrollTopProgrammatic(scrollEl.scrollHeight);
       unreadWhileScrolledUp = 0;
     } else {
-      scrollEl.scrollTop = previousTop;
+      setScrollTopProgrammatic(previousTop);
       if (newlyAddedVisible > 0) {
         unreadWhileScrolledUp += newlyAddedVisible;
       }
@@ -1479,7 +1509,9 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       }
       hooks.showPanel(false);
       if (target) {
-        scrollEl.scrollTop += target.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top - 16;
+        setScrollTopProgrammatic(
+          scrollEl.scrollTop + target.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top - 16,
+        );
         target.classList.add('message-highlight');
         setTimeout(() => target?.classList.remove('message-highlight'), 2000);
       }
@@ -1488,32 +1520,47 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     }
   }
 
-  async function loadOlder(): Promise<void> {
+  function maybeAutoLoadOlder(allowUnscrollable = false): void {
+    if (!appState.historyHasMore || appState.historyBusy || appState.historyBefore === undefined) return;
+    if (appState.authExpired || !hasRenderedMessages || historyAutoLoadPaused) return;
+    const now = Date.now();
+    if (now < suppressAutoLoadUntil || now - lastOlderAutoLoadAt < AUTO_LOAD_OLDER_COOLDOWN_MS) return;
+    const scrollable = scrollEl.scrollHeight > scrollEl.clientHeight + 24;
+    if (!scrollable && !allowUnscrollable) return;
+    if (scrollEl.scrollTop > AUTO_LOAD_OLDER_THRESHOLD_PX) return;
+    void loadOlder('auto');
+  }
+
+  async function loadOlder(trigger: 'auto' | 'manual' = 'manual'): Promise<void> {
     if (appState.historyBusy || appState.historyBefore === undefined) return;
+    if (trigger === 'auto' && !appState.historyHasMore) return;
     const beforeAtStart = appState.historyBefore;
     const cursorAtStart = appState.cursor;
     appState.historyBusy = true;
-    olderBtn.disabled = true;
-    olderBtn.textContent = '正在读取…';
+    historyAutoLoadPaused = false;
+    syncOlderButton('loading');
     historyErrorEl.textContent = '';
-    const oldHeight = scrollEl.scrollHeight;
-    const oldTop = scrollEl.scrollTop;
     try {
       const page = await api<MessagePage>(`/api/history?before=${beforeAtStart}`);
       if (appState.authExpired || appState.cursor < cursorAtStart || appState.historyBefore !== beforeAtStart) return;
+      const preRenderHeight = scrollEl.scrollHeight;
+      const preRenderTop = Math.max(0, scrollEl.scrollTop);
       for (const item of page.items) knownMessageIds.add(item.id);
       mergeMessages(page.items);
       appState.historyBefore = page.before;
       appState.historyHasMore = page.hasMore;
+      historyAutoLoadPaused = false;
       renderMessages();
-      scrollEl.scrollTop = oldTop + scrollEl.scrollHeight - oldHeight;
+      const heightDelta = Math.max(0, scrollEl.scrollHeight - preRenderHeight);
+      setScrollTopProgrammatic(preRenderTop + heightDelta);
       syncScrollBottomButton();
     } catch (error) {
-      historyErrorEl.textContent = `更早消息读取失败：${errorText(error)}。可再次点击加载。`;
+      historyAutoLoadPaused = true;
+      historyErrorEl.textContent = `更早消息读取失败：${errorText(error)}。可点击上方重试。`;
     } finally {
       appState.historyBusy = false;
-      olderBtn.disabled = false;
-      olderBtn.textContent = '加载更早消息';
+      lastOlderAutoLoadAt = Date.now();
+      syncOlderButton(historyAutoLoadPaused ? 'error' : 'idle');
     }
   }
 
@@ -1536,7 +1583,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       unreadWhileScrolledUp = 0;
       renderMessages();
       hooks.selectTrace({ type: 'message', id: accepted.id, label: trimmed.slice(0, 80) });
-      scrollEl.scrollTop = scrollEl.scrollHeight;
+      setScrollTopProgrammatic(scrollEl.scrollHeight);
       syncScrollBottomButton();
       hooks.scheduleRefresh();
     } catch (error) {
@@ -1576,7 +1623,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       unreadWhileScrolledUp = 0;
       renderMessages();
       hooks.selectTrace({ type: 'message', id: accepted.id, label: submitted.text.slice(0, 80) });
-      scrollEl.scrollTop = scrollEl.scrollHeight;
+      setScrollTopProgrammatic(scrollEl.scrollHeight);
       syncScrollBottomButton();
       hooks.scheduleRefresh();
     } catch (error) {
@@ -1647,25 +1694,79 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
   scrollEl.addEventListener('scroll', () => {
     const near = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 90;
     resizePinned = near;
-    if (near) unreadWhileScrolledUp = 0;
+    if (near) {
+      unreadWhileScrolledUp = 0;
+      suppressAutoLoadUntil = 0;
+    }
     syncScrollBottomButton();
+
+    let isProgrammatic = false;
+    if (programmaticScrollTop !== undefined) {
+      isProgrammatic = Date.now() <= programmaticScrollUntil
+        && Math.abs(scrollEl.scrollTop - programmaticScrollTop) <= 1;
+      programmaticScrollTop = undefined;
+      programmaticScrollUntil = 0;
+    }
+    if (historyAutoLoadPaused && scrollEl.scrollTop > AUTO_LOAD_OLDER_THRESHOLD_PX + 80) {
+      historyAutoLoadPaused = false;
+      syncOlderButton('idle');
+    }
+    if (!isProgrammatic) {
+      maybeAutoLoadOlder(false);
+    }
   }, { passive: true });
   window.addEventListener('resize', () => {
     // A viewport change must not leave the newest reply clipped under the composer when already near bottom.
     if (resizeTimer) clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
       resizeTimer = undefined;
-      if (resizePinned) scrollEl.scrollTop = scrollEl.scrollHeight;
+      if (resizePinned) setScrollTopProgrammatic(scrollEl.scrollHeight);
       syncScrollBottomButton();
     }, 120);
   });
 
   if (typeof window !== 'undefined' && window.visualViewport) {
     window.visualViewport.addEventListener('resize', () => {
-      if (resizePinned) scrollEl.scrollTop = scrollEl.scrollHeight;
+      if (resizePinned) setScrollTopProgrammatic(scrollEl.scrollHeight);
       syncScrollBottomButton();
     }, { passive: true });
   }
+
+  let pullStartX = 0;
+  let pullStartY = 0;
+  let pullStartedAtTop = false;
+  scrollEl.addEventListener('touchstart', event => {
+    if (!event.touches || event.touches.length !== 1 || scrollEl.scrollTop > 2) {
+      pullStartedAtTop = false;
+      return;
+    }
+    const touch = event.touches[0];
+    if (!touch) {
+      pullStartedAtTop = false;
+      return;
+    }
+    pullStartX = touch.clientX;
+    pullStartY = touch.clientY;
+    pullStartedAtTop = true;
+  }, { passive: true });
+
+  scrollEl.addEventListener('touchend', event => {
+    if (!pullStartedAtTop) return;
+    pullStartedAtTop = false;
+    const touch = event.changedTouches?.[0];
+    if (!touch || (event.changedTouches?.length ?? 0) !== 1) return;
+    const dy = touch.clientY - pullStartY;
+    const dx = touch.clientX - pullStartX;
+    if (dy >= PULL_TO_LOAD_MIN_DY_PX && Math.abs(dy) > Math.abs(dx) * 1.5 && scrollEl.scrollTop <= AUTO_LOAD_OLDER_THRESHOLD_PX) {
+      maybeAutoLoadOlder(true);
+    }
+  }, { passive: true });
+
+  scrollEl.addEventListener('wheel', event => {
+    if (scrollEl.scrollHeight <= scrollEl.clientHeight + 24 && scrollEl.scrollTop <= 2 && event.deltaY < -24) {
+      maybeAutoLoadOlder(true);
+    }
+  }, { passive: true });
 
   let touchStartX = 0;
   let touchStartY = 0;
@@ -1707,7 +1808,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     if (event.cancelable) event.preventDefault();
   }, { passive: false });
 
-  olderBtn.addEventListener('click', () => { void loadOlder(); });
+  olderBtn.addEventListener('click', () => { void loadOlder('manual'); });
 
   return {
     updateComposer,

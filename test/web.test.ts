@@ -716,6 +716,7 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
 
     const indexHtml = await (await fetch(f.base)).text();
     assert.match(indexHtml, /<html[^>]+data-theme="spatial"/);
+    assert.match(indexHtml, /<meta\s+name="theme-color"\s+content="#111520">/);
     assert.match(indexHtml, /viewport-fit=cover/);
     assert.match(indexHtml, /interactive-widget=resizes-content/);
     for (const marker of [
@@ -751,8 +752,13 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
     }
     assert.doesNotMatch(indexHtml, /\sstyle="/i);
 
+    const manifestJson = await (await fetch(`${f.base}/manifest.webmanifest`)).json() as Record<string, unknown>;
+    assert.equal(manifestJson.background_color, '#111520');
+    assert.equal(manifestJson.theme_color, '#111520');
+
     const mindmapHtml = await (await fetch(`${f.base}/mindmap`)).text();
     assert.match(mindmapHtml, /<html[^>]+data-theme="spatial"/);
+    assert.match(mindmapHtml, /<meta\s+name="theme-color"\s+content="#111520">/);
     assert.match(mindmapHtml, /viewport-fit=cover/);
     assert.match(mindmapHtml, /id="mm-theme-spatial"/);
     assert.match(mindmapHtml, /id="mm-theme-industrial"/);
@@ -765,7 +771,15 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
     assert.ok(styleCss.includes('html[data-theme="industrial"]'));
     assert.ok(styleCss.includes('(pointer: coarse)'));
     assert.ok(styleCss.includes('font-size:16px'));
-    for (const marker of ['--safe-top', '--safe-bottom', '.safe-area-probe', 'ios-standalone-clipped']) {
+    for (const marker of [
+      '--safe-top',
+      '--safe-bottom',
+      '.safe-area-probe',
+      'ios-standalone-clipped',
+      'overflow-anchor:none',
+      'color-scheme:dark',
+      'var(--surface-solid)',
+    ]) {
       assert.ok(styleCss.includes(marker), `style.css must include ${marker}`);
     }
     assert.doesNotMatch(styleCss, /ios-standalone-short-/);

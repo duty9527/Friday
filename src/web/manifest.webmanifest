@@ -4,8 +4,8 @@
   "description": "F.R.I.D.A.Y. 持续对话与任务控制台",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#06070b",
-  "theme_color": "#06070b",
+  "background_color": "#111520",
+  "theme_color": "#111520",
   "icons": [
     {
       "src": "/icon-192.png",
