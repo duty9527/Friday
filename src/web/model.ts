@@ -172,7 +172,7 @@ export function timelineSteps(events: TraceEvent[]): TimelineStep[] {
     .map(group => group.parent!));
   const steps: TimelineStep[] = [];
   for (const group of groups.values()) {
-    const ordered = group.events.slice().sort((a, b) => a.seq - b.seq);
+    const ordered = group.events.toSorted((a, b) => a.seq - b.seq);
     const latest = ordered.at(-1)!;
     if (ROUTER_TOOLS.has(latest.label) && hasRouteAction.has(group.id) && latest.kind !== 'route_action') continue;
     const start = ordered.find(event => activeStatus(event.status)) ?? ordered[0]!;
@@ -196,7 +196,7 @@ export function timelineSteps(events: TraceEvent[]): TimelineStep[] {
       // arguments and result readable instead of hiding them behind a second, folded node.
       const call = group.parent ? groups.get(group.parent) : undefined;
       if (call && ROUTER_TOOLS.has(call.events[0]!.label)) {
-        const callEvents = call.events.slice().sort((a, b) => a.seq - b.seq);
+        const callEvents = call.events.toSorted((a, b) => a.seq - b.seq);
         const callStart = callEvents.find(event => activeStatus(event.status)) ?? callEvents[0]!;
         const callEnd = callEvents.at(-1)!;
         const args = record(record(callStart.data).summary);
@@ -282,6 +282,12 @@ export function spanDuration(events: TraceEvent[]): string | undefined {
   const end = events.findLast(event => settledStatus(event.status));
   return start && end && end.at >= start.at ? `${((end.at - start.at) / 1000).toFixed(2)} 秒` : undefined;
 }
+const enNumberFormatter = typeof Intl !== 'undefined' ? new Intl.NumberFormat('en-US') : null;
+
+function formatEnNumber(n: number): string {
+  return enNumberFormatter ? enNumberFormatter.format(n) : n.toLocaleString('en-US');
+}
+
 /** Usage is shown only when the journal actually recorded it. */
 export function usageSummary(data: unknown): string {
   if (!data || typeof data !== 'object') return '— / —';
@@ -291,8 +297,8 @@ export function usageSummary(data: unknown): string {
   const output = typeof usage.output === 'number' ? usage.output : undefined;
   if (typeof record.tokensBefore === 'number') {
     const after = typeof record.estimatedTokensAfter === 'number' ? record.estimatedTokensAfter : undefined;
-    return `${record.tokensBefore.toLocaleString('en-US')} → ${after === undefined ? '—' : after.toLocaleString('en-US')} tokens`;
+    return `${formatEnNumber(record.tokensBefore)} → ${after === undefined ? '—' : formatEnNumber(after)} tokens`;
   }
   if (input === undefined && output === undefined) return '— / —';
-  return `${input === undefined ? '—' : input.toLocaleString('en-US')} / ${output === undefined ? '—' : output.toLocaleString('en-US')} tokens`;
+  return `${input === undefined ? '—' : formatEnNumber(input)} / ${output === undefined ? '—' : formatEnNumber(output)} tokens`;
 }

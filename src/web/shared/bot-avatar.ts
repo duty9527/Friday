@@ -1,5 +1,6 @@
 import { svgNode } from './dom.js';
-import type { BotExpression } from './bot-expressions.js';
+import { BOT_EXPRESSION_META, type BotExpression } from './bot-expressions.js';
+import { onReducedMotionChange, prefersReducedMotion } from './ui-primitives.js';
 
 export type BotBodyKind = 'squircle' | 'pebble' | 'sphere' | 'gem';
 export type BotMorphKind = 'thinking' | 'radar' | 'orbit';
@@ -16,8 +17,21 @@ export type BotStateId =
   | 'sleeping';
 export type BotPokeKind = 'bounce' | 'nod' | 'spin';
 
+export interface StaticBotSvgOptions {
+  size: number;
+  expr?: BotExpression;
+  body?: BotBodyKind;
+  rx?: number;
+  ry?: number;
+  rz?: number;
+  className?: string;
+  interactivePoke?: boolean;
+  label?: string;
+}
+
 export interface BotAvatarController {
   readonly svg: SVGSVGElement;
+  createPokeButton(label?: string): HTMLButtonElement;
   setState(state: BotStateId): void;
   setExpression(expr: BotExpression | 'auto'): void;
   setGaze(nx: number, ny: number): void;
@@ -131,7 +145,7 @@ function mulMatVec(m: Mat3, x: number, y: number, z: number): Vec3 {
 }
 
 function convexHull2D(pts: Vec2[]): Vec2[] {
-  const sorted = pts.slice().sort((a, b) => (a[0] === b[0] ? a[1] - b[1] : a[0] - b[0]));
+  const sorted = pts.toSorted((a, b) => (a[0] === b[0] ? a[1] - b[1] : a[0] - b[0]));
   if (sorted.length <= 2) return sorted;
   const cross = (o: Vec2, a: Vec2, b: Vec2): number =>
     (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
@@ -864,6 +878,9 @@ interface LiveAvatarRuntime {
   compact: boolean;
   wasConnected: boolean;
   destroyed: boolean;
+  onScreen: boolean;
+  contentSkipped: boolean;
+  observer: IntersectionObserver | undefined;
   bodyPathDef: SVGPathElement;
   botGroup: SVGGElement;
   eyeL: SVGPathElement;
@@ -899,22 +916,66 @@ let rafId: number | undefined;
 let lastRafTs = 0;
 let domUidCounter = 0;
 let visibilityHooked = false;
+let reducedMotionActive = prefersReducedMotion();
+
+function hasRunnableWork(): boolean {
+  if (reducedMotionActive) return false;
+  if (typeof document !== 'undefined' && document.hidden) return false;
+  if (activeTweens.size > 0) return true;
+  for (const rt of activeControllers) {
+    if (!rt.destroyed && rt.onScreen && !rt.contentSkipped) return true;
+  }
+  return false;
+}
 
 function ensureVisibilityHook(): void {
-  if (visibilityHooked || typeof document === 'undefined') return;
+  if (visibilityHooked) return;
   visibilityHooked = true;
-  document.addEventListener('visibilitychange', () => {
-    if (!document.hidden && (activeControllers.size > 0 || activeTweens.size > 0)) {
-      lastRafTs = performance.now();
+  reducedMotionActive = prefersReducedMotion();
+  onReducedMotionChange((reduced) => {
+    reducedMotionActive = reduced;
+    if (reduced) {
+      for (const rt of activeControllers) {
+        if (!rt.destroyed) applyRuntimeToSvg(rt);
+      }
+      if (rafId !== undefined && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(rafId);
+        rafId = undefined;
+      }
+      return;
+    }
+    if (hasRunnableWork()) {
       ensureRafLoop();
     }
   });
+  if (typeof document === 'undefined') return;
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && hasRunnableWork()) {
+      ensureRafLoop();
+    }
+  });
+  document.addEventListener('contentvisibilityautostatechange', (event) => {
+    const target = event.target as Node | null;
+    if (!target || typeof target.contains !== 'function') return;
+    const skipped = Boolean((event as Event & { skipped?: boolean }).skipped);
+    let woke = false;
+    for (const rt of activeControllers) {
+      if (rt.destroyed) continue;
+      if (target.contains(rt.svg)) {
+        rt.contentSkipped = skipped;
+        if (!skipped) woke = true;
+      }
+    }
+    if (woke && hasRunnableWork()) {
+      ensureRafLoop();
+    }
+  }, { capture: true });
 }
 
 function ensureRafLoop(): void {
-  if (rafId !== undefined || typeof requestAnimationFrame !== 'function') return;
   ensureVisibilityHook();
-  lastRafTs = performance.now();
+  if (rafId !== undefined || typeof requestAnimationFrame !== 'function' || !hasRunnableWork()) return;
+  lastRafTs = typeof performance !== 'undefined' ? performance.now() : Date.now();
   rafId = requestAnimationFrame(stepAllRuntimes);
 }
 
@@ -926,7 +987,7 @@ function renderMorphLayer(
 ): void {
   if (progress <= 0.02 || !morphName) {
     layer.setAttribute('opacity', '0');
-    if (layer.childNodes.length) layer.replaceChildren();
+    if (layer.childNodes?.length) layer.replaceChildren();
     return;
   }
   layer.setAttribute('opacity', clamp(progress, 0, 1).toFixed(3));
@@ -1228,9 +1289,10 @@ function stepAllRuntimes(now: number): void {
   const rawDt = Math.min(0.05, Math.max(0.001, (now - lastRafTs) / 1000));
   lastRafTs = now;
 
-  if (!document.hidden) {
+  if (!document.hidden && !reducedMotionActive) {
     for (const rt of [...activeControllers]) {
       if (rt.destroyed) {
+        rt.observer?.disconnect();
         activeControllers.delete(rt);
         continue;
       }
@@ -1238,10 +1300,13 @@ function stepAllRuntimes(now: number): void {
         rt.wasConnected = true;
       } else if (rt.wasConnected) {
         rt.destroyed = true;
+        rt.observer?.disconnect();
         activeControllers.delete(rt);
         continue;
       }
-      stepRuntime(rt, rawDt);
+      if (rt.onScreen && !rt.contentSkipped) {
+        stepRuntime(rt, rawDt);
+      }
     }
     for (const tween of [...activeTweens]) {
       if (!tween(rawDt)) {
@@ -1250,10 +1315,8 @@ function stepAllRuntimes(now: number): void {
     }
   }
 
-  if (activeControllers.size > 0 || activeTweens.size > 0) {
-    if (!document.hidden) {
-      rafId = requestAnimationFrame(stepAllRuntimes);
-    }
+  if (hasRunnableWork() && typeof requestAnimationFrame === 'function') {
+    rafId = requestAnimationFrame(stepAllRuntimes);
   }
 }
 
@@ -1326,17 +1389,18 @@ export function createLiveBotAvatar(options: {
   idPrefix?: string;
   className?: string;
 }): BotAvatarController {
+  ensureVisibilityHook();
   const idPrefix = options.idPrefix ?? `friday-bot-${++domUidCounter}`;
   const skeleton = buildSvgSkeleton(idPrefix, options.size, options.className);
-  const reducedMotion = typeof window !== 'undefined'
-    && typeof window.matchMedia === 'function'
-    && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
   const rt: LiveAvatarRuntime = {
     svg: skeleton.svg,
     compact: options.compact ?? false,
     wasConnected: false,
     destroyed: false,
+    onScreen: true,
+    contentSkipped: false,
+    observer: undefined,
     bodyPathDef: skeleton.bodyPathDef,
     botGroup: skeleton.botGroup,
     eyeL: skeleton.eyeL,
@@ -1370,28 +1434,55 @@ export function createLiveBotAvatar(options: {
   if (rt.activeMorph) rt.morphBlend.x = 1;
   applyRuntimeToSvg(rt);
 
-  let pokeSeq = 0;
-  if (options.interactive) {
-    skeleton.svg.addEventListener('click', ev => {
-      ev.stopPropagation();
-      const seq: BotPokeKind[] = ['bounce', 'nod', 'spin'];
-      const kind = seq[pokeSeq % seq.length]!;
-      pokeSeq++;
-      controller.poke(kind, kind === 'spin' ? 2 : 1);
-    });
+  if (typeof IntersectionObserver === 'function') {
+    try {
+      const io = new IntersectionObserver((entries) => {
+        if (rt.destroyed || !rt.svg.isConnected) return;
+        const entry = entries.at(-1);
+        if (!entry) return;
+        rt.onScreen = entry.isIntersecting;
+        if (entry.isIntersecting && hasRunnableWork()) {
+          ensureRafLoop();
+        }
+      }, { threshold: 0 });
+      io.observe(skeleton.svg);
+      rt.observer = io;
+    } catch {
+      // Ignore IntersectionObserver errors in stub environments
+    }
   }
 
-  if (!reducedMotion) {
-    activeControllers.add(rt);
+  activeControllers.add(rt);
+  if (hasRunnableWork()) {
     ensureRafLoop();
   }
 
+  let pokeSeq = 0;
+  const triggerCyclePoke = (): void => {
+    const seq: BotPokeKind[] = ['bounce', 'nod', 'spin'];
+    const kind = seq[pokeSeq % seq.length]!;
+    pokeSeq++;
+    controller.poke(kind, kind === 'spin' ? 2 : 1);
+  };
+
   const controller: BotAvatarController = {
     svg: skeleton.svg,
+    createPokeButton(label = '与 F.R.I.D.A.Y. 互动') {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'bot-poke-btn';
+      btn.setAttribute('aria-label', label);
+      btn.appendChild(skeleton.svg);
+      btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        triggerCyclePoke();
+      });
+      return btn;
+    },
     setState(state) {
       if (rt.destroyed || rt.stateId === state) return;
       setRuntimeState(rt, state);
-      if (reducedMotion) {
+      if (reducedMotionActive || !rt.onScreen || rt.contentSkipped) {
         if (rt.activeMorph) rt.morphBlend.x = 1;
         else rt.morphBlend.x = 0;
         applyRuntimeToSvg(rt);
@@ -1400,7 +1491,7 @@ export function createLiveBotAvatar(options: {
     setExpression(expr) {
       if (rt.destroyed || rt.exprOverride === expr) return;
       rt.exprOverride = expr;
-      if (reducedMotion) applyRuntimeToSvg(rt);
+      if (reducedMotionActive || !rt.onScreen || rt.contentSkipped) applyRuntimeToSvg(rt);
     },
     setGaze(nx, ny) {
       rt.gazeTarget = [clamp(nx, -1, 1), clamp(ny, -1, 1)];
@@ -1411,13 +1502,16 @@ export function createLiveBotAvatar(options: {
       rt.blinkTimer = 2.8 + Math.random() * 2.4;
     },
     poke(kind, turns = 2) {
-      if (rt.destroyed) return;
+      if (rt.destroyed || reducedMotionActive) return;
       const dur = kind === 'spin' ? 0.9 + 0.25 * Math.max(0, turns - 1) : kind === 'bounce' ? 0.62 : 0.48;
       rt.poke = { kind, elapsed: 0, dur, turns };
       if (kind !== 'spin') rt.blinkElapsed = 0;
+      if (hasRunnableWork()) ensureRafLoop();
     },
     destroy() {
       rt.destroyed = true;
+      rt.observer?.disconnect();
+      rt.observer = undefined;
       activeControllers.delete(rt);
     },
   };
@@ -1427,18 +1521,13 @@ export function createLiveBotAvatar(options: {
 
 /**
  * Creates a zero-idle-overhead static bot SVG (suitable for historical messages, inline emotes, and tray buttons).
- * When `interactivePoke` is enabled, clicking or hovering runs a brief 520ms elastic bounce tween and stops cleanly.
+ * When `interactivePoke` is enabled, wraps the decorative SVG in a keyboard-reachable `<button type="button">`
+ * that triggers a brief 520ms elastic bounce tween on click or hover.
  */
-export function createStaticBotSvg(options: {
-  size: number;
-  expr?: BotExpression;
-  body?: BotBodyKind;
-  rx?: number;
-  ry?: number;
-  rz?: number;
-  className?: string;
-  interactivePoke?: boolean;
-}): SVGSVGElement {
+export function createStaticBotSvg(options: StaticBotSvgOptions & { interactivePoke: true }): HTMLButtonElement;
+export function createStaticBotSvg(options: StaticBotSvgOptions & { interactivePoke?: false | undefined }): SVGSVGElement;
+export function createStaticBotSvg(options: StaticBotSvgOptions): SVGSVGElement | HTMLButtonElement;
+export function createStaticBotSvg(options: StaticBotSvgOptions): SVGSVGElement | HTMLButtonElement {
   const idPrefix = `friday-static-el-${++domUidCounter}`;
   const skeleton = buildSvgSkeleton(idPrefix, options.size, options.className);
   const expr = options.expr ?? 'neutral';
@@ -1467,15 +1556,16 @@ export function createStaticBotSvg(options: {
   paint(baseRx, baseRy, baseRz, 0, 1, 1, 0);
 
   if (options.interactivePoke) {
+    ensureVisibilityHook();
     let running = false;
     const triggerMicroTween = (): void => {
-      if (running || typeof requestAnimationFrame !== 'function') return;
-      if (typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return;
+      if (running || typeof requestAnimationFrame !== 'function' || reducedMotionActive || prefersReducedMotion()) return;
       running = true;
       let elapsed = 0;
       const dur = 0.52;
       activeTweens.add(dt => {
-        if (!skeleton.svg.isConnected) {
+        if (!skeleton.svg.isConnected || reducedMotionActive) {
+          paint(baseRx, baseRy, baseRz, 0, 1, 1, 0);
           running = false;
           return false;
         }
@@ -1494,11 +1584,18 @@ export function createStaticBotSvg(options: {
       });
       ensureRafLoop();
     };
-    skeleton.svg.addEventListener('click', ev => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'bot-poke-btn';
+    const metaLabel = BOT_EXPRESSION_META[expr]?.label ?? expr;
+    btn.setAttribute('aria-label', options.label ?? `与 F.R.I.D.A.Y. (${metaLabel}) 互动`);
+    btn.appendChild(skeleton.svg);
+    btn.addEventListener('click', ev => {
       ev.stopPropagation();
       triggerMicroTween();
     });
-    skeleton.svg.addEventListener('mouseenter', triggerMicroTween);
+    btn.addEventListener('mouseenter', triggerMicroTween);
+    return btn;
   }
 
   return skeleton.svg;

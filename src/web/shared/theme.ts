@@ -1,4 +1,5 @@
 export type UiTheme = 'spatial' | 'industrial';
+export type ThemePreference = 'system' | UiTheme;
 
 const THEME_STORAGE_KEY = 'friday.ui-theme';
 const LEFT_DRAWER_STORAGE_KEY = 'friday.ui-left-collapsed';
@@ -10,13 +11,9 @@ const LEFT_OPEN_LABEL = '◧ 任务舱';
 const LEFT_COLLAPSED_LABEL = '◨ 任务舱';
 const RIGHT_OPEN_LABEL = '执行链路 ◨';
 const RIGHT_COLLAPSED_LABEL = '执行链路 ◧';
-const THEME_COLOR_MEDIA_QUERIES = [
-  '(prefers-color-scheme: light)',
-  '(prefers-color-scheme: dark)',
-] as const;
 
 const themeListeners = new Set<(theme: UiTheme) => void>();
-const boundThemeButtons = new Map<HTMLButtonElement, UiTheme>();
+const boundThemeButtons = new Map<HTMLButtonElement, ThemePreference>();
 const wiredButtons = new WeakSet<HTMLButtonElement>();
 
 let channel: BroadcastChannel | undefined;
@@ -24,35 +21,48 @@ let boundWindow: (Window & typeof globalThis) | undefined;
 let boundRightBtn: HTMLButtonElement | null = null;
 let lastWriteSucceeded = true;
 let themeTransitionTimer: ReturnType<typeof setTimeout> | undefined;
-let chromeSyncRaf: number | undefined;
 
-function getThemeMetaColors(theme: UiTheme): { scheme: 'light' | 'dark'; themeColor: string } {
-  return theme === 'industrial'
-    ? { scheme: 'light', themeColor: '#f7f4ed' }
-    : { scheme: 'dark', themeColor: '#111520' };
+function prefersLightScheme(): boolean {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
+  try {
+    return Boolean(window.matchMedia('(prefers-color-scheme: light)')?.matches);
+  } catch {
+    return false;
+  }
 }
 
-function syncMetaTag(name: string, content: string, replaceNode: boolean): void {
+function getThemeMetaColors(theme: UiTheme, pref: ThemePreference = getUiThemePreference()): {
+  scheme: 'light dark' | 'light' | 'dark';
+  themeColor: string;
+} {
+  const themeColor = theme === 'industrial' ? '#f7f4ed' : '#111520';
+  const scheme = pref === 'system'
+    ? 'light dark'
+    : (theme === 'industrial' ? 'light' : 'dark');
+  return { scheme, themeColor };
+}
+
+function syncMetaTagInPlace(name: string, content: string): void {
   if (typeof document === 'undefined') return;
-  const existing = typeof document.querySelector === 'function'
-    ? document.querySelector(`meta[name="${name}"]`)
-    : null;
-  if (existing) {
-    if (replaceNode && existing.parentNode && typeof document.createElement === 'function') {
-      const fresh = document.createElement('meta');
-      fresh.setAttribute('name', name);
-      fresh.setAttribute('content', content);
-      if (typeof existing.replaceWith === 'function') {
-        existing.replaceWith(fresh);
-      } else {
-        existing.parentNode.insertBefore(fresh, existing);
-        existing.remove();
-      }
-      return;
+  let existingList: Element[] = [];
+  if (typeof document.querySelectorAll === 'function') {
+    existingList = Array.from(document.querySelectorAll(`meta[name="${name}"]`));
+  }
+  if (existingList.length === 0 && typeof document.querySelector === 'function') {
+    const single = document.querySelector(`meta[name="${name}"]`);
+    if (single) existingList = [single];
+  }
+
+  const primary = existingList[0];
+  if (primary) {
+    primary.setAttribute('content', content);
+    if (name === 'theme-color') primary.removeAttribute?.('media');
+    for (let i = 1; i < existingList.length; i++) {
+      existingList[i]?.remove?.();
     }
-    existing.setAttribute('content', content);
     return;
   }
+
   if (document.head && typeof document.createElement === 'function') {
     const fresh = document.createElement('meta');
     fresh.setAttribute('name', name);
@@ -61,63 +71,10 @@ function syncMetaTag(name: string, content: string, replaceNode: boolean): void 
   }
 }
 
-function appendThemeColorMeta(themeColor: string, media?: string): void {
-  if (!document.head || typeof document.createElement !== 'function') return;
-  const fresh = document.createElement('meta');
-  fresh.setAttribute('name', 'theme-color');
-  if (media) fresh.setAttribute('media', media);
-  fresh.setAttribute('content', themeColor);
-  document.head.appendChild(fresh);
-}
-
-function syncThemeColorMetas(themeColor: string, replaceNode: boolean): void {
-  if (typeof document === 'undefined') return;
-  let existingList: Element[] = [];
-  if (typeof document.querySelectorAll === 'function') {
-    existingList = Array.from(document.querySelectorAll('meta[name="theme-color"]'));
-  } else if (typeof document.querySelector === 'function') {
-    const single = document.querySelector('meta[name="theme-color"]');
-    if (single) existingList = [single];
-  }
-
-  if (existingList.length > 0) {
-    const seenMedia = new Set<string>();
-    let hasAttached = false;
-    for (const existing of existingList) {
-      const media = existing.getAttribute?.('media') ?? undefined;
-      if (media) seenMedia.add(media);
-      existing.setAttribute('content', themeColor);
-      if (existing.parentNode) {
-        hasAttached = true;
-        if (replaceNode && typeof document.createElement === 'function') {
-          const fresh = document.createElement('meta');
-          fresh.setAttribute('name', 'theme-color');
-          if (media) fresh.setAttribute('media', media);
-          fresh.setAttribute('content', themeColor);
-          existing.parentNode.insertBefore(fresh, existing);
-          existing.remove();
-        }
-      }
-    }
-    if (hasAttached && seenMedia.size > 0) {
-      for (const mq of THEME_COLOR_MEDIA_QUERIES) {
-        if (!seenMedia.has(mq)) {
-          appendThemeColorMeta(themeColor, mq);
-        }
-      }
-    }
-    return;
-  }
-
-  for (const mq of THEME_COLOR_MEDIA_QUERIES) {
-    appendThemeColorMeta(themeColor, mq);
-  }
-}
-
-export function syncThemeChrome(theme: UiTheme = getUiTheme()): void {
-  const { scheme, themeColor } = getThemeMetaColors(theme);
-  syncMetaTag('color-scheme', scheme, false);
-  syncThemeColorMetas(themeColor, true);
+export function syncThemeChrome(theme: UiTheme = getUiTheme(), pref: ThemePreference = getUiThemePreference()): void {
+  const { scheme, themeColor } = getThemeMetaColors(theme, pref);
+  syncMetaTagInPlace('color-scheme', scheme);
+  syncMetaTagInPlace('theme-color', themeColor);
 }
 
 function triggerThemeTransition(): void {
@@ -135,8 +92,14 @@ function triggerThemeTransition(): void {
   (themeTransitionTimer as { unref?: () => void }).unref?.();
 }
 
-function normalizeTheme(value: unknown): UiTheme {
-  return value === 'industrial' ? 'industrial' : 'spatial';
+function normalizePreference(value: unknown): ThemePreference {
+  if (value === 'industrial' || value === 'spatial' || value === 'system') return value;
+  return 'system';
+}
+
+function resolveThemeFromPreference(pref: ThemePreference): UiTheme {
+  if (pref === 'system') return prefersLightScheme() ? 'industrial' : 'spatial';
+  return pref;
 }
 
 function tryReadStorage(key: string): { ok: boolean; value: string | null } {
@@ -158,49 +121,66 @@ function writeStorage(key: string, value: string): boolean {
   }
 }
 
-function readInitialTheme(): UiTheme {
-  const stored = tryReadStorage(THEME_STORAGE_KEY);
-  if (stored.ok && (stored.value === 'spatial' || stored.value === 'industrial')) {
-    return stored.value;
+function removeStorage(key: string): boolean {
+  try {
+    if (typeof localStorage === 'undefined') return false;
+    localStorage.removeItem(key);
+    return true;
+  } catch {
+    return false;
   }
-  if (typeof document !== 'undefined') {
-    const attr = document.documentElement?.dataset?.theme;
-    if (attr === 'spatial' || attr === 'industrial') return attr;
-  }
-  return 'spatial';
 }
 
-let currentTheme: UiTheme = readInitialTheme();
+function readInitialPreference(): ThemePreference {
+  const stored = tryReadStorage(THEME_STORAGE_KEY);
+  if (stored.ok) {
+    if (stored.value === 'spatial' || stored.value === 'industrial') return stored.value;
+    return 'system';
+  }
+  if (typeof document !== 'undefined') {
+    const prefAttr = document.documentElement?.dataset?.themePref;
+    if (prefAttr === 'spatial' || prefAttr === 'industrial' || prefAttr === 'system') return prefAttr;
+    const themeAttr = document.documentElement?.dataset?.theme;
+    if (themeAttr === 'spatial' || themeAttr === 'industrial') return themeAttr;
+  }
+  return 'system';
+}
 
-function syncThemeButtons(theme: UiTheme): void {
-  for (const [btn, targetTheme] of boundThemeButtons) {
-    const active = targetTheme === theme;
+let currentPreference: ThemePreference = readInitialPreference();
+let currentTheme: UiTheme = resolveThemeFromPreference(currentPreference);
+
+function syncThemeButtons(theme: UiTheme, pref: ThemePreference): void {
+  let hasSystemButton = false;
+  for (const targetPref of boundThemeButtons.values()) {
+    if (targetPref === 'system') {
+      hasSystemButton = true;
+      break;
+    }
+  }
+  for (const [btn, targetPref] of boundThemeButtons) {
+    const active = hasSystemButton
+      ? targetPref === pref
+      : targetPref === theme;
     btn.classList.toggle('active', active);
     btn.setAttribute('aria-pressed', String(active));
   }
 }
 
-function applyThemeToDom(theme: UiTheme): void {
+function applyThemeToDom(theme: UiTheme, pref: ThemePreference): void {
   if (typeof document !== 'undefined') {
     const root = document.documentElement;
     if (root) {
-      if (root.dataset) root.dataset.theme = theme;
-      else if (typeof root.setAttribute === 'function') root.setAttribute('data-theme', theme);
-    }
-    syncThemeChrome(theme);
-    if (typeof requestAnimationFrame === 'function') {
-      if (chromeSyncRaf !== undefined && typeof cancelAnimationFrame === 'function') {
-        cancelAnimationFrame(chromeSyncRaf);
+      if (root.dataset) {
+        root.dataset.theme = theme;
+        root.dataset.themePref = pref;
+      } else if (typeof root.setAttribute === 'function') {
+        root.setAttribute('data-theme', theme);
+        root.setAttribute('data-theme-pref', pref);
       }
-      chromeSyncRaf = requestAnimationFrame(() => {
-        chromeSyncRaf = undefined;
-        if (currentTheme === theme) {
-          syncThemeColorMetas(getThemeMetaColors(theme).themeColor, true);
-        }
-      });
     }
+    syncThemeChrome(theme, pref);
   }
-  syncThemeButtons(theme);
+  syncThemeButtons(theme, pref);
 }
 
 function notifyThemeChange(theme: UiTheme): void {
@@ -216,16 +196,15 @@ function notifyThemeChange(theme: UiTheme): void {
   }
 }
 
-function handleExternalThemeUpdate(rawTheme: unknown): void {
-  const next = normalizeTheme(rawTheme);
-  if (next === currentTheme) {
-    applyThemeToDom(next);
-    return;
-  }
-  triggerThemeTransition();
-  currentTheme = next;
-  applyThemeToDom(next);
-  notifyThemeChange(next);
+function handleExternalThemeUpdate(rawPreference: unknown): void {
+  const nextPref = normalizePreference(rawPreference);
+  const nextTheme = resolveThemeFromPreference(nextPref);
+  const themeChanged = nextTheme !== currentTheme;
+  if (themeChanged) triggerThemeTransition();
+  currentPreference = nextPref;
+  currentTheme = nextTheme;
+  applyThemeToDom(nextTheme, nextPref);
+  if (themeChanged) notifyThemeChange(nextTheme);
 }
 
 function ensureCrossTabSync(): void {
@@ -236,11 +215,13 @@ function ensureCrossTabSync(): void {
       if (typeof unref === 'function') unref.call(bc);
       bc.onmessage = (event: MessageEvent) => {
         const data = event?.data as unknown;
-        const rawTheme = typeof data === 'string'
+        const rawPref = typeof data === 'string'
           ? data
-          : (data && typeof data === 'object' ? (data as { theme?: unknown }).theme : undefined);
-        if (rawTheme === 'spatial' || rawTheme === 'industrial') {
-          handleExternalThemeUpdate(rawTheme);
+          : (data && typeof data === 'object'
+              ? ((data as { preference?: unknown; theme?: unknown }).preference ?? (data as { theme?: unknown }).theme)
+              : undefined);
+        if (rawPref === 'system' || rawPref === 'spatial' || rawPref === 'industrial') {
+          handleExternalThemeUpdate(rawPref);
         }
       };
       channel = bc;
@@ -253,26 +234,36 @@ function ensureCrossTabSync(): void {
     boundWindow = window;
     window.addEventListener('storage', (event: StorageEvent) => {
       if (event.key === THEME_STORAGE_KEY) {
-        handleExternalThemeUpdate(event.newValue);
+        handleExternalThemeUpdate(event.newValue ?? 'system');
       } else if (event.key === null) {
         const stored = tryReadStorage(THEME_STORAGE_KEY);
-        handleExternalThemeUpdate(stored.ok ? stored.value : 'spatial');
+        handleExternalThemeUpdate(stored.ok ? (stored.value ?? 'system') : 'system');
       }
     });
     window.addEventListener('pageshow', () => {
-      syncThemeChrome();
+      syncThemeChrome(currentTheme, currentPreference);
     });
     if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
       document.addEventListener('visibilitychange', () => {
-        if (!document.hidden) syncThemeChrome();
+        if (!document.hidden) syncThemeChrome(currentTheme, currentPreference);
       });
     }
     if (typeof window.matchMedia === 'function') {
       try {
-        const mql = window.matchMedia('(prefers-color-scheme: dark)');
+        const mql = window.matchMedia('(prefers-color-scheme: light)');
         if (mql && typeof mql.addEventListener === 'function') {
           mql.addEventListener('change', () => {
-            syncThemeChrome();
+            const pref = getUiThemePreference();
+            if (pref === 'system') {
+              const resolved = resolveThemeFromPreference('system');
+              const changed = resolved !== currentTheme;
+              if (changed) triggerThemeTransition();
+              currentTheme = resolved;
+              applyThemeToDom(resolved, pref);
+              if (changed) notifyThemeChange(resolved);
+            } else {
+              syncThemeChrome(currentTheme, pref);
+            }
           });
         }
       } catch {
@@ -282,42 +273,52 @@ function ensureCrossTabSync(): void {
   }
 }
 
-export function getUiTheme(): UiTheme {
+export function getUiThemePreference(): ThemePreference {
   const stored = tryReadStorage(THEME_STORAGE_KEY);
   if (stored.ok) {
     if (stored.value === 'spatial' || stored.value === 'industrial') {
-      currentTheme = stored.value;
+      currentPreference = stored.value;
       return stored.value;
     }
     if (lastWriteSucceeded) {
-      currentTheme = 'spatial';
-      return 'spatial';
+      currentPreference = 'system';
+      return 'system';
     }
   }
-  return currentTheme;
+  return currentPreference;
 }
 
-export function setUiTheme(next: UiTheme): UiTheme {
+export function getUiTheme(): UiTheme {
+  const resolved = resolveThemeFromPreference(getUiThemePreference());
+  currentTheme = resolved;
+  return resolved;
+}
+
+export function setUiTheme(next: ThemePreference): UiTheme {
   ensureCrossTabSync();
-  const theme = normalizeTheme(next);
-  const prev = getUiTheme();
-  if (prev !== theme) {
+  const pref = normalizePreference(next);
+  const prevTheme = getUiTheme();
+  const resolved = resolveThemeFromPreference(pref);
+  if (prevTheme !== resolved) {
     triggerThemeTransition();
   }
-  currentTheme = theme;
-  lastWriteSucceeded = writeStorage(THEME_STORAGE_KEY, theme);
-  applyThemeToDom(theme);
+  currentPreference = pref;
+  currentTheme = resolved;
+  lastWriteSucceeded = pref === 'system'
+    ? removeStorage(THEME_STORAGE_KEY)
+    : writeStorage(THEME_STORAGE_KEY, pref);
+  applyThemeToDom(resolved, pref);
   if (channel) {
     try {
-      channel.postMessage({ theme });
+      channel.postMessage({ preference: pref, theme: resolved });
     } catch {
       // Ignore channel errors if closed or unavailable.
     }
   }
-  if (prev !== theme) {
-    notifyThemeChange(theme);
+  if (prevTheme !== resolved) {
+    notifyThemeChange(resolved);
   }
-  return theme;
+  return resolved;
 }
 
 export function onUiThemeChange(listener: (theme: UiTheme) => void): () => void {
@@ -331,25 +332,34 @@ export function onUiThemeChange(listener: (theme: UiTheme) => void): () => void 
 export function bindThemeButtons(
   spatialBtn: HTMLButtonElement | null,
   industrialBtn: HTMLButtonElement | null,
+  systemBtn: HTMLButtonElement | null = null,
 ): void {
   ensureCrossTabSync();
-  const pairs: Array<[HTMLButtonElement | null, UiTheme]> = [
+  const fallbackSystemId = spatialBtn?.id === 'mm-theme-spatial' ? 'mm-theme-system' : 'theme-system-btn';
+  const resolvedSystemBtn = systemBtn
+    ?? (typeof document !== 'undefined' && typeof document.getElementById === 'function'
+      ? (document.getElementById(fallbackSystemId) as HTMLButtonElement | null)
+      : null);
+  const pairs: Array<[HTMLButtonElement | null, ThemePreference]> = [
+    [resolvedSystemBtn, 'system'],
     [spatialBtn, 'spatial'],
     [industrialBtn, 'industrial'],
   ];
-  for (const [btn, targetTheme] of pairs) {
+  for (const [btn, targetPref] of pairs) {
     if (!btn) continue;
-    boundThemeButtons.set(btn, targetTheme);
+    boundThemeButtons.set(btn, targetPref);
     if (!wiredButtons.has(btn)) {
       wiredButtons.add(btn);
       btn.addEventListener('click', () => {
-        setUiTheme(targetTheme);
+        setUiTheme(targetPref);
       });
     }
   }
-  const active = getUiTheme();
+  const pref = getUiThemePreference();
+  const active = resolveThemeFromPreference(pref);
+  currentPreference = pref;
   currentTheme = active;
-  applyThemeToDom(active);
+  applyThemeToDom(active, pref);
 }
 
 function readDrawerState(key: string): boolean {
@@ -441,5 +451,6 @@ export function collapseRightDrawer(): void {
 
 if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   ensureCrossTabSync();
-  applyThemeToDom(getUiTheme());
+  const pref = getUiThemePreference();
+  applyThemeToDom(resolveThemeFromPreference(pref), pref);
 }

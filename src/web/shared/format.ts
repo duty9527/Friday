@@ -31,8 +31,81 @@ export function statusText(value: string): string {
   return statusNames[value] ?? value;
 }
 
+interface DurationInput {
+  hours?: number;
+  minutes?: number;
+  seconds?: number;
+}
+
+interface DurationFormatterLike {
+  format: (duration: DurationInput) => string;
+}
+
+interface IntlWithDurationFormat {
+  DurationFormat?: new (locale?: string, options?: { style?: 'long' | 'short' | 'narrow' | 'digital' }) => DurationFormatterLike;
+}
+
+const zhDateTimeFormatter = typeof Intl !== 'undefined'
+  ? new Intl.DateTimeFormat('zh-CN', {
+      year: 'numeric',
+      month: 'numeric',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    })
+  : null;
+
+const zhNumberFormatter = typeof Intl !== 'undefined'
+  ? new Intl.NumberFormat('zh-CN')
+  : null;
+
+const zhDurationFormatter: DurationFormatterLike | null = (() => {
+  if (typeof Intl === 'undefined') return null;
+  const ctor = (Intl as unknown as IntlWithDurationFormat).DurationFormat;
+  if (typeof ctor !== 'function') return null;
+  try {
+    return new ctor('zh-CN', { style: 'long' });
+  } catch {
+    return null;
+  }
+})();
+
 export function timestamp(at: number): string {
-  return Number.isFinite(at) ? new Date(at).toLocaleString('zh-CN', { hour12: false }) : '—';
+  if (!Number.isFinite(at)) return '—';
+  const d = new Date(at);
+  if (Number.isNaN(d.getTime())) return '—';
+  return zhDateTimeFormatter ? zhDateTimeFormatter.format(d) : d.toLocaleString('zh-CN', { hour12: false });
+}
+
+export function formatNumber(value: number): string {
+  if (!Number.isFinite(value)) return '—';
+  return zhNumberFormatter ? zhNumberFormatter.format(value) : String(value);
+}
+
+export function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms)) return '—';
+  const totalSec = Math.max(1, Math.round(ms / 1000));
+  const hours = Math.floor(totalSec / 3600);
+  const minutes = Math.floor((totalSec % 3600) / 60);
+  const seconds = totalSec % 60;
+  const parts: DurationInput = {};
+  if (hours > 0) parts.hours = hours;
+  if (minutes > 0) parts.minutes = minutes;
+  if (seconds > 0 || (!hours && !minutes)) parts.seconds = seconds;
+  if (zhDurationFormatter) {
+    try {
+      return zhDurationFormatter.format(parts);
+    } catch {
+      // Fall through to manual formatting
+    }
+  }
+  const tokens: string[] = [];
+  if (hours > 0) tokens.push(`${hours} 小时`);
+  if (minutes > 0) tokens.push(`${minutes} 分钟`);
+  if (seconds > 0 || tokens.length === 0) tokens.push(`${seconds} 秒`);
+  return tokens.join(' ');
 }
 
 export function json(value: unknown): string {
@@ -45,9 +118,13 @@ export function errorText(error: unknown): string {
 
 export function formatIntervalText(ms: number): string {
   const sec = Math.max(1, Math.round(ms / 1000));
-  if (sec % 3600 === 0) return `每 ${sec / 3600} 小时 (${sec}s)`;
-  if (sec % 60 === 0) return `每 ${sec / 60} 分钟 (${sec}s)`;
-  return `每 ${sec} 秒`;
+  if (sec % 3600 === 0) {
+    return `每 ${formatDuration(sec * 1000)} (${sec}s)`;
+  }
+  if (sec % 60 === 0) {
+    return `每 ${formatDuration(sec * 1000)} (${sec}s)`;
+  }
+  return `每 ${formatDuration(sec * 1000)}`;
 }
 
 export const synapseRelationNames: Record<string, string> = {
