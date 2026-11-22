@@ -28,6 +28,7 @@ import type {
   MindmapWorkerStep,
   RouteActionSummary,
 } from '../mindmap-types.js';
+import { yieldToMain } from './shared/ui-primitives.js';
 
 export type {
   FlowCategory,
@@ -67,11 +68,63 @@ export function shortText(raw: string | undefined, max = 38): string {
   return `${clean.slice(0, max - 1)}…`;
 }
 
+const zhShortDateTimeFormatter = typeof Intl !== 'undefined'
+  ? new Intl.DateTimeFormat('zh-CN', {
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hourCycle: 'h23',
+    })
+  : null;
+
+const zhShortClockFormatter = typeof Intl !== 'undefined'
+  ? new Intl.DateTimeFormat('zh-CN', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hourCycle: 'h23',
+    })
+  : null;
+
+const zhNumberFormatter = typeof Intl !== 'undefined'
+  ? new Intl.NumberFormat('zh-CN')
+  : null;
+
+const zhCollator = typeof Intl !== 'undefined'
+  ? new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' })
+  : null;
+
 export function formatTimeShort(ts?: number): string {
-  if (!ts) return '—';
+  if (!ts || !Number.isFinite(ts)) return '—';
   const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return '—';
+  if (zhShortDateTimeFormatter) {
+    return zhShortDateTimeFormatter.format(d);
+  }
   const pad = (n: number) => String(n).padStart(2, '0');
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+export function formatClockShort(ts?: number): string {
+  if (!ts || !Number.isFinite(ts)) return '—';
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return '—';
+  if (zhShortClockFormatter) {
+    return zhShortClockFormatter.format(d);
+  }
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+export function formatCount(value?: number): string {
+  if (value === undefined || !Number.isFinite(value)) return '0';
+  return zhNumberFormatter ? zhNumberFormatter.format(value) : String(value);
+}
+
+export function compareTextLocale(a: string, b: string): number {
+  return zhCollator ? zhCollator.compare(a, b) : a.localeCompare(b);
 }
 
 export function formatDuration(ms?: number): string {
@@ -167,7 +220,7 @@ function mergeSessionInto(target: MindmapSession, incoming: MindmapSession): voi
       target.turnSummaries.push({ ...summary, taskIds: [...summary.taskIds] });
     }
   }
-  target.turnSummaries.sort((a, b) => (a.seq - b.seq) || (a.at - b.at));
+  target.turnSummaries = target.turnSummaries.toSorted((a, b) => (a.seq - b.seq) || (a.at - b.at));
   const summaryById = new Set(target.turnSummaries.map(s => s.flowId));
   for (const fid of incoming.turnFlowIds) {
     if (!summaryById.has(fid) && !target.turnFlowIds.includes(fid)) {
@@ -241,7 +294,7 @@ export function getEffectiveSessions(snapshot: MindmapSnapshot | null, loadedFlo
   }
 
   for (const [sessionId, flows] of uncoveredGroups) {
-    const ordered = [...flows].sort((a, b) => (a.seq - b.seq) || (a.createdAt - b.createdAt));
+    const ordered = flows.toSorted((a, b) => (a.seq - b.seq) || (a.createdAt - b.createdAt));
     const first = ordered[0]!;
     const last = ordered[ordered.length - 1]!;
     const channels: MindmapSession['channels'] = [];
@@ -298,23 +351,28 @@ function nodeSearchBlob(badge: string, title: string, subtitle: string, extra?: 
   return `${badge} ${title} ${subtitle} ${extra ?? ''}`.toLowerCase();
 }
 
-export function buildSessionFlowchart(
-  session: MindmapSession,
-  flowsById: Map<string, MindmapTaskFlow>,
-  snapshot: MindmapSnapshot | null,
-  collapseMap: Map<string, boolean>,
-  searchTerm: string,
-): FlowchartGraph {
-  const turns = resolveSessionTurns(session, flowsById);
-  const needle = searchTerm.trim().toLowerCase();
-  const frames: FlowchartFrame[] = [];
-  const nodes: FlowchartNode[] = [];
-  const edges: FlowchartEdge[] = [];
+function nowMs(): number {
+  return typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now()
+    : Date.now();
+}
 
-  if (turns.length === 0) {
-    return { mode: 'session', width: FC_FRAME_X * 2 + FC_FRAME_W, height: 220, frames, nodes, edges };
-  }
+interface SessionLayoutState {
+  session: MindmapSession;
+  turns: MindmapTaskFlow[];
+  snapshot: MindmapSnapshot | null;
+  collapseMap: Map<string, boolean>;
+  needle: string;
+  frames: FlowchartFrame[];
+  nodes: FlowchartNode[];
+  edges: FlowchartEdge[];
+  globalY: number;
+  prevTurnTailNode: FlowchartNode | undefined;
+  edgeSeq: number;
+}
 
+function appendSessionTurnLayout(state: SessionLayoutState, flow: MindmapTaskFlow, turnIdx: number): void {
+  const { session, turns, snapshot, collapseMap, needle, frames, nodes, edges } = state;
   const pushNode = (raw: Omit<FlowchartNode, 'searchText' | 'match'>, extraSearch?: string): FlowchartNode => {
     const searchText = nodeSearchBlob(raw.badge, raw.title, raw.subtitle, `${raw.metric ?? ''} ${extraSearch ?? ''}`);
     const match = Boolean(needle) && searchText.includes(needle);
@@ -322,99 +380,94 @@ export function buildSessionFlowchart(
     nodes.push(node);
     return node;
   };
+  const nextEdgeId = (prefix: string) => `${prefix}:${++state.edgeSeq}`;
 
-  let globalY = 20;
-  let prevTurnTailNode: FlowchartNode | undefined;
-  let edgeSeq = 0;
-  const nextEdgeId = (prefix: string) => `${prefix}:${++edgeSeq}`;
+  const frameKey = `turn:${flow.id}`;
+  const defaultTurnCollapsed = turns.length > 4
+    && turnIdx > 0
+    && turnIdx < turns.length - 2
+    && flow.tasks.length === 0;
+  const isTurnCollapsed = collapseMap.has(frameKey) ? Boolean(collapseMap.get(frameKey)) : defaultTurnCollapsed;
 
-  turns.forEach((flow, turnIdx) => {
-    const frameKey = `turn:${flow.id}`;
-    const defaultTurnCollapsed = turns.length > 4
-      && turnIdx > 0
-      && turnIdx < turns.length - 2
-      && flow.tasks.length === 0;
-    const isTurnCollapsed = collapseMap.has(frameKey) ? Boolean(collapseMap.get(frameKey)) : defaultTurnCollapsed;
+  const frameTopY = state.globalY;
+  const firstTurnTitle = shortText(flow.ingress.text, 44);
+  const linkBadge = flow.sessionLink?.label;
 
-    const frameTopY = globalY;
-    const firstTurnTitle = shortText(flow.ingress.text, 44);
-    const linkBadge = flow.sessionLink?.label;
+  if (isTurnCollapsed) {
+    const compactNode = pushNode({
+      id: `${flow.id}:collapsed-turn`,
+      flowId: flow.id,
+      sessionId: session.id,
+      kind: 'flow_root',
+      category: flow.ingress.sourceKind === 'wechat' || flow.ingress.sourceKind === 'xiaoai' ? 'im' : 'ingress',
+      shape: 'pill',
+      icon: sourceIcon(flow.ingress.sourceKind),
+      badge: `第 ${turnIdx + 1}/${turns.length} 轮 (已折叠)`,
+      title: shortText(flow.ingress.text, 34),
+      subtitle: flow.deliveries.at(-1)?.text ? `回复: ${shortText(flow.deliveries.at(-1)!.text, 32)}` : '点击标题或展开看本轮思路',
+      metric: formatTimeShort(flow.createdAt),
+      status: flow.status,
+      x: FC_SPINE_X,
+      y: frameTopY + FC_HEADER_H + 12,
+      w: FC_SPINE_W,
+      h: 64,
+      toggleKey: frameKey,
+      collapsed: true,
+      inspector: { flow, snapshot: snapshot ?? undefined, session },
+    }, flow.ingress.text);
 
-    if (isTurnCollapsed) {
-      const compactNode = pushNode({
-        id: `${flow.id}:collapsed-turn`,
-        flowId: flow.id,
-        sessionId: session.id,
-        kind: 'flow_root',
-        category: flow.ingress.sourceKind === 'wechat' || flow.ingress.sourceKind === 'xiaoai' ? 'im' : 'ingress',
-        shape: 'pill',
-        icon: sourceIcon(flow.ingress.sourceKind),
-        badge: `第 ${turnIdx + 1}/${turns.length} 轮 (已折叠)`,
-        title: shortText(flow.ingress.text, 34),
-        subtitle: flow.deliveries.at(-1)?.text ? `回复: ${shortText(flow.deliveries.at(-1)!.text, 32)}` : '点击标题或展开看本轮思路',
-        metric: formatTimeShort(flow.createdAt),
-        status: flow.status,
-        x: FC_SPINE_X,
-        y: frameTopY + FC_HEADER_H + 12,
-        w: FC_SPINE_W,
-        h: 64,
-        toggleKey: frameKey,
-        collapsed: true,
-        inspector: { flow, snapshot: snapshot ?? undefined, session },
-      }, flow.ingress.text);
-
-      if (prevTurnTailNode) {
-        const y1 = prevTurnTailNode.y + prevTurnTailNode.h;
-        const y2 = compactNode.y;
-        edges.push({
-          id: nextEdgeId('bridge'),
-          fromId: prevTurnTailNode.id,
-          toId: compactNode.id,
-          kind: 'session_bridge',
-          tone: 'accent',
-          points: [{ x: FC_SPINE_CX, y: y1 }, { x: FC_SPINE_CX, y: y2 }],
-          label: linkBadge ?? '🔗 会话上下文延续',
-          labelX: FC_SPINE_CX,
-          labelY: Math.round((y1 + y2) / 2),
-        });
-      }
-
-      const frameH = FC_HEADER_H + 88;
-      frames.push({
-        id: `frame:${flow.id}`,
-        sessionId: session.id,
-        flowId: flow.id,
-        turnIndex: turnIdx + 1,
-        turnCount: turns.length,
-        title: `第 ${turnIdx + 1}/${turns.length} 轮 · ${flow.ingress.channelLabel} · #${flow.seq || '独立'}`,
-        subtitle: firstTurnTitle,
-        badge: linkBadge ?? statusLabel(flow.status),
-        status: flow.status,
-        x: FC_FRAME_X,
-        y: frameTopY,
-        w: FC_FRAME_W,
-        h: frameH,
-        collapsed: true,
-        toggleKey: frameKey,
+    if (state.prevTurnTailNode) {
+      const y1 = state.prevTurnTailNode.y + state.prevTurnTailNode.h;
+      const y2 = compactNode.y;
+      edges.push({
+        id: nextEdgeId('bridge'),
+        fromId: state.prevTurnTailNode.id,
+        toId: compactNode.id,
+        kind: 'session_bridge',
+        tone: 'accent',
+        points: [{ x: FC_SPINE_CX, y: y1 }, { x: FC_SPINE_CX, y: y2 }],
+        label: linkBadge ?? '🔗 会话上下文延续',
+        labelX: FC_SPINE_CX,
+        labelY: Math.round((y1 + y2) / 2),
       });
-
-      prevTurnTailNode = compactNode;
-      globalY = frameTopY + frameH + (turnIdx < turns.length - 1 ? 66 : 24);
-      return;
     }
 
-    let curY = frameTopY + FC_HEADER_H + 18;
-    let prevSpine: FlowchartNode | undefined;
+    const frameH = FC_HEADER_H + 88;
+    frames.push({
+      id: `frame:${flow.id}`,
+      sessionId: session.id,
+      flowId: flow.id,
+      turnIndex: turnIdx + 1,
+      turnCount: turns.length,
+      title: `第 ${turnIdx + 1}/${turns.length} 轮 · ${flow.ingress.channelLabel} · #${flow.seq || '独立'}`,
+      subtitle: firstTurnTitle,
+      badge: linkBadge ?? statusLabel(flow.status),
+      status: flow.status,
+      x: FC_FRAME_X,
+      y: frameTopY,
+      w: FC_FRAME_W,
+      h: frameH,
+      collapsed: true,
+      toggleKey: frameKey,
+    });
 
-    const advanceGap = (label?: string) => (label ? 46 : 30);
+    state.prevTurnTailNode = compactNode;
+    state.globalY = frameTopY + frameH + (turnIdx < turns.length - 1 ? 66 : 24);
+    return;
+  }
 
-    const connectDown = (fromNode: FlowchartNode | undefined, toNode: FlowchartNode, label?: string, tone: FlowchartEdgeTone = 'default', kind: FlowchartEdgeKind = 'spine') => {
-      if (!fromNode) return;
-      const y1 = fromNode.y + fromNode.h;
-      const y2 = toNode.y;
-      edges.push({
-        id: nextEdgeId(kind),
-        fromId: fromNode.id,
+  let curY = frameTopY + FC_HEADER_H + 18;
+  let prevSpine: FlowchartNode | undefined;
+
+  const advanceGap = (label?: string) => (label ? 46 : 30);
+
+  const connectDown = (fromNode: FlowchartNode | undefined, toNode: FlowchartNode, label?: string, tone: FlowchartEdgeTone = 'default', kind: FlowchartEdgeKind = 'spine') => {
+    if (!fromNode) return;
+    const y1 = fromNode.y + fromNode.h;
+    const y2 = toNode.y;
+    edges.push({
+      id: nextEdgeId(kind),
+      fromId: fromNode.id,
         toId: toNode.id,
         kind,
         tone,
@@ -513,21 +566,21 @@ export function buildSessionFlowchart(
       inspector: { flow, snapshot: snapshot ?? undefined, session },
     }, flow.ingress.text);
 
-    if (prevTurnTailNode) {
-      const y1 = prevTurnTailNode.y + prevTurnTailNode.h;
-      const y2 = ingressNode.y;
-      edges.push({
-        id: nextEdgeId('bridge'),
-        fromId: prevTurnTailNode.id,
-        toId: ingressNode.id,
-        kind: 'session_bridge',
-        tone: 'accent',
-        points: [{ x: FC_SPINE_CX, y: y1 }, { x: FC_SPINE_CX, y: y2 }],
-        label: linkBadge ?? '🔗 AI 会话上下文延续',
-        labelX: FC_SPINE_CX,
-        labelY: Math.round((y1 + y2) / 2),
-      });
-    }
+  if (state.prevTurnTailNode) {
+    const y1 = state.prevTurnTailNode.y + state.prevTurnTailNode.h;
+    const y2 = ingressNode.y;
+    edges.push({
+      id: nextEdgeId('bridge'),
+      fromId: state.prevTurnTailNode.id,
+      toId: ingressNode.id,
+      kind: 'session_bridge',
+      tone: 'accent',
+      points: [{ x: FC_SPINE_CX, y: y1 }, { x: FC_SPINE_CX, y: y2 }],
+      label: linkBadge ?? '🔗 AI 会话上下文延续',
+      labelX: FC_SPINE_CX,
+      labelY: Math.round((y1 + y2) / 2),
+    });
+  }
     prevSpine = ingressNode;
     curY += FC_SPINE_H + advanceGap();
 
@@ -1333,17 +1386,276 @@ export function buildSessionFlowchart(
       toggleKey: turns.length > 1 ? frameKey : undefined,
     });
 
-    prevTurnTailNode = imNode;
-    globalY = frameBottomY + (turnIdx < turns.length - 1 ? 66 : 28);
-  });
+  state.prevTurnTailNode = imNode;
+  state.globalY = frameBottomY + (turnIdx < turns.length - 1 ? 66 : 28);
+}
 
+function createSessionLayoutState(
+  session: MindmapSession,
+  flowsById: Map<string, MindmapTaskFlow>,
+  snapshot: MindmapSnapshot | null,
+  collapseMap: Map<string, boolean>,
+  searchTerm: string,
+): SessionLayoutState {
+  return {
+    session,
+    turns: resolveSessionTurns(session, flowsById),
+    snapshot,
+    collapseMap,
+    needle: searchTerm.trim().toLowerCase(),
+    frames: [],
+    nodes: [],
+    edges: [],
+    globalY: 20,
+    prevTurnTailNode: undefined,
+    edgeSeq: 0,
+  };
+}
+
+function finalizeSessionLayout(state: SessionLayoutState): FlowchartGraph {
   return {
     mode: 'session',
     width: FC_FRAME_X * 2 + FC_FRAME_W,
-    height: Math.max(globalY, 320),
-    frames,
-    nodes,
-    edges,
+    height: Math.max(state.globalY, 320),
+    frames: state.frames,
+    nodes: state.nodes,
+    edges: state.edges,
+  };
+}
+
+export function buildSessionFlowchart(
+  session: MindmapSession,
+  flowsById: Map<string, MindmapTaskFlow>,
+  snapshot: MindmapSnapshot | null,
+  collapseMap: Map<string, boolean>,
+  searchTerm: string,
+): FlowchartGraph {
+  const state = createSessionLayoutState(session, flowsById, snapshot, collapseMap, searchTerm);
+  if (state.turns.length === 0) {
+    return { mode: 'session', width: FC_FRAME_X * 2 + FC_FRAME_W, height: 220, frames: state.frames, nodes: state.nodes, edges: state.edges };
+  }
+  for (let turnIdx = 0; turnIdx < state.turns.length; turnIdx += 1) {
+    appendSessionTurnLayout(state, state.turns[turnIdx]!, turnIdx);
+  }
+  return finalizeSessionLayout(state);
+}
+
+/**
+ * Builds the session flowchart asynchronously, yielding to the main thread when work exceeds 50ms.
+ */
+export async function buildSessionFlowchartAsync(
+  session: MindmapSession,
+  flowsById: Map<string, MindmapTaskFlow>,
+  snapshot: MindmapSnapshot | null,
+  collapseMap: Map<string, boolean>,
+  searchTerm: string,
+  shouldAbort?: () => boolean,
+): Promise<FlowchartGraph | null> {
+  const state = createSessionLayoutState(session, flowsById, snapshot, collapseMap, searchTerm);
+  if (state.turns.length === 0) {
+    return { mode: 'session', width: FC_FRAME_X * 2 + FC_FRAME_W, height: 220, frames: state.frames, nodes: state.nodes, edges: state.edges };
+  }
+  let deadline = nowMs() + 50;
+  for (let turnIdx = 0; turnIdx < state.turns.length; turnIdx += 1) {
+    appendSessionTurnLayout(state, state.turns[turnIdx]!, turnIdx);
+    if (turnIdx < state.turns.length - 1 && nowMs() >= deadline) {
+      await yieldToMain();
+      if (shouldAbort?.()) return null;
+      deadline = nowMs() + 50;
+    }
+  }
+  return finalizeSessionLayout(state);
+}
+
+const OV_PIPE_FRAME_X = 24;
+const OV_PIPE_FRAME_W = 1480;
+const OV_STAGE_W = 248;
+const OV_STAGE_H = 74;
+const OV_STAGE_GAP = 42;
+const OV_START_X = OV_PIPE_FRAME_X + 24;
+const OV_ROW_STEP = 166;
+
+interface OverviewLayoutState {
+  flowsById: Map<string, MindmapTaskFlow>;
+  snapshot: MindmapSnapshot | null;
+  needle: string;
+  frames: FlowchartFrame[];
+  nodes: FlowchartNode[];
+  edges: FlowchartEdge[];
+  y: number;
+  edgeId: number;
+}
+
+function appendOverviewSessionLayout(state: OverviewLayoutState, session: MindmapSession, sIdx: number): void {
+  const { flowsById, snapshot, needle, frames, nodes, edges } = state;
+  const turns = resolveSessionTurns(session, flowsById);
+  const primaryFlow = turns[turns.length - 1] ?? null;
+  const frameY = state.y;
+  const nodeY = frameY + 56;
+  const totalTasks = session.taskCount;
+  const totalJev = session.jevCallCount;
+
+  const addStage = (col: number, raw: Omit<FlowchartNode, 'x' | 'y' | 'w' | 'h' | 'searchText' | 'match'>, extra?: string) => {
+    const searchText = nodeSearchBlob(raw.badge, raw.title, raw.subtitle, `${session.title} ${extra ?? ''}`);
+    const match = Boolean(needle) && searchText.includes(needle);
+    const node: FlowchartNode = {
+      ...raw,
+      x: OV_START_X + col * (OV_STAGE_W + OV_STAGE_GAP),
+      y: nodeY,
+      w: OV_STAGE_W,
+      h: OV_STAGE_H,
+      searchText,
+      match,
+    };
+    nodes.push(node);
+    return node;
+  };
+
+  const s0 = addStage(0, {
+    id: `${session.id}:ov:0`,
+    flowId: primaryFlow?.id ?? session.id,
+    sessionId: session.id,
+    kind: 'session_summary',
+    category: session.channels.includes('wechat') || session.channels.includes('xiaoai') ? 'im' : session.kind === 'timer' ? 'router' : 'ingress',
+    shape: 'pill',
+    icon: session.turnCount > 1 ? '🗂️' : sourceIcon(turns[0]?.ingress.sourceKind ?? 'local'),
+    badge: `${session.turnCount > 1 ? `多轮会话 (${session.turnCount}轮)` : '单轮对话'} · ${session.primaryChannelLabel}`,
+    title: shortText(session.title, 26),
+    subtitle: `${formatTimeShort(session.startedAt)} ~ ${formatTimeShort(session.updatedAt)}`,
+    status: session.status,
+    inspector: { flow: primaryFlow, snapshot: snapshot ?? undefined, session },
+  }, turns.map(t => t.ingress.text).join(' '));
+
+  const s1 = addStage(1, {
+    id: `${session.id}:ov:1`,
+    flowId: primaryFlow?.id ?? session.id,
+    sessionId: session.id,
+    kind: 'memory_group',
+    category: 'memory',
+    shape: 'process',
+    icon: '🧠',
+    badge: 'AI 上下文 & 记忆召回',
+    title: `召回 ${session.recalledMemoryCount} 条 · 沉淀 ${session.consolidatedMemoryCount} 条`,
+    subtitle: session.turnCount > 1 ? '跨轮语义上下文连贯管理' : '工作空间目录记忆联想',
+    status: 'completed',
+    inspector: { flow: primaryFlow, snapshot: snapshot ?? undefined, session },
+  });
+
+  const firstTask = turns.flatMap(t => t.tasks)[0];
+  const s2 = addStage(2, {
+    id: `${session.id}:ov:2`,
+    flowId: primaryFlow?.id ?? session.id,
+    sessionId: session.id,
+    kind: 'router_turn',
+    category: 'router',
+    shape: 'decision',
+    icon: '◆',
+    badge: 'Router & JEV 决策',
+    title: totalTasks > 0
+      ? `派发 ${totalTasks} 任务 · JEV ${totalJev} 次`
+      : '主控直回 / 插件调度',
+    subtitle: firstTask?.jevRoute?.response.selectedModel
+      ? `选模 ${shortText(firstTask.jevRoute.response.selectedModel.split('/').pop(), 20)}@${firstTask.jevRoute.response.thinkingLevel ?? 'med'}`
+      : `${snapshot?.summary.routerModel ?? '主控模型'}`,
+    status: session.status,
+    inspector: { flow: primaryFlow, task: firstTask, snapshot: snapshot ?? undefined, session },
+  });
+
+  const totalPhases = turns.flatMap(t => t.tasks).reduce((sum, t) => sum + (t.executionPhases?.length || 1), 0);
+  const totalSteps = turns.flatMap(t => t.tasks).reduce((sum, t) => sum + t.totalSteps, 0);
+  const lastQg = turns.flatMap(t => t.tasks).flatMap(t => t.jevQualityGates).at(-1);
+  const s3 = addStage(3, {
+    id: `${session.id}:ov:3`,
+    flowId: primaryFlow?.id ?? session.id,
+    sessionId: session.id,
+    kind: 'worker_exec',
+    category: totalTasks ? 'worker' : 'router',
+    shape: 'subprocess',
+    icon: totalTasks ? '⚙️' : '⚡',
+    badge: totalTasks ? 'Worker 执行 & 质检' : '轻量化执行路径',
+    title: totalTasks
+      ? `${totalPhases} 轮执行 · ${totalSteps} 个步骤`
+      : (turns[0]?.directPlugin ? `插件 ${turns[0].directPlugin.plugin}` : '无后台重型任务'),
+    subtitle: lastQg
+      ? `终检得分 ${lastQg.response.score.toFixed(2)}/${lastQg.response.maxScore}`
+      : (totalTasks ? 'Worker 完成全部操作' : '即时响应完毕'),
+    status: session.status,
+    inspector: { flow: primaryFlow, task: firstTask, snapshot: snapshot ?? undefined, session },
+  });
+
+  const lastTurn = turns.at(-1);
+  const s4 = addStage(4, {
+    id: `${session.id}:ov:4`,
+    flowId: primaryFlow?.id ?? session.id,
+    sessionId: session.id,
+    kind: 'im_delivery',
+    category: 'im',
+    shape: 'io',
+    icon: lastTurn?.imPush.channel === 'wechat' ? '📲' : lastTurn?.imPush.channel === 'xiaoai' ? '🔊' : '📩',
+    badge: `IM 交付 · ${lastTurn?.imPush.channelName ?? '控制台'}`,
+    title: lastTurn?.deliveries.at(-1)?.text
+      ? shortText(lastTurn.deliveries.at(-1)!.text, 26)
+      : '点击进入完整思考流程图',
+    subtitle: lastTurn?.imPush.delivered ? '已送达 · 双击查看全链路' : statusLabel(session.status),
+    status: session.status,
+    inspector: { flow: primaryFlow, delivery: lastTurn?.deliveries.at(-1), snapshot: snapshot ?? undefined, session },
+  });
+
+  const rowStages = [s0, s1, s2, s3, s4];
+  for (let i = 0; i < rowStages.length - 1; i += 1) {
+    const a = rowStages[i]!;
+    const b = rowStages[i + 1]!;
+    edges.push({
+      id: `ov-edge:${++state.edgeId}`,
+      fromId: a.id,
+      toId: b.id,
+      kind: 'spine',
+      tone: i === 2 && totalJev > 0 ? 'accent' : i === 3 && lastTurn?.imPush.delivered ? 'success' : 'default',
+      points: [{ x: a.x + a.w, y: Math.round(a.y + a.h / 2) }, { x: b.x, y: Math.round(b.y + b.h / 2) }],
+    });
+  }
+
+  frames.push({
+    id: `ov-frame:${session.id}`,
+    sessionId: session.id,
+    title: `会话 #${sIdx + 1} · ${session.title}`,
+    subtitle: turns.map((t, idx) => `#${t.seq || idx + 1}:${shortText(t.ingress.text, 16)}`).join('  ➔  '),
+    badge: `${session.turnCount} 轮 · 点击切换详解`,
+    status: session.status,
+    x: OV_PIPE_FRAME_X,
+    y: frameY,
+    w: OV_PIPE_FRAME_W,
+    h: 146,
+  });
+
+  state.y += OV_ROW_STEP;
+}
+
+function createOverviewLayoutState(
+  flowsById: Map<string, MindmapTaskFlow>,
+  snapshot: MindmapSnapshot | null,
+  searchTerm: string,
+): OverviewLayoutState {
+  return {
+    flowsById,
+    snapshot,
+    needle: searchTerm.trim().toLowerCase(),
+    frames: [],
+    nodes: [],
+    edges: [],
+    y: 20,
+    edgeId: 0,
+  };
+}
+
+function finalizeOverviewLayout(state: OverviewLayoutState): FlowchartGraph {
+  return {
+    mode: 'overview',
+    width: OV_PIPE_FRAME_X * 2 + OV_PIPE_FRAME_W,
+    height: Math.max(state.y + 20, 320),
+    frames: state.frames,
+    nodes: state.nodes,
+    edges: state.edges,
   };
 }
 
@@ -1353,171 +1665,32 @@ export function buildOverviewFlowchart(
   snapshot: MindmapSnapshot | null,
   searchTerm: string,
 ): FlowchartGraph {
-  const needle = searchTerm.trim().toLowerCase();
-  const frames: FlowchartFrame[] = [];
-  const nodes: FlowchartNode[] = [];
-  const edges: FlowchartEdge[] = [];
+  const state = createOverviewLayoutState(flowsById, snapshot, searchTerm);
+  for (let sIdx = 0; sIdx < sessions.length; sIdx += 1) {
+    appendOverviewSessionLayout(state, sessions[sIdx]!, sIdx);
+  }
+  return finalizeOverviewLayout(state);
+}
 
-  const PIPE_FRAME_X = 24;
-  const PIPE_FRAME_W = 1480;
-  const STAGE_W = 248;
-  const STAGE_H = 74;
-  const STAGE_GAP = 42;
-  const START_X = PIPE_FRAME_X + 24;
-  const ROW_STEP = 166;
-  let y = 20;
-  let edgeId = 0;
-
-  sessions.forEach((session, sIdx) => {
-    const turns = resolveSessionTurns(session, flowsById);
-    const primaryFlow = turns[turns.length - 1] ?? null;
-    const frameY = y;
-    const nodeY = frameY + 56;
-    const totalTasks = session.taskCount;
-    const totalJev = session.jevCallCount;
-
-    const addStage = (col: number, raw: Omit<FlowchartNode, 'x' | 'y' | 'w' | 'h' | 'searchText' | 'match'>, extra?: string) => {
-      const searchText = nodeSearchBlob(raw.badge, raw.title, raw.subtitle, `${session.title} ${extra ?? ''}`);
-      const match = Boolean(needle) && searchText.includes(needle);
-      const node: FlowchartNode = {
-        ...raw,
-        x: START_X + col * (STAGE_W + STAGE_GAP),
-        y: nodeY,
-        w: STAGE_W,
-        h: STAGE_H,
-        searchText,
-        match,
-      };
-      nodes.push(node);
-      return node;
-    };
-
-    const s0 = addStage(0, {
-      id: `${session.id}:ov:0`,
-      flowId: primaryFlow?.id ?? session.id,
-      sessionId: session.id,
-      kind: 'session_summary',
-      category: session.channels.includes('wechat') || session.channels.includes('xiaoai') ? 'im' : session.kind === 'timer' ? 'router' : 'ingress',
-      shape: 'pill',
-      icon: session.turnCount > 1 ? '🗂️' : sourceIcon(turns[0]?.ingress.sourceKind ?? 'local'),
-      badge: `${session.turnCount > 1 ? `多轮会话 (${session.turnCount}轮)` : '单轮对话'} · ${session.primaryChannelLabel}`,
-      title: shortText(session.title, 26),
-      subtitle: `${formatTimeShort(session.startedAt)} ~ ${formatTimeShort(session.updatedAt)}`,
-      status: session.status,
-      inspector: { flow: primaryFlow, snapshot: snapshot ?? undefined, session },
-    }, turns.map(t => t.ingress.text).join(' '));
-
-    const s1 = addStage(1, {
-      id: `${session.id}:ov:1`,
-      flowId: primaryFlow?.id ?? session.id,
-      sessionId: session.id,
-      kind: 'memory_group',
-      category: 'memory',
-      shape: 'process',
-      icon: '🧠',
-      badge: 'AI 上下文 & 记忆召回',
-      title: `召回 ${session.recalledMemoryCount} 条 · 沉淀 ${session.consolidatedMemoryCount} 条`,
-      subtitle: session.turnCount > 1 ? '跨轮语义上下文连贯管理' : '工作空间目录记忆联想',
-      status: 'completed',
-      inspector: { flow: primaryFlow, snapshot: snapshot ?? undefined, session },
-    });
-
-    const firstTask = turns.flatMap(t => t.tasks)[0];
-    const s2 = addStage(2, {
-      id: `${session.id}:ov:2`,
-      flowId: primaryFlow?.id ?? session.id,
-      sessionId: session.id,
-      kind: 'router_turn',
-      category: 'router',
-      shape: 'decision',
-      icon: '◆',
-      badge: 'Router & JEV 决策',
-      title: totalTasks > 0
-        ? `派发 ${totalTasks} 任务 · JEV ${totalJev} 次`
-        : '主控直回 / 插件调度',
-      subtitle: firstTask?.jevRoute?.response.selectedModel
-        ? `选模 ${shortText(firstTask.jevRoute.response.selectedModel.split('/').pop(), 20)}@${firstTask.jevRoute.response.thinkingLevel ?? 'med'}`
-        : `${snapshot?.summary.routerModel ?? '主控模型'}`,
-      status: session.status,
-      inspector: { flow: primaryFlow, task: firstTask, snapshot: snapshot ?? undefined, session },
-    });
-
-    const totalPhases = turns.flatMap(t => t.tasks).reduce((sum, t) => sum + (t.executionPhases?.length || 1), 0);
-    const totalSteps = turns.flatMap(t => t.tasks).reduce((sum, t) => sum + t.totalSteps, 0);
-    const lastQg = turns.flatMap(t => t.tasks).flatMap(t => t.jevQualityGates).at(-1);
-    const s3 = addStage(3, {
-      id: `${session.id}:ov:3`,
-      flowId: primaryFlow?.id ?? session.id,
-      sessionId: session.id,
-      kind: 'worker_exec',
-      category: totalTasks ? 'worker' : 'router',
-      shape: 'subprocess',
-      icon: totalTasks ? '⚙️' : '⚡',
-      badge: totalTasks ? 'Worker 执行 & 质检' : '轻量化执行路径',
-      title: totalTasks
-        ? `${totalPhases} 轮执行 · ${totalSteps} 个步骤`
-        : (turns[0]?.directPlugin ? `插件 ${turns[0].directPlugin.plugin}` : '无后台重型任务'),
-      subtitle: lastQg
-        ? `终检得分 ${lastQg.response.score.toFixed(2)}/${lastQg.response.maxScore}`
-        : (totalTasks ? 'Worker 完成全部操作' : '即时响应完毕'),
-      status: session.status,
-      inspector: { flow: primaryFlow, task: firstTask, snapshot: snapshot ?? undefined, session },
-    });
-
-    const lastTurn = turns.at(-1);
-    const s4 = addStage(4, {
-      id: `${session.id}:ov:4`,
-      flowId: primaryFlow?.id ?? session.id,
-      sessionId: session.id,
-      kind: 'im_delivery',
-      category: 'im',
-      shape: 'io',
-      icon: lastTurn?.imPush.channel === 'wechat' ? '📲' : lastTurn?.imPush.channel === 'xiaoai' ? '🔊' : '📩',
-      badge: `IM 交付 · ${lastTurn?.imPush.channelName ?? '控制台'}`,
-      title: lastTurn?.deliveries.at(-1)?.text
-        ? shortText(lastTurn.deliveries.at(-1)!.text, 26)
-        : '点击进入完整思考流程图',
-      subtitle: lastTurn?.imPush.delivered ? '已送达 · 双击查看全链路' : statusLabel(session.status),
-      status: session.status,
-      inspector: { flow: primaryFlow, delivery: lastTurn?.deliveries.at(-1), snapshot: snapshot ?? undefined, session },
-    });
-
-    const rowStages = [s0, s1, s2, s3, s4];
-    for (let i = 0; i < rowStages.length - 1; i += 1) {
-      const a = rowStages[i]!;
-      const b = rowStages[i + 1]!;
-      edges.push({
-        id: `ov-edge:${++edgeId}`,
-        fromId: a.id,
-        toId: b.id,
-        kind: 'spine',
-        tone: i === 2 && totalJev > 0 ? 'accent' : i === 3 && lastTurn?.imPush.delivered ? 'success' : 'default',
-        points: [{ x: a.x + a.w, y: Math.round(a.y + a.h / 2) }, { x: b.x, y: Math.round(b.y + b.h / 2) }],
-      });
+/**
+ * Builds the overview flowchart asynchronously, yielding to the main thread when work exceeds 50ms.
+ */
+export async function buildOverviewFlowchartAsync(
+  sessions: MindmapSession[],
+  flowsById: Map<string, MindmapTaskFlow>,
+  snapshot: MindmapSnapshot | null,
+  searchTerm: string,
+  shouldAbort?: () => boolean,
+): Promise<FlowchartGraph | null> {
+  const state = createOverviewLayoutState(flowsById, snapshot, searchTerm);
+  let deadline = nowMs() + 50;
+  for (let sIdx = 0; sIdx < sessions.length; sIdx += 1) {
+    appendOverviewSessionLayout(state, sessions[sIdx]!, sIdx);
+    if (sIdx < sessions.length - 1 && nowMs() >= deadline) {
+      await yieldToMain();
+      if (shouldAbort?.()) return null;
+      deadline = nowMs() + 50;
     }
-
-    frames.push({
-      id: `ov-frame:${session.id}`,
-      sessionId: session.id,
-      title: `会话 #${sIdx + 1} · ${session.title}`,
-      subtitle: turns.map((t, idx) => `#${t.seq || idx + 1}:${shortText(t.ingress.text, 16)}`).join('  ➔  '),
-      badge: `${session.turnCount} 轮 · 点击切换详解`,
-      status: session.status,
-      x: PIPE_FRAME_X,
-      y: frameY,
-      w: PIPE_FRAME_W,
-      h: 146,
-    });
-
-    y += ROW_STEP;
-  });
-
-  return {
-    mode: 'overview',
-    width: PIPE_FRAME_X * 2 + PIPE_FRAME_W,
-    height: Math.max(y + 20, 320),
-    frames,
-    nodes,
-    edges,
-  };
+  }
+  return finalizeOverviewLayout(state);
 }
