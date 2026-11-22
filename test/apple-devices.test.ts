@@ -1276,7 +1276,93 @@ test('10. FMiP recovery after 15m sessionLifespan, /setup/ws/1/validate renewal,
     }
   }
 
-  // 10b. Production 196 scenario: /refreshClient 450 -> /initClient 450 -> /validate 200 -> /initClient 200 while /accountLogin returns 421
+  // 10b-1. Live 196 behavior: /refreshClient 450 -> /initClient 450 -> /accountLogin 200 -> /initClient 200 (even when /validate alone does not re-authorize FMiP)
+  {
+    const dataDir = mkdtempSync(join(tmpdir(), 'friday-apple-acctlogin-'));
+    let now = 1_760_250_000_000;
+    let needAccountLogin = false;
+    try {
+      const mock = createMockAppleFetch({
+        appleId: 'live196@icloud.com',
+        password: 'Password123!',
+        require2fa: false,
+        devices: [sampleDev],
+        accountLoginHandler: (reqBody) => {
+          assert.ok(reqBody.dsWebAuthToken);
+          needAccountLogin = false;
+          return makeMockResponse(200, {
+            hsaTrustedBrowser: true,
+            dsInfo: { appleId: 'live196@icloud.com', dsid: '123456789' },
+            webservices: { findme: { url: 'https://p123-fmipweb.icloud.com.cn:443', status: 'active' } },
+          }, {
+            'set-cookie': [
+              'X-APPLE-WEBAUTH-USER=USER_1; Domain=.icloud.com.cn; Path=/; HttpOnly',
+              'X-APPLE-WEBAUTH-TOKEN=WEBAUTH_MINTED; Domain=.icloud.com.cn; Path=/; HttpOnly',
+            ],
+          });
+        },
+        validateHandler: () => makeMockResponse(200, {
+          hsaTrustedBrowser: true,
+          dsInfo: { appleId: 'live196@icloud.com', dsid: '123456789' },
+          webservices: { findme: { url: 'https://p123-fmipweb.icloud.com.cn:443', status: 'active' } },
+        }),
+        initClientHandler: () => {
+          if (needAccountLogin) return makeMockResponse(450, { error: 'FMiP auth needs accountLogin' });
+          return makeMockResponse(200, {
+            statusCode: '200',
+            serverContext: { serverTimestamp: now, callbackIntervalInMS: 2000, sessionLifespan: 900_000 },
+            content: [sampleDev],
+          }, {
+            'set-cookie': ['X-APPLE-WEBAUTH-FMIP=FMIP_COOKIE_MINTED; Domain=.icloud.com.cn; Path=/; HttpOnly'],
+          });
+        },
+        refreshClientHandler: () => {
+          if (needAccountLogin) return makeMockResponse(450, { error: 'FMiP subsession expired' });
+          return makeMockResponse(200, {
+            statusCode: '200',
+            serverContext: { serverTimestamp: now, callbackIntervalInMS: 2000, sessionLifespan: 900_000 },
+            content: [sampleDev],
+          });
+        },
+      });
+
+      await runAppleAction('auth-login', {
+        appleId: 'live196@icloud.com',
+        password: 'Password123!',
+      }, { dataDir, fetchFn: mock.fetchFn, nowFn: () => now });
+
+      const sessPath = join(dataDir, 'session.json');
+      const savedSess = JSON.parse(readFileSync(sessPath, 'utf8'));
+      delete savedSess.fmipContextUpdatedAt;
+      savedSess.lastError = { at: now, action: 'devices', stage: 'fmip_init', code: 'AUTH_EXPIRED', status: 450, message: 'old' };
+      const { writeFileSync } = await import('node:fs');
+      writeFileSync(sessPath, JSON.stringify(savedSess), { mode: 0o600 });
+
+      now += 1_860_000; // +31m (matches 196 timing)
+      needAccountLogin = true;
+      const callsBefore = mock.calls.length;
+      const recovered = await runAppleAction('status', { refresh: true }, { dataDir, fetchFn: mock.fetchFn, nowFn: () => now });
+      assert.equal(recovered.ok, true);
+      assert.equal(recovered.data.authState, 'authenticated');
+      assert.equal(recovered.data.devices.length, 1);
+
+      const slice = mock.calls.slice(callsBefore);
+      const acctIdx = slice.findIndex(c => c.url.includes('/setup/ws/1/accountLogin'));
+      const valIdx = slice.findIndex(c => c.url.includes('/setup/ws/1/validate'));
+      assert.ok(acctIdx >= 0, 'Stage A must call /setup/ws/1/accountLogin');
+      assert.equal(valIdx, -1, 'must NOT need /validate once accountLogin + initClient succeeds');
+
+      const postSess = JSON.parse(readFileSync(sessPath, 'utf8'));
+      assert.equal(postSess.state, 'authenticated');
+      assert.equal(postSess.cookies['X-APPLE-WEBAUTH-FMIP'], 'FMIP_COOKIE_MINTED');
+      assert.equal(postSess.lastError, undefined);
+      assert.equal(typeof postSess.fmipContextUpdatedAt, 'number');
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  }
+
+  // 10b-2. Stage B fallback: /refreshClient 450 -> /initClient 450 -> /accountLogin 421 -> /validate 200 -> /initClient 200
   {
     const dataDir = mkdtempSync(join(tmpdir(), 'friday-apple-validate-'));
     let now = 1_760_300_000_000;
@@ -1288,7 +1374,7 @@ test('10. FMiP recovery after 15m sessionLifespan, /setup/ws/1/validate renewal,
         require2fa: false,
         devices: [sampleDev],
         accountLoginHandler: (reqBody) => {
-          // Allow initial login; reject any subsequent renewal attempt (simulating short-lived dsWebAuthToken expiry!)
+          // Allow initial login; reject any subsequent renewal attempt (simulating short-lived dsWebAuthToken expiry)
           if (failUntilValidated) {
             return makeMockResponse(421, { error: 'dsWebAuthToken expired' });
           }
@@ -1364,7 +1450,7 @@ test('10. FMiP recovery after 15m sessionLifespan, /setup/ws/1/validate renewal,
       assert.equal(recovered.ok, true);
       assert.equal(recovered.data.authState, 'authenticated');
       assert.equal(recovered.data.devices.length, 1);
-      assert.ok(mock.calls.some(c => c.url.includes('/setup/ws/1/validate')), 'must recover via /setup/ws/1/validate');
+      assert.ok(mock.calls.some(c => c.url.includes('/setup/ws/1/validate')), 'must fallback to /setup/ws/1/validate when accountLogin returns 421');
       const postSess = JSON.parse(readFileSync(sessPath, 'utf8'));
       assert.equal(postSess.state, 'authenticated');
       assert.equal(postSess.findmeUrl, 'https://p205-fmipweb.icloud.com.cn');
@@ -1376,11 +1462,11 @@ test('10. FMiP recovery after 15m sessionLifespan, /setup/ws/1/validate renewal,
     }
   }
 
-  // 10c. Transient 503 on /validate must NOT mark session expired; confirmed 421 on both /validate and /accountLogin marks expired + writes redacted error.log
+  // 10c. Transient 503 on /accountLogin or /validate must NOT mark session expired; confirmed 421 on both marks expired + writes redacted error.log
   {
     const dataDir = mkdtempSync(join(tmpdir(), 'friday-apple-expiry-'));
     let now = 1_760_400_000_000;
-    let mode: 'ok' | 'transient503' | 'dead421' = 'ok';
+    let mode: 'ok' | 'acct503' | 'val503' | 'dead421' = 'ok';
     try {
       const mock = createMockAppleFetch({
         appleId: 'secretuser99@icloud.com',
@@ -1388,7 +1474,7 @@ test('10. FMiP recovery after 15m sessionLifespan, /setup/ws/1/validate renewal,
         require2fa: false,
         devices: [sampleDev],
         validateHandler: () => {
-          if (mode === 'transient503') return makeMockResponse(503, { error: 'Apple temporarily unavailable secretuser99@icloud.com' });
+          if (mode === 'val503') return makeMockResponse(503, { error: 'Apple validate unavailable secretuser99@icloud.com' });
           if (mode === 'dead421') return makeMockResponse(421, { error: 'Missing X-APPLE-WEBAUTH-TOKEN for secretuser99@icloud.com' });
           return makeMockResponse(200, {
             hsaTrustedBrowser: true,
@@ -1397,7 +1483,8 @@ test('10. FMiP recovery after 15m sessionLifespan, /setup/ws/1/validate renewal,
           });
         },
         accountLoginHandler: (reqBody) => {
-          if (mode === 'dead421') return makeMockResponse(421, { error: 'Session expired' });
+          if (mode === 'acct503') return makeMockResponse(503, { error: 'Apple accountLogin unavailable secretuser99@icloud.com' });
+          if (mode === 'val503' || mode === 'dead421') return makeMockResponse(421, { error: 'Session expired' });
           assert.ok(reqBody.dsWebAuthToken);
           return makeMockResponse(200, {
             hsaTrustedBrowser: true,
@@ -1430,17 +1517,25 @@ test('10. FMiP recovery after 15m sessionLifespan, /setup/ws/1/validate renewal,
         password: 'Password123!',
       }, { dataDir, fetchFn: mock.fetchFn, nowFn: () => now });
 
-      // Transient 503 during renewal keeps state=authenticated
+      // Transient 503 on /accountLogin keeps state=authenticated
       now += 3_600_000;
-      mode = 'transient503';
-      const transientRes = await runAppleAction('status', { refresh: true }, { dataDir, fetchFn: mock.fetchFn, nowFn: () => now });
-      assert.equal(transientRes.ok, false);
-      assert.equal(transientRes.data.authState, 'authenticated', '503 must NOT permanently mark session expired');
-      assert.ok(transientRes.data.lastError);
-      assert.equal(transientRes.data.lastError.stage, 'validate');
-      assert.equal(transientRes.data.lastError.status, 503);
+      mode = 'acct503';
+      const acct503Res = await runAppleAction('status', { refresh: true }, { dataDir, fetchFn: mock.fetchFn, nowFn: () => now });
+      assert.equal(acct503Res.ok, false);
+      assert.equal(acct503Res.data.authState, 'authenticated', '503 on /accountLogin must NOT mark session expired');
+      assert.equal(acct503Res.data.lastError?.stage, 'account_login');
+      assert.equal(acct503Res.data.lastError?.status, 503);
 
-      // Confirmed 421 on both /validate and /accountLogin marks expired + records expiredAt & redacted error.log
+      // Transient 503 on /validate (after /accountLogin 421) keeps state=authenticated
+      now += 60_000;
+      mode = 'val503';
+      const val503Res = await runAppleAction('status', { refresh: true }, { dataDir, fetchFn: mock.fetchFn, nowFn: () => now });
+      assert.equal(val503Res.ok, false);
+      assert.equal(val503Res.data.authState, 'authenticated', '503 on /validate must NOT mark session expired');
+      assert.equal(val503Res.data.lastError?.stage, 'validate');
+      assert.equal(val503Res.data.lastError?.status, 503);
+
+      // Confirmed 421 on both /accountLogin and /validate marks expired + records expiredAt & redacted error.log
       now += 60_000;
       mode = 'dead421';
       const deadRes = await runAppleAction('status', { refresh: true }, { dataDir, fetchFn: mock.fetchFn, nowFn: () => now });
@@ -1452,6 +1547,7 @@ test('10. FMiP recovery after 15m sessionLifespan, /setup/ws/1/validate renewal,
       assert.equal(existsSync(errLogPath), true);
       assert.equal(statSync(errLogPath).mode & 0o777, 0o600);
       const logContent = readFileSync(errLogPath, 'utf8');
+      assert.match(logContent, /\[apple-devices\].*action=devices.*stage=account_login.*http=503/);
       assert.match(logContent, /\[apple-devices\].*action=devices.*stage=validate.*http=503/);
       assert.match(logContent, /\[apple-devices\].*action=devices.*code=AUTH_EXPIRED/);
       assert.equal(logContent.includes('secretuser99@icloud.com'), false, 'raw email must be redacted in error.log');

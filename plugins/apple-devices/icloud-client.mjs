@@ -423,7 +423,7 @@ export async function validateAccountSession({ session, fetchFn = fetch, signal,
     body: null,
     signal,
   });
-  session.cookies = mergeCookies(session.cookies, resp.setCookies);
+  absorbAuthResponse(session, resp.headers, resp.setCookies);
   if (!resp.ok) {
     const isAuthErr = resp.status === 401 || resp.status === 421 || resp.status === 450;
     throw new AppleClientError(
@@ -476,7 +476,7 @@ export async function completeAccountLogin({ session, fetchFn = fetch, signal, n
     },
     signal,
   });
-  session.cookies = mergeCookies(session.cookies, resp.setCookies);
+  absorbAuthResponse(session, resp.headers, resp.setCookies);
   if (!resp.ok) {
     const code = resp.status === 401 || resp.status === 450 || resp.status === 421 ? 'AUTH_EXPIRED' : 'SETUP_LOGIN_FAILED';
     throw new AppleClientError(
@@ -1072,77 +1072,6 @@ function markSessionExpired(session, nowFn, message, status, stage) {
 }
 
 /**
- * Renew iCloud setup/WebAuth session using existing WebAuth cookies (`/validate`) first,
- * falling back to `sessionToken` (`/accountLogin`) only when WebAuth cookies are missing or rejected.
- * Transient network/5xx/429 errors are re-thrown without marking the session as expired.
- * @param {{
- *   session: Record<string, any>;
- *   fetchFn?: typeof fetch;
- *   signal?: AbortSignal;
- *   nowFn?: () => number;
- * }} params
- * @returns {Promise<'validate' | 'accountLogin'>}
- */
-async function renewIcloudWebSession({ session, fetchFn = fetch, signal, nowFn = Date.now }) {
-  let hasAuthRejection = false;
-  /** @type {number | undefined} */
-  let authRejectedStatus;
-  let authRejectedStage = 'validate';
-
-  if (hasWebAuthCookies(session.cookies)) {
-    try {
-      await validateAccountSession({ session, fetchFn, signal, nowFn });
-      return 'validate';
-    } catch (err) {
-      if (err instanceof AppleClientError) {
-        if (err.status === 401 || err.status === 421 || err.status === 450) {
-          hasAuthRejection = true;
-          authRejectedStatus = err.status;
-          authRejectedStage = err.stage || 'validate';
-        } else if (err.status === 404) {
-          if (!session.sessionToken) {
-            throw err;
-          }
-        } else {
-          throw err;
-        }
-      } else {
-        throw err;
-      }
-    }
-  }
-
-  if (session.sessionToken) {
-    try {
-      await completeAccountLogin({ session, fetchFn, signal, nowFn });
-      return 'accountLogin';
-    } catch (err) {
-      if (err instanceof AppleClientError && err.code === 'AUTH_EXPIRED') {
-        markSessionExpired(
-          session,
-          nowFn,
-          'Apple 会话已过期（约 30～60 天需重新完成一次 2FA 授权），请重新登录绑定',
-          err.status,
-          err.stage || 'account_login',
-        );
-      }
-      throw err;
-    }
-  }
-
-  if (hasAuthRejection || !hasWebAuthCookies(session.cookies)) {
-    markSessionExpired(
-      session,
-      nowFn,
-      'Apple 会话已过期（约 30～60 天需重新完成一次 2FA 授权），请重新登录绑定',
-      authRejectedStatus ?? 401,
-      authRejectedStage,
-    );
-  }
-  throw new AppleClientError('iCloud 会话校验失败', 'VALIDATE_FAILED', 404, 'validate');
-}
-
-/**
  * Perform a raw FMiP JSON POST against `findmeUrl` and absorb rotated cookies without throwing on HTTP errors.
  * @param {{
  *   session: Record<string, any>;
@@ -1166,8 +1095,10 @@ async function postFmipRaw({ session, path, body, fetchFn = fetch, signal }) {
 }
 
 /**
- * Initialize a fresh FMiP web subsession via `/fmipservice/client/web/initClient`,
- * recovering transparently via `/setup/ws/1/validate` (or `/accountLogin`) on 401/450.
+ * Initialize a fresh FMiP web subsession via `/fmipservice/client/web/initClient`.
+ * When Apple returns 401/450, tries `/setup/ws/1/accountLogin` -> `/initClient` first
+ * (minting fresh FMiP auth), falling back to `/setup/ws/1/validate` -> `/initClient`.
+ * Transient network/5xx/429 errors are re-thrown without marking the session as expired.
  * @param {{
  *   session: Record<string, any>;
  *   baseClientContext: Record<string, unknown>;
@@ -1203,26 +1134,108 @@ async function initFmipSession({
   });
 
   if (resp.status === 401 || resp.status === 450) {
-    await renewIcloudWebSession({ session, fetchFn, signal, nowFn });
-    clearFmipSubsession(session);
-    resp = await postFmipRaw({
-      session,
-      path: '/fmipservice/client/web/initClient',
-      body: makeInitBody(),
-      fetchFn,
-      signal,
-    });
+    let authRejectedStatus = resp.status;
+    let authRejectedStage = 'fmip_init';
+    const sawAuthRejection = true;
+    let triedAccountLogin = false;
+
+    // Stage A: accountLogin -> /initClient (primary path to re-mint FMiP auth on 450)
+    if (session.sessionToken) {
+      triedAccountLogin = true;
+      let loginOk = false;
+      try {
+        await completeAccountLogin({ session, fetchFn, signal, nowFn });
+        loginOk = true;
+      } catch (err) {
+        if (err instanceof AppleClientError && err.code === 'AUTH_EXPIRED') {
+          authRejectedStatus = err.status ?? authRejectedStatus;
+          authRejectedStage = err.stage || 'account_login';
+        } else {
+          throw err;
+        }
+      }
+      if (loginOk) {
+        clearFmipSubsession(session);
+        resp = await postFmipRaw({
+          session,
+          path: '/fmipservice/client/web/initClient',
+          body: makeInitBody(),
+          fetchFn,
+          signal,
+        });
+        if (resp.ok) {
+          storeFmipServerContext(session, resp.data, includeFamily, nowFn);
+          return resp.data;
+        }
+        if (resp.status !== 401 && resp.status !== 450) {
+          throw new AppleClientError(
+            extractAppleServiceError(resp.data, `iCloud Find My 初始化失败 (HTTP ${resp.status})`),
+            'FMIP_REQUEST_FAILED',
+            resp.status,
+            'fmip_init',
+          );
+        }
+        authRejectedStatus = resp.status;
+        authRejectedStage = 'fmip_init';
+      }
+    }
+
+    // Stage B: /validate -> /initClient fallback when sessionToken is absent/expired or Stage A still hit 450
+    if (hasWebAuthCookies(session.cookies)) {
+      let validateOk = false;
+      try {
+        await validateAccountSession({ session, fetchFn, signal, nowFn });
+        validateOk = true;
+      } catch (err) {
+        if (err instanceof AppleClientError && (err.status === 401 || err.status === 421 || err.status === 450)) {
+          authRejectedStatus = err.status;
+          authRejectedStage = err.stage || 'validate';
+        } else if (err instanceof AppleClientError && err.status === 404) {
+          if (!triedAccountLogin) {
+            throw err;
+          }
+        } else {
+          throw err;
+        }
+      }
+      if (validateOk) {
+        clearFmipSubsession(session);
+        resp = await postFmipRaw({
+          session,
+          path: '/fmipservice/client/web/initClient',
+          body: makeInitBody(),
+          fetchFn,
+          signal,
+        });
+        if (resp.ok) {
+          storeFmipServerContext(session, resp.data, includeFamily, nowFn);
+          return resp.data;
+        }
+        if (resp.status !== 401 && resp.status !== 450) {
+          throw new AppleClientError(
+            extractAppleServiceError(resp.data, `iCloud Find My 初始化失败 (HTTP ${resp.status})`),
+            'FMIP_REQUEST_FAILED',
+            resp.status,
+            'fmip_init',
+          );
+        }
+        authRejectedStatus = resp.status;
+        authRejectedStage = 'fmip_init';
+      }
+    }
+
+    // Stage C: exhausted all renewal paths with explicit auth rejections
+    if (sawAuthRejection) {
+      markSessionExpired(
+        session,
+        nowFn,
+        'Apple 会话已过期（约 30～60 天需重新完成一次 2FA 授权），请重新登录绑定',
+        authRejectedStatus,
+        authRejectedStage,
+      );
+    }
   }
 
-  if (resp.status === 401 || resp.status === 450) {
-    markSessionExpired(
-      session,
-      nowFn,
-      'Apple 会话已过期（约 30～60 天需重新完成一次 2FA 授权），请重新登录绑定',
-      resp.status,
-      'fmip_init',
-    );
-  }
   if (!resp.ok) {
     throw new AppleClientError(
       extractAppleServiceError(resp.data, `iCloud Find My 初始化失败 (HTTP ${resp.status})`),
