@@ -1,10 +1,11 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
+import { brotliCompressSync, gzipSync, constants as zlibConstants } from 'node:zlib';
 import type { Socket } from 'node:net';
 import { integer, request, REQUEST_LIMIT } from './protocol.js';
 import type { TraceEvent } from './view.js';
@@ -24,9 +25,49 @@ const staticMimeTypes: Record<string, string> = {
   '.css': 'text/css; charset=utf-8',
   '.js': 'application/javascript; charset=utf-8',
   '.png': 'image/png',
+  '.webp': 'image/webp',
+  '.avif': 'image/avif',
+  '.svg': 'image/svg+xml',
   '.woff2': 'font/woff2',
   '.webmanifest': 'application/manifest+json; charset=utf-8',
 };
+
+type CachedStaticAsset = {
+  bytes: Buffer;
+  gzip?: Buffer;
+  br?: Buffer;
+  etag: string;
+};
+
+const LONG_LIVED_STATIC_EXTS = new Set(['.woff2', '.png', '.webp', '.avif', '.svg']);
+const COMPRESSIBLE_MIMES = ['text/', 'application/javascript', 'application/manifest+json', 'image/svg+xml'];
+
+function isCompressibleMime(mime: string): boolean {
+  return COMPRESSIBLE_MIMES.some(prefix => mime.startsWith(prefix));
+}
+
+function parseAcceptEncoding(header: string | string[] | undefined): Set<string> {
+  const raw = Array.isArray(header) ? header.join(',') : header;
+  const accepted = new Set<string>();
+  if (!raw) return accepted;
+  for (const part of raw.split(',')) {
+    const [token, ...params] = part.trim().toLowerCase().split(';');
+    if (!token) continue;
+    const disabled = params.some(param => /^q\s*=\s*0(?:\.0+)?$/i.test(param.trim()));
+    if (!disabled) accepted.add(token.trim());
+  }
+  return accepted;
+}
+
+function matchesIfNoneMatch(header: string | string[] | undefined, etag: string): boolean {
+  const raw = Array.isArray(header) ? header.join(',') : header;
+  if (!raw) return false;
+  for (const candidate of raw.split(',')) {
+    const token = candidate.trim();
+    if (token === '*' || token === etag || token === `W/${etag}`) return true;
+  }
+  return false;
+}
 const adjacentWebRoot = resolve(fileURLToPath(new URL('./web/', import.meta.url)));
 const webRoot = existsSync(resolve(adjacentWebRoot, 'client.js'))
   ? adjacentWebRoot
@@ -54,7 +95,7 @@ function resolveStaticAsset(pathname: string): { filePath: string; mime: string 
   const mime = Object.hasOwn(staticMimeTypes, ext) ? staticMimeTypes[ext] : undefined;
   return mime ? { filePath, mime } : undefined;
 }
-const policy = "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
+const policy = "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; object-src 'none'; require-trusted-types-for 'script'; trusted-types 'none'";
 function send(
   response: ServerResponse,
   status: number,
@@ -367,23 +408,34 @@ export async function startWeb(options: StartWebOptions): Promise<{ url: string;
     }
   }
   await bridge(home, { command: 'health' });
-  const assetCache = new Map<string, Buffer>();
-  const loadAsset = async (filePath: string) => {
+  const assetCache = new Map<string, CachedStaticAsset>();
+  const loadAsset = async (filePath: string, mime = ''): Promise<CachedStaticAsset> => {
     let cached = assetCache.get(filePath);
     if (!cached) {
-      try { cached = await readFile(filePath); }
+      let bytes: Buffer;
+      try { bytes = await readFile(filePath); }
       catch (error) {
         const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
         if (code === 'ENOENT' || code === 'EISDIR' || code === 'ENOTDIR') throw new HttpFailure(404, 'Not found');
         throw error;
       }
+      const hash = createHash('sha256').update(bytes).digest('base64url').slice(0, 16);
+      let br: Buffer | undefined;
+      let gzip: Buffer | undefined;
+      if (isCompressibleMime(mime)) {
+        const brCandidate = brotliCompressSync(bytes, { params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 5 } });
+        if (brCandidate.length < bytes.length) br = brCandidate;
+        const gzipCandidate = gzipSync(bytes);
+        if (gzipCandidate.length < bytes.length) gzip = gzipCandidate;
+      }
+      cached = { bytes, gzip, br, etag: `"${hash}"` };
       assetCache.set(filePath, cached);
     }
     return cached;
   };
   const indexAsset = resolveStaticAsset('/');
   if (!indexAsset) throw new Error('Missing web entrypoint');
-  await loadAsset(indexAsset.filePath);
+  await loadAsset(indexAsset.filePath, indexAsset.mime);
   const sseBroadcaster = createSseBroadcaster(home);
   const token = requireAuth ? (options.token ?? randomBytes(32).toString('hex')) : '';
   const credential = requireAuth ? Buffer.from(`Bearer ${token}`) : undefined;
@@ -393,7 +445,9 @@ export async function startWeb(options: StartWebOptions): Promise<{ url: string;
   const server = createServer({ maxHeaderSize: 8192, requestTimeout: 15000, headersTimeout: 10000 }, (incoming, response) => {
     response.setHeader('content-security-policy', policy);
     response.setHeader('x-content-type-options', 'nosniff');
+    response.setHeader('x-frame-options', 'DENY');
     response.setHeader('referrer-policy', 'no-referrer');
+    response.setHeader('permissions-policy', 'camera=(), geolocation=(), microphone=(), payment=(), usb=(), focus-without-user-activation=()');
     response.setHeader('cache-control', 'no-store');
     response.setHeader('cross-origin-resource-policy', 'same-origin');
     response.setHeader('cross-origin-opener-policy', 'same-origin');
@@ -443,19 +497,45 @@ export async function startWeb(options: StartWebOptions): Promise<{ url: string;
         if (rawPath.includes('..') || rawPath.toLowerCase().includes('%2e%2e')) throw new HttpFailure(404, 'Not found');
         const asset = resolveStaticAsset(url.pathname);
         if (!asset) throw new HttpFailure(404, 'Not found');
-        const bytes = await loadAsset(asset.filePath);
-        const headers: Record<string, string> = { 'content-type': asset.mime };
+        const cached = await loadAsset(asset.filePath, asset.mime);
+        const accepted = parseAcceptEncoding(incoming.headers['accept-encoding']);
+        let encoding: 'br' | 'gzip' | null = null;
+        let payload = cached.bytes;
+        let etag = cached.etag;
+        if (accepted.has('br') && cached.br) {
+          encoding = 'br';
+          payload = cached.br;
+          etag = `${cached.etag.slice(0, -1)}-br"`;
+        } else if (accepted.has('gzip') && cached.gzip) {
+          encoding = 'gzip';
+          payload = cached.gzip;
+          etag = `${cached.etag.slice(0, -1)}-gzip"`;
+        }
+        const ext = extname(asset.filePath).toLowerCase();
+        const cacheControl = LONG_LIVED_STATIC_EXTS.has(ext) ? 'public, max-age=604800' : 'no-cache';
+        response.setHeader('cache-control', cacheControl);
+        response.setHeader('etag', etag);
+        response.setHeader('vary', 'Accept-Encoding');
         if (asset.mime.startsWith('text/html')) {
           if (!requireAuth) {
-            headers['set-cookie'] = 'friday_auth_mode=none; Path=/; SameSite=Strict';
+            response.setHeader('set-cookie', 'friday_auth_mode=none; Path=/; SameSite=Strict');
           } else if (typeof incoming.headers.cookie === 'string' && incoming.headers.cookie.includes('friday_auth_mode=')) {
-            headers['set-cookie'] = 'friday_auth_mode=; Path=/; Max-Age=0; SameSite=Strict';
+            response.setHeader('set-cookie', 'friday_auth_mode=; Path=/; Max-Age=0; SameSite=Strict');
           }
         }
-        response.writeHead(200, headers);
-        response.end(incoming.method === 'HEAD' ? undefined : bytes);
+        if (matchesIfNoneMatch(incoming.headers['if-none-match'], etag)) {
+          response.writeHead(304);
+          response.end();
+          return;
+        }
+        response.setHeader('content-type', asset.mime);
+        if (encoding) response.setHeader('content-encoding', encoding);
+        response.setHeader('content-length', String(payload.length));
+        response.writeHead(200);
+        response.end(incoming.method === 'HEAD' ? undefined : payload);
         return;
       }
+      response.setHeader('vary', 'Sec-Fetch-Dest, Sec-Fetch-Mode, Sec-Fetch-Site');
       const secFetchSite = incoming.headers['sec-fetch-site'];
       if (
         (incoming.headers.origin && incoming.headers.origin.toLowerCase() !== reqOrigin)

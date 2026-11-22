@@ -2,10 +2,10 @@
 <html lang="zh-CN" data-theme="spatial">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
-  <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#111520" media="(prefers-color-scheme: light)">
-  <meta name="theme-color" content="#111520" media="(prefers-color-scheme: dark)">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="text-scale" content="scale">
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#111520">
   <script src="/theme-boot.js"></script>
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="F.R.I.D.A.Y.">
@@ -13,32 +13,42 @@
   <link rel="icon" type="image/png" href="/logo.png">
   <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
   <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="preload" href="/plex-sans.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="modulepreload" href="/mindmap-data.js">
+  <link rel="modulepreload" href="/shared/auth-http.js">
+  <link rel="modulepreload" href="/model.js">
+  <link rel="modulepreload" href="/shared/sse-hub.js">
+  <link rel="modulepreload" href="/shared/theme.js">
+  <link rel="modulepreload" href="/shared/mobile-viewport.js">
   <link rel="stylesheet" href="/mindmap.css">
-  <script type="module" src="/mindmap.js"></script>
+  <script type="module" src="/mindmap.js" fetchpriority="high"></script>
 </head>
 <body>
+  <a class="skip-link" href="#main-content">跳到主内容</a>
+  <div id="sr-status-live" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+  <div id="sr-alert-live" class="visually-hidden" role="alert" aria-live="assertive" aria-atomic="true"></div>
   <header class="mm-topbar">
     <div class="mm-brand-group">
       <a id="mm-back-link" class="mm-back-btn" href="/">← 返回对话控制台</a>
       <button id="mm-toggle-sidebar" class="mm-mini-btn" type="button" title="收起或展开左侧会话目录">☰ 会话目录</button>
       <div class="mm-brand">
         <span class="mm-brand-logo" aria-hidden="true"></span>
-        <span>F.R.I.D.A.Y. 会话思考流程图</span>
+        <h1 class="mm-brand-title">F.R.I.D.A.Y. 会话思考流程图</h1>
       </div>
     </div>
 
-    <div class="mm-view-tabs" role="tablist" aria-label="视图模式切换">
-      <button id="view-session-btn" class="mm-tab-btn active" type="button" role="tab" aria-selected="true">🔀 会话思考流程图</button>
+    <div class="mm-view-tabs" role="tablist" aria-label="视图模式切换" focusgroup="tablist nomemory">
+      <button id="view-session-btn" class="mm-tab-btn active" type="button" role="tab" aria-selected="true" focusgroupstart>🔀 会话思考流程图</button>
       <button id="view-overview-btn" class="mm-tab-btn" type="button" role="tab" aria-selected="false">🗺️ 全局会话脉络图</button>
       <button id="view-list-btn" class="mm-tab-btn" type="button" role="tab" aria-selected="false">📋 全景数据清单</button>
     </div>
 
     <div class="mm-toolbar-actions">
-      <div class="mm-search-wrap">
-        <input id="mm-search-input" type="search" placeholder="搜会话、微信内容、记忆、JEV、bash…" aria-label="搜索会话与思考流程图节点">
-        <button id="mm-search-clear" class="mm-mini-btn" type="button" hidden>✕</button>
-      </div>
-      <div id="mm-canvas-controls" class="mm-canvas-controls">
+      <search class="mm-search-wrap">
+        <input id="mm-search-input" type="search" enterkeyhint="search" placeholder="搜会话、微信内容、记忆、JEV、bash…" aria-label="搜索会话与思考流程图节点">
+        <button id="mm-search-clear" class="mm-mini-btn" type="button" aria-label="清除搜索" title="清除搜索" hidden>✕</button>
+      </search>
+      <div id="mm-canvas-controls" class="mm-canvas-controls" role="toolbar" aria-label="画布视图控制" focusgroup="toolbar wrap">
         <button id="mm-expand-all" class="mm-mini-btn" type="button">全部展开</button>
         <button id="mm-collapse-all" class="mm-mini-btn" type="button">仅看主干</button>
         <button id="mm-zoom-out" class="mm-mini-btn" type="button" aria-label="缩小画布">－</button>
@@ -49,14 +59,15 @@
         <button id="mm-refresh-btn" class="mm-mini-btn" type="button">↻ 刷新</button>
       </div>
       <div id="mm-theme-switcher" class="mm-theme-switcher" role="group" aria-label="界面视觉风格切换">
-        <button id="mm-theme-spatial" class="mm-mini-btn mm-theme-btn active" type="button" aria-pressed="true">✦ 流光玻璃</button>
-        <button id="mm-theme-industrial" class="mm-mini-btn mm-theme-btn" type="button" aria-pressed="false">▣ 机械点阵</button>
+        <button id="mm-theme-system" class="mm-mini-btn mm-theme-btn" type="button" data-theme-pref="system" aria-pressed="false">◐ 系统</button>
+        <button id="mm-theme-spatial" class="mm-mini-btn mm-theme-btn active" type="button" data-theme-pref="spatial" aria-pressed="true">✦ 流光玻璃</button>
+        <button id="mm-theme-industrial" class="mm-mini-btn mm-theme-btn" type="button" data-theme-pref="industrial" aria-pressed="false">▣ 机械点阵</button>
       </div>
       <span id="mm-conn-pill" class="mm-conn-pill">正在连接…</span>
     </div>
   </header>
 
-  <section id="mm-kpi-strip" class="mm-kpi-strip" aria-label="全局实时运行指标">
+  <section id="mm-kpi-strip" class="mm-kpi-strip">
     <span class="mm-kpi-chip">🧠 AI会话: <strong id="kpi-sessions">0</strong></span>
     <span class="mm-kpi-chip">原始消息: <strong id="kpi-flows">0</strong></span>
     <span class="mm-kpi-chip">💬 微信: <strong id="kpi-wechat">0</strong></span>
@@ -68,7 +79,7 @@
     <span id="kpi-model-badge" class="mm-kpi-chip mm-kpi-model">主控: — · 决策: gemini-decision-1</span>
   </section>
 
-  <main class="mm-workspace">
+  <main id="main-content" class="mm-workspace" tabindex="-1">
     <aside class="mm-sidebar" aria-label="AI 会话与任务流目录">
       <div class="mm-sidebar-head">
         <div class="mm-sidebar-mode-toggle" role="group" aria-label="目录粒度切换">
@@ -91,7 +102,7 @@
       </div>
     </aside>
 
-    <section id="mm-canvas-panel" class="mm-canvas-panel" aria-label="交互式会话思考流程图画布">
+    <section id="mm-canvas-panel" class="mm-canvas-panel">
       <div id="mm-auth-banner" class="mm-auth-banner" hidden>
         <div class="mm-auth-card">
           <h2>🔐 需要本地访问令牌以读取思考流程图</h2>
@@ -101,7 +112,7 @@
         </div>
       </div>
 
-      <svg id="mm-svg" class="mm-svg" tabindex="0" aria-label="F.R.I.D.A.Y. 会话思考流程图画布">
+      <svg id="mm-svg" class="mm-svg" role="img" tabindex="0" aria-label="F.R.I.D.A.Y. 会话思考流程图画布">
         <defs>
           <marker id="fc-arrow-default" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
             <path d="M 0 1 L 8 5 L 0 9 z" class="fc-marker fc-marker-default"></path>
@@ -123,7 +134,7 @@
         </g>
       </svg>
 
-      <div class="mm-legend" aria-label="流程图图例">
+      <div class="mm-legend">
         <div class="mm-legend-chips">
           <span class="mm-leg-chip cat-ingress">⬭ 老板输入</span>
           <span class="mm-leg-chip cat-memory">▭ 记忆/上下文</span>
@@ -136,7 +147,7 @@
       </div>
     </section>
 
-    <section id="mm-list-panel" class="mm-list-panel" hidden aria-label="全任务流数据清单">
+    <section id="mm-list-panel" class="mm-list-panel" hidden>
       <div class="mm-list-panel-head">
         <h2>📋 全系统真实任务流全景明细</h2>
         <span id="mm-matrix-subtitle" class="mm-muted"></span>

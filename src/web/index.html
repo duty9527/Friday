@@ -2,10 +2,10 @@
 <html lang="zh-CN" data-theme="spatial">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
-  <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#111520" media="(prefers-color-scheme: light)">
-  <meta name="theme-color" content="#111520" media="(prefers-color-scheme: dark)">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="text-scale" content="scale">
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#111520">
   <script src="/theme-boot.js"></script>
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="F.R.I.D.A.Y.">
@@ -13,10 +13,49 @@
   <link rel="icon" type="image/png" href="/logo.png">
   <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
   <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="preload" href="/plex-sans.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="modulepreload" href="/model.js">
+  <link rel="modulepreload" href="/state.js">
+  <link rel="modulepreload" href="/shared/dom.js">
+  <link rel="modulepreload" href="/shared/auth-http.js">
+  <link rel="modulepreload" href="/shared/sse-hub.js">
+  <link rel="modulepreload" href="/shared/theme.js">
+  <link rel="modulepreload" href="/shared/mobile-viewport.js">
+  <link rel="modulepreload" href="/shared/format.js">
+  <link rel="modulepreload" href="/shared/chat-view.js">
+  <link rel="modulepreload" href="/shared/markdown.js">
+  <link rel="modulepreload" href="/shared/bot-avatar.js">
+  <link rel="modulepreload" href="/shared/bot-expressions.js">
+  <link rel="modulepreload" href="/panels/chat.js">
+  <link rel="modulepreload" href="/panels/trace.js">
+  <link rel="modulepreload" href="/trace-chain.js">
+  <link rel="modulepreload" href="/hubs/memory-hub.js">
+  <link rel="modulepreload" href="/brain.js">
+  <link rel="modulepreload" href="/hubs/timer-plugin-hub.js">
+  <link rel="modulepreload" href="/shared/plugin-catalog.js">
+  <link rel="modulepreload" href="/hubs/im-voice-hub.js">
+  <link rel="modulepreload" href="/hubs/notebook-hub.js">
+  <link rel="modulepreload" href="/hubs/system-hub.js">
+  <link rel="modulepreload" href="/hubs/model-hub.js">
+  <link rel="modulepreload" href="/hubs/usage-hub.js">
+  <link rel="modulepreload" href="/hubs/services-hub.js">
   <link rel="stylesheet" href="/style.css">
-  <script type="module" src="/client.js"></script>
+  <script type="module" src="/client.js" fetchpriority="high"></script>
 </head>
 <body>
+  <a class="skip-link" href="#main-content">跳到主内容</a>
+  <div id="sr-status-live" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+  <div id="sr-alert-live" class="visually-hidden" role="alert" aria-live="assertive" aria-atomic="true"></div>
+  <svg class="svg-sprite-defs" width="0" height="0" aria-hidden="true">
+    <symbol id="icon-grip" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+      <circle cx="9" cy="6" r="1.6"></circle>
+      <circle cx="15" cy="6" r="1.6"></circle>
+      <circle cx="9" cy="12" r="1.6"></circle>
+      <circle cx="15" cy="12" r="1.6"></circle>
+      <circle cx="9" cy="18" r="1.6"></circle>
+      <circle cx="15" cy="18" r="1.6"></circle>
+    </symbol>
+  </svg>
   <div id="mobile-nav-scrim" class="mobile-drawer-scrim" hidden></div>
   <header id="app-topbar" class="topbar">
     <div class="topbar-brand-head">
@@ -25,8 +64,8 @@
     </div>
     <button id="work-toggle" class="fold-control" type="button" aria-expanded="false" aria-controls="work-sidebar">任务列表</button>
     <button id="desktop-work-fold" class="desktop-fold-btn" type="button" aria-pressed="false" title="收起或展开左侧任务列表">◧ 任务舱</button>
-    <div class="topbar-hub-bar" role="toolbar" aria-label="系统功能中心">
-      <button id="open-memory-hub-top" class="hub-pill-btn memory-amber-pill" type="button">
+    <div class="topbar-hub-bar" role="toolbar" aria-label="系统功能中心" focusgroup="toolbar wrap">
+      <button id="open-memory-hub-top" class="hub-pill-btn memory-amber-pill" type="button" focusgroupstart>
         <span class="te-key-prefix" aria-hidden="true">M1</span>
         <span class="amber-core-dot" aria-hidden="true"></span>
         <span>全息记忆</span>
@@ -34,39 +73,34 @@
       </button>
       <button id="open-timer-hub-top" class="hub-pill-btn" type="button">
         <span class="te-key-prefix" aria-hidden="true">M2</span>
-        <span class="hub-pill-icon" aria-hidden="true"><svg class="hub-svg-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5"/><path d="M9 2h6"/><path d="M12 2v3"/></svg></span>
+        <span class="hub-pill-icon" aria-hidden="true"><svg class="hub-svg-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="13" r="8"></circle><path d="M12 9v4l2.5 2.5"></path><path d="M9 2h6"></path><path d="M12 2v3"></path></svg></span>
         <span>定时与目标</span>
         <span id="timer-top-badge" class="hub-pill-badge">0</span>
       </button>
       <button id="open-plugin-hub-top" class="hub-pill-btn" type="button">
         <span class="te-key-prefix" aria-hidden="true">M3</span>
-        <span class="hub-pill-icon" aria-hidden="true"><svg class="hub-svg-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/></svg></span>
+        <span class="hub-pill-icon" aria-hidden="true"><svg class="hub-svg-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22v-5"></path><path d="M9 8V2"></path><path d="M15 8V2"></path><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"></path></svg></span>
         <span>应用与插件</span>
         <span id="plugin-top-badge" class="hub-pill-badge">0</span>
       </button>
       <button id="open-im-hub-top" class="hub-pill-btn" type="button">
         <span class="te-key-prefix" aria-hidden="true">M4</span>
-        <span class="hub-pill-icon" aria-hidden="true"><svg class="hub-svg-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2" width="12" height="20" rx="2.5"/><path d="M10 18h4"/></svg></span>
+        <span class="hub-pill-icon" aria-hidden="true"><svg class="hub-svg-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2" width="12" height="20" rx="2.5"></rect><path d="M10 18h4"></path></svg></span>
         <span>IM 与声纹</span>
         <span id="im-top-badge" class="hub-pill-badge">0</span>
       </button>
-      <button id="open-notebook-hub-top" class="hub-pill-btn" type="button" title="记事本与 F.R.I.D.A.Y. 日记">
-        <span class="te-key-prefix" aria-hidden="true">M5</span>
-        <span class="hub-pill-icon" aria-hidden="true"><svg class="hub-svg-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/><path d="M8 7h8"/><path d="M8 11h6"/></svg></span>
-        <span>笔记与日记</span>
-        <span id="notebook-top-badge" class="hub-pill-badge">0</span>
-      </button>
     </div>
     <div class="topbar-right-controls">
-      <button id="open-system-hub-top" class="hub-pill-btn system-base-pill" type="button" title="系统底座：模型与提供方、用量账本">
+      <button id="open-system-hub-top" class="hub-pill-btn system-base-pill" type="button" title="系统底座：模型与提供方、用量账本、位置与地图底座">
         <span class="te-key-prefix" aria-hidden="true">SYS</span>
-        <span class="hub-pill-icon" aria-hidden="true"><svg class="hub-svg-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg></span>
+        <span class="hub-pill-icon" aria-hidden="true"><svg class="hub-svg-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"></path></svg></span>
         <span>系统底座</span>
         <span id="system-top-badge" class="hub-pill-badge">—</span>
       </button>
       <div id="theme-switcher" class="theme-switcher" role="group" aria-label="界面视觉风格切换">
-        <button id="theme-spatial-btn" class="theme-switch-btn active" type="button" aria-pressed="true" title="Fey × visionOS 深空流光空间玻璃">✦ 流光玻璃</button>
-        <button id="theme-industrial-btn" class="theme-switch-btn" type="button" aria-pressed="false" title="Teenage Engineering × Nothing 精密机械点阵">▣ 机械点阵</button>
+        <button id="theme-system-btn" class="theme-switch-btn" type="button" data-theme-pref="system" aria-pressed="false" title="跟随操作系统浅色/深色外观">◐ 系统</button>
+        <button id="theme-spatial-btn" class="theme-switch-btn active" type="button" data-theme-pref="spatial" aria-pressed="true" title="Fey × visionOS 深空流光空间玻璃">✦ 流光玻璃</button>
+        <button id="theme-industrial-btn" class="theme-switch-btn" type="button" data-theme-pref="industrial" aria-pressed="false" title="Teenage Engineering × Nothing 精密机械点阵">▣ 机械点阵</button>
       </div>
       <button id="desktop-trace-fold" class="desktop-fold-btn" type="button" aria-pressed="false" title="收起或展开右侧执行链路">执行链路 ◨</button>
     </div>
@@ -81,56 +115,57 @@
       <select id="work-filter" aria-label="任务筛选"><option value="all">全部任务</option><option value="active">进行中</option><option value="settled">已结束 / 暂停</option></select>
       <div id="works" class="works"><p class="empty">正在读取任务…</p></div>
     </aside>
-    <main class="sheet">
-      <div class="panel-nav" aria-label="面板导航"><button id="show-chat" type="button" aria-pressed="true">主对话</button><button id="show-trace" type="button" aria-pressed="false">执行链路</button></div>
+    <main id="main-content" class="sheet" tabindex="-1">
+      <nav class="panel-nav" aria-label="面板导航"><button id="show-chat" type="button" aria-pressed="true">主对话</button><button id="show-trace" type="button" aria-pressed="false">执行链路</button></nav>
       <div id="panels" class="panels">
         <section class="conversation" aria-label="主对话">
           <header class="conv-dock">
             <button id="mobile-nav-btn" class="mobile-only-btn mobile-header-icon-btn" type="button" aria-expanded="false" aria-controls="app-topbar" aria-label="打开功能菜单" title="菜单与功能">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="4" y1="6.5" x2="20" y2="6.5"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17.5" x2="20" y2="17.5"/></svg>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="4" y1="6.5" x2="20" y2="6.5"></line><line x1="4" y1="12" x2="20" y2="12"></line><line x1="4" y1="17.5" x2="20" y2="17.5"></line></svg>
             </button>
             <div class="conv-identity">
-              <span id="companion-avatar" class="companion-avatar" role="button" tabindex="0" aria-label="F.R.I.D.A.Y. 动态头像（点击互动）" title="点击与 F.R.I.D.A.Y. 互动"></span>
+              <button id="companion-avatar" class="companion-avatar" type="button" aria-label="F.R.I.D.A.Y. 动态头像（点击互动）" title="点击与 F.R.I.D.A.Y. 互动"></button>
               <div class="conv-identity-text">
                 <div class="conv-title-row">
-                  <span class="conv-title-name">F.R.I.D.A.Y.</span>
+                  <h1 class="conv-title-name">F.R.I.D.A.Y.</h1>
                   <span id="companion-status-pill" class="conv-status-pill tone-neutral" role="status" aria-live="polite">连接中…</span>
                   <button id="conv-active-works-btn" class="conv-active-works-btn mini-button" type="button" hidden>⚡ 0 项进行中</button>
                 </div>
               </div>
             </div>
-            <div id="conv-controls" class="conv-controls" role="toolbar" aria-label="对话显示控制">
+            <div id="conv-controls" class="conv-controls" role="toolbar" aria-label="对话显示控制" focusgroup="toolbar wrap">
               <div id="conv-channel-filters" class="conv-channel-filters" role="group" aria-label="按渠道筛选消息"></div>
               <button id="conv-hide-system-btn" class="conv-ctrl-chip mini-button" type="button" aria-pressed="false" title="隐藏系统状态与定时播报消息">静默系统</button>
               <button id="conv-detail-mode-btn" class="conv-ctrl-chip mini-button" type="button" aria-pressed="false" title="展开全部路由摘要、回应引用与审计明细">审计详情</button>
             </div>
             <div class="mobile-only-flex mobile-header-actions">
               <button id="mobile-filter-btn" class="mobile-header-icon-btn" type="button" aria-expanded="false" aria-controls="conv-controls" aria-label="消息筛选与显示设置" title="筛选与显示">
-                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.95" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="6" x2="20" y2="6"/><line x1="7" y1="12" x2="17" y2="12"/><line x1="10" y1="18" x2="14" y2="18"/></svg>
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.95" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="6" x2="20" y2="6"></line><line x1="7" y1="12" x2="17" y2="12"></line><line x1="10" y1="18" x2="14" y2="18"></line></svg>
                 <span id="mobile-filter-dot" class="mobile-action-dot" hidden aria-hidden="true"></span>
               </button>
               <button id="mobile-trace-btn" class="mobile-header-icon-btn" type="button" aria-expanded="false" aria-controls="trace-panel" aria-label="查看执行链路" title="执行链路">
-                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.95" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.95" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>
                 <span id="mobile-trace-dot" class="mobile-action-dot is-pulse" hidden aria-hidden="true"></span>
               </button>
             </div>
           </header>
           <div id="connection-banner" class="connection-bar" role="status" aria-live="polite" hidden><span id="connection"></span><button id="reconnect" class="mini-button" type="button">重新连接</button></div>
           <div id="conv-filter-banner" class="conv-filter-banner" role="status" hidden></div>
-          <div id="messages-scroll" class="messages-scroll" tabindex="0" aria-label="消息记录">
+          <div id="messages-scroll" class="messages-scroll" role="region" tabindex="0" aria-label="消息记录">
             <button id="older" class="older" type="button" hidden>上滑自动加载更早消息</button>
             <div id="history-error" class="error" role="status"></div>
             <div id="messages"><p class="empty">正在读取对话…</p></div>
           </div>
           <button id="scroll-bottom-btn" class="scroll-bottom-btn" type="button" hidden aria-label="回到底部">↓ 回到底部</button>
-          <section id="boss-decision-dock" class="boss-decision-dock" aria-label="等待拍板事项" hidden></section>
-          <form id="composer" class="composer">
+          <section id="boss-decision-dock" class="boss-decision-dock" hidden></section>
+          <form id="composer" class="composer" novalidate>
             <p id="send-error" class="error composer-error" role="alert"></p>
-            <div id="bot-emote-tray" class="bot-emote-tray" hidden role="group" aria-label="插入 F.R.I.D.A.Y. 小表情"></div>
+            <div id="bot-emote-tray" class="bot-emote-tray" popover="auto" role="group" aria-label="插入 F.R.I.D.A.Y. 小表情"></div>
             <div class="composer-row">
-              <button id="emote-toggle" class="composer-icon-btn emote-toggle-btn" type="button" aria-expanded="false" aria-controls="bot-emote-tray" aria-label="选择表情" title="选择表情" disabled><svg class="composer-svg-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9.5"/><path d="M8.5 14.5c.9 1.3 2.1 2 3.5 2s2.6-.7 3.5-2"/><circle cx="9" cy="9.8" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="9.8" r="1" fill="currentColor" stroke="none"/></svg></button>
-              <textarea id="draft" rows="1" maxlength="16384" placeholder="说点什么，或直接下达指令…" aria-label="消息输入" disabled></textarea>
-              <button id="send" class="composer-send-btn primary" type="submit" aria-label="发送消息" title="发送消息" disabled><svg class="send-arrow-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 12h14.5"/><path d="m13 6 6 6-6 6"/></svg></button>
+              <button id="emote-toggle" class="composer-icon-btn emote-toggle-btn" type="button" popovertarget="bot-emote-tray" aria-expanded="false" aria-controls="bot-emote-tray" aria-label="选择表情" title="选择表情" disabled><svg class="composer-svg-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9.5"></circle><path d="M8.5 14.5c.9 1.3 2.1 2 3.5 2s2.6-.7 3.5-2"></path><circle cx="9" cy="9.8" r="1" fill="currentColor" stroke="none"></circle><circle cx="15" cy="9.8" r="1" fill="currentColor" stroke="none"></circle></svg></button>
+              <label class="visually-hidden" for="draft">消息输入</label>
+              <textarea id="draft" rows="1" maxlength="16384" enterkeyhint="send" placeholder="说点什么，或直接下达指令…" aria-label="消息输入" disabled></textarea>
+              <button id="send" class="composer-send-btn primary" type="submit" aria-label="发送消息" title="发送消息" disabled><svg class="send-arrow-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 12h14.5"></path><path d="m13 6 6 6-6 6"></path></svg></button>
             </div>
           </form>
         </section>
@@ -139,7 +174,7 @@
           <div class="trace-sheet-grab" aria-hidden="true"></div>
           <div class="trace-heading">
             <h2>执行链路</h2>
-            <div class="trace-heading-actions">
+            <div class="trace-heading-actions" role="toolbar" aria-label="执行链路操作" focusgroup="toolbar wrap">
               <a id="open-mindmap-trace" class="mini-button trace-mindmap-link" href="/mindmap" title="打开全屏会话思考流程图">🧭 思考流程图</a>
               <button id="trace-wide-toggle" class="mini-button" type="button" aria-pressed="false" title="切换宽屏双栏检视">⤢ 宽屏双栏</button>
               <button id="clear-filter" class="mini-button" type="button">全部记录</button>
@@ -147,14 +182,14 @@
             </div>
           </div>
           <p id="trace-scope" class="meta trace-scope">全部事件</p>
-          <section id="work-detail" class="work-detail work-overview-card" aria-label="任务执行总览" hidden></section>
-          <section id="routing-detail" class="routing-detail" aria-label="本次路由上下文" hidden></section>
-          <div class="trace-tabs" role="tablist" aria-label="执行链路筛选">
-            <button id="step-mode" class="tab active" type="button" role="tab" aria-pressed="true" data-cat="all">全部链路</button>
-            <button id="filter-msg-mode" class="tab" type="button" role="tab" aria-pressed="false" data-cat="message">📨 消息</button>
-            <button id="graph-mode" class="tab" type="button" role="tab" aria-pressed="false" data-cat="llm">🧠 模型调用</button>
-            <button id="timeline-mode" class="tab" type="button" role="tab" aria-pressed="false" data-cat="tool">🔧 工具执行</button>
-            <button id="filter-route-mode" class="tab" type="button" role="tab" aria-pressed="false" data-cat="routing">🧭 路由质检</button>
+          <section id="work-detail" class="work-detail work-overview-card" hidden></section>
+          <section id="routing-detail" class="routing-detail" hidden></section>
+          <div class="trace-tabs" role="group" aria-label="执行链路筛选">
+            <button id="step-mode" class="tab active" type="button" aria-pressed="true" data-cat="all">全部链路</button>
+            <button id="filter-msg-mode" class="tab" type="button" aria-pressed="false" data-cat="message">📨 消息</button>
+            <button id="graph-mode" class="tab" type="button" aria-pressed="false" data-cat="llm">🧠 模型调用</button>
+            <button id="timeline-mode" class="tab" type="button" aria-pressed="false" data-cat="tool">🔧 工具执行</button>
+            <button id="filter-route-mode" class="tab" type="button" aria-pressed="false" data-cat="routing">🧭 路由质检</button>
           </div>
           <div class="trace-studio">
             <div class="trace-chain-pane">
@@ -163,35 +198,43 @@
               <div id="trace-content" class="trace-content"><p class="empty">等待读取执行链路…</p></div>
               <button id="trace-more" class="trace-more" type="button" hidden>加载更早记录</button>
             </div>
-            <section id="event-detail" class="event-detail trace-inspector-pane" aria-label="动作语义详情" hidden></section>
+            <section id="event-detail" class="event-detail trace-inspector-pane" hidden></section>
           </div>
         </aside>
       </div>
     </main>
   </div>
-  <!-- 1. 全息记忆弹窗 -->
-  <div id="memory-hub-backdrop" class="modal-backdrop" hidden>
-    <div id="memory-hub-modal" class="model-modal hub-modal memory-brain-modal" role="dialog" aria-modal="true" aria-labelledby="memory-modal-title">
-      <div class="model-modal-header memory-modal-header">
-        <div class="memory-header-brand">
-          <span class="amber-core-dot large" aria-hidden="true"></span>
-          <div>
-            <h2 id="memory-modal-title">F.R.I.D.A.Y. · 全息神经记忆矩阵</h2>
-          </div>
+  <!-- 1. 全息记忆弹窗（融合神经记忆、记事本、F.R.I.D.A.Y. 日记） -->
+  <dialog id="memory-hub-dialog" class="hub-dialog model-modal hub-modal memory-brain-modal" closedby="any" aria-labelledby="memory-modal-title">
+    <div class="model-modal-header memory-modal-header">
+      <div class="memory-header-brand">
+        <span class="amber-core-dot large" aria-hidden="true"></span>
+        <div>
+          <h2 id="memory-modal-title">F.R.I.D.A.Y. · 全息神经记忆矩阵</h2>
+        </div>
+      </div>
+      <div class="hub-modal-header-right">
+        <div id="memory-hub-tabs" class="hub-modal-tabs hub-surface-tabs" role="tablist" aria-label="全息记忆分区" focusgroup="tablist nomemory">
+          <button id="memory-tab-matrix" class="hub-surface-tab active" role="tab" type="button" aria-selected="true" aria-controls="memory-panel-matrix" focusgroupstart data-memory-tab="matrix">🧠 神经记忆</button>
+          <button id="notebook-tab-notes" class="hub-surface-tab" role="tab" type="button" aria-selected="false" aria-controls="notebook-panel-notes" data-memory-tab="notes">📒 记事本 <span id="notebook-notes-tab-badge" class="hub-pill-badge">0</span></button>
+          <button id="notebook-tab-diary" class="hub-surface-tab" role="tab" type="button" aria-selected="false" aria-controls="notebook-panel-diary" data-memory-tab="diary">📓 F.R.I.D.A.Y. 日记 <span id="notebook-diary-tab-badge" class="hub-pill-badge">0</span></button>
         </div>
         <button id="memory-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
       </div>
-      <div class="model-modal-body">
-        <section class="brain-stage-shell" aria-label="三维全息记忆大脑">
+    </div>
+    <div class="model-modal-body">
+      <p id="notebook-role-hint" class="hub-modal-sub" hidden>F.R.I.D.A.Y. 替你记事 · 与全息记忆隔离存储，支持按需转存</p>
+      <div id="memory-panel-matrix" role="tabpanel" aria-labelledby="memory-tab-matrix">
+        <section class="brain-stage-shell">
           <div id="memory-brain-viewport" class="brain-viewport-wrap">
-            <canvas id="memory-brain-canvas" class="brain-canvas" aria-label="F.R.I.D.A.Y. 金色全息记忆球体"></canvas>
-            <div class="brain-stage-controls">
-              <button id="memory-brain-spin-btn" class="brain-ctrl-btn active" type="button">⟳ 自转中</button>
+            <canvas id="memory-brain-canvas" class="brain-canvas" role="img" aria-label="F.R.I.D.A.Y. 金色全息记忆球体"></canvas>
+            <div class="brain-stage-controls" role="group" aria-label="全息大脑视角控制">
+              <button id="memory-brain-spin-btn" class="brain-ctrl-btn active" type="button" aria-pressed="true">⟳ 自转中</button>
               <button id="memory-brain-reset-btn" class="brain-ctrl-btn" type="button">⌖ 重置视角</button>
               <button id="memory-brain-fullscreen-btn" class="brain-ctrl-btn" type="button">⛶ 全屏大脑</button>
             </div>
           </div>
-          <aside id="memory-brain-inspector" class="brain-inspector" aria-live="polite">
+          <aside id="memory-brain-inspector" class="brain-inspector" aria-live="polite" aria-label="记忆神经元详情">
             <p class="brain-inspector-empty">点击左侧全息球体中的发光神经元检视记忆详情</p>
           </aside>
         </section>
@@ -200,20 +243,20 @@
 
         <section class="model-modal-section">
           <div class="hub-toolbar">
-            <div class="hub-search-group">
+            <search class="hub-search-group">
               <select id="memory-search-scope" class="hub-scope-select" aria-label="检索范围">
                 <option value="all">🌐 全部范围</option>
                 <option value="memories">🧠 仅记忆</option>
                 <option value="works">🔧 仅任务</option>
                 <option value="messages">💬 仅对话</option>
               </select>
-              <input id="memory-search-input" type="search" placeholder="搜索记忆、任务或对话…" aria-label="搜索全局上下文">
+              <input id="memory-search-input" type="search" enterkeyhint="search" placeholder="搜索记忆、任务或对话…" aria-label="搜索全局上下文">
               <button id="memory-search-btn" class="primary" type="button">搜索</button>
-            </div>
-            <div class="hub-filter-pills" role="tablist" aria-label="记忆筛选">
-              <button id="memory-filter-all" class="hub-filter-pill active" type="button" data-filter="all">全部</button>
-              <button id="memory-filter-pinned" class="hub-filter-pill" type="button" data-filter="pinned">★ 已置顶</button>
-              <button id="memory-filter-synapse" class="hub-filter-pill" type="button" data-filter="synapse">⚡ 含突触</button>
+            </search>
+            <div class="hub-filter-pills" role="group" aria-label="记忆筛选">
+              <button id="memory-filter-all" class="hub-filter-pill active" type="button" aria-pressed="true" data-filter="all">全部</button>
+              <button id="memory-filter-pinned" class="hub-filter-pill" type="button" aria-pressed="false" data-filter="pinned">★ 已置顶</button>
+              <button id="memory-filter-synapse" class="hub-filter-pill" type="button" aria-pressed="false" data-filter="synapse">⚡ 含突触</button>
             </div>
           </div>
           <div id="memory-search-results" class="hub-search-results" hidden></div>
@@ -224,7 +267,7 @@
             <summary class="hub-compose-summary">
               <span>+ 新增 / 编辑记忆</span>
             </summary>
-            <div class="hub-compose-body">
+            <form id="memory-compose-form" class="hub-compose-body" novalidate>
               <div class="modal-form-grid">
                 <label>
                   <span class="meta">主题</span>
@@ -246,10 +289,10 @@
                 </label>
                 <div class="modal-btn-group">
                   <button id="memory-cancel-edit-btn" class="mini-button" type="button" hidden>取消</button>
-                  <button id="memory-save-btn" class="primary" type="button">保存</button>
+                  <button id="memory-save-btn" class="primary" type="submit">保存</button>
                 </div>
               </div>
-            </div>
+            </form>
           </details>
         </section>
 
@@ -261,396 +304,505 @@
           <div id="memories-list" class="hub-cards-grid"><p class="empty">暂无记忆。</p></div>
         </section>
       </div>
+
+      <div id="notebook-panel-notes" class="hub-tab-panel notebook-tab-panel" role="tabpanel" aria-labelledby="notebook-tab-notes" hidden>
+        <div class="notebook-split">
+          <aside class="notebook-sidebar" aria-label="记事本列表">
+            <search class="notebook-sidebar-top">
+              <input id="note-search-input" type="search" enterkeyhint="search" maxlength="160" placeholder="搜索笔记标题、标签或正文…" aria-label="搜索记事本">
+              <button id="note-new-btn" class="primary mini-button" type="button">+ 新建</button>
+            </search>
+            <div class="hub-filter-pills notebook-filter-row" role="group" aria-label="记事筛选">
+              <button id="note-filter-all" class="hub-filter-pill active" type="button" aria-pressed="true">全部</button>
+              <button id="note-filter-pinned" class="hub-filter-pill" type="button" aria-pressed="false">★ 已置顶</button>
+            </div>
+            <div id="note-tag-chips" class="notebook-tag-chips" hidden></div>
+            <div id="note-list" class="notebook-item-list"><p class="empty">暂无记事。</p></div>
+          </aside>
+
+          <section class="notebook-main" aria-label="记事本内容区">
+            <div id="note-empty-state" class="notebook-empty-state">
+              <p class="notebook-empty-title">还没有选中的记事</p>
+              <p class="meta">在对话中对 F.R.I.D.A.Y. 说「帮我记一下…」，或者点击新建手动记录 Markdown 笔记。</p>
+              <button id="note-empty-new-btn" class="primary mini-button" type="button">+ 新建一条笔记</button>
+            </div>
+
+            <div id="note-workspace" class="notebook-workspace" hidden>
+              <div id="note-conflict-bar" class="notebook-conflict-bar" role="status" hidden>
+                <span class="notebook-conflict-text">⚠️ F.R.I.D.A.Y. 在后台更新了这篇笔记</span>
+                <div class="modal-btn-group">
+                  <button id="note-conflict-load-btn" class="mini-button primary" type="button">载入最新</button>
+                  <button id="note-conflict-keep-btn" class="mini-button" type="button">保留当前编辑</button>
+                </div>
+              </div>
+
+              <div class="notebook-workspace-head">
+                <input id="note-title-input" class="note-title-input" type="text" maxlength="160" placeholder="无标题笔记…" aria-label="笔记标题">
+                <div class="notebook-workspace-actions">
+                  <div class="hub-surface-tabs note-mode-tabs" role="group" aria-label="视图模式">
+                    <button id="note-mode-preview" class="hub-surface-tab active" type="button" aria-pressed="true">阅读</button>
+                    <button id="note-mode-edit" class="hub-surface-tab" type="button" aria-pressed="false">编辑</button>
+                    <button id="note-mode-split" class="hub-surface-tab" type="button" aria-pressed="false">分栏</button>
+                  </div>
+                  <button id="note-pin-btn" class="mini-button" type="button" title="置顶或取消置顶">☆ 置顶</button>
+                  <button id="note-promote-btn" class="mini-button" type="button" title="按需复制到全息神经记忆">🧠 转存记忆</button>
+                  <button id="note-delete-btn" class="mini-button danger" type="button">删除</button>
+                </div>
+              </div>
+
+              <div class="note-meta-bar">
+                <input id="note-tags-input" class="note-tags-input" type="text" maxlength="256" placeholder="标签（逗号分隔，如：清单, 项目）" aria-label="笔记标签">
+                <span id="note-meta-info" class="meta note-meta-info"></span>
+                <span id="note-save-status" class="hub-status-pill badge-slate">就绪</span>
+              </div>
+
+              <div id="note-md-toolbar" class="note-md-toolbar" role="toolbar" aria-label="Markdown 快捷格式" focusgroup="toolbar wrap" hidden>
+                <button class="mini-button note-md-btn" type="button" data-md-op="h2" title="插入二级标题">H2</button>
+                <button class="mini-button note-md-btn" type="button" data-md-op="bold" title="加粗">B</button>
+                <button class="mini-button note-md-btn" type="button" data-md-op="list" title="无序列表">• 列表</button>
+                <button class="mini-button note-md-btn" type="button" data-md-op="check" title="待办事项">☑ 待办</button>
+                <button class="mini-button note-md-btn" type="button" data-md-op="code" title="代码块">&lt;/&gt; 代码</button>
+                <button id="note-save-now-btn" class="mini-button primary note-save-now-btn" type="button">💾 保存</button>
+              </div>
+
+              <div id="note-editor-body" class="note-editor-body is-mode-preview">
+                <textarea id="note-content-input" class="note-content-input" maxlength="16384" placeholder="支持 Markdown 语法记录…" aria-label="笔记 Markdown 正文"></textarea>
+                <div id="note-preview-pane" class="note-preview-pane md-content" role="region" aria-label="Markdown 预览"></div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </div>
+
+      <div id="notebook-panel-diary" class="hub-tab-panel notebook-tab-panel" role="tabpanel" aria-labelledby="notebook-tab-diary" hidden>
+        <div class="notebook-split diary-split">
+          <aside class="notebook-sidebar" aria-label="F.R.I.D.A.Y. 日记时间线">
+            <search class="notebook-sidebar-top">
+              <input id="diary-search-input" type="search" enterkeyhint="search" maxlength="160" placeholder="搜索日记内容、标题或日期…" aria-label="搜索 F.R.I.D.A.Y. 日记">
+            </search>
+            <div id="diary-mood-filters" class="hub-filter-pills notebook-filter-row" role="group" aria-label="按心情筛选日记"></div>
+            <div id="diary-list" class="notebook-item-list"><p class="empty">F.R.I.D.A.Y. 还没有写下日记。</p></div>
+          </aside>
+
+          <section class="notebook-main diary-main" aria-label="F.R.I.D.A.Y. 日记阅读区">
+            <div id="diary-empty-state" class="notebook-empty-state">
+              <p class="notebook-empty-title">暂无选中日记</p>
+              <p class="meta">F.R.I.D.A.Y. 会在对话有感而发或夜间潜意识回想时，自主用第一人称把心情与心路记录在这里。</p>
+            </div>
+
+            <article id="diary-reader" class="diary-reader" hidden>
+              <header class="diary-masthead">
+                <div id="diary-avatar-slot" class="diary-avatar-slot" aria-hidden="true"></div>
+                <div class="diary-masthead-meta">
+                  <div class="diary-eyebrow-row">
+                    <span id="diary-date-display" class="diary-date-badge"></span>
+                    <div id="diary-badges-row" class="diary-badges-row"></div>
+                  </div>
+                  <h3 id="diary-title-display" class="diary-title-display"></h3>
+                  <div id="diary-tags-row" class="diary-tags-row"></div>
+                </div>
+              </header>
+
+              <div id="diary-content-body" class="diary-reader-body md-content"></div>
+
+              <footer class="diary-reader-footer">
+                <span class="meta">F.R.I.D.A.Y. 自主书写 · 纯净只读</span>
+                <div class="modal-btn-group">
+                  <button id="diary-promote-btn" class="mini-button" type="button" title="按需将此日记转存到全息记忆">🧠 转存记忆</button>
+                  <button id="diary-delete-btn" class="mini-button danger" type="button">删除</button>
+                </div>
+              </footer>
+            </article>
+          </section>
+        </div>
+      </div>
     </div>
-  </div>
+  </dialog>
 
   <!-- 2. 定时与目标弹窗 -->
-  <div id="timer-hub-backdrop" class="modal-backdrop" hidden>
-    <div id="timer-hub-modal" class="model-modal hub-modal" role="dialog" aria-modal="true" aria-labelledby="timer-modal-title">
-      <div class="model-modal-header">
-        <h2 id="timer-modal-title">⏱️ 定时与目标</h2>
-        <button id="timer-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
-      </div>
-      <div class="model-modal-body">
-        <div id="timer-kpi-grid" class="hub-kpi-grid"></div>
+  <dialog id="timer-hub-dialog" class="hub-dialog model-modal hub-modal" closedby="any" aria-labelledby="timer-modal-title">
+    <div class="model-modal-header">
+      <h2 id="timer-modal-title">⏱️ 定时与目标</h2>
+      <button id="timer-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
+    </div>
+    <div class="model-modal-body">
+      <div id="timer-kpi-grid" class="hub-kpi-grid"></div>
 
-        <section class="model-modal-section">
-          <details id="timer-add-details" class="hub-compose-details" open>
-            <summary class="hub-compose-summary">
-              <span>+ 新建定时任务</span>
-            </summary>
-            <div class="hub-compose-body">
-              <div id="timer-preset-bar" class="hub-preset-bar">
-                <span class="meta">模板：</span>
-                <button type="button" class="hub-preset-chip" data-timer-name="Git 工作区巡检" data-timer-sec="1800" data-timer-cmd="检查当前仓库的 git status 与最近改动，如有未提交的重要变更或冲突风险请简要汇报。">🔍 Git 巡检 (30m)</button>
-                <button type="button" class="hub-preset-chip" data-timer-name="自动化测试健康巡检" data-timer-sec="3600" data-timer-cmd="运行项目核心测试套件，若发现失败用例请定位根因并汇报。">🧪 测试巡检 (1h)</button>
-                <button type="button" class="hub-preset-chip" data-timer-name="持续跟进构建通过" data-timer-sec="600" data-timer-goal="CI / 核心测试全部通过且无阻塞错误" data-timer-cmd="检查当前项目构建与测试状态，若已全部通过则总结结果并标记目标达成。">🎯 构建通关目标 (10m)</button>
-              </div>
-              <div class="modal-form-grid">
-                <label>
-                  <span class="meta">名称</span>
-                  <input id="timer-name-input" type="text" maxlength="120" placeholder="如：每日工作区巡检" aria-label="定时任务名称">
-                </label>
-                <label>
-                  <span class="meta">每日定点 (HH:mm，优先于秒数)</span>
-                  <input id="timer-daily-input" type="text" maxlength="5" placeholder="如：12:00 或 21:30（留空则按间隔秒数）" aria-label="每日定点时间">
-                </label>
-                <label>
-                  <span class="meta">间隔（秒）</span>
-                  <div class="hub-interval-row">
-                    <input id="timer-interval-input" type="number" min="5" max="604800" value="300" placeholder="秒" aria-label="间隔秒数">
-                    <div class="hub-interval-quick">
-                      <button type="button" class="mini-button" data-interval-sec="60">1m</button>
-                      <button type="button" class="mini-button" data-interval-sec="300">5m</button>
-                      <button type="button" class="mini-button" data-interval-sec="900">15m</button>
-                      <button type="button" class="mini-button" data-interval-sec="1800">30m</button>
-                      <button type="button" class="mini-button" data-interval-sec="3600">1h</button>
-                    </div>
+      <section class="model-modal-section">
+        <details id="timer-add-details" class="hub-compose-details" open>
+          <summary class="hub-compose-summary">
+            <span>+ 新建定时任务</span>
+          </summary>
+          <form id="timer-compose-form" class="hub-compose-body" novalidate>
+            <div id="timer-preset-bar" class="hub-preset-bar" role="group" aria-label="定时任务预设模板">
+              <span class="meta">模板：</span>
+              <button type="button" class="hub-preset-chip" data-timer-name="Git 工作区巡检" data-timer-sec="1800" data-timer-cmd="检查当前仓库的 git status 与最近改动，如有未提交的重要变更或冲突风险请简要汇报。">🔍 Git 巡检 (30m)</button>
+              <button type="button" class="hub-preset-chip" data-timer-name="自动化测试健康巡检" data-timer-sec="3600" data-timer-cmd="运行项目核心测试套件，若发现失败用例请定位根因并汇报。">🧪 测试巡检 (1h)</button>
+              <button type="button" class="hub-preset-chip" data-timer-name="持续跟进构建通过" data-timer-sec="600" data-timer-goal="CI / 核心测试全部通过且无阻塞错误" data-timer-cmd="检查当前项目构建与测试状态，若已全部通过则总结结果并标记目标达成。">🎯 构建通关目标 (10m)</button>
+            </div>
+            <div class="modal-form-grid">
+              <label>
+                <span class="meta">名称</span>
+                <input id="timer-name-input" type="text" maxlength="120" placeholder="如：每日工作区巡检" aria-label="定时任务名称">
+              </label>
+              <label>
+                <span class="meta">每日定点 (HH:mm，优先于秒数)</span>
+                <input id="timer-daily-input" type="text" maxlength="5" placeholder="如：12:00 或 21:30（留空则按间隔秒数）" aria-label="每日定点时间">
+              </label>
+              <div class="modal-select-grow">
+                <label class="meta" for="timer-interval-input">间隔（秒）</label>
+                <div class="hub-interval-row">
+                  <input id="timer-interval-input" type="number" min="5" max="604800" value="300" placeholder="秒" aria-label="间隔秒数">
+                  <div class="hub-interval-quick" role="group" aria-label="快捷间隔选择">
+                    <button type="button" class="mini-button" data-interval-sec="60">1m</button>
+                    <button type="button" class="mini-button" data-interval-sec="300">5m</button>
+                    <button type="button" class="mini-button" data-interval-sec="900">15m</button>
+                    <button type="button" class="mini-button" data-interval-sec="1800">30m</button>
+                    <button type="button" class="mini-button" data-interval-sec="3600">1h</button>
                   </div>
-                </label>
-                <label>
-                  <span class="meta">插件直通 (可选，格式 plugin/action)</span>
-                  <input id="timer-plugin-input" type="text" maxlength="120" placeholder="如：plugin/action（留空则走大模型 Worker）" aria-label="插件与动作">
-                </label>
-                <label>
-                  <span class="meta">投递端口 (任务侧配置 IM 通道)</span>
-                  <input id="timer-channel-input" type="text" maxlength="120" placeholder="如：auto、wechat、xiaoai、dingtalk、telegram 或通道ID" aria-label="投递端口">
-                </label>
-                <label>
-                  <span class="meta">终态目标条件 (可选，达成后自动停止)</span>
-                  <input id="timer-goal-input" type="text" maxlength="500" placeholder="可选，如：PR 合并成功 / 构建全绿（达成后自动停止）" aria-label="终态目标条件">
-                </label>
-                <label>
-                  <span class="meta">连续失败熔断阈值 (1~100，默认 5)</span>
-                  <input id="timer-max-failures-input" type="number" min="1" max="100" value="5" placeholder="默认 5 次" aria-label="连续失败熔断阈值">
-                </label>
+                </div>
               </div>
               <label>
-                <span class="meta">执行指令</span>
-                <textarea id="timer-instruction-input" rows="2" maxlength="4096" placeholder="触发时执行的指令…" aria-label="定时任务指令"></textarea>
+                <span class="meta">插件直通 (可选，格式 plugin/action)</span>
+                <input id="timer-plugin-input" type="text" maxlength="120" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="如：plugin/action（留空则走大模型 Worker）" aria-label="插件与动作">
               </label>
-              <div class="modal-row-head">
-                <label class="timer-once-toggle">
-                  <input id="timer-once-input" type="checkbox" aria-label="仅执行一次">
-                  <span>仅执行一次（与终态目标互斥）</span>
-                </label>
-                <button id="timer-save-btn" class="primary" type="button">添加任务</button>
-              </div>
+              <label>
+                <span class="meta">投递端口 (任务侧配置 IM 通道)</span>
+                <input id="timer-channel-input" type="text" maxlength="120" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="如：auto、wechat、xiaoai、dingtalk、telegram 或通道ID" aria-label="投递端口">
+              </label>
+              <label>
+                <span class="meta">终态目标条件 (可选，达成后自动停止)</span>
+                <input id="timer-goal-input" type="text" maxlength="500" placeholder="可选，如：PR 合并成功 / 构建全绿（达成后自动停止）" aria-label="终态目标条件">
+              </label>
+              <label>
+                <span class="meta">连续失败熔断阈值 (1~100，默认 5)</span>
+                <input id="timer-max-failures-input" type="number" min="1" max="100" value="5" placeholder="默认 5 次" aria-label="连续失败熔断阈值">
+              </label>
             </div>
-          </details>
-        </section>
+            <label>
+              <span class="meta">执行指令</span>
+              <textarea id="timer-instruction-input" rows="2" maxlength="4096" placeholder="触发时执行的指令…" aria-label="定时任务指令"></textarea>
+            </label>
+            <div class="modal-row-head">
+              <label class="timer-once-toggle">
+                <input id="timer-once-input" type="checkbox" aria-label="仅执行一次">
+                <span>仅执行一次（与终态目标互斥）</span>
+              </label>
+              <button id="timer-save-btn" class="primary" type="submit">添加任务</button>
+            </div>
+          </form>
+        </details>
+      </section>
 
-        <section class="model-modal-section">
-          <div class="modal-row-head">
-            <h3>定时任务列表</h3>
-            <span id="timer-list-subtitle" class="meta"></span>
-          </div>
-          <div id="timers-list" class="hub-cards-grid"><p class="empty">暂无定时任务。</p></div>
-        </section>
-      </div>
+      <section class="model-modal-section">
+        <div class="modal-row-head">
+          <h3>定时任务列表</h3>
+          <span id="timer-list-subtitle" class="meta"></span>
+        </div>
+        <div id="timers-list" class="hub-cards-grid"><p class="empty">暂无定时任务。</p></div>
+      </section>
     </div>
-  </div>
+  </dialog>
 
   <!-- 3. IM 远端接入弹窗 -->
-  <div id="im-hub-backdrop" class="modal-backdrop" hidden>
-    <div id="im-hub-modal" class="model-modal hub-modal" role="dialog" aria-modal="true" aria-labelledby="im-modal-title">
-      <div class="model-modal-header">
-        <h2 id="im-modal-title">📱 IM 远端接入</h2>
-        <button id="im-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
-      </div>
-      <div class="model-modal-body">
-        <div id="im-kpi-grid" class="hub-kpi-grid"></div>
-
-        <section class="model-modal-section">
-          <div class="wechat-hero-card">
-            <div class="wechat-hero-info">
-              <h3>💬 微信个人号扫码绑定 (iLink)</h3>
-            </div>
-            <div class="wechat-hero-action modal-btn-group">
-              <button id="im-wechat-qr-btn" class="primary wechat-qr-trigger" type="button">📱 微信扫码绑定</button>
-              <button id="im-wechat-qr-new-btn" class="mini-button" type="button">➕ 新增微信账号</button>
-            </div>
-          </div>
-
-          <div id="im-wechat-qr-box" class="wechat-qr-showcase" hidden>
-            <div class="wechat-qr-visual">
-              <img id="im-wechat-qr-img" class="wechat-qr-img" alt="微信扫码登录二维码" />
-            </div>
-            <div class="wechat-qr-guide">
-              <strong id="im-wechat-qr-title" class="wechat-qr-heading">微信扫码绑定</strong>
-              <p id="im-wechat-qr-status" class="wechat-qr-status-text">正在获取二维码…</p>
-              <div id="im-wechat-qr-verify-row" class="wechat-qr-verify-row" hidden>
-                <input id="im-wechat-qr-verify-input" type="text" maxlength="32" placeholder="输入手机端显示的验证码" aria-label="微信登录验证码" />
-                <button id="im-wechat-qr-verify-btn" class="primary mini-button" type="button">提交验证码</button>
-              </div>
-              <div class="modal-btn-group">
-                <button id="im-wechat-qr-refresh" type="button">🔄 刷新二维码</button>
-                <button id="im-wechat-qr-copy" class="mini-button" type="button" hidden>🔗 复制链接</button>
-                <a id="im-wechat-qr-open" class="mini-button" target="_blank" rel="noopener noreferrer" hidden>🌐 浏览器打开</a>
-                <button id="im-wechat-qr-close" class="mini-button" type="button">关闭</button>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <section class="model-modal-section">
-          <div class="telegram-hero-card">
-            <div class="modal-row-head">
-              <div class="hub-card-title-group">
-                <h3>✈️ Telegram Bot 一键快速接入</h3>
-                <span class="hub-badge badge-blue">本机长轮询 · 无需公网 Webhook</span>
-              </div>
-            </div>
-            <div class="telegram-quick-form">
-              <label class="telegram-field-token">
-                <span class="meta">Bot Token</span>
-                <input id="im-tg-token-input" type="password" maxlength="512" autocomplete="off" placeholder="123456789:AAH..." aria-label="Telegram Bot Token">
-              </label>
-              <label class="telegram-field-allow">
-                <span class="meta">发送方白名单（可选，逗号或空格分隔）</span>
-                <input id="im-tg-allow-input" type="text" maxlength="512" placeholder="如：@myname, 123456789" aria-label="Telegram 发送方白名单">
-              </label>
-              <div class="telegram-quick-action">
-                <button id="im-tg-quick-btn" class="primary telegram-quick-trigger" type="button">🚀 一键接入</button>
-              </div>
-            </div>
-            <p id="im-tg-quick-status" class="telegram-quick-status" hidden></p>
-          </div>
-        </section>
-
-        <section class="model-modal-section">
-          <div class="voiceprint-hero-card">
-            <div class="modal-row-head">
-              <div class="hub-card-title-group">
-                <h3>🎙️ 小爱声纹识别与抗电视串音</h3>
-                <span id="im-voice-status-badge" class="hub-badge badge-slate">读取中…</span>
-              </div>
-              <div class="modal-btn-group">
-                <button id="im-voice-refresh-btn" class="mini-button" type="button">🔄 刷新</button>
-                <button id="im-voice-toggle-btn" class="mini-button" type="button">⏸ 暂停门控</button>
-                <button id="im-voice-clear-btn" class="mini-button danger-btn" type="button" hidden>🧹 清空全部</button>
-              </div>
-            </div>
-            <div id="im-voice-meta-row" class="hub-badges-row"></div>
-            <div id="im-voice-list" class="hub-cards-grid"><p class="empty">暂未录入声纹。</p></div>
-          </div>
-        </section>
-
-        <section class="model-modal-section">
-          <details id="im-add-details" class="hub-compose-details">
-            <summary id="im-form-summary" class="hub-compose-summary">
-              <span>+ 手动配置通道（微信 / 小爱音箱 / 钉钉 / Telegram）</span>
-            </summary>
-            <div class="hub-compose-body">
-              <div class="modal-form-grid">
-                <label>
-                  <span class="meta">平台</span>
-                  <select id="im-platform-input" aria-label="IM 平台">
-                    <option value="wechat">💬 微信 (WeChat)</option>
-                    <option value="xiaoai">🔊 小爱音箱 (XiaoAI)</option>
-                    <option value="dingtalk">🟦 钉钉 (DingTalk)</option>
-                    <option value="telegram">✈️ Telegram</option>
-                  </select>
-                </label>
-                <label>
-                  <span class="meta">名称</span>
-                  <input id="im-name-input" type="text" maxlength="120" placeholder="如：随身管家" aria-label="IM 通道名称">
-                </label>
-                <label>
-                  <span class="meta">Webhook URL（可选）</span>
-                  <input id="im-webhook-input" type="text" maxlength="1024" placeholder="https://..." aria-label="Webhook URL">
-                </label>
-                <label>
-                  <span class="meta">Bot Token（可选）</span>
-                  <input id="im-token-input" type="password" maxlength="512" placeholder="留空保持已存 Token" aria-label="Bot Token">
-                </label>
-                <label>
-                  <span class="meta">签名密钥 Secret（可选）</span>
-                  <input id="im-secret-input" type="password" maxlength="512" placeholder="留空保持已存密钥" aria-label="签名密钥">
-                </label>
-                <label>
-                  <span class="meta">默认接收目标（可选）</span>
-                  <input id="im-target-input" type="text" maxlength="256" placeholder="Chat ID / 账号 ID" aria-label="默认接收目标">
-                </label>
-                <label>
-                  <span class="meta">账号 / 小米 ID（可选）</span>
-                  <input id="im-account-input" type="text" maxlength="256" placeholder="小米账号（云端轮询时填写）" aria-label="账号或小米 ID">
-                </label>
-                <label>
-                  <span class="meta">API / SSH 地址（可选）</span>
-                  <input id="im-apibase-input" type="text" maxlength="1024" placeholder="ssh://speaker1=root@192.0.2.10,speaker2=root@192.0.2.11" aria-label="API 或 SSH 地址">
-                </label>
-              </div>
-              <label>
-                <span class="meta">发送方白名单（逗号分隔，可选）</span>
-                <input id="im-allow-input" type="text" maxlength="512" placeholder="如：user_01, 12345678" aria-label="发送方白名单">
-              </label>
-              <div class="wechat-channel-opts-grid">
-                <label class="wechat-inline-check">
-                  <input id="im-read-links-input" type="checkbox" checked>
-                  <span>自动读取微信消息中的网页链接正文 (readLinks)</span>
-                </label>
-                <div class="wechat-quiet-row">
-                  <label class="wechat-inline-check">
-                    <input id="im-quiet-enabled-input" type="checkbox">
-                    <span>夜间免打扰时段（仅顺延主动推送）</span>
-                  </label>
-                  <div class="wechat-quiet-times">
-                    <input id="im-quiet-start-input" type="text" maxlength="5" value="23:00" placeholder="23:00" aria-label="免打扰开始时间">
-                    <span>至</span>
-                    <input id="im-quiet-end-input" type="text" maxlength="5" value="07:00" placeholder="07:00" aria-label="免打扰结束时间">
-                  </div>
-                </div>
-              </div>
-              <div class="modal-row-head">
-                <span></span>
-                <div class="modal-btn-group">
-                  <button id="im-cancel-edit-btn" class="mini-button" type="button" hidden>取消</button>
-                  <button id="im-save-btn" class="primary" type="button">保存通道</button>
-                </div>
-              </div>
-            </div>
-          </details>
-        </section>
-
-        <section class="model-modal-section">
-          <div class="modal-row-head">
-            <h3>通道列表</h3>
-            <span id="im-list-subtitle" class="meta"></span>
-          </div>
-          <div id="im-list" class="hub-cards-grid"><p class="empty">暂未配置通道。</p></div>
-        </section>
-      </div>
+  <dialog id="im-hub-dialog" class="hub-dialog model-modal hub-modal" closedby="any" aria-labelledby="im-modal-title">
+    <div class="model-modal-header">
+      <h2 id="im-modal-title">📱 IM 远端接入</h2>
+      <button id="im-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
     </div>
-  </div>
+    <div class="model-modal-body">
+      <div id="im-kpi-grid" class="hub-kpi-grid"></div>
+
+      <section class="model-modal-section">
+        <div class="wechat-hero-card">
+          <div class="wechat-hero-info">
+            <h3>💬 微信个人号扫码绑定 (iLink)</h3>
+          </div>
+          <div class="wechat-hero-action modal-btn-group">
+            <button id="im-wechat-qr-btn" class="primary wechat-qr-trigger" type="button">📱 微信扫码绑定</button>
+            <button id="im-wechat-qr-new-btn" class="mini-button" type="button">➕ 新增微信账号</button>
+          </div>
+        </div>
+
+        <div id="im-wechat-qr-box" class="wechat-qr-showcase" hidden>
+          <div class="wechat-qr-visual">
+            <img id="im-wechat-qr-img" class="wechat-qr-img" width="220" height="220" decoding="async" fetchpriority="low" alt="微信扫码登录二维码">
+          </div>
+          <div class="wechat-qr-guide">
+            <strong id="im-wechat-qr-title" class="wechat-qr-heading">微信扫码绑定</strong>
+            <p id="im-wechat-qr-status" class="wechat-qr-status-text">正在获取二维码…</p>
+            <form id="im-wechat-qr-verify-row" class="wechat-qr-verify-row" novalidate hidden>
+              <input id="im-wechat-qr-verify-input" type="text" maxlength="32" autocomplete="one-time-code" placeholder="输入手机端显示的验证码" aria-label="微信登录验证码">
+              <button id="im-wechat-qr-verify-btn" class="primary mini-button" type="submit">提交验证码</button>
+            </form>
+            <div class="modal-btn-group">
+              <button id="im-wechat-qr-refresh" type="button">🔄 刷新二维码</button>
+              <button id="im-wechat-qr-copy" class="mini-button" type="button" hidden>🔗 复制链接</button>
+              <a id="im-wechat-qr-open" class="mini-button" target="_blank" rel="noopener noreferrer" hidden>🌐 浏览器打开</a>
+              <button id="im-wechat-qr-close" class="mini-button" type="button">关闭</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="model-modal-section">
+        <div class="telegram-hero-card">
+          <div class="modal-row-head">
+            <div class="hub-card-title-group">
+              <h3>✈️ Telegram Bot 一键快速接入</h3>
+              <span class="hub-badge badge-blue">本机长轮询 · 无需公网 Webhook</span>
+            </div>
+          </div>
+          <form id="im-tg-quick-form" class="telegram-quick-form" novalidate>
+            <label class="telegram-field-token">
+              <span class="meta">Bot Token</span>
+              <input id="im-tg-token-input" type="password" maxlength="512" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="123456789:AAH..." aria-label="Telegram Bot Token">
+            </label>
+            <label class="telegram-field-allow">
+              <span class="meta">发送方白名单（可选，逗号或空格分隔）</span>
+              <input id="im-tg-allow-input" type="text" maxlength="512" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="如：@myname, 123456789" aria-label="Telegram 发送方白名单">
+            </label>
+            <div class="telegram-quick-action">
+              <button id="im-tg-quick-btn" class="primary telegram-quick-trigger" type="submit">🚀 一键接入</button>
+            </div>
+          </form>
+          <p id="im-tg-quick-status" class="telegram-quick-status" role="status" hidden></p>
+        </div>
+      </section>
+
+      <section class="model-modal-section">
+        <div class="voiceprint-hero-card">
+          <div class="modal-row-head">
+            <div class="hub-card-title-group">
+              <h3>🎙️ 小爱声纹识别与抗电视串音</h3>
+              <span id="im-voice-status-badge" class="hub-badge badge-slate">读取中…</span>
+            </div>
+            <div class="modal-btn-group">
+              <button id="im-voice-refresh-btn" class="mini-button" type="button">🔄 刷新</button>
+              <button id="im-voice-toggle-btn" class="mini-button" type="button">⏸ 暂停门控</button>
+              <button id="im-voice-clear-btn" class="mini-button danger-btn" type="button" hidden>🧹 清空全部</button>
+            </div>
+          </div>
+          <div id="im-voice-meta-row" class="hub-badges-row"></div>
+          <div id="im-voice-list" class="hub-cards-grid"><p class="empty">暂未录入声纹。</p></div>
+        </div>
+      </section>
+
+      <section class="model-modal-section">
+        <details id="im-add-details" class="hub-compose-details">
+          <summary id="im-form-summary" class="hub-compose-summary">
+            <span>+ 手动配置通道（微信 / 小爱音箱 / 钉钉 / Telegram）</span>
+          </summary>
+          <form id="im-compose-form" class="hub-compose-body" novalidate>
+            <div class="modal-form-grid">
+              <label>
+                <span class="meta">平台</span>
+                <select id="im-platform-input" aria-label="IM 平台">
+                  <option value="wechat">💬 微信 (WeChat)</option>
+                  <option value="xiaoai">🔊 小爱音箱 (XiaoAI)</option>
+                  <option value="dingtalk">🟦 钉钉 (DingTalk)</option>
+                  <option value="telegram">✈️ Telegram</option>
+                </select>
+              </label>
+              <label>
+                <span class="meta">名称</span>
+                <input id="im-name-input" type="text" maxlength="120" placeholder="如：随身管家" aria-label="IM 通道名称">
+              </label>
+              <label>
+                <span class="meta">Webhook URL（可选）</span>
+                <input id="im-webhook-input" type="text" maxlength="1024" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="https://..." aria-label="Webhook URL">
+              </label>
+              <label>
+                <span class="meta">Bot Token（可选）</span>
+                <input id="im-token-input" type="password" maxlength="512" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="留空保持已存 Token" aria-label="Bot Token">
+              </label>
+              <label>
+                <span class="meta">签名密钥 Secret（可选）</span>
+                <input id="im-secret-input" type="password" maxlength="512" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="留空保持已存密钥" aria-label="签名密钥">
+              </label>
+              <label>
+                <span class="meta">默认接收目标（可选）</span>
+                <input id="im-target-input" type="text" maxlength="256" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="Chat ID / 账号 ID" aria-label="默认接收目标">
+              </label>
+              <label>
+                <span class="meta">账号 / 小米 ID（可选）</span>
+                <input id="im-account-input" type="text" maxlength="256" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="小米账号（云端轮询时填写）" aria-label="账号或小米 ID">
+              </label>
+              <label>
+                <span class="meta">API / SSH 地址（可选）</span>
+                <input id="im-apibase-input" type="text" maxlength="1024" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="ssh://speaker1=root@192.0.2.10,speaker2=root@192.0.2.11" aria-label="API 或 SSH 地址">
+              </label>
+            </div>
+            <label>
+              <span class="meta">发送方白名单（逗号分隔，可选）</span>
+              <input id="im-allow-input" type="text" maxlength="512" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="如：user_01, 12345678" aria-label="发送方白名单">
+            </label>
+            <div class="wechat-channel-opts-grid">
+              <label class="wechat-inline-check">
+                <input id="im-read-links-input" type="checkbox" checked>
+                <span>自动读取微信消息中的网页链接正文 (readLinks)</span>
+              </label>
+              <div class="wechat-quiet-row">
+                <label class="wechat-inline-check">
+                  <input id="im-quiet-enabled-input" type="checkbox">
+                  <span>夜间免打扰时段（仅顺延主动推送）</span>
+                </label>
+                <div class="wechat-quiet-times">
+                  <input id="im-quiet-start-input" type="text" maxlength="5" value="23:00" placeholder="23:00" aria-label="免打扰开始时间">
+                  <span>至</span>
+                  <input id="im-quiet-end-input" type="text" maxlength="5" value="07:00" placeholder="07:00" aria-label="免打扰结束时间">
+                </div>
+              </div>
+            </div>
+            <div class="modal-row-head">
+              <span></span>
+              <div class="modal-btn-group">
+                <button id="im-cancel-edit-btn" class="mini-button" type="button" hidden>取消</button>
+                <button id="im-save-btn" class="primary" type="submit">保存通道</button>
+              </div>
+            </div>
+          </form>
+        </details>
+      </section>
+
+      <section class="model-modal-section">
+        <div class="modal-row-head">
+          <h3>通道列表</h3>
+          <span id="im-list-subtitle" class="meta"></span>
+        </div>
+        <div id="im-list" class="hub-cards-grid"><p class="empty">暂未配置通道。</p></div>
+      </section>
+    </div>
+  </dialog>
 
   <!-- 4. 应用与插件宿主弹窗 (M3：侧边栏导航 + 专属看板 + 置底插件目录) -->
-  <div id="plugin-hub-backdrop" class="modal-backdrop" hidden>
-    <div id="plugin-hub-modal" class="model-modal hub-modal plugin-hub-modal" role="dialog" aria-modal="true" aria-labelledby="plugin-modal-title">
-      <div class="model-modal-header plugin-modal-header">
-        <div class="plugin-header-left">
-          <button id="plugin-mobile-nav-btn" class="mini-button plugin-mobile-nav-btn" type="button" aria-expanded="false" aria-controls="plugin-sidebar" aria-label="展开或收起插件侧边栏">
-            <svg class="plugin-ui-svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
-            <span id="plugin-mobile-nav-label">插件导航</span>
-          </button>
-          <div class="hub-modal-title-block">
-            <h2 id="plugin-modal-title">应用与插件</h2>
-          </div>
-        </div>
-        <div class="plugin-header-right">
-          <button id="plugin-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
+  <dialog id="plugin-hub-dialog" class="hub-dialog model-modal hub-modal plugin-hub-modal" closedby="any" aria-labelledby="plugin-modal-title">
+    <div class="model-modal-header plugin-modal-header">
+      <div class="plugin-header-left">
+        <button id="plugin-mobile-nav-btn" class="mini-button plugin-mobile-nav-btn" type="button" aria-expanded="false" aria-controls="plugin-sidebar" aria-label="展开或收起插件侧边栏">
+          <svg class="plugin-ui-svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+          <span id="plugin-mobile-nav-label">插件导航</span>
+        </button>
+        <div class="hub-modal-title-block">
+          <h2 id="plugin-modal-title">应用与插件</h2>
         </div>
       </div>
-      <div id="plugin-shell" class="plugin-shell">
-        <div id="plugin-sidebar-scrim" class="plugin-sidebar-scrim" hidden></div>
-        <aside id="plugin-sidebar" class="plugin-sidebar" aria-label="应用与插件侧边栏">
-          <div class="plugin-sidebar-head">
-            <span class="plugin-sidebar-heading">应用导航</span>
-            <button id="plugin-sidebar-toggle" class="plugin-sidebar-toggle" type="button" aria-expanded="true" aria-controls="plugin-sidebar" aria-label="收起侧边栏" title="收起为仅图标模式">
-              <svg class="plugin-ui-svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2.5"/><line x1="9" y1="3" x2="9" y2="21"/><polyline points="15 9 12 12 15 15"/></svg>
+      <div class="plugin-header-right">
+        <button id="plugin-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
+      </div>
+    </div>
+    <div id="plugin-shell" class="plugin-shell">
+      <div id="plugin-sidebar-scrim" class="plugin-sidebar-scrim" hidden></div>
+      <aside id="plugin-sidebar" class="plugin-sidebar" aria-label="应用与插件侧边栏">
+        <div class="plugin-sidebar-head">
+          <span class="plugin-sidebar-heading">应用导航</span>
+          <button id="plugin-sidebar-toggle" class="plugin-sidebar-toggle" type="button" aria-expanded="true" aria-controls="plugin-sidebar" aria-label="收起侧边栏" title="收起为仅图标模式">
+            <svg class="plugin-ui-svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2.5"></rect><line x1="9" y1="3" x2="9" y2="21"></line><polyline points="15 9 12 12 15 15"></polyline></svg>
+          </button>
+        </div>
+        <div class="plugin-nav-section-label">
+          <span>专属看板</span>
+        </div>
+        <div id="plugin-surface-tabs" class="plugin-surface-tabs" role="tablist" aria-orientation="vertical" aria-label="应用与插件视图切换" focusgroup="tablist nomemory">
+          <div class="plugin-nav-sortable-wrap" role="presentation">
+            <div id="plugin-nav-sortable" class="plugin-nav-sortable" role="presentation">
+              <button id="plugin-tab-health-scale" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-health-scale" data-plugin-tab="health-scale" draggable="true" title="健康管理" hidden>
+                <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" aria-hidden="true"><use href="#icon-grip"></use></svg></span>
+                <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"></path><path d="M7 11h2.5l1.5-2.5 2 5 1.5-2.5H17"></path></svg></span>
+                <span class="plugin-nav-label">健康管理</span>
+                <span id="health-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
+                <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
+              </button>
+              <button id="plugin-tab-fund-tracker" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-fund-tracker" data-plugin-tab="fund-tracker" draggable="true" title="投资管理" hidden>
+                <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" aria-hidden="true"><use href="#icon-grip"></use></svg></span>
+                <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"></polyline><polyline points="16 7 22 7 22 13"></polyline><line x1="3" y1="21" x2="21" y2="21"></line></svg></span>
+                <span class="plugin-nav-label">投资管理</span>
+                <span id="fund-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
+                <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
+              </button>
+              <button id="plugin-tab-cs80-face" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-cs80-face" data-plugin-tab="cs80-face" draggable="true" title="CS80 副屏" hidden>
+                <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" aria-hidden="true"><use href="#icon-grip"></use></svg></span>
+                <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="14" rx="2.5"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="18" x2="12" y2="21"></line><circle cx="9" cy="10" r="1"></circle><circle cx="15" cy="10" r="1"></circle><path d="M9.5 13.5c.8.8 1.6 1.2 2.5 1.2s1.7-.4 2.5-1.2"></path></svg></span>
+                <span class="plugin-nav-label">CS80 副屏</span>
+                <span id="cs80-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
+                <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
+              </button>
+              <button id="plugin-tab-laifen" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-laifen" data-plugin-tab="laifen" draggable="true" title="口腔护理" hidden>
+                <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" aria-hidden="true"><use href="#icon-grip"></use></svg></span>
+                <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v18"></path><path d="M9 6h6"></path><path d="M9 9h6"></path><path d="M5.5 8.5a4 4 0 0 0 0 5"></path><path d="M18.5 8.5a4 4 0 0 1 0 5"></path><rect x="10" y="13" width="4" height="8" rx="1.5"></rect></svg></span>
+                <span class="plugin-nav-label">口腔护理</span>
+                <span id="laifen-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
+                <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
+              </button>
+              <button id="plugin-tab-ninebot" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-ninebot" data-plugin-tab="ninebot" draggable="true" title="九号守护" hidden>
+                <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" aria-hidden="true"><use href="#icon-grip"></use></svg></span>
+                <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6.5" cy="17.5" r="3"></circle><circle cx="17.5" cy="17.5" r="3"></circle><path d="M6.5 14.5 9 9h5l2.5 5.5"></path><path d="M14 9 15.5 5H18"></path><path d="M9.5 17.5h5"></path></svg></span>
+                <span class="plugin-nav-label">九号守护</span>
+                <span id="ninebot-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
+                <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
+              </button>
+              <button id="plugin-tab-netlea" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-netlea" data-plugin-tab="netlea" draggable="true" title="鱼缸灯光" hidden>
+                <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" aria-hidden="true"><use href="#icon-grip"></use></svg></span>
+                <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="3"></circle><path d="M12 2v1.5"></path><path d="m5.8 5.2 1.1 1.1"></path><path d="m18.2 5.2-1.1 1.1"></path><path d="M3 16c1.8-1.4 3.6-1.4 5.4 0 1.8 1.4 3.6 1.4 5.4 0 1.8-1.4 3.6-1.4 5.4 0"></path><path d="M3 20c1.8-1.4 3.6-1.4 5.4 0 1.8 1.4 3.6 1.4 5.4 0 1.8-1.4 3.6-1.4 5.4 0"></path></svg></span>
+                <span class="plugin-nav-label">鱼缸灯光</span>
+                <span id="netlea-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
+                <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
+              </button>
+              <button id="plugin-tab-apple-devices" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-apple-devices" data-plugin-tab="apple-devices" draggable="true" title="苹果设备" hidden>
+                <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" aria-hidden="true"><use href="#icon-grip"></use></svg></span>
+                <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2.5" width="12" height="19" rx="2.5"></rect><line x1="10.5" y1="18.5" x2="13.5" y2="18.5"></line><circle cx="12" cy="10" r="2.2"></circle><path d="M9.2 7.2a4 4 0 0 1 5.6 0"></path></svg></span>
+                <span class="plugin-nav-label">苹果设备</span>
+                <span id="apple-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
+                <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
+              </button>
+              <button id="plugin-tab-miot" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-miot" data-plugin-tab="miot" draggable="true" title="米家中枢" hidden>
+                <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" aria-hidden="true"><use href="#icon-grip"></use></svg></span>
+                <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.5 12 3l9 7.5"></path><path d="M5 9.5V20a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9.5"></path><path d="M9.5 15a3.5 3.5 0 0 1 5 0"></path><circle cx="12" cy="17.5" r="0.8"></circle></svg></span>
+                <span class="plugin-nav-label">米家中枢</span>
+                <span id="miot-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
+                <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
+              </button>
+            </div>
+          </div>
+          <div class="plugin-sidebar-footer" role="presentation">
+            <button id="plugin-tab-catalog" class="plugin-nav-item plugin-nav-catalog active" type="button" role="tab" aria-selected="true" aria-controls="plugin-panel-catalog" data-plugin-tab="catalog" focusgroupstart title="插件目录">
+              <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="3" width="7" height="7" rx="1.5"></rect><rect x="3" y="14" width="7" height="7" rx="1.5"></rect><rect x="14" y="14" width="7" height="7" rx="1.5"></rect></svg></span>
+              <span class="plugin-nav-label">插件目录</span>
+              <span id="plugin-catalog-badge" class="hub-pill-badge plugin-nav-badge">0</span>
             </button>
           </div>
-          <div id="plugin-surface-tabs" class="plugin-surface-tabs" role="tablist" aria-orientation="vertical" aria-label="应用与插件视图切换">
-            <div class="plugin-nav-sortable-wrap">
-              <div class="plugin-nav-section-label">
-                <span>专属看板</span>
-              </div>
-              <div id="plugin-nav-sortable" class="plugin-nav-sortable">
-                <button id="plugin-tab-health-scale" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-health-scale" data-plugin-tab="health-scale" draggable="true" title="健康管理" hidden>
-                  <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span>
-                  <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/><path d="M7 11h2.5l1.5-2.5 2 5 1.5-2.5H17"/></svg></span>
-                  <span class="plugin-nav-label">健康管理</span>
-                  <span id="health-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
-                  <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
-                </button>
-                <button id="plugin-tab-fund-tracker" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-fund-tracker" data-plugin-tab="fund-tracker" draggable="true" title="投资管理" hidden>
-                  <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span>
-                  <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/><line x1="3" y1="21" x2="21" y2="21"/></svg></span>
-                  <span class="plugin-nav-label">投资管理</span>
-                  <span id="fund-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
-                  <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
-                </button>
-                <button id="plugin-tab-cs80-face" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-cs80-face" data-plugin-tab="cs80-face" draggable="true" title="CS80 副屏" hidden>
-                  <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span>
-                  <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="14" rx="2.5"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="18" x2="12" y2="21"/><circle cx="9" cy="10" r="1"/><circle cx="15" cy="10" r="1"/><path d="M9.5 13.5c.8.8 1.6 1.2 2.5 1.2s1.7-.4 2.5-1.2"/></svg></span>
-                  <span class="plugin-nav-label">CS80 副屏</span>
-                  <span id="cs80-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
-                  <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
-                </button>
-                <button id="plugin-tab-laifen" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-laifen" data-plugin-tab="laifen" draggable="true" title="口腔护理" hidden>
-                  <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span>
-                  <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v18"/><path d="M9 6h6"/><path d="M9 9h6"/><path d="M5.5 8.5a4 4 0 0 0 0 5"/><path d="M18.5 8.5a4 4 0 0 1 0 5"/><rect x="10" y="13" width="4" height="8" rx="1.5"/></svg></span>
-                  <span class="plugin-nav-label">口腔护理</span>
-                  <span id="laifen-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
-                  <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
-                </button>
-                <button id="plugin-tab-ninebot" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-ninebot" data-plugin-tab="ninebot" draggable="true" title="九号守护" hidden>
-                  <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span>
-                  <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6.5" cy="17.5" r="3"/><circle cx="17.5" cy="17.5" r="3"/><path d="M6.5 14.5 9 9h5l2.5 5.5"/><path d="M14 9 15.5 5H18"/><path d="M9.5 17.5h5"/></svg></span>
-                  <span class="plugin-nav-label">九号守护</span>
-                  <span id="ninebot-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
-                  <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
-                </button>
-                <button id="plugin-tab-netlea" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-netlea" data-plugin-tab="netlea" draggable="true" title="鱼缸灯光" hidden>
-                  <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span>
-                  <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="3"/><path d="M12 2v1.5"/><path d="m5.8 5.2 1.1 1.1"/><path d="m18.2 5.2-1.1 1.1"/><path d="M3 16c1.8-1.4 3.6-1.4 5.4 0 1.8 1.4 3.6 1.4 5.4 0 1.8-1.4 3.6-1.4 5.4 0"/><path d="M3 20c1.8-1.4 3.6-1.4 5.4 0 1.8 1.4 3.6 1.4 5.4 0 1.8-1.4 3.6-1.4 5.4 0"/></svg></span>
-                  <span class="plugin-nav-label">鱼缸灯光</span>
-                  <span id="netlea-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
-                  <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
-                </button>
-                <button id="plugin-tab-apple-devices" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-apple-devices" data-plugin-tab="apple-devices" draggable="true" title="苹果设备" hidden>
-                  <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span>
-                  <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2.5" width="12" height="19" rx="2.5"/><line x1="10.5" y1="18.5" x2="13.5" y2="18.5"/><circle cx="12" cy="10" r="2.2"/><path d="M9.2 7.2a4 4 0 0 1 5.6 0"/></svg></span>
-                  <span class="plugin-nav-label">苹果设备</span>
-                  <span id="apple-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
-                  <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
-                </button>
-                <button id="plugin-tab-miot" class="plugin-nav-item" type="button" role="tab" aria-selected="false" aria-controls="plugin-panel-miot" data-plugin-tab="miot" draggable="true" title="米家中枢" hidden>
-                  <span class="plugin-nav-grip" aria-hidden="true"><svg class="plugin-grip-svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span>
-                  <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V20a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9.5"/><path d="M9.5 15a3.5 3.5 0 0 1 5 0"/><circle cx="12" cy="17.5" r="0.8"/></svg></span>
-                  <span class="plugin-nav-label">米家中枢</span>
-                  <span id="miot-top-badge" class="hub-pill-badge plugin-nav-badge">—</span>
-                  <span class="plugin-nav-dot" aria-hidden="true" hidden></span>
-                </button>
-              </div>
-            </div>
-            <div class="plugin-sidebar-footer">
-              <button id="plugin-order-reset-btn" class="plugin-order-reset-btn" type="button" title="恢复插件默认展示顺序" hidden>
-                <svg class="plugin-ui-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><polyline points="3 3 3 8 8 8"/></svg>
-                <span class="plugin-nav-label">恢复默认排序</span>
-              </button>
-              <button id="plugin-tab-catalog" class="plugin-nav-item plugin-nav-catalog active" type="button" role="tab" aria-selected="true" aria-controls="plugin-panel-catalog" data-plugin-tab="catalog" title="插件目录">
-                <span class="plugin-nav-icon" aria-hidden="true"><svg class="plugin-svg-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></span>
-                <span class="plugin-nav-label">插件目录</span>
-                <span id="plugin-catalog-badge" class="hub-pill-badge plugin-nav-badge">0</span>
-              </button>
-            </div>
-          </div>
-        </aside>
-        <div class="model-modal-body plugin-modal-body plugin-stage">
-        <div id="plugin-panel-catalog" class="hub-tab-panel" role="tabpanel" aria-labelledby="plugin-tab-catalog">
-          <div id="plugin-catalog-home" class="plugin-catalog-home">
-            <div id="plugin-kpi-grid" class="hub-kpi-grid"></div>
-
-            <section class="model-modal-section plugin-catalog-controls" aria-label="筛选与搜索已安装插件">
-              <div class="plugin-catalog-toolbar">
-                <div class="plugin-catalog-search-wrap">
-                  <input id="plugin-catalog-search" class="plugin-catalog-search" type="search" maxlength="120" placeholder="搜索插件名称、功能或指令…" aria-label="搜索已安装插件">
-                </div>
-                <div id="plugin-catalog-filters" class="hub-filter-pills" role="tablist" aria-label="插件分类筛选">
-                  <button class="hub-filter-pill active" type="button" data-catalog-filter="all" aria-selected="true">全部</button>
-                  <button class="hub-filter-pill" type="button" data-catalog-filter="surface" aria-selected="false">专属看板</button>
-                  <button class="hub-filter-pill" type="button" data-catalog-filter="extension" aria-selected="false">系统扩展</button>
-                  <button class="hub-filter-pill" type="button" data-catalog-filter="voice" aria-selected="false">语音直通</button>
-                  <button class="hub-filter-pill" type="button" data-catalog-filter="timer" aria-selected="false">定时巡检</button>
-                </div>
-                <span id="plugin-list-subtitle" class="meta plugin-catalog-subtitle"></span>
-              </div>
-              <div id="plugins-list" class="plugin-catalog-sections"><p class="empty">正在读取插件…</p></div>
-            </section>
-          </div>
-          <div id="plugin-catalog-detail" class="plugin-catalog-detail" hidden></div>
         </div>
+        <div class="plugin-sidebar-reset-row">
+          <button id="plugin-order-reset-btn" class="plugin-order-reset-btn" type="button" title="恢复插件默认展示顺序" hidden>
+            <svg class="plugin-ui-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"></path><polyline points="3 3 3 8 8 8"></polyline></svg>
+            <span class="plugin-nav-label">恢复默认排序</span>
+          </button>
+        </div>
+      </aside>
+      <div class="model-modal-body plugin-modal-body plugin-stage">
+      <div id="plugin-panel-catalog" class="hub-tab-panel" role="tabpanel" aria-labelledby="plugin-tab-catalog">
+        <div id="plugin-catalog-home" class="plugin-catalog-home">
+          <div id="plugin-kpi-grid" class="hub-kpi-grid"></div>
+
+          <section class="model-modal-section plugin-catalog-controls">
+            <div class="plugin-catalog-toolbar">
+              <search class="plugin-catalog-search-wrap">
+                <input id="plugin-catalog-search" class="plugin-catalog-search" type="search" enterkeyhint="search" maxlength="120" placeholder="搜索插件名称、功能或指令…" aria-label="搜索已安装插件">
+              </search>
+              <div id="plugin-catalog-filters" class="hub-filter-pills" role="group" aria-label="插件分类筛选">
+                <button class="hub-filter-pill active" type="button" data-catalog-filter="all" aria-pressed="true">全部</button>
+                <button class="hub-filter-pill" type="button" data-catalog-filter="surface" aria-pressed="false">专属看板</button>
+                <button class="hub-filter-pill" type="button" data-catalog-filter="extension" aria-pressed="false">系统扩展</button>
+                <button class="hub-filter-pill" type="button" data-catalog-filter="voice" aria-pressed="false">语音直通</button>
+                <button class="hub-filter-pill" type="button" data-catalog-filter="timer" aria-pressed="false">定时巡检</button>
+              </div>
+              <span id="plugin-list-subtitle" class="meta plugin-catalog-subtitle"></span>
+            </div>
+            <div id="plugins-list" class="plugin-catalog-sections"><p class="empty">正在读取插件…</p></div>
+          </section>
+        </div>
+        <div id="plugin-catalog-detail" class="plugin-catalog-detail" hidden></div>
+      </div>
 
         <div id="plugin-panel-health-scale" class="hub-tab-panel" role="tabpanel" aria-labelledby="plugin-tab-health-scale" hidden>
           <div class="plugin-surface-bar">
@@ -660,15 +812,15 @@
             <div class="health-header-actions">
               <select id="health-profile-select" aria-label="切换成员档案"></select>
               <div class="hub-filter-pills health-unit-pills" role="group" aria-label="体重显示单位">
-                <button id="health-unit-kg" class="hub-filter-pill active" type="button" data-unit="kg">kg</button>
-                <button id="health-unit-jin" class="hub-filter-pill" type="button" data-unit="jin">斤</button>
+                <button id="health-unit-kg" class="hub-filter-pill active" type="button" aria-pressed="true" data-unit="kg">kg</button>
+                <button id="health-unit-jin" class="hub-filter-pill" type="button" aria-pressed="false" data-unit="jin">斤</button>
               </div>
               <button id="health-refresh-btn" class="mini-button" type="button">🔄 刷新</button>
             </div>
           </div>
-          <p id="health-action-status" class="health-status-banner" hidden></p>
+          <p id="health-action-status" class="health-status-banner" role="status" hidden></p>
 
-        <section class="model-modal-section health-hero-grid" aria-label="实时上秤与硬件状态总览">
+        <section class="model-modal-section health-hero-grid">
           <div class="health-hero-card health-live-card">
             <div class="modal-row-head">
               <span id="health-live-phase" class="hub-badge badge-slate">待机中</span>
@@ -713,32 +865,32 @@
 
         <div id="health-kpi-grid" class="hub-kpi-grid"></div>
 
-        <section class="model-modal-section" aria-label="多指标历史趋势图">
+        <section class="model-modal-section">
           <div class="modal-row-head">
             <h3>多维趋势变化</h3>
             <div class="modal-btn-group">
-              <div id="health-trend-metrics" class="hub-filter-pills" role="tablist" aria-label="趋势指标选择">
-                <button class="hub-filter-pill active" type="button" data-metric="weight">体重</button>
-                <button class="hub-filter-pill" type="button" data-metric="fat">体脂率</button>
-                <button class="hub-filter-pill" type="button" data-metric="bmi">BMI</button>
-                <button class="hub-filter-pill" type="button" data-metric="muscle">骨骼肌率</button>
-                <button class="hub-filter-pill" type="button" data-metric="bmr">基础代谢</button>
-                <button class="hub-filter-pill" type="button" data-metric="impedance">生物电阻抗</button>
+              <div id="health-trend-metrics" class="hub-filter-pills" role="group" aria-label="趋势指标选择">
+                <button class="hub-filter-pill active" type="button" aria-pressed="true" data-metric="weight">体重</button>
+                <button class="hub-filter-pill" type="button" aria-pressed="false" data-metric="fat">体脂率</button>
+                <button class="hub-filter-pill" type="button" aria-pressed="false" data-metric="bmi">BMI</button>
+                <button class="hub-filter-pill" type="button" aria-pressed="false" data-metric="muscle">骨骼肌率</button>
+                <button class="hub-filter-pill" type="button" aria-pressed="false" data-metric="bmr">基础代谢</button>
+                <button class="hub-filter-pill" type="button" aria-pressed="false" data-metric="impedance">生物电阻抗</button>
               </div>
-              <div id="health-trend-ranges" class="hub-filter-pills" role="tablist" aria-label="趋势条数筛选">
-                <button class="hub-filter-pill" type="button" data-range="7">近 7 次</button>
-                <button class="hub-filter-pill active" type="button" data-range="30">近 30 次</button>
-                <button class="hub-filter-pill" type="button" data-range="120">全部</button>
+              <div id="health-trend-ranges" class="hub-filter-pills" role="group" aria-label="趋势条数筛选">
+                <button class="hub-filter-pill" type="button" aria-pressed="false" data-range="7">近 7 次</button>
+                <button class="hub-filter-pill active" type="button" aria-pressed="true" data-range="30">近 30 次</button>
+                <button class="hub-filter-pill" type="button" aria-pressed="false" data-range="120">全部</button>
               </div>
             </div>
           </div>
           <div class="health-chart-shell">
-            <canvas id="health-trend-canvas" class="health-trend-canvas" width="920" height="220" aria-label="健康指标趋势折线图"></canvas>
+            <canvas id="health-trend-canvas" class="health-trend-canvas" width="920" height="220" role="img" aria-label="健康指标趋势折线图"></canvas>
             <div id="health-trend-caption" class="meta health-trend-caption">暂无足够数据绘制趋势。</div>
           </div>
         </section>
 
-        <section class="model-modal-section" aria-label="全量身体成分与原始遥测">
+        <section class="model-modal-section">
           <div class="modal-row-head">
             <h3>全量人体成分、九宫格体型与电生理遥测</h3>
             <div id="health-inspect-bar" class="modal-btn-group">
@@ -746,7 +898,7 @@
               <button id="health-inspect-latest-btn" class="mini-button" type="button" hidden>↩ 返回最新记录</button>
             </div>
           </div>
-          <div id="health-bodytype-grid" class="health-bodytype-grid" aria-label="九宫格体型定位"></div>
+          <div id="health-bodytype-grid" class="health-bodytype-grid" role="region" aria-label="九宫格体型定位"></div>
           <div id="health-metrics-grid" class="health-metrics-grid">
             <p class="empty">完成一次测量或补录后，这里将展示全部 16+ 项身体成分指标与正常区间尺。</p>
           </div>
@@ -755,15 +907,15 @@
           <details class="hub-compose-details">
             <summary class="hub-compose-summary">🔬 查看完整底层数据与协议载荷 (JSON)</summary>
             <div class="hub-compose-body">
-              <pre id="health-raw-json" class="hub-code-block">{}</pre>
+              <pre id="health-raw-json" class="hub-code-block" tabindex="0" role="region" aria-label="完整底层数据与协议载荷 JSON"><code>{}</code></pre>
             </div>
           </details>
         </section>
 
-        <section class="model-modal-section health-forms-section" aria-label="成员档案与手动补录">
+        <section class="model-modal-section health-forms-section">
           <details id="health-profile-details" class="hub-compose-details">
             <summary class="hub-compose-summary">👤 成员档案管理、参数校准与家庭成员切换</summary>
-            <div class="hub-compose-body">
+            <form id="health-profile-form" class="hub-compose-body" novalidate>
               <div id="health-profiles-bar" class="health-profiles-bar"></div>
               <div class="modal-form-grid">
                 <input id="health-profile-id" type="hidden">
@@ -798,15 +950,15 @@
                 </label>
                 <div class="modal-btn-group">
                   <button id="health-profile-new-btn" class="mini-button" type="button">＋ 新建空白档案</button>
-                  <button id="health-profile-save-btn" class="primary" type="button">💾 保存并应用档案</button>
+                  <button id="health-profile-save-btn" class="primary" type="submit">💾 保存并应用档案</button>
                 </div>
               </div>
-            </div>
+            </form>
           </details>
 
           <details id="health-manual-details" class="hub-compose-details">
             <summary class="hub-compose-summary">📝 手动补录历史体重 / 阻抗记录</summary>
-            <div class="hub-compose-body">
+            <form id="health-manual-form" class="hub-compose-body" novalidate>
               <div class="modal-form-grid">
                 <label>体重数值
                   <input id="health-manual-weight" type="number" min="5" max="500" step="0.05" placeholder="如：68.5">
@@ -832,23 +984,23 @@
               </div>
               <div class="modal-row-head">
                 <span></span>
-                <button id="health-manual-add-btn" class="primary" type="button">＋ 写入健康档案</button>
+                <button id="health-manual-add-btn" class="primary" type="submit">＋ 写入健康档案</button>
               </div>
-            </div>
+            </form>
           </details>
         </section>
 
-        <section class="model-modal-section" aria-label="历史测量记录">
+        <section class="model-modal-section">
           <div class="modal-row-head">
             <div>
               <h3>历史测量明细</h3>
               <span id="health-records-subtitle" class="meta">共 0 条记录</span>
             </div>
-            <div id="health-source-filters" class="hub-filter-pills" role="tablist" aria-label="记录来源筛选">
-              <button class="hub-filter-pill active" type="button" data-source="all">全部</button>
-              <button class="hub-filter-pill" type="button" data-source="live">蓝牙实测</button>
-              <button class="hub-filter-pill" type="button" data-source="history">秤端缓存</button>
-              <button class="hub-filter-pill" type="button" data-source="manual">手动补录</button>
+            <div id="health-source-filters" class="hub-filter-pills" role="group" aria-label="记录来源筛选">
+              <button class="hub-filter-pill active" type="button" aria-pressed="true" data-source="all">全部</button>
+              <button class="hub-filter-pill" type="button" aria-pressed="false" data-source="live">蓝牙实测</button>
+              <button class="hub-filter-pill" type="button" aria-pressed="false" data-source="history">秤端缓存</button>
+              <button class="hub-filter-pill" type="button" aria-pressed="false" data-source="manual">手动补录</button>
             </div>
           </div>
           <div id="health-records-list" class="health-records-list"><p class="empty">尚无测量记录。</p></div>
@@ -866,9 +1018,9 @@
               <button id="fund-settle-btn" class="mini-button" type="button">🌙 净值结算</button>
             </div>
           </div>
-          <p id="fund-action-status" class="health-status-banner" hidden></p>
+          <p id="fund-action-status" class="health-status-banner" role="status" hidden></p>
 
-        <section class="model-modal-section fund-hero-grid" aria-label="投资资产与仓位总览">
+        <section class="model-modal-section fund-hero-grid">
           <div class="fund-hero-card fund-overview-card">
             <div class="modal-row-head">
               <span id="fund-mode-badge" class="hub-badge badge-slate">缓存快照</span>
@@ -902,41 +1054,41 @@
 
         <div id="fund-kpi-grid" class="hub-kpi-grid"></div>
 
-        <section id="fund-chart-section" class="model-modal-section" aria-label="收益与净值趋势图">
+        <section id="fund-chart-section" class="model-modal-section">
           <div class="modal-row-head">
             <h3>收益与净值走势</h3>
             <div class="modal-btn-group">
-              <div id="fund-trend-metrics" class="hub-filter-pills" role="tablist" aria-label="趋势维度选择">
-                <button class="hub-filter-pill active" type="button" data-metric="asset">总资产</button>
-                <button class="hub-filter-pill" type="button" data-metric="totalPnl">累计收益</button>
-                <button class="hub-filter-pill" type="button" data-metric="dailyPnl">单日盈亏</button>
-                <button class="hub-filter-pill" type="button" data-metric="holdingNav">标的净值</button>
+              <div id="fund-trend-metrics" class="hub-filter-pills" role="group" aria-label="趋势维度选择">
+                <button class="hub-filter-pill active" type="button" aria-pressed="true" data-metric="asset">总资产</button>
+                <button class="hub-filter-pill" type="button" aria-pressed="false" data-metric="totalPnl">累计收益</button>
+                <button class="hub-filter-pill" type="button" aria-pressed="false" data-metric="dailyPnl">单日盈亏</button>
+                <button class="hub-filter-pill" type="button" aria-pressed="false" data-metric="holdingNav">标的净值</button>
               </div>
               <select id="fund-nav-select" aria-label="选择查看净值走势的标的" hidden></select>
-              <div id="fund-trend-ranges" class="hub-filter-pills" role="tablist" aria-label="趋势跨度选择">
-                <button class="hub-filter-pill" type="button" data-range="7">近 7 次</button>
-                <button class="hub-filter-pill active" type="button" data-range="30">近 30 次</button>
-                <button class="hub-filter-pill" type="button" data-range="120">全部</button>
+              <div id="fund-trend-ranges" class="hub-filter-pills" role="group" aria-label="趋势跨度选择">
+                <button class="hub-filter-pill" type="button" aria-pressed="false" data-range="7">近 7 次</button>
+                <button class="hub-filter-pill active" type="button" aria-pressed="true" data-range="30">近 30 次</button>
+                <button class="hub-filter-pill" type="button" aria-pressed="false" data-range="120">全部</button>
               </div>
             </div>
           </div>
           <div class="health-chart-shell">
-            <canvas id="fund-trend-canvas" class="health-trend-canvas" width="920" height="220" aria-label="投资收益与净值趋势图"></canvas>
+            <canvas id="fund-trend-canvas" class="health-trend-canvas" width="920" height="220" role="img" aria-label="投资收益与净值趋势图"></canvas>
             <div id="fund-trend-caption" class="meta health-trend-caption">暂无足够数据绘制趋势。</div>
           </div>
         </section>
 
-        <section class="model-modal-section" aria-label="持仓明细">
+        <section class="model-modal-section">
           <div class="modal-row-head">
             <div>
               <h3>持仓明细</h3>
               <span id="fund-holdings-subtitle" class="meta">共 0 只标的</span>
             </div>
             <div class="modal-btn-group">
-              <div id="fund-type-filters" class="hub-filter-pills" role="tablist" aria-label="持仓类型筛选">
-                <button class="hub-filter-pill active" type="button" data-filter="all">全部</button>
-                <button class="hub-filter-pill" type="button" data-filter="stock">股票</button>
-                <button class="hub-filter-pill" type="button" data-filter="fund">基金</button>
+              <div id="fund-type-filters" class="hub-filter-pills" role="group" aria-label="持仓类型筛选">
+                <button class="hub-filter-pill active" type="button" aria-pressed="true" data-filter="all">全部</button>
+                <button class="hub-filter-pill" type="button" aria-pressed="false" data-filter="stock">股票</button>
+                <button class="hub-filter-pill" type="button" aria-pressed="false" data-filter="fund">基金</button>
               </div>
               <button id="fund-add-jump-btn" class="mini-button" type="button">＋ 新增持仓</button>
             </div>
@@ -944,14 +1096,14 @@
           <div id="fund-holdings-list" class="fund-holdings-list"><p class="empty">尚无持仓记录。</p></div>
         </section>
 
-        <section class="model-modal-section" aria-label="新增或修改持仓">
+        <section class="model-modal-section">
           <details id="fund-form-details" class="hub-compose-details">
             <summary id="fund-form-summary" class="hub-compose-summary">➕ 新增或修改股票 / 基金持仓</summary>
-            <div class="hub-compose-body">
+            <form id="fund-holding-form" class="hub-compose-body" novalidate>
               <input id="fund-edit-original-code" type="hidden">
               <div class="modal-form-grid">
                 <label>标的代码
-                  <input id="fund-form-code" type="text" placeholder="如：000300 / 600519">
+                  <input id="fund-form-code" type="text" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="如：000300 / 600519">
                 </label>
                 <label>标的名称
                   <input id="fund-form-name" type="text" placeholder="如：沪深300指数A">
@@ -974,7 +1126,7 @@
                   <input id="fund-form-shares" type="number" min="0" step="0.0001" placeholder="可选，留空自动推算">
                 </label>
                 <label>跟踪指数 / 行情代码
-                  <input id="fund-form-proxy" type="text" placeholder="如：sh000300 / hkHSTECH / usINX">
+                  <input id="fund-form-proxy" type="text" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="如：sh000300 / hkHSTECH / usINX">
                 </label>
                 <label>跟踪标的名称
                   <input id="fund-form-proxy-name" type="text" placeholder="如：沪深300 / 标普500">
@@ -993,16 +1145,16 @@
                 <span></span>
                 <div class="modal-btn-group">
                   <button id="fund-form-reset-btn" class="mini-button" type="button">🧹 重置表单</button>
-                  <button id="fund-form-save-btn" class="primary" type="button">💾 保存持仓</button>
+                  <button id="fund-form-save-btn" class="primary" type="submit">💾 保存持仓</button>
                 </div>
               </div>
-            </div>
+            </form>
           </details>
         </section>
         </div>
 
         <div id="plugin-panel-cs80-face" class="hub-tab-panel cs80-panel" role="tabpanel" aria-labelledby="plugin-tab-cs80-face" hidden>
-          <section class="cs80-studio-grid" aria-label="CS80 实时预览与卡片编排工作室">
+          <section class="cs80-studio-grid">
             <div class="cs80-preview-column">
               <div class="cs80-preview-card">
                 <div class="modal-row-head">
@@ -1010,7 +1162,7 @@
                   <span id="cs80-device-pill" class="hub-badge badge-slate">检测中</span>
                 </div>
                 <div class="cs80-preview-frame">
-                  <img id="cs80-live-preview" class="cs80-preview-img" alt="CS80 副屏实时渲染预览" hidden />
+                  <img id="cs80-live-preview" class="cs80-preview-img" width="480" height="320" decoding="async" fetchpriority="low" alt="CS80 副屏实时渲染预览" hidden>
                   <p id="cs80-preview-empty" class="empty">正在读取 CS80 守护进程实时画面…</p>
                 </div>
                 <div class="modal-btn-group cs80-preview-actions">
@@ -1049,8 +1201,8 @@
                   <div>
                     <span class="meta">底栏网格密度</span>
                     <div id="cs80-grid-rows-pills" class="hub-filter-pills" role="group" aria-label="底栏网格密度">
-                      <button class="hub-filter-pill active" type="button" data-grid-rows="2">2×2 标准大脸 (4格)</button>
-                      <button class="hub-filter-pill" type="button" data-grid-rows="3">2×3 扩展六格 (6格)</button>
+                      <button class="hub-filter-pill active" type="button" aria-pressed="true" data-grid-rows="2">2×2 标准大脸 (4格)</button>
+                      <button class="hub-filter-pill" type="button" aria-pressed="false" data-grid-rows="3">2×3 扩展六格 (6格)</button>
                     </div>
                   </div>
                   <label>
@@ -1099,8 +1251,8 @@
                     <button id="cs80-page-del-btn" class="mini-button danger-btn" type="button">🗑 删当前页</button>
                   </div>
                 </div>
-                <div id="cs80-page-tabs" class="hub-filter-pills cs80-page-tabs" role="tablist" aria-label="CS80 卡片页签"></div>
-                <div id="cs80-bento-editor" class="cs80-bento-editor" aria-label="当前页二维卡片排布预览"></div>
+                <div id="cs80-page-tabs" class="hub-filter-pills cs80-page-tabs" role="group" aria-label="CS80 卡片页签"></div>
+                <div id="cs80-bento-editor" class="cs80-bento-editor" role="region" aria-label="当前页二维卡片排布预览"></div>
 
                 <div class="cs80-catalog-header">
                   <h4>＋ 添加插件 / 核心数据卡片到当前页</h4>
@@ -1132,18 +1284,18 @@
                       <button class="mini-button" type="button" data-expr="auto" data-poke="">🤖 恢复自动</button>
                     </div>
                   </div>
-                  <div class="cs80-ctrl-row">
+                  <form id="cs80-banner-form" class="cs80-ctrl-row" novalidate>
                     <input id="cs80-banner-input" type="text" maxlength="120" placeholder="发送一条临时互动文字到副屏跑马灯（可选）" aria-label="副屏互动文字">
-                    <button id="cs80-banner-send-btn" class="mini-button" type="button">📢 投送跑马灯</button>
-                  </div>
+                    <button id="cs80-banner-send-btn" class="mini-button" type="submit">📢 投送跑马灯</button>
+                  </form>
                   <div class="cs80-ctrl-row">
                     <span class="meta">屏幕亮度：</span>
                     <div id="cs80-brightness-pills" class="hub-filter-pills" role="group" aria-label="屏幕亮度预设">
-                      <button class="hub-filter-pill active" type="button" data-brightness="100">100% 零频闪</button>
-                      <button class="hub-filter-pill" type="button" data-brightness="80">80%</button>
-                      <button class="hub-filter-pill" type="button" data-brightness="60">60%</button>
-                      <button class="hub-filter-pill" type="button" data-brightness="35">35%</button>
-                      <button class="hub-filter-pill" type="button" data-brightness="15">15%</button>
+                      <button class="hub-filter-pill active" type="button" aria-pressed="true" data-brightness="100">100% 零频闪</button>
+                      <button class="hub-filter-pill" type="button" aria-pressed="false" data-brightness="80">80%</button>
+                      <button class="hub-filter-pill" type="button" aria-pressed="false" data-brightness="60">60%</button>
+                      <button class="hub-filter-pill" type="button" aria-pressed="false" data-brightness="35">35%</button>
+                      <button class="hub-filter-pill" type="button" aria-pressed="false" data-brightness="15">15%</button>
                     </div>
                   </div>
                   <div class="cs80-ctrl-row">
@@ -1193,11 +1345,11 @@
               <button id="laifen-refresh-btn" class="mini-button" type="button">↻ 刷新看板</button>
             </div>
           </div>
-          <p id="laifen-action-status" class="health-status-banner" hidden></p>
+          <p id="laifen-action-status" class="health-status-banner" role="status" hidden></p>
 
           <div id="laifen-kpi-grid" class="hub-kpi-grid"></div>
 
-          <section class="model-modal-section laifen-hero-grid" aria-label="实时监听与打卡控制">
+          <section class="model-modal-section laifen-hero-grid">
             <div class="health-hero-card">
               <div class="modal-row-head">
                 <h4>蓝牙状态与刷牙监听</h4>
@@ -1221,7 +1373,7 @@
             </div>
           </section>
 
-          <section class="model-modal-section" aria-label="档位与三维扫振参数调节">
+          <section class="model-modal-section">
             <div class="modal-row-head">
               <h3>档位模式、三维扫振与功能开关</h3>
               <button id="laifen-apply-btn" class="primary" type="button">⚡ 唤醒并写入牙刷</button>
@@ -1230,10 +1382,10 @@
               <div class="laifen-pill-row">
                 <span class="meta">运行档位：</span>
                 <div id="laifen-mode-pills" class="hub-filter-pills" role="group" aria-label="牙刷档位">
-                  <button class="hub-filter-pill active" type="button" data-mode="1">一档 · 柔和</button>
-                  <button class="hub-filter-pill" type="button" data-mode="2">二档 · 日常</button>
-                  <button class="hub-filter-pill" type="button" data-mode="3">三档 · 强劲</button>
-                  <button class="hub-filter-pill" type="button" data-mode="4">四档 · 高频</button>
+                  <button class="hub-filter-pill active" type="button" aria-pressed="true" data-mode="1">一档 · 柔和</button>
+                  <button class="hub-filter-pill" type="button" aria-pressed="false" data-mode="2">二档 · 日常</button>
+                  <button class="hub-filter-pill" type="button" aria-pressed="false" data-mode="3">三档 · 强劲</button>
+                  <button class="hub-filter-pill" type="button" aria-pressed="false" data-mode="4">四档 · 高频</button>
                 </div>
               </div>
               <div class="laifen-pill-row">
@@ -1287,16 +1439,16 @@
             </div>
           </section>
 
-          <section class="model-modal-section" aria-label="设备绑定与安全操作">
+          <section class="model-modal-section">
             <details class="hub-compose-details">
               <summary class="hub-compose-summary">⚙️ 设备 MAC 绑定、刷头周期与目标设置</summary>
-              <div class="hub-compose-body">
+              <form id="laifen-cfg-form" class="hub-compose-body" novalidate>
                 <div class="modal-form-grid">
                   <label>绑定蓝牙 MAC（留空自动匹配）
-                    <input id="laifen-cfg-mac" type="text" placeholder="如：C0:00:00:AA:BB:CC">
+                    <input id="laifen-cfg-mac" type="text" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="如：C0:00:00:AA:BB:CC">
                   </label>
                   <label>广播名称前缀
-                    <input id="laifen-cfg-prefix" type="text" placeholder="LFTB">
+                    <input id="laifen-cfg-prefix" type="text" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="LFTB">
                   </label>
                   <label>刷头更换周期（天）
                     <input id="laifen-cfg-lifespan" type="number" min="15" max="365" value="90">
@@ -1307,9 +1459,9 @@
                 </div>
                 <div class="modal-row-head">
                   <span></span>
-                  <button id="laifen-cfg-save-btn" class="primary" type="button">💾 保存配置</button>
+                  <button id="laifen-cfg-save-btn" class="primary" type="submit">💾 保存配置</button>
                 </div>
-              </div>
+              </form>
             </details>
 
             <details class="hub-compose-details">
@@ -1325,7 +1477,7 @@
             </details>
           </section>
 
-          <section class="model-modal-section" aria-label="历史刷牙打卡明细">
+          <section class="model-modal-section">
             <div class="modal-row-head">
               <div>
                 <h3>刷牙打卡记录</h3>
@@ -1349,9 +1501,9 @@
               <button id="ninebot-refresh-btn" class="mini-button" type="button">↻ 刷新</button>
             </div>
           </div>
-          <p id="ninebot-action-status" class="health-status-banner" hidden></p>
+          <p id="ninebot-action-status" class="health-status-banner" role="status" hidden></p>
 
-          <section id="ninebot-cockpit-card" class="ninebot-cockpit-card" data-tone="muted" aria-label="九号座驾数字座舱">
+          <section id="ninebot-cockpit-card" class="ninebot-cockpit-card" data-tone="muted">
             <div class="ninebot-cockpit-head">
               <div class="ninebot-identity-group">
                 <h4 id="ninebot-vehicle-title" class="ninebot-vehicle-title">九号座驾</h4>
@@ -1383,7 +1535,7 @@
 
               <div class="ninebot-scooter-stage">
                 <div class="ninebot-stage-glow" aria-hidden="true"></div>
-                <img id="ninebot-vehicle-img" class="ninebot-vehicle-img" alt="九号实车渲染图" hidden>
+                <img id="ninebot-vehicle-img" class="ninebot-vehicle-img" width="520" height="320" decoding="async" fetchpriority="low" alt="九号实车渲染图" hidden>
                 <svg id="ninebot-vehicle-fallback" class="ninebot-vehicle-fallback" viewBox="0 0 260 160" aria-hidden="true">
                   <ellipse class="nb-svg-shadow" cx="130" cy="142" rx="88" ry="8"></ellipse>
                   <circle class="nb-svg-wheel" cx="62" cy="118" r="22"></circle>
@@ -1401,10 +1553,10 @@
               </div>
             </div>
 
-            <div id="ninebot-status-dock" class="ninebot-status-dock" aria-label="车辆四维状态舱"></div>
+            <div id="ninebot-status-dock" class="ninebot-status-dock" role="region" aria-label="车辆四维状态舱"></div>
           </section>
 
-          <section class="model-modal-section ninebot-hero-grid" aria-label="停放位置与电量趋势">
+          <section class="model-modal-section ninebot-hero-grid">
             <div class="health-hero-card">
               <div class="modal-row-head">
                 <h4>📍 停放位置与主动守护</h4>
@@ -1422,57 +1574,57 @@
               <div class="modal-row-head">
                 <h4>📈 电量与续航历史趋势</h4>
                 <div id="ninebot-trend-pills" class="hub-filter-pills" role="group" aria-label="趋势指标切换">
-                  <button class="hub-filter-pill active" type="button" data-metric="battery">主电池 %</button>
-                  <button class="hub-filter-pill" type="button" data-metric="range">精准续航 km</button>
+                  <button class="hub-filter-pill active" type="button" aria-pressed="true" data-metric="battery">主电池 %</button>
+                  <button class="hub-filter-pill" type="button" aria-pressed="false" data-metric="range">精准续航 km</button>
                 </div>
               </div>
               <div class="ninebot-canvas-wrap">
-                <canvas id="ninebot-trend-canvas" class="ninebot-trend-canvas" width="520" height="156"></canvas>
+                <canvas id="ninebot-trend-canvas" class="ninebot-trend-canvas" width="520" height="156" role="img" aria-label="九号电量与续航历史趋势图"></canvas>
               </div>
               <p id="ninebot-trend-caption" class="meta">暂无历史快照点。</p>
             </div>
           </section>
 
-          <section class="model-modal-section" aria-label="历史骑行轨迹与极速明细">
+          <section class="model-modal-section">
             <div class="modal-row-head">
               <div>
                 <h3>🛣️ 骑行记录与极速统计</h3>
                 <span id="ninebot-trips-subtitle" class="meta">暂无本地骑行行程缓存。</span>
               </div>
               <div class="health-header-actions">
-                <input id="ninebot-month-input" class="hub-input mono-input" type="text" placeholder="YYYYMM，留空当月">
+                <input id="ninebot-month-input" class="hub-input mono-input" type="text" maxlength="6" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="YYYYMM，留空当月" aria-label="查询骑行记录月份 (YYYYMM)">
               </div>
             </div>
             <div id="ninebot-trip-kpis" class="ninebot-trip-kpis"></div>
             <div id="ninebot-trips-list" class="ninebot-trips-list"><p class="empty">暂无骑行记录。</p></div>
           </section>
 
-          <section class="model-modal-section" aria-label="账号绑定与守护阈值配置">
+          <section class="model-modal-section">
             <details class="hub-compose-details">
               <summary class="hub-compose-summary">🔑 九号账号登录绑定（强烈建议使用家庭只读子账号）</summary>
-              <div class="hub-compose-body">
+              <form id="ninebot-login-form" class="hub-compose-body" novalidate>
                 <p id="ninebot-login-status-hint" class="hint">尚未绑定九号账号</p>
                 <div class="modal-form-grid">
                   <label>子账号手机号
-                    <input id="ninebot-login-user" type="text" placeholder="九号子账号手机号" autocomplete="off">
+                    <input id="ninebot-login-user" type="tel" autocomplete="username" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="九号子账号手机号">
                   </label>
                   <label>登录密码
-                    <input id="ninebot-login-pass" type="password" placeholder="App 内设置的登录密码" autocomplete="new-password">
+                    <input id="ninebot-login-pass" type="password" autocomplete="current-password" placeholder="App 内设置的登录密码">
                   </label>
                   <label>区号
-                    <input id="ninebot-login-area" type="text" value="86">
+                    <input id="ninebot-login-area" type="text" value="86" inputmode="numeric">
                   </label>
                 </div>
                 <div class="modal-row-head">
                   <button id="ninebot-clear-creds-btn" class="mini-button danger-btn" type="button">🗑 清除已存凭据</button>
-                  <button id="ninebot-login-btn" class="primary" type="button">🔑 登录并绑定车辆</button>
+                  <button id="ninebot-login-btn" class="primary" type="submit">🔑 登录并绑定车辆</button>
                 </div>
-              </div>
+              </form>
             </details>
 
             <details class="hub-compose-details">
               <summary class="hub-compose-summary">🛡️ 主动巡检阈值与高德逆地理设置</summary>
-              <div class="hub-compose-body">
+              <form id="ninebot-cfg-form" class="hub-compose-body" novalidate>
                 <div class="modal-form-grid">
                   <label>默认车型网关
                     <select id="ninebot-cfg-line">
@@ -1493,7 +1645,7 @@
                     <input id="ninebot-cfg-cooldown" type="number" min="1" max="168" value="12">
                   </label>
                   <label>官方 DeviceService Key（可选）
-                    <input id="ninebot-cfg-dskey" type="password" placeholder="可选：输入 NINEBOT_DEVICESERVICE_KEY" autocomplete="off">
+                    <input id="ninebot-cfg-dskey" type="password" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="可选：输入 NINEBOT_DEVICESERVICE_KEY">
                   </label>
                 </div>
                 <div class="modal-row-head">
@@ -1505,9 +1657,9 @@
                     <input id="ninebot-cfg-unlocked" type="checkbox" checked>
                     <span>巡检时检查未锁车 / 电门未关状态</span>
                   </label>
-                  <button id="ninebot-cfg-save-btn" class="primary" type="button">💾 保存守护配置</button>
+                  <button id="ninebot-cfg-save-btn" class="primary" type="submit">💾 保存守护配置</button>
                 </div>
-              </div>
+              </form>
             </details>
           </section>
         </div>
@@ -1524,11 +1676,11 @@
               <button id="netlea-refresh-btn" class="mini-button" type="button">↻ 刷新缓存</button>
             </div>
           </div>
-          <p id="netlea-action-status" class="health-status-banner" hidden></p>
+          <p id="netlea-action-status" class="health-status-banner" role="status" hidden></p>
 
           <div id="netlea-kpi-grid" class="hub-kpi-grid"></div>
 
-          <section class="model-modal-section" aria-label="快捷临时控光">
+          <section class="model-modal-section">
             <div class="hub-form-card netlea-quick-card">
               <div class="modal-row-head">
                 <div class="modal-btn-group">
@@ -1552,23 +1704,23 @@
           </section>
 
           <div class="modal-row-head">
-            <div id="netlea-workspace-tabs" class="hub-filter-pills" role="tablist" aria-label="鱼缸灯光功能模式">
-              <button class="hub-filter-pill active" type="button" role="tab" aria-selected="true" data-netlea-view="schedule">📅 定时行程与日出日落</button>
-              <button class="hub-filter-pill" type="button" role="tab" aria-selected="false" data-netlea-view="preset">🌱 官方养殖预设</button>
-              <button class="hub-filter-pill" type="button" role="tab" aria-selected="false" data-netlea-view="manual">🎛️ 手动控光与光谱库</button>
+            <div id="netlea-workspace-tabs" class="hub-filter-pills" role="tablist" aria-label="鱼缸灯光功能模式" focusgroup="tablist nomemory">
+              <button id="netlea-tab-schedule" class="hub-filter-pill active" type="button" role="tab" aria-selected="true" aria-controls="netlea-view-schedule" focusgroupstart data-netlea-view="schedule">📅 定时行程与日出日落</button>
+              <button id="netlea-tab-preset" class="hub-filter-pill" type="button" role="tab" aria-selected="false" aria-controls="netlea-view-preset" data-netlea-view="preset">🌱 官方养殖预设</button>
+              <button id="netlea-tab-manual" class="hub-filter-pill" type="button" role="tab" aria-selected="false" aria-controls="netlea-view-manual" data-netlea-view="manual">🎛️ 手动控光与光谱库</button>
             </div>
             <span id="netlea-model-pill" class="hub-badge badge-slate">SG-X-PRO-60 · 22W</span>
           </div>
 
           <!-- 视图 1：定时行程与日出日落 -->
-          <section id="netlea-view-schedule" class="model-modal-section" aria-label="24小时定时行程与日出日落">
+          <section id="netlea-view-schedule" class="model-modal-section" role="tabpanel" aria-labelledby="netlea-tab-schedule">
             <div class="hub-form-card">
               <div class="modal-row-head">
                 <h3>🌅 24 小时日出/日落光照曲线</h3>
                 <span id="netlea-sched-badge" class="hub-badge badge-slate">未配置行程</span>
               </div>
               <div class="netlea-canvas-wrap">
-                <canvas id="netlea-timeline-canvas" class="netlea-timeline-canvas" width="880" height="190" aria-label="24小时光照与日出日落曲线图"></canvas>
+                <canvas id="netlea-timeline-canvas" class="netlea-timeline-canvas" width="880" height="190" role="img" aria-label="24小时光照与日出日落曲线图"></canvas>
               </div>
               <p id="netlea-timeline-caption" class="meta">当前尚未读取到灯内行程；可点击下方「从灯具读取行程」或新增时段。</p>
 
@@ -1605,7 +1757,7 @@
                 <p class="empty">暂无定时时段，点击「＋ 新增时段」或切换到「🌱 官方养殖预设」一键生成。</p>
               </div>
 
-              <div id="netlea-trip-editor" class="netlea-trip-editor" hidden>
+              <form id="netlea-trip-editor" class="netlea-trip-editor" novalidate hidden>
                 <div class="modal-row-head">
                   <h4 id="netlea-trip-editor-title">编辑定时时段</h4>
                   <label class="hub-checkbox-label">
@@ -1680,16 +1832,16 @@
                   <span></span>
                   <div class="modal-btn-group">
                     <button id="netlea-trip-cancel-btn" class="mini-button" type="button">取消</button>
-                    <button id="netlea-trip-apply-btn" class="primary" type="button">✓ 保存时段到列表</button>
+                    <button id="netlea-trip-apply-btn" class="primary" type="submit">✓ 保存时段到列表</button>
                   </div>
                 </div>
-              </div>
+              </form>
             </div>
           </section>
 
           <!-- 视图 2：官方科学养殖预设 -->
-          <section id="netlea-view-preset" class="model-modal-section" aria-label="官方科学养殖预设" hidden>
-            <div class="hub-form-card">
+          <section id="netlea-view-preset" class="model-modal-section" role="tabpanel" aria-labelledby="netlea-tab-preset" hidden>
+            <form id="netlea-preset-form" class="hub-form-card" novalidate>
               <div class="modal-row-head">
                 <div>
                   <h3>🌱 尼特利官方科学养殖预设向导</h3>
@@ -1726,14 +1878,14 @@
                 <span></span>
                 <div class="modal-btn-group">
                   <button id="netlea-preset-import-btn" class="mini-button" type="button">✏️ 导入行程编辑器微调</button>
-                  <button id="netlea-preset-apply-btn" class="primary" type="button">🚀 一键写入此预设行程</button>
+                  <button id="netlea-preset-apply-btn" class="primary" type="submit">🚀 一键写入此预设行程</button>
                 </div>
               </div>
-            </div>
+            </form>
           </section>
 
           <!-- 视图 3：手动控光、12 原厂光谱与配置 -->
-          <section id="netlea-view-manual" class="model-modal-section" aria-label="手动控光与原厂光谱库" hidden>
+          <section id="netlea-view-manual" class="model-modal-section" role="tabpanel" aria-labelledby="netlea-tab-manual" hidden>
             <div class="netlea-hero-grid">
               <div class="hub-form-card">
                 <div class="modal-row-head">
@@ -1797,7 +1949,7 @@
               <div class="hub-form-card">
                 <h3>🎨 四通道实时光谱分布</h3>
                 <div class="netlea-canvas-wrap">
-                  <canvas id="netlea-spectrum-canvas" class="netlea-spectrum-canvas" width="560" height="176"></canvas>
+                  <canvas id="netlea-spectrum-canvas" class="netlea-spectrum-canvas" width="560" height="176" role="img" aria-label="四通道实时光谱分布图"></canvas>
                 </div>
                 <p id="netlea-device-meta" class="meta">尚未读取鱼缸灯实时数据，点击右上角「实时同步」连接灯具。</p>
               </div>
@@ -1805,7 +1957,7 @@
 
             <details class="hub-compose-details">
               <summary class="hub-compose-summary">⏱️ 灯内默认临时开/关灯时长配置 (0x1A)</summary>
-              <div class="hub-compose-body">
+              <form id="netlea-cfg-temp-form" class="hub-compose-body" novalidate>
                 <div class="hub-form-grid">
                   <label>默认临时开灯时长（分钟，1-300）
                     <input id="netlea-cfg-on-min" type="number" min="1" max="300" value="20">
@@ -1816,28 +1968,28 @@
                 </div>
                 <div class="modal-row-head">
                   <span></span>
-                  <button id="netlea-cfg-temp-save-btn" class="primary" type="button">💾 写入灯具默认临时参数</button>
+                  <button id="netlea-cfg-temp-save-btn" class="primary" type="submit">💾 写入灯具默认临时参数</button>
                 </div>
-              </div>
+              </form>
             </details>
 
             <details class="hub-compose-details">
               <summary class="hub-compose-summary">⚙️ 蓝牙绑定参数与扫描列表</summary>
-              <div class="hub-compose-body">
+              <form id="netlea-cfg-form" class="hub-compose-body" novalidate>
                 <div class="hub-form-grid">
                   <label>绑定灯具 MAC（可选）
-                    <input id="netlea-cfg-mac" type="text" placeholder="留空自动发现，或填 AA:BB:CC:DD:EE:FF">
+                    <input id="netlea-cfg-mac" type="text" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="留空自动发现，或填 AA:BB:CC:DD:EE:FF">
                   </label>
                   <label>蓝牙名称前缀
-                    <input id="netlea-cfg-prefix" type="text" placeholder="SG-">
+                    <input id="netlea-cfg-prefix" type="text" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="SG-">
                   </label>
                 </div>
                 <div class="modal-row-head">
                   <span></span>
-                  <button id="netlea-cfg-save-btn" class="primary" type="button">💾 保存绑定配置</button>
+                  <button id="netlea-cfg-save-btn" class="primary" type="submit">💾 保存绑定配置</button>
                 </div>
                 <div id="netlea-scan-list" class="netlea-scan-list"></div>
-              </div>
+              </form>
             </details>
           </section>
         </div>
@@ -1853,41 +2005,43 @@
               <button id="apple-logout-btn" class="mini-button danger-btn" type="button" hidden>🚪 退出账号</button>
             </div>
           </div>
-          <p id="apple-action-status" class="health-status-banner" hidden></p>
+          <p id="apple-action-status" class="health-status-banner" role="status" hidden></p>
 
-          <section id="apple-auth-section" class="model-modal-section" aria-label="Apple ID 本地绑定与双重认证">
+          <section id="apple-auth-section" class="model-modal-section">
             <div class="apple-auth-card">
               <div class="modal-row-head">
                 <h3>🔐 本地绑定 Apple ID（SRP-6a + 2FA）</h3>
                 <span id="apple-bound-account" class="meta">未绑定</span>
               </div>
-              <div id="apple-login-form" class="modal-form-grid">
-                <label>账号区域
-                  <select id="apple-region-select">
-                    <option value="cn">中国大陆 · 云上贵州 (icloud.com.cn)</option>
-                    <option value="global">国际区 (icloud.com)</option>
-                  </select>
-                </label>
-                <label>Apple ID（邮箱或手机号）
-                  <input id="apple-id-input" type="text" autocomplete="username" placeholder="name@icloud.com">
-                </label>
-                <label>Apple ID 主密码（非 App 专用密码）
-                  <input id="apple-password-input" type="password" autocomplete="current-password" placeholder="仅本机直连验证，不保存明文">
-                </label>
-              </div>
-              <div id="apple-login-actions" class="modal-row-head">
-                <span></span>
-                <button id="apple-login-btn" class="primary" type="button">🔑 发起登录</button>
-              </div>
+              <form id="apple-login-submit-form" novalidate>
+                <div id="apple-login-form" class="modal-form-grid">
+                  <label>账号区域
+                    <select id="apple-region-select">
+                      <option value="cn">中国大陆 · 云上贵州 (icloud.com.cn)</option>
+                      <option value="global">国际区 (icloud.com)</option>
+                    </select>
+                  </label>
+                  <label>Apple ID（邮箱或手机号）
+                    <input id="apple-id-input" type="text" autocomplete="username" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="name@icloud.com">
+                  </label>
+                  <label>Apple ID 主密码（非 App 专用密码）
+                    <input id="apple-password-input" type="password" autocomplete="current-password" placeholder="仅本机直连验证，不保存明文">
+                  </label>
+                </div>
+                <div id="apple-login-actions" class="modal-row-head">
+                  <span></span>
+                  <button id="apple-login-btn" class="primary" type="submit">🔑 发起登录</button>
+                </div>
+              </form>
 
-              <div id="apple-2fa-box" class="apple-2fa-box" hidden>
+              <form id="apple-2fa-box" class="apple-2fa-box" novalidate hidden>
                 <div class="modal-row-head">
                   <strong>📱 请输入 6 位双重认证验证码</strong>
                   <span id="apple-2fa-phones" class="meta"></span>
                 </div>
                 <div class="modal-form-grid">
                   <label>6 位验证码
-                    <input id="apple-2fa-code-input" type="text" inputmode="numeric" maxlength="6" placeholder="例如 123456">
+                    <input id="apple-2fa-code-input" type="text" autocomplete="one-time-code" inputmode="numeric" pattern="\d{6}" maxlength="6" placeholder="例如 123456">
                   </label>
                   <label>验证方式
                     <select id="apple-2fa-mode-select">
@@ -1901,15 +2055,15 @@
                     <button id="apple-sms-btn" class="mini-button" type="button">📩 改发短信验证码</button>
                     <button id="apple-bypass-2fa-btn" class="mini-button" type="button">⚡ 免码临时直通</button>
                   </div>
-                  <button id="apple-2fa-verify-btn" class="primary" type="button">✅ 完成双重认证</button>
+                  <button id="apple-2fa-verify-btn" class="primary" type="submit">✅ 完成双重认证</button>
                 </div>
-              </div>
+              </form>
             </div>
           </section>
 
           <div id="apple-kpi-grid" class="hub-kpi-grid"></div>
 
-          <section class="model-modal-section" aria-label="已发现的苹果设备">
+          <section class="model-modal-section">
             <div class="modal-row-head">
               <div>
                 <h3>设备列表与实时状态</h3>
@@ -1922,10 +2076,10 @@
             </div>
           </section>
 
-          <section class="model-modal-section" aria-label="防耗电缓存与地点围栏配置">
+          <section class="model-modal-section">
             <details id="apple-config-details" class="hub-compose-details">
               <summary class="hub-compose-summary">⚙️ 缓存冷却、低电量告警阈值与常用地点围栏配置</summary>
-              <div class="hub-compose-body">
+              <form id="apple-cfg-form" class="hub-compose-body" novalidate>
                 <div class="modal-form-grid">
                   <label>缓存有效期（秒，防频繁唤醒耗电）
                     <input id="apple-cfg-cache-ttl" type="number" min="0" max="86400" value="300">
@@ -1956,9 +2110,9 @@
                 </div>
                 <div class="modal-row-head">
                   <span></span>
-                  <button id="apple-cfg-save-btn" class="primary" type="button">💾 保存配置</button>
+                  <button id="apple-cfg-save-btn" class="primary" type="submit">💾 保存配置</button>
                 </div>
-              </div>
+              </form>
             </details>
           </section>
         </div>
@@ -1975,31 +2129,31 @@
               <button id="miot-refresh-btn" class="mini-button" type="button">↻ 刷新中枢</button>
             </div>
           </div>
-          <p id="miot-action-status" class="health-status-banner" hidden></p>
+          <p id="miot-action-status" class="health-status-banner" role="status" hidden></p>
 
           <div id="miot-kpi-grid" class="hub-kpi-grid"></div>
 
           <div class="modal-row-head">
-            <div id="miot-workspace-tabs" class="hub-filter-pills" role="tablist" aria-label="米家中枢功能视图">
-              <button class="hub-filter-pill active" type="button" role="tab" aria-selected="true" data-miot-view="mesh">📡 设备与 Mesh 中枢</button>
-              <button class="hub-filter-pill" type="button" role="tab" aria-selected="false" data-miot-view="geek">⚡ 自动化极客版</button>
-              <button class="hub-filter-pill" type="button" role="tab" aria-selected="false" data-miot-view="scenes">🎬 本地场景与变量</button>
-              <button class="hub-filter-pill" type="button" role="tab" aria-selected="false" data-miot-view="config">⚙️ 中枢与保护配置</button>
+            <div id="miot-workspace-tabs" class="hub-filter-pills" role="tablist" aria-label="米家中枢功能视图" focusgroup="tablist nomemory">
+              <button id="miot-tab-mesh" class="hub-filter-pill active" type="button" role="tab" aria-selected="true" aria-controls="miot-view-mesh" focusgroupstart data-miot-view="mesh">📡 设备与 Mesh 中枢</button>
+              <button id="miot-tab-geek" class="hub-filter-pill" type="button" role="tab" aria-selected="false" aria-controls="miot-view-geek" data-miot-view="geek">⚡ 自动化极客版</button>
+              <button id="miot-tab-scenes" class="hub-filter-pill" type="button" role="tab" aria-selected="false" aria-controls="miot-view-scenes" data-miot-view="scenes">🎬 本地场景与变量</button>
+              <button id="miot-tab-config" class="hub-filter-pill" type="button" role="tab" aria-selected="false" aria-controls="miot-view-config" data-miot-view="config">⚙️ 中枢与保护配置</button>
             </div>
           </div>
 
-          <section id="miot-view-mesh" class="model-modal-section" aria-label="设备与蓝牙 Mesh 中枢">
+          <section id="miot-view-mesh" class="model-modal-section" role="tabpanel" aria-labelledby="miot-tab-mesh">
             <div id="miot-gateway-card" class="hub-form-card miot-gateway-card"></div>
 
             <div class="modal-row-head miot-filter-bar">
               <div id="miot-room-pills" class="hub-filter-pills" role="group" aria-label="按房间筛选设备"></div>
               <div class="modal-btn-group">
                 <div id="miot-channel-pills" class="hub-filter-pills" role="group" aria-label="按控制通道筛选">
-                  <button class="hub-filter-pill active" type="button" data-miot-channel="all">全部通道</button>
-                  <button class="hub-filter-pill" type="button" data-miot-channel="bt_mesh">蓝牙 Mesh</button>
-                  <button class="hub-filter-pill" type="button" data-miot-channel="miio_udp">Wi-Fi MiIO</button>
-                  <button class="hub-filter-pill" type="button" data-miot-channel="xiaoai_nlp">小爱红外</button>
-                  <button class="hub-filter-pill" type="button" data-miot-channel="tv_agent">智能电视</button>
+                  <button class="hub-filter-pill active" type="button" aria-pressed="true" data-miot-channel="all">全部通道</button>
+                  <button class="hub-filter-pill" type="button" aria-pressed="false" data-miot-channel="bt_mesh">蓝牙 Mesh</button>
+                  <button class="hub-filter-pill" type="button" aria-pressed="false" data-miot-channel="miio_udp">Wi-Fi MiIO</button>
+                  <button class="hub-filter-pill" type="button" aria-pressed="false" data-miot-channel="xiaoai_nlp">小爱红外</button>
+                  <button class="hub-filter-pill" type="button" aria-pressed="false" data-miot-channel="tv_agent">智能电视</button>
                 </div>
                 <button id="miot-batch-on-btn" class="mini-button" type="button">💡 Mesh 全开</button>
                 <button id="miot-batch-off-btn" class="mini-button" type="button">🌑 Mesh 全关</button>
@@ -2011,7 +2165,7 @@
             </div>
           </section>
 
-          <section id="miot-view-geek" class="model-modal-section" aria-label="米家自动化极客版" hidden>
+          <section id="miot-view-geek" class="model-modal-section" role="tabpanel" aria-labelledby="miot-tab-geek" hidden>
             <div class="modal-row-head">
               <div>
                 <h3>⚡ 本地极客版规则（autoLocal_service）</h3>
@@ -2024,7 +2178,7 @@
               </div>
             </div>
 
-            <div id="miot-geek-create-box" class="hub-form-card miot-geek-create-box" hidden>
+            <form id="miot-geek-create-box" class="hub-form-card miot-geek-create-box" novalidate hidden>
               <div class="modal-row-head">
                 <strong>⏱️ 快速生成极客版每日定时规则</strong>
                 <span class="meta">写入后可直接生效，也可在官方 8086 画布继续扩展节点</span>
@@ -2051,10 +2205,10 @@
                 <span></span>
                 <div class="modal-btn-group">
                   <button id="miot-geek-cancel-btn" class="mini-button" type="button">取消</button>
-                  <button id="miot-geek-create-btn" class="primary" type="button">💾 写入中枢引擎</button>
+                  <button id="miot-geek-create-btn" class="primary" type="submit">💾 写入中枢引擎</button>
                 </div>
               </div>
-            </div>
+            </form>
 
             <div id="miot-geek-list" class="miot-geek-list">
               <p class="empty">暂无极客版规则。</p>
@@ -2079,7 +2233,7 @@
             </div>
           </section>
 
-          <section id="miot-view-scenes" class="model-modal-section" aria-label="本地场景与自定义变量" hidden>
+          <section id="miot-view-scenes" class="model-modal-section" role="tabpanel" aria-labelledby="miot-tab-scenes" hidden>
             <div class="modal-row-head">
               <div>
                 <h3>🎬 中枢本地化手动场景</h3>
@@ -2098,45 +2252,47 @@
                   <span class="meta">Friday 可实时写入或读取极客版变量（scope 与 id 仅限英文字母与数字）。</span>
                 </div>
               </div>
-              <div class="modal-form-grid">
-                <label>作用域（Scope）
-                  <input id="miot-var-scope" type="text" placeholder="例如 friday">
-                </label>
-                <label>变量 ID
-                  <input id="miot-var-id" type="text" placeholder="例如 awayMode">
-                </label>
-                <label>类型
-                  <select id="miot-var-type">
-                    <option value="number">数字 (number)</option>
-                    <option value="string">字符串 (string)</option>
-                  </select>
-                </label>
-                <label>初始值
-                  <input id="miot-var-value" type="text" placeholder="0 或文本">
-                </label>
-              </div>
-              <div class="modal-row-head">
-                <span></span>
-                <button id="miot-var-create-btn" class="primary" type="button">＋ 创建变量</button>
-              </div>
+              <form id="miot-vars-form" novalidate>
+                <div class="modal-form-grid">
+                  <label>作用域（Scope）
+                    <input id="miot-var-scope" type="text" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="例如 friday">
+                  </label>
+                  <label>变量 ID
+                    <input id="miot-var-id" type="text" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="例如 awayMode">
+                  </label>
+                  <label>类型
+                    <select id="miot-var-type">
+                      <option value="number">数字 (number)</option>
+                      <option value="string">字符串 (string)</option>
+                    </select>
+                  </label>
+                  <label>初始值
+                    <input id="miot-var-value" type="text" placeholder="0 或文本">
+                  </label>
+                </div>
+                <div class="modal-row-head">
+                  <span></span>
+                  <button id="miot-var-create-btn" class="primary" type="submit">＋ 创建变量</button>
+                </div>
+              </form>
               <div id="miot-vars-list" class="miot-vars-list">
                 <p class="empty">暂无极客版自定义变量。</p>
               </div>
             </div>
           </section>
 
-          <section id="miot-view-config" class="model-modal-section" aria-label="中枢与设备保护配置" hidden>
-            <div id="miot-config-card" class="hub-form-card">
+          <section id="miot-view-config" class="model-modal-section" role="tabpanel" aria-labelledby="miot-tab-config" hidden>
+            <form id="miot-config-card" class="hub-form-card" novalidate>
               <div class="modal-row-head">
                 <h3>⚙️ BE6500 Pro 中枢连接与防误关保护</h3>
                 <span class="meta">保存后立即持久化到插件本地安全配置</span>
               </div>
               <div class="modal-form-grid">
                 <label>路由器中枢 SSH（routerSsh）
-                  <input id="miot-cfg-router" type="text" placeholder="例如 root@192.0.2.1">
+                  <input id="miot-cfg-router" type="text" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="例如 root@192.0.2.1">
                 </label>
                 <label>小爱音箱 SSH（speakerSsh，留空自动发现）
-                  <input id="miot-cfg-speaker" type="text" placeholder="例如 lx06=root@192.0.2.10">
+                  <input id="miot-cfg-speaker" type="text" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="例如 lx06=root@192.0.2.10">
                 </label>
                 <label>保护设备列表（逗号分隔，防批量/语音误关）
                   <input id="miot-cfg-protected" type="text" placeholder="例如：水族箱灯, 加湿器">
@@ -2156,71 +2312,70 @@
               </div>
               <div class="modal-row-head">
                 <span></span>
-                <button id="miot-cfg-save-btn" class="primary" type="button">💾 保存中枢配置</button>
+                <button id="miot-cfg-save-btn" class="primary" type="submit">💾 保存中枢配置</button>
               </div>
-            </div>
+            </form>
           </section>
-        </div>
         </div>
       </div>
     </div>
-  </div>
+  </dialog>
 
   <!-- 5. 系统底座弹窗 (SYS：模型与提供方 + 用量账本 + 位置与地图底座) -->
-  <div id="system-hub-backdrop" class="modal-backdrop" hidden>
-    <div id="system-hub-modal" class="model-modal hub-modal system-modal" role="dialog" aria-modal="true" aria-labelledby="system-modal-title">
-      <div class="model-modal-header system-modal-header">
-        <div class="hub-modal-title-block">
-          <h2 id="system-modal-title">⚙️ 系统底座</h2>
-        </div>
-        <div class="hub-modal-header-right">
-          <div id="system-hub-tabs" class="hub-surface-tabs" role="tablist" aria-label="系统底座视图切换">
-            <button id="system-tab-models" class="hub-surface-tab active" type="button" role="tab" aria-selected="true" aria-controls="system-panel-models" data-system-tab="models">
-              <span>🧩 模型与提供方</span>
-              <span id="model-top-badge" class="hub-pill-badge">—</span>
-            </button>
-            <button id="system-tab-usage" class="hub-surface-tab" type="button" role="tab" aria-selected="false" aria-controls="system-panel-usage" data-system-tab="usage">
-              <span>📊 用量账本</span>
-              <span id="usage-top-badge" class="hub-pill-badge">0</span>
-            </button>
-            <button id="system-tab-services" class="hub-surface-tab" type="button" role="tab" aria-selected="false" aria-controls="system-panel-services" data-system-tab="services">
-              <span>🗺️ 位置与地图底座</span>
-              <span id="services-top-badge" class="hub-pill-badge">—</span>
-            </button>
-          </div>
-          <button id="system-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
-        </div>
+  <dialog id="system-hub-dialog" class="hub-dialog model-modal hub-modal system-modal" closedby="any" aria-labelledby="system-modal-title">
+    <div class="model-modal-header system-modal-header">
+      <div class="hub-modal-title-block">
+        <h2 id="system-modal-title">⚙️ 系统底座</h2>
       </div>
-      <div class="model-modal-body system-modal-body">
-        <div id="system-panel-models" class="hub-tab-panel" role="tabpanel" aria-labelledby="system-tab-models">
-          <div id="model-current-status" class="hub-kpi-grid"></div>
+      <div class="hub-modal-header-right">
+        <div id="system-hub-tabs" class="hub-surface-tabs" role="tablist" aria-label="系统底座视图切换" focusgroup="tablist nomemory">
+          <button id="system-tab-models" class="hub-surface-tab active" type="button" role="tab" aria-selected="true" aria-controls="system-panel-models" focusgroupstart data-system-tab="models">
+            <span>🧩 模型与提供方</span>
+            <span id="model-top-badge" class="hub-pill-badge">—</span>
+          </button>
+          <button id="system-tab-usage" class="hub-surface-tab" type="button" role="tab" aria-selected="false" aria-controls="system-panel-usage" data-system-tab="usage">
+            <span>📊 用量账本</span>
+            <span id="usage-top-badge" class="hub-pill-badge">0</span>
+          </button>
+          <button id="system-tab-services" class="hub-surface-tab" type="button" role="tab" aria-selected="false" aria-controls="system-panel-services" data-system-tab="services">
+            <span>🗺️ 位置与地图底座</span>
+            <span id="services-top-badge" class="hub-pill-badge">—</span>
+          </button>
+        </div>
+        <button id="system-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
+      </div>
+    </div>
+    <div class="model-modal-body system-modal-body">
+      <div id="system-panel-models" class="hub-tab-panel" role="tabpanel" aria-labelledby="system-tab-models">
+        <div id="model-current-status" class="hub-kpi-grid"></div>
 
-          <section class="model-modal-section">
+        <section class="model-modal-section">
+          <div class="modal-row-head">
+            <h3>1. 接入模型提供方</h3>
+          </div>
+          <div id="modal-provider-tabs" class="modal-provider-tabs" role="tablist" aria-label="模型提供方" focusgroup="tablist nomemory"></div>
+          <div class="modal-auth-card">
             <div class="modal-row-head">
-              <h3>1. 接入模型提供方</h3>
-            </div>
-            <div id="modal-provider-tabs" class="modal-provider-tabs" role="tablist"></div>
-            <div class="modal-auth-card">
-              <div class="modal-row-head">
-                <div class="modal-provider-title-group">
-                  <strong id="modal-auth-provider-title" class="modal-provider-heading">DeepSeek</strong>
-                  <span id="modal-auth-status-badge" class="hub-status-pill">读取中…</span>
-                </div>
-                <button id="modal-auth-toggle-btn" class="mini-button" type="button">⏸ 禁用提供方</button>
+              <div class="modal-provider-title-group">
+                <strong id="modal-auth-provider-title" class="modal-provider-heading">DeepSeek</strong>
+                <span id="modal-auth-status-badge" class="hub-status-pill">读取中…</span>
               </div>
+              <button id="modal-auth-toggle-btn" class="mini-button" type="button">⏸ 禁用提供方</button>
+            </div>
+            <form id="model-auth-form" novalidate>
               <div class="modal-form-grid">
                 <label>
                   <span class="meta">API Key（留空保持已存凭据）</span>
-                  <input id="modal-auth-key-input" type="password" maxlength="512" placeholder="sk-...">
+                  <input id="modal-auth-key-input" type="password" maxlength="512" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="sk-...">
                 </label>
                 <label>
                   <span class="meta">Base URL（可选）</span>
-                  <input id="modal-auth-baseurl-input" type="text" maxlength="512" placeholder="https://api.deepseek.com/v1">
+                  <input id="modal-auth-baseurl-input" type="text" maxlength="512" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="https://api.deepseek.com/v1">
                 </label>
               </div>
               <label>
                 <span class="meta">自定义附加模型 ID（逗号分隔，可选）</span>
-                <input id="modal-auth-custom-models-input" type="text" maxlength="512" placeholder="如：deepseek-r1, qwen-coder-plus">
+                <input id="modal-auth-custom-models-input" type="text" maxlength="512" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="如：deepseek-r1, qwen-coder-plus">
               </label>
               <div class="modal-inline-test-bar">
                 <label class="modal-select-grow">
@@ -2230,352 +2385,237 @@
                 <div class="modal-btn-group">
                   <button id="modal-auth-fetch-btn" type="button">🔄 拉取模型</button>
                   <button id="modal-auth-test-btn" type="button">⚡ 测试</button>
-                  <button id="modal-auth-save-test-btn" class="primary" type="button">💾 保存并接入</button>
+                  <button id="modal-auth-save-test-btn" class="primary" type="submit">💾 保存并接入</button>
                   <button id="modal-auth-clear-btn" class="mini-button" type="button">清除 Key</button>
                 </div>
               </div>
-              <div id="modal-auth-probe-result" class="model-probe-result" hidden></div>
-              <details id="modal-auth-pool-details" class="hub-compose-details">
-                <summary class="hub-compose-summary">
-                  <span id="modal-auth-pool-summary">Worker 模型池：勾选启用的模型并指定等级</span>
-                </summary>
-                <div class="hub-compose-body">
-                  <div id="modal-auth-pool-list" class="modal-pool-select-list"></div>
-                  <div class="modal-btn-group">
-                    <button id="modal-auth-pool-save-btn" class="primary" type="button">💾 保存模型池勾选</button>
-                  </div>
-                </div>
-              </details>
-            </div>
-
-            <details id="modal-custom-provider-details" class="hub-compose-details">
+            </form>
+            <div id="modal-auth-probe-result" class="model-probe-result" hidden></div>
+            <details id="modal-auth-pool-details" class="hub-compose-details">
               <summary class="hub-compose-summary">
-                <span>+ 新增自定义提供方（OpenAI 兼容接口）</span>
+                <span id="modal-auth-pool-summary">Worker 模型池：勾选启用的模型并指定等级</span>
               </summary>
-              <div class="hub-compose-body">
-                <div class="modal-form-grid">
-                  <label>
-                    <span class="meta">提供方标识 (ID)</span>
-                    <input id="custom-prov-id-input" type="text" maxlength="64" placeholder="如：groq / together / my-gateway">
-                  </label>
-                  <label>
-                    <span class="meta">显示名称</span>
-                    <input id="custom-prov-name-input" type="text" maxlength="80" placeholder="如：Groq Cloud">
-                  </label>
-                  <label>
-                    <span class="meta">Base URL</span>
-                    <input id="custom-prov-url-input" type="text" maxlength="512" placeholder="https://api.groq.com/openai/v1">
-                  </label>
-                  <label>
-                    <span class="meta">API Key（可选）</span>
-                    <input id="custom-prov-key-input" type="password" maxlength="512" placeholder="gsk_...">
-                  </label>
+              <form id="model-auth-pool-form" class="hub-compose-body" novalidate>
+                <div id="modal-auth-pool-list" class="modal-pool-select-list"></div>
+                <div class="modal-btn-group">
+                  <button id="modal-auth-pool-save-btn" class="primary" type="submit">💾 保存模型池勾选</button>
                 </div>
-                <label>
-                  <span class="meta">默认模型 ID（逗号分隔，保存后也可从 /models 自动拉取）</span>
-                  <input id="custom-prov-models-input" type="text" maxlength="512" placeholder="如：llama-3.3-70b-versatile, deepseek-r1-distill-llama-70b">
-                </label>
-                <div class="modal-row-head">
-                  <span></span>
-                  <button id="custom-prov-save-btn" class="primary" type="button">💾 添加提供方</button>
-                </div>
-              </div>
+              </form>
             </details>
-          </section>
+          </div>
 
-          <section class="model-modal-section">
-            <div class="modal-row-head">
-              <h3>2. F.R.I.D.A.Y. 主控与 Worker 智能调度池</h3>
-            </div>
+          <details id="modal-custom-provider-details" class="hub-compose-details">
+            <summary class="hub-compose-summary">
+              <span>+ 新增自定义提供方（OpenAI 兼容接口）</span>
+            </summary>
+            <form id="custom-prov-form" class="hub-compose-body" novalidate>
+              <div class="modal-form-grid">
+                <label>
+                  <span class="meta">提供方标识 (ID)</span>
+                  <input id="custom-prov-id-input" type="text" maxlength="64" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="如：groq / together / my-gateway">
+                </label>
+                <label>
+                  <span class="meta">显示名称</span>
+                  <input id="custom-prov-name-input" type="text" maxlength="80" placeholder="如：Groq Cloud">
+                </label>
+                <label>
+                  <span class="meta">Base URL</span>
+                  <input id="custom-prov-url-input" type="text" maxlength="512" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="https://api.groq.com/openai/v1">
+                </label>
+                <label>
+                  <span class="meta">API Key（可选）</span>
+                  <input id="custom-prov-key-input" type="password" maxlength="512" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="gsk_...">
+                </label>
+              </div>
+              <label>
+                <span class="meta">默认模型 ID（逗号分隔，保存后也可从 /models 自动拉取）</span>
+                <input id="custom-prov-models-input" type="text" maxlength="512" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="如：llama-3.3-70b-versatile, deepseek-r1-distill-llama-70b">
+              </label>
+              <div class="modal-row-head">
+                <span></span>
+                <button id="custom-prov-save-btn" class="primary" type="submit">💾 添加提供方</button>
+              </div>
+            </form>
+          </details>
+        </section>
 
-            <div class="modal-tier-card router-tier-card">
-              <div class="modal-tier-row">
-                <div class="modal-tier-label">
-                  <div class="tier-title-line">
-                    <span class="tier-badge router-badge">主控</span>
-                    <strong>🤖 F.R.I.D.A.Y. 主控模型</strong>
-                  </div>
-                </div>
-                <div class="modal-tier-controls">
-                  <select id="modal-router-provider-select" aria-label="F.R.I.D.A.Y. 提供方"></select>
-                  <select id="modal-router-model-select" class="modal-model-select" aria-label="F.R.I.D.A.Y. 模型"></select>
-                  <button id="modal-test-router-btn" class="mini-button" type="button">⚡ 测试</button>
-                  <button id="modal-save-routing-btn" class="primary mini-button" type="button">💾 设定主控</button>
+        <section class="model-modal-section">
+          <div class="modal-row-head">
+            <h3>2. F.R.I.D.A.Y. 主控与 Worker 智能调度池</h3>
+          </div>
+
+          <div class="modal-tier-card router-tier-card">
+            <div class="modal-tier-row">
+              <div class="modal-tier-label">
+                <div class="tier-title-line">
+                  <span class="tier-badge router-badge">主控</span>
+                  <strong>🤖 F.R.I.D.A.Y. 主控模型</strong>
                 </div>
               </div>
-              <div id="modal-router-probe-result" class="model-probe-result" hidden></div>
+              <div class="modal-tier-controls">
+                <select id="modal-router-provider-select" aria-label="F.R.I.D.A.Y. 提供方"></select>
+                <select id="modal-router-model-select" class="modal-model-select" aria-label="F.R.I.D.A.Y. 模型"></select>
+                <button id="modal-test-router-btn" class="mini-button" type="button">⚡ 测试</button>
+                <button id="modal-save-routing-btn" class="primary mini-button" type="button">💾 设定主控</button>
+              </div>
             </div>
+            <div id="modal-router-probe-result" class="model-probe-result" hidden></div>
+          </div>
 
-            <div class="modal-row-head">
-              <h3>Worker 跨提供方可用模型池</h3>
-              <span id="model-pool-subtitle" class="meta"></span>
-            </div>
-            <div id="model-pool-matrix" class="hub-cards-grid hub-providers-grid"></div>
-          </section>
+          <div class="modal-row-head">
+            <h3>Worker 跨提供方可用模型池</h3>
+            <span id="model-pool-subtitle" class="meta"></span>
+          </div>
+          <div id="model-pool-matrix" class="hub-cards-grid hub-providers-grid"></div>
+        </section>
 
-          <section class="model-modal-section">
-            <div class="modal-row-head">
-              <h3>3. 提供方列表</h3>
-            </div>
-            <div id="model-providers-list" class="hub-cards-grid hub-providers-grid"><p class="meta">正在读取…</p></div>
-          </section>
+        <section class="model-modal-section">
+          <div class="modal-row-head">
+            <h3>3. 提供方列表</h3>
+          </div>
+          <div id="model-providers-list" class="hub-cards-grid hub-providers-grid"><p class="meta">正在读取…</p></div>
+        </section>
+      </div>
+
+      <div id="system-panel-usage" class="hub-tab-panel" role="tabpanel" aria-labelledby="system-tab-usage" hidden>
+        <div class="system-panel-bar">
+          <div>
+            <h3>📊 模型调用用量与费用账本</h3>
+          </div>
+          <div class="modal-btn-group">
+            <button id="usage-refresh-btn" class="mini-button" type="button">🔄 刷新</button>
+          </div>
         </div>
-
-        <div id="system-panel-usage" class="hub-tab-panel" role="tabpanel" aria-labelledby="system-tab-usage" hidden>
-          <div class="system-panel-bar">
-            <div>
-              <h3>📊 模型调用用量与费用账本</h3>
-            </div>
-            <div class="modal-btn-group">
-              <button id="usage-refresh-btn" class="mini-button" type="button">🔄 刷新</button>
-            </div>
+      <section class="usage-toolbar">
+        <div class="usage-toolbar-row">
+          <div class="hub-filter-pills" role="group" aria-label="统计维度">
+            <button id="usage-gran-day" class="hub-filter-pill active" type="button" data-granularity="day" aria-pressed="true">按日查看</button>
+            <button id="usage-gran-week" class="hub-filter-pill" type="button" data-granularity="week" aria-pressed="false">按周汇总</button>
+            <button id="usage-gran-month" class="hub-filter-pill" type="button" data-granularity="month" aria-pressed="false">按月汇总</button>
           </div>
-        <section class="usage-toolbar" aria-label="用量统计维度与汇率控制">
-          <div class="usage-toolbar-row">
-            <div class="hub-filter-pills" role="tablist" aria-label="统计维度">
-              <button id="usage-gran-day" class="hub-filter-pill active" type="button" data-granularity="day" aria-selected="true">按日查看</button>
-              <button id="usage-gran-week" class="hub-filter-pill" type="button" data-granularity="week" aria-selected="false">按周汇总</button>
-              <button id="usage-gran-month" class="hub-filter-pill" type="button" data-granularity="month" aria-selected="false">按月汇总</button>
-            </div>
-            <div class="usage-date-nav">
-              <button id="usage-prev-btn" class="mini-button" type="button">◀ 上一周期</button>
-              <input id="usage-date-input" class="usage-date-input" type="date" aria-label="选择统计日期">
-              <button id="usage-next-btn" class="mini-button" type="button">下一周期 ▶</button>
-              <button id="usage-today-btn" class="mini-button" type="button">回到今天</button>
-            </div>
+          <div class="usage-date-nav">
+            <button id="usage-prev-btn" class="mini-button" type="button">◀ 上一周期</button>
+            <input id="usage-date-input" class="usage-date-input" type="date" aria-label="选择统计日期">
+            <button id="usage-next-btn" class="mini-button" type="button">下一周期 ▶</button>
+            <button id="usage-today-btn" class="mini-button" type="button">回到今天</button>
           </div>
-          <div class="usage-toolbar-row usage-prefs-row">
-            <div class="usage-period-banner">
-              <strong id="usage-period-label" class="usage-period-label">—</strong>
-              <span id="usage-tz-chip" class="hub-meta-chip">本地时区</span>
+        </div>
+        <div class="usage-toolbar-row usage-prefs-row">
+          <div class="usage-period-banner">
+            <strong id="usage-period-label" class="usage-period-label">—</strong>
+            <span id="usage-tz-chip" class="hub-meta-chip">本地时区</span>
+          </div>
+          <div class="usage-currency-controls">
+            <div class="hub-filter-pills" role="group" aria-label="展示币种">
+              <button id="usage-curr-cny" class="hub-filter-pill active" type="button" aria-pressed="true" data-currency="CNY">¥ 人民币</button>
+              <button id="usage-curr-usd" class="hub-filter-pill" type="button" aria-pressed="false" data-currency="USD">$ 美元</button>
             </div>
-            <div class="usage-currency-controls">
-              <div class="hub-filter-pills" role="group" aria-label="展示币种">
-                <button id="usage-curr-cny" class="hub-filter-pill active" type="button" data-currency="CNY">¥ 人民币</button>
-                <button id="usage-curr-usd" class="hub-filter-pill" type="button" data-currency="USD">$ 美元</button>
-              </div>
+            <form id="usage-rate-form" class="modal-btn-group" novalidate>
               <label class="usage-rate-label">
                 <span class="meta">1 USD =</span>
                 <input id="usage-rate-input" class="usage-rate-input" type="number" min="0.1" max="100" step="0.01" value="7.25" aria-label="美元兑人民币汇率">
                 <span class="meta">CNY</span>
               </label>
-              <button id="usage-rate-save-btn" class="mini-button" type="button">保存汇率</button>
-            </div>
+              <button id="usage-rate-save-btn" class="mini-button" type="submit">保存汇率</button>
+            </form>
           </div>
-          <p id="usage-status-banner" class="error" role="status" hidden></p>
-        </section>
+        </div>
+        <p id="usage-status-banner" class="error" role="status" hidden></p>
+      </section>
 
-        <div id="usage-kpi-grid" class="hub-kpi-grid"></div>
+      <div id="usage-kpi-grid" class="hub-kpi-grid"></div>
 
-        <section class="model-modal-section" aria-label="分时段趋势柱状图">
-          <div class="modal-row-head">
-            <h3 id="usage-chart-title">分时趋势</h3>
-            <span id="usage-chart-subtitle" class="meta"></span>
+      <section class="model-modal-section">
+        <div class="modal-row-head">
+          <h3 id="usage-chart-title">分时趋势</h3>
+          <span id="usage-chart-subtitle" class="meta"></span>
+        </div>
+        <div id="usage-chart-shell" class="usage-chart-shell"></div>
+      </section>
+
+      <section class="model-modal-section">
+        <div class="modal-row-head">
+          <h3 id="usage-recent-title">近 7 日对比</h3>
+        </div>
+        <div id="usage-recent-grid" class="usage-recent-grid"></div>
+      </section>
+
+      <section class="model-modal-section">
+        <div class="modal-row-head">
+          <h3>按模型用量明细</h3>
+          <span id="usage-models-subtitle" class="meta"></span>
+        </div>
+        <div id="usage-models-list" class="hub-cards-grid"><p class="empty">当前周期暂无模型调用记录。</p></div>
+      </section>
+
+      <section class="model-modal-section">
+        <div class="modal-row-head">
+          <h3>按角色分摊概览</h3>
+        </div>
+        <div id="usage-actors-grid" class="usage-actors-grid"></div>
+      </section>
+      </div>
+
+      <div id="system-panel-services" class="hub-tab-panel" role="tabpanel" aria-labelledby="system-tab-services" hidden>
+        <div class="system-panel-bar">
+          <div>
+            <h3>🗺️ 全局位置与逆地理服务底座</h3>
           </div>
-          <div id="usage-chart-shell" class="usage-chart-shell"></div>
-        </section>
-
-        <section class="model-modal-section" aria-label="近期多周期对比">
-          <div class="modal-row-head">
-            <h3 id="usage-recent-title">近 7 日对比</h3>
+          <div class="modal-btn-group">
+            <button id="geo-refresh-btn" class="mini-button" type="button">🔄 刷新状态</button>
           </div>
-          <div id="usage-recent-grid" class="usage-recent-grid"></div>
-        </section>
-
-        <section class="model-modal-section" aria-label="按模型用量明细">
-          <div class="modal-row-head">
-            <h3>按模型用量明细</h3>
-            <span id="usage-models-subtitle" class="meta"></span>
-          </div>
-          <div id="usage-models-list" class="hub-cards-grid"><p class="empty">当前周期暂无模型调用记录。</p></div>
-        </section>
-
-        <section class="model-modal-section" aria-label="按角色分摊概览">
-          <div class="modal-row-head">
-            <h3>按角色分摊概览</h3>
-          </div>
-          <div id="usage-actors-grid" class="usage-actors-grid"></div>
-        </section>
         </div>
 
-        <div id="system-panel-services" class="hub-tab-panel" role="tabpanel" aria-labelledby="system-tab-services" hidden>
-          <div class="system-panel-bar">
-            <div>
-              <h3>🗺️ 全局位置与逆地理服务底座</h3>
-            </div>
-            <div class="modal-btn-group">
-              <button id="geo-refresh-btn" class="mini-button" type="button">🔄 刷新状态</button>
-            </div>
-          </div>
+        <div id="geo-kpi-grid" class="hub-kpi-grid"></div>
 
-          <div id="geo-kpi-grid" class="hub-kpi-grid"></div>
-
-          <section class="model-modal-section" aria-label="高德开放平台服务接入">
-            <div class="modal-auth-card">
-              <div class="modal-row-head">
-                <div class="modal-provider-title-group">
-                  <strong class="modal-provider-heading">高德开放平台 · Web 服务 API Key</strong>
-                  <span id="geo-status-badge" class="hub-status-pill">读取中…</span>
-                </div>
-                <button id="geo-clear-btn" class="mini-button" type="button">🗑 清除 Key</button>
+        <section class="model-modal-section">
+          <form id="geo-amap-form" class="modal-auth-card" novalidate>
+            <div class="modal-row-head">
+              <div class="modal-provider-title-group">
+                <strong class="modal-provider-heading">高德开放平台 · Web 服务 API Key</strong>
+                <span id="geo-status-badge" class="hub-status-pill">读取中…</span>
               </div>
-              <label>
-                <span class="meta">高德 Web 服务 API Key（留空保持已存凭据）</span>
-                <input id="geo-amap-key-input" type="password" maxlength="128" placeholder="输入高德「Web服务」API Key（留空保持已存凭据）" autocomplete="off">
-              </label>
-              <div class="modal-row-head">
-                <span></span>
-                <div class="modal-btn-group">
-                  <button id="geo-probe-btn" type="button">⚡ 测试连通性</button>
-                  <button id="geo-save-btn" class="primary" type="button">💾 保存全局 Key</button>
-                </div>
-              </div>
-              <div id="geo-probe-result" class="model-probe-result" hidden></div>
+              <button id="geo-clear-btn" class="mini-button" type="button">🗑 清除 Key</button>
             </div>
-          </section>
-        </div>
+            <label>
+              <span class="meta">高德 Web 服务 API Key（留空保持已存凭据）</span>
+              <input id="geo-amap-key-input" type="password" maxlength="128" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="输入高德「Web服务」API Key（留空保持已存凭据）">
+            </label>
+            <div class="modal-row-head">
+              <span></span>
+              <div class="modal-btn-group">
+                <button id="geo-probe-btn" type="button">⚡ 测试连通性</button>
+                <button id="geo-save-btn" class="primary" type="submit">💾 保存全局 Key</button>
+              </div>
+            </div>
+            <div id="geo-probe-result" class="model-probe-result" hidden></div>
+          </form>
+        </section>
       </div>
     </div>
-  </div>
+  </dialog>
 
-  <!-- 6. 笔记与日记弹窗 -->
-  <div id="notebook-hub-backdrop" class="modal-backdrop" hidden>
-    <div id="notebook-hub-modal" class="model-modal hub-modal notebook-modal" role="dialog" aria-modal="true" aria-labelledby="notebook-modal-title">
-      <div class="model-modal-header plugin-modal-header">
-        <div class="hub-modal-title-block">
-          <h2 id="notebook-modal-title">📒 笔记与日记</h2>
-          <p id="notebook-role-hint" class="hub-modal-sub">F.R.I.D.A.Y. 替你记事 · 与全息记忆隔离存储，支持按需转存</p>
+  <!-- 共享原生确认 / 输入弹窗 -->
+  <dialog id="app-confirm-dialog" class="hub-dialog confirm-dialog" closedby="any" aria-labelledby="app-confirm-title">
+    <form id="app-confirm-form" class="confirm-dialog-form" method="dialog">
+      <div class="model-modal-header confirm-dialog-header">
+        <h2 id="app-confirm-title">请确认操作</h2>
+        <button id="app-confirm-close-btn" class="mini-button modal-close-btn" type="button" aria-label="关闭确认框">✕ 关闭</button>
+      </div>
+      <div class="model-modal-body confirm-dialog-body">
+        <p id="app-confirm-message" class="confirm-dialog-message"></p>
+        <div id="app-confirm-input-wrap" class="confirm-dialog-input-wrap" hidden>
+          <label class="visually-hidden" for="app-confirm-input">输入内容</label>
+          <input id="app-confirm-input" type="text" maxlength="512">
         </div>
-        <div class="hub-modal-header-right">
-          <div id="notebook-hub-tabs" class="hub-surface-tabs" role="tablist" aria-label="笔记与日记切换">
-            <button id="notebook-tab-notes" class="hub-surface-tab active" type="button" role="tab" aria-selected="true" aria-controls="notebook-panel-notes">
-              <span>📒 记事本</span>
-              <span id="notebook-notes-tab-badge" class="hub-pill-badge">0</span>
-            </button>
-            <button id="notebook-tab-diary" class="hub-surface-tab" type="button" role="tab" aria-selected="false" aria-controls="notebook-panel-diary">
-              <span>📔 F.R.I.D.A.Y. 日记</span>
-              <span id="notebook-diary-tab-badge" class="hub-pill-badge">0</span>
-            </button>
-          </div>
-          <button id="notebook-modal-close" class="mini-button modal-close-btn" type="button">✕ 关闭</button>
+        <div class="modal-btn-group confirm-dialog-actions">
+          <button id="app-confirm-cancel-btn" class="mini-button" type="submit" value="cancel" formnovalidate autofocus>取消</button>
+          <button id="app-confirm-ok-btn" class="primary" type="submit" value="confirm">确认</button>
         </div>
       </div>
+    </form>
+  </dialog>
 
-      <div class="model-modal-body notebook-modal-body">
-        <div id="notebook-panel-notes" class="hub-tab-panel notebook-tab-panel" role="tabpanel" aria-labelledby="notebook-tab-notes">
-          <div class="notebook-split">
-            <aside class="notebook-sidebar" aria-label="记事本列表">
-              <div class="notebook-sidebar-top">
-                <input id="note-search-input" type="search" maxlength="160" placeholder="搜索笔记标题、标签或正文…" aria-label="搜索记事本">
-                <button id="note-new-btn" class="primary mini-button" type="button">+ 新建</button>
-              </div>
-              <div class="hub-filter-pills notebook-filter-row" role="group" aria-label="记事筛选">
-                <button id="note-filter-all" class="hub-filter-pill active" type="button">全部</button>
-                <button id="note-filter-pinned" class="hub-filter-pill" type="button">★ 已置顶</button>
-              </div>
-              <div id="note-tag-chips" class="notebook-tag-chips" hidden></div>
-              <div id="note-list" class="notebook-item-list"><p class="empty">暂无记事。</p></div>
-            </aside>
-
-            <section class="notebook-main" aria-label="记事本内容区">
-              <div id="note-empty-state" class="notebook-empty-state">
-                <p class="notebook-empty-title">还没有选中的记事</p>
-                <p class="meta">在对话中对 F.R.I.D.A.Y. 说「帮我记一下…」，或者点击新建手动记录 Markdown 笔记。</p>
-                <button id="note-empty-new-btn" class="primary mini-button" type="button">+ 新建一条笔记</button>
-              </div>
-
-              <div id="note-workspace" class="notebook-workspace" hidden>
-                <div id="note-conflict-bar" class="notebook-conflict-bar" role="status" hidden>
-                  <span class="notebook-conflict-text">⚠️ F.R.I.D.A.Y. 在后台更新了这篇笔记</span>
-                  <div class="modal-btn-group">
-                    <button id="note-conflict-load-btn" class="mini-button primary" type="button">载入最新</button>
-                    <button id="note-conflict-keep-btn" class="mini-button" type="button">保留当前编辑</button>
-                  </div>
-                </div>
-
-                <div class="notebook-workspace-head">
-                  <input id="note-title-input" class="note-title-input" type="text" maxlength="160" placeholder="无标题笔记…" aria-label="笔记标题">
-                  <div class="notebook-workspace-actions">
-                    <div class="hub-surface-tabs note-mode-tabs" role="group" aria-label="视图模式">
-                      <button id="note-mode-preview" class="hub-surface-tab active" type="button">阅读</button>
-                      <button id="note-mode-edit" class="hub-surface-tab" type="button">编辑</button>
-                      <button id="note-mode-split" class="hub-surface-tab" type="button">分栏</button>
-                    </div>
-                    <button id="note-pin-btn" class="mini-button" type="button" title="置顶或取消置顶">☆ 置顶</button>
-                    <button id="note-promote-btn" class="mini-button" type="button" title="按需复制到全息神经记忆">🧠 转存记忆</button>
-                    <button id="note-delete-btn" class="mini-button danger" type="button">删除</button>
-                  </div>
-                </div>
-
-                <div class="note-meta-bar">
-                  <input id="note-tags-input" class="note-tags-input" type="text" maxlength="256" placeholder="标签（逗号分隔，如：清单, 项目）" aria-label="笔记标签">
-                  <span id="note-meta-info" class="meta note-meta-info"></span>
-                  <span id="note-save-status" class="hub-status-pill badge-slate">就绪</span>
-                </div>
-
-                <div id="note-md-toolbar" class="note-md-toolbar" role="toolbar" aria-label="Markdown 快捷格式" hidden>
-                  <button class="mini-button note-md-btn" type="button" data-md-op="h2" title="插入二级标题">H2</button>
-                  <button class="mini-button note-md-btn" type="button" data-md-op="bold" title="加粗">B</button>
-                  <button class="mini-button note-md-btn" type="button" data-md-op="list" title="无序列表">• 列表</button>
-                  <button class="mini-button note-md-btn" type="button" data-md-op="check" title="待办事项">☑ 待办</button>
-                  <button class="mini-button note-md-btn" type="button" data-md-op="code" title="代码块">&lt;/&gt; 代码</button>
-                  <button id="note-save-now-btn" class="mini-button primary note-save-now-btn" type="button">💾 保存</button>
-                </div>
-
-                <div id="note-editor-body" class="note-editor-body is-mode-preview">
-                  <textarea id="note-content-input" class="note-content-input" maxlength="16384" placeholder="支持 Markdown 语法记录…" aria-label="笔记 Markdown 正文"></textarea>
-                  <div id="note-preview-pane" class="note-preview-pane md-content" aria-label="Markdown 预览"></div>
-                </div>
-              </div>
-            </section>
-          </div>
-        </div>
-
-        <div id="notebook-panel-diary" class="hub-tab-panel notebook-tab-panel" role="tabpanel" aria-labelledby="notebook-tab-diary" hidden>
-          <div class="notebook-split diary-split">
-            <aside class="notebook-sidebar" aria-label="F.R.I.D.A.Y. 日记时间线">
-              <div class="notebook-sidebar-top">
-                <input id="diary-search-input" type="search" maxlength="160" placeholder="搜索日记内容、标题或日期…" aria-label="搜索 F.R.I.D.A.Y. 日记">
-              </div>
-              <div id="diary-mood-filters" class="hub-filter-pills notebook-filter-row" role="group" aria-label="按心情筛选日记"></div>
-              <div id="diary-list" class="notebook-item-list"><p class="empty">F.R.I.D.A.Y. 还没有写下日记。</p></div>
-            </aside>
-
-            <section class="notebook-main diary-main" aria-label="F.R.I.D.A.Y. 日记阅读区">
-              <div id="diary-empty-state" class="notebook-empty-state">
-                <p class="notebook-empty-title">暂无选中日记</p>
-                <p class="meta">F.R.I.D.A.Y. 会在对话有感而发或夜间潜意识回想时，自主用第一人称把心情与心路记录在这里。</p>
-              </div>
-
-              <article id="diary-reader" class="diary-reader" hidden>
-                <header class="diary-masthead">
-                  <div id="diary-avatar-slot" class="diary-avatar-slot" aria-hidden="true"></div>
-                  <div class="diary-masthead-meta">
-                    <div class="diary-eyebrow-row">
-                      <span id="diary-date-display" class="diary-date-badge"></span>
-                      <div id="diary-badges-row" class="diary-badges-row"></div>
-                    </div>
-                    <h3 id="diary-title-display" class="diary-title-display"></h3>
-                    <div id="diary-tags-row" class="diary-tags-row"></div>
-                  </div>
-                </header>
-
-                <div id="diary-content-body" class="diary-reader-body md-content"></div>
-
-                <footer class="diary-reader-footer">
-                  <span class="meta">F.R.I.D.A.Y. 自主书写 · 纯净只读</span>
-                  <div class="modal-btn-group">
-                    <button id="diary-promote-btn" class="mini-button" type="button" title="按需将此日记转存到全息记忆">🧠 转存记忆</button>
-                    <button id="diary-delete-btn" class="mini-button danger" type="button">删除</button>
-                  </div>
-                </footer>
-              </article>
-            </section>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
   <noscript>此本机界面需要 JavaScript。</noscript>
 </body>
 </html>

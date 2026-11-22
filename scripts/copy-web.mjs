@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 const srcWeb = fileURLToPath(new URL('../src/web', import.meta.url));
 const distWeb = fileURLToPath(new URL('../dist/web', import.meta.url));
-const ALLOWED_STATIC_ASSET = /\.(?:html|css|png|woff2|webmanifest)$/i;
+const ALLOWED_STATIC_ASSET = /\.(?:html|css|png|webp|avif|svg|woff2|webmanifest)$/i;
 const FORBIDDEN_DIST_ASSET = /\.(?:map|txt)$/i;
 
 async function copyStaticTree(srcDir, dstDir) {
