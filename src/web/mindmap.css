@@ -1275,6 +1275,11 @@ svg:focus-visible,
 .mm-svg.dragging {
   cursor:grabbing;
 }
+.md-copy-wrap {
+  display:inline-flex;
+  align-items:center;
+  position:relative;
+}
 
 .mm-auth-banner {
   position:absolute;
@@ -2515,6 +2520,15 @@ html[data-theme="spatial"] .fc-edge.fc-edge-loopback {
   height:0;
   overflow:hidden;
   pointer-events:none;
+}
+[hidden="until-found"] {
+  padding:0!important;
+  margin:0!important;
+  border-width:0!important;
+  background:transparent!important;
+  box-shadow:none!important;
+  min-height:0!important;
+  min-block-size:0!important;
 }
 :is(.mm-copy-btn, .copy-mini-btn, .mm-mini-btn, button):is([data-copied], [data-copied="true"]) {
   color:var(--st-ok-fg);

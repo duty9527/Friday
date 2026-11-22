@@ -539,6 +539,24 @@ label {
 .error:empty {
   display:none;
 }
+.mini-button {
+  min-height:24px;
+  padding:2px 8px;
+  font-size:0.6875rem;
+  border-radius:6px;
+}
+.mini-button.danger {
+  color:var(--danger, #f87171);
+  border-color:rgba(248, 113, 113, 0.35);
+}
+.mini-button.danger:hover:not(:disabled) {
+  background:rgba(248, 113, 113, 0.14);
+  border-color:rgba(248, 113, 113, 0.7);
+}
+.mini-button.active {
+  border-color:var(--accent);
+  color:var(--accent-fg);
+}
 [hidden]:not([hidden="until-found"]) {
   display:none!important;
 }
@@ -1228,12 +1246,6 @@ svg.hub-svg-icon,
 /* ============================================================================
    Buttons, Badges, Works, Conversation Messages, Composer & Trace
    ============================================================================ */
-.mini-button {
-  min-height:24px;
-  padding:2px 8px;
-  font-size:0.6875rem;
-  border-radius:6px;
-}
 .danger-btn:hover:not(:disabled) {
   color:var(--err-fg);
   border-color:var(--err-bd);
@@ -1630,6 +1642,43 @@ svg.hub-svg-icon,
   flex:0 0 28px;
   padding-top:1px;
 }
+.bot-poke-btn,
+:where(html[data-theme="industrial"]) .bot-poke-btn {
+  position:relative;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  width:28px;
+  height:28px;
+  min-width:0;
+  min-height:0;
+  min-block-size:0;
+  padding:0;
+  margin:0;
+  border:0;
+  border-radius:8px;
+  background:transparent;
+  box-shadow:none;
+  cursor:pointer;
+  vertical-align:top;
+  translate:0;
+  scale:1;
+  rotate:0deg;
+}
+.bot-poke-btn:hover:not(:disabled),
+.bot-poke-btn:active:not(:disabled),
+:where(html[data-theme="industrial"]) .bot-poke-btn:hover:not(:disabled),
+:where(html[data-theme="industrial"]) .bot-poke-btn:active:not(:disabled) {
+  border:0;
+  background:transparent;
+  box-shadow:none;
+  transform:none;
+}
+.md-copy-wrap {
+  display:inline-flex;
+  align-items:center;
+  position:relative;
+}
 .assistant-body-col {
   flex:1 1 auto;
   min-width:0;
@@ -1762,7 +1811,7 @@ svg.hub-svg-icon,
   padding:1px 7px;
   font-size:0.6875rem;
 }
-.system-notice-body {
+.system-notice-body:not([hidden="until-found"]) {
   margin-top:8px;
   padding-top:8px;
   border-top:1px solid var(--rule);
@@ -1917,7 +1966,7 @@ svg.hub-svg-icon,
   font-size:0.71875rem;
   color:var(--warn-fg);
 }
-.route-expanded-drawer {
+.route-expanded-drawer:not([hidden="until-found"]) {
   width:100%;
   margin-top:2px;
   padding:10px 12px;
@@ -9183,18 +9232,6 @@ dialog.confirm-dialog {
   padding:16px 20px;
   min-height:0;
 }
-.mini-button.danger {
-  color:var(--danger, #f87171);
-  border-color:rgba(248, 113, 113, 0.35);
-}
-.mini-button.danger:hover:not(:disabled) {
-  background:rgba(248, 113, 113, 0.14);
-  border-color:rgba(248, 113, 113, 0.7);
-}
-.mini-button.active {
-  border-color:var(--accent);
-  color:var(--accent-fg);
-}
 
 /* F.R.I.D.A.Y. Diary tab */
 .diary-date-chip {
@@ -10723,6 +10760,15 @@ html.mobile-keyboard-open {
   overflow:hidden;
   pointer-events:none;
 }
+[hidden="until-found"] {
+  padding:0!important;
+  margin:0!important;
+  border-width:0!important;
+  background:transparent!important;
+  box-shadow:none!important;
+  min-height:0!important;
+  min-block-size:0!important;
+}
 :is(.md-code-copy, .copy-mini-btn, .msg-action-btn):is(.is-copied, [data-copied], [data-copied="true"]) {
   color:var(--ok-fg);
   border-color:var(--ok-bd);
@@ -10772,6 +10818,7 @@ html.mobile-keyboard-open {
   .cs80-size-btn::after,
   .cs80-editor-card .mini-button::after,
   .companion-avatar::after,
+  .bot-poke-btn::after,
   .mobile-header-icon-btn::after,
   .mobile-drawer-close::after,
   .composer-icon-btn::after,
@@ -10780,6 +10827,9 @@ html.mobile-keyboard-open {
     position:absolute;
     inset-block:min(0px, calc((var(--target-size) - 100%) / -2));
     inset-inline:0;
+  }
+  .bot-poke-btn::after {
+    inset:-8px;
   }
 }
 }

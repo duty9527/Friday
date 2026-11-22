@@ -408,9 +408,27 @@ try {
     assert.equal(await page.eval("document.documentElement.getAttribute('data-theme')"), themeName, `theme switched to ${themeName}`);
     assert.equal(await page.eval(`document.querySelector('${themeBtn}')?.getAttribute('aria-pressed')`), 'true', `${themeBtn} aria-pressed=true`);
 
+    if (themeName === 'industrial') {
+      assert.equal(
+        await page.eval("getComputedStyle(document.querySelector('#conv-channel-filters .conv-channel-chip.active')).color"),
+        'rgb(255, 255, 255)',
+        'industrial active channel chip text must remain crisp white (#ffffff)',
+      );
+    }
+
     await page.setViewport({ width: 1440, height: 900, mobile: false });
     await sleep(200);
     assert.equal(await page.eval('document.documentElement.scrollWidth <= innerWidth'), true, `1440x900 (${themeName}): no horizontal page overflow`);
+    assert.equal(
+      await page.eval("[...document.querySelectorAll('[hidden=\"until-found\"]')].every(el => Math.round(el.getBoundingClientRect().height) === 0)"),
+      true,
+      `1440x900 (${themeName}): collapsed [hidden="until-found"] containers must have zero height`,
+    );
+    assert.equal(
+      await page.eval("[...document.querySelectorAll('.bot-poke-btn')].every(el => { const r = el.getBoundingClientRect(); return r.width <= 32 && r.height <= 32 && getComputedStyle(el).borderTopWidth === '0px'; })"),
+      true,
+      `1440x900 (${themeName}): .bot-poke-btn avatars stay compact (<=32px) with 0px border`,
+    );
 
     for (const [width, height, name] of [[768, 1024, 'tablet'], [390, 844, 'mobile']]) {
       await page.setViewport({ width, height, mobile: width < 600 });
