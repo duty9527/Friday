@@ -1,14 +1,24 @@
-import type { ChatMessage, MainView, TraceEvent } from '../view.js';
+import type { ChatMessage, MainView } from '../view.js';
 import { activeStatus as active } from './model.js';
 import {
   createLiveBotAvatar,
   deriveFridayBotState,
+  type BotPokeKind,
 } from './shared/bot-avatar.js';
 import { createSharedSseHub, type SseUpdateBatch } from './shared/sse-hub.js';
 import { element, node } from './shared/dom.js';
 import { errorText } from './shared/format.js';
 import { bindThemeButtons, initDesktopDrawers, syncThemeChrome } from './shared/theme.js';
 import { initMobileViewport } from './shared/mobile-viewport.js';
+import {
+  announceStatus,
+  isDialogOpen,
+  onReducedMotionChange,
+  prefersReducedMotion,
+  safeFocus,
+  scheduleBackgroundTask,
+  setInertElements,
+} from './shared/ui-primitives.js';
 import { initChatPanel } from './panels/chat.js';
 import { initTracePanel } from './panels/trace.js';
 import { initMemoryHub } from './hubs/memory-hub.js';
@@ -21,12 +31,12 @@ import { api, appState, fetchMessagesBatch, hooks, request } from './state.js';
 const connectionBannerEl = element('connection-banner');
 const connectionEl = element('connection');
 const reconnectBtn = element<HTMLButtonElement>('reconnect');
-const memoryHubBackdrop = element<HTMLElement>('memory-hub-backdrop');
-const timerHubBackdrop = element<HTMLElement>('timer-hub-backdrop');
-const pluginHubBackdrop = element<HTMLElement>('plugin-hub-backdrop');
-const imHubBackdrop = element<HTMLElement>('im-hub-backdrop');
-const notebookHubBackdrop = element<HTMLElement>('notebook-hub-backdrop');
-const systemHubBackdrop = element<HTMLElement>('system-hub-backdrop');
+const memoryHubDialog = element<HTMLElement>('memory-hub-dialog');
+const timerHubDialog = element<HTMLElement>('timer-hub-dialog');
+const pluginHubDialog = element<HTMLElement>('plugin-hub-dialog');
+const imHubDialog = element<HTMLElement>('im-hub-dialog');
+const systemHubDialog = element<HTMLElement>('system-hub-dialog');
+const appConfirmDialog = document.getElementById('app-confirm-dialog');
 const healthSurfacePanel = element<HTMLElement>('plugin-panel-health-scale');
 const fundSurfacePanel = element<HTMLElement>('plugin-panel-fund-tracker');
 const cs80SurfacePanel = element<HTMLElement>('plugin-panel-cs80-face');
@@ -40,23 +50,57 @@ const worksEl = element('works');
 const companionEl = element('companion-avatar');
 const themeSpatialBtn = element<HTMLButtonElement>('theme-spatial-btn');
 const themeIndustrialBtn = element<HTMLButtonElement>('theme-industrial-btn');
+const themeSystemBtn = document.getElementById('theme-system-btn') as HTMLButtonElement | null;
 const desktopWorkFoldBtn = element<HTMLButtonElement>('desktop-work-fold');
 const desktopTraceFoldBtn = element<HTMLButtonElement>('desktop-trace-fold');
 const mobileNavBtn = document.getElementById('mobile-nav-btn') as HTMLButtonElement | null;
 const mobileNavCloseBtn = document.getElementById('mobile-nav-close') as HTMLButtonElement | null;
 const mobileNavScrim = document.getElementById('mobile-nav-scrim');
 const appTopbar = document.getElementById('app-topbar');
+const mainContentEl = document.getElementById('main-content');
+const workSidebarEl = document.getElementById('work-sidebar');
 
-function setMobileNavOpen(open: boolean): void {
+connectionBannerEl.removeAttribute?.('role');
+connectionBannerEl.removeAttribute?.('aria-live');
+
+const modalDialogs = [
+  memoryHubDialog,
+  timerHubDialog,
+  pluginHubDialog,
+  imHubDialog,
+  systemHubDialog,
+];
+
+function hasOpenModal(): boolean {
+  return modalDialogs.some(el => isDialogOpen(el)) || isDialogOpen(appConfirmDialog);
+}
+
+function setMobileNavOpen(open: boolean, restoreFocus = true): void {
+  const wasOpen = document.body.classList.contains('mobile-nav-open');
   document.body.classList.toggle('mobile-nav-open', open);
   if (mobileNavScrim) mobileNavScrim.hidden = !open;
   mobileNavBtn?.setAttribute('aria-expanded', String(open));
-  if (!open) {
+  setInertElements([mainContentEl, workSidebarEl], open);
+  if (open) {
+    appTopbar?.setAttribute('role', 'dialog');
+    appTopbar?.setAttribute('aria-modal', 'true');
+    appTopbar?.setAttribute('aria-label', '功能导航菜单');
+    const firstTarget = mobileNavCloseBtn
+      ?? appTopbar?.querySelector<HTMLElement>('button:not([disabled]), [href], [tabindex]:not([tabindex="-1"])')
+      ?? null;
+    safeFocus(firstTarget);
+  } else {
+    appTopbar?.removeAttribute?.('role');
+    appTopbar?.removeAttribute?.('aria-modal');
+    appTopbar?.removeAttribute?.('aria-label');
     syncThemeChrome();
+    if (wasOpen && restoreFocus) {
+      safeFocus(mobileNavBtn);
+    }
   }
 }
 
-bindThemeButtons(themeSpatialBtn, themeIndustrialBtn);
+bindThemeButtons(themeSpatialBtn, themeIndustrialBtn, themeSystemBtn);
 initMobileViewport();
 initDesktopDrawers({
   leftBtn: desktopWorkFoldBtn,
@@ -69,20 +113,81 @@ const companionAvatar = createLiveBotAvatar({
   idPrefix: 'friday-companion',
 });
 companionEl.replaceChildren(companionAvatar.svg);
-companionEl.addEventListener('keydown', event => {
-  if (event.key === 'Enter' || event.key === ' ') {
-    event.preventDefault();
-    companionAvatar.poke('bounce');
-  }
+let companionPokeSeq = 0;
+companionEl.addEventListener('click', () => {
+  const seq: BotPokeKind[] = ['bounce', 'nod', 'spin'];
+  const kind = seq[companionPokeSeq % seq.length]!;
+  companionPokeSeq++;
+  companionAvatar.poke(kind, kind === 'spin' ? 2 : 1);
 });
-window.addEventListener('pointermove', event => {
+
+let cachedCompanionRect: { left: number; top: number; width: number; height: number } | null = null;
+let pendingPointerX = 0;
+let pendingPointerY = 0;
+let gazeRafId = 0;
+let reducedMotionActive = prefersReducedMotion();
+
+function refreshCompanionRect(): void {
+  if (typeof companionEl.getBoundingClientRect !== 'function') return;
   const rect = companionEl.getBoundingClientRect();
-  if (!rect.width || !rect.height) return;
+  cachedCompanionRect = rect.width > 0 && rect.height > 0 ? rect : null;
+}
+
+function cancelPendingGaze(): void {
+  if (gazeRafId && typeof cancelAnimationFrame === 'function') {
+    cancelAnimationFrame(gazeRafId);
+  }
+  gazeRafId = 0;
+}
+
+function flushCompanionGaze(): void {
+  gazeRafId = 0;
+  if (reducedMotionActive || hasOpenModal()) return;
+  if (!cachedCompanionRect) refreshCompanionRect();
+  const rect = cachedCompanionRect;
+  if (!rect || !rect.width || !rect.height) return;
   const cx = rect.left + rect.width / 2;
   const cy = rect.top + rect.height / 2;
-  companionAvatar.setGaze((event.clientX - cx) / 360, -(event.clientY - cy) / 280);
+  companionAvatar.setGaze((pendingPointerX - cx) / 360, -(pendingPointerY - cy) / 280);
+}
+
+if (typeof ResizeObserver === 'function') {
+  const rectObserver = new ResizeObserver(() => refreshCompanionRect());
+  rectObserver.observe(companionEl);
+  if (mainContentEl) rectObserver.observe(mainContentEl);
+  if (appTopbar) rectObserver.observe(appTopbar);
+} else {
+  refreshCompanionRect();
+}
+window.addEventListener('resize', refreshCompanionRect, { passive: true });
+desktopWorkFoldBtn.addEventListener('click', () => {
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(refreshCompanionRect);
+  else refreshCompanionRect();
+});
+desktopTraceFoldBtn.addEventListener('click', () => {
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(refreshCompanionRect);
+  else refreshCompanionRect();
+});
+onReducedMotionChange(reduced => {
+  reducedMotionActive = reduced;
+  if (reduced) {
+    cancelPendingGaze();
+    companionAvatar.setGaze(0, 0);
+  }
+});
+
+window.addEventListener('pointermove', event => {
+  if (reducedMotionActive || hasOpenModal()) return;
+  pendingPointerX = event.clientX;
+  pendingPointerY = event.clientY;
+  if (typeof requestAnimationFrame === 'function') {
+    if (!gazeRafId) gazeRafId = requestAnimationFrame(flushCompanionGaze);
+  } else {
+    flushCompanionGaze();
+  }
 }, { passive: true });
 window.addEventListener('pointerleave', () => {
+  cancelPendingGaze();
   companionAvatar.setGaze(0, 0);
 });
 
@@ -168,7 +273,7 @@ const pluginSurfaces: PluginSurfaceRegistration[] = [
     messageTrigger: /体重|体脂|上秤|称重|health-scale/,
     load: () => import('./plugins/health-scale-ui.js').then(mod =>
       mod.initHealthScaleUi({
-        isVisible: () => !pluginHubBackdrop.hidden && !healthSurfacePanel.hidden,
+        isVisible: () => isDialogOpen(pluginHubDialog) && !healthSurfacePanel.hidden,
       })),
   },
   {
@@ -179,7 +284,7 @@ const pluginSurfaces: PluginSurfaceRegistration[] = [
     messageTrigger: /持仓晚间结算|持仓午间估值|持仓总览|fund-tracker/,
     load: () => import('./plugins/fund-tracker-ui.js').then(mod =>
       mod.initFundTrackerUi({
-        isVisible: () => !pluginHubBackdrop.hidden && !fundSurfacePanel.hidden,
+        isVisible: () => isDialogOpen(pluginHubDialog) && !fundSurfacePanel.hidden,
       })),
   },
   {
@@ -190,7 +295,7 @@ const pluginSurfaces: PluginSurfaceRegistration[] = [
     messageTrigger: /CS80|cs80-face|副屏|Bento/,
     load: () => import('./plugins/cs80-face-ui.js').then(mod =>
       mod.initCs80FaceUi({
-        isVisible: () => !pluginHubBackdrop.hidden && !cs80SurfacePanel.hidden,
+        isVisible: () => isDialogOpen(pluginHubDialog) && !cs80SurfacePanel.hidden,
       })),
   },
   {
@@ -201,7 +306,7 @@ const pluginSurfaces: PluginSurfaceRegistration[] = [
     messageTrigger: /牙刷|徕芬|莱芬|刷头|口腔护理|laifen/,
     load: () => import('./plugins/laifen-ui.js').then(mod =>
       mod.initLaifenUi({
-        isVisible: () => !pluginHubBackdrop.hidden && !laifenSurfacePanel.hidden,
+        isVisible: () => isDialogOpen(pluginHubDialog) && !laifenSurfacePanel.hidden,
       })),
   },
   {
@@ -212,7 +317,7 @@ const pluginSurfaces: PluginSurfaceRegistration[] = [
     messageTrigger: /九号|电摩|电动车|小电驴|ninebot/,
     load: () => import('./plugins/ninebot-ui.js').then(mod =>
       mod.initNinebotUi({
-        isVisible: () => !pluginHubBackdrop.hidden && !ninebotSurfacePanel.hidden,
+        isVisible: () => isDialogOpen(pluginHubDialog) && !ninebotSurfacePanel.hidden,
       })),
   },
   {
@@ -223,7 +328,7 @@ const pluginSurfaces: PluginSurfaceRegistration[] = [
     messageTrigger: /鱼缸灯|尼特利|水草灯|netlea/i,
     load: () => import('./plugins/netlea-ui.js').then(mod =>
       mod.initNetleaUi({
-        isVisible: () => !pluginHubBackdrop.hidden && !netleaSurfacePanel.hidden,
+        isVisible: () => isDialogOpen(pluginHubDialog) && !netleaSurfacePanel.hidden,
       })),
   },
   {
@@ -234,7 +339,7 @@ const pluginSurfaces: PluginSurfaceRegistration[] = [
     messageTrigger: /iPhone|iPad|AirPods|Apple\s*Watch|Find\s*My|苹果设备|apple-devices/i,
     load: () => import('./plugins/apple-devices-ui.js').then(mod =>
       mod.initAppleDevicesUi({
-        isVisible: () => !pluginHubBackdrop.hidden && !appleSurfacePanel.hidden,
+        isVisible: () => isDialogOpen(pluginHubDialog) && !appleSurfacePanel.hidden,
       })),
   },
   {
@@ -245,7 +350,7 @@ const pluginSurfaces: PluginSurfaceRegistration[] = [
     messageTrigger: /米家|中枢|蓝牙\s*Mesh|极客版|自动化|空气炸锅|空调|miot/i,
     load: () => import('./plugins/miot-ui.js').then(mod =>
       mod.initMiotUi({
-        isVisible: () => !pluginHubBackdrop.hidden && !miotSurfacePanel.hidden,
+        isVisible: () => isDialogOpen(pluginHubDialog) && !miotSurfacePanel.hidden,
       })),
   },
 ];
@@ -258,7 +363,77 @@ const imVoiceHub = initImVoiceHub();
 const notebookHub = initNotebookHub();
 const systemHub = initSystemHub();
 
+type HubKey = 'memory' | 'timer' | 'plugin' | 'im' | 'notebook' | 'system';
+const ALL_HUB_KEYS: readonly HubKey[] = ['memory', 'timer', 'plugin', 'im', 'notebook', 'system'];
+const dirtyHubs = new Set<HubKey>();
+let hubBgAbort: AbortController | undefined;
+
+function isHubOpen(key: HubKey): boolean {
+  switch (key) {
+    case 'memory':
+    case 'notebook':
+      return isDialogOpen(memoryHubDialog);
+    case 'timer':
+      return isDialogOpen(timerHubDialog);
+    case 'plugin':
+      return isDialogOpen(pluginHubDialog);
+    case 'im':
+      return isDialogOpen(imHubDialog);
+    case 'system':
+      return isDialogOpen(systemHubDialog);
+  }
+}
+
+function renderHubKey(key: HubKey, force = false): void {
+  switch (key) {
+    case 'memory':
+      memoryHub.render(force);
+      break;
+    case 'timer':
+      timerPluginHub.renderTimers(force);
+      break;
+    case 'plugin':
+      timerPluginHub.renderPlugins(force);
+      break;
+    case 'im':
+      imVoiceHub.render(force);
+      break;
+    case 'notebook':
+      notebookHub.render(force);
+      break;
+    case 'system':
+      systemHub.render(force);
+      break;
+  }
+}
+
+function flushDirtyHubs(): void {
+  if (!dirtyHubs.size) return;
+  for (const key of [...dirtyHubs]) {
+    dirtyHubs.delete(key);
+    renderHubKey(key);
+  }
+}
+
+function syncHubRenders(): void {
+  for (const key of ALL_HUB_KEYS) {
+    if (isHubOpen(key)) {
+      dirtyHubs.delete(key);
+      renderHubKey(key);
+    } else {
+      dirtyHubs.add(key);
+    }
+  }
+  if (dirtyHubs.size > 0) {
+    hubBgAbort?.abort();
+    hubBgAbort = typeof AbortController !== 'undefined' ? new AbortController() : undefined;
+    scheduleBackgroundTask(flushDirtyHubs, hubBgAbort?.signal);
+  }
+}
+
 let lastPluginCheckSeq = 0;
+let lastConnectionAnnouncement = '';
+let lastConnectionWasStale = false;
 
 function connection(text: string, stale = false): void {
   if (appState.authExpired) {
@@ -269,6 +444,17 @@ function connection(text: string, stale = false): void {
   connectionBannerEl.hidden = !stale;
   connectionBannerEl.classList.toggle('stale', stale);
   connectionEl.textContent = stale ? text : '';
+  if (stale) {
+    if (text !== lastConnectionAnnouncement || !lastConnectionWasStale) {
+      lastConnectionAnnouncement = text;
+      lastConnectionWasStale = true;
+      announceStatus(text, 'assertive');
+    }
+  } else if (lastConnectionWasStale) {
+    lastConnectionAnnouncement = text;
+    lastConnectionWasStale = false;
+    announceStatus(text, 'polite');
+  }
   syncCompanionState();
 }
 
@@ -285,6 +471,8 @@ function expireAuthentication(): void {
   appState.authExpired = true;
   appState.ready = false;
   sseHub.stop();
+  hubBgAbort?.abort();
+  dirtyHubs.clear();
   if (appState.reconnectTimer) { clearTimeout(appState.reconnectTimer); appState.reconnectTimer = undefined; }
   if (appState.refreshTimer) { clearTimeout(appState.refreshTimer); appState.refreshTimer = undefined; }
   imVoiceHub.stopWechatQrPoll();
@@ -293,21 +481,24 @@ function expireAuthentication(): void {
   reconnectBtn.disabled = true;
   chatPanel.updateComposer();
   tracePanel.renderWorks();
-  memoryHub.render();
-  timerPluginHub.renderTimers();
-  timerPluginHub.renderPlugins();
-  imVoiceHub.render();
-  notebookHub.render();
-  systemHub.render();
+  for (const key of ALL_HUB_KEYS) renderHubKey(key);
   chatPanel.renderMessages();
   syncCompanionState();
 }
 
+function findLatestUserMessage(): ChatMessage | undefined {
+  let latest: ChatMessage | undefined;
+  for (const message of appState.messages.values()) {
+    if (message.role === 'user' && (!latest || message.seq > latest.seq)) {
+      latest = message;
+    }
+  }
+  return latest;
+}
+
 function followLatestMessage(): void {
   if (appState.selectionPinned) return;
-  const latest = [...appState.messages.values()]
-    .filter(message => message.role === 'user')
-    .sort((a, b) => b.seq - a.seq)[0];
+  const latest = findLatestUserMessage();
   if (!latest || latest.id === appState.followedMessage) return;
   tracePanel.selectTrace({ type: 'message', id: latest.id, label: latest.text.slice(0, 80) }, false);
 }
@@ -340,7 +531,7 @@ async function refreshView(initial = false): Promise<void> {
     try {
       const resetEpochAtStart = cursorResetEpoch;
       const hadPendingReset = pendingCursorReset;
-      const result = await api<MainView>('/api/view');
+      const result = await api<MainView>('/api/view', undefined, initial ? undefined : { priority: 'low' });
       const selectedTaskId = appState.selection.type === 'task' ? appState.selection.id : undefined;
       const previousWorkStatus = appState.view?.works.find(work => work.id === selectedTaskId)?.status;
       const cursorReset = !initial && (hadPendingReset || result.cursor < appState.cursor);
@@ -388,12 +579,7 @@ async function refreshView(initial = false): Promise<void> {
       }
       chatPanel.renderMessages();
       tracePanel.renderWorks();
-      memoryHub.render();
-      timerPluginHub.renderTimers();
-      timerPluginHub.renderPlugins();
-      imVoiceHub.render();
-      notebookHub.render();
-      systemHub.render();
+      syncHubRenders();
       const newMessages = result.messages.items.filter(m => m.seq > lastPluginCheckSeq);
       lastPluginCheckSeq = result.messages.items.reduce((acc, m) => Math.max(acc, m.seq), lastPluginCheckSeq);
       timerPluginHub.syncPluginSurfaces({
@@ -496,7 +682,7 @@ const sseHub = createSharedSseHub({
         .map(event => event.messageId)
         .filter((id): id is string => Boolean(id)),
     )];
-    const changed = ids.length ? await fetchMessagesBatch(ids) : [];
+    const changed = ids.length ? await fetchMessagesBatch(ids, { priority: 'low' }) : [];
     if (appState.authExpired) return;
     chatPanel.mergeMessages(changed);
     await chatPanel.hydrateParents();
@@ -510,7 +696,26 @@ const sseHub = createSharedSseHub({
 });
 
 window.addEventListener('pagehide', () => {
-  sseHub.stop();
+  cancelPendingGaze();
+  hubBgAbort?.abort();
+  flushDirtyHubs();
+  if (appState.refreshTimer) {
+    clearTimeout(appState.refreshTimer);
+    appState.refreshTimer = undefined;
+  }
+  sseHub.pause();
+});
+
+window.addEventListener('pageshow', event => {
+  if (!event.persisted || appState.authExpired) return;
+  syncThemeChrome();
+  refreshCompanionRect();
+  if (sseStarted) {
+    sseHub.resume();
+    scheduleRefresh();
+  } else if (appState.token) {
+    void connect(true);
+  }
 });
 
 let sseStarted = false;
@@ -527,9 +732,7 @@ async function connect(forceReconnect = false): Promise<void> {
     if (generation !== appState.connectionGeneration || appState.authExpired) return;
     if (initial) {
       if (appState.selectionGeneration === 0) {
-        const latest = [...appState.messages.values()]
-          .sort((a, b) => b.seq - a.seq)
-          .find(message => message.role === 'user');
+        const latest = findLatestUserMessage();
         tracePanel.selectTrace(
           latest ? { type: 'message', id: latest.id, label: latest.text.slice(0, 80) } : { type: 'all' },
           false,
@@ -557,49 +760,53 @@ async function connect(forceReconnect = false): Promise<void> {
 
 reconnectBtn.addEventListener('click', () => { appState.retryDelay = 500; void connect(true); });
 
-const modalBackdrops = [
-  memoryHubBackdrop,
-  timerHubBackdrop,
-  pluginHubBackdrop,
-  imHubBackdrop,
-  notebookHubBackdrop,
-  systemHubBackdrop,
-];
 mobileNavBtn?.addEventListener('click', () => {
   const next = !document.body.classList.contains('mobile-nav-open');
   if (next) {
-    tracePanel.showPanel(false);
-    tracePanel.closeSidebar();
+    tracePanel.showPanel(false, { restoreFocus: false });
+    tracePanel.closeSidebar(false);
   }
-  setMobileNavOpen(next);
+  setMobileNavOpen(next, !next);
 });
 mobileNavCloseBtn?.addEventListener('click', () => {
-  setMobileNavOpen(false);
+  setMobileNavOpen(false, true);
 });
 mobileNavScrim?.addEventListener('click', () => {
-  setMobileNavOpen(false);
+  setMobileNavOpen(false, true);
 });
 appTopbar?.addEventListener('click', event => {
   if (!document.body.classList.contains('mobile-nav-open')) return;
   const target = event.target instanceof Element ? event.target : null;
   if (!target) return;
-  if (target.closest('#work-toggle, #open-memory-hub-top, #open-timer-hub-top, #open-plugin-hub-top, #open-im-hub-top, #open-notebook-hub-top, #open-system-hub-top')) {
-    setMobileNavOpen(false);
+  if (target.closest('#work-toggle, #open-memory-hub-top, #open-timer-hub-top, #open-plugin-hub-top, #open-im-hub-top, #open-system-hub-top')) {
+    setMobileNavOpen(false, false);
   }
-});
+}, { capture: true });
+if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+  try {
+    const mobileNavMql = window.matchMedia('(max-width: 730px)');
+    mobileNavMql.addEventListener?.('change', e => {
+      if (!e.matches && document.body.classList.contains('mobile-nav-open')) {
+        setMobileNavOpen(false, false);
+      }
+    });
+  } catch {
+    // Ignore matchMedia errors in stub environments
+  }
+}
 document.addEventListener('keydown', event => {
   if (event.key !== 'Escape') return;
   if (memoryHub.isImmersive()) {
     event.preventDefault();
     memoryHub.exitImmersive();
-  } else if (modalBackdrops.some(el => !el.hidden)) {
+  } else if (isDialogOpen(appConfirmDialog)) {
+    return;
+  } else if (modalDialogs.some(el => isDialogOpen(el))) {
     closeAllHubModals();
   } else if (document.body.classList.contains('mobile-nav-open')) {
-    setMobileNavOpen(false);
-    mobileNavBtn?.focus();
+    setMobileNavOpen(false, true);
   } else if (tracePanel.isSidebarOpen()) {
     tracePanel.closeSidebar();
-    tracePanel.focusSidebarToggle();
   } else if (
     typeof window.matchMedia === 'function'
     && window.matchMedia('(max-width: 730px)').matches

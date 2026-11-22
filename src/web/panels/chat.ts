@@ -38,8 +38,18 @@ import {
   type ChatChannelFilter,
 } from '../shared/chat-view.js';
 import { button, element, node } from '../shared/dom.js';
-import { errorText, makeRequestId, statusText, timestamp } from '../shared/format.js';
+import { errorText, formatNumber, makeRequestId, statusText, timestamp } from '../shared/format.js';
 import { renderMarkdownContent, renderUserMessageContent, type MarkdownRenderOptions } from '../shared/markdown.js';
+import {
+  announceStatus,
+  attachDelayedFormValidation,
+  copyTextWithFeedback,
+  isImeComposing,
+  moveElementPreservingState,
+  onScrollEnd,
+  prefersReducedMotion,
+  safeFocus,
+} from '../shared/ui-primitives.js';
 import { api, appState, fetchMessagesBatch, hooks } from '../state.js';
 
 export interface ChatPanelController {
@@ -61,46 +71,25 @@ const LONG_MESSAGE_COLLAPSE_CHARS = 4800;
 const AUTO_LOAD_OLDER_THRESHOLD_PX = 140;
 const AUTO_LOAD_OLDER_COOLDOWN_MS = 350;
 const PULL_TO_LOAD_MIN_DY_PX = 56;
-const MOBILE_SCROLLABLE_SELECTOR = [
-  '.messages-scroll',
-  '#draft',
-  'textarea',
-  '.sidebar',
-  '.works',
-  '.conv-controls',
-  '.md-code-pre',
-  '.trace-tabs',
-  '.trace-chain-pane',
-  '.trace-inspector-pane',
-  '.inspector-body',
-  '.inspector-text-box',
-  '.param-code',
-  '.diff-old',
-  '.diff-new',
-  '.result-box',
-  '.work-overview-card',
-  '.routing-detail',
-  '.model-modal-body',
-  '.hub-search-hits-grid',
-  '.modal-pool-select-list',
-  '.plugin-main',
-  '.plugin-stage',
-  '.plugin-sidebar',
-  '.plugin-nav-sortable-wrap',
-  '.hub-code-block',
-  '.cs80-config-scroll',
-  '.brain-insp-scroll',
-  '.notebook-modal-body',
-  '.notebook-item-list',
-  '.notebook-tag-chips',
-  '.note-content-input',
-  '.note-preview-pane',
-  '.diary-reader-body',
-  '.bot-emote-tray',
-  '.topbar',
-  'pre',
-  '.md-table-wrap',
-].join(', ');
+
+function domSafeId(raw: string): string {
+  return raw.replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+function safeRemoveAttr(el: Element | null | undefined, name: string): void {
+  if (!el) return;
+  if (typeof el.removeAttribute === 'function') {
+    el.removeAttribute(name);
+    return;
+  }
+  (el as unknown as { attributes?: Map<string, string> }).attributes?.delete(name);
+}
+
+function safeHasAttr(el: Element | null | undefined, name: string): boolean {
+  if (!el) return false;
+  if (typeof el.hasAttribute === 'function') return el.hasAttribute(name);
+  return el.getAttribute?.(name) !== null && el.getAttribute?.(name) !== undefined;
+}
 
 function singleLine(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
@@ -129,34 +118,24 @@ function normalizeStoredChannel(raw: string | null): ChatChannelFilter {
   return 'all';
 }
 
-function createClipboardButton(label: string, getText: () => string, className = 'mini-button copy-msg-btn'): HTMLButtonElement {
-  let resetTimer: ReturnType<typeof setTimeout> | undefined;
-  const btn = button(label, () => {
-    const text = getText();
-    const resetLater = () => {
-      if (resetTimer) clearTimeout(resetTimer);
-      resetTimer = setTimeout(() => {
-        resetTimer = undefined;
-        btn.classList.remove('is-copied');
-        btn.textContent = label;
-      }, 1500);
-    };
-    if (typeof navigator === 'undefined' || !navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
-      btn.textContent = '不支持';
-      resetLater();
-      return;
-    }
-    void navigator.clipboard.writeText(text).then(() => {
-      btn.classList.add('is-copied');
-      btn.textContent = '✓ 已复制';
-      resetLater();
-    }).catch(() => {
-      btn.textContent = '失败';
-      resetLater();
-    });
-  }, className);
+function createClipboardButton(
+  label: string,
+  getText: () => string,
+  opts?: { className?: string; ariaLabel?: string; actionKey?: string },
+): HTMLElement {
+  const wrap = node('span', '', 'md-copy-wrap');
+  const btn = node('button', label, opts?.className ?? 'mini-button copy-msg-btn msg-action-btn');
+  btn.type = 'button';
   btn.title = '复制正文';
-  return btn;
+  btn.setAttribute('aria-label', opts?.ariaLabel ?? label);
+  if (opts?.actionKey) btn.dataset.actionKey = opts.actionKey;
+  const statusEl = node('span', '', 'md-copy-status visually-hidden');
+  statusEl.setAttribute('role', 'status');
+  btn.addEventListener('click', () => {
+    void copyTextWithFeedback(btn, getText(), { statusEl });
+  });
+  wrap.append(btn, statusEl);
+  return wrap;
 }
 
 function actionToneClass(action: RouteAction): string {
@@ -169,10 +148,84 @@ function actionToneClass(action: RouteAction): string {
   return 'tone-ok';
 }
 
+interface IndexedQuoteCandidate {
+  id: string;
+  seq: number;
+  role: ChatMessage['role'];
+  clean: string;
+}
+
+interface QuoteLookupIndex {
+  allDesc: IndexedQuoteCandidate[];
+  byRoleDesc: Map<ChatMessage['role'], IndexedQuoteCandidate[]>;
+  exactByClean: Map<string, IndexedQuoteCandidate[]>;
+}
+
+function buildQuoteLookupIndex(orderedAsc: readonly ChatMessage[]): QuoteLookupIndex {
+  const allDesc: IndexedQuoteCandidate[] = [];
+  const byRoleDesc = new Map<ChatMessage['role'], IndexedQuoteCandidate[]>();
+  const exactByClean = new Map<string, IndexedQuoteCandidate[]>();
+
+  for (let i = orderedAsc.length - 1; i >= 0; i--) {
+    const cand = orderedAsc[i]!;
+    if (cand.source === 'system') continue;
+    const clean = singleLine(stripLeadingQuoteForPreview(cand.text));
+    if (!clean) continue;
+    const item: IndexedQuoteCandidate = { id: cand.id, seq: cand.seq, role: cand.role, clean };
+    allDesc.push(item);
+
+    let roleBucket = byRoleDesc.get(cand.role);
+    if (!roleBucket) {
+      roleBucket = [];
+      byRoleDesc.set(cand.role, roleBucket);
+    }
+    roleBucket.push(item);
+
+    let exactBucket = exactByClean.get(clean);
+    if (!exactBucket) {
+      exactBucket = [];
+      exactByClean.set(clean, exactBucket);
+    }
+    exactBucket.push(item);
+  }
+
+  return { allDesc, byRoleDesc, exactByClean };
+}
+
+function firstEarlierIndexDesc(list: readonly IndexedQuoteCandidate[], currentSeq: number): number {
+  let low = 0;
+  let high = list.length;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (list[mid]!.seq >= currentSeq) low = mid + 1;
+    else high = mid;
+  }
+  return low;
+}
+
+function scanQuoteBucket(
+  list: readonly IndexedQuoteCandidate[] | undefined,
+  current: ChatMessage,
+  needle: string,
+  excludedRole?: ChatMessage['role'],
+): string | undefined {
+  if (!list || !list.length) return undefined;
+  const start = firstEarlierIndexDesc(list, current.seq);
+  for (let i = start; i < list.length; i++) {
+    const cand = list[i]!;
+    if (cand.id === current.id) continue;
+    if (excludedRole && cand.role === excludedRole) continue;
+    if (cand.clean === needle) return cand.id;
+    if (needle.length >= 6 && (cand.clean.includes(needle) || needle.startsWith(cand.clean))) return cand.id;
+  }
+  return undefined;
+}
+
 function findQuotedJumpTargetId(
   current: ChatMessage,
   label: string,
   preview: string,
+  index?: QuoteLookupIndex,
 ): string | undefined {
   const needle = singleLine(preview);
   if (!needle || needle.length < 2) return undefined;
@@ -181,19 +234,31 @@ function findQuotedJumpTargetId(
     : label === '回复你'
       ? 'user'
       : undefined;
-  const earlier = [...appState.messages.values()]
-    .filter(m => m.id !== current.id && m.source !== 'system' && m.seq < current.seq)
-    .sort((a, b) => b.seq - a.seq);
-  const candidates = preferredRole
-    ? [...earlier.filter(m => m.role === preferredRole), ...earlier.filter(m => m.role !== preferredRole)]
-    : earlier;
-  for (const cand of candidates) {
-    const clean = singleLine(stripLeadingQuoteForPreview(cand.text));
-    if (!clean) continue;
-    if (clean === needle) return cand.id;
-    if (needle.length >= 6 && (clean.includes(needle) || needle.startsWith(clean))) return cand.id;
+  const lookup = index ?? buildQuoteLookupIndex(orderConversation(appState.messages.values()));
+
+  if (needle.length < 6) {
+    const exactList = lookup.exactByClean.get(needle);
+    if (!exactList || !exactList.length) return undefined;
+    const start = firstEarlierIndexDesc(exactList, current.seq);
+    if (preferredRole) {
+      for (let i = start; i < exactList.length; i++) {
+        const cand = exactList[i]!;
+        if (cand.id !== current.id && cand.role === preferredRole) return cand.id;
+      }
+    }
+    for (let i = start; i < exactList.length; i++) {
+      const cand = exactList[i]!;
+      if (cand.id !== current.id) return cand.id;
+    }
+    return undefined;
   }
-  return undefined;
+
+  if (preferredRole) {
+    const preferredHit = scanQuoteBucket(lookup.byRoleDesc.get(preferredRole), current, needle);
+    if (preferredHit) return preferredHit;
+    return scanQuoteBucket(lookup.allDesc, current, needle, preferredRole);
+  }
+  return scanQuoteBucket(lookup.allDesc, current, needle);
 }
 
 function isMessageMatchedByTraceSelection(message: ChatMessage): boolean {
@@ -227,17 +292,24 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
   const routingDetailEl = element('routing-detail');
 
   const statusPillEl = element('companion-status-pill');
+  safeRemoveAttr(statusPillEl, 'aria-live');
+  safeRemoveAttr(statusPillEl, 'role');
   const activeWorksBtn = element<HTMLButtonElement>('conv-active-works-btn');
   const channelFiltersEl = element('conv-channel-filters');
   const hideSystemBtn = element<HTMLButtonElement>('conv-hide-system-btn');
   const detailModeBtn = element<HTMLButtonElement>('conv-detail-mode-btn');
   const filterBannerEl = element('conv-filter-banner');
+  safeRemoveAttr(filterBannerEl, 'role');
+  safeRemoveAttr(filterBannerEl, 'aria-live');
   const scrollBottomBtn = element<HTMLButtonElement>('scroll-bottom-btn');
   const bossDecisionDockEl = element('boss-decision-dock');
   const convControlsEl = document.getElementById('conv-controls');
   const mobileFilterBtn = document.getElementById('mobile-filter-btn') as HTMLButtonElement | null;
   const mobileFilterDot = document.getElementById('mobile-filter-dot');
   const mobileTraceDot = document.getElementById('mobile-trace-dot');
+  if (!safeHasAttr(scrollEl, 'tabindex')) {
+    scrollEl.setAttribute('tabindex', '-1');
+  }
 
   let channelFilter: ChatChannelFilter = normalizeStoredChannel(readStoredString(STORAGE_KEY_CHANNEL));
   let hideSystem = readStoredString(STORAGE_KEY_HIDE_SYSTEM) === 'true';
@@ -245,6 +317,8 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
   let lastBotState: BotStateId = 'sleeping';
 
   let routingDetailRequest = 0;
+  let routingDetailAbort: AbortController | undefined;
+  let hydrateParentsAbort: AbortController | undefined;
   let draftTypingActive = false;
   let draftTypingTimer: ReturnType<typeof setTimeout> | undefined;
   let unreadWhileScrolledUp = 0;
@@ -261,7 +335,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
   function setScrollTopProgrammatic(nextTop: number): void {
     scrollEl.scrollTop = nextTop;
     programmaticScrollTop = scrollEl.scrollTop;
-    programmaticScrollUntil = Date.now() + 150;
+    programmaticScrollUntil = Date.now() + 300;
   }
 
   function syncOlderButton(state: 'idle' | 'loading' | 'error' = 'idle'): void {
@@ -322,9 +396,55 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     }
   }
 
+  const supportsNativePopover = typeof HTMLElement !== 'undefined'
+    && 'popover' in HTMLElement.prototype
+    && typeof emoteTrayEl.showPopover === 'function'
+    && typeof emoteTrayEl.hidePopover === 'function'
+    && safeHasAttr(emoteTrayEl, 'popover');
+  let emotePopoverOpen = false;
+  if (supportsNativePopover) {
+    emoteTrayEl.hidden = false;
+  } else {
+    emoteTrayEl.hidden = true;
+  }
+
+  function isEmoteTrayOpen(): boolean {
+    if (!supportsNativePopover) return !emoteTrayEl.hidden;
+    try {
+      if (typeof emoteTrayEl.matches === 'function') {
+        return emoteTrayEl.matches(':popover-open');
+      }
+    } catch {
+      // Fall back to tracked popover state if :popover-open selector is unsupported.
+    }
+    return emotePopoverOpen;
+  }
+
   function setEmoteTrayOpen(open: boolean): void {
-    emoteTrayEl.hidden = !open;
+    if (supportsNativePopover) {
+      try {
+        if (open && !isEmoteTrayOpen()) {
+          emoteTrayEl.showPopover();
+        } else if (!open && isEmoteTrayOpen()) {
+          emoteTrayEl.hidePopover();
+        }
+      } catch {
+        // Ignore popover state errors when disconnected or unsupported.
+      }
+      emotePopoverOpen = open;
+    } else {
+      emoteTrayEl.hidden = !open;
+    }
     emoteToggleBtn.setAttribute('aria-expanded', String(open));
+  }
+
+  if (supportsNativePopover) {
+    emoteTrayEl.addEventListener('toggle', event => {
+      const nextState = (event as Event & { newState?: string }).newState;
+      const open = nextState === 'open' || (nextState === undefined && isEmoteTrayOpen());
+      emotePopoverOpen = open;
+      emoteToggleBtn.setAttribute('aria-expanded', String(open));
+    });
   }
 
   function insertBotEmote(tag: string): void {
@@ -338,9 +458,9 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     const snippet = `${needLeadSpace ? ' ' : ''}${tag}${needTrailSpace ? ' ' : ''}`;
     draftEl.value = `${before}${snippet}${after}`;
     const caret = before.length + snippet.length;
-    draftEl.focus();
-    draftEl.setSelectionRange(caret, caret);
     setEmoteTrayOpen(false);
+    safeFocus(draftEl);
+    draftEl.setSelectionRange(caret, caret);
     setDraftTyping(true);
     updateComposer();
   }
@@ -350,6 +470,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     const itemBtn = node('button', '', 'bot-emote-item');
     itemBtn.type = 'button';
     itemBtn.title = `插入 [bot:${expr}] (${meta.label})`;
+    itemBtn.setAttribute('aria-label', `插入 ${meta.label} 表情`);
     itemBtn.append(createStaticBotSvg({ size: 20, expr }), node('span', meta.label));
     itemBtn.addEventListener('click', () => {
       insertBotEmote(`[bot:${expr}]`);
@@ -357,44 +478,66 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     emoteTrayEl.append(itemBtn);
   }
 
-  emoteToggleBtn.addEventListener('click', event => {
-    event.stopPropagation();
-    if (emoteToggleBtn.disabled) return;
-    setEmoteTrayOpen(emoteTrayEl.hidden);
-  });
+  if (!supportsNativePopover || emoteToggleBtn.getAttribute('popovertarget') !== emoteTrayEl.id) {
+    emoteToggleBtn.addEventListener('click', event => {
+      event.stopPropagation();
+      if (emoteToggleBtn.disabled) return;
+      setEmoteTrayOpen(!isEmoteTrayOpen());
+    });
+  }
 
-  function setMobileFilterOpen(open: boolean): void {
+  function setMobileFilterOpen(open: boolean, opts?: { restoreFocus?: boolean }): void {
     if (!convControlsEl || !mobileFilterBtn) return;
+    const wasOpen = convControlsEl.classList.contains('is-mobile-open');
     convControlsEl.classList.toggle('is-mobile-open', open);
     mobileFilterBtn.setAttribute('aria-expanded', String(open));
+    if (open && !wasOpen) {
+      const firstControl = convControlsEl.querySelector<HTMLElement>(
+        'button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      );
+      safeFocus(firstControl);
+    } else if (!open && wasOpen && opts?.restoreFocus !== false) {
+      const activeInside = typeof document !== 'undefined'
+        && typeof Node !== 'undefined'
+        && document.activeElement instanceof Node
+        && convControlsEl.contains(document.activeElement);
+      if (activeInside || opts?.restoreFocus === true) {
+        safeFocus(mobileFilterBtn);
+      }
+    }
   }
 
   mobileFilterBtn?.addEventListener('click', event => {
     event.stopPropagation();
     const isOpen = convControlsEl?.classList.contains('is-mobile-open') ?? false;
-    setMobileFilterOpen(!isOpen);
+    setMobileFilterOpen(!isOpen, { restoreFocus: isOpen });
   });
 
   document.addEventListener('click', event => {
-    if (!emoteTrayEl.hidden) {
-      if (!(event.target instanceof Node && (emoteTrayEl.contains(event.target) || emoteToggleBtn.contains(event.target)))) {
+    if (!supportsNativePopover && isEmoteTrayOpen()) {
+      if (!(typeof Node !== 'undefined' && event.target instanceof Node && (emoteTrayEl.contains(event.target) || emoteToggleBtn.contains(event.target)))) {
         setEmoteTrayOpen(false);
       }
     }
     if (convControlsEl?.classList.contains('is-mobile-open')) {
-      if (!(event.target instanceof Node && (convControlsEl.contains(event.target) || mobileFilterBtn?.contains(event.target)))) {
-        setMobileFilterOpen(false);
+      if (!(typeof Node !== 'undefined' && event.target instanceof Node && (convControlsEl.contains(event.target) || mobileFilterBtn?.contains(event.target)))) {
+        setMobileFilterOpen(false, { restoreFocus: false });
       }
     }
   });
 
   document.addEventListener('keydown', event => {
     if (event.key !== 'Escape') return;
-    if (!emoteTrayEl.hidden) {
+    if (!supportsNativePopover && isEmoteTrayOpen()) {
+      const activeInTray = typeof document !== 'undefined'
+        && typeof Node !== 'undefined'
+        && document.activeElement instanceof Node
+        && emoteTrayEl.contains(document.activeElement);
       setEmoteTrayOpen(false);
+      if (activeInTray) safeFocus(emoteToggleBtn);
     }
     if (convControlsEl?.classList.contains('is-mobile-open')) {
-      setMobileFilterOpen(false);
+      setMobileFilterOpen(false, { restoreFocus: true });
     }
   });
 
@@ -404,7 +547,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     draftEl.readOnly = appState.sending || appState.uncertain;
     const emoteLocked = locked || appState.sending || appState.uncertain;
     emoteToggleBtn.disabled = emoteLocked;
-    if (emoteLocked && !emoteTrayEl.hidden) {
+    if (emoteLocked && isEmoteTrayOpen()) {
       setEmoteTrayOpen(false);
     }
     sendBtn.disabled = locked || appState.sending || (!appState.uncertain && !draftEl.value.trim());
@@ -473,6 +616,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
         renderMessages();
         setScrollTopProgrammatic(scrollEl.scrollHeight);
         syncScrollBottomButton();
+        announceStatus(`已切换会话筛选为「${meta.shortLabel}」`);
       }, `conv-channel-chip mini-button${channelFilter === ch ? ' active' : ''}`);
       btn.setAttribute('aria-pressed', String(channelFilter === ch));
       btn.title = meta.label;
@@ -514,6 +658,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
         writeStoredString(STORAGE_KEY_HIDE_SYSTEM, 'false');
         unreadWhileScrolledUp = 0;
         renderMessages();
+        announceStatus('已恢复显示全部会话消息');
       }, 'mini-button'),
     );
   }
@@ -523,18 +668,25 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     writeStoredString(STORAGE_KEY_HIDE_SYSTEM, String(hideSystem));
     unreadWhileScrolledUp = 0;
     renderMessages();
+    announceStatus(hideSystem ? '已静默系统通知' : '已显示系统通知');
   });
 
   detailModeBtn.addEventListener('click', () => {
     detailMode = !detailMode;
     writeStoredString(STORAGE_KEY_DETAIL_MODE, String(detailMode));
     renderMessages();
+    announceStatus(detailMode ? '已切换至详细模式' : '已切换至精简模式');
   });
 
   function syncScrollBottomButton(): void {
     const dist = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
     const hasMessages = renderedArticles.size > 0;
     const show = hasMessages && (dist > 140 || unreadWhileScrolledUp > 0);
+    const wasVisible = !scrollBottomBtn.hidden;
+    const wasFocused = typeof document !== 'undefined' && document.activeElement === scrollBottomBtn;
+    if (!show && wasVisible && wasFocused) {
+      safeFocus(scrollEl, { preventScroll: true });
+    }
     scrollBottomBtn.hidden = !show;
     scrollBottomBtn.classList.toggle('has-unread', unreadWhileScrolledUp > 0);
     scrollBottomBtn.textContent = unreadWhileScrolledUp > 0
@@ -544,14 +696,45 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
 
   scrollBottomBtn.addEventListener('click', () => {
     unreadWhileScrolledUp = 0;
+    const finish = () => {
+      syncScrollBottomButton();
+      if (scrollBottomBtn.hidden && typeof document !== 'undefined' && document.activeElement === scrollBottomBtn) {
+        safeFocus(scrollEl, { preventScroll: true });
+      }
+    };
     if (typeof scrollEl.scrollTo === 'function') {
       suppressAutoLoadUntil = Date.now() + 700;
-      scrollEl.scrollTo({ top: scrollEl.scrollHeight, behavior: 'smooth' });
+      const behavior: ScrollBehavior = prefersReducedMotion() ? 'auto' : 'smooth';
+      const ret = scrollEl.scrollTo({ top: scrollEl.scrollHeight, behavior }) as unknown;
+      if (ret && typeof (ret as Promise<unknown>).then === 'function') {
+        void (ret as Promise<unknown>).then(finish, finish);
+      } else {
+        finish();
+      }
     } else {
       setScrollTopProgrammatic(scrollEl.scrollHeight);
+      finish();
     }
-    syncScrollBottomButton();
   });
+
+  function setSendFeedback(text: string, tone: 'error' | 'status' | 'clear'): void {
+    if (tone === 'clear') {
+      safeRemoveAttr(sendErrorEl, 'role');
+      sendErrorEl.className = 'error composer-error';
+      sendErrorEl.textContent = '';
+      return;
+    }
+    if (tone === 'status') {
+      sendErrorEl.setAttribute('role', 'status');
+      sendErrorEl.className = 'composer-error meta';
+      sendErrorEl.textContent = text;
+      announceStatus(text, 'polite');
+      return;
+    }
+    sendErrorEl.setAttribute('role', 'alert');
+    sendErrorEl.className = 'error composer-error';
+    sendErrorEl.textContent = text;
+  }
 
   function mergeMessages(items: ChatMessage[]): void {
     mergeInto(appState.messages, items);
@@ -561,7 +744,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       draftEl.value = '';
       setDraftTyping(false);
       setEmoteTrayOpen(false);
-      sendErrorEl.textContent = '已从持久记录确认接收，无需重发。';
+      setSendFeedback('已从持久记录确认接收，无需重发。', 'status');
       updateComposer();
     }
   }
@@ -576,7 +759,14 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       ),
     ];
     if (!missing.length) return;
-    const parents = await fetchMessagesBatch(missing.slice(0, 40)).catch(() => []);
+    hydrateParentsAbort?.abort();
+    const controller = typeof AbortController === 'function' ? new AbortController() : undefined;
+    hydrateParentsAbort = controller;
+    const parents = await fetchMessagesBatch(missing.slice(0, 40), {
+      signal: controller?.signal,
+      priority: 'low',
+    }).catch(() => []);
+    if (controller?.signal.aborted) return;
     mergeMessages(parents);
   }
 
@@ -620,7 +810,19 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     return row;
   }
 
-  function buildRoutingSection(message: ChatMessage): HTMLElement | undefined {
+  function buildWorkMap(): Map<string, WorkView> {
+    const workMap = new Map<string, WorkView>();
+    for (const work of appState.view?.works ?? []) {
+      workMap.set(work.id, work);
+    }
+    return workMap;
+  }
+
+  function buildRoutingSection(
+    message: ChatMessage,
+    workMap: Map<string, WorkView> = buildWorkMap(),
+    onBeforeMatchReveal?: () => void,
+  ): HTMLElement | undefined {
     const model = classifyRoutingDisplay(message, detailMode);
     if (!model.visible) return undefined;
 
@@ -632,9 +834,6 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       pending.append(node('span', '', 'route-pill-dot'), node('span', model.pendingText));
       row.append(pending);
     }
-
-    const workMap = new Map<string, WorkView>();
-    for (const work of appState.view?.works ?? []) workMap.set(work.id, work);
 
     for (const action of model.taskActions) {
       const work = action.taskId ? workMap.get(action.taskId) : undefined;
@@ -651,7 +850,9 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
           hooks.selectTrace({ type: 'task', id: action.taskId!, label: action.taskLabel ?? '目标工作' });
           hooks.showPanel(true);
         }, 'route-target route-pill-btn');
-        targetBtn.title = `${label} · ${work ? statusText(work.status) : routeState(action)}`;
+        const stateLabel = work ? statusText(work.status) : routeState(action);
+        targetBtn.title = `${label} · ${stateLabel}`;
+        targetBtn.setAttribute('aria-label', `${label}（${stateLabel}），查看轨迹`);
         pill.append(targetBtn);
       } else {
         const textSpan = node('span', label, 'route-pill-text');
@@ -673,6 +874,11 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
         }, 'route-pill-stop danger-btn mini-button');
         stopPillBtn.disabled = requested || appState.authExpired;
         stopPillBtn.title = requested ? '已请求停止' : '停止此后台任务';
+        stopPillBtn.setAttribute(
+          'aria-label',
+          requested ? `已请求停止后台任务「${label}」` : `停止后台任务「${label}」`,
+        );
+        stopPillBtn.dataset.actionKey = `stop-pill-${message.id}-${work.id}`;
         pill.append(stopPillBtn);
       }
       row.append(pill);
@@ -691,13 +897,19 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     }
 
     const isExpanded = expandedRoutingIds.has(message.id);
+    const hasDrawer = Boolean(message.routing && (model.hasExpandableDetails || model.mode === 'detail'));
+    const drawerId = `route-drawer-${domSafeId(message.id)}`;
+    let expandBtn: HTMLButtonElement | undefined;
     if (model.hasExpandableDetails || model.mode === 'detail') {
-      const expandBtn = button(isExpanded ? '▴ 收起' : '▾ 详情', () => {
+      expandBtn = button(isExpanded ? '▴ 收起' : '▾ 详情', () => {
         if (expandedRoutingIds.has(message.id)) expandedRoutingIds.delete(message.id);
         else expandedRoutingIds.add(message.id);
         renderMessages();
       }, 'route-expand-btn mini-button');
       expandBtn.setAttribute('aria-expanded', String(isExpanded));
+      expandBtn.setAttribute('aria-label', isExpanded ? '收起路由详情' : '展开路由详情');
+      expandBtn.dataset.actionKey = `route-expand-${message.id}`;
+      if (hasDrawer) expandBtn.setAttribute('aria-controls', drawerId);
       row.append(expandBtn);
     }
 
@@ -707,11 +919,26 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       area.append(node('p', model.warningText, 'route-warning-note'));
     }
 
-    if (isExpanded && message.routing) {
+    if (hasDrawer && message.routing) {
       const drawer = node('div', '', 'route-expanded-drawer');
+      drawer.id = drawerId;
       for (const action of message.routing.actions) {
         drawer.append(actionRow(action));
       }
+      if (!isExpanded) {
+        drawer.setAttribute('hidden', 'until-found');
+      }
+      drawer.addEventListener('beforematch', () => {
+        expandedRoutingIds.add(message.id);
+        drawer.hidden = false;
+        safeRemoveAttr(drawer, 'hidden');
+        if (expandBtn) {
+          expandBtn.textContent = '▴ 收起';
+          expandBtn.setAttribute('aria-expanded', 'true');
+          expandBtn.setAttribute('aria-label', '收起路由详情');
+        }
+        onBeforeMatchReveal?.();
+      });
       area.append(drawer);
     }
     return area;
@@ -720,6 +947,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
   function renderAttachmentAndFooterChips(
     message: ChatMessage,
     options?: { skipRoutingCoveredTasks?: boolean },
+    workMap: Map<string, WorkView> = buildWorkMap(),
   ): HTMLElement | undefined {
     const attachments: AttachmentView[] = message.attachments ?? [];
     const paths = message.paths ?? [];
@@ -751,8 +979,6 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       wrap.append(node('span', p, 'message-path attachment-chip'));
     }
 
-    const workMap = new Map<string, WorkView>();
-    for (const work of appState.view?.works ?? []) workMap.set(work.id, work);
     const seenTasks = new Set<string>();
     for (const id of taskIds) {
       if (seenTasks.has(id)) continue;
@@ -786,22 +1012,35 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
   function renderRoutingDetail(): void {
     syncSelectionHighlight();
     routingDetailEl.hidden = appState.selection.type !== 'message';
-    if (appState.selection.type !== 'message') return;
+    if (appState.selection.type !== 'message') {
+      routingDetailAbort?.abort();
+      routingDetailAbort = undefined;
+      return;
+    }
     const message = appState.messages.get(appState.selection.id);
     if (!message) {
+      routingDetailAbort?.abort();
+      const controller = typeof AbortController === 'function' ? new AbortController() : undefined;
+      routingDetailAbort = controller;
       const requestSeq = ++routingDetailRequest;
       const generation = appState.selectionGeneration;
       const id = appState.selection.id;
       routingDetailEl.replaceChildren(node('p', '正在读取该消息的路由记录…', 'meta'));
-      void api<ChatMessage>(`/api/message?${new URLSearchParams({ messageId: id })}`).then(fetched => {
-        if (requestSeq !== routingDetailRequest || generation !== appState.selectionGeneration) return;
+      void api<ChatMessage>(`/api/message?${new URLSearchParams({ messageId: id })}`, undefined, {
+        signal: controller?.signal,
+        priority: 'low',
+      }).then(fetched => {
+        if (controller?.signal.aborted || requestSeq !== routingDetailRequest || generation !== appState.selectionGeneration) return;
         mergeMessages([fetched]);
         renderMessages();
       }).catch(error => {
+        if (controller?.signal.aborted || (error instanceof Error && error.name === 'AbortError')) return;
         if (requestSeq === routingDetailRequest) routingDetailEl.replaceChildren(node('p', `读取路由记录失败：${errorText(error)}`, 'error'));
       });
       return;
     }
+    routingDetailAbort?.abort();
+    routingDetailAbort = undefined;
     const previous = routingDetailEl.querySelector<HTMLDetailsElement>('details.routing-facts');
     const factsOpen = previous?.open ?? false;
     const referencesOpen = previous?.querySelector<HTMLDetailsElement>('details.references')?.open ?? false;
@@ -895,14 +1134,16 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       replySourcePreview: string;
       channel: ReturnType<typeof resolveMessageChannel>;
       quoteJumpId?: string;
+      workMap?: Map<string, WorkView>;
     },
   ): string {
+    const workMap = opts.workMap ?? buildWorkMap();
     const workStates = [
       ...message.taskIds,
       ...(message.routing?.actions.map(a => a.taskId).filter((id): id is string => Boolean(id)) ?? []),
     ]
       .map(id => {
-        const w = appState.view?.works.find(item => item.id === id);
+        const w = workMap.get(id);
         return w ? `${id}:${w.status}:${w.pendingQuestion ? 1 : 0}:${appState.stopRequests.has(`task:${id}`) ? 1 : 0}` : id;
       })
       .join(',');
@@ -934,18 +1175,30 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     ].join('|');
   }
 
-  function buildStopActionButton(message: ChatMessage): HTMLButtonElement | undefined {
+  function buildStopActionButton(
+    message: ChatMessage,
+    workMap: Map<string, WorkView> = buildWorkMap(),
+  ): HTMLButtonElement | undefined {
     if (!active(message.status)) return undefined;
-    const deliveryWork = message.role === 'assistant'
-      ? appState.view?.works.find(work => message.taskIds.includes(work.id) && active(work.status))
-      : undefined;
+    let deliveryWork: WorkView | undefined;
+    if (message.role === 'assistant') {
+      for (const id of message.taskIds) {
+        const cand = workMap.get(id);
+        if (cand && active(cand.status)) {
+          deliveryWork = cand;
+          break;
+        }
+      }
+    }
     const requested = appState.stopRequests.has(deliveryWork ? `task:${deliveryWork.id}` : `message:${message.id}`);
     const label = message.role === 'user' ? '取消' : deliveryWork ? '停止任务' : '停止回复';
+    const timeLabel = formatShortClock(message.at);
     const stop = button(requested ? '已请求停止' : label, () => {
       if (deliveryWork) void hooks.stopWork(deliveryWork.id);
       else void stopMessage(message.id);
     }, 'mini-button danger-btn msg-stop-btn');
     stop.disabled = requested || appState.authExpired;
+    stop.setAttribute('aria-label', requested ? `已请求停止（${timeLabel}）` : `${label}（${timeLabel}）`);
     stop.dataset.actionKey = `stop-${message.id}`;
     return stop;
   }
@@ -959,22 +1212,29 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     quoteJumpId = parsedQuote && !parsedQuote.uncached
       ? findQuotedJumpTargetId(message, parsedQuote.label, parsedQuote.preview)
       : undefined,
+    workMap: Map<string, WorkView> = buildWorkMap(),
+    onBeforeMatchReveal?: () => void,
   ): void {
     article.className = `message user-message${isGrouped ? ' is-grouped' : ''}${isMessageMatchedByTraceSelection(message) ? ' is-trace-selected' : ''}`;
     const children: Node[] = [];
     const displayBody = parsedQuote ? parsedQuote.body : message.text;
+    const timeLabel = formatShortClock(message.at);
 
     const row = node('div', '', 'user-row');
     const actions = node('div', '', `message-actions${active(message.status) ? ' has-active-stop' : ''}`);
-    actions.append(createClipboardButton('复制', () => displayBody || message.text));
+    actions.append(createClipboardButton('复制', () => displayBody || message.text, {
+      ariaLabel: `复制我的消息（${timeLabel}）`,
+      actionKey: `copy-${message.id}`,
+    }));
     const traceBtn = button('路由', () => {
       hooks.selectTrace({ type: 'message', id: message.id, label: '本轮消息' });
       hooks.showPanel(true);
     }, 'mini-button');
     traceBtn.title = '查看本次路由与上下文';
+    traceBtn.setAttribute('aria-label', `查看我的消息（${timeLabel}）的路由与上下文`);
     traceBtn.dataset.actionKey = `trace-${message.id}`;
     actions.append(traceBtn);
-    const stopBtn = buildStopActionButton(message);
+    const stopBtn = buildStopActionButton(message, workMap);
     if (stopBtn) actions.append(stopBtn);
 
     const bubble = node('div', '', 'user-bubble');
@@ -999,7 +1259,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     textEl.append(renderUserMessageContent(displayBody || (parsedQuote ? '（仅引用）' : '（空消息）'), markdownOpts));
     bubble.append(textEl);
 
-    const footerChips = renderAttachmentAndFooterChips(message, { skipRoutingCoveredTasks: true });
+    const footerChips = renderAttachmentAndFooterChips(message, { skipRoutingCoveredTasks: true }, workMap);
     if (footerChips) bubble.append(footerChips);
 
     row.append(actions, bubble);
@@ -1032,16 +1292,22 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     speaker.append(time);
     children.push(speaker);
 
-    const routingSection = buildRoutingSection(message);
+    const routingSection = buildRoutingSection(message, workMap, onBeforeMatchReveal);
     if (routingSection) children.push(routingSection);
 
     article.replaceChildren(...children);
   }
 
-  function populateSystemArticle(article: HTMLElement, message: ChatMessage): void {
+  function populateSystemArticle(
+    article: HTMLElement,
+    message: ChatMessage,
+    workMap: Map<string, WorkView> = buildWorkMap(),
+    onBeforeMatchReveal?: () => void,
+  ): void {
     article.className = `message router-message system-message${isMessageMatchedByTraceSelection(message) ? ' is-trace-selected' : ''}`;
     const summary = summarizeSystemNotice(message);
     const expanded = expandedSystemIds.has(message.id) || detailMode;
+    const bodyId = `system-notice-body-${domSafeId(message.id)}`;
 
     const card = node('div', '', `system-notice-card${expanded ? ' is-expanded' : ''}`);
     const head = node('div', '', 'system-notice-head');
@@ -1054,13 +1320,20 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     time.title = timestamp(message.at);
     head.append(time);
 
+    let toggleBtn: HTMLButtonElement | undefined;
     if (summary.expandable && !detailMode) {
-      const toggleBtn = button(expanded ? '收起' : '详情', () => {
+      toggleBtn = button(expanded ? '收起' : '详情', () => {
         if (expandedSystemIds.has(message.id)) expandedSystemIds.delete(message.id);
         else expandedSystemIds.add(message.id);
         renderMessages();
       }, 'mini-button system-notice-toggle');
       toggleBtn.setAttribute('aria-expanded', String(expanded));
+      toggleBtn.setAttribute('aria-controls', bodyId);
+      toggleBtn.setAttribute(
+        'aria-label',
+        expanded ? `收起系统通知「${summary.title}」详情` : `展开系统通知「${summary.title}」详情`,
+      );
+      toggleBtn.dataset.actionKey = `sys-toggle-${message.id}`;
       head.append(toggleBtn);
     }
 
@@ -1068,19 +1341,36 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       hooks.selectTrace({ type: 'message', id: message.replyTo ?? message.id, label: '系统通知链路' });
       hooks.showPanel(true);
     }, 'mini-button system-notice-trace');
+    traceBtn.setAttribute('aria-label', `查看系统通知「${summary.title}」的链路`);
     traceBtn.dataset.actionKey = `trace-${message.id}`;
     head.append(traceBtn);
 
     card.append(head);
 
-    if (expanded) {
+    if (expanded || summary.expandable) {
       const body = node('div', '', 'system-notice-body');
+      body.id = bodyId;
       const md = node('div', '', 'message-text md-content');
       md.append(renderMarkdownContent(message.text || '没有公开文本。', markdownOpts));
       body.append(md);
-      const footerChips = renderAttachmentAndFooterChips(message);
+      const footerChips = renderAttachmentAndFooterChips(message, undefined, workMap);
       if (footerChips) body.append(footerChips);
       if (message.reason) body.append(node('p', message.reason, 'message-reason'));
+      if (!expanded) {
+        body.setAttribute('hidden', 'until-found');
+      }
+      body.addEventListener('beforematch', () => {
+        expandedSystemIds.add(message.id);
+        body.hidden = false;
+        safeRemoveAttr(body, 'hidden');
+        card.classList.add('is-expanded');
+        if (toggleBtn) {
+          toggleBtn.textContent = '收起';
+          toggleBtn.setAttribute('aria-expanded', 'true');
+          toggleBtn.setAttribute('aria-label', `收起系统通知「${summary.title}」详情`);
+        }
+        onBeforeMatchReveal?.();
+      });
       card.append(body);
     }
 
@@ -1096,13 +1386,16 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       showReplyRef: boolean;
       replySourceText?: string;
       channel: ReturnType<typeof resolveMessageChannel>;
+      workMap?: Map<string, WorkView>;
+      onBeforeMatchReveal?: () => void;
     },
   ): void {
     article.className = `message router-message${opts.isGrouped ? ' is-grouped' : ''}${isMessageMatchedByTraceSelection(message) ? ' is-trace-selected' : ''}`;
+    const workMap = opts.workMap ?? buildWorkMap();
+    const timeLabel = formatShortClock(message.at);
 
     const row = node('div', '', 'assistant-row');
     const avatarCol = node('div', '', 'assistant-avatar-col');
-    avatarCol.setAttribute('aria-hidden', 'true');
 
     if (!opts.isGrouped || active(message.status) || opts.isLatestAssistant) {
       const avatar = node('span', '', 'speaker-avatar');
@@ -1131,7 +1424,11 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
           ctrl.setState('idle');
           ctrl.setExpression(inferredExpr ?? 'auto');
         }
-        avatar.append(ctrl.svg);
+        avatar.append(
+          typeof ctrl.createPokeButton === 'function'
+            ? ctrl.createPokeButton('与 F.R.I.D.A.Y. 互动')
+            : ctrl.svg,
+        );
       } else {
         avatar.append(createStaticBotSvg({
           size: 28,
@@ -1140,6 +1437,8 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
         }));
       }
       avatarCol.append(avatar);
+    } else {
+      avatarCol.setAttribute('aria-hidden', 'true');
     }
 
     const bodyCol = node('div', '', 'assistant-body-col');
@@ -1170,15 +1469,19 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     speaker.append(time);
 
     const actions = node('div', '', `message-actions${active(message.status) ? ' has-active-stop' : ''}`);
-    actions.append(createClipboardButton('复制', () => message.text));
+    actions.append(createClipboardButton('复制', () => message.text, {
+      ariaLabel: `复制 F.R.I.D.A.Y. 回复（${timeLabel}）`,
+      actionKey: `copy-${message.id}`,
+    }));
     const traceBtn = button('链路', () => {
       hooks.selectTrace({ type: 'message', id: message.replyTo ?? message.id, label: '本轮消息' });
       hooks.showPanel(true);
     }, 'mini-button');
     traceBtn.title = '查看来源轨迹';
+    traceBtn.setAttribute('aria-label', `查看 F.R.I.D.A.Y. 回复（${timeLabel}）的来源轨迹`);
     traceBtn.dataset.actionKey = `trace-${message.id}`;
     actions.append(traceBtn);
-    const stopBtn = buildStopActionButton(message);
+    const stopBtn = buildStopActionButton(message, workMap);
     if (stopBtn) actions.append(stopBtn);
 
     headRow.append(speaker, actions);
@@ -1224,8 +1527,10 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
 
     if (isLong) {
       const remaining = fullText.length - LONG_MESSAGE_COLLAPSE_CHARS;
+      const tailId = `msg-long-tail-${domSafeId(message.id)}`;
+      const tailText = fullText.slice(LONG_MESSAGE_COLLAPSE_CHARS);
       const toggleLongBtn = button(
-        isLongExpanded ? '▴ 收起长文' : `▾ 展开全文（剩余 ${remaining.toLocaleString('en-US')} 字）`,
+        isLongExpanded ? '▴ 收起长文' : `▾ 展开全文（剩余 ${formatNumber(remaining)} 字）`,
         () => {
           if (expandedLongTextIds.has(message.id)) expandedLongTextIds.delete(message.id);
           else expandedLongTextIds.add(message.id);
@@ -1233,10 +1538,32 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
         },
         'long-text-toggle mini-button',
       );
+      toggleLongBtn.setAttribute('aria-expanded', String(isLongExpanded));
+      toggleLongBtn.setAttribute('aria-label', isLongExpanded ? `收起长文（${timeLabel}）` : `展开全文（剩余 ${formatNumber(remaining)} 字，${timeLabel}）`);
+      toggleLongBtn.dataset.actionKey = `long-toggle-${message.id}`;
+
+      if (!isLongExpanded && tailText) {
+        const longTailEl = node('div', '', 'message-text md-content msg-long-tail');
+        longTailEl.id = tailId;
+        longTailEl.setAttribute('hidden', 'until-found');
+        longTailEl.append(renderMarkdownContent(tailText, markdownOpts));
+        toggleLongBtn.setAttribute('aria-controls', tailId);
+        longTailEl.addEventListener('beforematch', () => {
+          expandedLongTextIds.add(message.id);
+          longTailEl.hidden = false;
+          safeRemoveAttr(longTailEl, 'hidden');
+          textBlock.classList.remove('is-long-truncated');
+          toggleLongBtn.textContent = '▴ 收起长文';
+          toggleLongBtn.setAttribute('aria-expanded', 'true');
+          toggleLongBtn.setAttribute('aria-label', `收起长文（${timeLabel}）`);
+          opts.onBeforeMatchReveal?.();
+        });
+        bodyCol.append(longTailEl);
+      }
       bodyCol.append(toggleLongBtn);
     }
 
-    const footerChips = renderAttachmentAndFooterChips(message);
+    const footerChips = renderAttachmentAndFooterChips(message, undefined, workMap);
     if (footerChips) bodyCol.append(footerChips);
     if (message.reason) bodyCol.append(node('p', message.reason, 'message-reason'));
 
@@ -1271,6 +1598,9 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
         break;
       }
     }
+
+    const workMap = buildWorkMap();
+    const quoteIndex = buildQuoteLookupIndex(ordered);
 
     const keptLiveIds = new Set<string>();
     const usedArticleIds = new Set<string>();
@@ -1318,17 +1648,25 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       const channel = resolveMessageChannel(message, appState.messages);
       const parsedQuote = !systemNotice && message.role === 'user' ? extractLeadingQuote(message.text) : undefined;
       const quoteJumpId = parsedQuote && !parsedQuote.uncached
-        ? findQuotedJumpTargetId(message, parsedQuote.label, parsedQuote.preview)
+        ? findQuotedJumpTargetId(message, parsedQuote.label, parsedQuote.preview, quoteIndex)
         : undefined;
 
-      const sig = buildMessageSignature(message, {
+      const sigOpts = {
         isLatestAssistant,
         isGrouped,
         showReplyRef,
         replySourcePreview,
         channel,
         quoteJumpId,
-      });
+        workMap,
+      };
+      const sig = buildMessageSignature(message, sigOpts);
+      const onBeforeMatchReveal = () => {
+        const currentEntry = renderedArticles.get(message.id);
+        if (currentEntry) {
+          currentEntry.sig = buildMessageSignature(message, { ...sigOpts, workMap: buildWorkMap() });
+        }
+      };
 
       usedArticleIds.add(message.id);
       let entry = renderedArticles.get(message.id);
@@ -1338,9 +1676,9 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
         el.dataset.seq = String(message.seq);
         if (message.replyTo) el.dataset.replyTo = message.replyTo;
         if (systemNotice) {
-          populateSystemArticle(el, message);
+          populateSystemArticle(el, message, workMap, onBeforeMatchReveal);
         } else if (message.role === 'user') {
-          populateUserArticle(el, message, channel, isGrouped, parsedQuote, quoteJumpId);
+          populateUserArticle(el, message, channel, isGrouped, parsedQuote, quoteJumpId, workMap, onBeforeMatchReveal);
         } else {
           populateAssistantArticle(el, message, {
             isLatestAssistant,
@@ -1348,6 +1686,8 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
             showReplyRef,
             replySourceText: replySourceClean,
             channel,
+            workMap,
+            onBeforeMatchReveal,
           });
         }
         if (isEntering) el.classList.add('is-entering');
@@ -1358,9 +1698,9 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
         if (message.replyTo) entry.el.dataset.replyTo = message.replyTo;
         else delete entry.el.dataset.replyTo;
         if (systemNotice) {
-          populateSystemArticle(entry.el, message);
+          populateSystemArticle(entry.el, message, workMap, onBeforeMatchReveal);
         } else if (message.role === 'user') {
-          populateUserArticle(entry.el, message, channel, isGrouped, parsedQuote, quoteJumpId);
+          populateUserArticle(entry.el, message, channel, isGrouped, parsedQuote, quoteJumpId, workMap, onBeforeMatchReveal);
         } else {
           populateAssistantArticle(entry.el, message, {
             isLatestAssistant,
@@ -1368,6 +1708,8 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
             showReplyRef,
             replySourceText: replySourceClean,
             channel,
+            workMap,
+            onBeforeMatchReveal,
           });
         }
         entry.sig = sig;
@@ -1411,6 +1753,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
             writeStoredString(STORAGE_KEY_CHANNEL, 'all');
             writeStoredString(STORAGE_KEY_HIDE_SYSTEM, 'false');
             renderMessages();
+            announceStatus('已恢复显示全部会话消息');
           }, 'mini-button'),
         );
       }
@@ -1424,7 +1767,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
         const expected = desiredNodes[i]!;
         const currentAt = messagesEl.children[i] ?? null;
         if (currentAt !== expected) {
-          messagesEl.insertBefore(expected, currentAt);
+          moveElementPreservingState(messagesEl, expected, currentAt);
         }
       }
       while (messagesEl.children.length > desiredNodes.length) {
@@ -1435,7 +1778,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     syncOlderButton();
     if (focus) {
       const replacement = [...messagesEl.querySelectorAll<HTMLButtonElement>('button')].find(item => item.dataset.actionKey === focus);
-      replacement?.focus({ preventScroll: true });
+      safeFocus(replacement, { preventScroll: true });
     }
 
     if (nearBottom) {
@@ -1512,9 +1855,22 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       }
       hooks.showPanel(false);
       if (target) {
-        setScrollTopProgrammatic(
-          scrollEl.scrollTop + target.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top - 16,
-        );
+        suppressAutoLoadUntil = Date.now() + 700;
+        const behavior: ScrollBehavior = prefersReducedMotion() ? 'auto' : 'smooth';
+        if (typeof target.scrollIntoView === 'function') {
+          const ret = target.scrollIntoView({ behavior, block: 'center' }) as unknown;
+          if (ret && typeof (ret as Promise<unknown>).then === 'function') {
+            await (ret as Promise<unknown>);
+          }
+        } else if (typeof target.getBoundingClientRect === 'function' && typeof scrollEl.getBoundingClientRect === 'function') {
+          setScrollTopProgrammatic(
+            scrollEl.scrollTop + target.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top - 16,
+          );
+        }
+        if (!safeHasAttr(target, 'tabindex')) {
+          target.setAttribute('tabindex', '-1');
+        }
+        safeFocus(target, { preventScroll: true });
         target.classList.add('message-highlight');
         setTimeout(() => target?.classList.remove('message-highlight'), 2000);
       }
@@ -1534,6 +1890,8 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     void loadOlder('auto');
   }
 
+  let olderAbort: AbortController | undefined;
+
   async function loadOlder(trigger: 'auto' | 'manual' = 'manual'): Promise<void> {
     if (appState.historyBusy || appState.historyBefore === undefined) return;
     if (trigger === 'auto' && !appState.historyHasMore) return;
@@ -1542,10 +1900,17 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     appState.historyBusy = true;
     historyAutoLoadPaused = false;
     syncOlderButton('loading');
+    safeRemoveAttr(historyErrorEl, 'role');
     historyErrorEl.textContent = '';
+    olderAbort?.abort();
+    const controller = typeof AbortController === 'function' ? new AbortController() : undefined;
+    olderAbort = controller;
     try {
-      const page = await api<MessagePage>(`/api/history?before=${beforeAtStart}`);
-      if (appState.authExpired || appState.cursor < cursorAtStart || appState.historyBefore !== beforeAtStart) return;
+      const page = await api<MessagePage>(`/api/history?before=${beforeAtStart}`, undefined, {
+        signal: controller?.signal,
+        ...(trigger === 'auto' ? { priority: 'low' as const } : {}),
+      });
+      if (controller?.signal.aborted || appState.authExpired || appState.cursor < cursorAtStart || appState.historyBefore !== beforeAtStart) return;
       const preRenderHeight = scrollEl.scrollHeight;
       const preRenderTop = Math.max(0, scrollEl.scrollTop);
       for (const item of page.items) knownMessageIds.add(item.id);
@@ -1558,9 +1923,12 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       setScrollTopProgrammatic(preRenderTop + heightDelta);
       syncScrollBottomButton();
     } catch (error) {
+      if (controller?.signal.aborted || (error instanceof Error && error.name === 'AbortError')) return;
       historyAutoLoadPaused = true;
+      historyErrorEl.setAttribute('role', 'alert');
       historyErrorEl.textContent = `更早消息读取失败：${errorText(error)}。可点击上方重试。`;
     } finally {
+      if (olderAbort === controller) olderAbort = undefined;
       appState.historyBusy = false;
       lastOlderAutoLoadAt = Date.now();
       syncOlderButton(historyAutoLoadPaused ? 'error' : 'idle');
@@ -1574,11 +1942,11 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     try {
       payload = { requestId: makeRequestId(), text: trimmed, files: [] };
     } catch (error) {
-      sendErrorEl.textContent = `发送失败：${errorText(error)}`;
+      setSendFeedback(`发送失败：${errorText(error)}`, 'error');
       return;
     }
     appState.sending = true;
-    sendErrorEl.textContent = '';
+    setSendFeedback('', 'clear');
     updateComposer();
     try {
       const accepted = await api<ChatMessage>('/api/chat', payload);
@@ -1590,7 +1958,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       syncScrollBottomButton();
       hooks.scheduleRefresh();
     } catch (error) {
-      sendErrorEl.textContent = `快捷回复发送失败：${errorText(error)}`;
+      setSendFeedback(`快捷回复发送失败：${errorText(error)}`, 'error');
     } finally {
       appState.sending = false;
       updateComposer();
@@ -1606,14 +1974,14 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       try {
         appState.pending = { requestId: makeRequestId(), text, files };
       } catch (error) {
-        sendErrorEl.textContent = `发送失败，草稿已保留：${errorText(error)}`;
+        setSendFeedback(`发送失败，草稿已保留：${errorText(error)}`, 'error');
         return;
       }
     }
     if (!appState.pending) return;
     const submitted = appState.pending;
     appState.sending = true;
-    sendErrorEl.textContent = '';
+    setSendFeedback('', 'clear');
     updateComposer();
     try {
       const accepted = await api<ChatMessage>('/api/chat', submitted);
@@ -1637,14 +2005,17 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
         draftEl.value = '';
         setDraftTyping(false);
         setEmoteTrayOpen(false);
-        sendErrorEl.textContent = '已从持久记录确认接收，无需重发。';
+        setSendFeedback('已从持久记录确认接收，无需重发。', 'status');
         return;
       }
       appState.uncertain = !(error instanceof ApiError) || error.status >= 500;
       if (!appState.uncertain) appState.pending = undefined;
-      sendErrorEl.textContent = appState.uncertain
-        ? `接收结果未确认：${errorText(error)}。草稿已保留并锁定；点击“重试原请求”会使用同一请求标识，不自动重发。`
-        : `发送失败，草稿已保留：${errorText(error)}`;
+      setSendFeedback(
+        appState.uncertain
+          ? `接收结果未确认：${errorText(error)}。草稿已保留并锁定；点击“重试原请求”会使用同一请求标识，不自动重发。`
+          : `发送失败，草稿已保留：${errorText(error)}`,
+        'error',
+      );
     } finally {
       appState.sending = false;
       updateComposer();
@@ -1666,6 +2037,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     }
   }
 
+  attachDelayedFormValidation(composerEl);
   sendBtn.addEventListener('pointerdown', event => {
     if (!sendBtn.disabled) event.preventDefault();
   });
@@ -1677,13 +2049,14 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     setDraftTyping(draftEl.value.trim().length > 0);
     updateComposer();
   });
-  let composing = false;
-  draftEl.addEventListener('compositionstart', () => { composing = true; });
-  draftEl.addEventListener('compositionend', () => { composing = false; });
   draftEl.addEventListener('keydown', event => {
-    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && !composing && event.keyCode !== 229) {
+    if (event.key === 'Enter' && !event.shiftKey && !isImeComposing(event)) {
       event.preventDefault();
-      void send();
+      if (typeof composerEl.requestSubmit === 'function') {
+        composerEl.requestSubmit();
+      } else {
+        void send();
+      }
     }
   });
   draftEl.addEventListener('blur', () => {
@@ -1703,10 +2076,7 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
     }
     syncScrollBottomButton();
 
-    let isProgrammatic = false;
-    if (programmaticScrollTop !== undefined) {
-      isProgrammatic = Date.now() <= programmaticScrollUntil
-        && Math.abs(scrollEl.scrollTop - programmaticScrollTop) <= 1;
+    if (programmaticScrollTop !== undefined && Math.abs(scrollEl.scrollTop - programmaticScrollTop) > 2) {
       programmaticScrollTop = undefined;
       programmaticScrollUntil = 0;
     }
@@ -1714,10 +2084,22 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       historyAutoLoadPaused = false;
       syncOlderButton('idle');
     }
-    if (!isProgrammatic) {
-      maybeAutoLoadOlder(false);
-    }
   }, { passive: true });
+
+  onScrollEnd(scrollEl, () => {
+    if (
+      programmaticScrollTop !== undefined
+      && Date.now() <= programmaticScrollUntil
+      && Math.abs(scrollEl.scrollTop - programmaticScrollTop) <= 2
+    ) {
+      programmaticScrollTop = undefined;
+      programmaticScrollUntil = 0;
+      return;
+    }
+    programmaticScrollTop = undefined;
+    programmaticScrollUntil = 0;
+    maybeAutoLoadOlder(false);
+  });
   window.addEventListener('resize', () => {
     // A viewport change must not leave the newest reply clipped under the composer when already near bottom.
     if (resizeTimer) clearTimeout(resizeTimer);
@@ -1770,46 +2152,6 @@ export function initChatPanel(options?: { onDraftActivity?: () => void }): ChatP
       maybeAutoLoadOlder(true);
     }
   }, { passive: true });
-
-  let touchStartX = 0;
-  let touchStartY = 0;
-  document.addEventListener('touchstart', event => {
-    if (event.touches.length !== 1) return;
-    const touch = event.touches[0];
-    if (!touch) return;
-    touchStartX = touch.clientX;
-    touchStartY = touch.clientY;
-  }, { passive: true });
-
-  document.addEventListener('touchmove', event => {
-    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
-    if (!window.matchMedia('(max-width: 730px)').matches) return;
-    if (event.touches.length !== 1) return;
-    const touch = event.touches[0];
-    if (!touch) return;
-    const target = event.target instanceof Element ? event.target : null;
-    if (!target) return;
-    if (target.closest('.brain-viewport-wrap, canvas, input[type="range"]')) return;
-
-    const dx = touch.clientX - touchStartX;
-    const dy = touch.clientY - touchStartY;
-    const horizontal = Math.abs(dx) > Math.abs(dy);
-    if (horizontal && target.closest('textarea, input')) return;
-
-    let cursor: Element | null = target;
-    while (cursor && cursor !== document.body && cursor !== document.documentElement) {
-      if (cursor.matches(MOBILE_SCROLLABLE_SELECTOR)) {
-        if (horizontal) {
-          if (cursor.scrollWidth > cursor.clientWidth + 1) return;
-        } else if (cursor.scrollHeight > cursor.clientHeight + 1) {
-          return;
-        }
-      }
-      cursor = cursor.parentElement;
-    }
-
-    if (event.cancelable) event.preventDefault();
-  }, { passive: false });
 
   olderBtn.addEventListener('click', () => { void loadOlder('manual'); });
 

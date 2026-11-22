@@ -7,7 +7,7 @@ import type {
   WorkView,
 } from '../view.js';
 import { activeStatus, record, routeLabel, routeState } from './model.js';
-import { profileBadges, statusText, tierBadges } from './shared/format.js';
+import { formatNumber, profileBadges, statusText, tierBadges } from './shared/format.js';
 
 // ---------------- Backend Shared Contracts ----------------
 
@@ -595,7 +595,7 @@ function formatUsageCost(usage: ChainLlmDetail['usage']): string {
   if (!usage) return '';
   const tokens = usage.totalTokens ?? ((usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheRead ?? 0));
   const parts: string[] = [];
-  if (tokens > 0) parts.push(`${tokens.toLocaleString('en-US')} tok`);
+  if (tokens > 0) parts.push(`${formatNumber(tokens)} tok`);
   if (usage.costUsd !== undefined && usage.costUsd > 0) parts.push(`$${usage.costUsd.toFixed(4)}`);
   return parts.join(' · ');
 }
@@ -1130,8 +1130,8 @@ function isDecisionQualitySpan(ev: TraceEvent): boolean {
  * human-readable semantic execution chain with waterfall timings and structured inspector payloads.
  */
 export function buildExecutionChain(bundle: ExecutionTraceBundle): ExecutionChainView {
-  const sortedEvents = [...(bundle.events ?? [])].sort((a, b) => a.seq - b.seq || a.at - b.at);
-  const messages = [...(bundle.messages ?? [])].sort((a, b) => a.seq - b.seq || a.at - b.at);
+  const sortedEvents = (bundle.events ?? []).toSorted((a, b) => a.seq - b.seq || a.at - b.at);
+  const messages = (bundle.messages ?? []).toSorted((a, b) => a.seq - b.seq || a.at - b.at);
 
   // Fold visible_text increments if bundle.events still carries any
   const streamedMap = new Map<string, string>(Object.entries(bundle.streamedTextBySpan ?? {}));
@@ -1313,7 +1313,7 @@ export function buildExecutionChain(bundle: ExecutionTraceBundle): ExecutionChai
   // Helper: map Router Agent 请求 spans so assistant delivery nodes align to the exact turn that finished producing them
   const routerReqList = [...agentReqSpans.values()]
     .filter(p => p.first.actor === 'router')
-    .sort((a, b) => (a.first.seq - b.first.seq));
+    .toSorted((a, b) => (a.first.seq - b.first.seq));
 
   // (A) Message Nodes from bundle.messages
   for (const msg of messages) {
@@ -1522,7 +1522,7 @@ export function buildExecutionChain(bundle: ExecutionTraceBundle): ExecutionChai
 
   // (B2) Agent 请求 spans (Router & Worker phases)
   const workerPhaseCounters = new Map<string, number>();
-  const sortedAgentReqs = [...agentReqSpans.values()].sort((a, b) => a.first.seq - b.first.seq);
+  const sortedAgentReqs = [...agentReqSpans.values()].toSorted((a, b) => a.first.seq - b.first.seq);
   for (const pair of sortedAgentReqs) {
     const startData = record(pair.start?.data);
     const endData = record(pair.end?.data);
@@ -1815,7 +1815,7 @@ export function buildExecutionChain(bundle: ExecutionTraceBundle): ExecutionChai
     if (req.isTimer === true) featureParts.push('定时任务');
     if (featureParts.length) summaryItems.push({ label: '请求特征', value: featureParts.join(' · ') });
     if (fallbackReason) summaryItems.push({ label: '降级原因', value: fallbackReason });
-    if (asNumber(usage.totalTokens)) summaryItems.push({ label: 'Decision Token', value: `${Number(usage.totalTokens).toLocaleString('en-US')} tok` });
+    if (asNumber(usage.totalTokens)) summaryItems.push({ label: 'Decision Token', value: `${formatNumber(Number(usage.totalTokens))} tok` });
 
     const previewParts: string[] = [];
     if (model) previewParts.push(`选定 ${model}${level ? `@${level}` : ''}`);
@@ -1930,7 +1930,7 @@ export function buildExecutionChain(bundle: ExecutionTraceBundle): ExecutionChai
       value: source === 'gemini-decision-1' ? 'Gemini Decision 1 (Jev)' : '启发式规则回退',
     });
     if (fallbackReason) summaryItems.push({ label: '降级原因', value: fallbackReason });
-    if (asNumber(usage.totalTokens)) summaryItems.push({ label: 'Decision Token', value: `${Number(usage.totalTokens).toLocaleString('en-US')} tok` });
+    if (asNumber(usage.totalTokens)) summaryItems.push({ label: 'Decision Token', value: `${formatNumber(Number(usage.totalTokens))} tok` });
 
     const effectiveStatus = skippedByRoute ? 'skipped' : pair.latest.status;
     const preview = skippedByRoute
@@ -2137,8 +2137,8 @@ export function buildExecutionChain(bundle: ExecutionTraceBundle): ExecutionChai
       if (asNumber(detail.attempt) !== undefined) summaryItems.push({ label: '重试次数', value: `${detail.attempt}/${detail.maxAttempts ?? '?'}` });
       if (asNumber(detail.delayMs) !== undefined) summaryItems.push({ label: '退避等待', value: `${detail.delayMs}ms` });
     } else {
-      if (asNumber(detail.tokensBefore) !== undefined) summaryItems.push({ label: '压缩前 Token', value: Number(detail.tokensBefore).toLocaleString('en-US') });
-      if (asNumber(detail.estimatedTokensAfter) !== undefined) summaryItems.push({ label: '压缩后预估', value: Number(detail.estimatedTokensAfter).toLocaleString('en-US') });
+      if (asNumber(detail.tokensBefore) !== undefined) summaryItems.push({ label: '压缩前 Token', value: formatNumber(Number(detail.tokensBefore)) });
+      if (asNumber(detail.estimatedTokensAfter) !== undefined) summaryItems.push({ label: '压缩后预估', value: formatNumber(Number(detail.estimatedTokensAfter)) });
     }
     const err = asNonEmptyString(detail.error ?? detail.finalError);
     rawNodes.push({
@@ -2350,7 +2350,7 @@ export function buildExecutionChain(bundle: ExecutionTraceBundle): ExecutionChai
   }
 
   // (C) LLM Call Nodes
-  const sortedLlmSpans = [...llmSpans.values()].sort((a, b) => a.first.seq - b.first.seq || a.first.at - b.first.at);
+  const sortedLlmSpans = [...llmSpans.values()].toSorted((a, b) => a.first.seq - b.first.seq || a.first.at - b.first.at);
   const routerLlmCount = sortedLlmSpans.filter(p => p.first.actor === 'router').length;
   let routerLlmIdx = 0;
   const workerLlmCounters = new Map<string, number>();
@@ -2712,7 +2712,7 @@ export function buildFallbackBundleFromAppState(
 
   const streamedTextBySpan: Record<string, string> = {};
   const filteredEvents: TraceEvent[] = [];
-  const sortedRaw = [...rawEvents].sort((a, b) => a.seq - b.seq || a.at - b.at);
+  const sortedRaw = rawEvents.toSorted((a, b) => a.seq - b.seq || a.at - b.at);
   for (const ev of sortedRaw) {
     if (ev.kind === 'visible_text') {
       if (ev.spanId) {
@@ -2753,7 +2753,7 @@ export function buildFallbackBundleFromAppState(
         || (msg.replyTo !== undefined && eventMsgIds.has(msg.replyTo))
       );
     })
-    .sort((a, b) => a.seq - b.seq || a.at - b.at);
+    .toSorted((a, b) => a.seq - b.seq || a.at - b.at);
 
   const linkedTasks: ExecutionTraceLinkedTask[] = works
     .filter(w => {

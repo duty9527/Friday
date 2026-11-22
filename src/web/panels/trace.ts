@@ -1,8 +1,15 @@
 import type { ChatMessage, TraceEvent, WorkView } from '../../view.js';
 import { activeStatus as active, mergeTraceWindow, record } from '../model.js';
 import { button, element, node } from '../shared/dom.js';
-import { errorText, profileBadges, statusText, tierBadges, timestamp } from '../shared/format.js';
+import { errorText, formatNumber, profileBadges, statusText, tierBadges, timestamp } from '../shared/format.js';
 import { collapseRightDrawer, ensureRightDrawerOpen } from '../shared/theme.js';
+import {
+  copyTextWithFeedback,
+  prefersReducedMotion,
+  safeFocus,
+  setInertElements,
+  yieldToMain,
+} from '../shared/ui-primitives.js';
 import { api, appState, hooks, type Selection } from '../state.js';
 import {
   buildExecutionChain,
@@ -20,9 +27,9 @@ import {
 export interface TracePanelController {
   renderWorks: () => void;
   stopWork: (target?: string) => Promise<void>;
-  showPanel: (trace: boolean) => void;
+  showPanel: (trace: boolean, opts?: { restoreFocus?: boolean }) => void;
   isTraceVisible: () => boolean;
-  closeSidebar: () => void;
+  closeSidebar: (restoreFocus?: boolean) => void;
   isSidebarOpen: () => boolean;
   focusSidebarToggle: () => void;
   selectTrace: (next: Selection, pin?: boolean) => void;
@@ -31,9 +38,33 @@ export interface TracePanelController {
 }
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
+const CHAIN_CHUNK_SIZE = 80;
+const CHAIN_SYNC_THRESHOLD = 120;
+
+const zhClockFormatter = typeof Intl !== 'undefined' && typeof Intl.DateTimeFormat === 'function'
+  ? new Intl.DateTimeFormat('zh-CN', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hourCycle: 'h23',
+    })
+  : undefined;
+
+interface DurationFormatLike {
+  format(duration: { hours?: number; minutes?: number; seconds?: number }): string;
+}
+
+const DurationFormatCtor = typeof Intl !== 'undefined' && 'DurationFormat' in Intl
+  ? (Intl as unknown as { DurationFormat?: new (locale: string, opts: { style: 'narrow' | 'short' | 'long' }) => DurationFormatLike }).DurationFormat
+  : undefined;
+
+const zhNarrowDurationFormatter = DurationFormatCtor
+  ? new DurationFormatCtor('zh-CN', { style: 'narrow' })
+  : undefined;
 
 function formatClock(at: number): string {
   if (!Number.isFinite(at)) return '—';
+  if (zhClockFormatter) return zhClockFormatter.format(at);
   return new Date(at).toLocaleTimeString('zh-CN', {
     hour12: false,
     hour: '2-digit',
@@ -61,15 +92,23 @@ function formatDuration(ms?: number): string {
   const totalSec = Math.round(ms / 1000);
   const mins = Math.floor(totalSec / 60);
   const secs = totalSec % 60;
-  if (mins < 60) return secs ? `${mins}m${secs}s` : `${mins}m`;
+  if (mins < 60) {
+    if (zhNarrowDurationFormatter) {
+      return zhNarrowDurationFormatter.format(secs ? { minutes: mins, seconds: secs } : { minutes: mins });
+    }
+    return secs ? `${mins}m${secs}s` : `${mins}m`;
+  }
   const hours = Math.floor(mins / 60);
   const remMins = mins % 60;
+  if (zhNarrowDurationFormatter) {
+    return zhNarrowDurationFormatter.format(remMins ? { hours, minutes: remMins } : { hours });
+  }
   return remMins ? `${hours}h${remMins}m` : `${hours}h`;
 }
 
 function formatTokens(count?: number): string {
   if (count === undefined || !Number.isFinite(count)) return '0';
-  return count.toLocaleString('en-US');
+  return formatNumber(count);
 }
 
 function statusTone(status: string, hasPendingQuestion = false): ChainActionNode['tone'] {
@@ -92,34 +131,62 @@ function isNarrowViewport(): boolean {
     && window.matchMedia('(max-width: 767px)').matches;
 }
 
-function createCopyButton(label: string, textToCopy: string): HTMLButtonElement {
-  let resetTimer: ReturnType<typeof setTimeout> | undefined;
-  const btn = button(label, () => {
-    const scheduleReset = () => {
-      if (resetTimer) clearTimeout(resetTimer);
-      resetTimer = setTimeout(() => {
-        resetTimer = undefined;
-        btn.classList.remove('is-copied');
-        btn.textContent = label;
-      }, 1500);
-    };
-    if (typeof navigator === 'undefined' || !navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
-      btn.classList.remove('is-copied');
-      btn.textContent = '当前环境不支持复制';
-      scheduleReset();
+function isMobileTraceViewport(): boolean {
+  return typeof window !== 'undefined'
+    && typeof window.matchMedia === 'function'
+    && window.matchMedia('(max-width: 730px)').matches;
+}
+
+function isSidebarDrawerViewport(): boolean {
+  return typeof window !== 'undefined'
+    && typeof window.matchMedia === 'function'
+    && window.matchMedia('(max-width: 1100px)').matches;
+}
+
+function runWithViewTransition(updateDom: () => void, afterFinish?: () => void): void {
+  const docWithVt = typeof document !== 'undefined'
+    ? (document as Document & { startViewTransition?: (cb: () => void) => { finished?: Promise<void> } })
+    : undefined;
+  if (docWithVt && typeof docWithVt.startViewTransition === 'function' && !prefersReducedMotion()) {
+    try {
+      const vt = docWithVt.startViewTransition(updateDom);
+      if (afterFinish) {
+        if (vt?.finished && typeof vt.finished.then === 'function') {
+          void vt.finished.then(afterFinish, afterFinish);
+        } else {
+          afterFinish();
+        }
+      }
       return;
+    } catch {
+      // Fall back to direct DOM update if transition is skipped/unavailable
     }
-    void navigator.clipboard.writeText(textToCopy).then(() => {
-      btn.classList.add('is-copied');
-      btn.textContent = '✓ 已复制';
-      scheduleReset();
-    }).catch(() => {
-      btn.classList.remove('is-copied');
-      btn.textContent = '复制失败';
-      scheduleReset();
-    });
-  }, 'copy-mini-btn mini-button');
-  return btn;
+  }
+  updateDom();
+  afterFinish?.();
+}
+
+function createCopyButton(label: string, textToCopy: string, ariaLabel?: string): HTMLElement {
+  const wrap = node('span', '', 'md-copy-wrap');
+  const btn = node('button', label, 'copy-mini-btn mini-button');
+  btn.type = 'button';
+  btn.setAttribute('aria-label', ariaLabel ?? label);
+  const statusEl = node('span', '', 'md-copy-status visually-hidden');
+  statusEl.setAttribute('role', 'status');
+  btn.addEventListener('click', () => {
+    void copyTextWithFeedback(btn, textToCopy, { statusEl });
+  });
+  wrap.append(btn, statusEl);
+  return wrap;
+}
+
+function createCodePreBlock(text: string, className: string, ariaLabel: string): HTMLPreElement {
+  const pre = node('pre', '', className);
+  pre.setAttribute('tabindex', '0');
+  pre.setAttribute('role', 'region');
+  pre.setAttribute('aria-label', ariaLabel);
+  pre.append(node('code', text));
+  return pre;
 }
 
 function createWaterfallBar(
@@ -217,6 +284,13 @@ export function initTracePanel(): TracePanelController {
   const mobileTraceScrim = document.getElementById('mobile-trace-scrim');
   const mobileSidebarScrim = document.getElementById('mobile-sidebar-scrim');
   const workSidebarCloseBtn = document.getElementById('work-sidebar-close') as HTMLButtonElement | null;
+  const tracePanelEl = document.getElementById('trace-panel');
+  const mainContentEl = document.getElementById('main-content');
+  const appTopbarEl = document.getElementById('app-topbar');
+  const mobileNavBtn = document.getElementById('mobile-nav-btn') as HTMLButtonElement | null;
+  const desktopTraceFoldBtn = document.getElementById('desktop-trace-fold') as HTMLButtonElement | null;
+  const conversationEl = typeof document.querySelector === 'function' ? document.querySelector<HTMLElement>('.conversation') : null;
+  const panelNavEl = typeof document.querySelector === 'function' ? document.querySelector<HTMLElement>('.panel-nav') : null;
 
   const categoryTabs: ReadonlyArray<{ cat: ChainCategory; label: string; btn: HTMLButtonElement | null }> = [
     { cat: 'all', label: '全部链路', btn: stepModeBtn },
@@ -231,6 +305,10 @@ export function initTracePanel(): TracePanelController {
   let traceRunSeq = 0;
   let bundleRequestSeq = 0;
   let bundleRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let bundleAbort: AbortController | undefined;
+  let workAbort: AbortController | undefined;
+  let traceAbort: AbortController | undefined;
+  let chainRenderSeq = 0;
   let userPickedNode = false;
   let userClearedSelection = false;
   let autoSelectedSource: 'none' | 'fallback' | 'bundle' = 'none';
@@ -239,23 +317,141 @@ export function initTracePanel(): TracePanelController {
   const seenChainNodeIds = new Set<string>();
   let lastChainScopeKey = '';
   let activeInspectorOperationKey: string | undefined;
+  let lastSidebarTrigger: HTMLElement | null = null;
+  let lastTraceTrigger: HTMLElement | null = null;
 
-  function showPanel(trace: boolean): void {
-    panelsEl.classList.toggle('trace-visible', trace);
-    showChatBtn.setAttribute('aria-pressed', String(!trace));
-    showTraceBtn.setAttribute('aria-pressed', String(trace));
-    mobileTraceBtn?.setAttribute('aria-expanded', String(trace));
-    mobileTraceBtn?.classList.toggle('active', trace);
+  function focusInspectorHeading(): void {
+    const titleEl = eventDetailEl.querySelector?.('h3.inspector-title') as HTMLElement | null | undefined;
+    if (titleEl) {
+      if (!titleEl.hasAttribute?.('tabindex')) titleEl.setAttribute?.('tabindex', '-1');
+      safeFocus(titleEl);
+    }
   }
 
-  function setSidebarOpen(open: boolean): void {
+  function focusChainCard(nodeId?: string): void {
+    const cards = Array.from(traceContentEl.querySelectorAll?.('.chain-card') ?? []) as HTMLElement[];
+    const match = (nodeId ? cards.find(card => card.dataset?.nodeId === nodeId) : undefined) ?? cards[0];
+    if (match) {
+      safeFocus(match);
+      return;
+    }
+    if (!traceContentEl.hasAttribute?.('tabindex')) traceContentEl.setAttribute?.('tabindex', '-1');
+    safeFocus(traceContentEl);
+  }
+
+  function focusSidebarToggle(): void {
+    if (isMobileTraceViewport() && mobileNavBtn) {
+      safeFocus(mobileNavBtn);
+      return;
+    }
+    if (lastSidebarTrigger && (!('isConnected' in lastSidebarTrigger) || lastSidebarTrigger.isConnected !== false) && !sidebarEl.contains?.(lastSidebarTrigger)) {
+      safeFocus(lastSidebarTrigger);
+      return;
+    }
+    safeFocus(workToggleBtn);
+  }
+
+  function showPanel(trace: boolean, opts?: { restoreFocus?: boolean }): void {
+    const wasVisible = panelsEl.classList.contains('trace-visible');
+    const mobileViewport = isMobileTraceViewport();
+
+    if (wasVisible === trace) {
+      showChatBtn.setAttribute('aria-pressed', String(!trace));
+      showTraceBtn.setAttribute('aria-pressed', String(trace));
+      mobileTraceBtn?.setAttribute('aria-expanded', String(trace));
+      mobileTraceBtn?.classList.toggle('active', trace);
+      if (!trace) {
+        tracePanelEl?.removeAttribute?.('role');
+        tracePanelEl?.removeAttribute?.('aria-modal');
+        setInertElements([conversationEl, panelNavEl, appTopbarEl, sidebarEl], false);
+      }
+      return;
+    }
+
+    if (trace && mobileViewport && typeof document !== 'undefined') {
+      const activeEl = document.activeElement;
+      lastTraceTrigger = activeEl && typeof (activeEl as HTMLElement).focus === 'function' && !tracePanelEl?.contains?.(activeEl) && activeEl !== document.body
+        ? (activeEl as HTMLElement)
+        : (mobileTraceBtn ?? showTraceBtn);
+    }
+
+    const applyUpdate = () => {
+      panelsEl.classList.toggle('trace-visible', trace);
+      showChatBtn.setAttribute('aria-pressed', String(!trace));
+      showTraceBtn.setAttribute('aria-pressed', String(trace));
+      mobileTraceBtn?.setAttribute('aria-expanded', String(trace));
+      mobileTraceBtn?.classList.toggle('active', trace);
+
+      if (trace && mobileViewport) {
+        tracePanelEl?.setAttribute?.('role', 'dialog');
+        tracePanelEl?.setAttribute?.('aria-modal', 'true');
+        setInertElements([conversationEl, panelNavEl, appTopbarEl, sidebarEl], true);
+      } else {
+        tracePanelEl?.removeAttribute?.('role');
+        tracePanelEl?.removeAttribute?.('aria-modal');
+        setInertElements([conversationEl, panelNavEl, appTopbarEl, sidebarEl], false);
+      }
+    };
+
+    const afterFinish = () => {
+      if (trace && mobileViewport) {
+        safeFocus(traceCloseBtn ?? clearFilterBtn);
+      } else if (!trace && mobileViewport) {
+        const trigger = lastTraceTrigger;
+        lastTraceTrigger = null;
+        if (opts?.restoreFocus !== false) {
+          const target = trigger && (!('isConnected' in trigger) || trigger.isConnected !== false) && !tracePanelEl?.contains?.(trigger)
+            ? trigger
+            : (mobileTraceBtn ?? showTraceBtn);
+          safeFocus(target);
+        }
+      } else if (!trace) {
+        lastTraceTrigger = null;
+      }
+    };
+
+    if (mobileViewport) {
+      runWithViewTransition(applyUpdate, afterFinish);
+    } else {
+      applyUpdate();
+    }
+  }
+
+  function setSidebarOpen(open: boolean, restoreFocus = true): void {
+    const isOpen = sidebarEl.classList.contains('open');
+    if (open === isOpen) return;
+
+    if (open && typeof document !== 'undefined') {
+      const activeEl = document.activeElement;
+      lastSidebarTrigger = activeEl && typeof (activeEl as HTMLElement).focus === 'function' && !sidebarEl.contains?.(activeEl) && activeEl !== document.body
+        ? (activeEl as HTMLElement)
+        : workToggleBtn;
+    }
+
     sidebarEl.classList.toggle('open', open);
     workToggleBtn.setAttribute('aria-expanded', String(open));
     if (mobileSidebarScrim) mobileSidebarScrim.hidden = !open;
+
+    if (open) {
+      sidebarEl.setAttribute?.('role', 'dialog');
+      sidebarEl.setAttribute?.('aria-modal', 'true');
+      if (isSidebarDrawerViewport()) {
+        setInertElements([mainContentEl, appTopbarEl], true);
+      }
+      safeFocus(workFilterEl);
+    } else {
+      sidebarEl.removeAttribute?.('role');
+      sidebarEl.removeAttribute?.('aria-modal');
+      setInertElements([mainContentEl, appTopbarEl], false);
+      if (restoreFocus) {
+        focusSidebarToggle();
+      }
+      lastSidebarTrigger = null;
+    }
   }
 
-  function closeSidebar(): void {
-    setSidebarOpen(false);
+  function closeSidebar(restoreFocus = true): void {
+    setSidebarOpen(false, restoreFocus);
   }
 
   function syncWideToggle(): void {
@@ -314,17 +510,28 @@ export function initTracePanel(): TracePanelController {
     if (!appState.ready || appState.authExpired) return;
     const generation = appState.selectionGeneration;
     const reqSeq = ++bundleRequestSeq;
+    bundleAbort?.abort();
+    const ac = typeof AbortController !== 'undefined' ? new AbortController() : undefined;
+    bundleAbort = ac;
     const params = new URLSearchParams();
     if (appState.selection.type === 'task') params.set('taskId', appState.selection.id);
     else if (appState.selection.type === 'message') params.set('messageId', appState.selection.id);
     try {
       const query = params.toString();
-      const bundle = await api<ExecutionTraceBundle>(`/api/execution-trace${query ? `?${query}` : ''}`);
-      if (generation !== appState.selectionGeneration || reqSeq !== bundleRequestSeq) return;
+      const useLowPriority = background || !appState.selectionPinned;
+      const bundle = await api<ExecutionTraceBundle>(
+        `/api/execution-trace${query ? `?${query}` : ''}`,
+        undefined,
+        {
+          ...(ac ? { signal: ac.signal } : {}),
+          ...(useLowPriority ? { priority: 'low' as const } : {}),
+        },
+      );
+      if (generation !== appState.selectionGeneration || reqSeq !== bundleRequestSeq || ac?.signal.aborted) return;
       appState.traceBundle = bundle;
       renderTrace();
     } catch {
-      if (generation !== appState.selectionGeneration || reqSeq !== bundleRequestSeq) return;
+      if (generation !== appState.selectionGeneration || reqSeq !== bundleRequestSeq || ac?.signal.aborted) return;
       if (!background) {
         renderTrace();
       }
@@ -348,7 +555,11 @@ export function initTracePanel(): TracePanelController {
     }
     appState.operationTextCache.set(cacheKey, { loading: true });
     try {
-      const raw = await api<unknown>(`/api/operation?${new URLSearchParams({ taskId, operationId })}`);
+      const raw = await api<unknown>(
+        `/api/operation?${new URLSearchParams({ taskId, operationId })}`,
+        undefined,
+        { priority: 'low' },
+      );
       const extracted = extractReadableOperationOutput(raw);
       appState.operationTextCache.set(cacheKey, {
         loading: false,
@@ -366,7 +577,7 @@ export function initTracePanel(): TracePanelController {
     }
   }
 
-  function selectNodeById(nodeId: string, ensureVisible = false): void {
+  function selectNodeById(nodeId: string, ensureVisible = false, focusHeading = true): void {
     appState.selectedNodeId = nodeId;
     userPickedNode = true;
     userClearedSelection = false;
@@ -376,7 +587,10 @@ export function initTracePanel(): TracePanelController {
         appState.traceCategory = 'all';
       }
     }
-    renderTrace();
+    runWithViewTransition(
+      () => renderTrace(),
+      focusHeading ? focusInspectorHeading : undefined,
+    );
   }
 
   function renderWorks(): void {
@@ -388,16 +602,16 @@ export function initTracePanel(): TracePanelController {
     for (const work of works) {
       const selected = appState.selection.type === 'task' && appState.selection.id === work.id;
       const entry = node('div', '', `work-row${selected ? ' selected' : ''}`);
-      entry.addEventListener('click', () => {
-        selectTrace({ type: 'task', id: work.id, label: work.prompt });
-        closeSidebar();
-        showPanel(true);
-      });
 
       const mainBtn = node('button', '', 'work-row-main');
       mainBtn.type = 'button';
       mainBtn.setAttribute('aria-pressed', String(selected));
       mainBtn.title = work.prompt;
+      mainBtn.addEventListener('click', () => {
+        selectTrace({ type: 'task', id: work.id, label: work.prompt });
+        closeSidebar(false);
+        showPanel(true);
+      });
       mainBtn.append(node('span', work.prompt || '后台工作', 'work-title'));
       const modelLabel = work.workerModel
         ? `${work.workerModel}${work.thinkingLevel ? `@${work.thinkingLevel}` : ''}`
@@ -414,12 +628,13 @@ export function initTracePanel(): TracePanelController {
 
       if (active(work.status)) {
         const requested = appState.stopRequests.has(`task:${work.id}`);
+        const workLabel = (work.prompt || '后台工作').replace(/\s+/g, ' ').trim().slice(0, 28);
         const stopBtn = node('button', requested ? '停止中…' : '■ 停止', 'work-stop-btn mini-button danger-btn');
         stopBtn.type = 'button';
         stopBtn.disabled = requested || appState.authExpired;
         stopBtn.title = requested ? '已请求停止，等待结算' : '停止该任务';
-        stopBtn.addEventListener('click', ev => {
-          ev?.stopPropagation?.();
+        stopBtn.setAttribute('aria-label', requested ? `正在请求停止工作：${workLabel}` : `停止工作：${workLabel}`);
+        stopBtn.addEventListener('click', () => {
           void stopWork(work.id);
         });
         entry.append(stopBtn);
@@ -516,12 +731,15 @@ export function initTracePanel(): TracePanelController {
         void stopWork(taskId);
       }, 'mini-button danger-btn');
       stopBtn.disabled = requested || appState.authExpired;
+      stopBtn.setAttribute('aria-label', requested ? `正在请求停止：${prompt || '当前任务'}` : `停止任务：${prompt || '当前任务'}`);
       actions.append(stopBtn);
     }
-    actions.append(button('🔄 刷新', () => {
+    const refreshBtn = button('🔄 刷新', () => {
       void loadWork(taskId, generation);
       void loadExecutionBundle();
-    }, 'mini-button'));
+    }, 'mini-button');
+    refreshBtn.setAttribute('aria-label', `刷新任务详情：${prompt || '当前任务'}`);
+    actions.append(refreshBtn);
 
     head.append(titleWrap, actions);
     frag.append(head);
@@ -689,17 +907,17 @@ export function initTracePanel(): TracePanelController {
           card.append(node('span', '文本变更对比', 'param-label'));
           block.append(
             node('div', `- ${param.label}`, 'diff-tag-old'),
-            node('pre', param.value, 'diff-old'),
+            createCodePreBlock(param.value, 'diff-old', `变更前：${param.label}`),
             node('div', `+ ${next.label}`, 'diff-tag-new'),
-            node('pre', next.value, 'diff-new'),
+            createCodePreBlock(next.value, 'diff-new', `变更后：${next.label}`),
           );
           i += 1;
         } else if (param.kind === 'diff_old') {
           card.append(node('span', param.label, 'param-label'));
-          block.append(node('pre', param.value, 'diff-old'));
+          block.append(createCodePreBlock(param.value, 'diff-old', `变更前：${param.label}`));
         } else {
           card.append(node('span', param.label, 'param-label'));
-          block.append(node('pre', param.value, 'diff-new'));
+          block.append(createCodePreBlock(param.value, 'diff-new', `变更后：${param.label}`));
         }
         card.append(block);
         list.append(card);
@@ -708,8 +926,8 @@ export function initTracePanel(): TracePanelController {
 
       if (param.kind === 'code') {
         const head = node('div', '', 'param-head');
-        head.append(node('span', param.label, 'param-label'), createCopyButton('复制', param.value));
-        card.append(head, node('pre', param.value, 'param-code'));
+        head.append(node('span', param.label, 'param-label'), createCopyButton('复制', param.value, `复制参数：${param.label}`));
+        card.append(head, createCodePreBlock(param.value, 'param-code', `参数代码：${param.label}`));
       } else if (param.kind === 'path') {
         card.append(node('span', param.label, 'param-label'), node('div', param.value, 'param-path'));
       } else if (param.kind === 'badge') {
@@ -764,7 +982,7 @@ export function initTracePanel(): TracePanelController {
       if (cached?.loading) {
         resSec.append(node('p', '正在读取完整执行结果…', 'meta'));
         if (tool.resultText) {
-          resSec.append(node('pre', tool.resultText, 'result-box'));
+          resSec.append(createCodePreBlock(tool.resultText, 'result-box', `${tool.displayName} 执行输出片段`));
         }
         return;
       }
@@ -787,8 +1005,8 @@ export function initTracePanel(): TracePanelController {
         const label = cached?.text
           ? '完整执行输出'
           : (tool.resultTruncated ? '执行输出（已截取片段）' : '执行输出');
-        head.append(node('span', label, 'param-label'), createCopyButton('复制结果', finalOutput));
-        resSec.append(head, node('pre', finalOutput, 'result-box'));
+        head.append(node('span', label, 'param-label'), createCopyButton('复制结果', finalOutput, `复制${tool.displayName}${label}`));
+        resSec.append(head, createCodePreBlock(finalOutput, 'result-box', `${tool.displayName} ${label}`));
         return;
       }
       if (!tool.errorText && !cached?.error) {
@@ -801,9 +1019,9 @@ export function initTracePanel(): TracePanelController {
       const head = node('div', '', 'param-head');
       head.append(
         node('span', tool.resultTruncated ? '执行输出（已截取）' : '执行输出', 'param-label'),
-        createCopyButton('复制结果', tool.resultText),
+        createCopyButton('复制结果', tool.resultText, `复制${tool.displayName}执行输出`),
       );
-      resSec.append(head, node('pre', tool.resultText, 'result-box'));
+      resSec.append(head, createCodePreBlock(tool.resultText, 'result-box', `${tool.displayName} 执行输出`));
     } else if (!tool.errorText) {
       resSec.append(node('p', active(selectedNode.status) ? '工具仍在执行中，等待返回结果…' : '本工具执行无文本输出。', 'meta'));
     }
@@ -859,7 +1077,7 @@ export function initTracePanel(): TracePanelController {
     if (llm.thinkingText) {
       const thinkSec = appendSection(body, '思考摘要');
       const head = node('div', '', 'param-head');
-      head.append(node('span', '模型内部推理片段', 'param-label'), createCopyButton('复制', llm.thinkingText));
+      head.append(node('span', '模型内部推理片段', 'param-label'), createCopyButton('复制', llm.thinkingText, `复制${selectedNode.title}思考摘要`));
       thinkSec.append(head, node('div', llm.thinkingText, 'inspector-text-card thinking-card'));
     }
 
@@ -867,7 +1085,7 @@ export function initTracePanel(): TracePanelController {
     if (llm.publicText) {
       const outSec = appendSection(body, llm.publicTextTruncated ? '本轮模型输出（已截取）' : '本轮模型输出');
       const head = node('div', '', 'param-head');
-      head.append(node('span', '公开文本回复', 'param-label'), createCopyButton('复制', llm.publicText));
+      head.append(node('span', '公开文本回复', 'param-label'), createCopyButton('复制', llm.publicText, `复制${selectedNode.title}公开文本回复`));
       outSec.append(head, node('div', llm.publicText, 'inspector-prose-card'));
     }
 
@@ -932,7 +1150,7 @@ export function initTracePanel(): TracePanelController {
     const textContent = msg.text || '（无公开文本）';
     if (msg.text) {
       const head = node('div', '', 'param-head');
-      head.append(node('span', '正文内容', 'param-label'), createCopyButton('复制正文', msg.text));
+      head.append(node('span', '正文内容', 'param-label'), createCopyButton('复制正文', msg.text, `复制${msg.senderLabel}消息正文`));
       textSec.append(head);
     }
     textSec.append(node('div', textContent, 'inspector-prose-card'));
@@ -1020,7 +1238,7 @@ export function initTracePanel(): TracePanelController {
     if (rt.reportText) {
       const sec = appendSection(body, '汇报正文');
       const head = node('div', '', 'param-head');
-      head.append(node('span', '交付内容', 'param-label'), createCopyButton('复制汇报', rt.reportText));
+      head.append(node('span', '交付内容', 'param-label'), createCopyButton('复制汇报', rt.reportText, `复制${rt.kindLabel}汇报正文`));
       sec.append(head, node('div', rt.reportText, 'inspector-prose-card'));
     }
   }
@@ -1053,9 +1271,11 @@ export function initTracePanel(): TracePanelController {
 
     const toolbar = node('div', '', 'inspector-toolbar');
     const titleGroup = node('div', '', 'inspector-title-group');
+    const titleEl = node('h3', selectedNode.title, 'inspector-title');
+    titleEl.setAttribute('tabindex', '-1');
     titleGroup.append(
       node('span', selectedNode.icon, 'inspector-icon'),
-      node('h3', selectedNode.title, 'inspector-title'),
+      titleEl,
       node('span', selectedNode.statusLabel, `chain-badge inspector-status-badge tone-${selectedNode.tone}`),
     );
 
@@ -1069,9 +1289,13 @@ export function initTracePanel(): TracePanelController {
     }, 'mini-button');
     nextBtn.disabled = !nextNode;
     const closeBtn = button('✕', () => {
+      const closedNodeId = appState.selectedNodeId;
       appState.selectedNodeId = undefined;
       userClearedSelection = true;
-      renderTrace();
+      runWithViewTransition(
+        () => renderTrace(),
+        () => focusChainCard(closedNodeId),
+      );
     }, 'mini-button inspector-close-btn');
     closeBtn.title = '关闭语义详情';
     closeBtn.setAttribute('aria-label', '关闭语义详情');
@@ -1105,7 +1329,86 @@ export function initTracePanel(): TracePanelController {
     eventDetailEl.scrollTop = prevScrollTop;
   }
 
+  function buildChainListItem(item: ChainActionNode, isEntering: boolean): HTMLLIElement {
+    const isSelected = item.id === appState.selectedNodeId;
+    const isLive = item.tone === 'run' || active(item.status);
+    const li = node('li', '', `chain-item${isEntering ? ' is-entering' : ''}`);
+    const card = node(
+      'button',
+      '',
+      `chain-card cat-${item.category}${isSelected ? ' is-selected' : ''}${isLive ? ' is-live' : ''}`,
+    );
+    card.type = 'button';
+    card.setAttribute('aria-pressed', String(isSelected));
+    if (card.dataset) card.dataset.nodeId = item.id;
+    card.addEventListener('click', () => {
+      selectNodeById(item.id);
+    });
+
+    const timeCol = node('div', '', 'chain-time-col');
+    timeCol.append(
+      node('span', formatClock(item.at), 'chain-clock'),
+      node('span', formatOffset(item.offsetMs), 'chain-offset'),
+      node('span', '', `chain-dot tone-${item.tone}`),
+    );
+
+    const bodyCol = node('div', '', 'chain-body-col');
+    const headRow = node('div', '', 'chain-head-row');
+    const badges = node('span', '', 'chain-badges');
+    badges.append(node('span', item.actorLabel, 'chain-badge tone-neutral'));
+    if (item.durationMs !== undefined) {
+      badges.append(node('span', formatDuration(item.durationMs), 'chain-badge tone-neutral'));
+    }
+    badges.append(node('span', item.statusLabel, `chain-badge tone-${item.tone}`));
+    headRow.append(
+      node('span', item.icon, 'chain-icon'),
+      node('span', item.title, 'chain-title'),
+      badges,
+    );
+    bodyCol.append(headRow);
+
+    if (item.subtitle) {
+      bodyCol.append(node('div', item.subtitle, 'chain-subtitle meta'));
+    }
+    if (item.preview) {
+      bodyCol.append(node('p', item.preview, 'chain-preview'));
+    }
+    bodyCol.append(createWaterfallBar(item.waterfallStartPermille, item.waterfallWidthPermille, item.tone));
+
+    card.append(timeCol, bodyCol);
+    li.append(card);
+    return li;
+  }
+
+  async function appendRemainingChainChunks(
+    seq: number,
+    listEl: HTMLUListElement,
+    visibleNodes: readonly ChainActionNode[],
+    startIndex: number,
+    isInitialBatchForScope: boolean,
+    scroller: HTMLElement | null | undefined,
+    pinned: boolean,
+  ): Promise<void> {
+    let cursor = startIndex;
+    while (cursor < visibleNodes.length) {
+      await yieldToMain();
+      if (seq !== chainRenderSeq) return;
+      const end = Math.min(visibleNodes.length, cursor + CHAIN_CHUNK_SIZE);
+      const frag = document.createDocumentFragment();
+      for (let i = cursor; i < end; i++) {
+        const item = visibleNodes[i]!;
+        const isEntering = !isInitialBatchForScope && !seenChainNodeIds.has(item.id);
+        seenChainNodeIds.add(item.id);
+        frag.append(buildChainListItem(item, isEntering));
+      }
+      listEl.append(frag);
+      cursor = end;
+      if (scroller && pinned) scroller.scrollTop = scroller.scrollHeight;
+    }
+  }
+
   function renderChainList(chainView: ExecutionChainView): readonly ChainActionNode[] {
+    const seq = ++chainRenderSeq;
     const scroller = typeof traceContentEl.closest === 'function'
       ? traceContentEl.closest<HTMLElement>('.trace-chain-pane')
       : undefined;
@@ -1150,64 +1453,23 @@ export function initTracePanel(): TracePanelController {
         ? (appState.selection.type === 'task' ? '此工作暂未采集到可执行链路。' : '此范围尚无可展示的执行链路。')
         : '当前筛选分类下暂无动作记录，可切换「全部链路」查看完整过程。';
       contents.append(node('p', emptyMsg, 'empty'));
+      traceContentEl.replaceChildren(contents);
     } else {
       const list = node('ul', '', `chain-list${isInitialBatchForScope ? ' is-fresh-list' : ''}`);
-      for (const item of visibleNodes) {
+      const syncLimit = visibleNodes.length > CHAIN_SYNC_THRESHOLD ? CHAIN_CHUNK_SIZE : visibleNodes.length;
+      for (let i = 0; i < syncLimit; i++) {
+        const item = visibleNodes[i]!;
         const isEntering = !isInitialBatchForScope && !seenChainNodeIds.has(item.id);
         seenChainNodeIds.add(item.id);
-        const isSelected = item.id === appState.selectedNodeId;
-        const isLive = item.tone === 'run' || active(item.status);
-        const li = node('li', '', `chain-item${isEntering ? ' is-entering' : ''}`);
-        const card = node(
-          'button',
-          '',
-          `chain-card cat-${item.category}${isSelected ? ' is-selected' : ''}${isLive ? ' is-live' : ''}`,
-        );
-        card.type = 'button';
-        card.setAttribute('aria-pressed', String(isSelected));
-        if (card.dataset) card.dataset.nodeId = item.id;
-        card.addEventListener('click', () => {
-          selectNodeById(item.id);
-        });
-
-        const timeCol = node('div', '', 'chain-time-col');
-        timeCol.append(
-          node('span', formatClock(item.at), 'chain-clock'),
-          node('span', formatOffset(item.offsetMs), 'chain-offset'),
-          node('span', '', `chain-dot tone-${item.tone}`),
-        );
-
-        const bodyCol = node('div', '', 'chain-body-col');
-        const headRow = node('div', '', 'chain-head-row');
-        const badges = node('span', '', 'chain-badges');
-        badges.append(node('span', item.actorLabel, 'chain-badge tone-neutral'));
-        if (item.durationMs !== undefined) {
-          badges.append(node('span', formatDuration(item.durationMs), 'chain-badge tone-neutral'));
-        }
-        badges.append(node('span', item.statusLabel, `chain-badge tone-${item.tone}`));
-        headRow.append(
-          node('span', item.icon, 'chain-icon'),
-          node('span', item.title, 'chain-title'),
-          badges,
-        );
-        bodyCol.append(headRow);
-
-        if (item.subtitle) {
-          bodyCol.append(node('div', item.subtitle, 'chain-subtitle meta'));
-        }
-        if (item.preview) {
-          bodyCol.append(node('p', item.preview, 'chain-preview'));
-        }
-        bodyCol.append(createWaterfallBar(item.waterfallStartPermille, item.waterfallWidthPermille, item.tone));
-
-        card.append(timeCol, bodyCol);
-        li.append(card);
-        list.append(li);
+        list.append(buildChainListItem(item, isEntering));
       }
       contents.append(list);
+      traceContentEl.replaceChildren(contents);
+      if (syncLimit < visibleNodes.length) {
+        void appendRemainingChainChunks(seq, list, visibleNodes, syncLimit, isInitialBatchForScope, scroller, pinned);
+      }
     }
 
-    traceContentEl.replaceChildren(contents);
     syncTraceMore();
     if (scroller && pinned) scroller.scrollTop = scroller.scrollHeight;
     return visibleNodes;
@@ -1243,6 +1505,9 @@ export function initTracePanel(): TracePanelController {
     const params = new URLSearchParams();
     if (anchor !== undefined) params.set(direction === 'earlier' ? 'before' : 'after', String(anchor));
     if (appState.selection.type !== 'all') params.set(appState.selection.type === 'task' ? 'taskId' : 'messageId', appState.selection.id);
+    traceAbort?.abort();
+    const ac = typeof AbortController !== 'undefined' ? new AbortController() : undefined;
+    traceAbort = ac;
     appState.traceBusy = true;
     traceMoreBtn.disabled = true;
     traceErrorEl.textContent = '';
@@ -1250,8 +1515,15 @@ export function initTracePanel(): TracePanelController {
     let failed = false;
     const run = (async () => {
       try {
-        const events = await api<TraceEvent[]>(`/api/trace?${params}`);
-        if (generation !== appState.selectionGeneration) return;
+        const events = await api<TraceEvent[]>(
+          `/api/trace?${params}`,
+          undefined,
+          {
+            ...(ac ? { signal: ac.signal } : {}),
+            ...(latest ? { priority: 'low' as const } : {}),
+          },
+        );
+        if (generation !== appState.selectionGeneration || ac?.signal.aborted) return;
         const win = mergeTraceWindow(appState.traceEvents, events, direction);
         appState.traceEvents = win.events;
         appState.traceAfter = Math.max(appState.traceAfter, events.at(-1)?.seq ?? 0);
@@ -1264,11 +1536,10 @@ export function initTracePanel(): TracePanelController {
           scheduleExecutionBundleRefresh();
         }
       } catch (error) {
+        if (generation !== appState.selectionGeneration || ac?.signal.aborted) return;
         failed = true;
-        if (generation === appState.selectionGeneration) {
-          traceErrorEl.textContent = `链路读取失败：${errorText(error)}`;
-          traceRetryBtn.hidden = false;
-        }
+        traceErrorEl.textContent = `链路读取失败：${errorText(error)}`;
+        traceRetryBtn.hidden = false;
       } finally {
         if (generation === appState.selectionGeneration) {
           appState.traceBusy = false;
@@ -1293,20 +1564,30 @@ export function initTracePanel(): TracePanelController {
 
   async function loadWork(id: string, generation: number, background = false): Promise<void> {
     const requestNumber = ++appState.workRequest;
+    workAbort?.abort();
+    const ac = typeof AbortController !== 'undefined' ? new AbortController() : undefined;
+    workAbort = ac;
     workDetailEl.hidden = false;
     if (!background && !appState.workData && !appState.traceBundle) {
       workDetailEl.replaceChildren(node('p', '正在读取任务执行总览…', 'meta'));
     }
     try {
-      const task = await api<unknown>(`/api/work?${new URLSearchParams({ taskId: id })}`);
-      if (generation !== appState.selectionGeneration || requestNumber !== appState.workRequest) return;
+      const task = await api<unknown>(
+        `/api/work?${new URLSearchParams({ taskId: id })}`,
+        undefined,
+        {
+          ...(ac ? { signal: ac.signal } : {}),
+          ...(background ? { priority: 'low' as const } : {}),
+        },
+      );
+      if (generation !== appState.selectionGeneration || requestNumber !== appState.workRequest || ac?.signal.aborted) return;
       appState.workData = task;
       renderWorkDetail(lastChainView);
       if (background) {
         void loadExecutionBundle(true);
       }
     } catch (error) {
-      if (generation !== appState.selectionGeneration || requestNumber !== appState.workRequest) return;
+      if (generation !== appState.selectionGeneration || requestNumber !== appState.workRequest || ac?.signal.aborted) return;
       if (!appState.traceBundle) {
         workDetailEl.replaceChildren(
           node('p', `任务详情读取失败：${errorText(error)}`, 'error'),
@@ -1328,6 +1609,9 @@ export function initTracePanel(): TracePanelController {
       clearTimeout(bundleRefreshTimer);
       bundleRefreshTimer = undefined;
     }
+    bundleAbort?.abort();
+    workAbort?.abort();
+    traceAbort?.abort();
     appState.traceEvents = [];
     appState.traceAfter = 0;
     appState.traceHasMore = false;
@@ -1393,10 +1677,23 @@ export function initTracePanel(): TracePanelController {
     }
   }
 
-  function setTraceCategory(cat: ChainCategory): void {
+  function setTraceCategory(cat: ChainCategory, clickedBtn?: HTMLButtonElement | null): void {
     if (appState.traceCategory === cat) return;
     appState.traceCategory = cat;
-    renderTrace();
+    runWithViewTransition(() => {
+      renderTrace();
+      if (clickedBtn && typeof clickedBtn.scrollIntoView === 'function') {
+        try {
+          clickedBtn.scrollIntoView({
+            behavior: prefersReducedMotion() ? 'auto' : 'smooth',
+            block: 'nearest',
+            inline: 'nearest',
+          });
+        } catch {
+          // Ignore scrollIntoView errors in stub environments
+        }
+      }
+    });
   }
 
   workFilterEl.addEventListener('change', renderWorks);
@@ -1409,22 +1706,32 @@ export function initTracePanel(): TracePanelController {
   clearFilterBtn.addEventListener('click', () => selectTrace({ type: 'all' }));
 
   for (const { cat, btn } of categoryTabs) {
-    btn?.addEventListener('click', () => setTraceCategory(cat));
+    btn?.addEventListener('click', () => setTraceCategory(cat, btn));
   }
 
   traceWideToggleBtn?.addEventListener('click', () => {
     appState.traceWide = !appState.traceWide;
-    syncWideToggle();
+    runWithViewTransition(syncWideToggle);
+  });
+
+  eventDetailEl.addEventListener('keydown', event => {
+    if (event.key !== 'Escape' || eventDetailEl.hidden) return;
+    event.stopPropagation?.();
+    const closedNodeId = appState.selectedNodeId;
+    appState.selectedNodeId = undefined;
+    userClearedSelection = true;
+    runWithViewTransition(
+      () => renderTrace(),
+      () => focusChainCard(closedNodeId),
+    );
   });
 
   traceCloseBtn?.addEventListener('click', () => {
-    const mobileViewport = typeof window !== 'undefined'
-      && typeof window.matchMedia === 'function'
-      && window.matchMedia('(max-width: 730px)').matches;
-    if (mobileViewport) {
+    if (isMobileTraceViewport()) {
       showPanel(false);
     } else {
       collapseRightDrawer();
+      if (desktopTraceFoldBtn) safeFocus(desktopTraceFoldBtn);
     }
   });
 
@@ -1434,18 +1741,43 @@ export function initTracePanel(): TracePanelController {
     showPanel(!panelsEl.classList.contains('trace-visible'));
   });
   mobileTraceScrim?.addEventListener('click', () => showPanel(false));
-  workSidebarCloseBtn?.addEventListener('click', closeSidebar);
-  mobileSidebarScrim?.addEventListener('click', closeSidebar);
+  workSidebarCloseBtn?.addEventListener('click', () => closeSidebar(true));
+  mobileSidebarScrim?.addEventListener('click', () => closeSidebar(true));
   workToggleBtn.addEventListener('click', () => {
     const open = !sidebarEl.classList.contains('open');
-    setSidebarOpen(open);
-    if (open) workFilterEl.focus();
+    setSidebarOpen(open, true);
   });
   document.addEventListener('click', event => {
+    if (!sidebarEl.classList.contains('open')) return;
     if (event.target instanceof Node && !sidebarEl.contains(event.target) && !workToggleBtn.contains(event.target)) {
-      closeSidebar();
+      const activeInSidebar = typeof document !== 'undefined' && document.activeElement
+        ? sidebarEl.contains(document.activeElement)
+        : false;
+      closeSidebar(activeInSidebar);
     }
   });
+
+  if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+    try {
+      const mobileTraceMql = window.matchMedia('(max-width: 730px)');
+      mobileTraceMql.addEventListener?.('change', e => {
+        if (!e.matches) {
+          tracePanelEl?.removeAttribute?.('role');
+          tracePanelEl?.removeAttribute?.('aria-modal');
+          setInertElements([conversationEl, panelNavEl, appTopbarEl, sidebarEl], false);
+          lastTraceTrigger = null;
+        }
+      });
+      const sidebarDrawerMql = window.matchMedia('(max-width: 1100px)');
+      sidebarDrawerMql.addEventListener?.('change', e => {
+        if (!e.matches && sidebarEl.classList.contains('open')) {
+          closeSidebar(false);
+        }
+      });
+    } catch {
+      // Ignore matchMedia errors in stub environments
+    }
+  }
 
   syncWideToggle();
   syncCategoryTabs();
@@ -1457,7 +1789,7 @@ export function initTracePanel(): TracePanelController {
     isTraceVisible: () => panelsEl.classList.contains('trace-visible'),
     closeSidebar,
     isSidebarOpen: () => sidebarEl.classList.contains('open'),
-    focusSidebarToggle: () => workToggleBtn.focus(),
+    focusSidebarToggle,
     selectTrace,
     loadTrace,
     loadWork,

@@ -1,4 +1,5 @@
 import type { MemoryCard, MemoryDirectoryItem, MemorySynapse, SynapseRelation } from '../view.js';
+import { announceStatus, onReducedMotionChange, prefersReducedMotion } from './shared/ui-primitives.js';
 
 export type BrainMemoryItem = MemoryCard | MemoryDirectoryItem;
 
@@ -537,8 +538,11 @@ export class GoldenBrainStage {
   private velY = 0;
   private velX = 0;
   private zoom = 1;
-  private autoRotate = true;
+  private reducedMotion = prefersReducedMotion();
+  private autoRotate = !this.reducedMotion;
   private running = false;
+  private onScreen = true;
+  private contentSkipped = false;
   private rafId = 0;
   private lastTs = 0;
   private elapsed = 0;
@@ -552,6 +556,8 @@ export class GoldenBrainStage {
 
   private projectedNodes = new Map<string, ProjectedPoint & { radius: number; node: BrainNode }>();
   private resizeObserver?: ResizeObserver;
+  private intersectionObserver?: IntersectionObserver;
+  private readonly abortController = typeof AbortController !== 'undefined' ? new AbortController() : undefined;
   private cssWidth = 640;
   private cssHeight = 412;
 
@@ -559,7 +565,6 @@ export class GoldenBrainStage {
   private backBlurLayer?: HTMLCanvasElement;
   private bloomLayer?: HTMLCanvasElement;
   private wideBloomLayer?: HTMLCanvasElement;
-  private onVisibilityChange?: () => void;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -572,6 +577,10 @@ export class GoldenBrainStage {
       this.backBlurLayer = document.createElement('canvas');
       this.bloomLayer = document.createElement('canvas');
       this.wideBloomLayer = document.createElement('canvas');
+    }
+    if (!this.canvas.hasAttribute?.('tabindex')) {
+      this.canvas.tabIndex = 0;
+      this.canvas.setAttribute?.('tabindex', '0');
     }
     this.bindEvents();
     if (typeof ResizeObserver !== 'undefined') {
@@ -606,8 +615,8 @@ export class GoldenBrainStage {
   }
 
   setAutoRotate(next: boolean): boolean {
-    this.autoRotate = next;
-    if (next) {
+    this.autoRotate = this.reducedMotion ? false : next;
+    if (this.autoRotate) {
       this.wakeAnimation();
     } else if (!this.needsAnimation()) {
       this.pauseRaf();
@@ -631,45 +640,65 @@ export class GoldenBrainStage {
     this.zoom = 1;
     this.userOrbX = 0;
     this.userOrbY = 0;
-    this.targetRotX = 0;
-    this.targetRotY = 0;
     this.velX = 0;
     this.velY = 0;
-    this.autoRotate = true;
-    this.wakeAnimation();
+    this.autoRotate = !this.reducedMotion;
+    if (this.reducedMotion) {
+      this.rotX = 0;
+      this.rotY = 0;
+      this.targetRotX = undefined;
+      this.targetRotY = undefined;
+      this.renderFrame(0);
+    } else {
+      this.targetRotX = 0;
+      this.targetRotY = 0;
+      this.wakeAnimation();
+    }
   }
 
   focusMemory(id: string | undefined, animate = true) {
     this.selectedId = id;
     const target = id ? this.graph.nodes.find(n => n.id === id) : undefined;
-    if (target && animate) {
+    const shouldAnimate = animate && !this.reducedMotion;
+    if (target) {
       const desiredRotY = -Math.atan2(target.x, target.z);
       const xz = Math.sqrt(target.x * target.x + target.z * target.z);
       const desiredRotX = clamp(Math.atan2(target.y, Math.max(0.001, xz)), -0.85, 0.85);
-      const deltaY = Math.atan2(Math.sin(desiredRotY - this.rotY), Math.cos(desiredRotY - this.rotY));
-      this.targetRotY = this.rotY + deltaY;
-      this.targetRotX = desiredRotX;
-      this.velX = 0;
-      this.velY = 0;
+      if (shouldAnimate) {
+        const deltaY = Math.atan2(Math.sin(desiredRotY - this.rotY), Math.cos(desiredRotY - this.rotY));
+        this.targetRotY = this.rotY + deltaY;
+        this.targetRotX = desiredRotX;
+        this.velX = 0;
+        this.velY = 0;
+      } else {
+        this.rotY = desiredRotY;
+        this.rotX = desiredRotX;
+        this.targetRotY = undefined;
+        this.targetRotX = undefined;
+        this.velX = 0;
+        this.velY = 0;
+      }
     }
     this.notifySelection();
-    if (!this.running || !animate) this.renderFrame(0);
+    if (!this.running || !shouldAnimate) this.renderFrame(0);
     this.wakeAnimation();
   }
 
   private needsAnimation(): boolean {
     if (typeof document !== 'undefined' && document.hidden) return false;
-    if (!this.running) return false;
-    if (this.autoRotate || this.dragging) return true;
+    if (!this.running || !this.onScreen || this.contentSkipped) return false;
+    if (this.dragging) return true;
+    if (this.reducedMotion) return false;
+    if (this.autoRotate) return true;
     if (this.targetRotY !== undefined && this.targetRotX !== undefined) return true;
     return Math.abs(this.velY) > 0.0002 || Math.abs(this.velX) > 0.0002;
   }
 
   private pauseRaf() {
-    if (this.rafId) {
+    if (this.rafId && typeof cancelAnimationFrame === 'function') {
       cancelAnimationFrame(this.rafId);
-      this.rafId = 0;
     }
+    this.rafId = 0;
   }
 
   private readonly rafTick = (now: number) => {
@@ -683,14 +712,14 @@ export class GoldenBrainStage {
     const dt = clamp((now - this.lastTs) / 1000, 0.001, 0.05);
     this.lastTs = now;
     this.renderFrame(dt);
-    if (this.needsAnimation()) {
+    if (this.needsAnimation() && typeof requestAnimationFrame === 'function') {
       this.rafId = requestAnimationFrame(this.rafTick);
     }
   };
 
   private wakeAnimation() {
-    if (!this.needsAnimation() || this.rafId) return;
-    this.lastTs = performance.now();
+    if (!this.needsAnimation() || this.rafId || typeof requestAnimationFrame !== 'function') return;
+    this.lastTs = typeof performance !== 'undefined' ? performance.now() : Date.now();
     this.rafId = requestAnimationFrame(this.rafTick);
   }
 
@@ -712,12 +741,11 @@ export class GoldenBrainStage {
 
   dispose() {
     this.stop();
-    if (this.onVisibilityChange && typeof document !== 'undefined') {
-      document.removeEventListener('visibilitychange', this.onVisibilityChange);
-      this.onVisibilityChange = undefined;
-    }
+    this.abortController?.abort();
     this.resizeObserver?.disconnect();
     this.resizeObserver = undefined;
+    this.intersectionObserver?.disconnect();
+    this.intersectionObserver = undefined;
   }
 
   private notifySelection() {
@@ -726,12 +754,14 @@ export class GoldenBrainStage {
   }
 
   private syncCanvasSize() {
-    const rect = this.canvas.getBoundingClientRect();
+    const rect = typeof this.canvas.getBoundingClientRect === 'function'
+      ? this.canvas.getBoundingClientRect()
+      : { width: 620, height: 412 };
     const w = Math.max(260, Math.round(rect.width || 620));
     const h = Math.max(240, Math.round(rect.height || 412));
     this.cssWidth = w;
     this.cssHeight = h;
-    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const dpr = typeof window !== 'undefined' ? Math.min(2, window.devicePixelRatio || 1) : 1;
     const targetW = Math.round(w * dpr);
     const targetH = Math.round(h * dpr);
     let resized = false;
@@ -1807,20 +1837,100 @@ export class GoldenBrainStage {
     return best?.node;
   }
 
+  private getNavigableNodes(): BrainNode[] {
+    if (this.hasActiveFilter && this.highlightedIds.size > 0) {
+      const matching = this.graph.nodes.filter(n => this.highlightedIds.has(n.id));
+      if (matching.length > 0) return matching;
+    }
+    return this.graph.nodes;
+  }
+
+  private announceNeuron(node: BrainNode, index: number, total: number): void {
+    const pinnedSuffix = node.pinned ? '，核心信条' : '';
+    announceStatus(`记忆神经元 ${index + 1}/${total}：${node.topic}${pinnedSuffix}，${node.synapseCount} 个突触`);
+  }
+
+  private addScopedListener(
+    target: EventTarget,
+    type: string,
+    handler: EventListener,
+    extra?: { passive?: boolean; capture?: boolean },
+  ): void {
+    const signal = this.abortController?.signal;
+    if (signal?.aborted) return;
+    if (signal || extra?.passive !== undefined || extra?.capture !== undefined) {
+      const opts: AddEventListenerOptions = {};
+      if (signal) opts.signal = signal;
+      if (extra?.passive !== undefined) opts.passive = extra.passive;
+      if (extra?.capture !== undefined) opts.capture = extra.capture;
+      target.addEventListener(type, handler, opts);
+    } else {
+      target.addEventListener(type, handler);
+    }
+  }
+
   private bindEvents() {
+    const signal = this.abortController?.signal;
+
+    onReducedMotionChange(reduced => {
+      this.reducedMotion = reduced;
+      if (reduced) {
+        this.autoRotate = false;
+        this.targetRotX = undefined;
+        this.targetRotY = undefined;
+        this.velX = 0;
+        this.velY = 0;
+        this.pauseRaf();
+        this.renderFrame(0);
+      } else {
+        this.wakeAnimation();
+      }
+    }, signal);
+
     if (typeof document !== 'undefined') {
-      this.onVisibilityChange = () => {
+      this.addScopedListener(document, 'visibilitychange', () => {
         if (document.hidden) {
           this.pauseRaf();
         } else {
           if (!this.rafId && this.running) this.renderFrame(0);
           this.wakeAnimation();
         }
-      };
-      document.addEventListener('visibilitychange', this.onVisibilityChange);
+      });
+
+      this.addScopedListener(document, 'contentvisibilityautostatechange', e => {
+        const target = e.target as Node | null;
+        if (!target || typeof target.contains !== 'function' || !target.contains(this.canvas)) return;
+        this.contentSkipped = Boolean((e as Event & { skipped?: boolean }).skipped);
+        if (this.contentSkipped) {
+          this.pauseRaf();
+        } else {
+          if (!this.rafId && this.running) this.renderFrame(0);
+          this.wakeAnimation();
+        }
+      }, { capture: true });
     }
 
-    this.canvas.addEventListener('pointerdown', e => {
+    if (typeof IntersectionObserver === 'function') {
+      try {
+        this.intersectionObserver = new IntersectionObserver(entries => {
+          const entry = entries.at(-1);
+          if (!entry) return;
+          this.onScreen = entry.isIntersecting;
+          if (!this.onScreen) {
+            this.pauseRaf();
+          } else {
+            if (!this.rafId && this.running) this.renderFrame(0);
+            this.wakeAnimation();
+          }
+        }, { threshold: 0 });
+        this.intersectionObserver.observe(this.canvas);
+      } catch {
+        // Ignore IntersectionObserver errors in stub environments
+      }
+    }
+
+    this.addScopedListener(this.canvas, 'pointerdown', ev => {
+      const e = ev as PointerEvent;
       this.dragging = true;
       this.dragMoved = false;
       this.pointerDownX = e.clientX;
@@ -1829,11 +1939,12 @@ export class GoldenBrainStage {
       this.lastPointerY = e.clientY;
       this.targetRotX = undefined;
       this.targetRotY = undefined;
-      this.canvas.setPointerCapture(e.pointerId);
+      this.canvas.setPointerCapture?.(e.pointerId);
       this.wakeAnimation();
     });
 
-    this.canvas.addEventListener('pointermove', e => {
+    this.addScopedListener(this.canvas, 'pointermove', ev => {
+      const e = ev as PointerEvent;
       if (this.dragging) {
         const dx = e.clientX - this.lastPointerX;
         const dy = e.clientY - this.lastPointerY;
@@ -1863,24 +1974,28 @@ export class GoldenBrainStage {
       }
     });
 
-    const releasePointer = (e: PointerEvent) => {
+    const releasePointer = (ev: Event) => {
+      const e = ev as PointerEvent;
       if (!this.dragging) return;
       this.dragging = false;
-      if (this.canvas.hasPointerCapture(e.pointerId)) {
-        this.canvas.releasePointerCapture(e.pointerId);
+      if (this.canvas.hasPointerCapture?.(e.pointerId)) {
+        this.canvas.releasePointerCapture?.(e.pointerId);
       }
       if (!this.dragMoved) {
         const hit = this.hitTest(e.clientX, e.clientY);
         if (hit) {
           this.focusMemory(hit.id, true);
+          const list = this.getNavigableNodes();
+          const idx = list.findIndex(n => n.id === hit.id);
+          if (idx >= 0) this.announceNeuron(hit, idx, list.length);
         }
       }
       this.wakeAnimation();
     };
 
-    this.canvas.addEventListener('pointerup', releasePointer);
-    this.canvas.addEventListener('pointercancel', releasePointer);
-    this.canvas.addEventListener('pointerleave', () => {
+    this.addScopedListener(this.canvas, 'pointerup', releasePointer);
+    this.addScopedListener(this.canvas, 'pointercancel', releasePointer);
+    this.addScopedListener(this.canvas, 'pointerleave', () => {
       if (!this.dragging && this.hoveredId) {
         this.hoveredId = undefined;
         this.canvas.classList.remove('is-hovering-node');
@@ -1888,11 +2003,69 @@ export class GoldenBrainStage {
       }
     });
 
-    this.canvas.addEventListener('wheel', e => {
+    this.addScopedListener(this.canvas, 'wheel', ev => {
+      const e = ev as WheelEvent;
       e.preventDefault();
       const factor = e.deltaY > 0 ? 0.92 : 1.08;
       this.zoom = clamp(this.zoom * factor, 0.72, 1.68);
       if (!this.rafId) this.renderFrame(0);
     }, { passive: false });
+
+    this.addScopedListener(this.canvas, 'keydown', ev => {
+      const e = ev as KeyboardEvent;
+      const list = this.getNavigableNodes();
+
+      if (e.key === '+' || e.key === '=') {
+        e.preventDefault();
+        this.zoom = clamp(this.zoom * 1.1, 0.72, 1.68);
+        if (!this.rafId) this.renderFrame(0);
+        announceStatus(`全息球体缩放 ${Math.round(this.zoom * 100)}%`);
+        return;
+      }
+      if (e.key === '-' || e.key === '_') {
+        e.preventDefault();
+        this.zoom = clamp(this.zoom * 0.9, 0.72, 1.68);
+        if (!this.rafId) this.renderFrame(0);
+        announceStatus(`全息球体缩放 ${Math.round(this.zoom * 100)}%`);
+        return;
+      }
+      if (e.key === '0') {
+        e.preventDefault();
+        this.resetView();
+        announceStatus('已重置全息记忆球体视角');
+        return;
+      }
+
+      if (!list.length) return;
+      const currentIdx = this.selectedId ? list.findIndex(n => n.id === this.selectedId) : -1;
+      let nextIdx = -1;
+
+      if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+        nextIdx = currentIdx >= 0 ? (currentIdx + 1) % list.length : 0;
+      } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+        nextIdx = currentIdx >= 0 ? (currentIdx - 1 + list.length) % list.length : list.length - 1;
+      } else if (e.key === 'Home') {
+        nextIdx = 0;
+      } else if (e.key === 'End') {
+        nextIdx = list.length - 1;
+      } else if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        const idx = currentIdx >= 0 ? currentIdx : 0;
+        const target = list[idx];
+        if (target) {
+          this.focusMemory(target.id, true);
+          this.announceNeuron(target, idx, list.length);
+        }
+        return;
+      } else {
+        return;
+      }
+
+      const target = list[nextIdx];
+      if (!target) return;
+      e.preventDefault();
+      this.focusMemory(target.id, true);
+      this.announceNeuron(target, nextIdx, list.length);
+    });
   }
 }
