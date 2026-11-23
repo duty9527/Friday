@@ -8,6 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { brotliCompressSync, gzipSync, constants as zlibConstants } from 'node:zlib';
 import type { Socket } from 'node:net';
 import { integer, request, REQUEST_LIMIT } from './protocol.js';
+import { handleMusicUpload, MusicMediaError, serveMusicStream } from './music-media.js';
 import type { TraceEvent } from './view.js';
 
 class HttpFailure extends Error { constructor(readonly status: number, message: string) { super(message); } }
@@ -96,7 +97,7 @@ function resolveStaticAsset(pathname: string): { filePath: string; mime: string 
   const mime = Object.hasOwn(staticMimeTypes, ext) ? staticMimeTypes[ext] : undefined;
   return mime ? { filePath, mime } : undefined;
 }
-const policy = "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; object-src 'none'; require-trusted-types-for 'script'; trusted-types 'none'";
+const policy = "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self' data:; media-src 'self'; manifest-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; object-src 'none'; require-trusted-types-for 'script'; trusted-types 'none'";
 function send(
   response: ServerResponse,
   status: number,
@@ -118,7 +119,16 @@ async function rawBytes(request: IncomingMessage): Promise<Buffer> {
   if (Number(request.headers['content-length']) > REQUEST_LIMIT) throw new HttpFailure(413, 'Request exceeds 64 KiB limit');
   return new Promise<Buffer>((resolve, reject) => {
     let size = 0; const chunks: Buffer[] = [];
-    const cleanup = () => { request.off('data', onData); request.off('end', onEnd); request.off('error', onError); request.off('aborted', onAborted); };
+    const timer = setTimeout(() => {
+      cleanup();
+      request.pause();
+      reject(new HttpFailure(408, 'Request body timed out'));
+    }, 15_000);
+    timer.unref?.();
+    const cleanup = () => {
+      clearTimeout(timer);
+      request.off('data', onData); request.off('end', onEnd); request.off('error', onError); request.off('aborted', onAborted);
+    };
     const onError = (error: Error) => { cleanup(); reject(error); };
     const onAborted = () => onError(new HttpFailure(400, 'Request aborted before acceptance'));
     const onEnd = () => { cleanup(); resolve(Buffer.concat(chunks)); };
@@ -443,7 +453,7 @@ export async function startWeb(options: StartWebOptions): Promise<{ url: string;
   let host = '';
   const allowedHosts = new Set<string>();
   const connections = new Set<Socket>();
-  const server = createServer({ maxHeaderSize: 8192, requestTimeout: 15000, headersTimeout: 10000 }, (incoming, response) => {
+  const server = createServer({ maxHeaderSize: 8192, requestTimeout: 120_000, headersTimeout: 10000 }, (incoming, response) => {
     response.setHeader('content-security-policy', policy);
     response.setHeader('x-content-type-options', 'nosniff');
     response.setHeader('x-frame-options', 'DENY');
@@ -492,6 +502,10 @@ export async function startWeb(options: StartWebOptions): Promise<{ url: string;
         return;
       }
       if (!allowedHosts.has(reqHost)) throw new HttpFailure(403, 'Invalid local Host');
+      if (url.pathname.startsWith('/media/music/')) {
+        await serveMusicStream(home, incoming, response, url);
+        return;
+      }
       if (!url.pathname.startsWith('/api/')) {
         if (!['GET', 'HEAD'].includes(incoming.method ?? '')) throw new HttpFailure(404, 'Not found');
         const rawPath = (incoming.url ?? '/').split('?')[0] ?? '/';
@@ -683,6 +697,17 @@ export async function startWeb(options: StartWebOptions): Promise<{ url: string;
         }
         send(response, 200, await bridge(home, command));
       } else if (incoming.method === 'POST') {
+        if (url.pathname === '/api/music/upload') {
+          const saved = await handleMusicUpload(home, incoming);
+          const scan = await bridge(home, {
+            command: 'plugin-run',
+            plugin: 'music',
+            action: 'scan',
+            args: { quick: true },
+          });
+          send(response, 200, { ok: true, uploaded: saved, scan });
+          return;
+        }
         const commands: Record<string, string> = {
           '/api/chat': 'chat', '/api/stop': 'stop', '/api/resume': 'resume', '/api/chat-stop': 'chat-stop',
           '/api/memory-save': 'memory-save', '/api/memory-link': 'memory-link', '/api/memory-pin': 'memory-pin', '/api/memory-remove': 'memory-remove',
@@ -706,8 +731,8 @@ export async function startWeb(options: StartWebOptions): Promise<{ url: string;
         send(response, 200, command === 'voice-config' ? sanitizeVoiceprint(res) : res);
       } else throw new HttpFailure(405, 'Method not allowed');
     })().catch(error => {
-      const status = error instanceof HttpFailure ? error.status : 500;
-      const shouldClose = [401, 403, 413, 415].includes(status) || !incoming.complete;
+      const status = (error instanceof HttpFailure || error instanceof MusicMediaError) ? error.status : 500;
+      const shouldClose = [401, 403, 408, 413, 415].includes(status) || !incoming.complete;
       if (response.headersSent) {
         response.end(() => {
           if (shouldClose) incoming.destroy();
@@ -718,7 +743,7 @@ export async function startWeb(options: StartWebOptions): Promise<{ url: string;
       send(
         response,
         status,
-        { error: error instanceof HttpFailure ? error.message : 'Web request failed' },
+        { error: (error instanceof HttpFailure || error instanceof MusicMediaError) ? error.message : 'Web request failed' },
         shouldClose ? { close: true, incoming } : undefined,
       );
     });

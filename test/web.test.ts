@@ -63,6 +63,7 @@ test('Web is authenticated, same-origin and loopback only with restrictive stati
     assert.equal(page.status, 200);
     const pageCsp = page.headers.get('content-security-policy')!;
     assert.match(pageCsp, /frame-ancestors 'none'/);
+    assert.match(pageCsp, /media-src 'self'/);
     assert.match(pageCsp, /manifest-src 'self'/);
     assert.match(pageCsp, /object-src 'none'/);
     assert.match(pageCsp, /require-trusted-types-for 'script'/);
@@ -265,6 +266,7 @@ test('every nested module the page or mindmap imports is served and path escapes
       'NetleaSurface',
       'AppleDevicesSurface',
       'MiotSurface',
+      'MusicSurface',
     ]) {
       assert.ok(
         visitedList.some(p => p.includes(`/assets/${surfaceChunk}-`) && p.endsWith('.js')),
@@ -668,6 +670,7 @@ test('Web console lazy-loads plugin surfaces, serves redacted PluginView metadat
       'NetleaSurface',
       'AppleDevicesSurface',
       'MiotSurface',
+      'MusicSurface',
     ] as const;
     for (const surface of surfaces) {
       assert.match(

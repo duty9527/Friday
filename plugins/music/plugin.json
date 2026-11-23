@@ -1,0 +1,146 @@
+{
+  "name": "music",
+  "title": "音乐点播 · 小爱曲库",
+  "description": "管理本地音乐曲库与歌单、通过 yt-dlp 搜索并下载在线歌曲（YouTube / Bilibili / 音频直链）、支持网页试听与文件上传，并将本地音频经纯内网流媒体推送至小爱音箱 Pro (LX06) 排队连播与语音快通道点歌。",
+  "entry": "index.mjs",
+  "runtime": "in-process",
+  "voiceFastpath": true,
+  "promptHint": "本地音乐库、小爱音箱LX06语音/控制台点歌播控（播放/暂停/切歌/音量/循环/睡眠定时）、歌单队列、按歌名或链接搜索下载音频到本地曲库（搜歌先用 search-online 或直接 download）。",
+  "actions": [
+    "dashboard",
+    "status",
+    "scan",
+    "tracks",
+    "play",
+    "pause",
+    "resume",
+    "stop",
+    "next",
+    "prev",
+    "volume",
+    "loop",
+    "timer",
+    "queue",
+    "playlist",
+    "search-online",
+    "download",
+    "delete-track",
+    "config"
+  ],
+  "actionSpecs": [
+    {
+      "name": "dashboard",
+      "label": "音乐控制台概览",
+      "description": "获取当前播放状态、曲库列表、歌单、播放队列、最近下载任务与插件配置（默认不触发远程 SSH，传 live=true 实时查询 LX06 状态）。",
+      "defaultArgs": { "live": false }
+    },
+    {
+      "name": "status",
+      "label": "查询播放状态",
+      "description": "查询当前播放曲目、进度、循环模式、音量与小爱音箱状态；传 live=true 通过 SSH 实时读取 LX06 状态。",
+      "defaultArgs": { "live": true }
+    },
+    {
+      "name": "scan",
+      "label": "扫描本地曲库",
+      "description": "扫描音乐目录中的音频文件（mp3/flac/m4a/wav/ogg/opus/aac），提取时长与标题歌手元数据并更新索引；quick=true 仅解析新增或变动文件。",
+      "defaultArgs": { "quick": true }
+    },
+    {
+      "name": "tracks",
+      "label": "检索本地曲目",
+      "description": "按关键词 query 或歌单 playlistId 检索本地曲库，返回匹配歌曲与试听地址。",
+      "defaultArgs": { "query": "", "playlistId": "" }
+    },
+    {
+      "name": "play",
+      "label": "点歌或播放歌单",
+      "description": "在小爱音箱 LX06 上播放指定歌曲（trackId / query）、歌单（playlistId），或随机播放（shuffle=true）；未传参数时播放当前队列或随机选曲。",
+      "defaultArgs": { "query": "" }
+    },
+    {
+      "name": "pause",
+      "label": "暂停播放",
+      "description": "暂停小爱音箱当前正在播放的音乐，并保留播放进度与队列。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "resume",
+      "label": "继续播放",
+      "description": "从暂停状态恢复小爱音箱音乐播放。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "stop",
+      "label": "停止播放",
+      "description": "停止小爱音箱音乐播放并结束自动连播监听。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "next",
+      "label": "下一首",
+      "description": "切换到播放队列中的下一首歌曲并立即推送播放。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "prev",
+      "label": "上一首",
+      "description": "切换到播放队列中的上一首歌曲并立即推送播放。",
+      "defaultArgs": {}
+    },
+    {
+      "name": "volume",
+      "label": "调节音量",
+      "description": "设置小爱音箱播放音量（volume: 0..100）或相对增减（delta）。",
+      "defaultArgs": { "volume": 45 }
+    },
+    {
+      "name": "loop",
+      "label": "切换循环模式",
+      "description": "设置播放循环模式：list（列表循环）、single（单曲循环）、shuffle（随机播放）或 once（顺序单次）。",
+      "defaultArgs": { "mode": "list" }
+    },
+    {
+      "name": "timer",
+      "label": "睡眠定时关闭",
+      "description": "设置小爱音箱倒计时停止播放（minutes: 1..240），或传 cancel=true 取消定时。",
+      "defaultArgs": { "minutes": 30 }
+    },
+    {
+      "name": "queue",
+      "label": "管理播放队列",
+      "description": "查看或编辑播放队列（op: list / add / remove / clear / set）。",
+      "defaultArgs": { "op": "list" }
+    },
+    {
+      "name": "playlist",
+      "label": "管理歌单与收藏",
+      "description": "管理歌单（op: list / create / rename / delete / add-track / remove-track / toggle-favorite）。",
+      "defaultArgs": { "op": "list" }
+    },
+    {
+      "name": "search-online",
+      "label": "在线搜索音源",
+      "description": "使用 yt-dlp 在 YouTube / Bilibili 搜索在线音乐候选列表（返回标题、作者、时长与链接，不直接下载）。",
+      "defaultArgs": { "query": "", "source": "youtube", "limit": 6 }
+    },
+    {
+      "name": "download",
+      "label": "下载音乐到本地",
+      "description": "按链接（url）或关键词（query）自动提取并转码音频保存到本地曲库，支持 playAfter=true 下载完成后立即播放，async=true 后台异步下载。",
+      "defaultArgs": { "query": "", "url": "", "source": "youtube", "playAfter": false }
+    },
+    {
+      "name": "delete-track",
+      "label": "删除本地曲目",
+      "description": "从本地曲库目录、转码缓存及歌单队列中永久删除指定 trackId 的歌曲文件。",
+      "defaultArgs": { "trackId": "" }
+    },
+    {
+      "name": "config",
+      "label": "插件配置",
+      "description": "查看或更新音乐目录（musicDir）、局域网流地址（streamBaseUrl）、音箱 SSH（speakerSsh）、默认音量、下载格式与搜索源。",
+      "defaultArgs": {}
+    }
+  ]
+}

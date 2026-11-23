@@ -35,6 +35,7 @@ BUILTIN_PLUGIN_WIDGETS: Tuple[str, ...] = (
     "apple-devices",
     "tv-agent",
     "tv-ir",
+    "music",
 )
 
 LAIFEN_MODE_ZH: Dict[int, str] = {
@@ -844,6 +845,16 @@ def discover_widget_catalog(
             "enabled": manifests.get("tv-ir", {}).get("enabled", True),
         },
         {
+            "kind": "music",
+            "category": "plugin",
+            "plugin": "music",
+            "title": "音乐播放",
+            "subtitle": "小爱曲库 · 正在播放 · 队列与音量",
+            "defaultSize": "2x1",
+            "supportedSizes": list(VALID_SIZES),
+            "enabled": manifests.get("music", {}).get("enabled", True),
+        },
+        {
             "kind": "system-pulse",
             "category": "core",
             "title": "主机脉搏",
@@ -1334,6 +1345,14 @@ class WidgetDataHub:
         if "tv-ir" in by_kind:
             if self._due("tv-ir", 300.0, now_mono, force=force):
                 self._collect_tv_ir(connected=connected)
+
+        if "music" in by_kind:
+            state_path = self.home / "plugins" / "music" / "playback-state.json"
+            lib_path = self.home / "plugins" / "music" / "library.json"
+            m1 = self._file_mtime_changed("music:state", state_path)
+            m2 = self._file_mtime_changed("music:lib", lib_path)
+            if self._should_poll("music", 30.0, now_mono, force=force, mtime_changed=(m1 or m2)):
+                self._collect_music(state_path, lib_path)
 
         if "weather" in by_kind:
             if self._due("weather", 600.0, now_mono, force=force):
@@ -3110,6 +3129,110 @@ class WidgetDataHub:
                         "subline": "气象源暂不可达",
                     },
                 )
+
+    def _collect_music(self, state_path: Path, lib_path: Path) -> None:
+        state_raw: Dict[str, Any] = {}
+        if state_path.is_file():
+            try:
+                parsed = json.loads(state_path.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    state_raw = parsed
+            except Exception:
+                state_raw = {}
+
+        lib_raw: Dict[str, Any] = {}
+        if lib_path.is_file():
+            try:
+                parsed = json.loads(lib_path.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    lib_raw = parsed
+            except Exception:
+                lib_raw = {}
+
+        tracks = lib_raw.get("tracks") if isinstance(lib_raw.get("tracks"), list) else []
+        by_id = {
+            str(t.get("id")): t
+            for t in tracks
+            if isinstance(t, dict) and isinstance(t.get("id"), str)
+        }
+        track_count = len(by_id)
+
+        status = str(state_raw.get("status") or "stopped").lower()
+        if status not in ("playing", "paused", "stopped"):
+            status = "stopped"
+        playing = status == "playing"
+        paused = status == "paused"
+
+        cur_id = str(state_raw.get("currentTrackId") or "")
+        cur_track = by_id.get(cur_id) if cur_id else None
+        title = str((cur_track or {}).get("title") or "").strip()
+        artist = str((cur_track or {}).get("artist") or "").strip()
+        album = str((cur_track or {}).get("album") or "").strip()
+        dur_raw = (cur_track or {}).get("durationSec")
+        duration_sec = int(dur_raw) if isinstance(dur_raw, (int, float)) and dur_raw > 0 else None
+
+        queue_raw = state_raw.get("queue") if isinstance(state_raw.get("queue"), list) else []
+        queue_count = len(queue_raw)
+        queue_idx_raw = state_raw.get("queueIndex")
+        queue_index = int(queue_idx_raw) if isinstance(queue_idx_raw, int) else -1
+
+        vol_raw = state_raw.get("volume")
+        volume = max(0, min(100, int(round(float(vol_raw))))) if isinstance(vol_raw, (int, float)) else 45
+
+        loop_mode = str(state_raw.get("loopMode") or "list").lower()
+        loop_labels = {
+            "list": "列表循环",
+            "single": "单曲循环",
+            "shuffle": "随机播放",
+            "once": "顺序单次",
+        }
+        loop_label = loop_labels.get(loop_mode, "列表循环")
+
+        pos_raw = state_raw.get("positionSec")
+        position_sec = max(0, int(pos_raw)) if isinstance(pos_raw, (int, float)) else 0
+        started_raw = state_raw.get("startedAtMs")
+        started_at_ms = float(started_raw) if isinstance(started_raw, (int, float)) and started_raw > 0 else None
+
+        upd_raw = state_raw.get("updatedAt") or lib_raw.get("updatedAt")
+        updated_hm = ""
+        if isinstance(upd_raw, (int, float)) and upd_raw > 0:
+            try:
+                updated_hm = time.strftime("%H:%M", time.localtime(float(upd_raw) / 1000.0))
+            except Exception:
+                updated_hm = ""
+
+        empty = track_count == 0 and not title
+        headline = title or (f"曲库 {track_count} 首" if track_count > 0 else "曲库待导入")
+        subline = (
+            f"{artist or '未知歌手'}{f' · {album}' if album else ''}"
+            if title
+            else ("语音说“星期五，放首歌”" if track_count > 0 else "请在控制台上传或搜歌下载")
+        )
+        self._store_widget(
+            "music",
+            {
+                "ok": True,
+                "empty": empty,
+                "status": status,
+                "playing": playing,
+                "paused": paused,
+                "title": title,
+                "artist": artist,
+                "album": album,
+                "durationSec": duration_sec,
+                "positionSec": position_sec,
+                "startedAtMs": started_at_ms,
+                "volume": volume,
+                "loopMode": loop_mode,
+                "loopLabel": loop_label,
+                "trackCount": track_count,
+                "queueCount": queue_count,
+                "queueIndex": queue_index,
+                "updatedHm": updated_hm,
+                "headline": headline,
+                "subline": subline,
+            },
+        )
 
     def _collect_custom_plugin(self, key: str, card: Dict[str, Any], *, connected: bool) -> None:
         plugin = str(card.get("plugin") or "").strip()

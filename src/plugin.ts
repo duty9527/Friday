@@ -12,7 +12,7 @@ const execFileAsync = promisify(execFile);
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const BUILTIN_PLUGINS_DIR = resolve(REPO_ROOT, 'plugins');
 const MAX_PLUGIN_CALL_DEPTH = 4;
-const DEFAULT_MEMBER_ALLOWED_PLUGINS: ReadonlySet<string> = new Set(['miot', 'tv-ir', 'tv-agent']);
+const DEFAULT_MEMBER_ALLOWED_PLUGINS: ReadonlySet<string> = new Set(['miot', 'tv-ir', 'tv-agent', 'music']);
 
 export type { PluginRuntimeMode };
 

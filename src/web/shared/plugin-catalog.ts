@@ -78,6 +78,10 @@ const INTERNAL_ACTION_NAMES: ReadonlySet<string> = new Set([
   'add-holding',
   'remove-holding',
   'set-holding',
+  'queue',
+  'playlist',
+  'delete-track',
+  'search-online',
 ]);
 
 const SAFE_QUICK_RUN_ACTIONS: ReadonlySet<string> = new Set([
@@ -94,6 +98,7 @@ const SAFE_QUICK_RUN_ACTIONS: ReadonlySet<string> = new Set([
   'charge-check',
   'scan',
   'tree',
+  'tracks',
 ]);
 
 const ACTION_FALLBACK_LABELS: Record<string, string> = {
@@ -140,6 +145,19 @@ const ACTION_FALLBACK_LABELS: Record<string, string> = {
   'watch-start': '自动唤醒',
   'watch-stop': '停止唤醒',
   'brushhead-reset': '重置刷头',
+  tracks: '曲库检索',
+  play: '点歌播放',
+  pause: '暂停播放',
+  stop: '停止播放',
+  next: '下一首',
+  prev: '上一首',
+  loop: '循环模式',
+  timer: '睡眠定时',
+  queue: '播放队列',
+  playlist: '歌单管理',
+  'search-online': '在线搜歌',
+  download: '下载音乐',
+  'delete-track': '删除曲目',
 };
 
 const PARAM_KEY_LABELS: Record<string, string> = {
@@ -194,6 +212,16 @@ const PARAM_KEY_LABELS: Record<string, string> = {
   scope: '作用域',
   confirmProtected: '确认保护设备',
   includeProtected: '包含保护设备',
+  query: '关键词',
+  url: '链接',
+  source: '音源',
+  trackId: '曲目 ID',
+  playlistId: '歌单 ID',
+  volume: '音量',
+  minutes: '分钟',
+  shuffle: '随机播放',
+  playAfter: '下载后播放',
+  quick: '快速扫描',
 };
 
 const PLATFORM_LABELS: Record<string, string> = {
@@ -268,6 +296,12 @@ export const PLUGIN_PRESENTATION: Record<string, PluginPresentationMeta> = {
     domain: '系统运维',
     summary: '零依赖监测主机 CPU/内存/磁盘余量与 Git 仓库状态，支持异常阈值静默巡航与零 Token 准点提醒。',
     quickCheckArgs: {},
+  },
+  music: {
+    shortTitle: '音乐点播 · 小爱曲库',
+    domain: '影音娱乐',
+    summary: '管理本地音乐曲库与歌单，支持 yt-dlp 在线搜歌下载、网页试听上传，并推送小爱音箱 LX06 连播与语音快控。',
+    quickCheckArgs: { live: false },
   },
 };
 

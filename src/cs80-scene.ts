@@ -40,6 +40,8 @@ const READONLY_PLUGIN_ACTIONS = new Set([
   'info',
   'measure-status',
   'monitor-status',
+  'tracks',
+  'search-online',
 ]);
 
 const PRINT_BASH_CMD_RE = /(?:^|[;&|(\n]\s*)(?:sudo\s+)?(?:\/usr\/bin\/|\/bin\/)?(?:lp|lpr|ipptool|cupsfilter)\b(?:\s|$)/m;
@@ -247,6 +249,16 @@ export function classifyPluginCs80Scene(
 
   if (READONLY_PLUGIN_ACTIONS.has(act)) return undefined;
 
+  if (name === 'music') {
+    if (act === 'download') {
+      return { scene: 'operating_xiaoai', caption: '正在搜索下载音乐…', holdSec: 30 };
+    }
+    if (['play', 'pause', 'resume', 'stop', 'next', 'prev', 'volume', 'loop', 'timer'].includes(act)) {
+      return { scene: 'operating_xiaoai', caption: '正在小爱音箱播控音乐…' };
+    }
+    return undefined;
+  }
+
   if (name === 'tv-ir') {
     if (['press', 'sequence', 'learn'].includes(act)) {
       return { scene: 'operating_tv', caption: '正在遥控客厅电视…' };
@@ -419,6 +431,10 @@ export function classifyFastpathCs80Scene(
       return { scene: 'operating_tv', caption: '正在遥控客厅电视…' };
     }
     return { scene: 'operating_xiaoai', caption: '正在通过小爱音箱操控家居设备…' };
+  }
+  if (plugin === 'music') {
+    if (['status', 'query', 'dashboard', 'tracks'].includes(act)) return undefined;
+    return { scene: 'operating_xiaoai', phase: 'pulse', holdSec: 4.0, caption: '正在小爱音箱播控音乐…' };
   }
   if (plugin.includes('print') || act.includes('print')) {
     return { scene: 'printing', caption: '正在操作打印机输出文档…' };

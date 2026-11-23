@@ -37,6 +37,7 @@ import {
   HomeIcon,
   LayoutGridIcon,
   MonitorIcon,
+  MusicIcon,
   PlayIcon,
   PlugIcon,
   RotateCcwIcon,
@@ -90,6 +91,7 @@ const SURFACE_LIST: SurfaceMeta[] = [
   { name: 'laifen', label: '口腔护理 · 徕芬牙刷', icon: BluetoothIcon, Component: lazy(() => import('@/components/plugins/LaifenSurface')) },
   { name: 'ninebot', label: '九号守护 · 智能电摩', icon: BikeIcon, Component: lazy(() => import('@/components/plugins/NinebotSurface')) },
   { name: 'netlea', label: '鱼缸灯光 · 尼特利', icon: SunIcon, Component: lazy(() => import('@/components/plugins/NetleaSurface')) },
+  { name: 'music', label: '音乐点播 · 小爱曲库', icon: MusicIcon, Component: lazy(() => import('@/components/plugins/MusicSurface')) },
 ];
 
 const SURFACE_BY_NAME = new Map(SURFACE_LIST.map(s => [s.name, s]));

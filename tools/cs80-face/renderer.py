@@ -2657,6 +2657,8 @@ class FaceRenderer:
             self._card_tv_agent(ctx, card, data)
         elif kind == "tv-ir":
             self._card_tv_ir(ctx, card, data)
+        elif kind == "music":
+            self._card_music(ctx, card, data)
         elif kind == "memory":
             self._card_memory(ctx, card, data)
         elif kind == "timers":
@@ -4094,6 +4096,154 @@ class FaceRenderer:
             ctx.show_text("电源 · 音量 · 方向导航")
             if learned_cnt > 0:
                 _draw_pill(ctx, x + 16.0, y + (136.0 if h < 220 else 144.0), 25.0, f"自学习 {learned_cnt} 键", COL_AMBER_BRIGHT, font_size=13.0, pad_x=10.0, font_family=self.font_family)
+
+    def _card_music(self, ctx, card: PlacedCard, d: Dict[str, Any]) -> None:
+        playing = bool(d.get("playing"))
+        paused = bool(d.get("paused"))
+        track_count = int(d.get("trackCount") or 0)
+        queue_count = int(d.get("queueCount") or 0)
+        queue_idx = int(d.get("queueIndex") if d.get("queueIndex") is not None else -1)
+        vol = int(d.get("volume") if d.get("volume") is not None else 45)
+        loop_lbl = str(d.get("loopLabel") or "列表循环")
+
+        if playing:
+            badge = "播放中"
+            accent = COL_EMERALD
+            border = COL_EMERALD
+            dot = COL_EMERALD
+        elif paused:
+            badge = "已暂停"
+            accent = COL_AMBER_BRIGHT
+            border = COL_AMBER
+            dot = COL_AMBER_BRIGHT
+        else:
+            badge = "音乐曲库"
+            accent = COL_SKY if track_count > 0 else COL_AMBER
+            border = COL_AMBER_DIM
+            dot = COL_SKY if track_count > 0 else COL_AMBER_DIM
+
+        self._draw_card_frame(
+            ctx,
+            card,
+            card.title or "音乐播放",
+            badge,
+            border,
+            accent,
+            dot_col=dot,
+        )
+
+        x, y, w, h = card.x, card.y, card.w, card.h
+        title = str(d.get("title") or "").strip() or (f"曲库共 {track_count} 首歌曲" if track_count > 0 else "曲库待添加歌曲")
+        subline = str(d.get("subline") or "").strip() or "语音说“星期五，放首歌”"
+
+        pos_sec = max(0, int(d.get("positionSec") or 0))
+        started_ms = d.get("startedAtMs")
+        if playing and isinstance(started_ms, (int, float)) and started_ms > 0:
+            pos_sec = max(0, int((time.time() * 1000.0 - float(started_ms)) / 1000.0))
+        dur_raw = d.get("durationSec")
+        dur_sec = int(dur_raw) if isinstance(dur_raw, (int, float)) and dur_raw > 0 else None
+        if dur_sec is not None:
+            pos_sec = min(dur_sec, pos_sec)
+            ratio = clamp(float(pos_sec) / float(dur_sec), 0.0, 1.0)
+        else:
+            ratio = 0.0
+
+        def fmt_mmss(sec: Optional[int]) -> str:
+            if sec is None:
+                return "--:--"
+            return f"{sec // 60:02d}:{sec % 60:02d}"
+
+        queue_str = f"队列 {queue_idx + 1}/{queue_count}" if (queue_count > 0 and queue_idx >= 0) else f"曲库 {track_count} 首"
+        time_str = f"{fmt_mmss(pos_sec)} / {fmt_mmss(dur_sec)}" if dur_sec else queue_str
+
+        if card.w_span == 2 and card.h_span == 1:
+            # 2x1 horizontal layout: left song title + artist + pills, right progress + time/queue
+            ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(25.0)
+            ctx.set_source_rgb(*(COL_WHITE if (playing or paused) else COL_AMBER_BRIGHT))
+            ctx.move_to(x + 18.0, y + 86.0)
+            ctx.show_text(_fit_single_line_cairo(ctx, title, w * 0.56))
+
+            ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            ctx.set_font_size(15.5)
+            ctx.set_source_rgb(*COL_AMBER)
+            ctx.move_to(x + 18.0, y + 114.0)
+            ctx.show_text(_fit_single_line_cairo(ctx, subline, w * 0.56))
+
+            px = x + 18.0
+            py_pill = y + h - 42.0
+            pw = _draw_pill(ctx, px, py_pill, 24.0, f"音量 {vol}%", accent, font_size=13.0, pad_x=9.0, font_family=self.font_family)
+            px += pw + 8.0
+            pw2 = _draw_pill(ctx, px, py_pill, 24.0, loop_lbl, COL_SKY, font_size=13.0, pad_x=9.0, font_family=self.font_family)
+            px += pw2 + 8.0
+            if px + 110.0 < x + w * 0.62:
+                _draw_pill(ctx, px, py_pill, 24.0, queue_str, COL_AMBER_BRIGHT, font_size=13.0, pad_x=9.0, font_family=self.font_family)
+
+            rx = x + w * 0.62
+            rw = w * 0.35
+            _draw_progress_bar(ctx, rx, y + 76.0, rw, 10.0, ratio, accent)
+            ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(15.0)
+            ctx.set_source_rgb(*COL_WHITE)
+            ctx.move_to(rx, y + 112.0)
+            ctx.show_text(_fit_single_line_cairo(ctx, time_str, rw))
+            ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            ctx.set_font_size(13.5)
+            ctx.set_source_rgb(*COL_AMBER_DIM)
+            ctx.move_to(rx, y + h - 24.0)
+            ctx.show_text(_fit_single_line_cairo(ctx, queue_str, rw))
+        elif card.h_span == 2:
+            # 1x2 or 2x2 vertical layout
+            ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(27.0 if card.w_span == 2 else 23.0)
+            ctx.set_source_rgb(*(COL_WHITE if (playing or paused) else COL_AMBER_BRIGHT))
+            ctx.move_to(x + 18.0, y + 90.0)
+            ctx.show_text(_fit_single_line_cairo(ctx, title, w - 36.0))
+
+            ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            ctx.set_font_size(16.0)
+            ctx.set_source_rgb(*COL_AMBER)
+            ctx.move_to(x + 18.0, y + 122.0)
+            ctx.show_text(_fit_single_line_cairo(ctx, subline, w - 36.0))
+
+            _draw_progress_bar(ctx, x + 18.0, y + 156.0, w - 36.0, 10.0, ratio, accent)
+            ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(14.5)
+            ctx.set_source_rgb(*COL_WHITE)
+            ctx.move_to(x + 18.0, y + 190.0)
+            ctx.show_text(time_str)
+
+            px = x + 18.0
+            py_pill = y + 216.0
+            for lbl, col in ((f"音量 {vol}%", accent), (loop_lbl, COL_SKY), (queue_str, COL_AMBER_BRIGHT)):
+                ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+                ctx.set_font_size(13.5)
+                est_w = ctx.text_extents(lbl).x_advance + 22.0
+                if px + est_w > x + w - 18.0:
+                    px = x + 18.0
+                    py_pill += 34.0
+                pw = _draw_pill(ctx, px, py_pill, 26.0, lbl, col, font_size=13.5, pad_x=10.0, font_family=self.font_family)
+                px += pw + 8.0
+        else:
+            # 1x1 compact layout
+            ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(21.0)
+            ctx.set_source_rgb(*(COL_WHITE if (playing or paused) else COL_AMBER_BRIGHT))
+            ctx.move_to(x + 16.0, y + 78.0)
+            ctx.show_text(_fit_single_line_cairo(ctx, title, w - 32.0))
+
+            ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            ctx.set_font_size(14.0)
+            ctx.set_source_rgb(*COL_AMBER)
+            ctx.move_to(x + 16.0, y + 104.0)
+            ctx.show_text(_fit_single_line_cairo(ctx, subline, w - 32.0))
+
+            bar_y = y + (122.0 if h < 220 else 132.0)
+            _draw_progress_bar(ctx, x + 16.0, bar_y, w - 32.0, 8.0, ratio, accent)
+
+            py_pill = y + h - 38.0
+            pw = _draw_pill(ctx, x + 16.0, py_pill, 23.0, f"音量 {vol}%", accent, font_size=12.5, pad_x=8.5, font_family=self.font_family)
+            _draw_pill(ctx, x + 24.0 + pw, py_pill, 23.0, loop_lbl if (playing or paused) else queue_str, COL_SKY, font_size=12.5, pad_x=8.5, font_family=self.font_family)
 
     def _card_memory(self, ctx, card: PlacedCard, d: Dict[str, Any]) -> None:
         total = int(d.get("totalActive") or 0)

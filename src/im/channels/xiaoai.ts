@@ -52,7 +52,7 @@ import {
 const DEFAULT_CONTINUOUS_IDLE_TTL_MS = 60_000;
 const DEFAULT_CONTINUOUS_CAPTURE_WAIT_MS = 10_000;
 const DEFAULT_CONTINUOUS_MAX_UTTERANCE_MS = 2_800;
-const MEMBER_ALLOWED_PLUGINS = new Set(['miot', 'tv-ir', 'tv-agent']);
+const MEMBER_ALLOWED_PLUGINS = new Set(['miot', 'tv-ir', 'tv-agent', 'music']);
 
 interface FastpathSessionEntry {
   pluginName?: string;

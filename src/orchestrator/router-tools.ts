@@ -48,7 +48,7 @@ const BINARY_ATTACHMENT_EXTS = new Set([
   '.zip', '.gz', '.tar', '.7z', '.rar',
 ]);
 export const READONLY_ROUTER_TOOLS = new Set(['recall_messages', 'search_memory', 'inspect_work']);
-export const MEMBER_ALLOWED_PLUGINS = new Set(['miot', 'tv-ir', 'tv-agent']);
+export const MEMBER_ALLOWED_PLUGINS = new Set(['miot', 'tv-ir', 'tv-agent', 'music']);
 
 export function isReadonlyNotebookAction(input: string): boolean {
   try {
