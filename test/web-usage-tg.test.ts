@@ -61,6 +61,7 @@ test('Web usage and Telegram UI files strictly adhere to CSP and zero inline sty
   const appleSurfaceTsx = await readFile(join(webRoot, 'src/components/plugins/AppleDevicesSurface.tsx'), 'utf8');
   const miotSurfaceTsx = await readFile(join(webRoot, 'src/components/plugins/MiotSurface.tsx'), 'utf8');
   const ninebotSurfaceTsx = await readFile(join(webRoot, 'src/components/plugins/NinebotSurface.tsx'), 'utf8');
+  const metricChartsTsx = await readFile(join(webRoot, 'src/components/shared/MetricCharts.tsx'), 'utf8');
 
   assert.match(topbarTsx, /id="open-system-hub-top"/);
   assert.match(topbarTsx, /id="system-top-badge"/);
@@ -80,6 +81,12 @@ test('Web usage and Telegram UI files strictly adhere to CSP and zero inline sty
   assert.match(systemHubTsx, /id="system-panel-services"/);
   assert.match(systemHubTsx, /id="geo-amap-key-input"/);
   assert.doesNotMatch(ninebotSurfaceTsx, /id="ninebot-cfg-amap"/, 'AMap key input must live in System Base');
+  assert.doesNotMatch(ninebotSurfaceTsx, /placeholder="YYYYMM"/, 'Manual YYYYMM trip sync input must be removed');
+  assert.match(ninebotSurfaceTsx, /ColumnBarChart/);
+  assert.match(ninebotSurfaceTsx, /上一页/);
+  assert.match(ninebotSurfaceTsx, /下一页/);
+  const columnBarChartSection = metricChartsTsx.slice(metricChartsTsx.indexOf('export function ColumnBarChart'));
+  assert.doesNotMatch(columnBarChartSection, /\sstyle\s*=|\.style\.|dangerouslySetInnerHTML|\.innerHTML\b/, 'ColumnBarChart must obey strict zero-inline-style CSP');
 
   assert.match(imVoiceHubTsx, /id="im-tg-token-input"/);
   assert.match(imVoiceHubTsx, /id="im-tg-allow-input"/);

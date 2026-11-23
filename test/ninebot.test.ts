@@ -9,6 +9,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { listPluginsSync, runPlugin, tryPluginVoiceFastpath } from '../src/plugin.js';
 
@@ -1372,6 +1373,313 @@ test('M95C lock/power_status semantics, indexed desktop unwrap, sanitizeNinebotI
     assert.match(String(dData.vehicleImages?.lightDataUrl), /^data:image\/png;base64,/);
     assert.equal(JSON.stringify(dData).includes(dataDir), false, 'dashboard must not expose host filesystem paths');
     assert.equal(dData.activeAlerts.some((a: any) => a.key === 'unlocked_warning'), false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('1-year rolling backfill, incremental knownIds stop, month rollover finalize, pagination & multi-granularity tripAnalytics', async () => {
+  const c = await loadCryptoModule();
+  const plugin = await loadPluginModule();
+  const home = mkdtempSync(join(tmpdir(), 'ninebot-year-analytics-'));
+  const dataDir = join(home, 'plugins', 'ninebot');
+  const { publicKey, privateKey } = generateKeyPairSync('rsa', { modulusLength: 1024 });
+  const pubPem = publicKey.export({ type: 'spki', format: 'pem' }).toString();
+  const privPem = privateKey.export({ type: 'pkcs1', format: 'pem' }).toString();
+
+  // 2026-11-23 20:00:00 +08:00
+  let nowMs = Date.UTC(2026, 10, 23, 12, 0, 0);
+  const shSec = (isoWithTz: string) => Math.floor(Date.parse(isoWithTz) / 1000);
+
+  const novBaseRides = [
+    {
+      travel_id: 'ride-nov-3',
+      start_time: shSec('2026-11-23T14:10:00+08:00'),
+      end_time: shSec('2026-11-23T14:25:00+08:00'),
+      duration: 900,
+      mileages: '6.00',
+      speed: '55.0',
+      used_electricity: '8.0',
+    },
+    {
+      // Crosses UTC midnight: 2026-11-22T16:15:00Z -> 2026-11-23 00:15:00 Asia/Shanghai
+      travel_id: 'ride-nov-2',
+      start_time: shSec('2026-11-23T00:15:00+08:00'),
+      end_time: shSec('2026-11-23T00:25:00+08:00'),
+      duration: 600,
+      mileages: '3.20',
+      speed: '41.0',
+      used_electricity: '4.0',
+    },
+    {
+      travel_id: 'ride-nov-1',
+      start_time: shSec('2026-11-02T10:00:00+08:00'),
+      end_time: shSec('2026-11-02T10:15:00+08:00'),
+      duration: 900,
+      mileages: '5.10',
+      speed: '48.0',
+      used_electricity: '6.0',
+    },
+  ];
+  const extraNovRides: Array<Record<string, unknown>> = [];
+  const dec26Rides: Array<Record<string, unknown>> = [];
+  const recordedTravelCalls: Array<{ month: string; page: string }> = [];
+
+  const requester = async (req: { url: string; body?: string }) => {
+    const u = new URL(req.url);
+    if (u.pathname === '/v6/user/login') {
+      return {
+        status: 200,
+        headers: {},
+        body: Buffer.from(
+          JSON.stringify({
+            resultCode: '00000',
+            data: {
+              uuid: 'u-year',
+              access_token: 'tok-year',
+              refresh_token: 'ref-year',
+              accessTokenValidity: String(nowMs + 30 * 86400_000),
+            },
+          }),
+        ),
+      };
+    }
+
+    const body = JSON.parse(req.body || '{}') as { d: string; k: string };
+    const aesKey = privateDecrypt({ key: privPem, padding: cryptoConstants.RSA_PKCS1_PADDING }, Buffer.from(body.k, 'base64'));
+    const wrapper = JSON.parse(c.aesCbcDecrypt(aesKey, Buffer.from(body.d, 'base64')).toString('utf8')) as Record<string, string>;
+    const innerStr = Buffer.from(wrapper.data!.replace(/\s+/g, ''), 'base64').toString('utf8');
+    const innerParams = JSON.parse(innerStr) as Record<string, unknown>;
+    const respKey = c.deriveKey(wrapper.keyDataOne!, wrapper.keyDataTwo!, wrapper.keyDataThree!, wrapper.keyDataFour!);
+
+    let payload: Record<string, unknown> = { code: 1, data: {} };
+    if (u.pathname === '/user/user/login') {
+      payload = { code: 0, data: { uid: '99887766' } };
+    } else if (u.pathname === '/vehicle/binding/my-vehicle') {
+      payload = u.hostname.includes('steeldust')
+        ? { code: 1, data: [{ wnumber: 'M95C-YEAR', ble_name: '全年电摩', is_common_user: 1 }] }
+        : { code: 1, data: [] };
+    } else if (u.pathname === '/app-api/travel/v6/travel-list2') {
+      const month = String(innerParams.month || '');
+      const page = String(innerParams.page || '1');
+      recordedTravelCalls.push({ month, page });
+
+      if (month === '202611') {
+        const allNov = [...extraNovRides, ...novBaseRides];
+        const pageList = page === '1' ? allNov.slice(0, allNov.length - 1) : page === '2' ? allNov.slice(-1) : [];
+        payload = {
+          code: 1,
+          data: { times: allNov.length, total_mileages: '14.3', duration: 2400, list: pageList },
+        };
+      } else if (month === '202610') {
+        payload = {
+          code: 1,
+          data: {
+            times: 1,
+            list: [
+              {
+                travel_id: 'ride-oct-1',
+                start_time: shSec('2026-10-15T09:00:00+08:00'),
+                end_time: shSec('2026-10-15T09:30:00+08:00'),
+                duration: 1800,
+                mileages: '11.50',
+                speed: '62.0',
+              },
+            ],
+          },
+        };
+      } else if (month === '202602') {
+        payload = {
+          code: 1,
+          data: {
+            times: 1,
+            list: [
+              {
+                travel_id: 'ride-feb-1',
+                start_time: shSec('2026-02-14T18:30:00+08:00'),
+                end_time: shSec('2026-02-14T18:50:00+08:00'),
+                duration: 1200,
+                mileages: '8.40',
+                speed: '50.0',
+              },
+            ],
+          },
+        };
+      } else if (month === '202512') {
+        payload = {
+          code: 1,
+          data: {
+            times: 1,
+            list: [
+              {
+                travel_id: 'ride-dec-1',
+                start_time: shSec('2025-12-25T11:00:00+08:00'),
+                end_time: shSec('2025-12-25T11:20:00+08:00'),
+                duration: 1200,
+                mileages: '7.20',
+                speed: '46.0',
+              },
+            ],
+          },
+        };
+      } else if (month === '202612') {
+        payload = { code: 1, data: { times: dec26Rides.length, list: dec26Rides } };
+      } else {
+        payload = { code: 1, data: { times: 0, list: [] } };
+      }
+    }
+
+    const respWrapper = JSON.stringify({ data: c.androidB64(JSON.stringify(payload)), platform: 2, timeStamp: Math.floor(nowMs / 1000) });
+    return {
+      status: 200,
+      headers: {},
+      body: Buffer.from(JSON.stringify({ r: c.aesCbcEncrypt(respKey, Buffer.from(respWrapper, 'utf8')).toString('base64') })),
+    };
+  };
+
+  const deps = { homeDir: home, dataDir, nowFn: () => nowMs, httpRequester: requester, rsaPublicKeyPem: pubPem };
+  try {
+    await plugin.runAction('login', { username: '13800138999', password: 'pw' }, deps);
+
+    // 1) Initial 1-year backfill in 3 batches of maxMonths=4
+    const b1 = await plugin.runAction('trips', { sync: 'year', maxMonths: 4 }, deps);
+    assert.equal(b1.ok, true);
+    const d1 = b1.data as Record<string, any>;
+    assert.equal(d1.syncBatch.syncedMonths.length, 4);
+    assert.equal(d1.tripSync.completedMonthCount, 4);
+    assert.equal(d1.tripSync.yearComplete, false);
+
+    const b2 = await plugin.runAction('trips', { sync: 'year', maxMonths: 4, skipCurrentIfSynced: true }, deps);
+    const d2 = b2.data as Record<string, any>;
+    assert.equal(d2.syncBatch.syncedMonths.length, 4);
+    assert.equal(d2.tripSync.completedMonthCount, 8);
+    assert.equal(d2.tripSync.yearComplete, false);
+
+    const b3 = await plugin.runAction('trips', { sync: 'year', maxMonths: 4, skipCurrentIfSynced: true }, deps);
+    const d3 = b3.data as Record<string, any>;
+    assert.equal(d3.syncBatch.syncedMonths.length, 4);
+    assert.equal(d3.tripSync.completedMonthCount, 12);
+    assert.equal(d3.tripSync.pendingMonths.length, 0);
+    assert.equal(d3.tripSync.yearComplete, true);
+    assert.equal(d3.tripSync.totalCachedTrips, 6);
+
+    // Verify trip_sync_months ledger in SQLite
+    const db = new DatabaseSync(join(dataDir, 'ninebot.sqlite'), { readOnly: true });
+    try {
+      const ledger = db.prepare('SELECT month, complete, initial_synced FROM trip_sync_months ORDER BY month').all() as Array<{
+        month: string;
+        complete: number;
+        initial_synced: number;
+      }>;
+      assert.equal(ledger.length, 12);
+      for (const row of ledger) {
+        assert.equal(row.initial_synced, 1);
+        assert.equal(row.complete, row.month === '202611' ? 0 : 1);
+      }
+    } finally {
+      db.close();
+    }
+
+    // 2) Subsequent sync: skips all 11 completed past months & stops on Page 1 via knownIds
+    recordedTravelCalls.length = 0;
+    extraNovRides.push({
+      travel_id: 'ride-nov-4',
+      start_time: shSec('2026-11-23T19:30:00+08:00'),
+      end_time: shSec('2026-11-23T19:45:00+08:00'),
+      duration: 900,
+      mileages: '4.80',
+      speed: '59.0',
+      used_electricity: '5.0',
+    });
+    const incRes = await plugin.runAction('trips', { sync: 'year' }, deps);
+    assert.equal(incRes.ok, true);
+    const incData = incRes.data as Record<string, any>;
+    assert.deepEqual(recordedTravelCalls, [{ month: '202611', page: '1' }]);
+    assert.equal(incData.syncBatch.addedCount, 1);
+    assert.equal(incData.tripSync.totalCachedTrips, 7);
+
+    // 3) Month rollover to 2026-12: incremental sync finalizes 202611 once and syncs 202612
+    nowMs = Date.UTC(2026, 11, 1, 2, 0, 0); // 2026-12-01 10:00 +08:00
+    dec26Rides.push({
+      travel_id: 'ride-dec26-1',
+      start_time: shSec('2026-12-01T08:30:00+08:00'),
+      end_time: shSec('2026-12-01T08:45:00+08:00'),
+      duration: 900,
+      mileages: '5.50',
+      speed: '52.0',
+    });
+    recordedTravelCalls.length = 0;
+    const rollover1 = await plugin.runAction('trips', {}, deps);
+    assert.equal(rollover1.ok, true);
+    assert.deepEqual(
+      recordedTravelCalls.map(x => x.month),
+      ['202611', '202612'],
+    );
+    recordedTravelCalls.length = 0;
+    await plugin.runAction('trips', {}, deps);
+    assert.deepEqual(
+      recordedTravelCalls.map(x => x.month),
+      ['202612'],
+    );
+
+    // 4) Pagination across all 8 cached trips (newest -> oldest) & dashboard options
+    const p1 = await plugin.runAction('trips', { offline: true, tripPage: 1, tripPageSize: 3 }, deps);
+    const p1Page = (p1.data as Record<string, any>).tripPage;
+    assert.equal(p1Page.page, 1);
+    assert.equal(p1Page.totalPages, 3);
+    assert.equal(p1Page.totalCount, 8);
+    assert.deepEqual(p1Page.items.map((x: any) => x.travelId), ['ride-dec26-1', 'ride-nov-4', 'ride-nov-3']);
+
+    const p99 = await plugin.runAction('trips', { offline: true, tripPage: 99, tripPageSize: 3 }, deps);
+    const p99Page = (p99.data as Record<string, any>).tripPage;
+    assert.equal(p99Page.page, 3);
+    assert.deepEqual(p99Page.items.map((x: any) => x.travelId), ['ride-feb-1', 'ride-dec-1']);
+
+    // 5) Multi-granularity tripAnalytics (year, month, week, day) in Asia/Shanghai
+    // Anchor back at 2026-11-23
+    const yearRes = await plugin.runAction(
+      'dashboard',
+      { tripPage: 2, tripPageSize: 3, chartGranularity: 'year', chartAnchor: '2026-11-23', includeImages: false },
+      deps,
+    );
+    const yData = yearRes.data as Record<string, any>;
+    assert.equal(yData.vehicleImages.darkDataUrl, null);
+    assert.equal(yData.tripPage.page, 2);
+    assert.equal(yData.tripAnalytics.granularity, 'year');
+    assert.equal(yData.tripAnalytics.buckets.length, 12);
+    assert.equal(yData.tripAnalytics.buckets[0].key, '2025-12');
+    assert.equal(yData.tripAnalytics.buckets[0].distanceKm, 7.2);
+    assert.equal(yData.tripAnalytics.buckets[0].drillGranularity, 'month');
+    assert.equal(yData.tripAnalytics.buckets[11].key, '2026-11');
+    assert.equal(yData.tripAnalytics.buckets[11].tripCount, 4);
+    assert.equal(yData.tripAnalytics.buckets[11].distanceKm, 19.1);
+
+    const monthRes = await plugin.runAction('trips', { offline: true, chartGranularity: 'month', chartAnchor: '2026-02-14' }, deps);
+    const mAnalytics = (monthRes.data as Record<string, any>).tripAnalytics;
+    assert.equal(mAnalytics.granularity, 'month');
+    assert.equal(mAnalytics.buckets.length, 28);
+    const feb14 = mAnalytics.buckets.find((b: any) => b.key === '2026-02-14');
+    assert.equal(feb14.distanceKm, 8.4);
+    assert.equal(feb14.drillGranularity, 'day');
+
+    const weekRes = await plugin.runAction('trips', { offline: true, chartGranularity: 'week', chartAnchor: '2026-11-23' }, deps);
+    const wAnalytics = (weekRes.data as Record<string, any>).tripAnalytics;
+    assert.equal(wAnalytics.granularity, 'week');
+    assert.equal(wAnalytics.buckets.length, 7);
+    assert.equal(wAnalytics.buckets[0].label, '周一');
+    assert.equal(wAnalytics.buckets[0].key, '2026-11-23');
+    assert.equal(wAnalytics.buckets[0].tripCount, 3);
+    assert.equal(wAnalytics.buckets[0].distanceKm, 14);
+
+    const dayRes = await plugin.runAction('trips', { offline: true, chartGranularity: 'day', chartAnchor: '2026-11-23' }, deps);
+    const dAnalytics = (dayRes.data as Record<string, any>).tripAnalytics;
+    assert.equal(dAnalytics.granularity, 'day');
+    assert.equal(dAnalytics.buckets.length, 24);
+    // ride-nov-2 (2026-11-22T16:15Z = 2026-11-23 00:15 +08:00) must fall in hour 00 of 2026-11-23
+    assert.equal(dAnalytics.buckets[0].key, '00');
+    assert.equal(dAnalytics.buckets[0].distanceKm, 3.2);
+    assert.equal(dAnalytics.buckets[14].distanceKm, 6);
+    assert.equal(dAnalytics.buckets[19].distanceKm, 4.8);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

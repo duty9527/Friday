@@ -1341,10 +1341,11 @@ export function createNinebotClient(options = {}) {
    * Fetch monthly trips from `cn-cbu-gateway.ninebot.com/app-api/travel/v6/travel-list2`.
    * Automatically maps `motor` -> `Business-Type: "1"` and `ebike` -> `Business-Type: "2"`,
    * probes the alternate type once if empty, and paginates through the full month when `page` is omitted.
+   * When `knownIds` is supplied (incremental sync), pagination stops early once cached trip IDs are reached.
    * @param {{ accessToken: string; businessUid?: string; deviceId: string }} session
    * @param {string} sn
    * @param {string} monthYYYYMM
-   * @param {number | { page?: number; maxPages?: number; businessLine?: 'motor' | 'ebike' }} [pageOrOpts]
+   * @param {number | { page?: number; maxPages?: number; businessLine?: 'motor' | 'ebike'; knownIds?: Set<string> | readonly string[] }} [pageOrOpts]
    */
   async function fetchTrips(session, sn, monthYYYYMM, pageOrOpts = {}) {
     const isNumericPage = typeof pageOrOpts === 'number';
@@ -1398,9 +1399,10 @@ export function createNinebotClient(options = {}) {
       : 1;
     const maxPages = explicitPage
       ? startPage
-      : Math.max(1, Math.min(15, Number.isFinite(Number(opts.maxPages)) ? Math.trunc(Number(opts.maxPages)) : 15));
+      : Math.max(1, Math.min(30, Number.isFinite(Number(opts.maxPages)) ? Math.trunc(Number(opts.maxPages)) : 25));
 
     let first = await fetchSinglePage(startPage, activeBizType);
+    let pagesFetched = 1;
     const firstTimes = pickNum(first.data.times, first.data.count) ?? 0;
     if (startPage === 1 && first.rawList.length === 0 && firstTimes === 0) {
       try {
@@ -1420,39 +1422,84 @@ export function createNinebotClient(options = {}) {
     /** @type {Array<ReturnType<typeof normalizeTripRow> & {}>} */
     const trips = [];
     const seenIds = new Set();
+    const knownSet = !explicitPage && opts.knownIds
+      ? (opts.knownIds instanceof Set ? opts.knownIds : new Set(opts.knownIds))
+      : null;
+    const hasKnown = Boolean(knownSet && knownSet.size > 0);
+    let newIdsAdded = 0;
+    let stoppedOnKnown = false;
 
     /**
      * @param {unknown[]} rawList
-     * @returns {number}
+     * @returns {{ added: number; knownOnPage: number; rawCount: number }}
      */
     const appendPage = (rawList) => {
       let added = 0;
+      let knownOnPage = 0;
       for (const item of rawList) {
         const norm = normalizeTripRow(item, monthYYYYMM);
         if (!norm || seenIds.has(norm.travelId)) continue;
         seenIds.add(norm.travelId);
         trips.push(norm);
         added += 1;
+        if (hasKnown && knownSet?.has(norm.travelId)) {
+          knownOnPage += 1;
+        } else {
+          newIdsAdded += 1;
+        }
       }
-      return added;
+      return { added, knownOnPage, rawCount: rawList.length };
     };
 
-    appendPage(first.rawList);
-    let prevRawLen = first.rawList.length;
+    /**
+     * @param {{ added: number; knownOnPage: number; rawCount: number }} pageStats
+     * @returns {boolean}
+     */
+    const shouldStopOnKnown = (pageStats) => {
+      if (!hasKnown || pageStats.rawCount === 0) return false;
+      if (pageStats.knownOnPage === pageStats.rawCount) return true;
+      if (
+        pageStats.knownOnPage > 0 &&
+        (pageStats.knownOnPage >= Math.min(3, pageStats.rawCount) || (knownSet?.size ?? 0) + newIdsAdded >= expectedTotal)
+      ) {
+        return true;
+      }
+      return false;
+    };
 
-    if (!explicitPage) {
+    const firstStats = appendPage(first.rawList);
+    let prevRawLen = first.rawList.length;
+    let lastAdded = firstStats.added;
+    if (shouldStopOnKnown(firstStats)) {
+      stoppedOnKnown = true;
+    }
+
+    if (!explicitPage && !stoppedOnKnown) {
       for (let pageNum = 2; pageNum <= maxPages; pageNum++) {
         if (prevRawLen === 0 || expectedTotal <= seenIds.size) {
           break;
         }
         const nextPage = await fetchSinglePage(pageNum, activeBizType);
+        pagesFetched += 1;
         prevRawLen = nextPage.rawList.length;
-        const added = appendPage(nextPage.rawList);
-        if (added === 0) {
+        const pageStats = appendPage(nextPage.rawList);
+        lastAdded = pageStats.added;
+        if (shouldStopOnKnown(pageStats)) {
+          stoppedOnKnown = true;
+          break;
+        }
+        if (pageStats.added === 0) {
           break;
         }
       }
     }
+
+    const complete = !explicitPage && (
+      stoppedOnKnown ||
+      prevRawLen === 0 ||
+      expectedTotal <= seenIds.size ||
+      lastAdded === 0
+    );
 
     return {
       month: monthYYYYMM,
@@ -1461,6 +1508,10 @@ export function createNinebotClient(options = {}) {
       totalDurationSec: pickNum(firstData.duration) ?? 0,
       totalEnergyWh: pickNum(firstData.ec) ?? 0,
       trips,
+      pagesFetched,
+      newCount: hasKnown ? newIdsAdded : trips.length,
+      stoppedOnKnown,
+      complete,
     };
   }
 

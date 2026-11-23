@@ -215,3 +215,188 @@ export function BarSeriesChart({
     </div>
   );
 }
+
+export interface ColumnBarDatum {
+  key: string;
+  label: string;
+  sublabel?: string;
+  fullLabel?: string;
+  value: number;
+  hint?: string;
+  clickable?: boolean;
+}
+
+export function ColumnBarChart({
+  items,
+  title = '柱状分布',
+  emptyText = '当前周期暂无记录',
+  formatValue = (v: number) => String(Math.round(v)),
+  onSelect,
+  className,
+}: {
+  items: readonly ColumnBarDatum[];
+  title?: string;
+  emptyText?: string;
+  formatValue?: (v: number) => string;
+  onSelect?: (item: ColumnBarDatum, index: number) => void;
+  className?: string;
+}) {
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  if (!items.length) {
+    return (
+      <div className={cn('flex h-44 items-center justify-center rounded-lg border bg-muted/20 text-xs text-muted-foreground', className)}>
+        {emptyText}
+      </div>
+    );
+  }
+
+  const rawMax = Math.max(0, ...items.map(i => (Number.isFinite(i.value) ? i.value : 0)));
+  const max = rawMax > 0 ? rawMax : 1;
+  const hovered = hoverIdx !== null ? items[hoverIdx] : undefined;
+  const hasSublabels = items.some(i => Boolean(i.sublabel));
+  const hasAnyClickable = Boolean(onSelect && items.some(i => i.clickable));
+
+  const width = 600;
+  const padL = 46;
+  const padR = 10;
+  const padT = 14;
+  const padB = hasSublabels ? 36 : 26;
+  const height = 160 + padB;
+  const plotW = width - padL - padR;
+  const plotH = height - padT - padB;
+  const n = items.length;
+  const slotW = plotW / n;
+  const barGap = Math.min(8, Math.max(1.5, slotW * 0.24));
+  const barW = Math.max(4, Math.min(28, slotW - barGap));
+
+  const showXLabel = (idx: number) => {
+    if (n <= 14) return true;
+    if (n <= 25) return idx % 3 === 0 || idx === n - 1;
+    return idx === 0 || (idx + 1) % 5 === 0 || idx === n - 1;
+  };
+
+  return (
+    <div className={cn('rounded-lg border bg-card p-3 space-y-2', className)}>
+      <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+        <div className="flex items-center gap-2 text-muted-foreground">
+          <span>{title}</span>
+          {hasAnyClickable && (
+            <span className="text-[11px] opacity-80">· 点击柱体可下钻</span>
+          )}
+        </div>
+        <span className="font-mono text-foreground">
+          {hovered
+            ? `${hovered.fullLabel ?? hovered.label}：${hovered.hint ?? formatValue(hovered.value)}`
+            : rawMax > 0
+              ? `峰值 ${formatValue(rawMax)}`
+              : '暂无骑行记录'}
+        </span>
+      </div>
+
+      <svg
+        viewBox={`0 0 ${width} ${height}`}
+        className="h-44 w-full overflow-visible select-none"
+        role="img"
+        aria-label={title}
+      >
+        <line x1={padL} y1={padT} x2={width - padR} y2={padT} stroke="var(--border)" strokeDasharray="3 3" strokeWidth="1" />
+        <line x1={padL} y1={padT + plotH / 2} x2={width - padR} y2={padT + plotH / 2} stroke="var(--border)" strokeDasharray="3 3" strokeWidth="1" />
+        <line x1={padL} y1={padT + plotH} x2={width - padR} y2={padT + plotH} stroke="var(--border)" strokeWidth="1" />
+
+        {rawMax > 0 && (
+          <>
+            <text x={padL - 6} y={padT + 3} textAnchor="end" fill="var(--muted-foreground)" fontSize="10">
+              {formatValue(rawMax)}
+            </text>
+            <text x={padL - 6} y={padT + plotH / 2 + 3} textAnchor="end" fill="var(--muted-foreground)" fontSize="10">
+              {formatValue(rawMax / 2)}
+            </text>
+          </>
+        )}
+        <text x={padL - 6} y={padT + plotH + 3} textAnchor="end" fill="var(--muted-foreground)" fontSize="10">
+          0
+        </text>
+
+        {items.map((item, idx) => {
+          const val = Number.isFinite(item.value) && item.value > 0 ? item.value : 0;
+          const barH = val > 0 ? Math.max(4, (val / max) * plotH) : 2;
+          const slotX = padL + idx * slotW;
+          const barX = slotX + (slotW - barW) / 2;
+          const barY = padT + plotH - barH;
+          const centerX = slotX + slotW / 2;
+          const isActive = hoverIdx === idx;
+          const isClickable = Boolean(onSelect && item.clickable);
+          const desc = `${item.fullLabel ?? item.label}: ${item.hint ?? formatValue(item.value)}`;
+
+          return (
+            <g
+              key={item.key}
+              role={isClickable ? 'button' : undefined}
+              tabIndex={isClickable ? 0 : undefined}
+              aria-label={desc}
+              className={isClickable ? 'cursor-pointer outline-none' : 'outline-none'}
+              onMouseEnter={() => setHoverIdx(idx)}
+              onMouseLeave={() => setHoverIdx(null)}
+              onFocus={() => setHoverIdx(idx)}
+              onBlur={() => setHoverIdx(null)}
+              onClick={isClickable ? () => onSelect?.(item, idx) : undefined}
+              onKeyDown={isClickable ? e => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  onSelect?.(item, idx);
+                }
+              } : undefined}
+            >
+              <title>{desc}</title>
+              {isActive && (
+                <rect
+                  x={slotX + 1}
+                  y={padT}
+                  width={Math.max(2, slotW - 2)}
+                  height={plotH}
+                  rx={4}
+                  fill="var(--muted)"
+                  fillOpacity={0.35}
+                />
+              )}
+              <rect
+                x={barX}
+                y={barY}
+                width={barW}
+                height={barH}
+                rx={2}
+                fill={val > 0 ? (isActive ? 'var(--primary)' : 'var(--info)') : 'var(--border)'}
+                fillOpacity={val > 0 ? (isActive ? 1 : 0.82) : (isActive ? 0.9 : 0.45)}
+              />
+              <rect x={slotX} y={padT} width={slotW} height={plotH + padB} fill="transparent" />
+              {showXLabel(idx) && (
+                <>
+                  <text
+                    x={centerX}
+                    y={padT + plotH + 14}
+                    textAnchor="middle"
+                    fill={isActive ? 'var(--foreground)' : 'var(--muted-foreground)'}
+                    fontSize="10"
+                  >
+                    {item.label}
+                  </text>
+                  {item.sublabel && (
+                    <text
+                      x={centerX}
+                      y={padT + plotH + 26}
+                      textAnchor="middle"
+                      fill="var(--muted-foreground)"
+                      fontSize="9"
+                    >
+                      {item.sublabel}
+                    </text>
+                  )}
+                </>
+              )}
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}

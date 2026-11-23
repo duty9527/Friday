@@ -9,7 +9,7 @@ import {
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ConfirmActionDialog } from '@/components/shared/ConfirmActionDialog';
-import { TrendLineChart, type TrendPoint } from '@/components/shared/MetricCharts';
+import { ColumnBarChart, TrendLineChart, type ColumnBarDatum, type TrendPoint } from '@/components/shared/MetricCharts';
 import { isSafePreviewImageUrl } from '@/components/shared/safeUrl';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
@@ -21,6 +21,9 @@ import { Label } from '@/components/ui/label';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { useFriday } from '@/lib/friday-store';
 import { useTheme } from '@/lib/theme';
+
+type ChartGranularity = 'year' | 'month' | 'week' | 'day';
+type ChartMetric = 'distance' | 'count';
 
 interface NinebotSnapshot {
   sn: string;
@@ -41,6 +44,93 @@ interface NinebotSnapshot {
   location: { valid: boolean; address: string | null; shortAddress: string | null };
 }
 
+interface NinebotTripItem {
+  travelId: string;
+  date: string;
+  startTime: number;
+  startTimeMs?: number;
+  endTime?: number;
+  endTimeMs?: number;
+  durationSec: number;
+  distanceKm: number;
+  maxSpeedKmh: number;
+  avgSpeedKmh: number;
+  usedElectricity?: number;
+  month?: string;
+}
+
+interface NinebotTripPage {
+  page: number;
+  pageSize: number;
+  totalCount: number;
+  totalPages: number;
+  totalDistanceKm: number;
+  totalDurationSec: number;
+  maxSpeedKmh: number;
+  items: NinebotTripItem[];
+}
+
+interface NinebotTripBucket {
+  key: string;
+  label: string;
+  sublabel?: string;
+  fullLabel: string;
+  distanceKm: number;
+  tripCount: number;
+  durationSec: number;
+  maxSpeedKmh: number;
+  usedElectricity: number;
+  drillGranularity?: 'month' | 'day';
+  drillAnchor?: string;
+}
+
+interface NinebotTripAnalytics {
+  granularity: ChartGranularity;
+  anchorDate: string;
+  anchorMonth: string;
+  todayDate: string;
+  todayMonth: string;
+  periodLabel: string;
+  prevAnchor: string;
+  nextAnchor: string;
+  canGoNext: boolean;
+  availableMonths: string[];
+  totals: {
+    distanceKm: number;
+    tripCount: number;
+    durationSec: number;
+    maxSpeedKmh: number;
+    overallAvgSpeedKmh: number;
+    usedElectricity: number;
+  };
+  buckets: NinebotTripBucket[];
+}
+
+interface NinebotTripSyncState {
+  windowMonths: string[];
+  currentMonth: string;
+  completedMonths: string[];
+  pendingMonths: string[];
+  completedMonthCount: number;
+  totalWindowMonths: number;
+  yearComplete: boolean;
+  totalCachedTrips: number;
+  earliestTripSec: number | null;
+  latestTripSec: number | null;
+  lastSyncedAt: number | null;
+}
+
+interface TripsActionPayload {
+  tripPage?: NinebotTripPage;
+  tripAnalytics?: NinebotTripAnalytics;
+  tripSync?: NinebotTripSyncState;
+  syncBatch?: {
+    syncedMonths?: string[];
+    addedCount?: number;
+    fetchedCount?: number;
+  };
+}
+
 interface NinebotDashboardPayload {
   configured: boolean;
   vehicles?: Array<{ sn: string; name: string; modelName?: string }>;
@@ -53,8 +143,11 @@ interface NinebotDashboardPayload {
     todayCount: number;
     todayDistanceKm: number;
     maxSpeedKmh: number;
-    trips: Array<{ travelId: string; date: string; startTime: number; durationSec: number; distanceKm: number; maxSpeedKmh: number; avgSpeedKmh: number }>;
+    trips: NinebotTripItem[];
   } | null;
+  tripPage?: NinebotTripPage | null;
+  tripAnalytics?: NinebotTripAnalytics | null;
+  tripSync?: NinebotTripSyncState | null;
   activeAlerts: Array<{ key: string; lastNotifiedAt: number; lastValue: unknown }>;
   config: {
     preferredLine: 'motor' | 'ebike';
@@ -72,12 +165,61 @@ interface NinebotDashboardPayload {
   };
 }
 
+const GRANULARITY_LABELS: Record<ChartGranularity, string> = {
+  year: '年',
+  month: '月',
+  week: '周',
+  day: '日',
+};
+
+const CURRENT_PERIOD_LABELS: Record<ChartGranularity, string> = {
+  year: '近一年',
+  month: '本月',
+  week: '本周',
+  day: '今天',
+};
+
+const CHART_TITLES: Record<ChartGranularity, string> = {
+  year: '按月分布',
+  month: '按日分布',
+  week: '按周分布',
+  day: '按小时分布',
+};
+
+function formatTripStart(startTime: number, fallbackDate?: string): string {
+  if (!Number.isFinite(startTime) || startTime <= 0) {
+    return fallbackDate || '—';
+  }
+  const ms = startTime > 1_000_000_000_000 ? startTime : startTime * 1000;
+  return timestamp(ms);
+}
+
+function formatTripDuration(sec: number): string {
+  if (!Number.isFinite(sec) || sec <= 0) return '0 min';
+  if (sec < 60) return `${Math.round(sec)} 秒`;
+  const mins = Math.round(sec / 60);
+  if (mins < 60) return `${mins} min`;
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return m > 0 ? `${h}h ${m}m` : `${h}h`;
+}
+
+function formatCompactMonthLabel(ym: string): string {
+  return ym.length === 6 ? `${ym.slice(0, 4)}-${ym.slice(4)}` : ym;
+}
+
 export default function NinebotSurface() {
   const { authExpired, api, openSystemHub } = useFriday();
   const { theme: resolvedTheme } = useTheme();
   const [data, setData] = useState<NinebotDashboardPayload | null>(null);
   const [trendMetric, setTrendMetric] = useState<'battery' | 'range'>('battery');
-  const [tripMonth, setTripMonth] = useState('');
+  const [tripPage, setTripPage] = useState(1);
+  const [chartGranularity, setChartGranularity] = useState<ChartGranularity>('year');
+  const [chartAnchor, setChartAnchor] = useState('');
+  const [chartMetric, setChartMetric] = useState<ChartMetric>('distance');
+  const [tripsLoading, setTripsLoading] = useState(false);
+  const [tripSyncing, setTripSyncing] = useState(false);
+  const [tripSyncNote, setTripSyncNote] = useState<{ text: string; tone: 'ok' | 'warn' | 'err' } | null>(null);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<{ text: string; tone: 'ok' | 'warn' | 'err' } | null>(null);
 
@@ -97,6 +239,12 @@ export default function NinebotSurface() {
   const [clearCredsOpen, setClearCredsOpen] = useState(false);
 
   const seqRef = useRef(0);
+  const tripsSeqRef = useRef(0);
+  const viewStateRef = useRef<{ tripPage: number; chartGranularity: ChartGranularity; chartAnchor: string }>({
+    tripPage: 1,
+    chartGranularity: 'year',
+    chartAnchor: '',
+  });
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -111,6 +259,7 @@ export default function NinebotSurface() {
         plugin: 'ninebot',
         action,
         args,
+        ...(timeoutMs ? { timeoutMs } : {}),
       }, timeoutMs ? { timeoutMs } : undefined);
     },
     [api],
@@ -119,6 +268,10 @@ export default function NinebotSurface() {
   const applyDashboard = useCallback(
     (d: NinebotDashboardPayload, forceSync = false) => {
       setData(d);
+      if (d.tripPage?.page) {
+        setTripPage(d.tripPage.page);
+        viewStateRef.current.tripPage = d.tripPage.page;
+      }
       if (!forceSync && draftDirty) return;
       setAreaCode(d.config.areaCode || '86');
       setPreferredLine(d.config.preferredLine === 'ebike' ? 'ebike' : 'motor');
@@ -135,8 +288,15 @@ export default function NinebotSurface() {
     async (quiet = false) => {
       if (authExpired) return;
       const seq = ++seqRef.current;
+      const { tripPage: curPage, chartGranularity: curGran, chartAnchor: curAnchor } = viewStateRef.current;
       try {
-        const res = await callNinebot<NinebotDashboardPayload>('dashboard', { historyLimit: 96, tripLimit: 20 });
+        const res = await callNinebot<NinebotDashboardPayload>('dashboard', {
+          historyLimit: 96,
+          tripPage: curPage,
+          tripPageSize: 10,
+          chartGranularity: curGran,
+          ...(curAnchor ? { chartAnchor: curAnchor } : {}),
+        });
         if (!mountedRef.current || seq !== seqRef.current || authExpired) return;
         if (res.ok && res.data) applyDashboard(res.data);
         else if (!quiet) setStatus({ text: res.message || '读取九号电摩看板失败', tone: 'err' });
@@ -153,8 +313,64 @@ export default function NinebotSurface() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const loadTripsView = useCallback(
+    async (next: { page?: number; granularity?: ChartGranularity; anchor?: string }) => {
+      if (authExpired) return;
+      const nextPage = next.page ?? viewStateRef.current.tripPage;
+      const nextGran = next.granularity ?? viewStateRef.current.chartGranularity;
+      const nextAnchor = next.anchor !== undefined ? next.anchor : viewStateRef.current.chartAnchor;
+
+      viewStateRef.current = {
+        tripPage: nextPage,
+        chartGranularity: nextGran,
+        chartAnchor: nextAnchor,
+      };
+      setTripPage(nextPage);
+      setChartGranularity(nextGran);
+      setChartAnchor(nextAnchor);
+
+      const seq = ++tripsSeqRef.current;
+      setTripsLoading(true);
+      try {
+        const res = await callNinebot<TripsActionPayload>('trips', {
+          offline: true,
+          tripPage: nextPage,
+          tripPageSize: 10,
+          chartGranularity: nextGran,
+          ...(nextAnchor ? { chartAnchor: nextAnchor } : {}),
+        }, 15_000);
+        if (!mountedRef.current || seq !== tripsSeqRef.current || authExpired) return;
+        if (res.ok && res.data) {
+          setData(prev => {
+            if (!prev) return prev;
+            return {
+              ...prev,
+              ...(res.data?.tripPage ? { tripPage: res.data.tripPage } : {}),
+              ...(res.data?.tripAnalytics ? { tripAnalytics: res.data.tripAnalytics } : {}),
+              ...(res.data?.tripSync ? { tripSync: res.data.tripSync } : {}),
+            };
+          });
+          if (res.data.tripPage?.page && res.data.tripPage.page !== nextPage) {
+            setTripPage(res.data.tripPage.page);
+            viewStateRef.current.tripPage = res.data.tripPage.page;
+          }
+        } else if (!res.ok) {
+          setTripSyncNote({ text: res.message || '读取本地行程失败', tone: 'err' });
+        }
+      } catch (err) {
+        if (!mountedRef.current || seq !== tripsSeqRef.current) return;
+        setTripSyncNote({ text: errorText(err), tone: 'err' });
+      } finally {
+        if (mountedRef.current && seq === tripsSeqRef.current) {
+          setTripsLoading(false);
+        }
+      }
+    },
+    [authExpired, callNinebot],
+  );
+
   const runBusy = async (label: string, fn: () => Promise<void>) => {
-    if (busy || authExpired) return;
+    if (busy || tripSyncing || authExpired) return;
     setBusy(true);
     setStatus({ text: label, tone: 'warn' });
     try {
@@ -163,6 +379,76 @@ export default function NinebotSurface() {
       if (mountedRef.current) setStatus({ text: errorText(err), tone: 'err' });
     } finally {
       if (mountedRef.current) setBusy(false);
+    }
+  };
+
+  const handleSyncTrips = async () => {
+    if (busy || tripSyncing || authExpired) return;
+    setTripSyncing(true);
+    setTripSyncNote({ text: '正在检查最新行程并同步近一年历史记录…', tone: 'warn' });
+    try {
+      let totalAdded = 0;
+      let ranBackfill = false;
+      for (let batchIdx = 0; batchIdx < 12; batchIdx++) {
+        if (!mountedRef.current || authExpired) break;
+        const { chartGranularity: curGran, chartAnchor: curAnchor } = viewStateRef.current;
+        const res = await callNinebot<TripsActionPayload>('trips', {
+          sync: 'year',
+          maxMonths: 2,
+          ...(batchIdx > 0 ? { skipCurrentIfSynced: true } : {}),
+          tripPage: 1,
+          tripPageSize: 10,
+          chartGranularity: curGran,
+          ...(curAnchor ? { chartAnchor: curAnchor } : {}),
+        }, 90_000);
+        if (!mountedRef.current || authExpired) break;
+        if (!res.ok || !res.data) {
+          const errText = res.message || '行程同步失败';
+          setTripSyncNote({ text: errText, tone: 'err' });
+          setStatus({ text: errText, tone: 'err' });
+          break;
+        }
+
+        totalAdded += res.data.syncBatch?.addedCount ?? 0;
+        if ((res.data.syncBatch?.syncedMonths?.length ?? 0) > 1 || !res.data.tripSync?.yearComplete) {
+          ranBackfill = true;
+        }
+
+        setTripPage(1);
+        viewStateRef.current.tripPage = 1;
+        setData(prev => (prev ? {
+          ...prev,
+          ...(res.data?.tripPage ? { tripPage: res.data.tripPage } : {}),
+          ...(res.data?.tripAnalytics ? { tripAnalytics: res.data.tripAnalytics } : {}),
+          ...(res.data?.tripSync ? { tripSync: res.data.tripSync } : {}),
+        } : prev));
+
+        const syncInfo = res.data.tripSync;
+        const pendingCount = syncInfo?.pendingMonths?.length ?? 0;
+        if (syncInfo && !syncInfo.yearComplete && pendingCount > 0) {
+          setTripSyncNote({
+            text: `正在首次回溯近一年行程（已完成 ${syncInfo.completedMonthCount}/${syncInfo.totalWindowMonths} 个月，已新增 ${totalAdded} 段）…`,
+            tone: 'warn',
+          });
+          continue;
+        }
+
+        const totalCached = syncInfo?.totalCachedTrips ?? res.data.tripPage?.totalCount ?? 0;
+        const doneMsg = ranBackfill
+          ? `近一年行程同步完成（12 个月，本次新增 ${totalAdded} 段，共缓存 ${totalCached} 段）。`
+          : `已完成增量同步（本次新增 ${totalAdded} 段，共缓存 ${totalCached} 段）。`;
+        setTripSyncNote({ text: doneMsg, tone: 'ok' });
+        setStatus({ text: doneMsg, tone: 'ok' });
+        break;
+      }
+    } catch (err) {
+      if (mountedRef.current) {
+        const msg = errorText(err);
+        setTripSyncNote({ text: msg, tone: 'err' });
+        setStatus({ text: msg, tone: 'err' });
+      }
+    } finally {
+      if (mountedRef.current) setTripSyncing(false);
     }
   };
 
@@ -180,7 +466,7 @@ export default function NinebotSurface() {
       if (res.ok) {
         setDraftDirty(false);
         await callNinebot('status', {}, 30_000).catch(() => undefined);
-        await callNinebot('trips', { limit: 20 }, 30_000).catch(() => undefined);
+        await callNinebot('trips', { sync: 'incremental', tripPage: 1, tripPageSize: 10 }, 45_000).catch(() => undefined);
       }
       await loadDashboard(true);
     });
@@ -218,9 +504,36 @@ export default function NinebotSurface() {
       }));
   }, [data?.history, trendMetric]);
 
+  const analytics = data?.tripAnalytics ?? null;
+  const tripSync = data?.tripSync ?? null;
+  const chartItems = useMemo<ColumnBarDatum[]>(() => {
+    if (!analytics?.buckets?.length) return [];
+    return analytics.buckets.map(b => ({
+      key: b.key,
+      label: b.label,
+      sublabel: b.sublabel,
+      fullLabel: b.fullLabel,
+      value: chartMetric === 'distance' ? b.distanceKm : b.tripCount,
+      hint: `${b.distanceKm.toFixed(2)} km · ${b.tripCount} 段 · ${formatTripDuration(b.durationSec)}${b.maxSpeedKmh > 0 ? ` · 极速 ${b.maxSpeedKmh.toFixed(1)} km/h` : ''}`,
+      clickable: Boolean(b.drillGranularity && b.drillAnchor),
+    }));
+  }, [analytics, chartMetric]);
+
+  const tripPageData = data?.tripPage ?? null;
+  const tripPageItems = tripPageData?.items ?? data?.tripSummary?.trips ?? [];
+  const tripTotalCount = tripPageData?.totalCount ?? data?.tripSummary?.tripCount ?? 0;
+  const tripTotalDistance = tripPageData?.totalDistanceKm ?? data?.tripSummary?.totalDistanceKm ?? 0;
+  const tripMaxSpeed = tripPageData?.maxSpeedKmh ?? data?.tripSummary?.maxSpeedKmh ?? 0;
+  const currentPage = tripPageData?.page ?? tripPage;
+  const totalPages = tripPageData?.totalPages ?? 1;
+  const pageSize = tripPageData?.pageSize ?? 10;
+  const startRow = tripTotalCount > 0 ? (currentPage - 1) * pageSize + 1 : 0;
+  const endRow = tripTotalCount > 0 ? startRow + tripPageItems.length - 1 : 0;
+
   const snap = data?.snapshot;
   const rawImg = resolvedTheme === 'dark' ? data?.vehicleImages?.darkDataUrl : data?.vehicleImages?.lightDataUrl;
   const safeVehicleImg = isSafePreviewImageUrl(rawImg) ? rawImg! : '';
+  const actionDisabled = busy || tripSyncing;
 
   return (
     <div className="space-y-4">
@@ -232,12 +545,14 @@ export default function NinebotSurface() {
             <select
               aria-label="选择车辆"
               value={snap?.sn || data?.config.defaultSn || ''}
-              disabled={busy}
+              disabled={actionDisabled}
               onChange={e => {
                 const sn = e.target.value;
                 void runBusy(`切换车辆 ${sn}…`, async () => {
                   const res = await callNinebot('vehicles', { selectSn: sn }, 20_000);
                   setStatus({ text: res.message || '已切换车辆', tone: res.ok ? 'ok' : 'err' });
+                  setTripPage(1);
+                  viewStateRef.current.tripPage = 1;
                   await loadDashboard(true);
                 });
               }}
@@ -252,16 +567,28 @@ export default function NinebotSurface() {
             <MapPinIcon className="size-3.5" />
             <span>高德 Key ({data?.config.hasAmapKey ? '已配' : '未配'})</span>
           </Button>
-          <Button size="xs" variant="outline" disabled={busy} onClick={() => void runBusy('同步九号车况与本月行程…', async () => {
+          <Button size="xs" variant="outline" disabled={actionDisabled} onClick={() => void runBusy('同步九号车况与新增行程…', async () => {
             const res = await callNinebot('status', {}, 30_000);
-            if (res.ok) await callNinebot('trips', { limit: 20 }, 30_000).catch(() => undefined);
+            if (res.ok) {
+              try {
+                const tripRes = await callNinebot('trips', { sync: 'incremental', tripPage: 1, tripPageSize: 10 }, 45_000);
+                if (!tripRes.ok) {
+                  setTripSyncNote({ text: tripRes.message || '增量同步最新行程失败', tone: 'warn' });
+                } else {
+                  setTripPage(1);
+                  viewStateRef.current.tripPage = 1;
+                }
+              } catch (err) {
+                setTripSyncNote({ text: `车况已同步，行程增量更新失败：${errorText(err)}`, tone: 'warn' });
+              }
+            }
             setStatus({ text: res.message || '同步完成', tone: res.ok ? 'ok' : 'err' });
             await loadDashboard(true);
           })}>
             <RefreshCwIcon className="size-3.5" />
             <span>同步车况</span>
           </Button>
-          <Button size="xs" disabled={busy} onClick={() => void runBusy('执行安全与补能巡检…', async () => {
+          <Button size="xs" disabled={actionDisabled} onClick={() => void runBusy('执行安全与补能巡检…', async () => {
             const res = await callNinebot('patrol', { force: true }, 30_000);
             setStatus({ text: res.message || '巡检完成', tone: res.ok ? 'ok' : 'err' });
             await loadDashboard(true);
@@ -345,52 +672,242 @@ export default function NinebotSurface() {
         </CardContent>
       </Card>
 
-      {/* Trips */}
+      {/* Yearly / Monthly / Weekly / Daily Riding Bar Chart */}
+      <Card>
+        <CardHeader className="pb-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <CardTitle className="text-sm">近一年骑行统计</CardTitle>
+              {tripSync && (
+                <Badge variant={tripSync.yearComplete ? 'success' : 'outline'}>
+                  {tripSync.yearComplete
+                    ? '已同步近 12 个月'
+                    : `已同步 ${tripSync.completedMonthCount}/${tripSync.totalWindowMonths} 个月`}
+                </Badge>
+              )}
+              {tripSync && !tripSync.yearComplete && (
+                <Button size="xs" variant="outline" disabled={actionDisabled} onClick={() => void handleSyncTrips()}>
+                  同步近一年
+                </Button>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <div className="flex gap-1">
+                {(['year', 'month', 'week', 'day'] as const).map(g => (
+                  <Button
+                    key={g}
+                    size="xs"
+                    variant={chartGranularity === g ? 'default' : 'outline'}
+                    disabled={tripsLoading}
+                    onClick={() => void loadTripsView({ granularity: g })}
+                  >
+                    {GRANULARITY_LABELS[g]}
+                  </Button>
+                ))}
+              </div>
+              <div className="flex gap-1">
+                <Button
+                  size="xs"
+                  variant={chartMetric === 'distance' ? 'secondary' : 'outline'}
+                  onClick={() => setChartMetric('distance')}
+                >
+                  里程 km
+                </Button>
+                <Button
+                  size="xs"
+                  variant={chartMetric === 'count' ? 'secondary' : 'outline'}
+                  onClick={() => setChartMetric('count')}
+                >
+                  段数
+                </Button>
+              </div>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-1">
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={tripsLoading || !analytics}
+                onClick={() => analytics && void loadTripsView({ anchor: analytics.prevAnchor })}
+              >
+                ← 上期
+              </Button>
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={tripsLoading || !analytics || !analytics.canGoNext}
+                onClick={() => void loadTripsView({ anchor: '' })}
+              >
+                {CURRENT_PERIOD_LABELS[chartGranularity]}
+              </Button>
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={tripsLoading || !analytics || !analytics.canGoNext}
+                onClick={() => analytics && void loadTripsView({ anchor: analytics.nextAnchor })}
+              >
+                下期 →
+              </Button>
+              {analytics && (
+                <span className="ms-1 text-xs font-medium text-foreground">{analytics.periodLabel}</span>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              {chartGranularity === 'month' && analytics && analytics.availableMonths.length > 0 && (
+                <select
+                  aria-label="选择月份"
+                  value={analytics.anchorMonth}
+                  disabled={tripsLoading}
+                  onChange={e => {
+                    const ym = e.target.value;
+                    if (ym.length === 6) {
+                      void loadTripsView({ granularity: 'month', anchor: `${ym.slice(0, 4)}-${ym.slice(4)}-01` });
+                    }
+                  }}
+                  className="h-7 rounded-md border border-input bg-background px-2 font-mono text-xs outline-none"
+                >
+                  {analytics.availableMonths.map(ym => (
+                    <option key={ym} value={ym}>{formatCompactMonthLabel(ym)}</option>
+                  ))}
+                </select>
+              )}
+              {(chartGranularity === 'week' || chartGranularity === 'day') && analytics && (
+                <Input
+                  size="sm"
+                  type="date"
+                  aria-label="选择日期"
+                  className="w-36 font-mono"
+                  value={analytics.anchorDate}
+                  max={analytics.todayDate}
+                  disabled={tripsLoading}
+                  onChange={e => {
+                    if (e.target.value) {
+                      void loadTripsView({ anchor: e.target.value });
+                    }
+                  }}
+                />
+              )}
+            </div>
+          </div>
+
+          {analytics && (
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+              <div className="rounded-lg border bg-muted/20 p-2.5">
+                <div className="text-muted-foreground">骑行里程</div>
+                <div className="font-mono text-base font-semibold">{analytics.totals.distanceKm.toFixed(1)} km</div>
+              </div>
+              <div className="rounded-lg border bg-muted/20 p-2.5">
+                <div className="text-muted-foreground">骑行段数</div>
+                <div className="font-mono text-base font-semibold">{analytics.totals.tripCount} 段</div>
+              </div>
+              <div className="rounded-lg border bg-muted/20 p-2.5">
+                <div className="text-muted-foreground">累计耗时</div>
+                <div className="font-mono text-base font-semibold">{formatTripDuration(analytics.totals.durationSec)}</div>
+              </div>
+              <div className="rounded-lg border bg-muted/20 p-2.5">
+                <div className="text-muted-foreground">最高极速</div>
+                <div className="font-mono text-base font-semibold">{analytics.totals.maxSpeedKmh.toFixed(1)} km/h</div>
+              </div>
+            </div>
+          )}
+
+          <ColumnBarChart
+            items={chartItems}
+            title={CHART_TITLES[chartGranularity]}
+            formatValue={v => (chartMetric === 'distance' ? `${v.toFixed(1)} km` : `${Math.round(v)} 段`)}
+            onSelect={(item) => {
+              const bucket = analytics?.buckets.find(b => b.key === item.key);
+              if (bucket?.drillGranularity && bucket.drillAnchor) {
+                void loadTripsView({ granularity: bucket.drillGranularity, anchor: bucket.drillAnchor });
+              }
+            }}
+          />
+        </CardContent>
+      </Card>
+
+      {/* Trips (Latest-First Paginated) */}
       <Card>
         <CardHeader className="pb-2">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div>
-              <CardTitle className="text-sm">骑行轨迹 ({data?.tripSummary?.tripCount ?? 0} 段)</CardTitle>
+              <CardTitle className="text-sm">骑行轨迹 ({tripTotalCount} 段)</CardTitle>
               <CardDescription className="text-xs">
-                累计 {data?.tripSummary?.totalDistanceKm ?? 0} km · 极速 {data?.tripSummary?.maxSpeedKmh ?? 0} km/h
+                累计 {tripTotalDistance.toFixed(1)} km · 极速 {tripMaxSpeed.toFixed(1)} km/h
               </CardDescription>
             </div>
-            <div className="flex items-center gap-1.5">
-              <Input size="sm" className="w-28" placeholder="YYYYMM" value={tripMonth} onChange={e => setTripMonth(e.target.value)} />
-              <Button size="xs" variant="outline" disabled={busy} onClick={() => void runBusy('同步行程轨迹…', async () => {
-                const res = await callNinebot('trips', { limit: 20, ...(tripMonth.trim() ? { month: tripMonth.trim() } : {}) }, 30_000);
-                setStatus({ text: res.message || '行程同步完成', tone: res.ok ? 'ok' : 'err' });
-                await loadDashboard(true);
-              })}>
-                同步行程
-              </Button>
-            </div>
+            <Button size="xs" variant="outline" disabled={actionDisabled} onClick={() => void handleSyncTrips()}>
+              <RefreshCwIcon className={tripSyncing ? 'size-3.5 animate-spin' : 'size-3.5'} />
+              <span>{tripSyncing ? '同步中…' : '同步行程'}</span>
+            </Button>
           </div>
         </CardHeader>
-        <CardContent>
-          {!(data?.tripSummary?.trips?.length) ? (
-            <p className="py-4 text-center text-xs text-muted-foreground">暂无行程记录。</p>
+        <CardContent className="space-y-3">
+          {tripSyncNote && (
+            <Alert variant={tripSyncNote.tone === 'err' ? 'error' : tripSyncNote.tone === 'warn' ? 'warning' : 'success'}>
+              <AlertDescription className="text-xs">{tripSyncNote.text}</AlertDescription>
+            </Alert>
+          )}
+
+          {!tripPageItems.length ? (
+            <p className="py-4 text-center text-xs text-muted-foreground">暂无行程记录，点击右上角「同步行程」获取近一年数据。</p>
           ) : (
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="text-xs">时间</TableHead>
-                  <TableHead className="text-xs">里程</TableHead>
-                  <TableHead className="text-xs">均速 / 极速</TableHead>
-                  <TableHead className="text-xs">耗时</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {data.tripSummary.trips.map(t => (
-                  <TableRow key={t.travelId}>
-                    <TableCell className="font-mono text-xs">{timestamp(t.startTime)}</TableCell>
-                    <TableCell className="font-mono text-xs font-medium">{t.distanceKm.toFixed(2)} km</TableCell>
-                    <TableCell className="font-mono text-xs">{t.avgSpeedKmh.toFixed(1)} / {t.maxSpeedKmh.toFixed(1)} km/h</TableCell>
-                    <TableCell className="font-mono text-xs text-muted-foreground">{Math.round(t.durationSec / 60)} min</TableCell>
+            <>
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="text-xs">时间</TableHead>
+                    <TableHead className="text-xs">里程</TableHead>
+                    <TableHead className="text-xs">均速 / 极速</TableHead>
+                    <TableHead className="text-xs">耗时</TableHead>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+                </TableHeader>
+                <TableBody>
+                  {tripPageItems.map(t => (
+                    <TableRow key={t.travelId}>
+                      <TableCell className="font-mono text-xs">{formatTripStart(t.startTime, t.date)}</TableCell>
+                      <TableCell className="font-mono text-xs font-medium">{t.distanceKm.toFixed(2)} km</TableCell>
+                      <TableCell className="font-mono text-xs">{t.avgSpeedKmh.toFixed(1)} / {t.maxSpeedKmh.toFixed(1)} km/h</TableCell>
+                      <TableCell className="font-mono text-xs text-muted-foreground">{formatTripDuration(t.durationSec)}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-xs text-muted-foreground">
+                <span>
+                  第 {currentPage} / {totalPages} 页 · 第 {startRow}–{endRow} 段（共 {tripTotalCount} 段）
+                </span>
+                <div className="flex items-center gap-1">
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    disabled={tripsLoading || currentPage <= 1}
+                    onClick={() => void loadTripsView({ page: 1 })}
+                  >
+                    最新
+                  </Button>
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    disabled={tripsLoading || currentPage <= 1}
+                    onClick={() => void loadTripsView({ page: currentPage - 1 })}
+                  >
+                    上一页
+                  </Button>
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    disabled={tripsLoading || currentPage >= totalPages}
+                    onClick={() => void loadTripsView({ page: currentPage + 1 })}
+                  >
+                    下一页
+                  </Button>
+                </div>
+              </div>
+            </>
           )}
         </CardContent>
       </Card>
@@ -426,7 +943,7 @@ export default function NinebotSurface() {
                   <Label className="text-xs">登录密码</Label>
                   <Input size="sm" type="password" value={password} onChange={e => setPassword(e.target.value)} />
                 </div>
-                <Button type="submit" size="sm" disabled={busy}>登录发现车辆</Button>
+                <Button type="submit" size="sm" disabled={actionDisabled}>登录发现车辆</Button>
               </div>
             </form>
           </CardContent>
@@ -472,7 +989,7 @@ export default function NinebotSurface() {
                   <Checkbox checked={checkUnlocked} onCheckedChange={v => { setDraftDirty(true); setCheckUnlocked(Boolean(v)); }} />
                   <span>检查未锁车告警</span>
                 </label>
-                <Button type="submit" size="sm" disabled={busy}>保存配置</Button>
+                <Button type="submit" size="sm" disabled={actionDisabled}>保存配置</Button>
               </div>
             </form>
           </CardContent>
@@ -485,7 +1002,7 @@ export default function NinebotSurface() {
         title="清除九号账号凭据"
         description="确定清除已保存的九号账号密码、本地会话及巡检凭据吗？"
         confirmLabel="确认清除"
-        busy={busy}
+        busy={actionDisabled}
         onConfirm={async () => {
           setClearCredsOpen(false);
           await runBusy('清除九号账号凭据…', async () => {

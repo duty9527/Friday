@@ -82,25 +82,171 @@ const NINEBOT_LOCATION_LOCK_RE = /(停哪|停在|在哪|位置|地址|锁好|锁
 const NINEBOT_TRIPS_RE = /(骑了多远|骑了多少|骑行|行程|轨迹|最高速|极速|均速|平均速度|跑了多远)/;
 const NINEBOT_STATUS_RE = /(多少电|电量|还有电|能跑多远|续航|充电|充满|电压|功率|总里程|状态|情况|怎么样|报告)/;
 
+const SH_OFFSET_MS = 8 * 3600 * 1000;
+const WEEKDAY_ZH = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+
+/**
+ * Normalize epoch seconds or milliseconds into integer Unix seconds.
+ * @param {unknown} ts
+ * @returns {number}
+ */
+function toUnixSec(ts) {
+  const n = Number(ts);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return n > 1_000_000_000_000 ? Math.floor(n / 1000) : Math.trunc(n);
+}
+
+/**
+ * Break epoch milliseconds into Asia/Shanghai calendar components.
+ * @param {number} ms
+ */
+function shPartsFromMs(ms) {
+  const d = new Date(ms + SH_OFFSET_MS);
+  const year = d.getUTCFullYear();
+  const month = d.getUTCMonth() + 1;
+  const day = d.getUTCDate();
+  const hour = d.getUTCHours();
+  const dow = d.getUTCDay();
+  const mm = String(month).padStart(2, '0');
+  const dd = String(day).padStart(2, '0');
+  return {
+    year,
+    month,
+    day,
+    hour,
+    dow,
+    date: `${year}-${mm}-${dd}`,
+    monthIso: `${year}-${mm}`,
+    monthCompact: `${year}${mm}`,
+  };
+}
+
+/**
+ * Unix seconds for 00:00:00 Asia/Shanghai of `(y, m, d)`.
+ * @param {number} y
+ * @param {number} m
+ * @param {number} d
+ * @returns {number}
+ */
+function shStartOfDaySec(y, m, d) {
+  return Math.floor((Date.UTC(y, m - 1, d, 0, 0, 0) - SH_OFFSET_MS) / 1000);
+}
+
+/**
+ * @param {number} y
+ * @param {number} m
+ * @returns {number}
+ */
+function daysInMonth(y, m) {
+  return new Date(Date.UTC(y, m, 0)).getUTCDate();
+}
+
+/**
+ * @param {number} y
+ * @param {number} m
+ * @param {number} deltaMonths
+ */
+function shiftShMonths(y, m, deltaMonths) {
+  const d = new Date(Date.UTC(y, m - 1 + deltaMonths, 1));
+  const year = d.getUTCFullYear();
+  const month = d.getUTCMonth() + 1;
+  const mm = String(month).padStart(2, '0');
+  return {
+    year,
+    month,
+    monthCompact: `${year}${mm}`,
+    monthIso: `${year}-${mm}`,
+  };
+}
+
+/**
+ * @param {number} y
+ * @param {number} m
+ * @param {number} d
+ * @param {number} deltaDays
+ */
+function shiftShDays(y, m, d, deltaDays) {
+  const dt = new Date(Date.UTC(y, m - 1, d + deltaDays));
+  const year = dt.getUTCFullYear();
+  const month = dt.getUTCMonth() + 1;
+  const day = dt.getUTCDate();
+  const dow = dt.getUTCDay();
+  const mm = String(month).padStart(2, '0');
+  const dd = String(day).padStart(2, '0');
+  return {
+    year,
+    month,
+    day,
+    dow,
+    date: `${year}-${mm}-${dd}`,
+    monthCompact: `${year}${mm}`,
+    monthIso: `${year}-${mm}`,
+  };
+}
+
+/**
+ * Return `count` compact `YYYYMM` strings in chronological order ending at `nowMs`'s Shanghai month.
+ * @param {number} nowMs
+ * @param {number} [count]
+ * @returns {string[]}
+ */
+function rollingYearMonths(nowMs, count = 12) {
+  const cur = shPartsFromMs(nowMs);
+  /** @type {string[]} */
+  const out = [];
+  for (let offset = -(count - 1); offset <= 0; offset++) {
+    out.push(shiftShMonths(cur.year, cur.month, offset).monthCompact);
+  }
+  return out;
+}
+
+/**
+ * Parse `'YYYY-MM-DD'`, `'YYYY-MM'`, or `'YYYYMM'` into Asia/Shanghai calendar parts.
+ * @param {unknown} rawAnchor
+ * @param {string} fallbackDate
+ */
+function parseAnchorDate(rawAnchor, fallbackDate) {
+  const fbMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(fallbackDate);
+  const fbY = fbMatch ? Number(fbMatch[1]) : 2026;
+  const fbM = fbMatch ? Number(fbMatch[2]) : 1;
+  const fbD = fbMatch ? Number(fbMatch[3]) : 1;
+  const fallbackParts = shiftShDays(fbY, fbM, fbD, 0);
+
+  if (typeof rawAnchor !== 'string' || !rawAnchor.trim()) {
+    return fallbackParts;
+  }
+  const s = rawAnchor.trim();
+  const fullMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (fullMatch) {
+    const y = Number(fullMatch[1]);
+    const m = Number(fullMatch[2]);
+    const d = Number(fullMatch[3]);
+    if (m >= 1 && m <= 12 && d >= 1 && d <= daysInMonth(y, m)) {
+      return shiftShDays(y, m, d, 0);
+    }
+    return fallbackParts;
+  }
+  const monthMatch = /^(\d{4})-?(\d{2})$/.exec(s);
+  if (monthMatch) {
+    const y = Number(monthMatch[1]);
+    const m = Number(monthMatch[2]);
+    if (m >= 1 && m <= 12) {
+      return shiftShDays(y, m, 1, 0);
+    }
+  }
+  return fallbackParts;
+}
+
 /**
  * @param {number} ms
  * @returns {{ month: string; date: string; monthCompact: string }}
  */
 function formatShDateParts(ms) {
-  const fmt = new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Asia/Shanghai',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  });
-  const parts = fmt.formatToParts(new Date(ms));
-  const year = parts.find(p => p.type === 'year')?.value || '2026';
-  const month = parts.find(p => p.type === 'month')?.value || '01';
-  const day = parts.find(p => p.type === 'day')?.value || '01';
+  const p = shPartsFromMs(ms);
   return {
-    month: `${year}-${month}`,
-    monthCompact: `${year}${month}`,
-    date: `${year}-${month}-${day}`,
+    month: p.monthIso,
+    monthCompact: p.monthCompact,
+    date: p.date,
   };
 }
 
@@ -109,8 +255,9 @@ function formatShDateParts(ms) {
  * @returns {string}
  */
 function formatShDateFromUnixSec(sec) {
-  if (!Number.isFinite(sec) || sec <= 0) return '';
-  return formatShDateParts(sec * 1000).date;
+  const s = toUnixSec(sec);
+  if (s <= 0) return '';
+  return shPartsFromMs(s * 1000).date;
 }
 
 /**
@@ -299,6 +446,17 @@ function openDb(dbPath) {
       PRIMARY KEY (sn, travel_id)
     );
     CREATE INDEX IF NOT EXISTS idx_trips_sn_end ON trips (sn, end_time DESC);
+    CREATE INDEX IF NOT EXISTS idx_trips_sn_start ON trips (sn, start_time DESC);
+
+    CREATE TABLE IF NOT EXISTS trip_sync_months (
+      sn TEXT NOT NULL,
+      month TEXT NOT NULL,
+      trip_count INTEGER NOT NULL DEFAULT 0,
+      complete INTEGER NOT NULL DEFAULT 0,
+      initial_synced INTEGER NOT NULL DEFAULT 0,
+      synced_at INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (sn, month)
+    );
 
     CREATE TABLE IF NOT EXISTS geo_cache (
       grid_key TEXT PRIMARY KEY,
@@ -514,6 +672,442 @@ function summarizeCachedTrips(db, sn, nowMs, monthFilter, limit = 10) {
     sevenDayCount,
     sevenDayDistanceKm: Number(sevenDayDistanceKm.toFixed(2)),
     trips: normalized.slice(0, limit),
+  };
+}
+
+/**
+ * Inspect 12-month rolling backfill & incremental sync coverage for `sn`.
+ * @param {DatabaseSync} db
+ * @param {string} sn
+ * @param {number} nowMs
+ */
+function getTripSyncState(db, sn, nowMs) {
+  const windowMonths = rollingYearMonths(nowMs, 12);
+  const currentMonth = windowMonths[windowMonths.length - 1] || shPartsFromMs(nowMs).monthCompact;
+
+  const syncRows = /** @type {Array<Record<string, any>>} */ (
+    db.prepare('SELECT month, trip_count, complete, initial_synced, synced_at FROM trip_sync_months WHERE sn=?').all(sn)
+  );
+  /** @type {Map<string, { tripCount: number; complete: number; initialSynced: number; syncedAt: number }>} */
+  const rowMap = new Map();
+  let lastLedgerSync = 0;
+  for (const r of syncRows) {
+    const syncedAt = Number(r.synced_at ?? 0);
+    if (syncedAt > lastLedgerSync) lastLedgerSync = syncedAt;
+    rowMap.set(String(r.month), {
+      tripCount: Number(r.trip_count ?? 0),
+      complete: Number(r.complete ?? 0),
+      initialSynced: Number(r.initial_synced ?? 0),
+      syncedAt,
+    });
+  }
+
+  const tripsAgg = /** @type {Record<string, any> | undefined} */ (
+    db.prepare(`
+      SELECT
+        COUNT(*) AS cnt,
+        MIN(CASE WHEN start_time > 0 THEN start_time ELSE end_time END) AS min_ts,
+        MAX(CASE WHEN end_time > 0 THEN end_time ELSE start_time END) AS max_ts,
+        MAX(updated_at) AS last_upd
+      FROM trips WHERE sn=?
+    `).get(sn)
+  );
+
+  const curRow = rowMap.get(currentMonth);
+  const currentInitialSynced = curRow?.initialSynced === 1;
+
+  /** @type {string[]} */
+  const completedMonths = [];
+  /** @type {string[]} */
+  const pendingPastMonths = [];
+
+  for (const m of windowMonths) {
+    if (m === currentMonth) {
+      if (currentInitialSynced) completedMonths.push(m);
+      continue;
+    }
+    const row = rowMap.get(m);
+    if (row?.complete === 1) {
+      completedMonths.push(m);
+    } else {
+      pendingPastMonths.push(m);
+    }
+  }
+
+  pendingPastMonths.sort((a, b) => b.localeCompare(a));
+  const pendingMonths = [
+    ...(currentInitialSynced ? [] : [currentMonth]),
+    ...pendingPastMonths,
+  ];
+  const yearComplete = pendingPastMonths.length === 0 && currentInitialSynced;
+
+  const earliestTripSec = toUnixSec(tripsAgg?.min_ts) || null;
+  const latestTripSec = toUnixSec(tripsAgg?.max_ts) || null;
+  const lastTripsUpd = Number(tripsAgg?.last_upd ?? 0);
+  const lastSyncedAt = Math.max(lastLedgerSync, lastTripsUpd) || null;
+
+  return {
+    windowMonths,
+    currentMonth,
+    completedMonths,
+    pendingMonths,
+    completedMonthCount: completedMonths.length,
+    totalWindowMonths: windowMonths.length,
+    yearComplete,
+    totalCachedTrips: Number(tripsAgg?.cnt ?? 0),
+    earliestTripSec,
+    latestTripSec,
+    lastSyncedAt,
+  };
+}
+
+/**
+ * Record sync state for `(sn, month)`.
+ * @param {DatabaseSync} db
+ * @param {string} sn
+ * @param {string} month
+ * @param {{ tripCount: number; complete: number | boolean; initialSynced: number | boolean; nowMs: number }} opts
+ */
+function markMonthSynced(db, sn, month, opts) {
+  db.prepare(`
+    INSERT INTO trip_sync_months (sn, month, trip_count, complete, initial_synced, synced_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(sn, month) DO UPDATE SET
+      trip_count=excluded.trip_count,
+      complete=MAX(trip_sync_months.complete, excluded.complete),
+      initial_synced=MAX(trip_sync_months.initial_synced, excluded.initial_synced),
+      synced_at=excluded.synced_at
+  `).run(
+    sn,
+    month,
+    opts.tripCount,
+    opts.complete ? 1 : 0,
+    opts.initialSynced ? 1 : 0,
+    opts.nowMs,
+  );
+}
+
+/**
+ * Return all cached `travel_id` values for `(sn, month)`.
+ * @param {DatabaseSync} db
+ * @param {string} sn
+ * @param {string} month
+ * @returns {Set<string>}
+ */
+function getKnownTripIdsForMonth(db, sn, month) {
+  const rows = /** @type {Array<Record<string, any>>} */ (
+    db.prepare('SELECT travel_id FROM trips WHERE sn=? AND month=?').all(sn, month)
+  );
+  return new Set(rows.map(r => String(r.travel_id)));
+}
+
+/**
+ * Query newest-first paginated trips across all cached months.
+ * @param {DatabaseSync} db
+ * @param {string} sn
+ * @param {{ page?: number; pageSize?: number }} [opts]
+ */
+function queryPaginatedTrips(db, sn, opts = {}) {
+  const pageSize = clampInt(opts.pageSize, 1, 50) ?? 10;
+  const requestedPage = clampInt(opts.page, 1, 10000) ?? 1;
+
+  const agg = /** @type {Record<string, any> | undefined} */ (
+    db.prepare(`
+      SELECT
+        COUNT(*) AS cnt,
+        COALESCE(SUM(distance_km), 0) AS dist,
+        COALESCE(MAX(max_speed_kmh), 0) AS max_spd,
+        COALESCE(SUM(duration_sec), 0) AS dur
+      FROM trips WHERE sn=?
+    `).get(sn)
+  );
+
+  const totalCount = Number(agg?.cnt ?? 0);
+  const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+  const page = Math.min(Math.max(1, requestedPage), totalPages);
+  const offset = (page - 1) * pageSize;
+
+  const rows = /** @type {Array<Record<string, any>>} */ (
+    db.prepare('SELECT * FROM trips WHERE sn=? ORDER BY end_time DESC, start_time DESC LIMIT ? OFFSET ?').all(sn, pageSize, offset)
+  );
+
+  const items = rows.map(r => {
+    const startSec = toUnixSec(r.start_time);
+    const endSec = toUnixSec(r.end_time);
+    const dist = Number(r.distance_km ?? 0);
+    const dur = Number(r.duration_sec ?? 0);
+    const maxSpd = Number(r.max_speed_kmh ?? 0);
+    const avgSpd = Number(r.avg_speed_kmh ?? 0);
+    const usedElec = Number(r.used_electricity ?? 0);
+    return {
+      travelId: String(r.travel_id),
+      startTime: startSec,
+      startTimeMs: startSec * 1000,
+      endTime: endSec,
+      endTimeMs: endSec * 1000,
+      date: formatShDateFromUnixSec(startSec || endSec),
+      durationSec: dur,
+      distanceKm: Number(dist.toFixed(2)),
+      maxSpeedKmh: Number(maxSpd.toFixed(1)),
+      avgSpeedKmh: Number(avgSpd.toFixed(1)),
+      usedElectricity: Number(usedElec.toFixed(1)),
+      month: String(r.month || ''),
+    };
+  });
+
+  return {
+    page,
+    pageSize,
+    totalCount,
+    totalPages,
+    totalDistanceKm: Number(Number(agg?.dist ?? 0).toFixed(2)),
+    totalDurationSec: Number(agg?.dur ?? 0),
+    maxSpeedKmh: Number(Number(agg?.max_spd ?? 0).toFixed(1)),
+    items,
+  };
+}
+
+/**
+ * Aggregate cached trips into zero-filled `year` (12m) / `month` (daily) / `week` (Mon–Sun) / `day` (24h) buckets.
+ * @param {DatabaseSync} db
+ * @param {string} sn
+ * @param {number} nowMs
+ * @param {string} [rawGranularity]
+ * @param {string} [rawAnchor]
+ */
+function buildTripAnalytics(db, sn, nowMs, rawGranularity = 'year', rawAnchor) {
+  const gRaw = String(rawGranularity || 'year').trim().toLowerCase();
+  /** @type {'year' | 'month' | 'week' | 'day'} */
+  const granularity = (gRaw === 'month' || gRaw === 'week' || gRaw === 'day') ? gRaw : 'year';
+
+  const today = shPartsFromMs(nowMs);
+  let anchor = parseAnchorDate(rawAnchor, today.date);
+  if (granularity === 'year' || granularity === 'month') {
+    if (anchor.monthCompact > today.monthCompact) {
+      anchor = shiftShDays(today.year, today.month, today.day, 0);
+    }
+  } else if (anchor.date > today.date) {
+    anchor = shiftShDays(today.year, today.month, today.day, 0);
+  }
+
+  const dbMonthRows = /** @type {Array<Record<string, any>>} */ (
+    db.prepare("SELECT DISTINCT month FROM trips WHERE sn=? AND month != '' ORDER BY month DESC").all(sn)
+  );
+  const availableMonthSet = new Set(rollingYearMonths(nowMs, 12));
+  for (const r of dbMonthRows) {
+    const m = String(r.month || '').trim();
+    if (/^20\d{2}(0[1-9]|1[0-2])$/.test(m)) availableMonthSet.add(m);
+  }
+  const availableMonths = [...availableMonthSet].sort((a, b) => b.localeCompare(a));
+
+  /**
+   * @type {Array<{
+   *   key: string;
+   *   label: string;
+   *   sublabel?: string;
+   *   fullLabel: string;
+   *   distanceKm: number;
+   *   tripCount: number;
+   *   durationSec: number;
+   *   maxSpeedKmh: number;
+   *   usedElectricity: number;
+   *   drillGranularity?: 'month' | 'day';
+   *   drillAnchor?: string;
+   * }>}
+   */
+  const buckets = [];
+  let rangeStartSec = 0;
+  let rangeEndSec = 0;
+  let periodLabel = '';
+  let prevAnchor = today.date;
+  let nextAnchor = today.date;
+  let canGoNext = false;
+
+  if (granularity === 'year') {
+    const firstM = shiftShMonths(anchor.year, anchor.month, -11);
+    const afterLastM = shiftShMonths(anchor.year, anchor.month, 1);
+    rangeStartSec = shStartOfDaySec(firstM.year, firstM.month, 1);
+    rangeEndSec = shStartOfDaySec(afterLastM.year, afterLastM.month, 1);
+    const spansYears = firstM.year !== anchor.year;
+    for (let offset = -11; offset <= 0; offset++) {
+      const m = shiftShMonths(anchor.year, anchor.month, offset);
+      buckets.push({
+        key: m.monthIso,
+        label: spansYears ? `${String(m.year).slice(-2)}/${String(m.month).padStart(2, '0')}` : `${m.month}月`,
+        fullLabel: `${m.year}年${String(m.month).padStart(2, '0')}月`,
+        distanceKm: 0,
+        tripCount: 0,
+        durationSec: 0,
+        maxSpeedKmh: 0,
+        usedElectricity: 0,
+        drillGranularity: 'month',
+        drillAnchor: `${m.monthIso}-01`,
+      });
+    }
+    periodLabel = anchor.monthCompact === today.monthCompact
+      ? `${firstM.monthIso} ~ ${anchor.monthIso}（近12个月）`
+      : `${firstM.monthIso} ~ ${anchor.monthIso}`;
+    prevAnchor = `${shiftShMonths(anchor.year, anchor.month, -12).monthIso}-01`;
+    const nextM = shiftShMonths(anchor.year, anchor.month, 12);
+    nextAnchor = nextM.monthCompact > today.monthCompact ? today.date : `${nextM.monthIso}-01`;
+    canGoNext = anchor.monthCompact < today.monthCompact;
+  } else if (granularity === 'month') {
+    const nextM = shiftShMonths(anchor.year, anchor.month, 1);
+    rangeStartSec = shStartOfDaySec(anchor.year, anchor.month, 1);
+    rangeEndSec = shStartOfDaySec(nextM.year, nextM.month, 1);
+    const numDays = daysInMonth(anchor.year, anchor.month);
+    for (let d = 1; d <= numDays; d++) {
+      const dd = String(d).padStart(2, '0');
+      const dateStr = `${anchor.monthIso}-${dd}`;
+      buckets.push({
+        key: dateStr,
+        label: dd,
+        fullLabel: dateStr,
+        distanceKm: 0,
+        tripCount: 0,
+        durationSec: 0,
+        maxSpeedKmh: 0,
+        usedElectricity: 0,
+        drillGranularity: 'day',
+        drillAnchor: dateStr,
+      });
+    }
+    periodLabel = `${anchor.year}年${String(anchor.month).padStart(2, '0')}月`;
+    prevAnchor = `${shiftShMonths(anchor.year, anchor.month, -1).monthIso}-01`;
+    nextAnchor = nextM.monthCompact > today.monthCompact ? today.date : `${nextM.monthIso}-01`;
+    canGoNext = anchor.monthCompact < today.monthCompact;
+  } else if (granularity === 'week') {
+    const monOffset = -((anchor.dow + 6) % 7);
+    const weekStart = shiftShDays(anchor.year, anchor.month, anchor.day, monOffset);
+    const weekEnd = shiftShDays(weekStart.year, weekStart.month, weekStart.day, 6);
+    const todayMonOffset = -((today.dow + 6) % 7);
+    const todayWeekStart = shiftShDays(today.year, today.month, today.day, todayMonOffset);
+    rangeStartSec = shStartOfDaySec(weekStart.year, weekStart.month, weekStart.day);
+    rangeEndSec = rangeStartSec + 7 * 86400;
+    for (let i = 0; i < 7; i++) {
+      const dayP = shiftShDays(weekStart.year, weekStart.month, weekStart.day, i);
+      const dayLabel = WEEKDAY_ZH[i] || '';
+      buckets.push({
+        key: dayP.date,
+        label: dayLabel,
+        sublabel: `${String(dayP.month).padStart(2, '0')}/${String(dayP.day).padStart(2, '0')}`,
+        fullLabel: `${dayP.date} (${dayLabel})`,
+        distanceKm: 0,
+        tripCount: 0,
+        durationSec: 0,
+        maxSpeedKmh: 0,
+        usedElectricity: 0,
+        drillGranularity: 'day',
+        drillAnchor: dayP.date,
+      });
+    }
+    periodLabel = `${weekStart.date} ~ ${weekEnd.date}`;
+    prevAnchor = shiftShDays(weekStart.year, weekStart.month, weekStart.day, -7).date;
+    const nextW = shiftShDays(weekStart.year, weekStart.month, weekStart.day, 7);
+    nextAnchor = nextW.date > today.date ? today.date : nextW.date;
+    canGoNext = weekStart.date < todayWeekStart.date;
+  } else {
+    rangeStartSec = shStartOfDaySec(anchor.year, anchor.month, anchor.day);
+    rangeEndSec = rangeStartSec + 86400;
+    for (let h = 0; h < 24; h++) {
+      const hh = String(h).padStart(2, '0');
+      buckets.push({
+        key: hh,
+        label: hh,
+        fullLabel: `${anchor.date} ${hh}:00~${hh}:59`,
+        distanceKm: 0,
+        tripCount: 0,
+        durationSec: 0,
+        maxSpeedKmh: 0,
+        usedElectricity: 0,
+      });
+    }
+    periodLabel = anchor.date === today.date ? `${anchor.date}（今天）` : anchor.date;
+    prevAnchor = shiftShDays(anchor.year, anchor.month, anchor.day, -1).date;
+    const nextD = shiftShDays(anchor.year, anchor.month, anchor.day, 1);
+    nextAnchor = nextD.date > today.date ? today.date : nextD.date;
+    canGoNext = anchor.date < today.date;
+  }
+
+  const rows = /** @type {Array<Record<string, any>>} */ (
+    db.prepare(`
+      SELECT start_time, end_time, duration_sec, distance_km, max_speed_kmh, used_electricity
+      FROM trips
+      WHERE sn=?
+        AND (CASE WHEN start_time > 0 THEN start_time ELSE end_time END) >= ?
+        AND (CASE WHEN start_time > 0 THEN start_time ELSE end_time END) < ?
+    `).all(sn, rangeStartSec, rangeEndSec)
+  );
+
+  const bucketMap = new Map(buckets.map(b => [b.key, b]));
+  let totalDist = 0;
+  let totalCount = 0;
+  let totalDur = 0;
+  let totalElec = 0;
+  let maxSpeed = 0;
+
+  for (const r of rows) {
+    const tsSec = toUnixSec(Number(r.start_time ?? 0) > 0 ? r.start_time : r.end_time);
+    if (tsSec <= 0) continue;
+    const p = shPartsFromMs(tsSec * 1000);
+    const bucketKey =
+      granularity === 'year'
+        ? p.monthIso
+        : granularity === 'day'
+          ? String(p.hour).padStart(2, '0')
+          : p.date;
+
+    const dist = Number(r.distance_km ?? 0);
+    const dur = Number(r.duration_sec ?? 0);
+    const spd = Number(r.max_speed_kmh ?? 0);
+    const elec = Number(r.used_electricity ?? 0);
+
+    totalDist += dist;
+    totalCount += 1;
+    totalDur += dur;
+    totalElec += elec;
+    if (spd > maxSpeed) maxSpeed = spd;
+
+    const b = bucketMap.get(bucketKey);
+    if (b) {
+      b.distanceKm += dist;
+      b.tripCount += 1;
+      b.durationSec += dur;
+      b.usedElectricity += elec;
+      if (spd > b.maxSpeedKmh) b.maxSpeedKmh = spd;
+    }
+  }
+
+  for (const b of buckets) {
+    b.distanceKm = Number(b.distanceKm.toFixed(2));
+    b.maxSpeedKmh = Number(b.maxSpeedKmh.toFixed(1));
+    b.usedElectricity = Number(b.usedElectricity.toFixed(1));
+  }
+
+  const overallAvgSpeedKmh = totalDur > 0
+    ? Number((totalDist / (totalDur / 3600)).toFixed(1))
+    : 0;
+
+  return {
+    granularity,
+    anchorDate: anchor.date,
+    anchorMonth: anchor.monthCompact,
+    todayDate: today.date,
+    todayMonth: today.monthCompact,
+    periodLabel,
+    prevAnchor,
+    nextAnchor,
+    canGoNext,
+    availableMonths,
+    totals: {
+      distanceKm: Number(totalDist.toFixed(2)),
+      tripCount: totalCount,
+      durationSec: totalDur,
+      maxSpeedKmh: Number(maxSpeed.toFixed(1)),
+      overallAvgSpeedKmh,
+      usedElectricity: Number(totalElec.toFixed(1)),
+    },
+    buckets,
   };
 }
 
@@ -1209,6 +1803,64 @@ export async function runAction(action, args = {}, deps = {}) {
     return session;
   }
 
+  /** @type {Promise<Record<string, any>> | null} */
+  let renewSessionPromise = null;
+
+  /**
+   * Renew account session at most once across concurrent workers.
+   * @param {Record<string, any>} baseSession
+   * @param {unknown} authErr
+   * @returns {Promise<Record<string, any>>}
+   */
+  async function renewAccountSession(baseSession, authErr) {
+    if (renewSessionPromise) return await renewSessionPromise;
+    renewSessionPromise = (async () => {
+      let nextSession = baseSession;
+      let renewed = false;
+      if (nextSession.accessToken && nextSession.refreshToken) {
+        try {
+          const refreshed = await client.passportRefresh(/** @type {any} */ (nextSession));
+          nextSession = { ...nextSession, ...refreshed };
+          renewed = true;
+        } catch {
+          renewed = false;
+        }
+      }
+      if (!renewed && config.username && config.password) {
+        const sameUser = !nextSession.username || nextSession.username === config.username;
+        const loggedIn = await client.passportLogin({
+          username: config.username,
+          password: config.password,
+          areaCode: config.areaCode,
+        });
+        nextSession = {
+          deviceId: nextSession.deviceId,
+          ...(sameUser ? nextSession : {}),
+          ...loggedIn,
+        };
+        if (!sameUser) {
+          delete nextSession.businessUid;
+          delete nextSession.vehicles;
+        }
+        renewed = true;
+      }
+      if (!renewed) throw authErr;
+
+      try {
+        const bizUid = await client.businessLogin(/** @type {any} */ (nextSession), nextSession.deviceId);
+        if (bizUid) nextSession.businessUid = bizUid;
+      } catch {
+        // Ignore transient business-login failure
+      }
+      session = nextSession;
+      await saveSessionLocked(paths.sessionPath, session);
+      return nextSession;
+    })().finally(() => {
+      renewSessionPromise = null;
+    });
+    return await renewSessionPromise;
+  }
+
   /**
    * Execute an account API function with automatic 1-time refresh/re-login retry on auth errors.
    * @template T
@@ -1223,44 +1875,7 @@ export async function runAction(action, args = {}, deps = {}) {
       if (!(err instanceof NinebotApiError) || !err.isAuthError) {
         throw err;
       }
-      let renewed = false;
-      if (activeSession.accessToken && activeSession.refreshToken) {
-        try {
-          const refreshed = await client.passportRefresh(/** @type {any} */ (activeSession));
-          activeSession = { ...activeSession, ...refreshed };
-          renewed = true;
-        } catch {
-          renewed = false;
-        }
-      }
-      if (!renewed && config.username && config.password) {
-        const sameUser = !activeSession.username || activeSession.username === config.username;
-        const loggedIn = await client.passportLogin({
-          username: config.username,
-          password: config.password,
-          areaCode: config.areaCode,
-        });
-        activeSession = {
-          deviceId: activeSession.deviceId,
-          ...(sameUser ? activeSession : {}),
-          ...loggedIn,
-        };
-        if (!sameUser) {
-          delete activeSession.businessUid;
-          delete activeSession.vehicles;
-        }
-        renewed = true;
-      }
-      if (!renewed) throw err;
-
-      try {
-        const bizUid = await client.businessLogin(/** @type {any} */ (activeSession), activeSession.deviceId);
-        if (bizUid) activeSession.businessUid = bizUid;
-      } catch {
-        // Ignore transient business-login failure
-      }
-      session = activeSession;
-      await saveSessionLocked(paths.sessionPath, session);
+      activeSession = await renewAccountSession(activeSession, err);
       return await fn(activeSession);
     }
   }
@@ -1721,8 +2336,14 @@ export async function runAction(action, args = {}, deps = {}) {
 
     if (cleanAction === 'trips') {
       const sn = String(safeArgs.sn ?? config.defaultSn ?? '').trim();
-      const month = normalizeMonthCompact(safeArgs.month, formatShDateParts(nowMs).monthCompact);
+      const todayParts = shPartsFromMs(nowMs);
+      const currentMonth = todayParts.monthCompact;
+      const month = normalizeMonthCompact(safeArgs.month, currentMonth);
       const limit = clampInt(safeArgs.limit, 1, 100) ?? 10;
+      const tripPageNum = clampInt(safeArgs.tripPage, 1, 10000) ?? 1;
+      const tripPageSize = clampInt(safeArgs.tripPageSize ?? safeArgs.pageSize, 1, 50) ?? 10;
+      const chartGranularity = typeof safeArgs.chartGranularity === 'string' ? safeArgs.chartGranularity : 'year';
+      const chartAnchor = typeof safeArgs.chartAnchor === 'string' ? safeArgs.chartAnchor : undefined;
       const detailId = typeof safeArgs.detailId === 'string' ? safeArgs.detailId.trim() : '';
 
       if (safeArgs.offline) {
@@ -1738,12 +2359,23 @@ export async function runAction(action, args = {}, deps = {}) {
           };
         }
         const summary = summarizeCachedTrips(db, targetSn, nowMs, safeArgs.month ? month : undefined, limit);
+        const tripPage = queryPaginatedTrips(db, targetSn, { page: tripPageNum, pageSize: tripPageSize });
+        const tripAnalytics = buildTripAnalytics(db, targetSn, nowMs, chartGranularity, chartAnchor);
+        const tripSync = getTripSyncState(db, targetSn, nowMs);
         return {
           ok: true,
           notify: true,
           title: `九号电摩行程统计 (${month})`,
           message: `本月共 ${summary.tripCount} 次骑行，累计 ${summary.totalDistanceKm} km（今日 ${summary.todayDistanceKm} km），历史极速 ${summary.maxSpeedKmh} km/h，平均速度 ${summary.overallAvgSpeedKmh} km/h。`,
-          data: { offline: true, sn: targetSn, month, ...summary },
+          data: {
+            offline: true,
+            sn: targetSn,
+            month,
+            ...summary,
+            tripPage,
+            tripAnalytics,
+            tripSync,
+          },
         };
       }
 
@@ -1761,14 +2393,147 @@ export async function runAction(action, args = {}, deps = {}) {
       const vLine = (vehicleMeta?.businessLine === 'ebike' || (!vehicleMeta && config.preferredLine === 'ebike'))
         ? 'ebike'
         : 'motor';
-      const explicitPage = safeArgs.page !== undefined ? clampInt(safeArgs.page, 1, 50) : undefined;
-      const fetched = await callWithAccountAuth(sess =>
-        client.fetchTrips(/** @type {any} */ (sess), resolvedSn, month, {
-          businessLine: vLine,
-          ...(explicitPage !== undefined ? { page: explicitPage } : { maxPages: 15 }),
-        }),
-      );
-      upsertTrips(db, resolvedSn, fetched.trips, nowMs);
+
+      const syncModeRaw = typeof safeArgs.sync === 'string' ? safeArgs.sync.trim().toLowerCase() : '';
+      const syncMode = (syncModeRaw === 'year' || syncModeRaw === 'month' || syncModeRaw === 'incremental')
+        ? syncModeRaw
+        : (safeArgs.backfillYear ? 'year' : (safeArgs.month ? 'month' : 'incremental'));
+
+      /**
+       * @param {string} targetMonth
+       * @param {{ incremental: boolean; explicitPage?: number }} syncOpts
+       */
+      const syncSingleMonth = async (targetMonth, syncOpts) => {
+        const prevMeta = /** @type {Record<string, any> | undefined} */ (
+          db.prepare('SELECT trip_count, complete, initial_synced FROM trip_sync_months WHERE sn=? AND month=?').get(resolvedSn, targetMonth)
+        );
+        const existingIds = getKnownTripIdsForMonth(db, resolvedSn, targetMonth);
+        const useKnownIds = syncOpts.incremental && Number(prevMeta?.initial_synced ?? 0) === 1 && existingIds.size > 0;
+        const fetched = await callWithAccountAuth(sess =>
+          client.fetchTrips(/** @type {any} */ (sess), resolvedSn, targetMonth, {
+            businessLine: vLine,
+            ...(syncOpts.explicitPage !== undefined ? { page: syncOpts.explicitPage } : { maxPages: 25 }),
+            ...(useKnownIds ? { knownIds: existingIds } : {}),
+          }),
+        );
+        const addedCount = fetched.trips.filter(t => !existingIds.has(t.travelId)).length;
+        upsertTrips(db, resolvedSn, fetched.trips, nowMs);
+        if (syncOpts.explicitPage === undefined) {
+          const cntRow = /** @type {Record<string, any> | undefined} */ (
+            db.prepare('SELECT COUNT(*) AS cnt FROM trips WHERE sn=? AND month=?').get(resolvedSn, targetMonth)
+          );
+          const dbMonthCount = Number(cntRow?.cnt ?? 0);
+          const isPastMonth = targetMonth < currentMonth;
+          const isComplete = Boolean(fetched.complete);
+          markMonthSynced(db, resolvedSn, targetMonth, {
+            tripCount: dbMonthCount,
+            complete: isPastMonth && isComplete ? 1 : 0,
+            initialSynced: isComplete ? 1 : 0,
+            nowMs,
+          });
+        }
+        return {
+          month: targetMonth,
+          fetchedCount: fetched.trips.length,
+          addedCount,
+          complete: Boolean(fetched.complete),
+        };
+      };
+
+      if (syncMode === 'year') {
+        const maxMonths = clampInt(safeArgs.maxMonths, 1, 12) ?? 12;
+        const skipCurrentIfSynced = Boolean(safeArgs.skipCurrentIfSynced);
+        const beforeSync = getTripSyncState(db, resolvedSn, nowMs);
+        const currentNeedsInitial = beforeSync.pendingMonths.includes(currentMonth);
+
+        /** @type {string[]} */
+        const queue = [];
+        const queuedSet = new Set();
+        if (currentNeedsInitial || !skipCurrentIfSynced) {
+          queue.push(currentMonth);
+          queuedSet.add(currentMonth);
+        }
+        for (const m of beforeSync.pendingMonths) {
+          if (queue.length >= maxMonths) break;
+          if (!queuedSet.has(m)) {
+            queue.push(m);
+            queuedSet.add(m);
+          }
+        }
+
+        await ensureAccountSession();
+        /** @type {Array<{ month: string; fetchedCount: number; addedCount: number; complete: boolean }>} */
+        const syncedMonths = [];
+        let batchFetchedCount = 0;
+        let batchAddedCount = 0;
+        let nextIdx = 0;
+        const workerCount = Math.min(2, queue.length);
+        await Promise.all(
+          Array.from({ length: workerCount }, async () => {
+            while (nextIdx < queue.length) {
+              const idx = nextIdx++;
+              const targetMonth = queue[idx];
+              if (!targetMonth) continue;
+              const itemRes = await syncSingleMonth(targetMonth, { incremental: true });
+              syncedMonths.push(itemRes);
+              batchFetchedCount += itemRes.fetchedCount;
+              batchAddedCount += itemRes.addedCount;
+            }
+          }),
+        );
+
+        const summary = summarizeCachedTrips(db, resolvedSn, nowMs, currentMonth, limit);
+        const tripPage = queryPaginatedTrips(db, resolvedSn, { page: tripPageNum, pageSize: tripPageSize });
+        const tripAnalytics = buildTripAnalytics(db, resolvedSn, nowMs, chartGranularity, chartAnchor);
+        const afterSync = getTripSyncState(db, resolvedSn, nowMs);
+
+        const message = afterSync.yearComplete
+          ? `近一年行程同步完成（12 个月，本次新增 ${batchAddedCount} 段，共缓存 ${afterSync.totalCachedTrips} 段）。`
+          : `本批已同步 ${syncedMonths.length} 个月（新增 ${batchAddedCount} 段），已完成 ${afterSync.completedMonthCount}/${afterSync.totalWindowMonths} 个月。`;
+
+        return {
+          ok: true,
+          notify: true,
+          title: '九号电摩近一年行程同步',
+          message,
+          data: {
+            offline: false,
+            sn: resolvedSn,
+            month: currentMonth,
+            ...summary,
+            tripPage,
+            tripAnalytics,
+            tripSync: afterSync,
+            syncBatch: {
+              syncedMonths: syncedMonths.map(s => s.month),
+              addedCount: batchAddedCount,
+              fetchedCount: batchFetchedCount,
+            },
+          },
+        };
+      }
+
+      /** @type {Array<{ month: string; fetchedCount: number; addedCount: number; complete: boolean }>} */
+      const syncedResults = [];
+      let summaryMonth = month;
+
+      if (syncMode === 'incremental') {
+        summaryMonth = currentMonth;
+        const prevMonth = shiftShMonths(todayParts.year, todayParts.month, -1).monthCompact;
+        const prevMeta = /** @type {Record<string, any> | undefined} */ (
+          db.prepare('SELECT complete, initial_synced FROM trip_sync_months WHERE sn=? AND month=?').get(resolvedSn, prevMonth)
+        );
+        if (prevMeta && Number(prevMeta.initial_synced ?? 0) === 1 && Number(prevMeta.complete ?? 0) === 0) {
+          syncedResults.push(await syncSingleMonth(prevMonth, { incremental: true }));
+        }
+        syncedResults.push(await syncSingleMonth(currentMonth, { incremental: true }));
+      } else {
+        const explicitPage = safeArgs.page !== undefined ? clampInt(safeArgs.page, 1, 50) : undefined;
+        syncedResults.push(await syncSingleMonth(month, {
+          incremental: Boolean(safeArgs.incremental),
+          explicitPage,
+        }));
+      }
 
       let detail = null;
       if (detailId) {
@@ -1777,10 +2542,16 @@ export async function runAction(action, args = {}, deps = {}) {
         );
       }
 
-      const summary = summarizeCachedTrips(db, resolvedSn, nowMs, month, limit);
+      const summary = summarizeCachedTrips(db, resolvedSn, nowMs, summaryMonth, limit);
+      const tripPage = queryPaginatedTrips(db, resolvedSn, { page: tripPageNum, pageSize: tripPageSize });
+      const tripAnalytics = buildTripAnalytics(db, resolvedSn, nowMs, chartGranularity, chartAnchor);
+      const tripSync = getTripSyncState(db, resolvedSn, nowMs);
+      const addedTotal = syncedResults.reduce((acc, s) => acc + s.addedCount, 0);
+      const fetchedTotal = syncedResults.reduce((acc, s) => acc + s.fetchedCount, 0);
+
       const latestRide = summary.trips[0];
       const lines = [
-        `🛣️ ${config.deviceName || resolvedSn} ${month} 骑行统计`,
+        `🛣️ ${config.deviceName || resolvedSn} ${summaryMonth} 骑行统计`,
         `• 本月：${summary.tripCount} 次 · ${summary.totalDistanceKm} km · 耗时 ${formatDurationZh(summary.totalDurationSec)}`,
         `• 今日：${summary.todayCount} 次 · ${summary.todayDistanceKm} km | 近 7 日：${summary.sevenDayCount} 次 · ${summary.sevenDayDistanceKm} km`,
         `• 极速：${summary.maxSpeedKmh} km/h · 均速 ${summary.overallAvgSpeedKmh} km/h`,
@@ -1794,20 +2565,33 @@ export async function runAction(action, args = {}, deps = {}) {
       return {
         ok: true,
         notify: true,
-        title: `九号电摩行程统计 (${month})`,
+        title: `九号电摩行程统计 (${summaryMonth})`,
         message: lines.join('\n'),
         data: {
           offline: false,
           sn: resolvedSn,
-          month,
+          month: summaryMonth,
           ...summary,
+          tripPage,
+          tripAnalytics,
+          tripSync,
+          syncBatch: {
+            syncedMonths: syncedResults.map(s => s.month),
+            addedCount: addedTotal,
+            fetchedCount: fetchedTotal,
+          },
           ...(detail ? { detail } : {}),
         },
       };
     }
 
     if (cleanAction === 'dashboard') {
-      const limit = clampInt(safeArgs.limit, 1, 100) ?? 20;
+      const historyLimit = clampInt(safeArgs.historyLimit ?? safeArgs.limit, 1, 200) ?? 20;
+      const tripPageNum = clampInt(safeArgs.tripPage, 1, 10000) ?? 1;
+      const tripPageSize = clampInt(safeArgs.tripPageSize ?? safeArgs.tripLimit, 1, 50) ?? 10;
+      const chartGranularity = typeof safeArgs.chartGranularity === 'string' ? safeArgs.chartGranularity : 'year';
+      const chartAnchor = typeof safeArgs.chartAnchor === 'string' ? safeArgs.chartAnchor : undefined;
+      const includeImages = safeArgs.includeImages !== false;
       let latestSnapshot = null;
 
       if (safeArgs.refresh) {
@@ -1833,15 +2617,18 @@ export async function runAction(action, args = {}, deps = {}) {
         }
       }
 
-      const history = sn ? getRecentSnapshotSummaries(db, sn, limit) : [];
+      const history = sn ? getRecentSnapshotSummaries(db, sn, historyLimit) : [];
       const currentMonth = formatShDateParts(nowMs).monthCompact;
-      let tripSummary = sn ? summarizeCachedTrips(db, sn, nowMs, currentMonth, 10) : null;
+      let tripSummary = sn ? summarizeCachedTrips(db, sn, nowMs, currentMonth, tripPageSize) : null;
       if (sn && tripSummary && tripSummary.tripCount === 0) {
-        const anyMonthSummary = summarizeCachedTrips(db, sn, nowMs, undefined, 10);
+        const anyMonthSummary = summarizeCachedTrips(db, sn, nowMs, undefined, tripPageSize);
         if (anyMonthSummary.tripCount > 0) {
           tripSummary = anyMonthSummary;
         }
       }
+      const tripPage = sn ? queryPaginatedTrips(db, sn, { page: tripPageNum, pageSize: tripPageSize }) : null;
+      const tripAnalytics = sn ? buildTripAnalytics(db, sn, nowMs, chartGranularity, chartAnchor) : null;
+      const tripSync = sn ? getTripSyncState(db, sn, nowMs) : null;
       const activeAlerts = sn
         ? /** @type {Array<Record<string, any>>} */ (
             db.prepare('SELECT alert_key, active, last_notified_at, last_value FROM alert_state WHERE sn=? AND active=1').all(sn)
@@ -1852,7 +2639,9 @@ export async function runAction(action, args = {}, deps = {}) {
           }))
         : [];
       const redactedCfg = redactConfig(config, session, env, nowMs, paths.homeDir);
-      const vehicleImages = readVehicleImageDataUrls(paths.pluginDataDir, sn);
+      const vehicleImages = includeImages
+        ? readVehicleImageDataUrls(paths.pluginDataDir, sn)
+        : { darkDataUrl: null, lightDataUrl: null };
 
       return {
         ok: true,
@@ -1868,6 +2657,9 @@ export async function runAction(action, args = {}, deps = {}) {
           vehicleImages,
           history,
           tripSummary,
+          tripPage,
+          tripAnalytics,
+          tripSync,
           activeAlerts,
           config: redactedCfg,
         },

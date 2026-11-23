@@ -37,8 +37,8 @@
     },
     {
       "name": "trips",
-      "label": "查询骑行行程与极速统计",
-      "description": "查询指定月份（默认当月 YYYYMM）骑行列表、今日里程、近 7 日里程、最高速、平均速与耗电统计；传 detailId 可查看单次行程详情，传 offline:true 仅读本地 SQLite 缓存。",
+      "label": "查询与增量同步骑行行程",
+      "description": "默认增量同步当月新增骑行；传 sync:\"year\" 支持首次近一年 12 个月历史回溯与后续增量同步；支持分页查看最新至历史行程（tripPage/tripPageSize）及按年/月/周/日多粒度柱状图聚合（chartGranularity/chartAnchor）；传 detailId 可查看单次详情，传 offline:true 仅读本地 SQLite。",
       "defaultArgs": { "limit": 10 }
     },
     {
@@ -62,7 +62,7 @@
     {
       "name": "dashboard",
       "label": "电摩看板汇总数据",
-      "description": "默认快速读取本地 SQLite 最新车况、电量变化历史、近期行程统计与当前激活告警（传 refresh:true 可实时联网刷新）。",
+      "description": "默认快速读取本地 SQLite 最新车况、电量变化历史、分页骑行轨迹、近一年年/月/周/日统计聚合与当前激活告警（传 refresh:true 可实时联网刷新）。",
       "defaultArgs": { "limit": 20 }
     }
   ]
