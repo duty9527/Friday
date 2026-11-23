@@ -71,10 +71,18 @@ interface NetleaCatalogScene {
 }
 
 interface NetleaDashboardPayload {
-  device: { address: string; name: string; rssi: number | null; connected: boolean } | null;
+  updatedAt?: number | null;
+  device: { address: string; name: string; rssi: number | null; connected: boolean; advertisement?: { rtc?: string } } | null;
   state: { on: boolean; runModeLabel?: string; scheduleRunning?: boolean; channels: NetleaChannels; powerWatts?: number; maxWatts?: number } | null;
   schedule?: NetleaSchedule | null;
-  tempConfig?: { onMinutes: number; offMinutes: number } | null;
+  tempConfig?: {
+    onMinutes: number;
+    offMinutes: number;
+    channels?: NetleaChannels;
+    powerWatts?: number;
+    modeCode?: number;
+    gear?: number;
+  } | null;
   config: {
     targetMac: string;
     namePrefix: string;
@@ -177,7 +185,7 @@ export default function NetleaSurface() {
   const [presetFade, setPresetFade] = useState('20');
 
   // Manual 5 channels
-  const [channels, setChannels] = useState<NetleaChannels>({ red: 45, green: 60, white: 85, blue: 35, fan: 50 });
+  const [channels, setChannels] = useState<NetleaChannels>({ red: 45, green: 60, white: 85, blue: 35, fan: 0 });
   const [cfgOnMin, setCfgOnMin] = useState('60');
   const [cfgOffMin, setCfgOffMin] = useState('60');
   const [cfgMac, setCfgMac] = useState('');
@@ -214,18 +222,23 @@ export default function NetleaSurface() {
           setDraftTravelModel(d.schedule.travelModel ?? 0);
         }
       }
-      if (d.state?.channels && forceInputs) {
-        setChannels(d.state.channels);
-      }
       if (!selectedPresetId && d.catalog?.cultivationPresets?.length) {
         setSelectedPresetId(d.catalog.cultivationPresets[0]!.id);
       }
       if (forceInputs) {
+        if (d.state?.on && (d.state.channels.red + d.state.channels.green + d.state.channels.white + d.state.channels.blue) > 0) {
+          setChannels(d.state.channels);
+        } else {
+          setChannels(d.tempConfig?.channels ?? d.config.defaultChannels);
+        }
+        const effOnMin = d.tempConfig?.onMinutes ?? d.config.tempOnMinutes ?? 60;
+        const effOffMin = d.tempConfig?.offMinutes ?? d.config.tempOffMinutes ?? 60;
         setTankL(String(d.config.tankSize?.lengthCm ?? 60));
         setTankW(String(d.config.tankSize?.widthCm ?? 40));
         setTankH(String(d.config.tankSize?.heightCm ?? 40));
-        setCfgOnMin(String(d.tempConfig?.onMinutes ?? d.config.tempOnMinutes ?? 60));
-        setCfgOffMin(String(d.tempConfig?.offMinutes ?? d.config.tempOffMinutes ?? 60));
+        setTempMinutes(String(effOnMin));
+        setCfgOnMin(String(effOnMin));
+        setCfgOffMin(String(effOffMin));
         setCfgMac(d.config.targetMac || '');
         setCfgPrefix(d.config.namePrefix || 'SG-');
       }
@@ -248,6 +261,28 @@ export default function NetleaSurface() {
     [applyDashboard, authExpired, callNetlea],
   );
 
+  const syncLive = useCallback(async () => {
+    if (busy || authExpired) return;
+    setBusy(true);
+    setStatus({ text: '正在蓝牙直连同步灯具实时状态、临时配置与行程…', tone: 'warn' });
+    const seq = ++seqRef.current;
+    try {
+      const res = await callNetlea<NetleaDashboardPayload>('dashboard', { refresh: true });
+      if (!mountedRef.current || seq !== seqRef.current || authExpired) return;
+      if (res.ok && res.data) {
+        setSchedDirty(false);
+        applyDashboard(res.data, true);
+        setStatus({ text: res.message || '已从鱼缸灯同步实时状态与行程', tone: 'ok' });
+      } else {
+        setStatus({ text: res.message || '实时同步失败', tone: 'err' });
+      }
+    } catch (err) {
+      if (mountedRef.current) setStatus({ text: `实时同步失败：${errorText(err)}`, tone: 'err' });
+    } finally {
+      if (mountedRef.current) setBusy(false);
+    }
+  }, [applyDashboard, authExpired, busy, callNetlea]);
+
   useEffect(() => {
     void refresh(true);
     const clockTimer = setInterval(() => {
@@ -258,17 +293,28 @@ export default function NetleaSurface() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const runAndRefresh = async (action: string, args: Record<string, unknown>, pendingText: string) => {
-    if (busy || authExpired) return;
+  const runAndRefresh = async (
+    action: string,
+    args: Record<string, unknown>,
+    pendingText: string,
+    opts: { forceInputs?: boolean; clearDirty?: boolean } = {},
+  ): Promise<boolean> => {
+    if (busy || authExpired) return false;
     setBusy(true);
     setStatus({ text: pendingText, tone: 'warn' });
     try {
       const res = await callNetlea(action, args);
-      if (!mountedRef.current) return;
+      if (!mountedRef.current) return false;
       setStatus({ text: res.message || (res.ok ? '指令已生效' : '指令失败'), tone: res.ok ? 'ok' : 'err' });
-      if (res.ok) await refresh(false);
+      if (res.ok) {
+        if (opts.clearDirty) setSchedDirty(false);
+        await refresh(Boolean(opts.forceInputs));
+        return true;
+      }
+      return false;
     } catch (err) {
       if (mountedRef.current) setStatus({ text: errorText(err), tone: 'err' });
+      return false;
     } finally {
       if (mountedRef.current) setBusy(false);
     }
@@ -374,14 +420,27 @@ export default function NetleaSurface() {
   // Spectrum SVG bars (pure SVG presentation attributes)
   const spectrumBars = useMemo(
     () => [
-      { key: 'red', label: '红 R', val: channels.red, fill: '#ef4444' },
-      { key: 'green', label: '绿 G', val: channels.green, fill: '#22c55e' },
-      { key: 'white', label: '白 W', val: channels.white, fill: '#e5e7eb' },
-      { key: 'blue', label: '蓝 B', val: channels.blue, fill: '#3b82f6' },
-      { key: 'fan', label: '风扇', val: channels.fan, fill: '#06b6d4' },
+      { key: 'red', label: '红 R', val: channels.red, max: 100, unit: '%', fill: '#ef4444' },
+      { key: 'green', label: '绿 G', val: channels.green, max: 100, unit: '%', fill: '#22c55e' },
+      { key: 'white', label: '白 W', val: channels.white, max: 100, unit: '%', fill: '#e5e7eb' },
+      { key: 'blue', label: '蓝 B', val: channels.blue, max: 100, unit: '%', fill: '#3b82f6' },
+      { key: 'fan', label: '风扇', val: channels.fan, max: 5, unit: '档', fill: '#06b6d4' },
     ],
     [channels],
   );
+
+  const metaLine = useMemo(() => {
+    const rtcRaw = data?.device?.advertisement?.rtc;
+    const rtcShort = typeof rtcRaw === 'string' && rtcRaw
+      ? (rtcRaw.length >= 19 ? rtcRaw.slice(11, 19) : rtcRaw)
+      : '';
+    let syncShort = '';
+    if (typeof data?.updatedAt === 'number' && Number.isFinite(data.updatedAt) && data.updatedAt > 0) {
+      const dt = new Date(data.updatedAt);
+      syncShort = `${pad2(dt.getHours())}:${pad2(dt.getMinutes())}:${pad2(dt.getSeconds())}`;
+    }
+    return [rtcShort ? `灯内时钟 ${rtcShort}` : '', syncShort ? `上次同步 ${syncShort}` : ''].filter(Boolean).join(' · ');
+  }, [data?.device?.advertisement?.rtc, data?.updatedAt]);
 
   // 24h lighting curve SVG plot derived from draftTrips + sunrise/sunset ramp minutes
   const timelinePlot = useMemo(() => {
@@ -520,12 +579,15 @@ export default function NetleaSurface() {
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <SunIcon className="size-4 text-primary" />
           <h3 className="text-sm font-semibold">尼特利水草灯 · 五通道光谱与 24h 日照</h3>
           <Badge variant={data?.state?.on ? 'success' : 'secondary'}>
             {data?.state ? (data.state.on ? `${data.state.runModeLabel || '开灯'} (${data.state.powerWatts ?? 0}W)` : '已关灯') : '待同步'}
           </Badge>
+          {metaLine && (
+            <span className="text-[11px] font-mono text-muted-foreground">{metaLine}</span>
+          )}
         </div>
         <div className="flex flex-wrap items-center gap-1.5">
           <Input size="sm" className="w-16 font-mono" type="number" value={tempMinutes} onChange={e => setTempMinutes(e.target.value)} aria-label="临时时长(分)" />
@@ -556,8 +618,13 @@ export default function NetleaSurface() {
             <Slider min={1} max={100} step={1} value={brightness} onValueChange={v => setBrightness(Number(v))} />
           </div>
           <span className="font-mono font-semibold w-10">{brightness}%</span>
-          <Button size="xs" variant="ghost" disabled={busy} onClick={() => void refresh(true)}>
+          <Button size="xs" variant="outline" disabled={busy} onClick={() => void runAndRefresh('clock', {}, '正在将主机时间同步至鱼缸灯时钟…')}>
+            <ClockIcon className="size-3.5" />
+            <span>校时</span>
+          </Button>
+          <Button size="xs" variant="outline" disabled={busy} onClick={() => void syncLive()}>
             <RefreshCwIcon className="size-3.5" />
+            <span>实时同步</span>
           </Button>
         </CardContent>
       </Card>
@@ -769,7 +836,7 @@ export default function NetleaSurface() {
               </div>
             </div>
             <div className="flex flex-wrap gap-1.5">
-              <Button size="xs" variant="outline" disabled={busy} onClick={() => void runAndRefresh('schedule', { op: 'get' }, '回读灯内定时行程…')}>回读行程</Button>
+              <Button size="xs" variant="outline" disabled={busy} onClick={() => void runAndRefresh('schedule', { op: 'get' }, '回读灯内定时行程…', { forceInputs: true, clearDirty: true })}>回读行程</Button>
               <Button size="xs" variant="outline" disabled={draftTrips.length >= 10} onClick={() => openEditor(-1)}>
                 <PlusIcon className="size-3" />
                 <span>新增时段</span>
@@ -778,7 +845,7 @@ export default function NetleaSurface() {
               <Button
                 size="xs"
                 disabled={busy || !draftTrips.length}
-                onClick={() => void runAndRefresh('schedule', { op: 'set', travelModel: draftTravelModel, sunriseMinutes: draftSunrise, sunsetMinutes: draftSunset, trips: draftTrips }, '保存并下发 24h 日照行程…').then(() => setSchedDirty(false))}
+                onClick={() => void runAndRefresh('schedule', { op: 'set', travelModel: draftTravelModel, sunriseMinutes: draftSunrise, sunsetMinutes: draftSunset, trips: draftTrips }, '保存并下发 24h 日照行程…', { forceInputs: true, clearDirty: true })}
               >
                 保存并下发行程
               </Button>
@@ -920,7 +987,10 @@ export default function NetleaSurface() {
                       sunsetMinutes: Number(presetFade) || 20,
                     },
                     '正在按鱼缸尺寸生成并下发科学预设…',
-                  ).then(() => setTab('schedule'));
+                    { forceInputs: true, clearDirty: true },
+                  ).then(ok => {
+                    if (ok) setTab('schedule');
+                  });
                 }}
               >
                 计算并直接下发行程
@@ -943,11 +1013,11 @@ export default function NetleaSurface() {
               <svg viewBox="0 0 300 68" className="h-16 w-full rounded-md border bg-muted/20 p-1" aria-label="五通道光谱分布">
                 {spectrumBars.map((b, i) => {
                   const x = 18 + i * 56;
-                  const h = Math.max(2, (b.val / 100) * 40);
+                  const h = Math.max(2, (Math.min(b.max, Math.max(0, b.val)) / b.max) * 40);
                   return (
                     <g key={b.key}>
                       <rect x={x} y={48 - h} width="32" height={h} rx="3" fill={b.fill} />
-                      <text x={x + 16} y="62" textAnchor="middle" fill="var(--muted-foreground)" fontSize="9">{b.label} {b.val}%</text>
+                      <text x={x + 16} y="62" textAnchor="middle" fill="var(--muted-foreground)" fontSize="9">{b.label} {b.val}{b.unit}</text>
                     </g>
                   );
                 })}
@@ -956,19 +1026,19 @@ export default function NetleaSurface() {
               <div className="space-y-2.5">
                 {(
                   [
-                    { key: 'red', label: '红光 R (%)' },
-                    { key: 'green', label: '绿光 G (%)' },
-                    { key: 'white', label: '白光 W (%)' },
-                    { key: 'blue', label: '蓝光 B (%)' },
-                    { key: 'fan', label: '风扇散热 (%)' },
+                    { key: 'red', label: '红光 R (%)', max: 100, unit: '%' },
+                    { key: 'green', label: '绿光 G (%)', max: 100, unit: '%' },
+                    { key: 'white', label: '白光 W (%)', max: 100, unit: '%' },
+                    { key: 'blue', label: '蓝光 B (%)', max: 100, unit: '%' },
+                    { key: 'fan', label: '风扇散热 (档)', max: 5, unit: '档' },
                   ] as const
                 ).map(item => (
                   <div key={item.key} className="flex items-center gap-3">
                     <span className="w-24 text-muted-foreground">{item.label}</span>
                     <div className="flex-1">
-                      <Slider min={0} max={100} step={1} value={channels[item.key]} onValueChange={v => setChannels(prev => ({ ...prev, [item.key]: Number(v) }))} />
+                      <Slider min={0} max={item.max} step={1} value={channels[item.key]} onValueChange={v => setChannels(prev => ({ ...prev, [item.key]: Number(v) }))} />
                     </div>
-                    <span className="w-10 text-right font-mono">{channels[item.key]}%</span>
+                    <span className="w-10 text-right font-mono">{channels[item.key]}{item.unit}</span>
                   </div>
                 ))}
               </div>
@@ -996,7 +1066,7 @@ export default function NetleaSurface() {
               <CardContent className="flex items-end gap-2 text-xs">
                 <div className="space-y-1 flex-1"><Label className="text-[11px]">开灯(分)</Label><Input size="sm" value={cfgOnMin} onChange={e => setCfgOnMin(e.target.value)} /></div>
                 <div className="space-y-1 flex-1"><Label className="text-[11px]">关灯(分)</Label><Input size="sm" value={cfgOffMin} onChange={e => setCfgOffMin(e.target.value)} /></div>
-                <Button size="xs" disabled={busy} onClick={() => void runAndRefresh('mode', { mode: 'temp-config', onMinutes: Number(cfgOnMin) || 60, offMinutes: Number(cfgOffMin) || 60, ...channels }, '写入硬件默认时长…')}>写入</Button>
+                <Button size="xs" disabled={busy} onClick={() => void runAndRefresh('mode', { mode: 'temp-config', onMinutes: Number(cfgOnMin) || 60, offMinutes: Number(cfgOffMin) || 60, ...channels }, '写入硬件默认时长…', { forceInputs: true })}>写入</Button>
               </CardContent>
             </Card>
             <Card>
@@ -1020,10 +1090,11 @@ export default function NetleaSurface() {
         busy={busy}
         onConfirm={async () => {
           setClearConfirmOpen(false);
-          await runAndRefresh('schedule', { op: 'clear' }, '清空灯内行程…');
-          setDraftTrips([]);
-          setSchedDirty(false);
-          setEditingTripIndex(-2);
+          const ok = await runAndRefresh('schedule', { op: 'clear' }, '清空灯内行程…', { forceInputs: true, clearDirty: true });
+          if (ok) {
+            setDraftTrips([]);
+            setEditingTripIndex(-2);
+          }
         }}
       />
     </div>

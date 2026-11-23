@@ -1262,6 +1262,7 @@ netlea_state.write_text(json.dumps({
     "lastAddress": "11:22:33:44:55:66",
     "device": {"name": "尼特利水草灯", "address": "11:22:33:44:55:66"},
     "state": {"on": True, "channels": {"red": 40, "green": 50, "white": 70, "blue": 30, "fan": 1}, "master": {"lampMode": 0, "stateType": 1}},
+    "schedule": {"trips": []},
 }), encoding="utf-8")
 
 apple_dir = home / "plugins" / "apple-devices"
@@ -1318,7 +1319,7 @@ def _live_rpc(req, timeout):
             netlea_state_flag["refreshed"] = True
             return {"ok": True, "data": {"state": {"on": False}}}
         is_ref = netlea_state_flag["refreshed"]
-        return {"ok": True, "data": {"updatedAt": now_ms if is_ref else stale_ms, "device": {"name": "水草灯", "address": "11:22:33:44:55:66"}, "state": {"on": not is_ref, "channels": {"red": 0, "green": 0, "white": 0, "blue": 0, "fan": 0}, "master": {}}, "config": {"targetMac": "11:22:33:44:55:66"}}}
+        return {"ok": True, "data": {"updatedAt": now_ms if is_ref else stale_ms, "device": {"name": "水草灯", "address": "11:22:33:44:55:66"}, "state": {"on": not is_ref, "channels": {"red": 0, "green": 0, "white": 0, "blue": 0, "fan": 0}, "master": {}}, "schedule": {"trips": []}, "config": {"targetMac": "11:22:33:44:55:66"}}}
     if plug == "apple-devices":
         is_ref = bool(args.get("refresh"))
         return {"ok": True, "data": {"authState": "authenticated", "fetchedAt": now_ms if is_ref else stale_ms, "devices": [{"name": "我的 iPhone", "category": "iphone", "batteryPercent": 64 if is_ref else 77, "batteryStatus": "NotCharging", "online": True}], "config": {"minBatteryPct": 25}}}

@@ -2560,13 +2560,12 @@ class WidgetDataHub:
             and self._can_attempt_live("netlea", 600.0)
         ):
             try:
-                has_sched = isinstance(data.get("schedule"), dict)
                 st_res = self._rpc(
                     {
                         "command": "plugin-run",
                         "plugin": "netlea",
                         "action": "status",
-                        "args": {"minimal": has_sched, "silent": True},
+                        "args": {"minimal": False, "silent": True},
                     },
                     25.0,
                 )

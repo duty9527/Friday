@@ -455,11 +455,10 @@ export class PluginRefreshScheduler {
       return 'deferred';
     }
 
-    const hasSchedule = Boolean(lastState?.schedule && typeof lastState.schedule === 'object');
     return {
       plugin: 'netlea',
       action: 'status',
-      args: { minimal: hasSchedule, silent: true },
+      args: { minimal: false, silent: true },
       timeoutMs: 30_000,
       intervalMs,
     };

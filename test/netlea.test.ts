@@ -186,6 +186,8 @@ async function loadProfilesModule(): Promise<XproProfilesModule> {
 const GOLDEN_0X14_ON = '5A260114000001000001000145366236000000020000000002000000010000010001000000B2';
 const GOLDEN_0X14_OFF = '5A2601140000010000000001000000000000000100000000020000000100000100010000009D';
 const GOLDEN_0X1A_TEMP = '5A13011A0000030003004536623600010900AB';
+const GOLDEN_0X12_APP_SCENE = '5A9801120000011E001E00017F0E1E151E2B27362300000500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000D1';
+const GOLDEN_0X12_APP_CUSTOM = '5A9801120000011E001E00017F0E1E151E2B273723000C0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000D9';
 
 test('Netlea v2.90 0x5A frames, [R,W,G,B,F] calibration, 22W guard, 0x12 schedule & presets match golden specs', async () => {
   const mod = await loadPluginModule();
@@ -376,7 +378,31 @@ test('Netlea v2.90 0x5A frames, [R,W,G,B,F] calibration, 22W guard, 0x12 schedul
     assert.equal(presetHex.length, 304);
   }
 
-  // 9. ManufacturerData RTC decoding
+  // 9. Official App hardware-captured 0x12 schedule golden roundtrip (scene & custom)
+  const appSceneSched = mod.decodeMainScheduleFrame(GOLDEN_0X12_APP_SCENE, 'SG-X-PRO-60w11');
+  assert.ok(appSceneSched);
+  assert.equal(appSceneSched.travelModel, 0);
+  assert.equal(appSceneSched.sunEnable, 1);
+  assert.equal(appSceneSched.sunriseMinutes, 30);
+  assert.equal(appSceneSched.sunsetMinutes, 30);
+  assert.equal(appSceneSched.trips.length, 1);
+  assert.equal(appSceneSched.trips[0]?.modeCode, 0);
+  assert.equal(appSceneSched.trips[0]?.gear, 5);
+  assert.equal(mod.buildMainScheduleFrame(appSceneSched, 'SG-X-PRO-60w11'), GOLDEN_0X12_APP_SCENE);
+
+  const appCustomSched = mod.decodeMainScheduleFrame(GOLDEN_0X12_APP_CUSTOM, 'SG-X-PRO-60w11');
+  assert.ok(appCustomSched);
+  assert.equal(appCustomSched.travelModel, 0);
+  assert.equal(appCustomSched.sunEnable, 1);
+  assert.equal(appCustomSched.sunriseMinutes, 30);
+  assert.equal(appCustomSched.sunsetMinutes, 30);
+  assert.equal(appCustomSched.trips.length, 1);
+  assert.equal(appCustomSched.trips[0]?.modeCode, 12);
+  assert.equal(appCustomSched.trips[0]?.gear, 0);
+  assert.deepEqual(appCustomSched.trips[0]?.pwm, [43, 39, 55, 35, 0]);
+  assert.equal(mod.buildMainScheduleFrame(appCustomSched, 'SG-X-PRO-60w11'), GOLDEN_0X12_APP_CUSTOM);
+
+  // 10. ManufacturerData RTC decoding
   const adv = mod.decodeManufacturerData({ '0x0000': '1a0b15011b398101aabbccddeeff' });
   assert.ok(adv);
   assert.equal(adv.rtc, '2026-11-21 01:27:57');
@@ -576,12 +602,23 @@ test('Netlea plugin all 10 actions work end-to-end with mocked bleRunner and fil
     assert.ok(dashData.catalog && typeof dashData.catalog === 'object');
     assert.ok(dashData.tempConfig && typeof dashData.tempConfig === 'object');
 
-    // 6b. dashboard refresh: true sends 0x15,0x1B,0x25 batch and updates cache
+    // 6b. dashboard refresh: true sends 0x15,0x1B,0x25 batch, updates cache, and syncs tempOnMinutes/tempOffMinutes to config.json while preserving tankSize & presets
     const dashRefresh = await mod.runAction('dashboard', { refresh: true }, deps);
     assert.equal(dashRefresh.ok, true);
     assert.equal(dashRefresh.notify, false);
     assert.equal(calls.length, callsBeforeCache + 1);
-    assert.equal((dashRefresh.data as Record<string, unknown>).refreshed, true);
+    const dashRefreshData = dashRefresh.data as Record<string, unknown>;
+    assert.equal(dashRefreshData.refreshed, true);
+    const syncedCfg = dashRefreshData.config as {
+      tempOnMinutes: number;
+      tempOffMinutes: number;
+      tankSize: { lengthCm: number; widthCm: number; heightCm: number };
+      savedCustomPresets: Array<{ name: string }>;
+    };
+    assert.equal(syncedCfg.tempOnMinutes, 3);
+    assert.equal(syncedCfg.tempOffMinutes, 3);
+    assert.equal(syncedCfg.tankSize.heightCm, 36);
+    assert.equal(syncedCfg.savedCustomPresets[0]?.name, '夜间微光');
     const refreshTx = (calls.at(-1) ?? [])[(calls.at(-1) ?? []).indexOf('--tx') + 1];
     assert.equal(refreshTx, '5A070115000077,5A07011B00007D,5A0801250000078F');
 
@@ -652,6 +689,10 @@ test('Netlea plugin all 10 actions work end-to-end with mocked bleRunner and fil
     const resRes = await mod.runAction('resume', { lampStateHint: 1 }, deps);
     assert.equal(resRes.ok, true);
     assert.equal((resRes.data as Record<string, unknown>).tx, '5A17011000000100000000000000000100000000000084');
+    assert.deepEqual((resRes.data as Record<string, unknown>).txFrames, [
+      '5A17011000000100000000000000000100000000000084',
+      '5A070115000077',
+    ]);
 
     // 12. NOT_FOUND surfaces friendly occupancy guidance
     const notFoundRes = await mod.runAction('status', {}, {
@@ -744,6 +785,8 @@ test('Python ble_helper.py matching and 0x14/0x1A/0x12/0x02 reply detection work
     'assert m.is_expected_netlea_reply(bytes.fromhex("5A0F0102000010000000000000007C")) == (True, False)',
     'assert m.is_expected_netlea_reply(bytes.fromhex("5A070114000076")) == (False, False)',
     `assert m.is_expected_netlea_reply(bytes.fromhex(${JSON.stringify(`${GOLDEN_0X14_ON.slice(0, -2)}00`)})) == (False, False)`,
+    'assert m.is_resume_control_frame(bytes.fromhex("5A17011000000100000000000000000100000000000084")) is True',
+    `assert m.is_resume_control_frame(bytes.fromhex(${JSON.stringify(mod.buildControlFrame({ on: true, permanent: false, modeCode: 0, gear: 8, restoreSeconds: 1200 }))})) is False`,
   ].join('\n');
   await execFileAsync('python3', ['-c', pyScript]);
 });

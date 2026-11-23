@@ -167,7 +167,7 @@ export function buildQueryTempConfigFrame() {
 }
 
 /**
- * Build the 0x25 stored schedule query frame (`5A0801250000078E`).
+ * Build the 0x25 stored schedule query frame (`5A0801250000078F`).
  * @returns {string}
  */
 export function buildQueryScheduleFrame() {
@@ -918,6 +918,33 @@ function loadNormalizedConfig(configPath) {
 }
 
 /**
+ * Align local config temp durations with hardware-reported `tempConfig` when present.
+ * @param {string} configPath
+ * @param {ReturnType<typeof decodeTempConfigFrame> | null | undefined} tempConfig
+ */
+async function syncHardwareTempConfig(configPath, tempConfig) {
+  if (!tempConfig || typeof tempConfig !== 'object') return;
+  const onMin = clampInt(tempConfig.onMinutes, 1, 300);
+  const offMin = clampInt(tempConfig.offMinutes, 1, 300);
+  if (onMin === undefined && offMin === undefined) return;
+  await withFileLock(configPath, () => {
+    const cur = loadNormalizedConfig(configPath);
+    let changed = false;
+    if (onMin !== undefined && cur.tempOnMinutes !== onMin) {
+      cur.tempOnMinutes = onMin;
+      changed = true;
+    }
+    if (offMin !== undefined && cur.tempOffMinutes !== offMin) {
+      cur.tempOffMinutes = offMin;
+      changed = true;
+    }
+    if (changed) {
+      writeConfig(configPath, cur);
+    }
+  });
+}
+
+/**
  * Format channel summary text.
  * @param {NetleaChannels} ch
  * @returns {string}
@@ -1260,7 +1287,7 @@ async function runBleCommandBatch(opts) {
   const scanTimeoutSec = clampInt(safeArgs.scanTimeoutSec, 2, 15) ?? 6;
   const connectTimeoutSec = clampInt(safeArgs.connectTimeoutSec, 3, 20) ?? 10;
   const replyTimeoutSec = clampInt(safeArgs.replyTimeoutSec, 1, 10) ?? 3;
-  const execTimeoutMs = (scanTimeoutSec + connectTimeoutSec + replyTimeoutSec + 8) * 1000;
+  const execTimeoutMs = (scanTimeoutSec + connectTimeoutSec + replyTimeoutSec + 10) * 1000;
   const txJoined = txFrames.join(',');
 
   let raw;
@@ -1545,6 +1572,7 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
 
   if (cleanAction === 'dashboard') {
     const wantRefresh = safeArgs.refresh === true;
+    let effectiveConfig = config;
     if (wantRefresh) {
       if (platform !== 'linux' && !hasInjectedRunner) {
         return disabledBleResult(platform);
@@ -1566,8 +1594,12 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
       if (!cmdRes.ok) {
         return cmdRes.errorResult;
       }
+      if (cmdRes.tempConfig) {
+        await syncHardwareTempConfig(paths.configPath, cmdRes.tempConfig);
+        effectiveConfig = loadNormalizedConfig(paths.configPath);
+      }
     }
-    return buildDashboardResponse(paths.statePath, config, wantRefresh, nowFn());
+    return buildDashboardResponse(paths.statePath, effectiveConfig, wantRefresh, nowFn());
   }
 
   if (cleanAction === 'status' && safeArgs.live === false) {
@@ -2016,7 +2048,7 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
     }
   } else if (cleanAction === 'resume') {
     const hint = safeArgs.lampStateHint === 0 || safeArgs.lampStateHint === false ? 0 : 1;
-    txFrames = [buildResumeScheduleFrame(hint, 1)];
+    txFrames = [buildResumeScheduleFrame(hint, 1), buildQueryStatusFrame()];
   } else if (cleanAction === 'clock') {
     const targetTs = safeArgs.timestamp !== undefined ? safeArgs.timestamp : nowFn();
     const tzHours = clampInt(safeArgs.tzHours, -12, 14);
@@ -2154,6 +2186,8 @@ export async function runAction(action = 'status', args = {}, deps = {}) {
       if (plannedChannels) cur.defaultChannels = plannedChannels;
       writeConfig(paths.configPath, cur);
     });
+  } else if (cmdRes.tempConfig) {
+    await syncHardwareTempConfig(paths.configPath, cmdRes.tempConfig);
   }
 
   const { deviceView, state, tempConfig, schedule, replies } = cmdRes;

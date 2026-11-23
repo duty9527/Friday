@@ -237,7 +237,7 @@ test('PluginRefreshScheduler enforces tiered intervals, disk freshness reuse, an
       { plugin: 'ninebot', action: 'trips', args: { silent: true } },
     ]);
 
-    // 5. Advance to 10:26 (netlea was at T0-5m = 09:55 -> 31m old -> due with minimal:true since schedule exists)
+    // 5. Advance to 10:26 (netlea was at T0-5m = 09:55 -> 31m old -> due with minimal:false even when schedule exists)
     now = Date.parse('2026-11-16T10:26:00+08:00');
     seedFundDb(home, now - 10_000);
     writeJson(join(home, 'plugins', 'miot', 'hub-cache.json'), {
@@ -251,7 +251,7 @@ test('PluginRefreshScheduler enforces tiered intervals, disk freshness reuse, an
     assert.deepEqual(calls.at(-1), {
       plugin: 'netlea',
       action: 'status',
-      args: { minimal: true, silent: true },
+      args: { minimal: false, silent: true },
     });
 
     // 6. Advance to 10:31 (apple was at T0-30m = 09:30 -> 61m old -> due!)

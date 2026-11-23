@@ -355,6 +355,18 @@ def run_scan(args: argparse.Namespace) -> int:
 VALID_REPLY_CMDS = {0x02, 0x07, 0x12, 0x13, 0x14, 0x19, 0x1A, 0x1C, 0x1F, 0x20}
 
 
+def is_resume_control_frame(frame_bytes: bytes) -> bool:
+    """Return True for a 0x10 immediate schedule-resume frame (permanent=0, PWM all 0, restoreSec=1)."""
+    return (
+        len(frame_bytes) >= 17
+        and frame_bytes[0] == 0x5A
+        and frame_bytes[3] == 0x10
+        and frame_bytes[7] == 0
+        and frame_bytes[10:15] == b"\x00\x00\x00\x00\x00"
+        and (frame_bytes[15] | (frame_bytes[16] << 8)) == 1
+    )
+
+
 def is_expected_netlea_reply(raw_bytes: bytes) -> tuple[bool, bool]:
     """Return (is_ack, is_state_14_frame) after verifying frame length and checksum."""
     if len(raw_bytes) < 7 or raw_bytes[0] != 0x5A:
@@ -589,22 +601,28 @@ def run_command(args: argparse.Namespace) -> int:
         last_ack_ts = 0.0
 
         inter_frame_sec = max(0.05, float(args.inter_frame_ms) / 1000.0)
+        post_resume_sec = max(inter_frame_sec, float(args.post_resume_ms) / 1000.0)
         for idx, frame_bytes in enumerate(tx_frames):
-            # Track state_has_travel freshly from any state queries triggered later
-            if len(frame_bytes) >= 4 and frame_bytes[3] in (0x12, 0x10):
+            # Track freshly queried state/tempConfig/schedule frames after preceding mutations or delays
+            cmd = frame_bytes[3] if len(frame_bytes) >= 4 else -1
+            if cmd in (0x12, 0x10) or (idx > 0 and cmd in (0x13, 0x15)):
                 state_hex = None
                 state_has_travel = None
                 received_cmds.discard(0x14)
-                if frame_bytes[3] == 0x12:
-                    received_cmds.discard(0x12)
-                    schedule_hex = None
+            if cmd == 0x12 or (idx > 0 and cmd == 0x25):
+                received_cmds.discard(0x12)
+                schedule_hex = None
+            if cmd == 0x1A or (idx > 0 and cmd == 0x1B):
+                received_cmds.discard(0x1A)
+                temp_config_hex = None
             arr = dbus.Array([dbus.Byte(b) for b in frame_bytes], signature="y")
             try:
                 write_iface.WriteValue(arr, dbus.Dictionary({"type": dbus.String("command")}, signature="sv"))
             except Exception:
                 write_iface.WriteValue(arr, dbus.Dictionary({}, signature="sv"))
             if idx < len(tx_frames) - 1:
-                _pump_glib(ctx, inter_frame_sec)
+                delay_sec = post_resume_sec if is_resume_control_frame(frame_bytes) else inter_frame_sec
+                _pump_glib(ctx, delay_sec)
 
         reply_deadline = time.monotonic() + max(0.5, float(args.reply_timeout))
         while time.monotonic() < reply_deadline:
@@ -687,6 +705,7 @@ def build_parser() -> argparse.ArgumentParser:
     cmd_p.add_argument("--connect-timeout", type=float, default=10.0)
     cmd_p.add_argument("--reply-timeout", type=float, default=3.5)
     cmd_p.add_argument("--inter-frame-ms", type=int, default=120)
+    cmd_p.add_argument("--post-resume-ms", type=int, default=1350)
     cmd_p.add_argument("--adapter", default="")
 
     return parser
