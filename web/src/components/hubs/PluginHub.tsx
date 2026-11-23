@@ -30,8 +30,10 @@ import {
   ArrowUpIcon,
   BikeIcon,
   BluetoothIcon,
+  CheckIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
+  CopyIcon,
   HomeIcon,
   LayoutGridIcon,
   MonitorIcon,
@@ -55,6 +57,11 @@ import {
   useMemo,
   useState,
 } from 'react';
+import {
+  FullContentDialog,
+  ViewFullButton,
+  type FullContentPayload,
+} from '@/components/shared/FullContentViewer';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -139,7 +146,9 @@ export function PluginHub() {
   const [query, setQuery] = useState('');
 
   // Quick-check state per plugin
-  const [quickChecks, setQuickChecks] = useState<Record<string, { busy?: boolean; ok?: boolean; summary?: string }>>({});
+  const [quickChecks, setQuickChecks] = useState<
+    Record<string, { busy?: boolean; ok?: boolean; summary?: string; fullMessage?: string; data?: unknown }>
+  >({});
 
   // Detail & Developer runner view inside catalog
   const [detailPluginName, setDetailPluginName] = useState<string | null>(null);
@@ -148,6 +157,8 @@ export function PluginHub() {
   const [devArgsText, setDevArgsText] = useState('{}');
   const [runBusy, setRunBusy] = useState(false);
   const [runResult, setRunResult] = useState<RunResult | null>(null);
+  const [resultCopied, setResultCopied] = useState(false);
+  const [viewerPayload, setViewerPayload] = useState<FullContentPayload | null>(null);
 
   const orderedSurfaceNames = useMemo(
     () => mergePluginOrder(savedOrder, DEFAULT_SURFACE_ORDER),
@@ -206,6 +217,8 @@ export function PluginHub() {
           busy: false,
           ok: res.ok,
           summary: summarizePluginRunMessage(res.message || ''),
+          fullMessage: res.message || '',
+          data: res.data,
         },
       }));
     } catch (err) {
@@ -519,24 +532,64 @@ export function PluginHub() {
               </TabsPanel>
             </Tabs>
 
-            {runResult && (
-              <Card>
-                <CardHeader className="pb-1">
-                  <div className="flex items-center gap-2">
-                    <Badge variant={runResult.ok ? 'success' : 'error'}>{runResult.ok ? '成功' : '异常'}</Badge>
-                    <span className="font-mono text-xs">{runResult.action}</span>
-                  </div>
-                </CardHeader>
-                <CardContent className="space-y-2 text-xs">
-                  {runResult.message && <p>{runResult.message}</p>}
-                  {runResult.data !== undefined && (
-                    <pre className="max-h-56 overflow-auto rounded-md border bg-muted/40 p-2 font-mono text-[11px]">
-                      {JSON.stringify(runResult.data, null, 2)}
-                    </pre>
-                  )}
-                </CardContent>
-              </Card>
-            )}
+            {runResult && (() => {
+              const formattedResult = [
+                runResult.message ?? '',
+                runResult.data !== undefined ? JSON.stringify(runResult.data, null, 2) : '',
+              ].filter(Boolean).join('\n\n');
+              return (
+                <Card>
+                  <CardHeader className="pb-1">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <Badge variant={runResult.ok ? 'success' : 'error'}>{runResult.ok ? '成功' : '异常'}</Badge>
+                        <span className="font-mono text-xs">{runResult.action}</span>
+                      </div>
+                      <div className="flex items-center gap-1">
+                        {formattedResult && (
+                          <>
+                            <ViewFullButton
+                              onClick={() =>
+                                setViewerPayload({
+                                  title: `动作执行完整返回 · ${runResult.action}`,
+                                  badges: [{ label: runResult.ok ? '成功' : '异常', variant: runResult.ok ? 'success' : 'error' }],
+                                  content: formattedResult,
+                                  mode: 'code',
+                                })
+                              }
+                            />
+                            <Button
+                              size="xs"
+                              variant="ghost"
+                              onClick={async () => {
+                                try {
+                                  await navigator.clipboard?.writeText(formattedResult);
+                                  setResultCopied(true);
+                                  setTimeout(() => setResultCopied(false), 1600);
+                                } catch {
+                                  // ignore
+                                }
+                              }}
+                            >
+                              {resultCopied ? <CheckIcon className="size-3 text-success-foreground" /> : <CopyIcon className="size-3" />}
+                              <span>{resultCopied ? '已复制' : '复制'}</span>
+                            </Button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  </CardHeader>
+                  <CardContent className="space-y-2 text-xs">
+                    {runResult.message && <p className="whitespace-pre-wrap break-words">{runResult.message}</p>}
+                    {runResult.data !== undefined && (
+                      <pre className="max-h-56 overflow-auto rounded-md border bg-muted/40 p-2 font-mono text-[11px]">
+                        {JSON.stringify(runResult.data, null, 2)}
+                      </pre>
+                    )}
+                  </CardContent>
+                </Card>
+              );
+            })()}
           </div>
         ) : (
           /* Catalog View */
@@ -599,8 +652,24 @@ export function PluginHub() {
                       </CardHeader>
                       <CardContent className="space-y-2 text-xs">
                         {qc?.summary && (
-                          <div className={`rounded border px-2 py-1 text-[11px] ${qc.ok ? 'border-success/30 bg-success/5 text-foreground' : 'border-warning/30 bg-warning/5 text-muted-foreground'}`}>
-                            {qc.summary}
+                          <div className={`flex items-start justify-between gap-2 rounded border px-2 py-1 text-[11px] ${qc.ok ? 'border-success/30 bg-success/5 text-foreground' : 'border-warning/30 bg-warning/5 text-muted-foreground'}`}>
+                            <span className="min-w-0 flex-1 break-words">{qc.summary}</span>
+                            {(qc.fullMessage || qc.data !== undefined) && (
+                              <ViewFullButton
+                                className="shrink-0"
+                                onClick={() =>
+                                  setViewerPayload({
+                                    title: `${getPluginDisplayTitle(p)} · 快速自检完整结果`,
+                                    badges: [{ label: qc.ok ? '通过' : '异常', variant: qc.ok ? 'success' : 'warning' }],
+                                    content: [
+                                      qc.fullMessage ?? qc.summary ?? '',
+                                      qc.data !== undefined ? JSON.stringify(qc.data, null, 2) : '',
+                                    ].filter(Boolean).join('\n\n'),
+                                    mode: 'code',
+                                  })
+                                }
+                              />
+                            )}
                           </div>
                         )}
                         <div className="flex flex-wrap items-center justify-between gap-1.5 pt-0.5">
@@ -627,6 +696,8 @@ export function PluginHub() {
           </div>
         )}
       </div>
+
+      <FullContentDialog payload={viewerPayload} onClose={() => setViewerPayload(null)} />
     </div>
   );
 }

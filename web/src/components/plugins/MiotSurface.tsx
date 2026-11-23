@@ -12,6 +12,11 @@ import {
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ConfirmActionDialog } from '@/components/shared/ConfirmActionDialog';
+import {
+  ExpandableText,
+  FullContentDialog,
+  type FullContentPayload,
+} from '@/components/shared/FullContentViewer';
 import { isSafeHttpUrl } from '@/components/shared/safeUrl';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
@@ -166,6 +171,8 @@ export default function MiotSurface() {
   const [delRuleTarget, setDelRuleTarget] = useState<MiotGeekRuleItem | null>(null);
   const [sceneConfirmTarget, setSceneConfirmTarget] = useState<MiotSceneItem | null>(null);
   const [delVarTarget, setDelVarTarget] = useState<MiotVarItem | null>(null);
+  const [showAllLogs, setShowAllLogs] = useState(false);
+  const [viewerPayload, setViewerPayload] = useState<FullContentPayload | null>(null);
 
   const seqRef = useRef(0);
   const mountedRef = useRef(true);
@@ -603,32 +610,54 @@ export default function MiotSurface() {
           {/* Geek Logs */}
           <Card>
             <CardHeader className="pb-2">
-              <div className="flex items-center justify-between gap-2">
-                <CardTitle className="text-xs font-medium">极客执行日志</CardTitle>
-                <select
-                  aria-label="筛选规则日志"
-                  value={logFilterGraphId}
-                  onChange={e => setLogFilterGraphId(e.target.value)}
-                  className="h-7 rounded-md border border-input bg-background px-2 text-xs outline-none"
-                >
-                  <option value="">全部规则</option>
-                  {graphs.map(g => <option key={g.id} value={g.id}>{g.name || g.id}</option>)}
-                </select>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <CardTitle className="text-xs font-medium">极客执行日志 ({filteredLogs.length})</CardTitle>
+                <div className="flex items-center gap-1.5">
+                  {filteredLogs.length > 30 && (
+                    <Button size="xs" variant="ghost" onClick={() => setShowAllLogs(v => !v)}>
+                      {showAllLogs ? '仅看最近 30 条' : `显示全部 (${filteredLogs.length} 条)`}
+                    </Button>
+                  )}
+                  <select
+                    aria-label="筛选规则日志"
+                    value={logFilterGraphId}
+                    onChange={e => setLogFilterGraphId(e.target.value)}
+                    className="h-7 rounded-md border border-input bg-background px-2 text-xs outline-none"
+                  >
+                    <option value="">全部规则</option>
+                    {graphs.map(g => <option key={g.id} value={g.id}>{g.name || g.id}</option>)}
+                  </select>
+                </div>
               </div>
             </CardHeader>
-            <CardContent className="space-y-1">
+            <CardContent className="space-y-1.5">
               {filteredLogs.length === 0 ? (
                 <p className="text-xs text-muted-foreground">暂无执行日志。</p>
               ) : (
-                filteredLogs.slice(0, 30).map((entry, idx) => (
-                  <div key={`${entry.ts}-${idx}`} className="flex items-center justify-between gap-2 border-b py-1 text-xs last:border-0">
-                    <div className="min-w-0 truncate">
-                      <span className="font-mono text-[11px] text-muted-foreground me-2">{timestamp(entry.ts)}</span>
-                      <Badge variant="outline" className="me-1.5">{entry.graphName || entry.graphId}</Badge>
-                      <span>{entry.summary}</span>
+                (showAllLogs ? filteredLogs : filteredLogs.slice(0, 30)).map((entry, idx) => (
+                  <div key={`${entry.ts}-${idx}`} className="flex items-start justify-between gap-2 border-b py-1.5 text-xs last:border-0">
+                    <div className="min-w-0 flex-1 space-y-1">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="font-mono text-[11px] text-muted-foreground">{timestamp(entry.ts)}</span>
+                        <Badge variant="outline">{entry.graphName || entry.graphId}</Badge>
+                      </div>
+                      <ExpandableText
+                        text={entry.summary}
+                        clampClass="line-clamp-2"
+                        threshold={80}
+                        onOpenFull={() =>
+                          setViewerPayload({
+                            title: `极客日志详情 · ${entry.graphName || entry.graphId}`,
+                            subtitle: timestamp(entry.ts),
+                            badges: entry.ok !== undefined ? [{ label: entry.ok ? '成功' : '异常', variant: entry.ok ? 'success' : 'error' }] : undefined,
+                            content: entry.summary,
+                            mode: 'text',
+                          })
+                        }
+                      />
                     </div>
                     {entry.ok !== undefined && (
-                      <Badge variant={entry.ok ? 'success' : 'error'}>{entry.ok ? '成功' : '异常'}</Badge>
+                      <Badge variant={entry.ok ? 'success' : 'error'} className="shrink-0">{entry.ok ? '成功' : '异常'}</Badge>
                     )}
                   </div>
                 ))
@@ -649,8 +678,8 @@ export default function MiotSurface() {
                     <CardContent className="flex items-center justify-between gap-2 pt-3">
                       <div className="min-w-0 space-y-0.5">
                         <div className="flex items-center gap-1.5">
-                          <span className="text-xs font-medium truncate">{sc.summary || sc.id}</span>
-                          {sc.turnsOffProtected && <Badge variant="warning">含保护设备</Badge>}
+                          <span title={sc.summary || sc.id} className="line-clamp-2 text-xs font-medium">{sc.summary || sc.id}</span>
+                          {sc.turnsOffProtected && <Badge variant="warning" className="shrink-0">含保护设备</Badge>}
                         </div>
                         <p className="font-mono text-[11px] text-muted-foreground">ID {sc.id}</p>
                       </div>
@@ -856,6 +885,8 @@ export default function MiotSurface() {
           }
         }}
       />
+
+      <FullContentDialog payload={viewerPayload} onClose={() => setViewerPayload(null)} />
     </div>
   );
 }

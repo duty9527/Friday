@@ -22,6 +22,12 @@ import {
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ConfirmActionDialog } from '@/components/shared/ConfirmActionDialog';
+import {
+  ExpandableText,
+  FullContentDialog,
+  ViewFullButton,
+  type FullContentPayload,
+} from '@/components/shared/FullContentViewer';
 import { isSafeHttpUrl, isSafePreviewImageUrl } from '@/components/shared/safeUrl';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
@@ -86,6 +92,7 @@ export function ImVoiceHub() {
   const [voiceMsg, setVoiceMsg] = useState('');
   const [deleteProfile, setDeleteProfile] = useState<VoiceprintProfileView | null>(null);
   const [clearAllVoice, setClearAllVoice] = useState(false);
+  const [viewerPayload, setViewerPayload] = useState<FullContentPayload | null>(null);
 
   const stopQrPoll = useCallback(() => {
     qrSeqRef.current += 1;
@@ -518,18 +525,51 @@ export function ImVoiceHub() {
                 <span>入站 {ch.inboundCount} / 出站 {ch.outboundCount}</span>
                 {ch.accountId && <span>· 账号 {ch.accountId}</span>}
                 {ch.allowedSenders.length > 0 && <span>· 白名单 {ch.allowedSenders.length} 人</span>}
-                {ch.lastError && <span className="text-destructive-foreground">· 异常：{ch.lastError}</span>}
+                {ch.lastError && (
+                  <span className="inline-flex flex-wrap items-center gap-1 break-words text-destructive-foreground">
+                    <span>· 异常：{ch.lastError}</span>
+                    {ch.lastError.length > 100 && (
+                      <ViewFullButton
+                        onClick={() =>
+                          setViewerPayload({
+                            title: `渠道异常详情 · ${ch.name}`,
+                            content: ch.lastError!,
+                            mode: 'text',
+                          })
+                        }
+                      />
+                    )}
+                  </span>
+                )}
               </div>
 
               {ch.rejectedSenders && ch.rejectedSenders.length > 0 && (
                 <div className="rounded-lg border border-warning/30 bg-warning/8 p-2 space-y-1.5">
                   <div className="font-medium text-warning-foreground">近期拦截的陌生发送者</div>
                   {ch.rejectedSenders.map(stranger => (
-                    <div key={stranger.senderId} className="flex flex-wrap items-center justify-between gap-2">
-                      <span className="truncate">
-                        {stranger.senderName || stranger.senderId} ({stranger.count}次) {stranger.lastText ? `· "${stranger.lastText.slice(0, 30)}"` : ''}
-                      </span>
-                      <div className="flex gap-1">
+                    <div key={stranger.senderId} className="flex flex-wrap items-start justify-between gap-2">
+                      <div className="min-w-0 flex-1 space-y-0.5">
+                        <div className="font-medium text-foreground break-words">
+                          {stranger.senderName || stranger.senderId} ({stranger.count}次)
+                        </div>
+                        {stranger.lastText && (
+                          <ExpandableText
+                            text={stranger.lastText}
+                            clampClass="line-clamp-1"
+                            threshold={36}
+                            className="text-muted-foreground"
+                            onOpenFull={() =>
+                              setViewerPayload({
+                                title: `拦截陌生消息 · ${stranger.senderName || stranger.senderId}`,
+                                subtitle: `Sender ID: ${stranger.senderId} · 拦截 ${stranger.count} 次`,
+                                content: stranger.lastText!,
+                                mode: 'text',
+                              })
+                            }
+                          />
+                        )}
+                      </div>
+                      <div className="flex shrink-0 gap-1">
                         <Button
                           size="xs"
                           variant="secondary"
@@ -700,6 +740,8 @@ export function ImVoiceHub() {
           }
         }}
       />
+
+      <FullContentDialog payload={viewerPayload} onClose={() => setViewerPayload(null)} />
     </Tabs>
   );
 }

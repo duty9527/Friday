@@ -50,6 +50,11 @@ import {
   XIcon,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  FullContentDialog,
+  ViewFullButton,
+  type FullContentPayload,
+} from '@/components/shared/FullContentViewer';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -57,6 +62,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Input } from '@/components/ui/input';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Separator } from '@/components/ui/separator';
+import { Sheet, SheetHeader, SheetPopup, SheetTitle } from '@/components/ui/sheet';
 import { Tabs, TabsList, TabsTab } from '@/components/ui/tabs';
 import { useTheme } from '@/lib/theme';
 
@@ -184,6 +190,8 @@ export function MindmapApp() {
   // Expanded payload cache for truncated operation/message/work text
   const [expandedText, setExpandedText] = useState<Record<string, string>>({});
   const [expandingKey, setExpandingKey] = useState('');
+  const [viewerPayload, setViewerPayload] = useState<FullContentPayload | null>(null);
+  const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false);
 
   // Inspector scroll preservation per inspected key
   const inspectorScrollRef = useRef<HTMLDivElement | null>(null);
@@ -327,6 +335,16 @@ export function MindmapApp() {
       setExpandingKey('');
     }
   };
+
+  const makeLoadFull = useCallback(
+    (key: string, url: string, extract: (raw: Record<string, unknown>) => string) => async () => {
+      const res = await http.api<Record<string, unknown>>(url);
+      const text = extract(res);
+      setExpandedText(prev => ({ ...prev, [key]: text }));
+      return text;
+    },
+    [http],
+  );
 
   const toggleNodeCollapse = (toggleKey: string, currentlyCollapsed: boolean) => {
     setCollapseMap(prev => {
@@ -513,6 +531,11 @@ export function MindmapApp() {
             </Button>
           </div>
 
+          {selectedNode && viewMode !== 'list' && (
+            <Button size="xs" variant="outline" className="lg:hidden" onClick={() => setMobileInspectorOpen(true)}>
+              节点详情
+            </Button>
+          )}
           <Button size="xs" variant="outline" disabled={loading || authExpired} onClick={() => void refreshMindmap()}>
             <RefreshCwIcon className="size-3.5" />
           </Button>
@@ -647,10 +670,15 @@ export function MindmapApp() {
                       </CardHeader>
                       <CardContent className="space-y-1.5 text-xs">
                         {turns.slice(0, 3).map(t => (
-                          <div key={t.id} className="truncate text-muted-foreground">
+                          <div key={t.id} title={t.ingress.text} className="truncate text-muted-foreground">
                             {sourceIcon(t.ingress.sourceKind)} {shortText(t.ingress.text, 44)}
                           </div>
                         ))}
+                        {turns.length > 3 && (
+                          <div className="text-[11px] text-muted-foreground">
+                            还有 {turns.length - 3} 轮（点击下方查看完整会话）
+                          </div>
+                        )}
                         <Button
                           size="xs"
                           variant="outline"
@@ -764,7 +792,12 @@ export function MindmapApp() {
                       data-interactive="true"
                       transform={`translate(${n.x}, ${n.y})`}
                       className="cursor-pointer"
-                      onClick={() => setSelectedNodeId(n.id)}
+                      onClick={() => {
+                        setSelectedNodeId(n.id);
+                        if (typeof window !== 'undefined' && window.innerWidth < 1024) {
+                          setMobileInspectorOpen(true);
+                        }
+                      }}
                     >
                       <rect
                         x="0"
@@ -827,6 +860,8 @@ export function MindmapApp() {
                 expandedText={expandedText}
                 expandingKey={expandingKey}
                 onFetchExpanded={fetchExpanded}
+                onOpenFull={setViewerPayload}
+                makeLoadFull={makeLoadFull}
                 onJumpSession={sid => {
                   setSelectedSessionId(sid);
                   setViewMode('session');
@@ -836,6 +871,36 @@ export function MindmapApp() {
           </div>
         </aside>
       </div>
+
+      {/* Mobile / Tablet Inspector Drawer (< 1024px) */}
+      <Sheet open={mobileInspectorOpen} onOpenChange={setMobileInspectorOpen}>
+        <SheetPopup side="right" className="flex w-96 max-w-[92vw] flex-col p-0 lg:hidden" closeProps={{ 'aria-label': '关闭节点详情' }}>
+          <SheetHeader className="shrink-0 border-b px-4 py-3 pe-12">
+            <SheetTitle className="text-sm">节点检视面板</SheetTitle>
+          </SheetHeader>
+          <div className="min-h-0 flex-1 overflow-y-auto p-3 text-xs">
+            {selectedNode ? (
+              <InspectorDetails
+                node={selectedNode}
+                expandedText={expandedText}
+                expandingKey={expandingKey}
+                onFetchExpanded={fetchExpanded}
+                onOpenFull={setViewerPayload}
+                makeLoadFull={makeLoadFull}
+                onJumpSession={sid => {
+                  setSelectedSessionId(sid);
+                  setViewMode('session');
+                  setMobileInspectorOpen(false);
+                }}
+              />
+            ) : (
+              <p className="py-8 text-center text-muted-foreground">点击流程图任意节点查看详情</p>
+            )}
+          </div>
+        </SheetPopup>
+      </Sheet>
+
+      <FullContentDialog payload={viewerPayload} onClose={() => setViewerPayload(null)} />
     </div>
   );
 }
@@ -845,16 +910,22 @@ function InspectorDetails({
   expandedText,
   expandingKey,
   onFetchExpanded,
+  onOpenFull,
+  makeLoadFull,
   onJumpSession,
 }: {
   node: FlowchartNode;
   expandedText: Record<string, string>;
   expandingKey: string;
   onFetchExpanded: (key: string, url: string, extract: (raw: Record<string, unknown>) => string) => void;
+  onOpenFull: (payload: FullContentPayload) => void;
+  makeLoadFull: (key: string, url: string, extract: (raw: Record<string, unknown>) => string) => () => Promise<string>;
   onJumpSession: (sessionId: string) => void;
 }) {
   const payload: InspectorPayload = node.inspector;
   const flow = payload.flow;
+  const ingressKey = flow?.ingress.messageId ? `ingress:${flow.ingress.messageId}` : '';
+  const ingressText = (ingressKey && expandedText[ingressKey]) ? expandedText[ingressKey]! : (flow?.ingress.text ?? '');
 
   return (
     <div className="space-y-3">
@@ -878,14 +949,52 @@ function InspectorDetails({
       {flow && (
         <Card>
           <CardHeader className="pb-1">
-            <CardTitle className="text-xs">接入与消息上下文</CardTitle>
+            <div className="flex items-center justify-between gap-2">
+              <CardTitle className="text-xs">接入与消息上下文</CardTitle>
+              <ViewFullButton
+                onClick={() =>
+                  onOpenFull({
+                    title: '接入消息完整上下文',
+                    subtitle: `${flow.ingress.channelLabel} · ${formatTimeShort(flow.createdAt)}`,
+                    content: ingressText,
+                    mode: 'markdown',
+                    ...(flow.ingress.textTruncated && flow.ingress.messageId && !expandedText[ingressKey]
+                      ? {
+                          truncatedHint: '快照只保留了前缀预览，可点击「拉取未截断全文」加载完整原始消息。',
+                          loadFull: makeLoadFull(
+                            ingressKey,
+                            `/api/message?messageId=${encodeURIComponent(flow.ingress.messageId)}`,
+                            raw => String(raw.text ?? '（空）'),
+                          ),
+                        }
+                      : {}),
+                  })
+                }
+              />
+            </div>
           </CardHeader>
-          <CardContent className="space-y-1 text-xs">
+          <CardContent className="space-y-1.5 text-xs">
             <div className="flex justify-between"><span className="text-muted-foreground">渠道</span><span>{flow.ingress.channelLabel}</span></div>
             <div className="flex justify-between"><span className="text-muted-foreground">时间</span><span className="font-mono">{formatTimeShort(flow.createdAt)}</span></div>
             <pre className="mt-1.5 max-h-36 overflow-auto rounded bg-muted/40 p-2 font-mono text-[11px] whitespace-pre-wrap break-words">
-              {flow.ingress.text}
+              {ingressText}
             </pre>
+            {flow.ingress.textTruncated && flow.ingress.messageId && !expandedText[ingressKey] && (
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={expandingKey === ingressKey}
+                onClick={() =>
+                  onFetchExpanded(
+                    ingressKey,
+                    `/api/message?messageId=${encodeURIComponent(flow.ingress.messageId!)}`,
+                    raw => String(raw.text ?? '（空）'),
+                  )
+                }
+              >
+                {expandingKey === ingressKey ? '正在拉取全文…' : '拉取完整原始消息'}
+              </Button>
+            )}
           </CardContent>
         </Card>
       )}
@@ -900,9 +1009,22 @@ function InspectorDetails({
             <div className="flex justify-between"><span className="text-muted-foreground">耗时</span><span className="font-mono">{formatDuration(payload.routerTurn.durationMs)}</span></div>
             {payload.routerTool && (
               <div className="mt-1 rounded border p-2 space-y-1">
-                <div className="font-mono font-medium">{payload.routerTool.toolName}</div>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-mono font-medium">{payload.routerTool.toolName}</span>
+                  {payload.routerTool.inputPreview && (
+                    <ViewFullButton
+                      onClick={() =>
+                        onOpenFull({
+                          title: `Router 工具入参 · ${payload.routerTool!.toolName}`,
+                          content: payload.routerTool!.inputPreview!,
+                          mode: 'code',
+                        })
+                      }
+                    />
+                  )}
+                </div>
                 {payload.routerTool.inputPreview && (
-                  <pre className="max-h-28 overflow-auto rounded bg-muted/40 p-1.5 font-mono text-[11px]">{payload.routerTool.inputPreview}</pre>
+                  <pre className="max-h-28 overflow-auto rounded bg-muted/40 p-1.5 font-mono text-[11px] whitespace-pre-wrap break-words">{payload.routerTool.inputPreview}</pre>
                 )}
               </div>
             )}
@@ -916,52 +1038,100 @@ function InspectorDetails({
           expandedText={expandedText}
           expandingKey={expandingKey}
           onFetchExpanded={onFetchExpanded}
+          onOpenFull={onOpenFull}
+          makeLoadFull={makeLoadFull}
         />
       )}
 
-      {payload.workerStep && payload.task && (
-        <Card>
-          <CardHeader className="pb-1"><CardTitle className="text-xs">Worker 步骤 · {payload.workerStep.title}</CardTitle></CardHeader>
-          <CardContent className="space-y-1.5">
-            <div className="flex justify-between">
-              <span className="text-muted-foreground">状态 / 耗时</span>
-              <span className="font-mono">{statusLabel(payload.workerStep.status)} · {formatDuration(payload.workerStep.durationMs)}</span>
-            </div>
-            {payload.workerStep.inputPreview && (
-              <pre className="max-h-28 overflow-auto rounded bg-muted/40 p-1.5 font-mono text-[11px]">{payload.workerStep.inputPreview}</pre>
-            )}
-            {(expandedText[`op:${payload.task.id}:${payload.workerStep.operationId ?? ''}`] ?? payload.workerStep.outputPreview) && (
-              <pre className="max-h-40 overflow-auto rounded bg-muted/40 p-1.5 font-mono text-[11px] whitespace-pre-wrap">
-                {expandedText[`op:${payload.task.id}:${payload.workerStep.operationId ?? ''}`] ?? payload.workerStep.outputPreview}
-              </pre>
-            )}
-            {payload.workerStep.operationId && payload.workerStep.hasFullOperation && !expandedText[`op:${payload.task.id}:${payload.workerStep.operationId}`] && (
-              <Button
-                size="xs"
-                variant="outline"
-                disabled={expandingKey === `op:${payload.task.id}:${payload.workerStep.operationId}`}
-                onClick={() =>
-                  onFetchExpanded(
-                    `op:${payload.task!.id}:${payload.workerStep!.operationId}`,
-                    `/api/operation?taskId=${encodeURIComponent(payload.task!.id)}&operationId=${encodeURIComponent(payload.workerStep!.operationId!)}`,
-                    raw => String(raw.result ?? raw.error ?? '（空）'),
-                  )
-                }
-              >
-                拉取完整工具输出
-              </Button>
-            )}
-          </CardContent>
-        </Card>
-      )}
+      {payload.workerStep && payload.task && (() => {
+        const ws = payload.workerStep!;
+        const taskId = payload.task!.id;
+        const opKey = `op:${taskId}:${ws.operationId ?? ''}`;
+        const opOutput = expandedText[opKey] ?? ws.outputPreview;
+        return (
+          <Card>
+            <CardHeader className="pb-1"><CardTitle className="text-xs">Worker 步骤 · {ws.title}</CardTitle></CardHeader>
+            <CardContent className="space-y-1.5">
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">状态 / 耗时</span>
+                <span className="font-mono">{statusLabel(ws.status)} · {formatDuration(ws.durationMs)}</span>
+              </div>
+              {ws.inputPreview && (
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] text-muted-foreground">调用参数</span>
+                    <ViewFullButton
+                      onClick={() =>
+                        onOpenFull({
+                          title: `${ws.title} · 调用参数`,
+                          content: ws.inputPreview!,
+                          mode: 'code',
+                        })
+                      }
+                    />
+                  </div>
+                  <pre className="max-h-28 overflow-auto rounded bg-muted/40 p-1.5 font-mono text-[11px] whitespace-pre-wrap break-words">{ws.inputPreview}</pre>
+                </div>
+              )}
+              {opOutput && (
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] text-muted-foreground">{expandedText[opKey] ? '完整输出' : '输出预览'}</span>
+                    <ViewFullButton
+                      onClick={() =>
+                        onOpenFull({
+                          title: `${ws.title} · 执行输出`,
+                          content: opOutput,
+                          mode: 'code',
+                          ...(ws.operationId && ws.hasFullOperation && !expandedText[opKey]
+                            ? {
+                                truncatedHint: '当前为步骤输出预览，可点击「拉取未截断全文」获取完整工具结果。',
+                                loadFull: makeLoadFull(
+                                  opKey,
+                                  `/api/operation?taskId=${encodeURIComponent(taskId)}&operationId=${encodeURIComponent(ws.operationId)}`,
+                                  raw => String(raw.result ?? raw.error ?? '（空）'),
+                                ),
+                              }
+                            : {}),
+                        })
+                      }
+                    />
+                  </div>
+                  <pre className="max-h-40 overflow-auto rounded bg-muted/40 p-1.5 font-mono text-[11px] whitespace-pre-wrap break-words">
+                    {opOutput}
+                  </pre>
+                </div>
+              )}
+              {ws.operationId && ws.hasFullOperation && !expandedText[opKey] && (
+                <Button
+                  size="xs"
+                  variant="outline"
+                  disabled={expandingKey === opKey}
+                  onClick={() =>
+                    onFetchExpanded(
+                      opKey,
+                      `/api/operation?taskId=${encodeURIComponent(taskId)}&operationId=${encodeURIComponent(ws.operationId!)}`,
+                      raw => String(raw.result ?? raw.error ?? '（空）'),
+                    )
+                  }
+                >
+                  拉取完整工具输出
+                </Button>
+              )}
+            </CardContent>
+          </Card>
+        );
+      })()}
 
-      {payload.consolidatedMemory && <ConsolidatedMemoryCard mem={payload.consolidatedMemory} />}
+      {payload.consolidatedMemory && <ConsolidatedMemoryCard mem={payload.consolidatedMemory} onOpenFull={onOpenFull} />}
       {payload.delivery && (
         <DeliveryCard
           delivery={payload.delivery}
           expandedText={expandedText}
           expandingKey={expandingKey}
           onFetchExpanded={onFetchExpanded}
+          onOpenFull={onOpenFull}
+          makeLoadFull={makeLoadFull}
         />
       )}
     </div>
@@ -1002,22 +1172,52 @@ function TaskCard({
   expandedText,
   expandingKey,
   onFetchExpanded,
+  onOpenFull,
+  makeLoadFull,
 }: {
   task: MindmapTaskDetail;
   expandedText: Record<string, string>;
   expandingKey: string;
   onFetchExpanded: (key: string, url: string, extract: (raw: Record<string, unknown>) => string) => void;
+  onOpenFull: (payload: FullContentPayload) => void;
+  makeLoadFull: (key: string, url: string, extract: (raw: Record<string, unknown>) => string) => () => Promise<string>;
 }) {
   const workKey = `work:${task.id}`;
   const fullReport = expandedText[workKey] ?? task.reportPreview;
   return (
     <Card>
-      <CardHeader className="pb-1"><CardTitle className="text-xs">Worker 任务 · {task.id.slice(0, 8)}</CardTitle></CardHeader>
+      <CardHeader className="pb-1">
+        <div className="flex items-center justify-between gap-2">
+          <CardTitle className="text-xs">Worker 任务 · {task.id.slice(0, 8)}</CardTitle>
+          {fullReport && (
+            <ViewFullButton
+              onClick={() =>
+                onOpenFull({
+                  title: `Worker 完整报告 · ${task.id.slice(0, 8)}`,
+                  badges: [{ label: statusLabel(task.status) }],
+                  content: fullReport,
+                  mode: 'markdown',
+                  ...(task.reportTruncated && !expandedText[workKey]
+                    ? {
+                        truncatedHint: '当前为报告预览片段，点击「拉取未截断全文」加载完整 Worker 报告。',
+                        loadFull: makeLoadFull(
+                          workKey,
+                          `/api/work?taskId=${encodeURIComponent(task.id)}`,
+                          raw => String(raw.report ?? '（空）'),
+                        ),
+                      }
+                    : {}),
+                })
+              }
+            />
+          )}
+        </div>
+      </CardHeader>
       <CardContent className="space-y-1.5 text-xs">
         <div className="flex justify-between"><span className="text-muted-foreground">状态</span><span>{statusLabel(task.status)}</span></div>
         <div className="flex justify-between"><span className="text-muted-foreground">用时</span><span className="font-mono">{formatDuration(task.activeMs)}</span></div>
         {fullReport && (
-          <pre className="max-h-36 overflow-auto rounded bg-muted/40 p-1.5 font-mono text-[11px] whitespace-pre-wrap">{fullReport}</pre>
+          <pre className="max-h-36 overflow-auto rounded bg-muted/40 p-1.5 font-mono text-[11px] whitespace-pre-wrap break-words">{fullReport}</pre>
         )}
         {task.reportTruncated && !expandedText[workKey] && (
           <Button
@@ -1034,13 +1234,34 @@ function TaskCard({
   );
 }
 
-function ConsolidatedMemoryCard({ mem }: { mem: MindmapConsolidatedMemory }) {
+function ConsolidatedMemoryCard({
+  mem,
+  onOpenFull,
+}: {
+  mem: MindmapConsolidatedMemory;
+  onOpenFull: (payload: FullContentPayload) => void;
+}) {
   return (
     <Card>
-      <CardHeader className="pb-1"><CardTitle className="text-xs">沉淀记忆 · {mem.topic}</CardTitle></CardHeader>
+      <CardHeader className="pb-1">
+        <div className="flex items-center justify-between gap-2">
+          <CardTitle className="text-xs">沉淀记忆 · {mem.topic}</CardTitle>
+          <ViewFullButton
+            onClick={() =>
+              onOpenFull({
+                title: `沉淀记忆 · ${mem.topic}`,
+                badges: mem.tags.map(t => ({ label: t, variant: 'secondary' as const })),
+                subtitle: `突触数 ${mem.synapseCount}`,
+                content: mem.contentPreview,
+                mode: 'markdown',
+              })
+            }
+          />
+        </div>
+      </CardHeader>
       <CardContent className="space-y-1 text-xs">
         <p className="text-muted-foreground">突触数 {mem.synapseCount} · 标签 {mem.tags.join(', ')}</p>
-        <p className="whitespace-pre-wrap">{mem.contentPreview}</p>
+        <p className="whitespace-pre-wrap break-words">{mem.contentPreview}</p>
       </CardContent>
     </Card>
   );
@@ -1051,19 +1272,46 @@ function DeliveryCard({
   expandedText,
   expandingKey,
   onFetchExpanded,
+  onOpenFull,
+  makeLoadFull,
 }: {
   delivery: MindmapDeliveryItem;
   expandedText: Record<string, string>;
   expandingKey: string;
   onFetchExpanded: (key: string, url: string, extract: (raw: Record<string, unknown>) => string) => void;
+  onOpenFull: (payload: FullContentPayload) => void;
+  makeLoadFull: (key: string, url: string, extract: (raw: Record<string, unknown>) => string) => () => Promise<string>;
 }) {
   const key = `del:${delivery.messageId}`;
   const text = expandedText[key] ?? (delivery.text || delivery.reason || '（空）');
   return (
     <Card>
-      <CardHeader className="pb-1"><CardTitle className="text-xs">回复投递 · #{delivery.seq}</CardTitle></CardHeader>
+      <CardHeader className="pb-1">
+        <div className="flex items-center justify-between gap-2">
+          <CardTitle className="text-xs">回复投递 · #{delivery.seq}</CardTitle>
+          <ViewFullButton
+            onClick={() =>
+              onOpenFull({
+                title: `回复投递完整正文 · #${delivery.seq}`,
+                content: text,
+                mode: 'markdown',
+                ...(delivery.textTruncated && !expandedText[key]
+                  ? {
+                      truncatedHint: '当前为回复正文截取片段，点击「拉取未截断全文」加载完整回复。',
+                      loadFull: makeLoadFull(
+                        key,
+                        `/api/message?messageId=${encodeURIComponent(delivery.messageId)}`,
+                        raw => String(raw.text ?? '（空）'),
+                      ),
+                    }
+                  : {}),
+              })
+            }
+          />
+        </div>
+      </CardHeader>
       <CardContent className="space-y-1.5 text-xs">
-        <pre className="max-h-40 overflow-auto rounded bg-muted/40 p-2 font-mono text-[11px] whitespace-pre-wrap">{text}</pre>
+        <pre className="max-h-40 overflow-auto rounded bg-muted/40 p-2 font-mono text-[11px] whitespace-pre-wrap break-words">{text}</pre>
         {delivery.textTruncated && !expandedText[key] && (
           <Button
             size="xs"

@@ -3,6 +3,12 @@ import { errorText, formatIntervalText, timestamp } from '@friday/web/shared/for
 import { ArrowUpRightIcon, CheckCircle2Icon, ClockIcon, PlusIcon, Trash2Icon } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { ConfirmActionDialog } from '@/components/shared/ConfirmActionDialog';
+import {
+  ExpandableText,
+  FullContentDialog,
+  ViewFullButton,
+  type FullContentPayload,
+} from '@/components/shared/FullContentViewer';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -43,6 +49,7 @@ export function TimerHub() {
   const [busy, setBusy] = useState(false);
   const [errMsg, setErrMsg] = useState('');
   const [deleteTarget, setDeleteTarget] = useState<TimerView | null>(null);
+  const [viewerPayload, setViewerPayload] = useState<FullContentPayload | null>(null);
 
   const disabled = !ready || authExpired || busy;
 
@@ -200,7 +207,7 @@ export function TimerHub() {
               >
                 <option value="">由主控大模型调度</option>
                 {plugins.filter(p => p.enabled !== false).flatMap(p =>
-                  (p.actionSpecs ?? p.actions.map(a => ({ name: a, label: a }))).slice(0, 3).map(spec => (
+                  (p.actionSpecs ?? p.actions.map(a => ({ name: a, label: a }))).map(spec => (
                     <option key={`${p.name}/${spec.name}`} value={`${p.name}/${spec.name}`}>
                       {p.title} · {spec.label ?? spec.name}
                     </option>
@@ -255,7 +262,7 @@ export function TimerHub() {
             return (
               <div key={t.id} className="rounded-xl border bg-card p-3 text-xs space-y-2">
                 <div className="flex flex-wrap items-start justify-between gap-2">
-                  <div className="min-w-0 space-y-1">
+                  <div className="min-w-0 flex-1 space-y-1">
                     <div className="flex flex-wrap items-center gap-1.5">
                       <ClockIcon className="size-3.5 text-muted-foreground" />
                       <span className="font-semibold text-sm text-foreground">{t.name}</span>
@@ -280,7 +287,24 @@ export function TimerHub() {
                         </Badge>
                       )}
                     </div>
-                    <p className="text-muted-foreground whitespace-pre-wrap">{t.instruction}</p>
+                    {t.instruction.length > 220 ? (
+                      <ExpandableText
+                        text={t.instruction}
+                        clampClass="line-clamp-3"
+                        threshold={220}
+                        className="text-muted-foreground"
+                        onOpenFull={() =>
+                          setViewerPayload({
+                            title: `定时任务完整指令 · ${t.name}`,
+                            subtitle: t.dailyAt ? `每日 ${t.dailyAt}` : formatIntervalText(t.intervalMs),
+                            content: t.instruction,
+                            mode: 'text',
+                          })
+                        }
+                      />
+                    ) : (
+                      <p className="text-muted-foreground whitespace-pre-wrap">{t.instruction}</p>
+                    )}
                   </div>
 
                   <div className="flex shrink-0 items-center gap-1.5">
@@ -332,8 +356,20 @@ export function TimerHub() {
                   </div>
                 )}
                 {t.lastError && (
-                  <div className="rounded border border-destructive/30 bg-destructive/8 px-2.5 py-1.5 text-[11px] text-destructive-foreground">
-                    最近错误：{t.lastError}
+                  <div className="flex items-start justify-between gap-2 rounded border border-destructive/30 bg-destructive/8 px-2.5 py-1.5 text-[11px] text-destructive-foreground">
+                    <span className="min-w-0 flex-1 break-words whitespace-pre-wrap">最近错误：{t.lastError}</span>
+                    {t.lastError.length > 180 && (
+                      <ViewFullButton
+                        className="shrink-0"
+                        onClick={() =>
+                          setViewerPayload({
+                            title: `定时任务错误详情 · ${t.name}`,
+                            content: t.lastError!,
+                            mode: 'text',
+                          })
+                        }
+                      />
+                    )}
                   </div>
                 )}
               </div>
@@ -350,6 +386,8 @@ export function TimerHub() {
         busy={busy}
         onConfirm={removeTimer}
       />
+
+      <FullContentDialog payload={viewerPayload} onClose={() => setViewerPayload(null)} />
     </div>
   );
 }

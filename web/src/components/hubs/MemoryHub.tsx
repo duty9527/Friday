@@ -28,6 +28,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { StaticBotAvatar } from '@/components/CompanionAvatar';
 import { MarkdownContent } from '@/components/MarkdownContent';
 import { ConfirmActionDialog } from '@/components/shared/ConfirmActionDialog';
+import {
+  FullContentDialog,
+  ViewFullButton,
+  type FullContentPayload,
+} from '@/components/shared/FullContentViewer';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -86,6 +91,8 @@ function MemoryMatrixPanel({ active }: { active: boolean }) {
   const [busy, setBusy] = useState(false);
   const [errMsg, setErrMsg] = useState('');
   const [deleteTarget, setDeleteTarget] = useState<BrainMemoryItem | null>(null);
+  const [showAllHits, setShowAllHits] = useState(false);
+  const [viewerPayload, setViewerPayload] = useState<FullContentPayload | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const brainRef = useRef<GoldenBrainStage | null>(null);
@@ -227,12 +234,13 @@ function MemoryMatrixPanel({ active }: { active: boolean }) {
     setErrMsg('');
     try {
       const res = await api<{ hits?: ContextSearchHit[] } | ContextSearchHit[]>(
-        `/api/memories?${new URLSearchParams({ query: q, scope: searchScope })}`,
+        `/api/memories?${new URLSearchParams({ query: q, scope: searchScope, limit: '36' })}`,
         undefined,
         { signal: ac.signal },
       );
       if (seq !== searchSeqRef.current || ac.signal.aborted) return;
       const hits = Array.isArray(res) ? res : (res.hits ?? []);
+      setShowAllHits(false);
       setSearchHits(hits);
       const firstId = hits.find(h => h.kind === 'memory')?.memoryId ?? hits.find(h => h.kind === 'memory')?.id;
       if (firstId) {
@@ -375,43 +383,92 @@ function MemoryMatrixPanel({ active }: { active: boolean }) {
 
       {/* Bounded Search Hits */}
       {searchHits && (
-        <Card className="flex max-h-36 shrink-0 flex-col overflow-hidden text-xs">
+        <Card className="flex max-h-44 shrink-0 flex-col overflow-hidden text-xs">
           <div className="flex shrink-0 items-center justify-between border-b px-3 py-1.5">
             <span className="font-semibold text-foreground">联想检索命中 {searchHits.length} 条</span>
-            <Button size="xs" variant="ghost" onClick={() => { setSearchQuery(''); setSearchHits(null); }}>
-              清空结果
-            </Button>
+            <div className="flex items-center gap-1">
+              {searchHits.length > 8 && (
+                <Button size="xs" variant="ghost" onClick={() => setShowAllHits(v => !v)}>
+                  {showAllHits ? '收起至前 8 条' : `显示全部 (${searchHits.length})`}
+                </Button>
+              )}
+              <Button size="xs" variant="ghost" onClick={() => { setSearchQuery(''); setSearchHits(null); setShowAllHits(false); }}>
+                清空结果
+              </Button>
+            </div>
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto p-2">
             {searchHits.length === 0 ? (
               <p className="py-2 text-center text-muted-foreground">未命中相关条目。</p>
             ) : (
               <div className="grid gap-1.5 sm:grid-cols-2">
-                {searchHits.slice(0, 8).map(hit => (
-                  <button
-                    key={`${hit.kind}-${hit.id}`}
-                    type="button"
-                    onClick={() => {
-                      if (hit.kind === 'memory') {
-                        focusItem(hit.memoryId ?? hit.id);
-                      } else if (hit.kind === 'work' && hit.taskId) {
-                        selectTrace({ type: 'task', id: hit.taskId, label: hit.title }, true);
-                        setMobilePanel('trace');
-                        setActiveHub(null);
-                      } else if (hit.kind === 'message' && hit.messageId) {
-                        setActiveHub(null);
-                        void jumpMessage(hit.messageId);
-                      }
-                    }}
-                    className="flex cursor-pointer flex-col items-start gap-0.5 rounded-lg border bg-background p-2 text-start hover:bg-accent"
-                  >
-                    <div className="flex w-full items-center gap-1.5 font-medium text-foreground">
-                      <Badge size="sm" variant="outline">{hit.kind}</Badge>
-                      <span className="truncate">{hit.title}</span>
+                {(showAllHits ? searchHits : searchHits.slice(0, 8)).map(hit => {
+                  const matchedMem = hit.kind === 'memory' ? allItemsById.get(hit.memoryId ?? hit.id) : undefined;
+                  const memBody = matchedMem ? ('content' in matchedMem ? matchedMem.content : matchedMem.preview) : hit.snippet;
+                  return (
+                    <div
+                      key={`${hit.kind}-${hit.id}`}
+                      className="flex flex-col gap-1 rounded-lg border bg-background p-2 transition-colors hover:bg-accent/40"
+                    >
+                      <div className="flex items-start justify-between gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (hit.kind === 'memory') {
+                              focusItem(hit.memoryId ?? hit.id);
+                            } else if (hit.kind === 'work' && hit.taskId) {
+                              selectTrace({ type: 'task', id: hit.taskId, label: hit.title }, true);
+                              setMobilePanel('trace');
+                              setActiveHub(null);
+                            } else if (hit.kind === 'message' && hit.messageId) {
+                              setActiveHub(null);
+                              void jumpMessage(hit.messageId);
+                            }
+                          }}
+                          className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-start font-medium text-foreground hover:underline"
+                        >
+                          <Badge size="sm" variant="outline" className="shrink-0">{hit.kind}</Badge>
+                          <span className="truncate" title={hit.title}>{hit.title}</span>
+                        </button>
+                        <ViewFullButton
+                          className="shrink-0"
+                          onClick={() =>
+                            setViewerPayload({
+                              title: hit.title,
+                              badges: [{ label: hit.kind, variant: 'outline' }],
+                              content: memBody,
+                              mode: 'markdown',
+                              ...(hit.kind === 'message' && hit.messageId
+                                ? {
+                                    truncatedHint: '点击下方按钮可拉取该历史消息的完整未截断正文。',
+                                    loadFull: async () => {
+                                      const res = await api<Record<string, unknown>>(
+                                        `/api/message?messageId=${encodeURIComponent(hit.messageId!)}`,
+                                      );
+                                      return String(res.text ?? hit.snippet);
+                                    },
+                                  }
+                                : hit.kind === 'work' && hit.taskId
+                                  ? {
+                                      truncatedHint: '点击下方按钮可拉取该后台工作的完整指令与总结报告。',
+                                      loadFull: async () => {
+                                        const res = await api<Record<string, unknown>>(
+                                          `/api/work?taskId=${encodeURIComponent(hit.taskId!)}`,
+                                        );
+                                        const p = res.prompt ? `## 任务指令\n\n${String(res.prompt)}` : '';
+                                        const r = res.report ? `\n\n## 总结报告\n\n${String(res.report)}` : '';
+                                        return (p + r) || hit.snippet;
+                                      },
+                                    }
+                                  : {}),
+                            })
+                          }
+                        />
+                      </div>
+                      <p className="line-clamp-2 text-muted-foreground">{hit.snippet}</p>
                     </div>
-                    <p className="line-clamp-2 text-muted-foreground">{hit.snippet}</p>
-                  </button>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
@@ -465,10 +522,21 @@ function MemoryMatrixPanel({ active }: { active: boolean }) {
                 <div className="flex shrink-0 items-center justify-between gap-2 border-b px-3.5 py-2.5">
                   <div className="flex min-w-0 items-center gap-1.5">
                     <BrainIcon className="size-3.5 shrink-0 text-amber-500" />
-                    <span className="truncate text-sm font-semibold text-foreground">{selectedItem.topic}</span>
+                    <span title={selectedItem.topic} className="truncate text-sm font-semibold text-foreground">{selectedItem.topic}</span>
                     {selectedItem.pinned && <Badge size="sm" variant="warning" className="shrink-0">置顶</Badge>}
                   </div>
                   <div className="flex shrink-0 items-center gap-1">
+                    <ViewFullButton
+                      onClick={() =>
+                        setViewerPayload({
+                          title: selectedItem.topic,
+                          badges: selectedItem.tags.map(tag => ({ label: tag, variant: 'secondary' as const })),
+                          subtitle: `提取 ${selectedItem.accessCount ?? 0} 次 · 更新于 ${timestamp(selectedItem.updatedAt)}`,
+                          content: 'content' in selectedItem ? selectedItem.content : selectedItem.preview,
+                          mode: 'markdown',
+                        })
+                      }
+                    />
                     <Button
                       size="xs"
                       variant="ghost"
@@ -676,6 +744,8 @@ function MemoryMatrixPanel({ active }: { active: boolean }) {
           }
         }}
       />
+
+      <FullContentDialog payload={viewerPayload} onClose={() => setViewerPayload(null)} />
     </div>
   );
 }
@@ -700,6 +770,8 @@ function NotesPanel() {
   const [conflictNote, setConflictNote] = useState<NoteItem | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<NoteItem | null>(null);
   const [busy, setBusy] = useState(false);
+  const [showAllTags, setShowAllTags] = useState(false);
+  const [viewerPayload, setViewerPayload] = useState<FullContentPayload | null>(null);
 
   const seqRef = useRef(0);
   const dirtyRef = useRef(false);
@@ -848,7 +920,7 @@ function NotesPanel() {
           <Button size="xs" variant={!filterTag ? 'secondary' : 'ghost'} onClick={() => setFilterTag('')}>
             全部标签
           </Button>
-          {tagsList.slice(0, 10).map(t => (
+          {(showAllTags ? tagsList : tagsList.slice(0, 10)).map(t => (
             <Button
               key={t.tag}
               size="xs"
@@ -858,6 +930,11 @@ function NotesPanel() {
               {t.tag} ({t.count})
             </Button>
           ))}
+          {tagsList.length > 10 && (
+            <Button size="xs" variant="ghost" onClick={() => setShowAllTags(v => !v)}>
+              {showAllTags ? '收起标签' : `全部 (${tagsList.length})`}
+            </Button>
+          )}
         </div>
       )}
 
@@ -919,10 +996,10 @@ function NotesPanel() {
                   </Alert>
                 )}
 
-                <div className="flex items-center justify-between gap-2">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                   {inPreview ? (
                     <div className="flex min-w-0 flex-1 items-center gap-2">
-                      <h3 className="truncate text-base font-semibold text-foreground">{title || '无标题笔记'}</h3>
+                      <h3 title={title || '无标题笔记'} className="line-clamp-2 text-base font-semibold text-foreground">{title || '无标题笔记'}</h3>
                       {selectedNote?.pinned && <Badge size="sm" variant="warning" className="shrink-0">置顶</Badge>}
                     </div>
                   ) : (
@@ -935,12 +1012,26 @@ function NotesPanel() {
                     />
                   )}
 
-                  <div className="flex shrink-0 items-center gap-1">
+                  <div className="flex shrink-0 flex-wrap items-center gap-1">
                     {inPreview ? (
-                      <Button size="xs" variant="outline" onClick={() => setPreviewMode(false)}>
-                        <PencilIcon className="size-3" />
-                        <span>编辑</span>
-                      </Button>
+                      <>
+                        <ViewFullButton
+                          label="全屏阅读"
+                          onClick={() =>
+                            setViewerPayload({
+                              title: title || '无标题笔记',
+                              badges: parsedTags.map(tag => ({ label: tag, variant: 'secondary' as const })),
+                              subtitle: selectedNote ? `更新于 ${timestamp(selectedNote.updatedAt)}` : undefined,
+                              content: content || '*空笔记*',
+                              mode: 'markdown',
+                            })
+                          }
+                        />
+                        <Button size="xs" variant="outline" onClick={() => setPreviewMode(false)}>
+                          <PencilIcon className="size-3" />
+                          <span>编辑</span>
+                        </Button>
+                      </>
                     ) : (
                       <>
                         {!isNew && (
@@ -1064,6 +1155,8 @@ function NotesPanel() {
           }
         }}
       />
+
+      <FullContentDialog payload={viewerPayload} onClose={() => setViewerPayload(null)} />
     </div>
   );
 }
@@ -1082,6 +1175,7 @@ function DiaryPanel() {
   const [newTitle, setNewTitle] = useState('');
   const [newContent, setNewContent] = useState('');
   const [newMood, setNewMood] = useState<DiaryMood>('calm');
+  const [viewerPayload, setViewerPayload] = useState<FullContentPayload | null>(null);
 
   const seqRef = useRef(0);
 
@@ -1253,17 +1347,28 @@ function DiaryPanel() {
             <>
               {/* Fixed Diary Header */}
               <div className="shrink-0 space-y-1.5 border-b px-4 py-3">
-                <div className="flex items-start justify-between gap-2">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
                   <div className="flex min-w-0 flex-1 items-center gap-2.5">
                     <StaticBotAvatar expr={safeDiaryMood(selected.mood)} size={32} />
                     <div className="min-w-0 flex-1">
-                      <h4 className="truncate text-base font-semibold text-foreground">{selected.title}</h4>
+                      <h4 title={selected.title} className="line-clamp-2 text-base font-semibold text-foreground">{selected.title}</h4>
                       <div className="truncate text-[11px] text-muted-foreground">
                         {selected.date} · 来源 {selected.source} · {BOT_EXPRESSION_META[safeDiaryMood(selected.mood)].label}
                       </div>
                     </div>
                   </div>
-                  <div className="flex shrink-0 items-center gap-1">
+                  <div className="flex shrink-0 flex-wrap items-center gap-1">
+                    <ViewFullButton
+                      label="全屏阅读"
+                      onClick={() =>
+                        setViewerPayload({
+                          title: selected.title,
+                          subtitle: `${selected.date} · 来源 ${selected.source} · ${BOT_EXPRESSION_META[safeDiaryMood(selected.mood)].label}`,
+                          content: selected.content,
+                          mode: 'markdown',
+                        })
+                      }
+                    />
                     <Button
                       size="xs"
                       variant="outline"
@@ -1318,6 +1423,8 @@ function DiaryPanel() {
           }
         }}
       />
+
+      <FullContentDialog payload={viewerPayload} onClose={() => setViewerPayload(null)} />
     </div>
   );
 }

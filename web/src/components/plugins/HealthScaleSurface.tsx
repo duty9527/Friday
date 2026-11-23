@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ConfirmActionDialog } from '@/components/shared/ConfirmActionDialog';
+import { FullContentDialog, type FullContentPayload } from '@/components/shared/FullContentViewer';
 import { TrendLineChart, type TrendPoint } from '@/components/shared/MetricCharts';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
@@ -222,6 +223,8 @@ export default function HealthScaleSurface() {
   const [trendLimit, setTrendLimit] = useState<number>(30);
   const [sourceFilter, setSourceFilter] = useState<SourceFilterKey>('all');
   const [inspectedRecordId, setInspectedRecordId] = useState<string | null>(null);
+  const [showAllRecords, setShowAllRecords] = useState(false);
+  const [viewerPayload, setViewerPayload] = useState<FullContentPayload | null>(null);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<{ text: string; tone: 'ok' | 'warn' | 'err' } | null>(null);
 
@@ -1301,7 +1304,12 @@ export default function HealthScaleSurface() {
               <CardTitle className="text-sm">历史测量明细</CardTitle>
               <CardDescription className="text-xs">共 {filteredRecords.length} 条记录</CardDescription>
             </div>
-            <div className="flex flex-wrap gap-1">
+            <div className="flex flex-wrap items-center gap-1">
+              {filteredRecords.length > 60 && (
+                <Button size="xs" variant="ghost" onClick={() => setShowAllRecords(v => !v)}>
+                  {showAllRecords ? '收起至前 60 条' : `显示全部 (${filteredRecords.length} 条)`}
+                </Button>
+              )}
               {SOURCE_LABELS.map(src => (
                 <Button
                   key={src.key}
@@ -1331,7 +1339,7 @@ export default function HealthScaleSurface() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {filteredRecords.slice(0, 60).map(r => {
+                {(showAllRecords ? filteredRecords : filteredRecords.slice(0, 60)).map(r => {
                   const sb = sourceBadgeInfo(r.source);
                   const isInspected = inspectedRecord?.id === r.id;
                   return (
@@ -1342,7 +1350,27 @@ export default function HealthScaleSurface() {
                       <TableCell className="font-mono text-xs text-muted-foreground">
                         {r.metrics ? `${r.metrics.bodyFatPercent.toFixed(1)}% / ${r.metrics.bmi.toFixed(1)}` : '—'}
                       </TableCell>
-                      <TableCell className="text-xs text-muted-foreground max-w-44 truncate">{r.note || '—'}</TableCell>
+                      <TableCell className="max-w-44 text-xs text-muted-foreground">
+                        {r.note && r.note.length > 16 ? (
+                          <button
+                            type="button"
+                            title={`${r.note}（点击查看完整备注）`}
+                            onClick={() =>
+                              setViewerPayload({
+                                title: `测量记录完整备注 · ${fmtWeightUnit(r.weightKg, unit, 2)}`,
+                                subtitle: `${timestamp(r.measuredAt)} · ${sb.text}${r.metrics ? ` · 体脂 ${r.metrics.bodyFatPercent.toFixed(1)}% · BMI ${r.metrics.bmi.toFixed(1)}` : ''}`,
+                                content: r.note!,
+                                mode: 'text',
+                              })
+                            }
+                            className="block w-full cursor-pointer truncate text-start hover:text-foreground hover:underline"
+                          >
+                            {r.note}
+                          </button>
+                        ) : (
+                          <span title={r.note || undefined} className="block truncate">{r.note || '—'}</span>
+                        )}
+                      </TableCell>
                       <TableCell className="text-right">
                         <div className="inline-flex items-center gap-1">
                           <Button size="xs" variant={isInspected ? 'secondary' : 'ghost'} onClick={() => setInspectedRecordId(r.id)}>
@@ -1381,6 +1409,8 @@ export default function HealthScaleSurface() {
         busy={busy}
         onConfirm={confirmDeleteRecord}
       />
+
+      <FullContentDialog payload={viewerPayload} onClose={() => setViewerPayload(null)} />
     </div>
   );
 }

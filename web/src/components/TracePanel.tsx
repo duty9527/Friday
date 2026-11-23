@@ -1,5 +1,6 @@
+import type { MemoryCard } from '@friday/view.js';
 import { activeStatus, record } from '@friday/web/model.js';
-import { errorText, formatNumber, profileBadges, statusText, tierBadges } from '@friday/web/shared/format.js';
+import { formatNumber, profileBadges, statusText, tierBadges } from '@friday/web/shared/format.js';
 import type {
   ChainActionNode,
   ChainCategory,
@@ -22,6 +23,12 @@ import {
   XIcon,
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  ExpandableText,
+  FullContentDialog,
+  ViewFullButton,
+  type FullContentPayload,
+} from '@/components/shared/FullContentViewer';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -93,7 +100,13 @@ function CopySnippetBtn({ text, label = '复制' }: { text: string; label?: stri
   );
 }
 
-function ToolParamsView({ params }: { params: readonly ChainParamItem[] }) {
+function ToolParamsView({
+  params,
+  onOpenFull,
+}: {
+  params: readonly ChainParamItem[];
+  onOpenFull: (payload: FullContentPayload) => void;
+}) {
   if (!params.length) {
     return <p className="text-xs text-muted-foreground">本工具调用未传入额外参数。</p>;
   }
@@ -104,17 +117,29 @@ function ToolParamsView({ params }: { params: readonly ChainParamItem[] }) {
     if (param.kind === 'diff_old' || param.kind === 'diff_new') {
       const next = params[i + 1];
       if (param.kind === 'diff_old' && next?.kind === 'diff_new') {
+        const diffCombined = `--- ${param.label}\n${param.value}\n\n+++ ${next.label}\n${next.value}`;
         items.push({
           key: `diff-${i}`,
           el: (
             <div className="space-y-1.5 rounded-lg border bg-card p-2.5 text-xs">
-              <div className="font-medium text-muted-foreground">文本变更对比</div>
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-medium text-muted-foreground">文本变更对比</span>
+                <ViewFullButton
+                  onClick={() =>
+                    onOpenFull({
+                      title: '文本变更完整对比',
+                      content: diffCombined,
+                      mode: 'code',
+                    })
+                  }
+                />
+              </div>
               <div className="text-[11px] font-mono text-destructive-foreground">- {param.label}</div>
-              <pre className="overflow-x-auto rounded border border-destructive/30 bg-destructive/6 p-2 font-mono text-[11px]">
+              <pre className="max-h-40 overflow-auto rounded border border-destructive/30 bg-destructive/6 p-2 font-mono text-[11px]">
                 {param.value}
               </pre>
               <div className="text-[11px] font-mono text-success-foreground">+ {next.label}</div>
-              <pre className="overflow-x-auto rounded border border-success/30 bg-success/6 p-2 font-mono text-[11px]">
+              <pre className="max-h-40 overflow-auto rounded border border-success/30 bg-success/6 p-2 font-mono text-[11px]">
                 {next.value}
               </pre>
             </div>
@@ -127,8 +152,19 @@ function ToolParamsView({ params }: { params: readonly ChainParamItem[] }) {
         key: `diff-single-${i}`,
         el: (
           <div className="space-y-1 rounded-lg border bg-card p-2.5 text-xs">
-            <div className="font-medium text-muted-foreground">{param.label}</div>
-            <pre className="overflow-x-auto rounded border bg-code p-2 font-mono text-[11px]">{param.value}</pre>
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-medium text-muted-foreground">{param.label}</span>
+              <ViewFullButton
+                onClick={() =>
+                  onOpenFull({
+                    title: param.label,
+                    content: param.value,
+                    mode: 'code',
+                  })
+                }
+              />
+            </div>
+            <pre className="max-h-40 overflow-auto rounded border bg-code p-2 font-mono text-[11px]">{param.value}</pre>
           </div>
         ),
       });
@@ -140,11 +176,22 @@ function ToolParamsView({ params }: { params: readonly ChainParamItem[] }) {
         key: `code-${i}`,
         el: (
           <div className="space-y-1 rounded-lg border bg-card p-2.5 text-xs">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-1">
               <span className="font-medium text-muted-foreground">{param.label}</span>
-              <CopySnippetBtn text={param.value} />
+              <div className="flex items-center gap-1">
+                <ViewFullButton
+                  onClick={() =>
+                    onOpenFull({
+                      title: `参数 · ${param.label}`,
+                      content: param.value,
+                      mode: 'code',
+                    })
+                  }
+                />
+                <CopySnippetBtn text={param.value} />
+              </div>
             </div>
-            <pre className="overflow-x-auto rounded border bg-code p-2 font-mono text-[11px]">{param.value}</pre>
+            <pre className="max-h-40 overflow-auto rounded border bg-code p-2 font-mono text-[11px]">{param.value}</pre>
           </div>
         ),
       });
@@ -153,7 +200,10 @@ function ToolParamsView({ params }: { params: readonly ChainParamItem[] }) {
         key: `path-${i}`,
         el: (
           <div className="rounded-lg border bg-card p-2.5 text-xs space-y-1">
-            <div className="font-medium text-muted-foreground">{param.label}</div>
+            <div className="flex items-center justify-between gap-1">
+              <span className="font-medium text-muted-foreground">{param.label}</span>
+              <CopySnippetBtn text={param.value} />
+            </div>
             <div className="break-all font-mono text-[11px] text-foreground">{param.value}</div>
           </div>
         ),
@@ -169,11 +219,25 @@ function ToolParamsView({ params }: { params: readonly ChainParamItem[] }) {
         ),
       });
     } else {
+      const isLongText = param.value.length > 160 || param.value.split('\n').length > 4;
       items.push({
         key: `text-${i}`,
         el: (
           <div className="rounded-lg border bg-card p-2.5 text-xs space-y-1">
-            <div className="font-medium text-muted-foreground">{param.label}</div>
+            <div className="flex items-center justify-between gap-1">
+              <span className="font-medium text-muted-foreground">{param.label}</span>
+              {isLongText && (
+                <ViewFullButton
+                  onClick={() =>
+                    onOpenFull({
+                      title: `参数 · ${param.label}`,
+                      content: param.value,
+                      mode: 'text',
+                    })
+                  }
+                />
+              )}
+            </div>
             <div className="whitespace-pre-wrap break-words text-foreground">{param.value}</div>
           </div>
         ),
@@ -188,12 +252,15 @@ function SemanticInspector({
   node,
   chainView,
   onClose,
+  onOpenFull,
 }: {
   node: ChainActionNode;
   chainView: ExecutionChainView;
   onClose: () => void;
+  onOpenFull: (payload: FullContentPayload) => void;
 }) {
   const {
+    api,
     ready,
     authExpired,
     selection,
@@ -228,25 +295,95 @@ function SemanticInspector({
 
   const finalToolOutput = (cachedOp?.text && cachedOp.text.trim().length > 0) ? cachedOp.text : tool?.resultText;
 
+  const buildInspectorSummaryPayload = (): FullContentPayload | null => {
+    if (tool) {
+      const content = finalToolOutput || tool.errorText || tool.params.map(p => `${p.label}:\n${p.value}`).join('\n\n');
+      return {
+        title: `${node.title} · 完整步骤详情`,
+        subtitle: `${tool.displayName} (${tool.toolName})`,
+        badges: [{ label: node.statusLabel, variant: badgeVariantForTone(node.tone) }],
+        content: content || '（无额外文本输出）',
+        mode: finalToolOutput ? 'code' : 'text',
+        ...(opId && opTaskId && !cachedOp?.text
+          ? {
+              truncatedHint: tool.resultTruncated ? '当前展示为截取输出，点击可从后台拉取完整执行结果。' : undefined,
+              loadFull: async () => {
+                const res = await api<Record<string, unknown>>(
+                  `/api/operation?taskId=${encodeURIComponent(opTaskId)}&operationId=${encodeURIComponent(opId)}`,
+                );
+                return String(res.result ?? res.error ?? finalToolOutput ?? '（空）');
+              },
+            }
+          : {}),
+      };
+    }
+    if (llm) {
+      const parts: string[] = [];
+      if (llm.inputContext) parts.push(`## 输入触发上下文\n\n${llm.inputContext}`);
+      if (llm.thinkingText) parts.push(`## 思考摘要\n\n${llm.thinkingText}`);
+      if (llm.publicText) parts.push(`## 本轮模型输出\n\n${llm.publicText}`);
+      if (llm.errorText) parts.push(`## 异常信息\n\n${llm.errorText}`);
+      return {
+        title: `${node.title} · 模型调用完整详情`,
+        subtitle: `${llm.model ?? '未记录模型'}${llm.provider ? ` · ${llm.provider}` : ''}`,
+        badges: [{ label: llm.stopReasonLabel, variant: badgeVariantForTone(node.tone) }],
+        content: parts.join('\n\n') || '（无详细文本记录）',
+        mode: 'markdown',
+        ...(llm.publicTextTruncated ? { truncatedHint: '事件日志中记录的模型正文已被截断保存。' } : {}),
+      };
+    }
+    if (msg) {
+      return {
+        title: `${node.title} · 消息完整正文`,
+        subtitle: `${msg.channelLabel} · ${msg.senderLabel}`,
+        content: msg.text || '（无公开文本）',
+        mode: 'markdown',
+      };
+    }
+    if (rt) {
+      const parts: string[] = [];
+      if (rt.promptText) parts.push(`## 任务指令正文\n\n${rt.promptText}`);
+      if (rt.contextBrief) parts.push(`## 背景简报\n\n${rt.contextBrief}`);
+      if (rt.reportText) parts.push(`## 汇报正文\n\n${rt.reportText}`);
+      if (rt.errorText) parts.push(`## 错误说明\n\n${rt.errorText}`);
+      return {
+        title: rt.kindLabel || `${node.title} · 完整详情`,
+        subtitle: rt.targetTaskLabel,
+        content: parts.join('\n\n') || rt.summaryItems.map(i => `${i.label}: ${i.value}`).join('\n') || '（空）',
+        mode: 'markdown',
+      };
+    }
+    return null;
+  };
+
   return (
     <div id="event-detail" className="flex min-h-0 flex-col border-t bg-card/40">
       <div className="flex items-center justify-between gap-2 border-b px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
-          <h3 ref={headingRef} tabIndex={-1} className="truncate text-xs font-semibold text-foreground outline-none">
+          <h3 ref={headingRef} tabIndex={-1} title={node.title} className="truncate text-xs font-semibold text-foreground outline-none">
             {node.title}
           </h3>
           <Badge size="sm" variant={badgeVariantForTone(node.tone)}>{node.statusLabel}</Badge>
         </div>
-        <Button
-          type="button"
-          size="icon-xs"
-          variant="ghost"
-          className="inspector-close-btn"
-          aria-label="关闭步骤检视器"
-          onClick={onClose}
-        >
-          <XIcon className="size-3.5" />
-        </Button>
+        <div className="flex shrink-0 items-center gap-1">
+          <ViewFullButton
+            label="全屏"
+            onClick={() => {
+              const summaryPayload = buildInspectorSummaryPayload();
+              if (summaryPayload) onOpenFull(summaryPayload);
+            }}
+          />
+          <Button
+            type="button"
+            size="icon-xs"
+            variant="ghost"
+            className="inspector-close-btn"
+            aria-label="关闭步骤检视器"
+            onClick={onClose}
+          >
+            <XIcon className="size-3.5" />
+          </Button>
+        </div>
       </div>
 
       <ScrollArea className="max-h-96 min-h-0 flex-1" overscrollContain>
@@ -270,13 +407,13 @@ function SemanticInspector({
 
               <section className="space-y-2">
                 <div className="font-semibold text-muted-foreground">使用参数</div>
-                <ToolParamsView params={tool.params} />
+                <ToolParamsView params={tool.params} onOpenFull={onOpenFull} />
               </section>
 
               <section className="space-y-2">
                 <div className="font-semibold text-muted-foreground">获取结果</div>
                 {tool.errorText && (
-                  <p className="rounded-lg border border-destructive/30 bg-destructive/10 p-2.5 text-destructive-foreground">
+                  <p className="rounded-lg border border-destructive/30 bg-destructive/10 p-2.5 text-destructive-foreground whitespace-pre-wrap break-words">
                     {tool.errorText}
                   </p>
                 )}
@@ -293,11 +430,34 @@ function SemanticInspector({
                 )}
                 {finalToolOutput ? (
                   <div className="space-y-1">
-                    <div className="flex items-center justify-between">
+                    <div className="flex items-center justify-between gap-1">
                       <span className="text-muted-foreground">
                         {cachedOp?.text ? '完整执行输出' : (tool.resultTruncated ? '执行输出（已截取片段）' : '执行输出')}
                       </span>
-                      <CopySnippetBtn text={finalToolOutput} label="复制结果" />
+                      <div className="flex items-center gap-1">
+                        <ViewFullButton
+                          onClick={() =>
+                            onOpenFull({
+                              title: `${tool.displayName} · 完整执行输出`,
+                              subtitle: tool.toolName,
+                              content: finalToolOutput,
+                              mode: 'code',
+                              ...(opId && opTaskId && !cachedOp?.text
+                                ? {
+                                    truncatedHint: tool.resultTruncated ? '当前显示为截取片段，可尝试从后台拉取完整执行输出。' : undefined,
+                                    loadFull: async () => {
+                                      const res = await api<Record<string, unknown>>(
+                                        `/api/operation?taskId=${encodeURIComponent(opTaskId)}&operationId=${encodeURIComponent(opId)}`,
+                                      );
+                                      return String(res.result ?? res.error ?? finalToolOutput);
+                                    },
+                                  }
+                                : {}),
+                            })
+                          }
+                        />
+                        <CopySnippetBtn text={finalToolOutput} label="复制结果" />
+                      </div>
                     </div>
                     <pre className="max-h-60 overflow-auto rounded-lg border bg-code p-2.5 font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-words">
                       {finalToolOutput}
@@ -351,7 +511,7 @@ function SemanticInspector({
                   </div>
                 )}
                 {llm.errorText && (
-                  <p className="rounded-lg border border-destructive/30 bg-destructive/10 p-2 text-destructive-foreground">
+                  <p className="rounded-lg border border-destructive/30 bg-destructive/10 p-2 text-destructive-foreground whitespace-pre-wrap break-words">
                     {llm.errorText}
                   </p>
                 )}
@@ -359,18 +519,45 @@ function SemanticInspector({
 
               {llm.inputContext && (
                 <section className="space-y-1.5">
-                  <div className="font-semibold text-muted-foreground">输入触发上下文</div>
-                  <div className="rounded-lg border bg-background p-2.5 whitespace-pre-wrap break-words">{llm.inputContext}</div>
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="font-semibold text-muted-foreground">输入触发上下文</span>
+                    <div className="flex items-center gap-1">
+                      <ViewFullButton
+                        onClick={() =>
+                          onOpenFull({
+                            title: '输入触发完整上下文',
+                            subtitle: llm.model ?? undefined,
+                            content: llm.inputContext!,
+                            mode: 'text',
+                          })
+                        }
+                      />
+                      <CopySnippetBtn text={llm.inputContext} />
+                    </div>
+                  </div>
+                  <div className="max-h-40 overflow-y-auto rounded-lg border bg-background p-2.5 whitespace-pre-wrap break-words">{llm.inputContext}</div>
                 </section>
               )}
 
               {llm.thinkingText && (
                 <section className="space-y-1.5">
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-center justify-between gap-1">
                     <span className="font-semibold text-muted-foreground">思考摘要</span>
-                    <CopySnippetBtn text={llm.thinkingText} />
+                    <div className="flex items-center gap-1">
+                      <ViewFullButton
+                        onClick={() =>
+                          onOpenFull({
+                            title: '完整思考过程',
+                            subtitle: llm.model ?? undefined,
+                            content: llm.thinkingText!,
+                            mode: 'markdown',
+                          })
+                        }
+                      />
+                      <CopySnippetBtn text={llm.thinkingText} />
+                    </div>
                   </div>
-                  <div className="rounded-lg border bg-muted/35 p-2.5 whitespace-pre-wrap break-words text-muted-foreground">
+                  <div className="max-h-48 overflow-y-auto rounded-lg border bg-muted/35 p-2.5 whitespace-pre-wrap break-words text-muted-foreground">
                     {llm.thinkingText}
                   </div>
                 </section>
@@ -378,13 +565,26 @@ function SemanticInspector({
 
               {llm.publicText && (
                 <section className="space-y-1.5">
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-center justify-between gap-1">
                     <span className="font-semibold text-muted-foreground">
                       {llm.publicTextTruncated ? '本轮模型输出（已截取）' : '本轮模型输出'}
                     </span>
-                    <CopySnippetBtn text={llm.publicText} />
+                    <div className="flex items-center gap-1">
+                      <ViewFullButton
+                        onClick={() =>
+                          onOpenFull({
+                            title: '本轮模型完整输出',
+                            subtitle: llm.model ?? undefined,
+                            content: llm.publicText!,
+                            mode: 'markdown',
+                            ...(llm.publicTextTruncated ? { truncatedHint: '事件日志保存的是截取后的模型输出摘要。' } : {}),
+                          })
+                        }
+                      />
+                      <CopySnippetBtn text={llm.publicText} />
+                    </div>
                   </div>
-                  <div className="rounded-lg border bg-background p-2.5 whitespace-pre-wrap break-words">
+                  <div className="max-h-48 overflow-y-auto rounded-lg border bg-background p-2.5 whitespace-pre-wrap break-words">
                     {llm.publicText}
                   </div>
                 </section>
@@ -415,7 +615,7 @@ function SemanticInspector({
                             </div>
                             {targetNode && <Badge size="sm" variant="outline">跳转检视 →</Badge>}
                           </div>
-                          {dec.summary && <p className="text-muted-foreground line-clamp-2">{dec.summary}</p>}
+                          {dec.summary && <p className="text-muted-foreground whitespace-pre-wrap break-words">{dec.summary}</p>}
                         </button>
                       );
                     })}
@@ -442,11 +642,25 @@ function SemanticInspector({
               </section>
 
               <section className="space-y-1.5">
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between gap-1">
                   <span className="font-semibold text-muted-foreground">消息完整正文</span>
-                  {msg.text && <CopySnippetBtn text={msg.text} label="复制正文" />}
+                  <div className="flex items-center gap-1">
+                    {msg.text && (
+                      <ViewFullButton
+                        onClick={() =>
+                          onOpenFull({
+                            title: '消息完整正文',
+                            subtitle: `${msg.channelLabel} · ${msg.senderLabel}`,
+                            content: msg.text!,
+                            mode: 'markdown',
+                          })
+                        }
+                      />
+                    )}
+                    {msg.text && <CopySnippetBtn text={msg.text} label="复制正文" />}
+                  </div>
                 </div>
-                <div className="rounded-lg border bg-background p-2.5 whitespace-pre-wrap break-words">
+                <div className="max-h-56 overflow-y-auto rounded-lg border bg-background p-2.5 whitespace-pre-wrap break-words">
                   {msg.text || '（无公开文本）'}
                 </div>
               </section>
@@ -480,30 +694,69 @@ function SemanticInspector({
                   </div>
                 )}
                 {rt.errorText && (
-                  <p className="rounded-lg border border-destructive/30 bg-destructive/10 p-2 text-destructive-foreground">
+                  <p className="rounded-lg border border-destructive/30 bg-destructive/10 p-2 text-destructive-foreground whitespace-pre-wrap break-words">
                     {rt.errorText}
                   </p>
                 )}
               </section>
               {rt.promptText && (
                 <section className="space-y-1">
-                  <div className="font-semibold text-muted-foreground">任务指令正文</div>
-                  <div className="rounded-lg border bg-background p-2.5 whitespace-pre-wrap">{rt.promptText}</div>
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="font-semibold text-muted-foreground">任务指令正文</span>
+                    <div className="flex items-center gap-1">
+                      <ViewFullButton
+                        onClick={() =>
+                          onOpenFull({
+                            title: '任务指令完整正文',
+                            content: rt.promptText!,
+                            mode: 'text',
+                          })
+                        }
+                      />
+                      <CopySnippetBtn text={rt.promptText} />
+                    </div>
+                  </div>
+                  <div className="max-h-40 overflow-y-auto rounded-lg border bg-background p-2.5 whitespace-pre-wrap break-words">{rt.promptText}</div>
                 </section>
               )}
               {rt.contextBrief && (
                 <section className="space-y-1">
-                  <div className="font-semibold text-muted-foreground">背景简报</div>
-                  <div className="rounded-lg border bg-background p-2.5 whitespace-pre-wrap">{rt.contextBrief}</div>
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="font-semibold text-muted-foreground">背景简报</span>
+                    <div className="flex items-center gap-1">
+                      <ViewFullButton
+                        onClick={() =>
+                          onOpenFull({
+                            title: '完整背景简报',
+                            content: rt.contextBrief!,
+                            mode: 'text',
+                          })
+                        }
+                      />
+                      <CopySnippetBtn text={rt.contextBrief} />
+                    </div>
+                  </div>
+                  <div className="max-h-40 overflow-y-auto rounded-lg border bg-background p-2.5 whitespace-pre-wrap break-words">{rt.contextBrief}</div>
                 </section>
               )}
               {rt.reportText && (
                 <section className="space-y-1">
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-center justify-between gap-1">
                     <span className="font-semibold text-muted-foreground">汇报正文</span>
-                    <CopySnippetBtn text={rt.reportText} label="复制汇报" />
+                    <div className="flex items-center gap-1">
+                      <ViewFullButton
+                        onClick={() =>
+                          onOpenFull({
+                            title: '完整汇报正文',
+                            content: rt.reportText!,
+                            mode: 'markdown',
+                          })
+                        }
+                      />
+                      <CopySnippetBtn text={rt.reportText} label="复制汇报" />
+                    </div>
                   </div>
-                  <div className="rounded-lg border bg-background p-2.5 whitespace-pre-wrap">{rt.reportText}</div>
+                  <div className="max-h-48 overflow-y-auto rounded-lg border bg-background p-2.5 whitespace-pre-wrap break-words">{rt.reportText}</div>
                 </section>
               )}
             </>
@@ -514,8 +767,15 @@ function SemanticInspector({
   );
 }
 
-function WorkDetailOverview({ chainView }: { chainView: ExecutionChainView }) {
+function WorkDetailOverview({
+  chainView,
+  onOpenFull,
+}: {
+  chainView: ExecutionChainView;
+  onOpenFull: (payload: FullContentPayload) => void;
+}) {
   const {
+    api,
     selection,
     traceBundle,
     workData,
@@ -567,9 +827,27 @@ function WorkDetailOverview({ chainView }: { chainView: ExecutionChainView }) {
   return (
     <div id="work-detail" className="border-b bg-card/50 px-3 py-2.5 space-y-2">
       <div className="work-overview-head flex items-start justify-between gap-2">
-        <div className="min-w-0">
-          <h3 className="line-clamp-2 text-xs font-semibold text-foreground">{prompt || '后台工作'}</h3>
-          {cwd && <p className="truncate font-mono text-[11px] text-muted-foreground">{cwd}</p>}
+        <div className="min-w-0 flex-1 space-y-1">
+          <ExpandableText
+            text={prompt || '后台工作'}
+            clampClass="line-clamp-2"
+            threshold={64}
+            textClassName="text-xs font-semibold text-foreground"
+            onOpenFull={() =>
+              onOpenFull({
+                title: '任务完整指令与总览',
+                badges: [{ label: statusLabel }],
+                subtitle: cwd ? `工作目录：${cwd}` : undefined,
+                content: [
+                  prompt || '后台工作',
+                  cwd ? `\n工作目录：${cwd}` : '',
+                  reason ? `\n状态说明：${reason}` : '',
+                ].filter(Boolean).join('\n'),
+                mode: 'text',
+              })
+            }
+          />
+          {cwd && <p title={cwd} className="truncate font-mono text-[11px] text-muted-foreground">{cwd}</p>}
         </div>
         <div className="flex shrink-0 items-center gap-1">
           {status === 'paused' && (
@@ -634,7 +912,7 @@ function WorkDetailOverview({ chainView }: { chainView: ExecutionChainView }) {
         </Badge>
       </div>
 
-      {reason && <p className="text-[11px] text-muted-foreground">{reason}</p>}
+      {reason && <p className="text-[11px] text-muted-foreground whitespace-pre-wrap break-words">{reason}</p>}
       {(contextBrief || report || memories.length > 0) && (
         <details className="text-xs">
           <summary className="cursor-pointer text-[11px] font-medium text-muted-foreground hover:text-foreground">
@@ -642,17 +920,62 @@ function WorkDetailOverview({ chainView }: { chainView: ExecutionChainView }) {
           </summary>
           <div className="mt-2 space-y-2">
             {contextBrief && (
-              <div className="rounded border bg-background p-2 text-[11px] whitespace-pre-wrap">{contextBrief}</div>
+              <div className="space-y-1 rounded border bg-background p-2 text-[11px]">
+                <div className="flex items-center justify-between gap-1">
+                  <span className="font-medium text-muted-foreground">任务背景简报</span>
+                  <ViewFullButton
+                    onClick={() =>
+                      onOpenFull({
+                        title: '任务完整背景简报',
+                        content: contextBrief,
+                        mode: 'markdown',
+                      })
+                    }
+                  />
+                </div>
+                <div className="max-h-40 overflow-y-auto whitespace-pre-wrap break-words">{contextBrief}</div>
+              </div>
             )}
             {report && (
-              <div className="rounded border bg-background p-2 text-[11px] whitespace-pre-wrap">{report}</div>
+              <div className="space-y-1 rounded border bg-background p-2 text-[11px]">
+                <div className="flex items-center justify-between gap-1">
+                  <span className="font-medium text-muted-foreground">已交付总结报告</span>
+                  <ViewFullButton
+                    onClick={() =>
+                      onOpenFull({
+                        title: 'Worker 完整总结报告',
+                        content: report,
+                        mode: 'markdown',
+                      })
+                    }
+                  />
+                </div>
+                <div className="max-h-40 overflow-y-auto whitespace-pre-wrap break-words">{report}</div>
+              </div>
             )}
             {memories.length > 0 && (
               <div className="space-y-1">
                 {memories.map(m => (
-                  <div key={m.id} className="rounded border bg-background px-2 py-1 text-[11px]">
-                    <div className="font-medium">{m.topic}</div>
-                    <div className="text-muted-foreground">{m.preview}</div>
+                  <div key={m.id} className="rounded border bg-background px-2 py-1.5 text-[11px]">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-medium text-foreground">{m.topic}</span>
+                      <ViewFullButton
+                        onClick={() =>
+                          onOpenFull({
+                            title: `挂载记忆 · ${m.topic}`,
+                            badges: m.tags?.map(t => ({ label: t, variant: 'secondary' as const })),
+                            content: m.preview,
+                            mode: 'markdown',
+                            loadFull: async () => {
+                              const list = await api<MemoryCard[]>('/api/memories');
+                              const found = Array.isArray(list) ? list.find(c => c.id === m.id) : undefined;
+                              return found?.content ?? m.preview;
+                            },
+                          })
+                        }
+                      />
+                    </div>
+                    <div className="text-muted-foreground whitespace-pre-wrap break-words">{m.preview}</div>
                   </div>
                 ))}
               </div>
@@ -682,6 +1005,8 @@ export function TracePanel() {
     loadEarlierTrace,
     mobilePanel,
   } = useFriday();
+
+  const [viewerPayload, setViewerPayload] = useState<FullContentPayload | null>(null);
 
   const visibleNodes = useMemo(
     () => (traceCategory === 'all' ? chainView.nodes : chainView.nodes.filter(n => n.category === traceCategory)),
@@ -772,7 +1097,7 @@ export function TracePanel() {
       </div>
 
       {/* Selected Work Overview */}
-      <WorkDetailOverview chainView={chainView} />
+      <WorkDetailOverview chainView={chainView} onOpenFull={setViewerPayload} />
 
       {/* Category Tabs */}
       <div className="trace-tabs flex shrink-0 items-center gap-1 overflow-x-auto border-b px-3 py-1.5" role="group" aria-label="链路节点筛选">
@@ -891,10 +1216,13 @@ export function TracePanel() {
           node={selectedNode}
           chainView={chainView}
           onClose={() => setSelectedNodeId(undefined)}
+          onOpenFull={setViewerPayload}
         />
       ) : (
         <div id="event-detail" hidden />
       )}
+
+      <FullContentDialog payload={viewerPayload} onClose={() => setViewerPayload(null)} />
     </aside>
   );
 }

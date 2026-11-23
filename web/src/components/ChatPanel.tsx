@@ -46,6 +46,12 @@ import {
 } from 'react';
 import { CompanionAvatar, StaticBotAvatar } from '@/components/CompanionAvatar';
 import { MarkdownContent } from '@/components/MarkdownContent';
+import {
+  ExpandableText,
+  FullContentDialog,
+  ViewFullButton,
+  type FullContentPayload,
+} from '@/components/shared/FullContentViewer';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
@@ -183,7 +189,13 @@ function RoutingSummaryBlock({
   );
 }
 
-function AttachmentAndPathChips({ message }: { message: ChatMessage }) {
+function AttachmentAndPathChips({
+  message,
+  onOpenFull,
+}: {
+  message: ChatMessage;
+  onOpenFull: (payload: FullContentPayload) => void;
+}) {
   if (!message.attachments?.length && !message.paths.length) return null;
   return (
     <div className="mt-1.5 flex flex-wrap gap-1.5">
@@ -193,11 +205,35 @@ function AttachmentAndPathChips({ message }: { message: ChatMessage }) {
           {att.bytes ? <span className="opacity-70">({formatByteSize(att.bytes)})</span> : null}
         </Badge>
       ))}
-      {message.paths.map((p, idx) => (
-        <Badge key={`path-${idx}`} size="sm" variant="outline" className="font-mono max-w-full truncate">
-          {p}
-        </Badge>
-      ))}
+      {message.paths.map((p, idx) =>
+        p.length > 48 ? (
+          <Badge
+            key={`path-${idx}`}
+            render={
+              <button
+                type="button"
+                onClick={() =>
+                  onOpenFull({
+                    title: '完整路径 / 引用',
+                    content: p,
+                    mode: 'code',
+                  })
+                }
+              />
+            }
+            size="sm"
+            variant="outline"
+            title={`${p}（点击查看完整路径）`}
+            className="max-w-full truncate font-mono"
+          >
+            {p}
+          </Badge>
+        ) : (
+          <Badge key={`path-${idx}`} size="sm" variant="outline" title={p} className="max-w-full truncate font-mono">
+            {p}
+          </Badge>
+        ),
+      )}
     </div>
   );
 }
@@ -205,12 +241,15 @@ function AttachmentAndPathChips({ message }: { message: ChatMessage }) {
 function SystemMessageCard({
   message,
   onJump,
+  onOpenFull,
 }: {
   message: ChatMessage;
   onJump: (id: string) => void;
+  onOpenFull: (payload: FullContentPayload) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const summary = summarizeSystemNotice(message);
+  const canExpand = summary.expandable || message.text.trim().length > 60;
   return (
     <article
       data-message-id={message.id}
@@ -221,11 +260,12 @@ function SystemMessageCard({
       <div className="flex flex-wrap items-center gap-2">
         <span aria-hidden="true">{summary.icon}</span>
         <Badge size="sm" variant="outline">{summary.badge}</Badge>
-        <span className="min-w-0 flex-1 truncate font-medium text-foreground">{summary.title}</span>
+        <span title={summary.title} className="min-w-0 flex-1 truncate font-medium text-foreground">{summary.title}</span>
         <span className="font-mono text-[11px] text-muted-foreground">{formatShortClock(message.at)}</span>
-        {summary.expandable && (
+        {canExpand && (
           <button
             type="button"
+            aria-expanded={expanded}
             className="cursor-pointer rounded px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground"
             onClick={() => setExpanded(prev => !prev)}
           >
@@ -234,18 +274,33 @@ function SystemMessageCard({
         )}
       </div>
       {expanded && (
-        <div className="mt-2 border-t pt-2 space-y-1.5">
+        <div className="mt-2 space-y-1.5 border-t pt-2">
           <MarkdownContent text={message.text} mode="assistant" />
-          <AttachmentAndPathChips message={message} />
-          {message.replyTo && (
-            <button
-              type="button"
-              className="source-reference text-[11px] text-info-foreground hover:underline"
-              onClick={() => onJump(message.replyTo!)}
-            >
-              跳转来源消息 ↗
-            </button>
-          )}
+          <AttachmentAndPathChips message={message} onOpenFull={onOpenFull} />
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            {message.replyTo ? (
+              <button
+                type="button"
+                className="source-reference text-[11px] text-info-foreground hover:underline cursor-pointer"
+                onClick={() => onJump(message.replyTo!)}
+              >
+                跳转来源消息 ↗
+              </button>
+            ) : <span />}
+            {message.text.length > 400 && (
+              <ViewFullButton
+                label="大窗查看完整通知"
+                onClick={() =>
+                  onOpenFull({
+                    title: summary.title,
+                    badges: [{ label: summary.badge }],
+                    content: message.text,
+                    mode: 'markdown',
+                  })
+                }
+              />
+            )}
+          </div>
         </div>
       )}
     </article>
@@ -297,6 +352,7 @@ export function ChatPanel() {
   const [unreadCount, setUnreadCount] = useState(0);
   const [nearBottom, setNearBottom] = useState(true);
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
+  const [viewerPayload, setViewerPayload] = useState<FullContentPayload | null>(null);
 
   const scrollElRef = useRef<HTMLDivElement>(null);
   const scrollStateRef = useRef({
@@ -658,7 +714,11 @@ export function ChatPanel() {
 
                       {msg.source === 'system' ? (
                         <div className={cn(isHighlighted && 'message-highlight')}>
-                          <SystemMessageCard message={msg} onJump={id => void jumpMessage(id)} />
+                          <SystemMessageCard
+                            message={msg}
+                            onJump={id => void jumpMessage(id)}
+                            onOpenFull={setViewerPayload}
+                          />
                         </div>
                       ) : msg.role === 'user' ? (
                         <UserMessageArticle
@@ -677,6 +737,7 @@ export function ChatPanel() {
                             setMobilePanel('trace');
                           }}
                           onOpenRoutingDetail={() => setRoutingDetailMessageId(msg.id)}
+                          onOpenFull={setViewerPayload}
                         />
                       ) : (
                         <AssistantMessageArticle
@@ -694,6 +755,7 @@ export function ChatPanel() {
                             selectTrace({ type: 'message', id: msg.replyTo ?? msg.id, label: msg.text.slice(0, 80) }, true);
                             setMobilePanel('trace');
                           }}
+                          onOpenFull={setViewerPayload}
                         />
                       )}
                     </div>
@@ -740,10 +802,22 @@ export function ChatPanel() {
                     key={work.id}
                     className="rounded-xl border border-warning/40 bg-warning/8 p-3 text-xs space-y-2"
                   >
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="flex items-center gap-2 min-w-0">
-                        <Badge size="sm" variant="warning">⏳ 等待老板拍板</Badge>
-                        <span className="truncate font-medium text-foreground">{work.prompt || '后台任务请示'}</span>
+                    <div className="flex flex-wrap items-start justify-between gap-2">
+                      <div className="flex min-w-0 flex-1 items-start gap-2">
+                        <Badge size="sm" variant="warning" className="shrink-0 mt-0.5">⏳ 等待老板拍板</Badge>
+                        <ExpandableText
+                          text={work.prompt || '后台任务请示'}
+                          clampClass="line-clamp-1"
+                          threshold={56}
+                          textClassName="font-medium text-foreground"
+                          onOpenFull={() =>
+                            setViewerPayload({
+                              title: '后台任务请示完整内容',
+                              content: `任务指令：\n${work.prompt || '（空）'}\n\n待确认问题：\n${pq.question}`,
+                              mode: 'text',
+                            })
+                          }
+                        />
                       </div>
                       <Button
                         type="button"
@@ -889,6 +963,8 @@ export function ChatPanel() {
           </Composer>
         </div>
       </div>
+
+      <FullContentDialog payload={viewerPayload} onClose={() => setViewerPayload(null)} />
     </main>
   );
 }
@@ -903,6 +979,7 @@ function UserMessageArticle({
   onSelectTrace,
   onSelectTask,
   onOpenRoutingDetail,
+  onOpenFull,
 }: {
   message: ChatMessage;
   grouped: boolean;
@@ -913,6 +990,7 @@ function UserMessageArticle({
   onSelectTrace: () => void;
   onSelectTask: (taskId: string, label: string) => void;
   onOpenRoutingDetail: () => void;
+  onOpenFull: (payload: FullContentPayload) => void;
 }) {
   const ch = resolveMessageChannel(message);
   const chMeta = channelMeta(ch);
@@ -953,14 +1031,29 @@ function UserMessageArticle({
         )}
       >
         {parsedQuote && (
-          <div className="mb-2 rounded-lg border-s-2 border-primary/50 bg-background/60 px-2.5 py-1.5 text-xs text-muted-foreground">
-            <span className="font-medium text-foreground me-1">{parsedQuote.label}:</span>
-            <span>{parsedQuote.preview}</span>
+          <div className="mb-2 flex items-start justify-between gap-2 rounded-lg border-s-2 border-primary/50 bg-background/60 px-2.5 py-1.5 text-xs text-muted-foreground">
+            <div className="min-w-0">
+              <span className="font-medium text-foreground me-1">{parsedQuote.label}:</span>
+              <span>{parsedQuote.preview}</span>
+            </div>
+            {message.text.length > displayText.length + 20 && (
+              <ViewFullButton
+                label="原文"
+                className="shrink-0"
+                onClick={() =>
+                  onOpenFull({
+                    title: '发送消息完整原文（含引用）',
+                    content: message.text,
+                    mode: 'text',
+                  })
+                }
+              />
+            )}
           </div>
         )}
 
         <MarkdownContent text={displayText} mode="user" />
-        <AttachmentAndPathChips message={message} />
+        <AttachmentAndPathChips message={message} onOpenFull={onOpenFull} />
         <RoutingSummaryBlock
           message={message}
           detailMode={detailMode}
@@ -996,6 +1089,7 @@ function AssistantMessageArticle({
   onStop,
   onJump,
   onSelectTrace,
+  onOpenFull,
 }: {
   message: ChatMessage;
   prevVisible: ChatMessage | undefined;
@@ -1008,6 +1102,7 @@ function AssistantMessageArticle({
   onStop: () => void;
   onJump: (id: string) => void;
   onSelectTrace: () => void;
+  onOpenFull: (payload: FullContentPayload) => void;
 }) {
   const showRef = shouldShowReplyReference(message, prevVisible, detailMode);
   const parentMsg = message.replyTo ? messagesMap.get(message.replyTo) : undefined;
@@ -1044,6 +1139,7 @@ function AssistantMessageArticle({
           {showRef && message.replyTo && (
             <button
               type="button"
+              title={parentMsg ? stripLeadingQuoteForPreview(parentMsg.text) : undefined}
               className="source-reference mb-2 flex w-full cursor-pointer items-center gap-1.5 rounded-md border bg-muted/40 px-2.5 py-1 text-start text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
               onClick={() => onJump(message.replyTo!)}
             >
@@ -1066,7 +1162,7 @@ function AssistantMessageArticle({
             <p className="mt-1.5 text-xs text-destructive-foreground">{message.reason}</p>
           )}
 
-          <AttachmentAndPathChips message={message} />
+          <AttachmentAndPathChips message={message} onOpenFull={onOpenFull} />
 
           <div className="message-actions mt-1.5 flex flex-wrap items-center gap-1">
             {isActive && (

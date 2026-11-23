@@ -1,6 +1,14 @@
+import type { MemoryCard } from '@friday/view.js';
 import { activeStatus, routeLabel, routeState } from '@friday/web/model.js';
 import { formatActionShortLabel } from '@friday/web/shared/chat-view.js';
 import { ArrowUpRightIcon, XIcon } from 'lucide-react';
+import { useState } from 'react';
+import {
+  ExpandableText,
+  FullContentDialog,
+  ViewFullButton,
+  type FullContentPayload,
+} from '@/components/shared/FullContentViewer';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogHeader, DialogPanel, DialogPopup, DialogTitle } from '@/components/ui/dialog';
@@ -8,6 +16,7 @@ import { useFriday } from '@/lib/friday-store';
 
 export function RoutingDetailDialog() {
   const {
+    api,
     routingDetailMessageId,
     setRoutingDetailMessageId,
     messagesMap,
@@ -15,6 +24,8 @@ export function RoutingDetailDialog() {
     setMobilePanel,
     jumpMessage,
   } = useFriday();
+
+  const [viewerPayload, setViewerPayload] = useState<FullContentPayload | null>(null);
 
   const message = routingDetailMessageId ? messagesMap.get(routingDetailMessageId) : undefined;
   const open = Boolean(message);
@@ -26,7 +37,7 @@ export function RoutingDetailDialog() {
       <DialogPopup
         id="routing-detail"
         showCloseButton={false}
-        className="max-w-2xl"
+        className="max-h-[min(84dvh,780px)] max-w-2xl max-sm:max-h-[88dvh]"
         hidden={!open}
       >
         <DialogHeader className="flex-row items-center justify-between border-b pb-3">
@@ -60,9 +71,20 @@ export function RoutingDetailDialog() {
 
         <DialogPanel className="space-y-4">
           {message && (
-            <div className="rounded-lg border bg-muted/40 p-3 text-xs text-muted-foreground">
-              <div className="mb-1 font-medium text-foreground">对应消息</div>
-              <p className="line-clamp-3 whitespace-pre-wrap break-words">{message.text}</p>
+            <div className="space-y-1.5 rounded-lg border bg-muted/40 p-3 text-xs text-muted-foreground">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-medium text-foreground">对应消息</span>
+                <ViewFullButton
+                  onClick={() =>
+                    setViewerPayload({
+                      title: '对应消息完整正文',
+                      content: message.text,
+                      mode: 'markdown',
+                    })
+                  }
+                />
+              </div>
+              <ExpandableText text={message.text} clampClass="line-clamp-3" threshold={120} />
             </div>
           )}
 
@@ -144,9 +166,23 @@ export function RoutingDetailDialog() {
                     ) : (
                       <ul className="space-y-1">
                         {routing.context.works.map(w => (
-                          <li key={w.id} className="flex items-center justify-between gap-2 rounded border bg-background px-2 py-1">
-                            <span className="truncate">{w.prompt}</span>
-                            <Badge size="sm" variant="secondary">{w.status}</Badge>
+                          <li key={w.id} className="flex items-start justify-between gap-2 rounded border bg-background px-2 py-1.5">
+                            <div className="min-w-0 flex-1">
+                              <ExpandableText
+                                text={w.prompt}
+                                clampClass="line-clamp-2"
+                                threshold={80}
+                                onOpenFull={() =>
+                                  setViewerPayload({
+                                    title: '关联后台工作完整指令',
+                                    badges: [{ label: w.status }],
+                                    content: w.prompt,
+                                    mode: 'text',
+                                  })
+                                }
+                              />
+                            </div>
+                            <Badge size="sm" variant="secondary" className="shrink-0">{w.status}</Badge>
                           </li>
                         ))}
                       </ul>
@@ -165,7 +201,8 @@ export function RoutingDetailDialog() {
                           <li key={m.id} className="flex items-center justify-between gap-2 rounded border bg-background px-2 py-1">
                             <button
                               type="button"
-                              className="min-w-0 flex-1 truncate text-start hover:underline"
+                              title={m.preview}
+                              className="min-w-0 flex-1 truncate text-start hover:underline cursor-pointer"
                               onClick={() => {
                                 setRoutingDetailMessageId(null);
                                 void jumpMessage(m.id);
@@ -174,6 +211,22 @@ export function RoutingDetailDialog() {
                               <span className="font-mono text-[10px] uppercase text-muted-foreground me-1.5">{m.role}</span>
                               {m.preview}
                             </button>
+                            <ViewFullButton
+                              label="原文"
+                              className="shrink-0"
+                              onClick={() =>
+                                setViewerPayload({
+                                  title: `近期对话引用（${m.role}）`,
+                                  content: m.preview,
+                                  mode: 'markdown',
+                                  truncatedHint: '快照只记录引用摘要；点击「拉取未截断全文」获取完整历史消息。',
+                                  loadFull: async () => {
+                                    const res = await api<Record<string, unknown>>(`/api/message?messageId=${encodeURIComponent(m.id)}`);
+                                    return String(res.text ?? m.preview);
+                                  },
+                                })
+                              }
+                            />
                           </li>
                         ))}
                       </ul>
@@ -187,9 +240,25 @@ export function RoutingDetailDialog() {
                       </div>
                       <ul className="space-y-1">
                         {routing.context.autoRecalled.map(hit => (
-                          <li key={hit.id} className="rounded border bg-background px-2 py-1">
-                            <div className="font-medium">{hit.title}</div>
-                            <div className="line-clamp-2 text-muted-foreground">{hit.snippet}</div>
+                          <li key={hit.id} className="space-y-1 rounded border bg-background px-2 py-1.5">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-medium text-foreground">{hit.title}</span>
+                              <ViewFullButton
+                                onClick={() =>
+                                  setViewerPayload({
+                                    title: `潜意识记忆 · ${hit.title}`,
+                                    content: hit.snippet,
+                                    mode: 'markdown',
+                                    loadFull: async () => {
+                                      const list = await api<MemoryCard[]>('/api/memories');
+                                      const found = Array.isArray(list) ? list.find(c => c.id === hit.id || c.topic === hit.title) : undefined;
+                                      return found?.content ?? hit.snippet;
+                                    },
+                                  })
+                                }
+                              />
+                            </div>
+                            <ExpandableText text={hit.snippet} clampClass="line-clamp-2" threshold={90} className="text-muted-foreground" />
                           </li>
                         ))}
                       </ul>
@@ -201,6 +270,8 @@ export function RoutingDetailDialog() {
           )}
         </DialogPanel>
       </DialogPopup>
+
+      <FullContentDialog payload={viewerPayload} onClose={() => setViewerPayload(null)} />
     </Dialog>
   );
 }

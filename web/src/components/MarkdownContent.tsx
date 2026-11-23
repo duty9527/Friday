@@ -9,15 +9,26 @@ import {
   type TableAlign,
 } from '@friday/web/shared/markdown.js';
 import { tokenizeBotMessageText } from '@friday/web/shared/bot-expressions.js';
+import { FullContentDialog, ViewFullButton } from '@/components/shared/FullContentViewer';
 import { StaticBotAvatar } from '@/components/CompanionAvatar';
 import { Button } from '@/components/ui/button';
 
 const CODE_COLLAPSE_LINES = 26;
 
-function CodeBlock({ lang, code }: { lang: string; code: string }) {
+function CodeBlock({
+  lang,
+  code,
+  allowCodeModal = true,
+}: {
+  lang: string;
+  code: string;
+  allowCodeModal?: boolean;
+}) {
   const [copied, setCopied] = useState(false);
+  const [modalOpen, setModalOpen] = useState(false);
   const lineCount = useMemo(() => code.split('\n').length, [code]);
   const collapsible = lineCount >= CODE_COLLAPSE_LINES;
+  const canOpenModal = allowCodeModal && (lineCount >= 16 || code.length >= 600);
   const [expanded, setExpanded] = useState(!collapsible);
 
   const handleCopy = async () => {
@@ -46,6 +57,9 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
               {expanded ? '收起' : `展开 ${lineCount} 行`}
             </Button>
           )}
+          {canOpenModal && (
+            <ViewFullButton onClick={() => setModalOpen(true)} />
+          )}
           <Button type="button" size="xs" variant="ghost" onClick={() => void handleCopy()}>
             {copied ? <CheckIcon className="size-3.5 text-success-foreground" /> : <CopyIcon className="size-3.5" />}
             {copied ? '已复制' : '复制'}
@@ -60,6 +74,20 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
         <pre className="max-h-36 overflow-hidden p-3 text-xs leading-relaxed opacity-75">
           <code>{code.split('\n').slice(0, 8).join('\n')}</code>
         </pre>
+      )}
+      {canOpenModal && (
+        <FullContentDialog
+          payload={
+            modalOpen
+              ? {
+                  title: `代码块 · ${lang || 'text'}`,
+                  content: code,
+                  mode: 'code',
+                }
+              : null
+          }
+          onClose={() => setModalOpen(false)}
+        />
       )}
     </div>
   );
@@ -112,7 +140,7 @@ function alignClass(align: TableAlign): string {
   return 'text-start';
 }
 
-function renderBlocks(blocks: MarkdownBlock[], keyPrefix: string): ReactNode {
+function renderBlocks(blocks: MarkdownBlock[], keyPrefix: string, allowCodeModal = true): ReactNode {
   return blocks.map((block, idx) => {
     const key = `${keyPrefix}-b-${idx}`;
     switch (block.kind) {
@@ -137,9 +165,9 @@ function renderBlocks(blocks: MarkdownBlock[], keyPrefix: string): ReactNode {
         return <p key={key}>{renderRichInlineText(block.text, key)}</p>;
       }
       case 'code':
-        return <CodeBlock key={key} lang={block.lang} code={block.code} />;
+        return <CodeBlock key={key} lang={block.lang} code={block.code} allowCodeModal={allowCodeModal} />;
       case 'quote':
-        return <blockquote key={key}>{renderBlocks(block.blocks, key)}</blockquote>;
+        return <blockquote key={key}>{renderBlocks(block.blocks, key, allowCodeModal)}</blockquote>;
       case 'hr':
         return <hr key={key} />;
       case 'list': {
@@ -161,7 +189,7 @@ function renderBlocks(blocks: MarkdownBlock[], keyPrefix: string): ReactNode {
                   )}
                   <div className="min-w-0 flex-1">
                     {renderRichInlineText(item.text, itemKey)}
-                    {item.children?.length ? renderBlocks(item.children, itemKey) : null}
+                    {item.children?.length ? renderBlocks(item.children, itemKey, allowCodeModal) : null}
                   </div>
                 </li>
               );
@@ -203,9 +231,11 @@ function renderBlocks(blocks: MarkdownBlock[], keyPrefix: string): ReactNode {
 export function MarkdownContent({
   text,
   mode = 'assistant',
+  allowCodeModal = true,
 }: {
   text: string;
   mode?: 'assistant' | 'user';
+  allowCodeModal?: boolean;
 }) {
   const blocks = useMemo(() => parseMarkdownBlocks(text), [text]);
   if (mode === 'user') {
@@ -221,5 +251,5 @@ export function MarkdownContent({
       </div>
     );
   }
-  return <div className="message-text friday-prose">{renderBlocks(blocks, 'md')}</div>;
+  return <div className="message-text friday-prose">{renderBlocks(blocks, 'md', allowCodeModal)}</div>;
 }
