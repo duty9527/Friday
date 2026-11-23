@@ -120,7 +120,7 @@ function WorksListContent({ onAfterSelect }: { onAfterSelect?: () => void }) {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex items-center justify-between gap-2 border-b px-3 py-2.5">
+      <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b px-3">
         <div className="flex items-center gap-2">
           <h2 className="text-xs font-semibold tracking-tight text-foreground">任务列表</h2>
           <Badge variant="secondary" size="sm" className="font-mono">

@@ -1,3 +1,5 @@
+import { activeStatus } from '@friday/web/model.js';
+import { deriveCompanionStatus } from '@friday/web/shared/chat-view.js';
 import {
   ActivityIcon,
   BrainIcon,
@@ -16,7 +18,8 @@ import {
   SunIcon,
   XIcon,
 } from 'lucide-react';
-import { useEffect, useRef } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
+import { CompanionAvatar } from '@/components/CompanionAvatar';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Kbd } from '@/components/ui/kbd';
@@ -28,8 +31,12 @@ import { cn } from '@/lib/utils';
 export function Topbar() {
   const {
     view,
+    works,
+    botState,
     activeHub,
     setActiveHub,
+    routingDetailMessageId,
+    commandOpen,
     leftCollapsed,
     setLeftCollapsed,
     rightCollapsed,
@@ -45,6 +52,19 @@ export function Topbar() {
   const mobileNavBtnRef = useRef<HTMLButtonElement>(null);
   const mobileCloseBtnRef = useRef<HTMLButtonElement>(null);
   const wasMobileNavOpen = useRef(false);
+
+  const activeWorksCount = useMemo(() => works.filter(w => activeStatus(w.status)).length, [works]);
+  const pendingBossWorksCount = useMemo(
+    () => works.filter(w => Boolean(w.pendingQuestion) && (activeStatus(w.status) || w.status === 'paused' || w.status === 'waiting_decision')).length,
+    [works],
+  );
+  const companionPill = useMemo(
+    () => deriveCompanionStatus(botState, activeWorksCount, pendingBossWorksCount),
+    [activeWorksCount, botState, pendingBossWorksCount],
+  );
+  const modalPaused = Boolean(activeHub || routingDetailMessageId || commandOpen);
+  const isIdleReady = companionPill.tone === 'ok' && companionPill.text === '就绪';
+  const showCollapsedWorkDot = leftCollapsed && (activeWorksCount > 0 || pendingBossWorksCount > 0);
 
   useEffect(() => {
     document.body.classList.toggle('mobile-nav-open', mobileNavOpen);
@@ -100,7 +120,7 @@ export function Topbar() {
         id="app-topbar"
         className="flex h-12 shrink-0 items-center justify-between gap-2 border-b bg-background/95 px-3 backdrop-blur-sm"
       >
-        {/* Left: Brand & Work drawer toggle */}
+        {/* Left: Work drawer toggle & Unified Brand Identity */}
         <div className="flex min-w-0 items-center gap-2">
           <Button
             ref={mobileNavBtnRef}
@@ -116,26 +136,76 @@ export function Topbar() {
             <MenuIcon className="size-4" />
           </Button>
 
-          <div className="flex items-center gap-2 select-none">
-            <span className="size-2 rounded-full bg-amber-500 shadow-[0_0_8px_var(--color-amber-500)]" aria-hidden="true" />
-            <span className="font-semibold text-sm tracking-tight">F.R.I.D.A.Y.</span>
-          </div>
-
-          <Separator orientation="vertical" className="hidden h-4 lg:block" />
-
           <Button
             id="desktop-work-fold"
             type="button"
             variant="ghost"
-            size="xs"
-            className="hidden lg:inline-flex"
+            size="icon-sm"
+            className="relative hidden lg:inline-flex text-muted-foreground hover:text-foreground"
             aria-pressed={leftCollapsed}
-            title="收起或展开左侧任务舱"
+            aria-label="收起或展开左侧任务舱"
+            title={leftCollapsed ? '展开左侧任务舱' : '收起左侧任务舱'}
             onClick={() => setLeftCollapsed(!leftCollapsed)}
           >
-            {leftCollapsed ? <PanelLeftOpenIcon className="size-3.5" /> : <PanelLeftCloseIcon className="size-3.5" />}
-            <span>任务舱</span>
+            {leftCollapsed ? <PanelLeftOpenIcon className="size-4" /> : <PanelLeftCloseIcon className="size-4" />}
+            {showCollapsedWorkDot && (
+              <span
+                aria-hidden="true"
+                className={cn(
+                  'absolute top-1 right-1 size-1.5 rounded-full',
+                  pendingBossWorksCount > 0 ? 'bg-amber-500' : 'bg-info',
+                )}
+              />
+            )}
           </Button>
+
+          <div className="flex min-w-0 items-center gap-2">
+            <CompanionAvatar botState={botState} paused={modalPaused} size={24} />
+            <h1 className="truncate font-semibold text-sm tracking-tight text-foreground select-none">
+              F.R.I.D.A.Y.
+            </h1>
+            {isIdleReady ? (
+              <span
+                id="companion-status-dot"
+                role="status"
+                aria-label="F.R.I.D.A.Y. 就绪"
+                title="就绪"
+                className="size-1.5 shrink-0 rounded-full bg-emerald-500/85"
+              />
+            ) : (
+              <Badge
+                id="companion-status-pill"
+                size="sm"
+                className="rounded-full px-2"
+                variant={
+                  companionPill.tone === 'ok'
+                    ? 'success'
+                    : companionPill.tone === 'warn'
+                      ? 'warning'
+                      : companionPill.tone === 'err'
+                        ? 'error'
+                        : companionPill.tone === 'run'
+                          ? 'info'
+                          : 'secondary'
+                }
+              >
+                <span
+                  aria-hidden="true"
+                  className={cn(
+                    'size-1.5 rounded-full',
+                    companionPill.tone === 'warn'
+                      ? 'animate-pulse bg-amber-500'
+                      : companionPill.tone === 'err'
+                        ? 'bg-destructive'
+                        : companionPill.tone === 'run'
+                          ? 'animate-pulse bg-info'
+                          : 'bg-muted-foreground',
+                  )}
+                />
+                <span>{companionPill.text}</span>
+              </Badge>
+            )}
+          </div>
         </div>
 
         {/* Center: Primary Navigation */}
@@ -310,14 +380,14 @@ export function Topbar() {
             id="desktop-trace-fold"
             type="button"
             variant="ghost"
-            size="xs"
-            className="hidden lg:inline-flex"
+            size="icon-sm"
+            className="hidden lg:inline-flex text-muted-foreground hover:text-foreground"
             aria-pressed={rightCollapsed}
-            title="收起或展开右侧执行链路"
+            aria-label="收起或展开右侧执行链路"
+            title={rightCollapsed ? '展开右侧执行链路' : '收起右侧执行链路'}
             onClick={() => setRightCollapsed(!rightCollapsed)}
           >
-            <span>执行链路</span>
-            {rightCollapsed ? <PanelRightOpenIcon className="size-3.5" /> : <PanelRightCloseIcon className="size-3.5" />}
+            {rightCollapsed ? <PanelRightOpenIcon className="size-4" /> : <PanelRightCloseIcon className="size-4" />}
           </Button>
         </div>
       </header>

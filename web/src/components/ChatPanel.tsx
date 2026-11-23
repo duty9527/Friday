@@ -5,7 +5,6 @@ import {
   channelMeta,
   classifyRoutingDisplay,
   collectAvailableChannels,
-  deriveCompanionStatus,
   extractLeadingQuote,
   filterConversationMessages,
   formatActionShortLabel,
@@ -27,7 +26,6 @@ import {
   ChevronUpIcon,
   CopyIcon,
   CheckIcon,
-  FilterIcon,
   GitBranchIcon,
   RotateCcwIcon,
   SmileIcon,
@@ -35,6 +33,7 @@ import {
   SlidersHorizontalIcon,
   EyeOffIcon,
   EyeIcon,
+  XIcon,
 } from 'lucide-react';
 import {
   useCallback,
@@ -44,7 +43,7 @@ import {
   useRef,
   useState,
 } from 'react';
-import { CompanionAvatar, StaticBotAvatar } from '@/components/CompanionAvatar';
+import { StaticBotAvatar } from '@/components/CompanionAvatar';
 import { MarkdownContent } from '@/components/MarkdownContent';
 import {
   ExpandableText,
@@ -338,10 +337,6 @@ export function ChatPanel() {
     selectTrace,
     setMobilePanel,
     setRoutingDetailMessageId,
-    botState,
-    activeHub,
-    routingDetailMessageId,
-    commandOpen,
     jumpTarget,
     jumpMessage,
   } = useFriday();
@@ -366,14 +361,9 @@ export function ChatPanel() {
   });
 
   const worksById = useMemo(() => new Map(works.map(w => [w.id, w])), [works]);
-  const activeWorksCount = useMemo(() => works.filter(w => activeStatus(w.status)).length, [works]);
   const pendingBossWorks = useMemo(
     () => works.filter(w => Boolean(w.pendingQuestion) && (activeStatus(w.status) || w.status === 'paused' || w.status === 'waiting_decision')),
     [works],
-  );
-  const companionPill = useMemo(
-    () => deriveCompanionStatus(botState, activeWorksCount, pendingBossWorks.length),
-    [activeWorksCount, botState, pendingBossWorks.length],
   );
 
   const configuredPlatforms = useMemo(() => view?.imChannels?.map(c => c.platform) ?? [], [view]);
@@ -519,141 +509,154 @@ export function ChatPanel() {
     setEmoteOpen(false);
   };
 
-  const modalPaused = Boolean(activeHub || routingDetailMessageId || commandOpen);
+  const hasActiveViewFilters = channelFilter !== 'all' || hideSystem || detailMode;
 
   return (
     <main id="main-content" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col bg-background">
-      {/* Chat Header */}
-      <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b px-3 py-2 sm:px-4">
-        <div className="flex min-w-0 items-center gap-2.5">
-          <CompanionAvatar botState={botState} paused={modalPaused} />
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <h1 className="truncate text-sm font-semibold tracking-tight text-foreground">持续对话</h1>
-              <Badge
-                size="sm"
-                variant={
-                  companionPill.tone === 'ok'
-                    ? 'success'
-                    : companionPill.tone === 'warn'
-                      ? 'warning'
-                      : companionPill.tone === 'err'
-                        ? 'error'
-                        : companionPill.tone === 'run'
-                          ? 'info'
-                          : 'secondary'
-                }
-              >
-                {companionPill.text}
-              </Badge>
-            </div>
-          </div>
-        </div>
-
-        {/* Desktop Channel & Mode Controls */}
-        <div className="flex items-center gap-1.5">
-          <div
-            id="conv-channel-filters"
-            className="hidden items-center gap-1 lg:flex"
-            role="group"
-            aria-label="渠道筛选"
-          >
-            {availableChannels.map(ch => {
-              const meta = channelMeta(ch);
-              const isActive = channelFilter === ch;
-              return (
-                <button
-                  key={ch}
-                  type="button"
-                  aria-pressed={isActive}
-                  onClick={() => setChannelFilter(ch)}
-                  className={cn(
-                    'conv-channel-chip inline-flex h-6 cursor-pointer items-center gap-1 rounded-md border px-2 text-xs transition-colors',
-                    isActive
-                      ? 'active border-primary bg-primary text-primary-foreground'
-                      : 'border-transparent text-muted-foreground hover:bg-accent hover:text-foreground',
-                  )}
-                >
-                  <span>{meta.shortLabel}</span>
-                </button>
-              );
-            })}
-          </div>
-
-          <Button
-            id="conv-hide-system-btn"
-            type="button"
-            size="xs"
-            variant={hideSystem ? 'secondary' : 'ghost'}
-            aria-pressed={hideSystem}
-            className="hidden sm:inline-flex"
-            onClick={() => setHideSystem(!hideSystem)}
-            title="隐藏系统通知消息"
-          >
-            {hideSystem ? <EyeOffIcon className="size-3.5" /> : <EyeIcon className="size-3.5" />}
-            <span>系统通知</span>
-            {hiddenSystemCount > 0 && <Badge size="sm" variant="secondary">{hiddenSystemCount}</Badge>}
-          </Button>
-
-          <Button
-            id="conv-detail-mode-btn"
-            type="button"
-            size="xs"
-            variant={detailMode ? 'secondary' : 'ghost'}
-            aria-pressed={detailMode}
-            onClick={() => setDetailMode(!detailMode)}
-            title="切换审计详情模式（展示路由与处理回执）"
-          >
-            <SlidersHorizontalIcon className="size-3.5" />
-            <span>审计详情</span>
-          </Button>
+      {/* Scrollable Message Viewport */}
+      <div className="relative min-h-0 flex-1">
+        {/* Floating Top-Right View & Filter Controls */}
+        <div className="pointer-events-none absolute top-2.5 right-3 z-20 flex flex-wrap items-center justify-end gap-1.5 sm:right-5">
+          {channelFilter !== 'all' && (
+            <Button
+              type="button"
+              size="xs"
+              variant="secondary"
+              className="pointer-events-auto rounded-full bg-background/90 shadow-xs backdrop-blur-sm border"
+              onClick={() => setChannelFilter('all')}
+              title="清除渠道筛选"
+            >
+              <span>{channelMeta(channelFilter).shortLabel}</span>
+              <XIcon className="size-3 text-muted-foreground" />
+            </Button>
+          )}
+          {hideSystem && (
+            <Button
+              type="button"
+              size="xs"
+              variant="secondary"
+              className="pointer-events-auto rounded-full bg-background/90 shadow-xs backdrop-blur-sm border"
+              onClick={() => setHideSystem(false)}
+              title="恢复显示系统通知"
+            >
+              <EyeOffIcon className="size-3" />
+              <span>已静默系统</span>
+              <XIcon className="size-3 text-muted-foreground" />
+            </Button>
+          )}
+          {detailMode && (
+            <Button
+              type="button"
+              size="xs"
+              variant="secondary"
+              className="pointer-events-auto rounded-full bg-background/90 shadow-xs backdrop-blur-sm border"
+              onClick={() => setDetailMode(false)}
+              title="退出审计详情模式"
+            >
+              <span>审计详情</span>
+              <XIcon className="size-3 text-muted-foreground" />
+            </Button>
+          )}
 
           <Popover open={filterPopoverOpen} onOpenChange={setFilterPopoverOpen}>
             <PopoverTrigger
-              id="mobile-filter-btn"
-              render={<Button type="button" size="xs" variant="outline" className="lg:hidden" />}
+              id="chat-view-filter-btn"
+              render={
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="outline"
+                  className="pointer-events-auto rounded-full bg-background/90 shadow-xs backdrop-blur-sm"
+                  title="渠道筛选、系统通知与审计详情"
+                />
+              }
             >
-              <FilterIcon className="size-3.5" />
-              <span>筛选</span>
+              <SlidersHorizontalIcon className="size-3.5" />
+              <span>视图与筛选</span>
+              {hasActiveViewFilters && (
+                <span aria-hidden="true" className="size-1.5 rounded-full bg-amber-500" />
+              )}
             </PopoverTrigger>
-            <PopoverPopup align="end" className="w-64 space-y-3 p-3">
+            <PopoverPopup align="end" className="w-68 space-y-3 p-3">
               <div className="space-y-1.5">
                 <div className="text-xs font-medium text-muted-foreground">消息渠道</div>
-                <div className="flex flex-wrap gap-1">
+                <div
+                  id="conv-channel-filters"
+                  className="flex flex-wrap gap-1"
+                  role="group"
+                  aria-label="渠道筛选"
+                >
                   {availableChannels.map(ch => {
                     const meta = channelMeta(ch);
                     const isActive = channelFilter === ch;
                     return (
-                      <Button
+                      <button
                         key={ch}
                         type="button"
-                        size="xs"
-                        variant={isActive ? 'default' : 'outline'}
-                        onClick={() => { setChannelFilter(ch); setFilterPopoverOpen(false); }}
+                        aria-pressed={isActive}
+                        onClick={() => setChannelFilter(ch)}
+                        className={cn(
+                          'conv-channel-chip inline-flex h-6 cursor-pointer items-center gap-1 rounded-md border px-2 text-xs transition-colors',
+                          isActive
+                            ? 'active border-primary bg-primary text-primary-foreground'
+                            : 'border-border/70 text-muted-foreground hover:bg-accent hover:text-foreground',
+                        )}
                       >
-                        {meta.shortLabel}
-                      </Button>
+                        <span>{meta.shortLabel}</span>
+                      </button>
                     );
                   })}
                 </div>
               </div>
-              <div className="flex items-center justify-between border-t pt-2">
-                <span className="text-xs text-muted-foreground">隐藏系统通知</span>
-                <Button size="xs" variant={hideSystem ? 'secondary' : 'outline'} onClick={() => setHideSystem(!hideSystem)}>
-                  {hideSystem ? '已隐藏' : '显示中'}
-                </Button>
+
+              <div className="space-y-1.5 border-t pt-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <span>隐藏系统通知</span>
+                    {hiddenSystemCount > 0 && (
+                      <Badge size="sm" variant="secondary" className="font-mono">
+                        {hiddenSystemCount}
+                      </Badge>
+                    )}
+                  </div>
+                  <Button
+                    id="conv-hide-system-btn"
+                    type="button"
+                    size="xs"
+                    variant={hideSystem ? 'secondary' : 'outline'}
+                    aria-pressed={hideSystem}
+                    onClick={() => setHideSystem(!hideSystem)}
+                    title="隐藏系统通知消息"
+                  >
+                    {hideSystem ? <EyeOffIcon className="size-3.5" /> : <EyeIcon className="size-3.5" />}
+                    <span>{hideSystem ? '已隐藏' : '显示中'}</span>
+                  </Button>
+                </div>
+
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs text-muted-foreground">审计详情模式</span>
+                  <Button
+                    id="conv-detail-mode-btn"
+                    type="button"
+                    size="xs"
+                    variant={detailMode ? 'secondary' : 'outline'}
+                    aria-pressed={detailMode}
+                    onClick={() => setDetailMode(!detailMode)}
+                    title="切换审计详情模式（展示路由与处理回执）"
+                  >
+                    <SlidersHorizontalIcon className="size-3.5" />
+                    <span>{detailMode ? '已开启' : '已关闭'}</span>
+                  </Button>
+                </div>
               </div>
             </PopoverPopup>
           </Popover>
         </div>
-      </div>
 
-      {/* Scrollable Message Viewport */}
-      <div className="relative min-h-0 flex-1">
         <div
           ref={scrollElRef}
           onScroll={handleScroll}
-          className="h-full overflow-y-auto px-3 py-4 sm:px-6"
+          className="h-full overflow-y-auto px-3 pt-11 pb-4 sm:px-6 sm:pt-10"
         >
           <div className="mx-auto flex max-w-3xl flex-col gap-3">
             {/* Load older button */}

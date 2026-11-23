@@ -11,9 +11,11 @@ import { useEffect, useRef } from 'react';
 export function CompanionAvatar({
   botState,
   paused,
+  size = 24,
 }: {
   botState: BotStateId;
   paused: boolean;
+  size?: number;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const ctrlRef = useRef<BotAvatarController | null>(null);
@@ -23,7 +25,7 @@ export function CompanionAvatar({
     const host = hostRef.current;
     if (!host) return;
     const avatar = createLiveBotAvatar({
-      size: 32,
+      size,
       interactive: true,
       idPrefix: 'friday-companion',
     });
@@ -83,7 +85,7 @@ export function CompanionAvatar({
       ctrlRef.current = null;
       host.replaceChildren();
     };
-  }, [paused]);
+  }, [paused, size]);
 
   useEffect(() => {
     ctrlRef.current?.setState(botState);

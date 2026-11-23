@@ -1048,7 +1048,7 @@ export function TracePanel() {
       )}
     >
       {/* Trace Header */}
-      <div className="flex shrink-0 items-center justify-between gap-2 border-b px-3 py-2">
+      <div className="flex min-h-10 shrink-0 items-center justify-between gap-2 border-b px-3 py-1.5">
         <div className="min-w-0">
           <div className="flex items-center gap-1.5">
             <h2 className="text-xs font-semibold tracking-tight text-foreground">执行链路</h2>
