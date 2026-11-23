@@ -13,6 +13,7 @@ export const PLUGIN_REFRESH_INTERVALS = Object.freeze({
   netleaMs: 30 * 60_000,
   laifenMaintenanceMs: 30_000,
   appleMs: 60 * 60_000,
+  appleKeepaliveMs: 8 * 60_000,
   bleDeferMs: 60_000,
   failureBackoffBaseMs: 5 * 60_000,
 });
@@ -229,6 +230,8 @@ export class PluginRefreshScheduler {
   private readonly entries = new Map<RefreshPluginName, PluginRefreshEntryState>();
   private miotHubLastSuccessAt = 0;
   private miotLiveLastSuccessAt = 0;
+  private appleActiveLastSuccessAt = 0;
+  private appleKeepaliveLastSuccessAt = 0;
   private lastCheckAt?: number;
   private lastCompletedAt?: number;
   private activeJob?: Promise<void>;
@@ -524,23 +527,56 @@ export class PluginRefreshScheduler {
     };
   }
 
-  private prepareAppleDevicesPlan(now: number, entry: PluginRefreshEntryState): RefreshPlan | null {
+  private prepareAppleDevicesPlan(now: number): RefreshPlan | null {
     const dir = join(this.home, 'plugins', 'apple-devices');
     const sess = readJsonRecordSafe(join(dir, 'session.json'));
     if (sess?.state !== 'authenticated') return null;
 
     const cache = readJsonRecordSafe(join(dir, 'devices-cache.json'));
-    const intervalMs = PLUGIN_REFRESH_INTERVALS.appleMs;
-    const effectiveLast = Math.max(toFiniteTs(cache?.fetchedAt), entry.lastSuccessAt);
-    if (effectiveLast > 0 && now - effectiveLast < intervalMs) return null;
+    const diskActiveTs = toFiniteTs(cache?.locatedAt ?? cache?.fetchedAt);
+    const activeLast = Math.max(diskActiveTs, this.appleActiveLastSuccessAt);
+    if (activeLast <= 0 || now - activeLast >= PLUGIN_REFRESH_INTERVALS.appleMs) {
+      return {
+        plugin: 'apple-devices',
+        action: 'status',
+        args: { refresh: true, silent: true },
+        timeoutMs: 30_000,
+        intervalMs: PLUGIN_REFRESH_INTERVALS.appleMs,
+        afterSuccess: async (_res, completedAt) => {
+          this.appleActiveLastSuccessAt = completedAt;
+          this.appleKeepaliveLastSuccessAt = completedAt;
+        },
+      };
+    }
 
-    return {
-      plugin: 'apple-devices',
-      action: 'status',
-      args: { refresh: true, silent: true },
-      timeoutMs: 30_000,
-      intervalMs,
-    };
+    if (sess.fmipServerContext && typeof sess.fmipServerContext === 'object' && !Array.isArray(sess.fmipServerContext)) {
+      const fmipUpdatedTs = toFiniteTs(sess.fmipContextUpdatedAt);
+      const keepaliveLast = Math.max(
+        fmipUpdatedTs,
+        this.appleKeepaliveLastSuccessAt,
+        this.appleActiveLastSuccessAt,
+      );
+      const rawLifespan = Number((sess.fmipServerContext as Record<string, unknown>).sessionLifespan);
+      const lifespanMs = Number.isFinite(rawLifespan) && rawLifespan > 0 ? rawLifespan : 900_000;
+      const keepaliveIntervalMs = Math.max(
+        3 * 60_000,
+        Math.min(PLUGIN_REFRESH_INTERVALS.appleKeepaliveMs, Math.floor(lifespanMs * 0.55)),
+      );
+      if (keepaliveLast <= 0 || now - keepaliveLast >= keepaliveIntervalMs) {
+        return {
+          plugin: 'apple-devices',
+          action: 'status',
+          args: { refresh: true, locate: false, silent: true },
+          timeoutMs: 20_000,
+          intervalMs: PLUGIN_REFRESH_INTERVALS.appleMs,
+          afterSuccess: async (_res, completedAt) => {
+            this.appleKeepaliveLastSuccessAt = completedAt;
+          },
+        };
+      }
+    }
+
+    return null;
   }
 
   private pickNextPlan(now: number): RefreshPlan | null {
@@ -570,7 +606,7 @@ export class PluginRefreshScheduler {
           candidate = this.prepareLaifenPlan(now, entry);
           break;
         case 'apple-devices':
-          candidate = this.prepareAppleDevicesPlan(now, entry);
+          candidate = this.prepareAppleDevicesPlan(now);
           break;
       }
 

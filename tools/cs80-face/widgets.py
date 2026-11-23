@@ -2775,16 +2775,26 @@ class WidgetDataHub:
                 "devices": raw_devices_fb,
                 "config": cfg_raw,
             }
+            if isinstance(sess_raw.get("lastError"), dict):
+                data["lastError"] = sess_raw["lastError"]
 
         auth_state = str(data.get("authState") or "unauthenticated")
         fetched_ms = float(data.get("fetchedAt") or 0.0)
         cache_age_sec = ((time.time() * 1000.0 - fetched_ms) / 1000.0) if fetched_ms > 0 else 999999.0
+        last_err = data.get("lastError") if isinstance(data.get("lastError"), dict) else None
+        try:
+            err_at_ms = float((last_err or {}).get("at") or 0.0)
+        except (TypeError, ValueError):
+            err_at_ms = 0.0
+        has_recent_err = err_at_ms > fetched_ms and ((time.time() * 1000.0 - err_at_ms) < 1800_000.0)
+        live_cooldown = 1800.0 if err_at_ms > fetched_ms else 600.0
         if (
             connected
             and not self.disable_network
             and auth_state == "authenticated"
             and (fetched_ms <= 0 or cache_age_sec > 3900.0)
-            and self._can_attempt_live("apple-devices", 600.0)
+            and not has_recent_err
+            and self._can_attempt_live("apple-devices", live_cooldown)
         ):
             try:
                 res = self._rpc(

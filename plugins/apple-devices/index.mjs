@@ -417,7 +417,7 @@ function loadSession(sessionPath) {
 /**
  * Load device cache safely from `<pluginDataDir>/devices-cache.json`.
  * @param {string} cachePath
- * @returns {{ fetchedAt: number; serverTimestamp: number | null; entries: Array<{ rawId: string; device: Record<string, any> }> } | null}
+ * @returns {{ fetchedAt: number; locatedAt: number | null; serverTimestamp: number | null; entries: Array<{ rawId: string; device: Record<string, any> }> } | null}
  */
 function loadDeviceCache(cachePath) {
   const data = readJsonSafe(cachePath, null);
@@ -425,6 +425,7 @@ function loadDeviceCache(cachePath) {
   if (!Array.isArray(data.entries)) return null;
   return {
     fetchedAt: Number(data.fetchedAt ?? 0),
+    locatedAt: typeof data.locatedAt === 'number' && Number.isFinite(data.locatedAt) ? data.locatedAt : null,
     serverTimestamp: typeof data.serverTimestamp === 'number' ? data.serverTimestamp : null,
     entries: data.entries,
   };
@@ -721,8 +722,9 @@ async function enrichDeviceEntriesGeo(entries, opts) {
  *   paths: import('../_shared/types.d.ts').PluginPaths;
  *   config: ReturnType<typeof loadPluginConfig>;
  *   refresh: boolean;
+ *   locate?: boolean;
  *   locatePollDelayMs?: number;
- *   fetchFn: typeof fetch;
+ *   fetchFn?: typeof fetch;
  *   nowFn: () => number;
  *   signal?: AbortSignal;
  *   env?: Record<string, string | undefined>;
@@ -732,6 +734,7 @@ async function enrichDeviceEntriesGeo(entries, opts) {
  */
 async function getDevicesWithCache(opts) {
   const { paths, config, refresh, locatePollDelayMs, fetchFn, nowFn, signal, env, amapRequester, amapUrl } = opts;
+  const locate = opts.locate !== false;
   const session = loadSession(paths.sessionPath);
   if (!session || session.state !== 'authenticated') {
     const auth = buildPublicAuthSummary(session, config);
@@ -760,6 +763,7 @@ async function getDevicesWithCache(opts) {
     if (enriched.changed && cache) {
       await withFileLock(paths.cachePath, () => writeJsonAtomic(paths.cachePath, {
         fetchedAt: cache.fetchedAt,
+        ...(cache.locatedAt ? { locatedAt: cache.locatedAt } : {}),
         serverTimestamp: cache.serverTimestamp,
         entries: enriched.entries,
       }, { mode: 0o600 }));
@@ -779,8 +783,10 @@ async function getDevicesWithCache(opts) {
   }
 
   const allowBypassCooldown = familyChanged || (incompleteCache && cacheAgeMs >= 3_000);
-  if (refresh && !allowBypassCooldown && cache && cache.entries.length > 0 && cacheAgeMs < config.minRefreshIntervalSec * 1000) {
-    const remainingSec = Math.ceil((config.minRefreshIntervalSec * 1000 - cacheAgeMs) / 1000);
+  const cooldownBaseTs = locate ? (cache?.locatedAt ?? cache?.fetchedAt ?? 0) : (cache?.fetchedAt ?? 0);
+  const cooldownAgeMs = cooldownBaseTs > 0 ? Math.max(0, now - cooldownBaseTs) : Infinity;
+  if (refresh && !allowBypassCooldown && cache && cache.entries.length > 0 && cooldownAgeMs < config.minRefreshIntervalSec * 1000) {
+    const remainingSec = Math.ceil((config.minRefreshIntervalSec * 1000 - cooldownAgeMs) / 1000);
     return await finalizeCachedEntries(cache.entries, {
       ok: true,
       auth: buildPublicAuthSummary(session, config),
@@ -794,6 +800,8 @@ async function getDevicesWithCache(opts) {
   try {
     const live = await fetchFindMyDevices({
       session,
+      locate,
+      maxLocatePolls: locate ? 2 : 0,
       includeFamily: config.includeFamily,
       locatePollDelayMs,
       fetchFn,
@@ -803,6 +811,8 @@ async function getDevicesWithCache(opts) {
     session.lastError = undefined;
     session.expiredAt = undefined;
     const stampedAt = nowFn();
+    const prevLocatedAt = cache?.locatedAt ?? (cache?.fetchedAt && cache.fetchedAt > 0 ? cache.fetchedAt : null);
+    const locatedAt = locate ? stampedAt : (prevLocatedAt ?? stampedAt);
     const mergedEntries = mergeEntriesWithPreviousCache(live.entries, cache?.entries, stampedAt, cache?.fetchedAt);
     const enriched = await enrichDeviceEntriesGeo(mergedEntries, {
       homeDir: paths.homeDir,
@@ -813,6 +823,7 @@ async function getDevicesWithCache(opts) {
     });
     const cacheObj = {
       fetchedAt: stampedAt,
+      locatedAt,
       serverTimestamp: live.serverTimestamp,
       entries: enriched.entries,
     };
@@ -878,7 +889,7 @@ export async function runAction(action = 'status', rawArgs = {}, rawDeps = {}) {
   });
   ensurePrivateDir(paths.pluginDataDir);
 
-  const fetchFn = typeof deps?.fetchFn === 'function' ? deps.fetchFn : fetch;
+  const fetchFn = typeof deps?.fetchFn === 'function' ? deps.fetchFn : undefined;
   const nowFn = typeof deps?.nowFn === 'function' ? deps.nowFn : Date.now;
   const locatePollDelayMs = typeof deps?.locatePollDelayMs === 'number' && Number.isFinite(deps.locatePollDelayMs)
     ? deps.locatePollDelayMs
@@ -1035,6 +1046,7 @@ export async function runAction(action = 'status', rawArgs = {}, rawDeps = {}) {
         await withFileLock(paths.sessionPath, () => saveSession(paths.sessionPath, session));
         await withFileLock(paths.cachePath, () => writeJsonAtomic(paths.cachePath, {
           fetchedAt,
+          locatedAt: fetchedAt,
           serverTimestamp: live.serverTimestamp,
           entries: enriched.entries,
         }, { mode: 0o600 }));
@@ -1140,6 +1152,7 @@ export async function runAction(action = 'status', rawArgs = {}, rawDeps = {}) {
         await withFileLock(paths.sessionPath, () => saveSession(paths.sessionPath, session));
         await withFileLock(paths.cachePath, () => writeJsonAtomic(paths.cachePath, {
           fetchedAt,
+          locatedAt: fetchedAt,
           serverTimestamp: live.serverTimestamp,
           entries: enriched.entries,
         }, { mode: 0o600 }));
@@ -1174,6 +1187,7 @@ export async function runAction(action = 'status', rawArgs = {}, rawDeps = {}) {
         paths,
         config,
         refresh: true,
+        locate: args.locate !== false,
         locatePollDelayMs,
         fetchFn,
         nowFn,
@@ -1264,6 +1278,7 @@ export async function runAction(action = 'status', rawArgs = {}, rawDeps = {}) {
       if (enriched.changed && cache) {
         await withFileLock(paths.cachePath, () => writeJsonAtomic(paths.cachePath, {
           fetchedAt: cache.fetchedAt,
+          ...(cache.locatedAt ? { locatedAt: cache.locatedAt } : {}),
           serverTimestamp: cache.serverTimestamp,
           entries: cacheEntries,
         }, { mode: 0o600 }));
@@ -1308,6 +1323,7 @@ export async function runAction(action = 'status', rawArgs = {}, rawDeps = {}) {
       paths,
       config,
       refresh: args.refresh === true,
+      locate: args.locate !== false,
       locatePollDelayMs,
       fetchFn,
       nowFn,

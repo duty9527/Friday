@@ -1,8 +1,13 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import {
+  completeAccountLogin,
+  httpJson,
+} from '../plugins/apple-devices/icloud-client.mjs';
 import {
   completeSrpClientChallenge,
   createMockSrpServerSession,
@@ -1642,6 +1647,213 @@ test('10. FMiP recovery after 15m sessionLifespan, /setup/ws/1/validate renewal,
       }, { dataDir, fetchFn: mock.fetchFn });
 
       assert.equal(seenTrustCookieOnSignin, true, 're-login for same account must preserve DES* trust cookies');
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test('11. Native HTTP transport avoids 421 retry, failed accountLogin preserves cookies & classifies auth 400, and passive keepalive preserves locatedAt', async () => {
+  // 11a. httpJson(undefined, ...) against real HTTP 421 server sends exactly 1 request and returns status 421
+  {
+    let requestCount = 0;
+    const server = createServer((_req, res) => {
+      requestCount += 1;
+      res.writeHead(421, { 'content-type': 'application/json; charset=UTF-8' });
+      res.end(JSON.stringify({ success: false, error: 1 }));
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const addr = server.address();
+      assert.ok(addr && typeof addr === 'object');
+      const resp = await httpJson(undefined, `http://127.0.0.1:${addr.port}/setup/ws/1/accountLogin`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: { dsWebAuthToken: 'expired-tok' },
+      });
+      assert.equal(requestCount, 1, 'nodeHttpRequest must not auto-retry HTTP 421');
+      assert.equal(resp.status, 421);
+      assert.equal(resp.ok, false);
+      assert.equal(resp.data?.error, 1);
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  }
+
+  // 11b. Failed completeAccountLogin preserves cookies on 400 Invalid Session Token / HTML 400 Bad Request, falls through to /validate, and marks session expired
+  {
+    const token400Session: Record<string, any> = {
+      region: 'cn',
+      clientId: 'fa7a28e9-5454-4110-82d3-0023711d6a5f',
+      sessionToken: 'expired-session-token',
+      cookies: {
+        'X-APPLE-WEBAUTH-TOKEN': 'KEEP_WEBAUTH',
+        DES5162f8ffe76c: 'KEEP_DES',
+      },
+    };
+    await assert.rejects(
+      () => completeAccountLogin({
+        session: token400Session,
+        fetchFn: (async () => makeMockResponse(400, { success: false, error: 'Invalid Session Token' }, {
+          'set-cookie': [
+            'X-APPLE-WEBAUTH-TOKEN=""; Path=/; Max-Age=0',
+            'DES5162f8ffe76c=""; Path=/; Max-Age=0',
+          ],
+        })) as typeof fetch,
+      }),
+      (err: any) => err?.code === 'AUTH_EXPIRED' && err?.status === 400,
+    );
+    assert.equal(token400Session.cookies['X-APPLE-WEBAUTH-TOKEN'], 'KEEP_WEBAUTH', 'failed accountLogin must not wipe webauth cookie');
+    assert.equal(token400Session.cookies.DES5162f8ffe76c, 'KEEP_DES', 'failed accountLogin must not wipe DES trust cookie');
+
+    // Also test full initClient 450 -> accountLogin HTML 400 Bad Request -> validate 200 -> initClient 450 => state='expired'
+    const dataDir = mkdtempSync(join(tmpdir(), 'friday-apple-html400-'));
+    let now = 1_760_600_000_000;
+    let rejectExpired = false;
+    try {
+      const sampleDev = {
+        id: 'RAW-HTML400-1',
+        name: '我的 iPhone',
+        deviceDisplayName: 'iPhone 17 Pro',
+        rawDeviceModel: 'iPhone18,4',
+        deviceClass: 'iPhone',
+        deviceStatus: '200',
+        batteryLevel: 0.9,
+        batteryStatus: 'NotCharging',
+        features: { SND: true, LOC: true },
+      };
+      const mock = createMockAppleFetch({
+        appleId: 'html400@icloud.com',
+        password: 'Password123!',
+        require2fa: false,
+        devices: [sampleDev],
+        accountLoginHandler: () => {
+          if (rejectExpired) {
+            return new Response('<html><head><title>400 Bad Request</title></head><body>AppleHttpServer</body></html>', {
+              status: 400,
+              headers: { 'content-type': 'text/html' },
+            });
+          }
+          return makeMockResponse(200, {
+            hsaTrustedBrowser: true,
+            dsInfo: { appleId: 'html400@icloud.com', dsid: '123456789' },
+            webservices: { findme: { url: 'https://p123-fmipweb.icloud.com.cn:443', status: 'active' } },
+          }, {
+            'set-cookie': ['X-APPLE-WEBAUTH-TOKEN=TOKEN_SECRET_COOKIE; Path=/; HttpOnly'],
+          });
+        },
+        initClientHandler: () => rejectExpired
+          ? makeMockResponse(450, '')
+          : makeMockResponse(200, {
+              statusCode: '200',
+              serverContext: { serverTimestamp: now, callbackIntervalInMS: 2000, sessionLifespan: 900_000 },
+              content: [sampleDev],
+            }),
+        refreshClientHandler: () => rejectExpired
+          ? makeMockResponse(450, '')
+          : makeMockResponse(200, {
+              statusCode: '200',
+              serverContext: { serverTimestamp: now, callbackIntervalInMS: 2000, sessionLifespan: 900_000 },
+              content: [sampleDev],
+            }),
+      });
+      await runAppleAction('auth-login', {
+        appleId: 'html400@icloud.com',
+        password: 'Password123!',
+      }, { dataDir, fetchFn: mock.fetchFn, nowFn: () => now });
+
+      rejectExpired = true;
+      now += 3_600_000;
+      const callsBefore = mock.calls.length;
+      const expiredRes = await runAppleAction('status', { refresh: true }, { dataDir, fetchFn: mock.fetchFn, nowFn: () => now });
+      assert.equal(expiredRes.ok, false);
+      assert.equal(expiredRes.data.authState, 'expired');
+      const slice = mock.calls.slice(callsBefore);
+      assert.ok(slice.some(c => c.url.includes('/setup/ws/1/accountLogin')));
+      assert.ok(slice.some(c => c.url.includes('/setup/ws/1/validate')), 'HTML 400 Bad Request must fall back to Stage B /validate before marking expired');
+      const persistedSess = JSON.parse(readFileSync(join(dataDir, 'session.json'), 'utf8'));
+      assert.equal(persistedSess.state, 'expired');
+      assert.equal(persistedSess.cookies['X-APPLE-WEBAUTH-TOKEN'], 'TOKEN_SECRET_COOKIE');
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  }
+
+  // 11c. Passive keepalive status({ refresh: true, locate: false }) skips locate flags/polling, preserves locatedAt, and does not trigger active locate cooldown
+  {
+    const dataDir = mkdtempSync(join(tmpdir(), 'friday-apple-keepalive-'));
+    let now = 1_760_700_000_000;
+    try {
+      const sampleDev = {
+        id: 'RAW-KEEPALIVE-1',
+        name: '我的 iPhone',
+        deviceDisplayName: 'iPhone 17 Pro',
+        rawDeviceModel: 'iPhone18,4',
+        deviceClass: 'iPhone',
+        deviceStatus: '200',
+        batteryLevel: 0.8,
+        batteryStatus: 'NotCharging',
+        features: { SND: true, LOC: true },
+      };
+      const mock = createMockAppleFetch({
+        appleId: 'keepalive@icloud.com',
+        password: 'Password123!',
+        require2fa: false,
+        devices: [sampleDev],
+      });
+      await runAppleAction('auth-login', {
+        appleId: 'keepalive@icloud.com',
+        password: 'Password123!',
+      }, { dataDir, fetchFn: mock.fetchFn, nowFn: () => now, locatePollDelayMs: 0 });
+
+      const initialCache = JSON.parse(readFileSync(join(dataDir, 'devices-cache.json'), 'utf8'));
+      const initialLocatedAt = initialCache.locatedAt;
+      assert.equal(initialLocatedAt, now);
+
+      // Advance 8 min (< 15m sessionLifespan) and perform passive keepalive
+      now += 8 * 60_000;
+      const callsBefore = mock.calls.length;
+      const keepaliveRes = await runAppleAction('status', { refresh: true, locate: false }, {
+        dataDir,
+        fetchFn: mock.fetchFn,
+        nowFn: () => now,
+        locatePollDelayMs: 0,
+      });
+      assert.equal(keepaliveRes.ok, true);
+      assert.equal(keepaliveRes.data.fromCache, false);
+
+      const keepaliveCalls = mock.calls.slice(callsBefore);
+      assert.equal(keepaliveCalls.length, 1, 'passive keepalive must issue exactly 1 refreshClient call');
+      const keepaliveCall = keepaliveCalls[0];
+      assert.ok(keepaliveCall);
+      assert.ok(keepaliveCall.url.includes('/fmipservice/client/web/refreshClient'));
+      assert.equal(keepaliveCall.body.clientContext?.shouldLocate, undefined);
+      assert.equal(keepaliveCall.body.isUpdatingAllLocations, undefined);
+
+      const postKeepaliveCache = JSON.parse(readFileSync(join(dataDir, 'devices-cache.json'), 'utf8'));
+      assert.equal(postKeepaliveCache.fetchedAt, now);
+      assert.equal(postKeepaliveCache.locatedAt, initialLocatedAt, 'passive keepalive must preserve previous locatedAt');
+      const postKeepaliveSess = JSON.parse(readFileSync(join(dataDir, 'session.json'), 'utf8'));
+      assert.equal(postKeepaliveSess.fmipContextUpdatedAt, now);
+
+      // Immediately after (5s < 30s minRefreshIntervalSec), active locate must NOT be blocked by passive keepalive cooldown
+      now += 5_000;
+      const activeCallsBefore = mock.calls.length;
+      const activeRes = await runAppleAction('status', { refresh: true }, {
+        dataDir,
+        fetchFn: mock.fetchFn,
+        nowFn: () => now,
+        locatePollDelayMs: 0,
+      });
+      assert.equal(activeRes.ok, true);
+      assert.equal(activeRes.data.fromCache, false);
+      assert.equal(activeRes.data.cooldownActive, false);
+      const activeCalls = mock.calls.slice(activeCallsBefore);
+      const activeCall = activeCalls[0];
+      assert.ok(activeCall);
+      assert.equal(activeCall.body.clientContext?.shouldLocate, true);
+      const postActiveCache = JSON.parse(readFileSync(join(dataDir, 'devices-cache.json'), 'utf8'));
+      assert.equal(postActiveCache.locatedAt, now);
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
     }

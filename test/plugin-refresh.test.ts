@@ -487,3 +487,100 @@ test('PluginRefreshScheduler runs laifen maintenance on pending outbox or autoWa
     ]);
   });
 });
+
+test('PluginRefreshScheduler runs 8m passive apple keepalive without waking GPS, prioritizes 60m active locate, backs off failures, and stops when expired', async () => {
+  await withTmpHome(async home => {
+    let now = Date.parse('2026-11-23T10:00:00+08:00');
+    const appleDir = join(home, 'plugins', 'apple-devices');
+    writeJson(join(appleDir, 'session.json'), {
+      state: 'authenticated',
+      fmipServerContext: { sessionLifespan: 900_000 },
+      fmipContextUpdatedAt: now - 8 * 60_000,
+    });
+    writeJson(join(appleDir, 'devices-cache.json'), {
+      fetchedAt: now - 8 * 60_000,
+      locatedAt: now - 20 * 60_000,
+      entries: [],
+    });
+
+    let failNext = false;
+    const calls: Array<{ plugin: string; action: string; args: Record<string, unknown> }> = [];
+    const ac = new AbortController();
+    const scheduler = new PluginRefreshScheduler({
+      home,
+      mode: 'real',
+      closingSignal: ac.signal,
+      isClosing: () => false,
+      enabled: true,
+      nowFn: () => now,
+      platform: 'linux',
+      initialDelayMs: 0,
+      checkIntervalMs: 0,
+      staggerMs: 0,
+      listPluginsFn: h => makeManifests(h, ['apple-devices']),
+      runPluginFn: async (_h, plugin, action = 'status', args = {}): Promise<PluginRunResult> => {
+        calls.push({ plugin, action, args });
+        if (failNext) {
+          failNext = false;
+          return { ok: false, plugin, action, notify: false, message: 'transient error' };
+        }
+        return { ok: true, plugin, action, notify: false, message: 'ok' };
+      },
+    });
+
+    // 1. At 8m keepalive age & 20m locate age -> passive keepalive (locate: false)
+    scheduler.tick();
+    await scheduler.awaitSettled();
+    assert.deepEqual(calls.at(-1), {
+      plugin: 'apple-devices',
+      action: 'status',
+      args: { refresh: true, locate: false, silent: true },
+    });
+
+    // 2. +5m (only 5m since keepalive, 25m since locate) -> fires nothing
+    const callsAfterKeepalive = calls.length;
+    now += 5 * 60_000;
+    scheduler.tick();
+    await scheduler.awaitSettled();
+    assert.equal(calls.length, callsAfterKeepalive);
+
+    // 3. Advance to 60m since initial locatedAt -> active refresh (prioritized over keepalive)
+    now += 35 * 60_000; // total 60m since locatedAt (T0 - 20m -> T0 + 40m)
+    scheduler.tick();
+    await scheduler.awaitSettled();
+    assert.deepEqual(calls.at(-1), {
+      plugin: 'apple-devices',
+      action: 'status',
+      args: { refresh: true, silent: true },
+    });
+
+    // 4. Failure on next keepalive triggers 5m failure backoff, then 10m on 2nd failure
+    now += 8 * 60_000;
+    failNext = true;
+    scheduler.tick();
+    await scheduler.awaitSettled();
+    assert.equal(scheduler.status().entries['apple-devices']?.consecutiveFailures, 1);
+    assert.equal(scheduler.status().entries['apple-devices']?.nextRetryAt, now + 5 * 60_000);
+
+    now += 4 * 60_000;
+    const countBeforeBackoff = calls.length;
+    scheduler.tick();
+    await scheduler.awaitSettled();
+    assert.equal(calls.length, countBeforeBackoff);
+
+    now += 60_000;
+    failNext = true;
+    scheduler.tick();
+    await scheduler.awaitSettled();
+    assert.equal(calls.length, countBeforeBackoff + 1);
+    assert.equal(scheduler.status().entries['apple-devices']?.consecutiveFailures, 2);
+    assert.equal(scheduler.status().entries['apple-devices']?.nextRetryAt, now + 10 * 60_000);
+
+    // 5. Once session transitions to expired, scheduler stops attempting even after backoff
+    writeJson(join(appleDir, 'session.json'), { state: 'expired' });
+    now += 60 * 60_000;
+    scheduler.tick();
+    await scheduler.awaitSettled();
+    assert.equal(calls.length, countBeforeBackoff + 1);
+  });
+});

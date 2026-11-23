@@ -1349,6 +1349,74 @@ hub_live._collect_apple_devices(apple_cache, connected=True)
 apple_cd_calls = live_calls[calls_before_cd:]
 assert len(apple_cd_calls) == 1 and apple_cd_calls[0][2].get("cacheOnly") is True, apple_cd_calls
 
+# Recent Apple lastError newer than fetchedAt suppresses fallback live refresh (avoids 10-12m retry storm)
+recent_err_ts = int(time.time() * 1000) - 60_000
+apple_sess_path = home / "plugins" / "apple-devices" / "session.json"
+apple_sess_path.write_text(json.dumps({
+    "state": "authenticated",
+    "lastError": {"at": recent_err_ts, "code": "AUTH_EXPIRED", "status": 421},
+}), encoding="utf-8")
+def _err_rpc(req, timeout):
+    plug = req.get("plugin")
+    act = req.get("action")
+    args = dict(req.get("args") or {})
+    live_calls.append((plug, act, args, timeout))
+    if plug == "apple-devices" and args.get("cacheOnly"):
+        return {
+            "ok": True,
+            "data": {
+                "authState": "authenticated",
+                "fetchedAt": stale_ms,
+                "lastError": {"at": recent_err_ts, "code": "AUTH_EXPIRED", "status": 421},
+                "devices": [],
+                "config": {"minBatteryPct": 25},
+            },
+        }
+    return {"ok": True, "data": {"authState": "authenticated", "fetchedAt": now_ms, "devices": [], "config": {"minBatteryPct": 25}}}
+
+hub_err = WidgetDataHub(home, _err_rpc, ls, disable_network=False)
+calls_before_err = len(live_calls)
+hub_err._collect_apple_devices(apple_cache, connected=True)
+apple_err_calls = live_calls[calls_before_err:]
+assert len(apple_err_calls) == 1 and apple_err_calls[0][2].get("cacheOnly") is True, apple_err_calls
+
+# Local fallback also reads session.json lastError; once >= 30m old, a single retry is allowed again
+old_err_ts = int(time.time() * 1000) - 1_900_000
+apple_sess_path.write_text(json.dumps({
+    "state": "authenticated",
+    "lastError": {"at": old_err_ts, "code": "ERR"},
+}), encoding="utf-8")
+apple_cache.write_text(json.dumps({"fetchedAt": stale_ms, "entries": []}), encoding="utf-8")
+calls_before_old_err = len(live_calls)
+hub_err._collect_apple_devices(apple_cache, connected=True)
+apple_old_err_calls = live_calls[calls_before_old_err:]
+assert len(apple_old_err_calls) == 1 and apple_old_err_calls[0][2].get("cacheOnly") is True, apple_old_err_calls
+
+def _old_err_rpc(req, timeout):
+    plug = req.get("plugin")
+    act = req.get("action")
+    args = dict(req.get("args") or {})
+    live_calls.append((plug, act, args, timeout))
+    if plug == "apple-devices" and args.get("cacheOnly"):
+        return {
+            "ok": True,
+            "data": {
+                "authState": "authenticated",
+                "fetchedAt": stale_ms,
+                "lastError": {"at": old_err_ts, "code": "ERR"},
+                "devices": [],
+                "config": {"minBatteryPct": 25},
+            },
+        }
+    return {"ok": True, "data": {"authState": "authenticated", "fetchedAt": now_ms, "devices": [], "config": {"minBatteryPct": 25}}}
+
+hub_old_err = WidgetDataHub(home, _old_err_rpc, ls, disable_network=False)
+calls_before_retry_ok = len(live_calls)
+hub_old_err._collect_apple_devices(apple_cache, connected=True)
+apple_retry_ok_calls = live_calls[calls_before_retry_ok:]
+assert any(c[2].get("refresh") is True for c in apple_retry_ok_calls), apple_retry_ok_calls
+apple_sess_path.write_text(json.dumps({"state": "authenticated"}), encoding="utf-8")
+
 # 4. netlea skips fallback live refresh when BLE peer is busy
 netlea_state_flag["refreshed"] = False
 (health_dir / "live-session.json").write_text(json.dumps({"phase": "measuring"}), encoding="utf-8")

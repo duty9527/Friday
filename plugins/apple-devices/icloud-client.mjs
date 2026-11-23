@@ -1,5 +1,10 @@
+import http from 'node:http';
+import https from 'node:https';
 import { createHash, randomUUID } from 'node:crypto';
+import { brotliDecompressSync, gunzipSync, inflateSync } from 'node:zlib';
 import { completeSrpClientChallenge, createSrpClientEphemeral } from './icloud-srp.mjs';
+
+const NATIVE_FETCH = globalThis.fetch;
 
 export const APPLE_WIDGET_KEY = 'd39ba9916b7251055b22c7f910e2ea796ee65e98b2ddecea8f5dde8d9d1a815d';
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3.1 Safari/605.1.15';
@@ -187,7 +192,7 @@ export function serializeCookies(jar) {
 }
 
 /**
- * Case-insensitive header lookup for both Fetch `Headers` and plain objects.
+ * Case-insensitive header lookup for Fetch `Headers`, Node `IncomingHttpHeaders`, and plain objects.
  * @param {Headers | Record<string, unknown> | undefined} headers
  * @param {string} name
  * @returns {string}
@@ -201,7 +206,8 @@ function readHeader(headers, name) {
   const target = name.toLowerCase();
   for (const [k, v] of Object.entries(anyHeaders)) {
     if (k.toLowerCase() === target && v !== undefined && v !== null) {
-      return String(v).trim();
+      const val = Array.isArray(v) ? (v[0] ?? '') : v;
+      return String(val).trim();
     }
   }
   return '';
@@ -234,6 +240,9 @@ function extractAppleServiceError(data, fallback) {
     }
     if (typeof data.error === 'string' && data.error.trim()) {
       return data.error.trim();
+    }
+    if (typeof data.error === 'number') {
+      return `${fallback} (error=${data.error})`;
     }
     if (typeof data.reason === 'string' && data.reason.trim()) {
       return data.reason.trim();
@@ -331,8 +340,9 @@ function buildSetupQuery(session) {
 }
 
 /**
- * Perform HTTP JSON request with timeout + AbortSignal propagation + cookie/header capture.
- * @param {typeof fetch} fetchFn
+ * Execute an HTTP/HTTPS JSON request using Node's native `http`/`https` modules.
+ * Unlike Node 26 `fetch` (`undici`), does not auto-retry HTTP `421 Misdirected Request`,
+ * which Apple edge nodes reject as HTML `400 Bad Request`.
  * @param {string} url
  * @param {{
  *   method?: string;
@@ -340,9 +350,135 @@ function buildSetupQuery(session) {
  *   body?: unknown;
  *   signal?: AbortSignal;
  *   timeoutMs?: number;
- * }} options
+ * }} [options]
  */
-async function httpJson(fetchFn, url, options = {}) {
+function nodeHttpRequest(url, options = {}) {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS;
+  const parsed = new URL(url);
+  const transport = parsed.protocol === 'http:' ? http : https;
+  const bodyBuf = options.body === undefined
+    ? undefined
+    : Buffer.from(JSON.stringify(options.body), 'utf8');
+  /** @type {Record<string, string>} */
+  const headers = { ...(options.headers ?? {}) };
+  if (bodyBuf !== undefined && !Object.keys(headers).some(k => k.toLowerCase() === 'content-length')) {
+    headers['Content-Length'] = String(bodyBuf.length);
+  }
+
+  return new Promise((resolve, reject) => {
+    if (options.signal?.aborted) {
+      reject(options.signal.reason ?? new Error('Request aborted'));
+      return;
+    }
+    let settled = false;
+    /** @type {ReturnType<typeof setTimeout> | undefined} */
+    let timer;
+    /** @type {(() => void) | undefined} */
+    let onAbort;
+    /** @type {import('node:http').ClientRequest | undefined} */
+    let req;
+
+    const cleanup = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+      if (options.signal && onAbort) {
+        options.signal.removeEventListener('abort', onAbort);
+        onAbort = undefined;
+      }
+    };
+
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    };
+
+    req = transport.request(parsed, {
+      method: options.method ?? 'POST',
+      headers,
+    }, (res) => {
+      /** @type {Buffer[]} */
+      const chunks = [];
+      res.on('data', chunk => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+      res.on('error', err => fail(err));
+      res.on('end', () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        try {
+          let buf = Buffer.concat(chunks);
+          const enc = String(res.headers['content-encoding'] ?? '').trim().toLowerCase();
+          if (enc === 'gzip' || enc === 'x-gzip') {
+            buf = gunzipSync(buf);
+          } else if (enc === 'deflate') {
+            buf = inflateSync(buf);
+          } else if (enc === 'br') {
+            buf = brotliDecompressSync(buf);
+          }
+          const textBody = buf.toString('utf8');
+          const status = res.statusCode ?? 0;
+          const rawSc = res.headers['set-cookie'];
+          const setCookies = Array.isArray(rawSc)
+            ? rawSc
+            : (typeof rawSc === 'string' ? splitSetCookieHeader(rawSc) : []);
+          resolve({
+            status,
+            ok: status >= 200 && status < 300,
+            headers: res.headers,
+            data: safeJsonParse(textBody),
+            rawText: textBody,
+            setCookies,
+          });
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+
+    req.on('error', err => fail(err));
+
+    onAbort = () => {
+      const reason = options.signal?.reason ?? new Error('Request aborted');
+      req?.destroy(reason instanceof Error ? reason : new Error(String(reason)));
+      fail(reason);
+    };
+    if (options.signal) {
+      options.signal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    timer = setTimeout(() => {
+      const timeoutErr = new Error(`iCloud HTTP request timed out after ${timeoutMs}ms`);
+      req?.destroy(timeoutErr);
+      fail(timeoutErr);
+    }, timeoutMs);
+
+    if (bodyBuf !== undefined) {
+      req.write(bodyBuf);
+    }
+    req.end();
+  });
+}
+
+/**
+ * Perform HTTP JSON request with timeout + AbortSignal propagation + cookie/header capture.
+ * Uses `nodeHttpRequest` for default transport and preserves injected `fetchFn` for tests.
+ * @param {typeof fetch | undefined} fetchFn
+ * @param {string} url
+ * @param {{
+ *   method?: string;
+ *   headers?: Record<string, string>;
+ *   body?: unknown;
+ *   signal?: AbortSignal;
+ *   timeoutMs?: number;
+ * }} [options]
+ */
+export async function httpJson(fetchFn, url, options = {}) {
+  if (!fetchFn || fetchFn === NATIVE_FETCH) {
+    return await nodeHttpRequest(url, options);
+  }
   const timeoutMs = options.timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS;
   const controller = new AbortController();
   let timer;
@@ -423,7 +559,6 @@ export async function validateAccountSession({ session, fetchFn = fetch, signal,
     body: null,
     signal,
   });
-  absorbAuthResponse(session, resp.headers, resp.setCookies);
   if (!resp.ok) {
     const isAuthErr = resp.status === 401 || resp.status === 421 || resp.status === 450;
     throw new AppleClientError(
@@ -433,6 +568,7 @@ export async function validateAccountSession({ session, fetchFn = fetch, signal,
       'validate',
     );
   }
+  absorbAuthResponse(session, resp.headers, resp.setCookies);
   if (resp.data?.dsInfo?.dsid) {
     session.dsid = String(resp.data.dsInfo.dsid);
   }
@@ -476,9 +612,14 @@ export async function completeAccountLogin({ session, fetchFn = fetch, signal, n
     },
     signal,
   });
-  absorbAuthResponse(session, resp.headers, resp.setCookies);
   if (!resp.ok) {
-    const code = resp.status === 401 || resp.status === 450 || resp.status === 421 ? 'AUTH_EXPIRED' : 'SETUP_LOGIN_FAILED';
+    const isAuth400 = resp.status === 400 && (
+      (typeof resp.data?.error === 'string' && /invalid\s+session\s+token|expired|auth/i.test(resp.data.error))
+      || /400\s+bad\s+request/i.test(resp.rawText || '')
+    );
+    const code = (resp.status === 401 || resp.status === 450 || resp.status === 421 || isAuth400)
+      ? 'AUTH_EXPIRED'
+      : 'SETUP_LOGIN_FAILED';
     throw new AppleClientError(
       extractAppleServiceError(resp.data, `iCloud 会话建权失败 (HTTP ${resp.status})`),
       code,
@@ -486,6 +627,7 @@ export async function completeAccountLogin({ session, fetchFn = fetch, signal, n
       'account_login',
     );
   }
+  absorbAuthResponse(session, resp.headers, resp.setCookies);
   if (resp.data?.dsInfo?.dsid) {
     session.dsid = String(resp.data.dsInfo.dsid);
   }
@@ -1229,7 +1371,7 @@ async function initFmipSession({
       markSessionExpired(
         session,
         nowFn,
-        'Apple 会话已过期（约 30～60 天需重新完成一次 2FA 授权），请重新登录绑定',
+        'Apple 会话已过期，请重新登录绑定（30～60 天信任期内可免 2FA 验证码）',
         authRejectedStatus,
         authRejectedStage,
       );
@@ -1441,7 +1583,7 @@ export async function fetchFindMyDevices({
         markSessionExpired(
           session,
           nowFn,
-          'Apple 会话已过期（约 30～60 天需重新完成一次 2FA 授权），请重新登录绑定',
+          'Apple 会话已过期，请重新登录绑定（30～60 天信任期内可免 2FA 验证码）',
           resp.status,
           'fmip_refresh',
         );
@@ -1646,7 +1788,7 @@ export async function playFindMySound({ session, rawDeviceId, subject, fetchFn =
     markSessionExpired(
       session,
       nowFn,
-      'Apple 会话已过期（约 30～60 天需重新完成一次 2FA 授权），请重新登录绑定',
+      'Apple 会话已过期，请重新登录绑定（30～60 天信任期内可免 2FA 验证码）',
       resp.status,
       'fmip_play_sound',
     );
