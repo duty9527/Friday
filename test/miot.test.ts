@@ -33,6 +33,7 @@ import {
   discoverSpeakerSsh,
   encryptMiioPacket,
   handleVoiceFastpath,
+  isMiotWriteSuccessCode,
   packMipsFrame,
   parseAutoLocalLogs,
   parseCentralOverviewOutput,
@@ -322,6 +323,7 @@ interface MockHarnessOptions {
   protectedDevices?: string[];
   bleProps?: Record<string, boolean | number | undefined>;
   bleWriteCode?: number;
+  udpWriteCode?: number;
   fryerReadQueue?: Array<Record<string, unknown>>;
   fryerActionCode?: number;
   routerReachable?: boolean;
@@ -396,7 +398,7 @@ function createMockHarness(opts: MockHarnessOptions) {
       if (payload.method === 'set_properties') {
         const code = opts.bleWriteCode ?? 0;
         const result = (payload.params ?? []).map((p: any) => {
-          if (code === 0) bleState[String(p.did)] = p.value;
+          if (code === 0 || code === 1) bleState[String(p.did)] = p.value;
           return { did: p.did, siid: p.siid, piid: p.piid, code };
         });
         return {
@@ -446,7 +448,7 @@ function createMockHarness(opts: MockHarnessOptions) {
       if (call.method === 'set_properties') {
         return {
           id: 1,
-          result: (call.params ?? []).map((p: any) => ({ did: p.did, siid: p.siid, piid: p.piid, code: 0 })),
+          result: (call.params ?? []).map((p: any) => ({ did: p.did, siid: p.siid, piid: p.piid, code: opts.udpWriteCode ?? 0 })),
         };
       }
       return { id: 1, result: [] };
@@ -2228,5 +2230,121 @@ test('42. dashboard writes sanitized central-cache.json, supports cacheOnly zero
     const dashUnconf = await runAction('dashboard', {}, customDeps);
     assert.equal(dashUnconf.ok, true);
     assert.equal(dashUnconf.data.configured, false);
+  });
+});
+
+test('43. MIoT write/action treats code=1 (accepted async) as success across set, mesh batch, action, and cook, while rejecting negative codes', async () => {
+  // 1. Unit assertions on isMiotWriteSuccessCode
+  assert.equal(isMiotWriteSuccessCode(0), true);
+  assert.equal(isMiotWriteSuccessCode(1), true);
+  assert.equal(isMiotWriteSuccessCode(undefined), true);
+  assert.equal(isMiotWriteSuccessCode(-4004), false);
+  assert.equal(isMiotWriteSuccessCode(-4001), false);
+  assert.equal(isMiotWriteSuccessCode(-1), false);
+  assert.equal(isMiotWriteSuccessCode(2), false);
+  assert.equal(isMiotWriteSuccessCode(null), false);
+  assert.equal(isMiotWriteSuccessCode('0'), false);
+
+  // 2. BLE Mesh set (on, toggle, generic siid/piid/value) with code=1 succeeds with acceptedAsync
+  await withTmp(async dir => {
+    const h = createMockHarness({ dir, bleProps: { '110022003': false, '110022001': true }, bleWriteCode: 1 });
+
+    const setOn = await runAction('set', { device: '卧室灯', on: true }, h.deps);
+    assert.equal(setOn.ok, true);
+    assert.equal(setOn.data.on, true);
+    assert.equal(setOn.data.acceptedAsync, true);
+    assert.equal(h.bleState['110022003'], true);
+
+    const toggled = await runAction('set', { device: '卧室灯', toggle: true }, h.deps);
+    assert.equal(toggled.ok, true);
+    assert.equal(toggled.data.previous, true);
+    assert.equal(toggled.data.on, false);
+    assert.equal(toggled.data.acceptedAsync, true);
+    assert.equal(h.bleState['110022003'], false);
+
+    const setGeneric = await runAction('set', { device: '水草补光灯', siid: 2, piid: 2, value: 1 }, h.deps);
+    assert.equal(setGeneric.ok, true);
+    assert.equal(setGeneric.data.acceptedAsync, true);
+    assert.deepEqual(h.sshBinCalls.at(-1)!.decoded.payload.params, [{ did: '110022001', siid: 2, piid: 2, value: 1 }]);
+    assertNoTokenLeak(setOn, 'ble set code=1');
+  });
+
+  // 3. BLE Mesh set with negative code (-4004) still fails
+  await withTmp(async dir => {
+    const h = createMockHarness({ dir, bleProps: { '110022003': false }, bleWriteCode: -4004 });
+    const badSet = await runAction('set', { device: '卧室灯', on: true }, h.deps);
+    assert.equal(badSet.ok, false);
+    assert.match(badSet.message, /写入失败（code=-4004）/);
+  });
+
+  // 4. Wi-Fi MiIO generic set accepts code=1 and rejects code=-4001
+  await withTmp(async dir => {
+    const hOk = createMockHarness({ dir, udpWriteCode: 1 });
+    const udpOk = await runAction('set', { device: '空气炸锅', siid: 2, piid: 3, value: 10 }, hOk.deps);
+    assert.equal(udpOk.ok, true);
+    assert.equal(udpOk.data.acceptedAsync, true);
+
+    const hBad = createMockHarness({ dir, udpWriteCode: -4001 });
+    const udpBad = await runAction('set', { device: '空气炸锅', siid: 2, piid: 3, value: 10 }, hBad.deps);
+    assert.equal(udpBad.ok, false);
+    assert.match(udpBad.message, /写入失败（code=-4001）/);
+  });
+
+  // 5. mesh batch control with code=1 succeeds while skipping protected devices
+  await withTmp(async dir => {
+    const h = createMockHarness({ dir, protectedDevices: ['水草补光灯'], bleWriteCode: 1 });
+    const batchRes = await runAction('mesh', { op: 'batch', on: true }, h.deps);
+    assert.equal(batchRes.ok, true);
+    assert.equal(batchRes.data.failed.length, 0);
+    assert.equal(batchRes.data.succeeded.length, 2);
+    assert.equal(batchRes.data.skipped.length, 1);
+    assert.equal(h.bleState['110022002'], true);
+    assert.equal(h.bleState['110022003'], true);
+  });
+
+  // 6. action on BLE Mesh accepts code=1 and rejects code=-4004
+  await withTmp(async dir => {
+    const hOk = createMockHarness({ dir, bleWriteCode: 1 });
+    const actOk = await runAction('action', { device: '卧室灯', siid: 2, aiid: 1, in: [] }, hOk.deps);
+    assert.equal(actOk.ok, true);
+    assert.equal(actOk.data.acceptedAsync, true);
+
+    const hBad = createMockHarness({ dir, bleWriteCode: -4004 });
+    const actBad = await runAction('action', { device: '卧室灯', siid: 2, aiid: 1, in: [] }, hBad.deps);
+    assert.equal(actBad.ok, false);
+    assert.match(actBad.message, /返回 code=-4004/);
+  });
+
+  // 7. cook start & stop accept fryerActionCode=1 and reject fryerActionCode=-4004
+  await withTmp(async dir => {
+    const hOk = createMockHarness({
+      dir,
+      fryerActionCode: 1,
+      fryerReadQueue: [
+        { '2.1': 1 },
+        { '2.1': 4, '2.4': 180, '2.3': 15, '2.5': 15, '3.1': 'M1', '3.2': '薯条' },
+        { '2.1': 1 },
+      ],
+    });
+    const cookStart = await runAction('cook', { op: 'start', recipe: '薯条' }, hOk.deps);
+    assert.equal(cookStart.ok, true);
+    assert.equal(cookStart.data.after.statusCode, 4);
+
+    const cookStop = await runAction('cook', { op: 'stop' }, hOk.deps);
+    assert.equal(cookStop.ok, true);
+    assert.equal(cookStop.data.op, 'stop');
+
+    const hBad = createMockHarness({
+      dir,
+      fryerActionCode: -4004,
+      fryerReadQueue: [{ '2.1': 1 }],
+    });
+    const badStart = await runAction('cook', { op: 'start', recipe: '薯条' }, hBad.deps);
+    assert.equal(badStart.ok, false);
+    assert.match(badStart.message, /code=-4004/);
+
+    const badStop = await runAction('cook', { op: 'stop' }, hBad.deps);
+    assert.equal(badStop.ok, false);
+    assert.match(badStop.message, /code=-4004/);
   });
 });

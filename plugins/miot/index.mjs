@@ -2046,15 +2046,31 @@ async function handleSet(ctx) {
   }
 }
 
+/**
+ * MIoT-Spec-V2 write/action status codes:
+ * - `0`: operation completed synchronously
+ * - `1`: request received/accepted, executing asynchronously (common on BLE Mesh 2.0 switches)
+ * - `undefined`: some local firmware acknowledgements omit `code`
+ * Negative codes (e.g. -4001, -4003, -4004) indicate failure.
+ * @param {unknown} code
+ */
+export function isMiotWriteSuccessCode(code) {
+  return code === 0 || code === 1 || code === undefined;
+}
+
 function checkWrite(name, results, okMessage, base) {
-  const bad = results.filter(r => r.code !== 0 && r.code !== undefined);
+  const bad = results.filter(r => !isMiotWriteSuccessCode(r.code));
   if (results.length === 0) {
     return failure('米家设备控制失败', `${name} 没有返回写入结果（设备可能离线）。`, { device: base, results });
   }
   if (bad.length > 0) {
     return failure('米家设备控制失败', `${name} 写入失败（code=${bad.map(b => b.code).join(',')}），设备可能离线或属性只读。`, { device: base, results });
   }
-  return success('米家设备控制', okMessage, { device: base, results });
+  return success('米家设备控制', okMessage, {
+    device: base,
+    results,
+    ...(results.some(r => r.code === 1) ? { acceptedAsync: true } : {}),
+  });
 }
 
 // ---- cook -----------------------------------------------------------------
@@ -2143,7 +2159,7 @@ async function handleCook(ctx) {
       }
       const reply = await miioCall(ctx, device, 'action', plan.params);
       const code = reply?.result?.code;
-      if (code !== 0) {
+      if (code !== 0 && code !== 1) {
         return failure('空气炸锅启动失败', `设备拒绝启动指令（code=${code ?? '无'}）。`, { device: base, before, reply: sanitizeOutput(reply) });
       }
       let after;
@@ -2176,7 +2192,7 @@ async function handleCook(ctx) {
     await loadSnapshotIfNeeded(ctx);
     const reply = await miioCall(ctx, device, 'action', params);
     const code = reply?.result?.code;
-    if (code !== 0) {
+    if (code !== 0 && code !== 1) {
       return failure('空气炸锅控制失败', `设备拒绝「${spec.label}」指令（code=${code ?? '无'}）。`, { device: base, reply: sanitizeOutput(reply) });
     }
     const expectedCodes = {
@@ -2238,10 +2254,15 @@ async function handleActionCall(ctx) {
       const reply = await miioCall(ctx, device, 'action', params);
       result = reply?.result && typeof reply.result === 'object' ? normalizeMiotResult(reply.result) : { code: undefined };
     }
-    if (result.code !== undefined && result.code !== 0) {
+    if (!isMiotWriteSuccessCode(result.code)) {
       return failure('米家动作失败', `${name} 的 action ${siid}.${aiid} 返回 code=${result.code}。`, { device: base, result });
     }
-    return success('米家动作', `已对 ${name} 执行 action ${siid}.${aiid}${warning ? `。${warning}` : ''}`, { device: base, result, ...(warning ? { warning } : {}) });
+    return success('米家动作', `已对 ${name} 执行 action ${siid}.${aiid}${warning ? `。${warning}` : ''}`, {
+      device: base,
+      result,
+      ...(result.code === 1 ? { acceptedAsync: true } : {}),
+      ...(warning ? { warning } : {}),
+    });
   } catch (err) {
     return failFromError('米家动作失败', err);
   }
@@ -2549,7 +2570,7 @@ async function handleMesh(ctx) {
       const failed = [];
       for (const dev of targets) {
         const r = results.find(x => x.did === dev.did && x.siid === 2 && x.piid === 1);
-        if (r && (r.code === 0 || r.code === undefined)) {
+        if (r && isMiotWriteSuccessCode(r.code)) {
           succeeded.push({ did: dev.did, name: fullName(dev) });
         } else {
           failed.push({ did: dev.did, name: fullName(dev), code: r?.code ?? '无返回' });
