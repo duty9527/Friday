@@ -39,3 +39,5 @@ async function pruneForbiddenAssets(dir) {
 await mkdir(distWeb, { recursive: true });
 await pruneForbiddenAssets(distWeb);
 await copyStaticTree(srcWeb, distWeb);
+await copyFile(join(srcWeb, 'index.html'), join(distWeb, 'legacy.html'));
+await copyFile(join(srcWeb, 'mindmap.html'), join(distWeb, 'mindmap-legacy.html'));

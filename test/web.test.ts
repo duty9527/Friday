@@ -199,6 +199,19 @@ async function collectDistWebJsFiles(): Promise<Array<{ rel: string; text: strin
 test('every nested module the page or mindmap imports is served and path escapes are rejected', async () => {
   const f = await fixture();
   try {
+    const rootHtml = await (await fetch(f.base)).text();
+    const assetPaths = [
+      ...[...rootHtml.matchAll(/<script[^>]+src="(\/assets\/[^"]+)"/g)].map(m => m[1]!),
+      ...[...rootHtml.matchAll(/<link[^>]+href="(\/assets\/[^"]+)"/g)].map(m => m[1]!),
+    ];
+    assert.ok(assetPaths.some(p => p.endsWith('.js')), 'coss index.html must reference built /assets/*.js');
+    assert.ok(assetPaths.some(p => p.endsWith('.css')), 'coss index.html must reference built /assets/*.css');
+    for (const assetPath of assetPaths) {
+      const res = await fetch(`${f.base}${assetPath}`);
+      assert.equal(res.status, 200, `built asset ${assetPath} must be served`);
+    }
+    assert.equal((await fetch(`${f.base}/legacy`)).status, 200, '/legacy console must remain reachable');
+
     const visited = new Set<string>();
     const queue = ['/client.js', '/mindmap.js'];
     while (queue.length) {
@@ -334,10 +347,30 @@ test('Web chat accepts a folder path and completes reads for every nested file',
 test('Mindmap standalone page serves strict CSP assets and aggregates real task flows via /api/mindmap', { timeout: 15000 }, async () => {
   const f = await fixture();
   try {
-    const indexHtml = await (await fetch(f.base)).text();
-    assert.match(indexHtml, /href="\/mindmap"/, 'main page links to /mindmap');
+    const legacyHtml = await (await fetch(`${f.base}/legacy`)).text();
+    assert.match(legacyHtml, /href="\/mindmap"/, 'legacy main page links to /mindmap');
+    const cossHtml = await (await fetch(f.base)).text();
+    const assetMatch = cossHtml.match(/<script[^>]+src="(\/assets\/[^"]+\.js)"/);
+    assert.ok(assetMatch?.[1], 'coss index.html references built JS bundle');
+    const cossJs = await (await fetch(`${f.base}${assetMatch![1]}`)).text();
+    assert.match(cossJs, /`\/mindmap`|["']\/mindmap["']/, 'coss React bundle links to /mindmap');
 
     for (const route of ['/mindmap', '/mindmap.html']) {
+      const page = await fetch(`${f.base}${route}`);
+      assert.equal(page.status, 200);
+      assert.equal(page.headers.get('content-type'), 'text/html; charset=utf-8');
+      const csp = page.headers.get('content-security-policy') ?? '';
+      assert.match(csp, /script-src 'self'/);
+      assert.match(csp, /style-src 'self'/);
+      const html = await page.text();
+      assert.match(html, /<html[^>]+data-app="coss"/);
+      assert.match(html, /F\.R\.I\.D\.A\.Y\. · 会话思考流程图/);
+      assert.match(html, /\/assets\/[^"]+\.js/);
+      assert.doesNotMatch(html, /\sstyle="/i, 'strict CSP forbids inline style attributes');
+      assert.doesNotMatch(html, /<script(?![^>]*\bsrc=)[^>]*>/i, 'strict CSP forbids inline script tags');
+    }
+
+    for (const route of ['/mindmap-legacy', '/mindmap-legacy.html']) {
       const page = await fetch(`${f.base}${route}`);
       assert.equal(page.status, 200);
       assert.equal(page.headers.get('content-type'), 'text/html; charset=utf-8');
@@ -476,20 +509,43 @@ test('Web console exposes XiaoAI voiceprint status, listing, gate toggling, remo
     assert.equal((await fetch(`${f.base}/api/voice-remove`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).status, 401);
 
     const html = await (await fetch(f.base)).text();
-    assert.match(html, /id="im-voice-list"/);
-    assert.match(html, /id="im-voice-toggle-btn"/);
-    assert.match(html, /id="im-voice-clear-btn"/);
     assert.doesNotMatch(html, /\sstyle="/i, 'strict CSP forbids inline style attributes in index.html');
+    assert.doesNotMatch(html, /<style\b/i, 'strict CSP forbids inline <style> tags in index.html');
+    assert.doesNotMatch(html, /<script(?![^>]*\bsrc=)[^>]*>/i, 'strict CSP forbids inline <script> tags in index.html');
+
+    const legacyHtml = await (await fetch(`${f.base}/legacy`)).text();
+    assert.match(legacyHtml, /id="im-voice-list"/);
+    assert.match(legacyHtml, /id="im-voice-toggle-btn"/);
+    assert.match(legacyHtml, /id="im-voice-clear-btn"/);
+    assert.doesNotMatch(legacyHtml, /\sstyle="/i, 'strict CSP forbids inline style attributes in legacy.html');
 
     const css = await (await fetch(`${f.base}/style.css`)).text();
     assert.ok(css.includes('.voiceprint-hero-card') && css.includes('.origin-speaker-badge') && css.includes('.badge-purple'));
 
-    const allWebJs = await collectDistWebJsFiles();
+    const allWebJs = (await collectDistWebJsFiles()).filter(file => !file.rel.startsWith('assets/'));
     assert.ok(allWebJs.length >= 10, 'modular build emits client, panels, hubs, shared, plugins, and mindmap modules');
     for (const file of allWebJs) {
       assert.doesNotMatch(file.text, /\.style\./, `${file.rel} must not mutate element.style under strict CSP`);
       assert.doesNotMatch(file.text, /setAttribute\(\s*['"]style['"]/, `${file.rel} must not set style attributes`);
       assert.doesNotMatch(file.text, /\.innerHTML\b/, `${file.rel} must not assign innerHTML`);
+    }
+
+    const cossSrcRoot = fileURLToPath(new URL('../web/src/', import.meta.url));
+    async function walkTsSrc(dir: string): Promise<string[]> {
+      const entries = await readdir(dir, { withFileTypes: true });
+      const files: string[] = [];
+      for (const entry of entries) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) files.push(...await walkTsSrc(full));
+        else if (entry.isFile() && /\.(?:ts|tsx)$/.test(entry.name)) files.push(full);
+      }
+      return files;
+    }
+    for (const file of await walkTsSrc(cossSrcRoot)) {
+      const text = await readFile(file, 'utf8');
+      assert.doesNotMatch(text, /dangerouslySetInnerHTML/, `${file} must not use dangerouslySetInnerHTML under Trusted Types`);
+      assert.doesNotMatch(text, /\.innerHTML\b/, `${file} must not assign innerHTML under Trusted Types`);
+      assert.doesNotMatch(text, /\beval\s*\(|new\s+Function\s*\(/, `${file} must not use dynamic code eval`);
     }
 
     const manager = new XiaoaiSpeakerManager({ homeDir: f.home });
@@ -553,7 +609,7 @@ test('Web console exposes XiaoAI voiceprint status, listing, gate toggling, remo
 test('Web console lazy-loads health-scale UI, serves redacted PluginView metadata, and completes profile-save + record-add', { timeout: 15000 }, async () => {
   const f = await fixture();
   try {
-    const html = await (await fetch(f.base)).text();
+    const html = await (await fetch(`${f.base}/legacy`)).text();
     assert.match(html, /id="open-plugin-hub-top"/);
     assert.doesNotMatch(html, /id="open-notebook-hub-top"/, 'M5 notebook entry must be merged into M1');
     assert.doesNotMatch(html, /id="notebook-hub-backdrop"/, 'legacy notebook backdrop must be removed');
@@ -788,9 +844,23 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
     assert.doesNotMatch(themeBootJs, /\.style\./);
     assert.doesNotMatch(themeBootJs, /\.innerHTML\b/);
 
-    const indexHtml = await (await fetch(f.base)).text();
+    const cossIndexHtml = await (await fetch(f.base)).text();
+    assert.match(cossIndexHtml, /<html[^>]+data-app="coss"/);
+    assert.equal(cossIndexHtml.match(/<meta\s+name="theme-color"[^>]*>/g)?.length, 1, 'coss index.html must contain a single theme-color meta tag');
+    assert.match(cossIndexHtml, /<meta\s+name="theme-color"\s+content="#0a0a0a">/);
+    assert.match(cossIndexHtml, /<meta\s+name="color-scheme"\s+content="dark light">/);
+    assert.match(cossIndexHtml, /<script\s+src="\/theme-boot\.js"><\/script>/);
+    assert.match(cossIndexHtml, /viewport-fit=cover/);
+    assert.match(cossIndexHtml, /interactive-widget=resizes-content/);
+    assert.match(cossIndexHtml, /apple-touch-icon/);
+    assert.match(cossIndexHtml, /manifest\.webmanifest/);
+    assert.doesNotMatch(cossIndexHtml, /black-translucent/);
+    assert.doesNotMatch(cossIndexHtml, /apple-mobile-web-app-capable/);
+    assert.doesNotMatch(cossIndexHtml, /\sstyle="/i);
+
+    const indexHtml = await (await fetch(`${f.base}/legacy`)).text();
     assert.match(indexHtml, /<html[^>]+data-theme="spatial"/);
-    assert.equal(indexHtml.match(/<meta\s+name="theme-color"[^>]*>/g)?.length, 1, 'index.html must contain a single theme-color meta tag');
+    assert.equal(indexHtml.match(/<meta\s+name="theme-color"[^>]*>/g)?.length, 1, 'legacy.html must contain a single theme-color meta tag');
     assert.match(indexHtml, /<meta\s+name="theme-color"\s+content="#111520">/);
     assert.match(indexHtml, /<meta\s+name="color-scheme"\s+content="dark light">/);
     assert.match(indexHtml, /<script\s+src="\/theme-boot\.js"><\/script>/);
@@ -834,9 +904,18 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
     assert.equal(manifestJson.background_color, '#111520');
     assert.equal(manifestJson.theme_color, '#111520');
 
-    const mindmapHtml = await (await fetch(`${f.base}/mindmap`)).text();
+    const cossMindmapHtml = await (await fetch(`${f.base}/mindmap`)).text();
+    assert.match(cossMindmapHtml, /<html[^>]+data-app="coss"/);
+    assert.equal(cossMindmapHtml.match(/<meta\s+name="theme-color"[^>]*>/g)?.length, 1, 'coss mindmap.html must contain a single theme-color meta tag');
+    assert.match(cossMindmapHtml, /<meta\s+name="theme-color"\s+content="#0a0a0a">/);
+    assert.match(cossMindmapHtml, /<meta\s+name="color-scheme"\s+content="dark light">/);
+    assert.match(cossMindmapHtml, /<script\s+src="\/theme-boot\.js"><\/script>/);
+    assert.match(cossMindmapHtml, /viewport-fit=cover/);
+    assert.doesNotMatch(cossMindmapHtml, /\sstyle="/i);
+
+    const mindmapHtml = await (await fetch(`${f.base}/mindmap-legacy`)).text();
     assert.match(mindmapHtml, /<html[^>]+data-theme="spatial"/);
-    assert.equal(mindmapHtml.match(/<meta\s+name="theme-color"[^>]*>/g)?.length, 1, 'mindmap.html must contain a single theme-color meta tag');
+    assert.equal(mindmapHtml.match(/<meta\s+name="theme-color"[^>]*>/g)?.length, 1, 'mindmap-legacy.html must contain a single theme-color meta tag');
     assert.match(mindmapHtml, /<meta\s+name="theme-color"\s+content="#111520">/);
     assert.match(mindmapHtml, /<meta\s+name="color-scheme"\s+content="dark light">/);
     assert.match(mindmapHtml, /<script\s+src="\/theme-boot\.js"><\/script>/);

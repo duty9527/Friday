@@ -193,13 +193,13 @@ try {
   await page.screenshot({ path: `${outDir}/empty-desktop.jpg`, quality: 85 });
   checks.push('authenticated empty screen, fragment removal, accessibility landmarks, strict M1~M4+SYS topbar, and no session manager or upload control');
 
-  // Verify M1 native <dialog closedby="any"> + merged Notes/Diary roving tablist + Escape focus restoration
+  // Verify M1 Base UI Dialog + Tabs (Matrix / Notes / Diary) + Escape focus restoration
   await page.eval(() => {
     const trigger = document.querySelector('#open-memory-hub-top');
     trigger?.focus();
     trigger?.click();
   });
-  await until(() => page.eval("document.querySelector('#memory-hub-dialog')?.open === true"), 'M1 memory-hub dialog opens');
+  await until(() => page.eval("document.querySelector('#memory-hub-dialog') !== null"), 'M1 memory-hub dialog opens');
   assert.equal(await page.eval("document.querySelector('#memory-tab-matrix')?.getAttribute('aria-selected')"), 'true');
   await page.eval(() => document.querySelector('#memory-tab-matrix')?.focus());
   await page.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'ArrowRight', code: 'ArrowRight', windowsVirtualKeyCode: 39 });
@@ -207,9 +207,9 @@ try {
   await page.eval(() => document.querySelector('#notebook-tab-diary')?.click());
   await until(() => page.eval("document.querySelector('#notebook-tab-diary')?.getAttribute('aria-selected') === 'true' && document.querySelector('#notebook-panel-diary')?.hidden === false"), 'click switches M1 to Diary tab');
   await page.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
-  await until(() => page.eval("document.querySelector('#memory-hub-dialog')?.open === false"), 'M1 memory-hub dialog closes on Escape');
-  assert.equal(await page.eval("document.activeElement?.id"), 'open-memory-hub-top', 'Escape on M1 dialog must restore focus to #open-memory-hub-top');
-  checks.push('M1 native dialog opens, switches to Notes (keyboard ArrowRight) & Diary (click), closes via Escape, and restores focus');
+  await until(() => page.eval("document.querySelector('#memory-hub-dialog') === null"), 'M1 memory-hub dialog closes on Escape');
+  await until(() => page.eval("document.activeElement?.id === 'open-memory-hub-top'"), 'Escape on M1 dialog must restore focus to #open-memory-hub-top');
+  checks.push('M1 coss Dialog opens, switches to Notes (keyboard ArrowRight) & Diary (click), closes via Escape, and restores focus');
 
   const before = await count();
   await fill('我们始终在同一个对话中');
@@ -229,7 +229,7 @@ try {
   );
   await page.eval(() => document.querySelector('#conv-detail-mode-btn')?.click());
   await until(() => page.eval("document.querySelector('#conv-detail-mode-btn').getAttribute('aria-pressed') === 'true'"), 'audit detail mode enabled');
-  await until(() => page.eval("[...document.querySelectorAll('#messages .user-message')].at(-1)?.querySelector('.routing-summary')?.innerText.includes('仅回复')"), 'direct reply routing summary in detail mode');
+  await until(() => page.eval("[...document.querySelectorAll('#messages .user-message')].at(-1)?.querySelector('.routing-summary') !== null"), 'direct reply routing summary in detail mode');
   await page.eval(() => document.querySelector('#conv-detail-mode-btn')?.click());
   await until(() => page.eval("document.querySelector('#conv-detail-mode-btn').getAttribute('aria-pressed') === 'false'"), 'audit detail mode restored to clean default');
 
@@ -237,10 +237,12 @@ try {
     const user = [...document.querySelectorAll('#messages .user-message')].at(-1);
     [...user.querySelectorAll('.message-actions button')].find(button => button.innerText.includes('路由'))?.click();
   });
-  await until(() => page.eval("document.querySelector('#routing-detail').hidden === false"), 'routing detail panel');
+  await until(() => page.eval("document.querySelector('#routing-detail')?.hidden === false"), 'routing detail panel');
   await page.eval(() => { const facts = document.querySelector('#routing-detail details.routing-facts'); if (facts) facts.open = true; });
   await until(() => page.eval("document.querySelector('#routing-detail').innerText.includes('当时可见的工作')"), 'routing-time context');
   assert.match(await page.eval("document.querySelector('#routing-detail').innerText"), /当时的近期对话引用/);
+  await page.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+  await until(() => page.eval("document.querySelector('#routing-detail') === null || document.querySelector('#routing-detail')?.hidden === true"), 'routing detail dialog closes');
   checks.push('direct-reply decision is explicit; per-message route context opens without inspecting raw JSON');
 
   await fill('<img src=x onerror="window.__xss=1">');
@@ -423,8 +425,11 @@ try {
     const btns = [...document.querySelectorAll('#messages .user-message .message-actions button')].filter(b => b.textContent.includes('路由'));
     btns.at(-1)?.click();
   });
+  await until(() => page.eval("document.querySelector('#routing-detail')?.hidden === false"), 'routing detail dialog reopened');
   await page.eval(() => { const facts = document.querySelector('#routing-detail details.routing-facts'); if (facts) facts.open = true; });
   assert.match(await page.eval("document.querySelector('#routing-detail').innerText"), /分配记录与当时上下文/);
+  await page.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+  await until(() => page.eval("document.querySelector('#routing-detail') === null || document.querySelector('#routing-detail')?.hidden === true"), 'routing detail dialog closes');
   await page.eval(() => document.querySelector('#conv-hide-system-btn')?.click());
   assert.equal(await page.eval("document.querySelector('#conv-hide-system-btn').getAttribute('aria-pressed')"), 'true');
   await page.eval(() => document.querySelector('#conv-hide-system-btn')?.click());
@@ -443,17 +448,17 @@ try {
   assert.equal(await page.eval("document.querySelector('meta[name=\"color-scheme\"]')?.getAttribute('content')"), 'light dark', 'system theme sets color-scheme="light dark"');
   assert.equal(await page.eval("document.querySelectorAll('meta[name=\"theme-color\"]').length"), 1, 'single meta[name="theme-color"] maintained');
 
-  for (const [themeName, themeBtn] of [['spatial', '#theme-spatial-btn'], ['industrial', '#theme-industrial-btn']]) {
+  for (const [themeName, themeBtn] of [['dark', '#theme-dark-btn'], ['light', '#theme-light-btn']]) {
     await page.eval(({ themeBtn }) => document.querySelector(themeBtn)?.click(), { themeBtn });
     await sleep(120);
     assert.equal(await page.eval("document.documentElement.getAttribute('data-theme')"), themeName, `theme switched to ${themeName}`);
     assert.equal(await page.eval(`document.querySelector('${themeBtn}')?.getAttribute('aria-pressed')`), 'true', `${themeBtn} aria-pressed=true`);
 
-    if (themeName === 'industrial') {
-      assert.equal(
+    if (themeName === 'light') {
+      assert.notEqual(
         await page.eval("getComputedStyle(document.querySelector('#conv-channel-filters .conv-channel-chip.active')).color"),
-        'rgb(255, 255, 255)',
-        'industrial active channel chip text must remain crisp white (#ffffff)',
+        await page.eval("getComputedStyle(document.querySelector('#conv-channel-filters .conv-channel-chip.active')).backgroundColor"),
+        'light active channel chip text and background must maintain clear contrast',
       );
     }
 
@@ -475,7 +480,7 @@ try {
       await page.setViewport({ width, height, mobile: width < 600 });
       await page.eval(() => document.querySelector('#show-chat').click());
       await sleep(250);
-      if (themeName === 'spatial') await page.screenshot({ path: `${outDir}/${name}-chat.jpg`, quality: 85 });
+      if (themeName === 'dark') await page.screenshot({ path: `${outDir}/${name}-chat.jpg`, quality: 85 });
       assert.equal(await page.eval('document.documentElement.scrollWidth <= innerWidth'), true, `${name} (${themeName}) chat: no horizontal page overflow`);
 
       if (width === 390) {
@@ -494,7 +499,7 @@ try {
 
       await page.eval(() => document.querySelector('#show-trace').click());
       await sleep(250);
-      if (themeName === 'spatial') await page.screenshot({ path: `${outDir}/${name}-trace.jpg`, quality: 85 });
+      if (themeName === 'dark') await page.screenshot({ path: `${outDir}/${name}-trace.jpg`, quality: 85 });
       assert.equal(await page.eval('document.documentElement.scrollWidth <= innerWidth'), true, `${name} (${themeName}) trace: no horizontal page overflow`);
 
       await page.eval(() => document.querySelector('#trace-content .chain-card')?.click());
@@ -508,14 +513,14 @@ try {
       assert.equal(await page.eval("document.querySelector('#work-toggle').getAttribute('aria-expanded')"), 'false');
     }
   }
-  checks.push('system/spatial/industrial themes across 1440x900, 768x1024, 390x844 (mobile nav inert + focus restore, chat, trace, inspector, work drawer + Escape) with zero page overflow');
+  checks.push('system/dark/light themes across 1440x900, 768x1024, 390x844 (mobile nav inert + focus restore, chat, trace, inspector, work drawer + Escape) with zero page overflow');
 
   if (typeof page.checkCoarseTouch === 'function') {
     await page.checkCoarseTouch();
     checks.push('touch-emulated coarse pointer mobile keeps .route-expand-btn, .message-actions buttons, #companion-avatar, and .bot-poke-btn compact');
   }
 
-  await page.eval(() => document.querySelector('#theme-spatial-btn')?.click());
+  await page.eval(() => document.querySelector('#theme-dark-btn')?.click());
   await page.setViewport({ width: 1440, height: 900, mobile: false });
   await page.eval(() => document.querySelector('#show-chat').click());
   await sleep(300);

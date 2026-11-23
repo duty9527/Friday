@@ -824,7 +824,7 @@ test('7. Web console lazy-loads apple-devices-ui.js, renders panel cleanly, and 
     const token = new URLSearchParams(entry.hash.slice(1)).get('token')!;
     const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
 
-    const html = await (await fetch(base)).text();
+    const html = await (await fetch(`${base}/legacy`)).text();
     assert.match(html, /id="plugin-tab-apple-devices"/);
     assert.match(html, /id="plugin-panel-apple-devices"/);
     assert.match(html, /id="apple-cfg-include-family"/);

@@ -428,7 +428,7 @@ test('Daemon RPC, Web REST API (with 409 conflict & promote-to-memory), CLI, and
       const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
 
       // 1. Static HTML & JS asset hygiene (M1 merged into #memory-hub-dialog; standalone M5 removed)
-      const html = await (await fetch(base)).text();
+      const html = await (await fetch(`${base}/legacy`)).text();
       assert.equal(html.includes('id="open-notebook-hub-top"'), false);
       assert.equal(html.includes('id="notebook-hub-backdrop"'), false);
       const m1Start = html.indexOf('<dialog id="memory-hub-dialog"');
