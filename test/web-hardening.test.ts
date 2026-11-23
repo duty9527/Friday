@@ -224,7 +224,7 @@ test('IM webhook rejects malformed URLs (400) and browser headers (403) while al
 test('Static server and dist/web block .map source maps and .txt files', async () => {
   const f = await fixture();
   try {
-    for (const forbidden of ['/client.js.map', '/mindmap.js.map', '/web-server.js.map', '/FONT-LICENSE.txt']) {
+    for (const forbidden of ['/model.js.map', '/mindmap-data.js.map', '/web-server.js.map', '/assets/main.js.map', '/FONT-LICENSE.txt']) {
       const res = await fetch(`${f.base}${forbidden}`);
       assert.equal(res.status, 404, `${forbidden} must not be served`);
     }
@@ -684,150 +684,36 @@ test('model helpers provide safe fallbacks & bounded trace window; mindmap dedup
   assert.deepEqual(mergedSessions[0]!.turnFlowIds, ['f1', 'f2', 'f3']);
 });
 
-test('loadTrace halts after a failed fetch even when traceHasMore is true (no 0ms retry storm)', async () => {
-  const prevGlobals = {
-    document: globalThis.document,
-    location: globalThis.location,
-    history: globalThis.history,
-    sessionStorage: globalThis.sessionStorage,
-    fetch: globalThis.fetch,
-    Node: globalThis.Node,
-  };
-  const makeStubEl = () => {
-    const classSet = new Set<string>();
-    const el: Record<string, unknown> = {
-      value: 'all',
-      hidden: true,
-      disabled: false,
-      textContent: '',
-      title: '',
-      innerText: '',
-      scrollHeight: 0,
-      scrollTop: 0,
-      clientHeight: 100,
-      parentElement: null,
-      closest: () => undefined,
-      classList: {
-        add: (...names: string[]) => names.forEach(n => classSet.add(n)),
-        remove: (...names: string[]) => names.forEach(n => classSet.delete(n)),
-        toggle: (name: string, force?: boolean) => {
-          if (force === undefined) {
-            if (classSet.has(name)) { classSet.delete(name); return false; }
-            classSet.add(name); return true;
-          }
-          if (force) classSet.add(name); else classSet.delete(name);
-          return force;
-        },
-        contains: (name: string) => classSet.has(name),
-      },
-      setAttribute: () => {},
-      addEventListener: () => {},
-      replaceChildren: () => {},
-      append: () => {},
-      focus: () => {},
-      contains: () => false,
-    };
-    return el;
-  };
-  const elements = new Map<string, Record<string, unknown>>();
-  const getEl = (id: string) => {
-    let el = elements.get(id);
-    if (!el) { el = makeStubEl(); elements.set(id, el); }
-    return el;
-  };
-
-  Object.assign(globalThis, {
-    location: { hash: `#token=${'a'.repeat(64)}`, pathname: '/', search: '' },
-    history: { replaceState: () => {} },
-    sessionStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
-    Node: class {},
-    document: {
-      getElementById: (id: string) => getEl(id),
-      createElement: () => makeStubEl(),
-      createDocumentFragment: () => makeStubEl(),
-      addEventListener: () => {},
-    },
-  });
-
-  try {
-    const { appState } = await import('../src/web/state.js');
-    const { initTracePanel } = await import('../src/web/panels/trace.js');
-    appState.ready = true;
-    appState.authExpired = false;
-    appState.selection = { type: 'message', id: 'm1', label: 'm1' };
-    appState.traceMode = 'steps';
-    appState.traceHasMore = true;
-
-    let fetchCount = 0;
-    globalThis.fetch = async () => {
-      fetchCount += 1;
-      return new Response(JSON.stringify({ error: 'simulated 500' }), {
-        status: 500,
-        headers: { 'content-type': 'application/json' },
-      });
-    };
-
-    const panel = initTracePanel();
-    await panel.loadTrace('live');
-    await new Promise(resolve => setTimeout(resolve, 40));
-
-    assert.equal(fetchCount, 1, 'failed loadTrace must NOT auto-loop when traceHasMore is true');
-    assert.equal(appState.traceBusy, false);
-    assert.equal(getEl('trace-retry').hidden, false);
-
-    // Direction queueing: calling loadTrace('earlier') while a 'live' request is in flight must queue 'earlier'
-    let releaseFirst!: () => void;
-    const requestedUrls: string[] = [];
-    globalThis.fetch = (input: RequestInfo | URL) => {
-      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-      requestedUrls.push(url);
-      if (requestedUrls.length === 1) {
-        return new Promise<Response>(resolve => {
-          releaseFirst = () => resolve(new Response('[]', { status: 200, headers: { 'content-type': 'application/json' } }));
-        });
-      }
-      return Promise.resolve(new Response('[]', { status: 200, headers: { 'content-type': 'application/json' } }));
-    };
-
-    appState.traceEvents = [{ id: 'ev-50', rootId: 'r1', actor: 'worker', seq: 50, at: 1, type: 'trace', kind: 'span', label: 's', status: 'completed' }];
-    appState.traceHasMore = false;
-    const first = panel.loadTrace('live');
-    const queued = panel.loadTrace('earlier');
-    await queued;
-    releaseFirst();
-    await first;
-    await new Promise(resolve => setTimeout(resolve, 40));
-
-    assert.equal(requestedUrls.length, 2);
-    assert.match(requestedUrls[0]!, /after=/);
-    assert.match(requestedUrls[1]!, /before=50/);
-  } finally {
-    Object.assign(globalThis, prevGlobals);
-  }
-});
-
-test('src/web and dist/web uphold zero inline styles and light-theme WCAG contrast for health badges', async () => {
+test('src/web and web/src uphold strict Trusted Types CSP and theme tokens without inline styles', async () => {
   const srcWebDir = fileURLToPath(new URL('../src/web/', import.meta.url));
-  const css = await readFile(join(srcWebDir, 'style.css'), 'utf8');
-  assert.doesNotMatch(css, /\.health-status-banner\.tone-ok\s*\{[^}]*#86efac/i);
-  assert.doesNotMatch(css, /\.health-status-banner\.tone-warn\s*\{[^}]*#fcd34d/i);
-  assert.doesNotMatch(css, /\.health-status-banner\.tone-err\s*\{[^}]*#fca5a5/i);
-  assert.doesNotMatch(css, /\.rating-badge-(?:excellent|normal|low|high|critical)[^}]*(?:#4ade80|#7dd3fc|#fcd34d|#fdba74|#fca5a5)/i);
-
-  for (const token of ['--ease-out', '--dur-modal', 'prefers-reduced-motion', '@keyframes modalFloatIn', '@keyframes messageEnter']) {
-    assert.ok(css.includes(token), `style.css must define ${token}`);
-  }
-
-  const mindmapCss = await readFile(join(srcWebDir, 'mindmap.css'), 'utf8');
-  for (const token of ['--mm-ease-out', '--mm-dur-panel', 'prefers-reduced-motion', '@keyframes mmInspEnter', '@keyframes mmStatusDotPulse']) {
-    assert.ok(mindmapCss.includes(token), `mindmap.css must define ${token}`);
-  }
+  const webRoot = fileURLToPath(new URL('../web/', import.meta.url));
 
   const srcScripts = (await walkFiles(srcWebDir)).filter(f => f.endsWith('.ts') || f.endsWith('.js'));
   for (const file of srcScripts) {
     const content = await readFile(file, 'utf8');
     assert.doesNotMatch(content, /\.style\./, `${file} must not use inline .style.`);
-    assert.doesNotMatch(content, /\.innerHTML/, `${file} must not use .innerHTML`);
+    assert.doesNotMatch(content, /\.innerHTML\b/, `${file} must not use .innerHTML`);
+    assert.doesNotMatch(content, /setAttribute\(\s*['"]style['"]/, `${file} must not set style attributes`);
+  }
+
+  for (const htmlFile of ['index.html', 'mindmap.html']) {
+    const html = await readFile(join(webRoot, htmlFile), 'utf8');
+    assert.doesNotMatch(html, /\sstyle\s*=/i, `${htmlFile} must not contain inline style attributes`);
+    assert.doesNotMatch(html, /<script(?![^>]*\bsrc=)[^>]*>/i, `${htmlFile} must not contain inline scripts`);
+    assert.doesNotMatch(html, /\son[a-z]+\s*=/i, `${htmlFile} must not contain inline event handlers`);
+  }
+
+  const globalsCss = await readFile(join(webRoot, 'src/styles/globals.css'), 'utf8');
+  for (const token of [':root', '.dark', '--background', '--foreground', '@theme inline']) {
+    assert.ok(globalsCss.includes(token), `globals.css must define ${token}`);
+  }
+
+  const webSrcFiles = (await walkFiles(join(webRoot, 'src'))).filter(f => /\.(?:ts|tsx)$/.test(f));
+  for (const file of webSrcFiles) {
+    const content = await readFile(file, 'utf8');
+    assert.doesNotMatch(content, /dangerouslySetInnerHTML/, `${file} must not use dangerouslySetInnerHTML under Trusted Types`);
+    assert.doesNotMatch(content, /\.innerHTML\b/, `${file} must not use .innerHTML under Trusted Types`);
+    assert.doesNotMatch(content, /setAttribute\(\s*['"]style['"]/, `${file} must not set style attributes`);
   }
 });
 
@@ -864,9 +750,13 @@ test('Static assets & API routes enforce Trusted Types CSP, security headers, co
     assert.equal(revalRes.status, 304);
     assert.equal(revalRes.text, '');
 
-    const fontRes = await rawHttp(`${f.base}/plex-sans.woff2`, { host, 'accept-encoding': 'identity' });
+    const distAssetsDir = fileURLToPath(new URL('../dist/web/assets/', import.meta.url));
+    const fontFile = (await readdir(distAssetsDir)).find(name => name.endsWith('.woff2'));
+    assert.ok(fontFile, 'dist/web/assets must bundle .woff2 fonts');
+    const fontRes = await rawHttp(`${f.base}/assets/${fontFile}`, { host, 'accept-encoding': 'identity' });
     assert.equal(fontRes.status, 200);
     assert.equal(fontRes.headers['cache-control'], 'public, max-age=604800');
+    assert.equal((await rawHttp(`${f.base}/plex-sans.woff2`, { host, 'accept-encoding': 'identity' })).status, 404);
 
     const apiRes = await rawHttp(`${f.base}/api/view`, { host, authorization: f.headers.authorization });
     assert.equal(apiRes.status, 200);

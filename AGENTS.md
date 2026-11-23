@@ -27,5 +27,4 @@
 ## 前端 UI 规范
 
 - 对话框仅保留右上角 `X` 关闭按钮，不在底部额外放置重复的 `关闭` 按钮；
-- 禁止 `<button>` 嵌套 `<button>`；
-- 保留 `/legacy` 与 `/mindmap-legacy` 兼容路径。
+- 禁止 `<button>` 嵌套 `<button>`。

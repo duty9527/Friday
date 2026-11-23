@@ -14,12 +14,8 @@ class HttpFailure extends Error { constructor(readonly status: number, message: 
 const staticRoutes: Record<string, string> = {
   '/': 'index.html',
   '/index.html': 'index.html',
-  '/legacy': 'legacy.html',
-  '/legacy.html': 'legacy.html',
   '/mindmap': 'mindmap.html',
   '/mindmap.html': 'mindmap.html',
-  '/mindmap-legacy': 'mindmap-legacy.html',
-  '/mindmap-legacy.html': 'mindmap-legacy.html',
   '/favicon.ico': 'logo.png',
   '/apple-touch-icon.png': 'apple-touch-icon.png',
   '/apple-touch-icon-precomposed.png': 'apple-touch-icon.png',
@@ -76,7 +72,7 @@ const adjacentWebRoot = resolve(fileURLToPath(new URL('./web/', import.meta.url)
 const distWebRoot = resolve(fileURLToPath(new URL('../dist/web/', import.meta.url)));
 const webRoot = existsSync(resolve(distWebRoot, 'assets'))
   ? distWebRoot
-  : (existsSync(resolve(adjacentWebRoot, 'client.js')) ? adjacentWebRoot : distWebRoot);
+  : (existsSync(resolve(adjacentWebRoot, 'index.html')) ? adjacentWebRoot : distWebRoot);
 const webRootPrefix = `${webRoot}${sep}`;
 
 function resolveStaticAsset(pathname: string): { filePath: string; mime: string } | undefined {

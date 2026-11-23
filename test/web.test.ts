@@ -74,25 +74,41 @@ test('Web is authenticated, same-origin and loopback only with restrictive stati
     assert.equal(page.headers.get('cache-control'), 'no-cache');
     assert.equal(page.headers.get('vary'), 'Accept-Encoding');
     assert.match(page.headers.get('etag') ?? '', /^"[^"]+"$/);
-    assert.doesNotMatch(await page.text(), new RegExp(f.home));
-    const brAsset = await raw(`${f.base}/style.css`, { host: new URL(f.base).host, 'accept-encoding': 'br, gzip' });
+    assert.doesNotMatch(await page.clone().text(), new RegExp(f.home));
+    const pageHtml = await page.text();
+    const cssMatch = pageHtml.match(/<link[^>]+href="(\/assets\/[^"]+\.css)"/);
+    assert.ok(cssMatch?.[1], 'index.html must reference built /assets/*.css');
+    const builtCssPath = cssMatch![1];
+    const brAsset = await raw(`${f.base}${builtCssPath}`, { host: new URL(f.base).host, 'accept-encoding': 'br, gzip' });
     assert.equal(brAsset.status, 200);
     assert.equal(brAsset.headers['content-encoding'], 'br');
     assert.equal(brAsset.headers['cache-control'], 'no-cache');
     assert.equal(brAsset.headers.vary, 'Accept-Encoding');
     const brEtag = String(brAsset.headers.etag ?? '');
     assert.match(brEtag, /^"[^"]+-br"$/);
-    const gzipAsset = await raw(`${f.base}/style.css`, { host: new URL(f.base).host, 'accept-encoding': 'gzip' });
+    const gzipAsset = await raw(`${f.base}${builtCssPath}`, { host: new URL(f.base).host, 'accept-encoding': 'gzip' });
     assert.equal(gzipAsset.status, 200);
     assert.equal(gzipAsset.headers['content-encoding'], 'gzip');
     assert.notEqual(gzipAsset.headers.etag, brEtag);
-    const notModified = await raw(`${f.base}/style.css`, {
+    const notModified = await raw(`${f.base}${builtCssPath}`, {
       host: new URL(f.base).host,
       'accept-encoding': 'br, gzip',
       'if-none-match': brEtag,
     });
     assert.equal(notModified.status, 304);
     assert.equal(notModified.text, '');
+    for (const legacyPath of [
+      '/legacy',
+      '/legacy.html',
+      '/mindmap-legacy',
+      '/mindmap-legacy.html',
+      '/style.css',
+      '/client.js',
+      '/mindmap.js',
+      '/mindmap.css',
+    ]) {
+      assert.equal((await fetch(`${f.base}${legacyPath}`)).status, 404, `${legacyPath} must return 404`);
+    }
     for (const icon of [
       '/logo.png',
       '/favicon.ico',
@@ -200,20 +216,26 @@ test('every nested module the page or mindmap imports is served and path escapes
   const f = await fixture();
   try {
     const rootHtml = await (await fetch(f.base)).text();
+    const mindmapHtml = await (await fetch(`${f.base}/mindmap`)).text();
     const assetPaths = [
       ...[...rootHtml.matchAll(/<script[^>]+src="(\/assets\/[^"]+)"/g)].map(m => m[1]!),
       ...[...rootHtml.matchAll(/<link[^>]+href="(\/assets\/[^"]+)"/g)].map(m => m[1]!),
+      ...[...mindmapHtml.matchAll(/<script[^>]+src="(\/assets\/[^"]+)"/g)].map(m => m[1]!),
+      ...[...mindmapHtml.matchAll(/<link[^>]+href="(\/assets\/[^"]+)"/g)].map(m => m[1]!),
     ];
-    assert.ok(assetPaths.some(p => p.endsWith('.js')), 'coss index.html must reference built /assets/*.js');
-    assert.ok(assetPaths.some(p => p.endsWith('.css')), 'coss index.html must reference built /assets/*.css');
-    for (const assetPath of assetPaths) {
+    assert.ok(assetPaths.some(p => /\/assets\/main-[^"]+\.js$/.test(p)), 'index.html must reference built /assets/main-*.js');
+    assert.ok(assetPaths.some(p => /\/assets\/mindmap-[^"]+\.js$/.test(p)), 'mindmap.html must reference built /assets/mindmap-*.js');
+    assert.ok(assetPaths.some(p => p.endsWith('.css')), 'index.html must reference built /assets/*.css');
+    for (const assetPath of new Set(assetPaths)) {
       const res = await fetch(`${f.base}${assetPath}`);
       assert.equal(res.status, 200, `built asset ${assetPath} must be served`);
     }
-    assert.equal((await fetch(`${f.base}/legacy`)).status, 200, '/legacy console must remain reachable');
+    for (const legacyRoute of ['/legacy', '/legacy.html', '/mindmap-legacy', '/mindmap-legacy.html']) {
+      assert.equal((await fetch(`${f.base}${legacyRoute}`)).status, 404, `legacy route ${legacyRoute} must return 404`);
+    }
 
     const visited = new Set<string>();
-    const queue = ['/client.js', '/mindmap.js'];
+    const queue = [...new Set(assetPaths.filter(p => p.endsWith('.js')))];
     while (queue.length) {
       const modPath = queue.shift()!;
       if (visited.has(modPath)) continue;
@@ -224,28 +246,34 @@ test('every nested module the page or mindmap imports is served and path escapes
       const source = await response.text();
       const baseDir = posix.dirname(modPath);
       const specs = [
-        ...[...source.matchAll(/\bfrom\s+['"](\.[^'"]+)['"]/g)].map(m => m[1]!),
-        ...[...source.matchAll(/\bimport\(\s*['"](\.[^'"]+)['"]\s*\)/g)].map(m => m[1]!),
+        ...[...source.matchAll(/\bfrom\s*["'`]([^"'`]+)["'`]/g)].map(m => m[1]!),
+        ...[...source.matchAll(/\bimport\(\s*["'`]([^"'`]+)["'`]\s*\)/g)].map(m => m[1]!),
       ];
-      for (const relSpec of specs) {
-        const resolved = posix.normalize(posix.join(baseDir, relSpec));
+      for (const spec of specs) {
+        if (!spec.startsWith('./') && !spec.startsWith('../')) continue;
+        const resolved = posix.normalize(posix.join(baseDir, spec));
         if (!resolved.startsWith('..')) queue.push(resolved.startsWith('/') ? resolved : `/${resolved}`);
       }
     }
-    assert.ok(visited.has('/shared/auth-http.js'), 'nested shared module must be reached and served');
-    assert.ok(visited.has('/hubs/memory-hub.js'), 'nested hub module must be reached and served');
-    assert.ok(visited.has('/panels/chat.js'), 'nested panel module must be reached and served');
-    assert.ok(visited.has('/plugins/health-scale-ui.js'), 'lazy plugin UI module must be reached and served');
-    assert.ok(visited.has('/plugins/fund-tracker-ui.js'), 'lazy fund plugin UI module must be reached and served');
-    assert.ok(visited.has('/plugins/cs80-face-ui.js'), 'lazy cs80-face plugin UI module must be reached and served');
-    assert.ok(visited.has('/plugins/laifen-ui.js'), 'lazy laifen plugin UI module must be reached and served');
-    assert.ok(visited.has('/plugins/ninebot-ui.js'), 'lazy ninebot plugin UI module must be reached and served');
-    assert.ok(visited.has('/plugins/netlea-ui.js'), 'lazy netlea plugin UI module must be reached and served');
-    assert.ok(visited.has('/plugins/apple-devices-ui.js'), 'lazy apple-devices plugin UI module must be reached and served');
-    assert.ok(visited.has('/plugins/miot-ui.js'), 'lazy miot plugin UI module must be reached and served');
+    const visitedList = [...visited];
+    for (const surfaceChunk of [
+      'HealthScaleSurface',
+      'FundTrackerSurface',
+      'Cs80FaceSurface',
+      'LaifenSurface',
+      'NinebotSurface',
+      'NetleaSurface',
+      'AppleDevicesSurface',
+      'MiotSurface',
+    ]) {
+      assert.ok(
+        visitedList.some(p => p.includes(`/assets/${surfaceChunk}-`) && p.endsWith('.js')),
+        `lazy plugin surface chunk ${surfaceChunk} must be reached and served`,
+      );
+    }
     assert.equal((await fetch(`${f.base}/../src/agent.ts`)).status, 404, 'path escape must return 404');
     assert.equal((await fetch(`${f.base}/shared/%2e%2e/%2e%2e/package.json`)).status, 404, 'encoded traversal must return 404');
-    assert.equal((await fetch(`${f.base}/client.ts`)).status, 404, 'non-allowlisted extension must return 404');
+    assert.equal((await fetch(`${f.base}/model.ts`)).status, 404, 'non-allowlisted extension must return 404');
   } finally { await f.close(); }
 });
 
@@ -347,14 +375,13 @@ test('Web chat accepts a folder path and completes reads for every nested file',
 test('Mindmap standalone page serves strict CSP assets and aggregates real task flows via /api/mindmap', { timeout: 15000 }, async () => {
   const f = await fixture();
   try {
-    const legacyHtml = await (await fetch(`${f.base}/legacy`)).text();
-    assert.match(legacyHtml, /href="\/mindmap"/, 'legacy main page links to /mindmap');
-    const cossHtml = await (await fetch(f.base)).text();
-    const assetMatch = cossHtml.match(/<script[^>]+src="(\/assets\/[^"]+\.js)"/);
-    assert.ok(assetMatch?.[1], 'coss index.html references built JS bundle');
-    const cossJs = await (await fetch(`${f.base}${assetMatch![1]}`)).text();
-    assert.match(cossJs, /`\/mindmap`|["']\/mindmap["']/, 'coss React bundle links to /mindmap');
+    const mainHtml = await (await fetch(f.base)).text();
+    const assetMatch = mainHtml.match(/<script[^>]+src="(\/assets\/main-[^"]+\.js)"/);
+    assert.ok(assetMatch?.[1], 'index.html references built main JS bundle');
+    const mainJs = await (await fetch(`${f.base}${assetMatch![1]}`)).text();
+    assert.match(mainJs, /`\/mindmap`|["']\/mindmap["']/, 'React console links to /mindmap');
 
+    let mindmapPageHtml = '';
     for (const route of ['/mindmap', '/mindmap.html']) {
       const page = await fetch(`${f.base}${route}`);
       assert.equal(page.status, 200);
@@ -363,47 +390,37 @@ test('Mindmap standalone page serves strict CSP assets and aggregates real task 
       assert.match(csp, /script-src 'self'/);
       assert.match(csp, /style-src 'self'/);
       const html = await page.text();
+      mindmapPageHtml ||= html;
       assert.match(html, /<html[^>]+data-app="coss"/);
       assert.match(html, /F\.R\.I\.D\.A\.Y\. · 会话思考流程图/);
-      assert.match(html, /\/assets\/[^"]+\.js/);
+      assert.match(html, /\/assets\/mindmap-[^"]+\.js/);
       assert.doesNotMatch(html, /\sstyle="/i, 'strict CSP forbids inline style attributes');
       assert.doesNotMatch(html, /<script(?![^>]*\bsrc=)[^>]*>/i, 'strict CSP forbids inline script tags');
     }
 
-    for (const route of ['/mindmap-legacy', '/mindmap-legacy.html']) {
-      const page = await fetch(`${f.base}${route}`);
-      assert.equal(page.status, 200);
-      assert.equal(page.headers.get('content-type'), 'text/html; charset=utf-8');
-      const csp = page.headers.get('content-security-policy') ?? '';
-      assert.match(csp, /script-src 'self'/);
-      assert.match(csp, /style-src 'self'/);
-      const html = await page.text();
-      assert.match(html, /F\.R\.I\.D\.A\.Y\. · 会话思考流程图/);
-      assert.doesNotMatch(html, /id="mm-flow-sidebar"/, 'dead #mm-flow-sidebar removed');
-      assert.doesNotMatch(html, /\sstyle="/i, 'strict CSP forbids inline style attributes');
-      assert.doesNotMatch(html, /<script(?![^>]*\bsrc=)[^>]*>/i, 'strict CSP forbids inline script tags');
+    for (const legacyRoute of ['/mindmap-legacy', '/mindmap-legacy.html', '/mindmap.css', '/mindmap.js']) {
+      assert.equal((await fetch(`${f.base}${legacyRoute}`)).status, 404, `${legacyRoute} must return 404`);
     }
 
-    const css = await fetch(`${f.base}/mindmap.css`);
+    const mmCssMatch = mindmapPageHtml.match(/<link[^>]+href="(\/assets\/[^"]+\.css)"/);
+    assert.ok(mmCssMatch?.[1], 'mindmap.html must reference built CSS asset');
+    const css = await fetch(`${f.base}${mmCssMatch![1]}`);
     assert.equal(css.status, 200);
     assert.equal(css.headers.get('content-type'), 'text/css; charset=utf-8');
 
-    const mindmapJsRes = await fetch(`${f.base}/mindmap.js`);
+    const mmJsMatch = mindmapPageHtml.match(/<script[^>]+src="(\/assets\/mindmap-[^"]+\.js)"/);
+    assert.ok(mmJsMatch?.[1], 'mindmap.html must reference built mindmap JS bundle');
+    const mindmapJsRes = await fetch(`${f.base}${mmJsMatch![1]}`);
     assert.equal(mindmapJsRes.status, 200);
     assert.match(mindmapJsRes.headers.get('content-type') ?? '', /javascript/);
-    const mindmapJs = await mindmapJsRes.text();
-    assert.doesNotMatch(mindmapJs, /\.style\./, 'mindmap.ts must not mutate element.style under strict CSP');
-    assert.doesNotMatch(mindmapJs, /setAttribute\(\s*['"]style['"]/, 'mindmap.ts must not set style attributes');
 
-    const imported = [...mindmapJs.matchAll(/from\s+'(\.[^']+)'/g)].map(match => match[1]!);
-    assert.ok(imported.includes('./mindmap-data.js'), 'mindmap.js imports mindmap-data.js');
-    assert.ok(imported.includes('./shared/auth-http.js'), 'mindmap.js imports shared/auth-http.js');
-    assert.doesNotMatch(mindmapJs, /#token=/, 'mindmap must not rewrite back links with #token=');
-    for (const path of new Set(imported)) {
-      const modRes = await fetch(`${f.base}/${path.replace(/^\.\//, '')}`);
-      assert.equal(modRes.status, 200, `module ${path} must be served to the browser`);
-      assert.match(modRes.headers.get('content-type') ?? '', /javascript/);
-    }
+    const mindmapAppTsx = await readFile(fileURLToPath(new URL('../web/src/mindmap/MindmapApp.tsx', import.meta.url)), 'utf8');
+    assert.doesNotMatch(mindmapAppTsx, /\.style\./, 'MindmapApp.tsx must not mutate element.style under strict CSP');
+    assert.doesNotMatch(mindmapAppTsx, /setAttribute\(\s*['"]style['"]/, 'MindmapApp.tsx must not set style attributes');
+    assert.doesNotMatch(mindmapAppTsx, /\.innerHTML\b/, 'MindmapApp.tsx must not assign innerHTML');
+    assert.doesNotMatch(mindmapAppTsx, /dangerouslySetInnerHTML/, 'MindmapApp.tsx must not use dangerouslySetInnerHTML');
+    assert.doesNotMatch(mindmapAppTsx, /#token=/, 'MindmapApp must not rewrite back links with #token=');
+    assert.doesNotMatch(mindmapAppTsx, /\/mindmap-legacy/, 'MindmapApp must not link to removed /mindmap-legacy');
 
     const dataJs = await (await fetch(`${f.base}/mindmap-data.js`)).text();
     for (const symbol of ['buildSessionFlowchart', 'buildOverviewFlowchart']) {
@@ -513,24 +530,20 @@ test('Web console exposes XiaoAI voiceprint status, listing, gate toggling, remo
     assert.doesNotMatch(html, /<style\b/i, 'strict CSP forbids inline <style> tags in index.html');
     assert.doesNotMatch(html, /<script(?![^>]*\bsrc=)[^>]*>/i, 'strict CSP forbids inline <script> tags in index.html');
 
-    const legacyHtml = await (await fetch(`${f.base}/legacy`)).text();
-    assert.match(legacyHtml, /id="im-voice-list"/);
-    assert.match(legacyHtml, /id="im-voice-toggle-btn"/);
-    assert.match(legacyHtml, /id="im-voice-clear-btn"/);
-    assert.doesNotMatch(legacyHtml, /\sstyle="/i, 'strict CSP forbids inline style attributes in legacy.html');
-
-    const css = await (await fetch(`${f.base}/style.css`)).text();
-    assert.ok(css.includes('.voiceprint-hero-card') && css.includes('.origin-speaker-badge') && css.includes('.badge-purple'));
+    const imVoiceHubTsx = await readFile(fileURLToPath(new URL('../web/src/components/hubs/ImVoiceHub.tsx', import.meta.url)), 'utf8');
+    assert.ok(imVoiceHubTsx.includes('/api/voice-config'));
+    assert.ok(imVoiceHubTsx.includes('/api/voice-remove'));
+    assert.ok(imVoiceHubTsx.includes('/api/voice-clear'));
 
     const allWebJs = (await collectDistWebJsFiles()).filter(file => !file.rel.startsWith('assets/'));
-    assert.ok(allWebJs.length >= 10, 'modular build emits client, panels, hubs, shared, plugins, and mindmap modules');
+    assert.ok(allWebJs.length >= 10, 'shared build emits core and shared JS modules');
     for (const file of allWebJs) {
       assert.doesNotMatch(file.text, /\.style\./, `${file.rel} must not mutate element.style under strict CSP`);
       assert.doesNotMatch(file.text, /setAttribute\(\s*['"]style['"]/, `${file.rel} must not set style attributes`);
       assert.doesNotMatch(file.text, /\.innerHTML\b/, `${file.rel} must not assign innerHTML`);
     }
 
-    const cossSrcRoot = fileURLToPath(new URL('../web/src/', import.meta.url));
+    const webSrcRoot = fileURLToPath(new URL('../web/src/', import.meta.url));
     async function walkTsSrc(dir: string): Promise<string[]> {
       const entries = await readdir(dir, { withFileTypes: true });
       const files: string[] = [];
@@ -541,10 +554,11 @@ test('Web console exposes XiaoAI voiceprint status, listing, gate toggling, remo
       }
       return files;
     }
-    for (const file of await walkTsSrc(cossSrcRoot)) {
+    for (const file of await walkTsSrc(webSrcRoot)) {
       const text = await readFile(file, 'utf8');
       assert.doesNotMatch(text, /dangerouslySetInnerHTML/, `${file} must not use dangerouslySetInnerHTML under Trusted Types`);
       assert.doesNotMatch(text, /\.innerHTML\b/, `${file} must not assign innerHTML under Trusted Types`);
+      assert.doesNotMatch(text, /setAttribute\(\s*['"]style['"]/, `${file} must not set style attributes`);
       assert.doesNotMatch(text, /\beval\s*\(|new\s+Function\s*\(/, `${file} must not use dynamic code eval`);
     }
 
@@ -606,120 +620,63 @@ test('Web console exposes XiaoAI voiceprint status, listing, gate toggling, remo
   } finally { await f.close(); }
 });
 
-test('Web console lazy-loads health-scale UI, serves redacted PluginView metadata, and completes profile-save + record-add', { timeout: 15000 }, async () => {
+test('Web console lazy-loads plugin surfaces, serves redacted PluginView metadata, and completes profile-save + record-add', { timeout: 15000 }, async () => {
   const f = await fixture();
   try {
-    const html = await (await fetch(`${f.base}/legacy`)).text();
-    assert.match(html, /id="open-plugin-hub-top"/);
-    assert.doesNotMatch(html, /id="open-notebook-hub-top"/, 'M5 notebook entry must be merged into M1');
-    assert.doesNotMatch(html, /id="notebook-hub-backdrop"/, 'legacy notebook backdrop must be removed');
-    assert.doesNotMatch(html, /id="plugin-hub-backdrop"/, 'legacy plugin backdrop must be removed');
-    assert.doesNotMatch(html, /id="plugin-hub-modal"/, 'legacy plugin modal must be replaced by native dialog');
+    const html = await (await fetch(f.base)).text();
+    assert.doesNotMatch(html, /\sstyle="/i);
+    assert.doesNotMatch(html, /<input[^>]+type=["']file["']/i);
+    assert.doesNotMatch(html, /018168|192\.168\.|CC:03:3D/i, 'index.html must not contain hardcoded personal samples');
+
+    const hubShellTsx = await readFile(fileURLToPath(new URL('../web/src/components/HubShellDialog.tsx', import.meta.url)), 'utf8');
     for (const dialogId of [
       'memory-hub-dialog',
       'timer-hub-dialog',
-      'im-hub-dialog',
       'plugin-hub-dialog',
+      'im-hub-dialog',
       'system-hub-dialog',
-      'app-confirm-dialog',
     ]) {
-      assert.match(html, new RegExp(`<dialog[^>]+id="${dialogId}"[^>]+closedby="any"`), `${dialogId} must be a native <dialog closedby="any">`);
+      assert.match(hubShellTsx, new RegExp(`id="${dialogId}"`), `HubShellDialog.tsx must define ${dialogId}`);
     }
-    const m1Start = html.indexOf('<dialog id="memory-hub-dialog"');
-    const m1End = html.indexOf('</dialog>', m1Start);
-    assert.ok(m1Start >= 0 && m1End > m1Start);
-    const m1Html = html.slice(m1Start, m1End);
+
+    const memoryHubTsx = await readFile(fileURLToPath(new URL('../web/src/components/hubs/MemoryHub.tsx', import.meta.url)), 'utf8');
     for (const marker of [
-      'id="memory-hub-tabs"',
+      'id="memory-tab-matrix"',
       'id="notebook-tab-notes"',
       'id="notebook-tab-diary"',
       'id="notebook-panel-notes"',
       'id="notebook-panel-diary"',
     ]) {
-      assert.ok(m1Html.includes(marker), `#memory-hub-dialog must contain ${marker}`);
+      assert.ok(memoryHubTsx.includes(marker), `MemoryHub.tsx must contain ${marker}`);
     }
-    assert.match(html, /id="plugin-shell"/);
-    assert.match(html, /id="plugin-sidebar"/);
-    assert.match(html, /id="plugin-sidebar-toggle"/);
-    assert.match(html, /id="plugin-nav-sortable"/);
-    assert.match(html, /id="plugin-order-reset-btn"/);
-    assert.match(html, /id="plugin-catalog-search"/);
-    assert.match(html, /id="plugin-catalog-filters"/);
-    assert.match(html, /id="plugin-catalog-home"/);
-    assert.match(html, /id="plugin-catalog-detail"/);
-    assert.match(html, /id="plugin-tab-catalog"/);
-    const sortableIdx = html.indexOf('id="plugin-nav-sortable"');
-    const footerIdx = html.indexOf('class="plugin-sidebar-footer"');
-    const catalogTabIdx = html.indexOf('id="plugin-tab-catalog"');
-    assert.ok(sortableIdx > 0 && footerIdx > sortableIdx && catalogTabIdx > footerIdx,
-      'plugin catalog tab must be pinned inside .plugin-sidebar-footer at the bottom of the sidebar');
-    assert.match(html, /id="plugin-tab-health-scale"/);
-    assert.match(html, /id="plugin-panel-health-scale"/);
-    assert.match(html, /id="health-trend-canvas"/);
-    assert.match(html, /id="plugin-tab-fund-tracker"/);
-    assert.match(html, /id="plugin-panel-fund-tracker"/);
-    assert.match(html, /id="fund-trend-canvas"/);
-    assert.match(html, /id="plugin-tab-cs80-face"/);
-    assert.match(html, /id="plugin-panel-cs80-face"/);
-    assert.match(html, /id="cs80-live-preview"/);
-    assert.match(html, /id="plugin-tab-laifen"/);
-    assert.match(html, /id="plugin-panel-laifen"/);
-    assert.match(html, /id="laifen-kpi-grid"/);
-    assert.match(html, /id="plugin-tab-ninebot"/);
-    assert.match(html, /id="plugin-panel-ninebot"/);
-    assert.match(html, /id="ninebot-trend-canvas"/);
-    assert.match(html, /id="plugin-tab-netlea"/);
-    assert.match(html, /id="plugin-panel-netlea"/);
-    assert.match(html, /id="netlea-timeline-canvas"/);
-    assert.match(html, /id="netlea-spectrum-canvas"/);
-    assert.match(html, /id="netlea-clock-btn"/);
-    assert.match(html, /id="netlea-workspace-tabs"/);
-    assert.match(html, /id="plugin-tab-apple-devices"/);
-    assert.match(html, /id="plugin-panel-apple-devices"/);
-    assert.match(html, /id="apple-devices-grid"/);
-    assert.match(html, /id="plugin-tab-miot"/);
-    assert.match(html, /id="plugin-panel-miot"/);
-    assert.match(html, /id="miot-devices-grid"/);
-    assert.match(html, /id="miot-geek-list"/);
-    assert.doesNotMatch(html, /id="open-health-hub-top"/, 'health surface must live inside M3 plugin hub');
-    assert.doesNotMatch(html, /id="open-fund-hub-top"/, 'fund surface must live inside M3 plugin hub');
-    assert.doesNotMatch(html, /\sstyle="/i);
-    assert.doesNotMatch(html, /<input[^>]+type=["']file["']/i);
-    assert.doesNotMatch(html, /018168|192\.168\.|CC:03:3D/i, 'index.html must not contain hardcoded personal samples');
 
-    const clientJs = await (await fetch(`${f.base}/client.js`)).text();
-    assert.match(clientJs, /import\(\s*['"]\.\/plugins\/health-scale-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load health-scale-ui.js');
-    assert.doesNotMatch(clientJs, /healthDashboard/, 'health-scale dashboard logic must not be eagerly bundled into client.js');
-    assert.match(clientJs, /import\(\s*['"]\.\/plugins\/fund-tracker-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load fund-tracker-ui.js');
-    assert.match(clientJs, /import\(\s*['"]\.\/plugins\/cs80-face-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load cs80-face-ui.js');
-    assert.match(clientJs, /import\(\s*['"]\.\/plugins\/laifen-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load laifen-ui.js');
-    assert.match(clientJs, /import\(\s*['"]\.\/plugins\/ninebot-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load ninebot-ui.js');
-    assert.match(clientJs, /import\(\s*['"]\.\/plugins\/netlea-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load netlea-ui.js');
-    assert.match(clientJs, /import\(\s*['"]\.\/plugins\/apple-devices-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load apple-devices-ui.js');
-    assert.match(clientJs, /import\(\s*['"]\.\/plugins\/miot-ui\.js['"]\s*\)/, 'client.js must dynamically lazy-load miot-ui.js');
+    const pluginHubTsx = await readFile(fileURLToPath(new URL('../web/src/components/hubs/PluginHub.tsx', import.meta.url)), 'utf8');
+    const distAssetFiles = await readdir(fileURLToPath(new URL('../dist/web/assets/', import.meta.url)));
+    const surfaces = [
+      'HealthScaleSurface',
+      'FundTrackerSurface',
+      'Cs80FaceSurface',
+      'LaifenSurface',
+      'NinebotSurface',
+      'NetleaSurface',
+      'AppleDevicesSurface',
+      'MiotSurface',
+    ] as const;
+    for (const surface of surfaces) {
+      assert.match(
+        pluginHubTsx,
+        new RegExp(`lazy\\(\\(\\)\\s*=>\\s*import\\(['"]@/components/plugins/${surface}['"]\\)\\)`),
+        `PluginHub.tsx must lazy-load ${surface}`,
+      );
+      const tsx = await readFile(fileURLToPath(new URL(`../web/src/components/plugins/${surface}.tsx`, import.meta.url)), 'utf8');
+      assert.doesNotMatch(tsx, /\.style\.|setAttribute\(\s*['"]style['"]|\.innerHTML\b|dangerouslySetInnerHTML/, `${surface}.tsx must obey strict CSP`);
+      const chunkFile = distAssetFiles.find(name => name.startsWith(`${surface}-`) && name.endsWith('.js'));
+      assert.ok(chunkFile, `dist/web/assets must include built ${surface} chunk`);
+      const chunkRes = await fetch(`${f.base}/assets/${chunkFile}`);
+      assert.equal(chunkRes.status, 200);
+      assert.match(chunkRes.headers.get('content-type') ?? '', /javascript/);
+    }
 
-    const healthUiJs = await (await fetch(`${f.base}/plugins/health-scale-ui.js`)).text();
-    assert.match(healthUiJs, /initHealthScaleUi/);
-    const fundUiJs = await (await fetch(`${f.base}/plugins/fund-tracker-ui.js`)).text();
-    assert.match(fundUiJs, /initFundTrackerUi/);
-    const cs80UiJs = await (await fetch(`${f.base}/plugins/cs80-face-ui.js`)).text();
-    assert.match(cs80UiJs, /initCs80FaceUi/);
-    assert.doesNotMatch(cs80UiJs, /\.style\.|setAttribute\(\s*['"]style['"]/, 'cs80-face-ui must obey strict CSP without inline style mutations');
-    const laifenUiJs = await (await fetch(`${f.base}/plugins/laifen-ui.js`)).text();
-    assert.match(laifenUiJs, /initLaifenUi/);
-    assert.doesNotMatch(laifenUiJs, /\.style\.|setAttribute\(\s*['"]style['"]/, 'laifen-ui must obey strict CSP without inline style mutations');
-    const ninebotUiJs = await (await fetch(`${f.base}/plugins/ninebot-ui.js`)).text();
-    assert.match(ninebotUiJs, /initNinebotUi/);
-    assert.doesNotMatch(ninebotUiJs, /\.style\.|setAttribute\(\s*['"]style['"]/, 'ninebot-ui must obey strict CSP without inline style mutations');
-    const netleaUiJs = await (await fetch(`${f.base}/plugins/netlea-ui.js`)).text();
-    assert.match(netleaUiJs, /initNetleaUi/);
-    assert.doesNotMatch(netleaUiJs, /\.style\.|setAttribute\(\s*['"]style['"]|\.innerHTML\b/, 'netlea-ui must obey strict CSP without inline style or innerHTML mutations');
-    const appleUiJs = await (await fetch(`${f.base}/plugins/apple-devices-ui.js`)).text();
-    assert.match(appleUiJs, /initAppleDevicesUi/);
-    assert.doesNotMatch(appleUiJs, /\.style\.|setAttribute\(\s*['"]style['"]/, 'apple-devices-ui must obey strict CSP without inline style mutations');
-    const miotUiJs = await (await fetch(`${f.base}/plugins/miot-ui.js`)).text();
-    assert.match(miotUiJs, /initMiotUi/);
-    assert.doesNotMatch(miotUiJs, /\.style\.|setAttribute\(\s*['"]style['"]|\.innerHTML\b/, 'miot-ui must obey strict CSP without inline style or innerHTML mutations');
     const pluginCatalogJs = await (await fetch(`${f.base}/shared/plugin-catalog.js`)).text();
     assert.match(pluginCatalogJs, /mergePluginOrder/);
     assert.doesNotMatch(pluginCatalogJs, /\.style\.|setAttribute\(\s*['"]style['"]|\.innerHTML\b/, 'plugin-catalog.js must obey strict CSP');
@@ -816,25 +773,9 @@ test('Web console lazy-loads health-scale UI, serves redacted PluginView metadat
 test('Web console and mindmap expose dual-skin theme switching, streamlined workspace, and zero inline styles', async () => {
   const f = await fixture();
   try {
-    const themeRes = await fetch(`${f.base}/shared/theme.js`);
-    assert.equal(themeRes.status, 200);
-    assert.match(themeRes.headers.get('content-type') ?? '', /javascript/);
-    const themeJs = await themeRes.text();
-    for (const sym of ['getUiTheme', 'getUiThemePreference', 'setUiTheme', 'bindThemeButtons', 'initDesktopDrawers', 'syncThemeChrome']) {
-      assert.ok(themeJs.includes(sym), `shared/theme.js must export ${sym}`);
+    for (const removed of ['/shared/theme.js', '/shared/mobile-viewport.js', '/legacy', '/mindmap-legacy', '/style.css', '/mindmap.css']) {
+      assert.equal((await fetch(`${f.base}${removed}`)).status, 404, `${removed} must return 404`);
     }
-    assert.doesNotMatch(themeJs, /\.style\./);
-    assert.doesNotMatch(themeJs, /\.innerHTML\b/);
-
-    const mobileVpRes = await fetch(`${f.base}/shared/mobile-viewport.js`);
-    assert.equal(mobileVpRes.status, 200);
-    assert.match(mobileVpRes.headers.get('content-type') ?? '', /javascript/);
-    const mobileVpJs = await mobileVpRes.text();
-    for (const sym of ['isIosStandaloneClipped', 'initMobileViewport']) {
-      assert.ok(mobileVpJs.includes(sym), `shared/mobile-viewport.js must export ${sym}`);
-    }
-    assert.doesNotMatch(mobileVpJs, /\.style\./);
-    assert.doesNotMatch(mobileVpJs, /\.innerHTML\b/);
 
     const themeBootRes = await fetch(`${f.base}/theme-boot.js`);
     assert.equal(themeBootRes.status, 200);
@@ -844,129 +785,45 @@ test('Web console and mindmap expose dual-skin theme switching, streamlined work
     assert.doesNotMatch(themeBootJs, /\.style\./);
     assert.doesNotMatch(themeBootJs, /\.innerHTML\b/);
 
-    const cossIndexHtml = await (await fetch(f.base)).text();
-    assert.match(cossIndexHtml, /<html[^>]+data-app="coss"/);
-    assert.equal(cossIndexHtml.match(/<meta\s+name="theme-color"[^>]*>/g)?.length, 1, 'coss index.html must contain a single theme-color meta tag');
-    assert.match(cossIndexHtml, /<meta\s+name="theme-color"\s+content="#0a0a0a">/);
-    assert.match(cossIndexHtml, /<meta\s+name="color-scheme"\s+content="dark light">/);
-    assert.match(cossIndexHtml, /<script\s+src="\/theme-boot\.js"><\/script>/);
-    assert.match(cossIndexHtml, /viewport-fit=cover/);
-    assert.match(cossIndexHtml, /interactive-widget=resizes-content/);
-    assert.match(cossIndexHtml, /apple-touch-icon/);
-    assert.match(cossIndexHtml, /manifest\.webmanifest/);
-    assert.doesNotMatch(cossIndexHtml, /black-translucent/);
-    assert.doesNotMatch(cossIndexHtml, /apple-mobile-web-app-capable/);
-    assert.doesNotMatch(cossIndexHtml, /\sstyle="/i);
+    const themeLibTs = await readFile(fileURLToPath(new URL('../web/src/lib/theme.ts', import.meta.url)), 'utf8');
+    for (const sym of ['useTheme', 'applyThemeToDocument', 'normalizeThemePreference']) {
+      assert.ok(themeLibTs.includes(sym), `theme.ts must export ${sym}`);
+    }
+    assert.doesNotMatch(themeLibTs, /\.style\./);
+    assert.doesNotMatch(themeLibTs, /\.innerHTML\b/);
 
-    const indexHtml = await (await fetch(`${f.base}/legacy`)).text();
-    assert.match(indexHtml, /<html[^>]+data-theme="spatial"/);
-    assert.equal(indexHtml.match(/<meta\s+name="theme-color"[^>]*>/g)?.length, 1, 'legacy.html must contain a single theme-color meta tag');
-    assert.match(indexHtml, /<meta\s+name="theme-color"\s+content="#111520">/);
+    const indexHtml = await (await fetch(f.base)).text();
+    assert.match(indexHtml, /<html[^>]+data-app="coss"/);
+    assert.equal(indexHtml.match(/<meta\s+name="theme-color"[^>]*>/g)?.length, 1, 'index.html must contain a single theme-color meta tag');
+    assert.match(indexHtml, /<meta\s+name="theme-color"\s+content="#0a0a0a">/);
     assert.match(indexHtml, /<meta\s+name="color-scheme"\s+content="dark light">/);
     assert.match(indexHtml, /<script\s+src="\/theme-boot\.js"><\/script>/);
     assert.match(indexHtml, /viewport-fit=cover/);
     assert.match(indexHtml, /interactive-widget=resizes-content/);
-    for (const marker of [
-      'id="theme-system-btn"',
-      'id="theme-spatial-btn"',
-      'id="theme-industrial-btn"',
-      'id="desktop-work-fold"',
-      'id="desktop-trace-fold"',
-      'id="companion-avatar"',
-      'id="emote-toggle"',
-      'id="bot-emote-tray"',
-      'id="send"',
-      'id="mobile-nav-btn"',
-      'id="mobile-trace-btn"',
-      'id="mobile-filter-btn"',
-      'apple-touch-icon',
-      'manifest.webmanifest',
-      'class="send-arrow-icon"',
-      'class="hub-svg-icon"',
-    ]) {
-      assert.ok(indexHtml.includes(marker), `index.html must include ${marker}`);
-    }
-    for (const removed of [
-      'id="mode"',
-      'id="stop-work"',
-      'id="paths-disclosure"',
-      'id="te-oled-strip"',
-      '与 F.R.I.D.A.Y. 对话',
-      'Enter 发送 · Shift+Enter 换行',
-      'black-translucent',
-      'apple-mobile-web-app-capable',
-    ]) {
-      assert.ok(!indexHtml.includes(removed), `index.html must not include ${removed}`);
-    }
+    assert.match(indexHtml, /apple-touch-icon/);
+    assert.match(indexHtml, /manifest\.webmanifest/);
+    assert.doesNotMatch(indexHtml, /black-translucent/);
+    assert.doesNotMatch(indexHtml, /apple-mobile-web-app-capable/);
     assert.doesNotMatch(indexHtml, /\sstyle="/i);
 
     const manifestJson = await (await fetch(`${f.base}/manifest.webmanifest`)).json() as Record<string, unknown>;
     assert.equal(manifestJson.background_color, '#111520');
     assert.equal(manifestJson.theme_color, '#111520');
 
-    const cossMindmapHtml = await (await fetch(`${f.base}/mindmap`)).text();
-    assert.match(cossMindmapHtml, /<html[^>]+data-app="coss"/);
-    assert.equal(cossMindmapHtml.match(/<meta\s+name="theme-color"[^>]*>/g)?.length, 1, 'coss mindmap.html must contain a single theme-color meta tag');
-    assert.match(cossMindmapHtml, /<meta\s+name="theme-color"\s+content="#0a0a0a">/);
-    assert.match(cossMindmapHtml, /<meta\s+name="color-scheme"\s+content="dark light">/);
-    assert.match(cossMindmapHtml, /<script\s+src="\/theme-boot\.js"><\/script>/);
-    assert.match(cossMindmapHtml, /viewport-fit=cover/);
-    assert.doesNotMatch(cossMindmapHtml, /\sstyle="/i);
-
-    const mindmapHtml = await (await fetch(`${f.base}/mindmap-legacy`)).text();
-    assert.match(mindmapHtml, /<html[^>]+data-theme="spatial"/);
-    assert.equal(mindmapHtml.match(/<meta\s+name="theme-color"[^>]*>/g)?.length, 1, 'mindmap-legacy.html must contain a single theme-color meta tag');
-    assert.match(mindmapHtml, /<meta\s+name="theme-color"\s+content="#111520">/);
+    const mindmapHtml = await (await fetch(`${f.base}/mindmap`)).text();
+    assert.match(mindmapHtml, /<html[^>]+data-app="coss"/);
+    assert.equal(mindmapHtml.match(/<meta\s+name="theme-color"[^>]*>/g)?.length, 1, 'mindmap.html must contain a single theme-color meta tag');
+    assert.match(mindmapHtml, /<meta\s+name="theme-color"\s+content="#0a0a0a">/);
     assert.match(mindmapHtml, /<meta\s+name="color-scheme"\s+content="dark light">/);
     assert.match(mindmapHtml, /<script\s+src="\/theme-boot\.js"><\/script>/);
     assert.match(mindmapHtml, /viewport-fit=cover/);
-    assert.match(mindmapHtml, /id="mm-theme-system"/);
-    assert.match(mindmapHtml, /id="mm-theme-spatial"/);
-    assert.match(mindmapHtml, /id="mm-theme-industrial"/);
-    assert.doesNotMatch(mindmapHtml, /black-translucent/);
-    assert.doesNotMatch(mindmapHtml, /apple-mobile-web-app-capable/);
     assert.doesNotMatch(mindmapHtml, /\sstyle="/i);
 
-    const styleCss = await (await fetch(`${f.base}/style.css`)).text();
-    assert.ok(styleCss.includes('html[data-theme="spatial"]'));
-    assert.ok(styleCss.includes('html[data-theme="industrial"]'));
-    assert.ok(styleCss.includes('(pointer: coarse)'));
-    assert.ok(styleCss.includes('font-size:16px'));
-    for (const marker of [
-      '--safe-top',
-      '--safe-bottom',
-      '.safe-area-probe',
-      'ios-standalone-clipped',
-      'overflow-anchor:none',
-      'color-scheme:dark',
-      'var(--surface-solid)',
-      'html[data-theme="industrial"]',
-      'visibility:hidden',
-      '[hidden]:not([hidden="until-found"])',
-    ]) {
-      assert.ok(styleCss.includes(marker), `style.css must include ${marker}`);
-    }
-    assert.match(styleCss, /@media\(max-width:730px\)[\s\S]*html\[data-theme="industrial"\][\s\S]*html\.theme-transitioning body/);
-    assert.doesNotMatch(styleCss, /ios-standalone-short-/);
-
-    const mindmapCss = await (await fetch(`${f.base}/mindmap.css`)).text();
-    assert.ok(mindmapCss.includes('html[data-theme="spatial"]'));
-    assert.ok(mindmapCss.includes('html[data-theme="industrial"]'));
-    for (const marker of [
-      '--safe-top',
-      '--safe-bottom',
-      '.safe-area-probe',
-      'ios-standalone-clipped',
-      '[hidden]:not([hidden="until-found"])',
-      'touch-action:none',
-      '-webkit-user-select:none',
-      '.mm-svg.dragging',
-      '[data-copied="true"]',
-      '[data-failed="true"]',
-    ]) {
-      assert.ok(mindmapCss.includes(marker), `mindmap.css must include ${marker}`);
-    }
-    assert.doesNotMatch(mindmapCss, /ios-standalone-short-/);
+    const cssMatch = indexHtml.match(/<link[^>]+href="(\/assets\/globals-[^"]+\.css)"/);
+    assert.ok(cssMatch?.[1], 'index.html must reference built globals CSS');
+    const globalsCss = await (await fetch(`${f.base}${cssMatch![1]}`)).text();
+    assert.ok(globalsCss.includes('.dark'));
+    assert.ok(globalsCss.includes('--background'));
   } finally {
     await f.close();
   }
@@ -1018,10 +875,14 @@ test('Web supports --no-auth LAN mode with allowHosts while preserving Host and 
     });
     assert.equal(badHost.status, 403);
 
-    const chatJs = await raw(`${entry.origin}/panels/chat.js`, { host: 'livis.bot' });
-    assert.equal(chatJs.status, 200);
-    assert.doesNotMatch(chatJs.text, /crypto\.randomUUID/);
-    assert.match(chatJs.text, /\bmakeRequestId\b/);
+    const mainMatch = page.text.match(/<script[^>]+src="(\/assets\/main-[^"]+\.js)"/);
+    assert.ok(mainMatch?.[1], 'LAN index.html must reference built /assets/main-*.js');
+    const mainBundle = await raw(`${entry.origin}${mainMatch![1]}`, { host: 'livis.bot' });
+    assert.equal(mainBundle.status, 200);
+
+    const storeTsx = await readFile(fileURLToPath(new URL('../web/src/lib/friday-store.tsx', import.meta.url)), 'utf8');
+    assert.doesNotMatch(storeTsx, /crypto\.randomUUID/);
+    assert.match(storeTsx, /\bmakeRequestId\b/);
   } finally {
     await web.close();
     await daemon.close();

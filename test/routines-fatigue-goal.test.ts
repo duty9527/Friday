@@ -501,13 +501,14 @@ test('Routines Web API (/api/timer-add, /api/timer-complete) and Strict CSP comp
     assert.equal(rejectCompleteRes.ok, false);
 
     // Strict CSP check on modified web sources
-    const indexHtml = await readFile(join(process.cwd(), 'src/web/index.html'), 'utf8');
-    const hubTs = await readFile(join(process.cwd(), 'src/web/hubs/timer-plugin-hub.ts'), 'utf8');
-    const traceTs = await readFile(join(process.cwd(), 'src/web/panels/trace.ts'), 'utf8');
+    const indexHtml = await readFile(join(process.cwd(), 'web/index.html'), 'utf8');
+    const hubTsx = await readFile(join(process.cwd(), 'web/src/components/hubs/TimerHub.tsx'), 'utf8');
+    const traceTsx = await readFile(join(process.cwd(), 'web/src/components/TracePanel.tsx'), 'utf8');
     assert.equal(/style\s*=/i.test(indexHtml), false, 'index.html must contain zero inline style=');
-    assert.equal(/\.style\./.test(hubTs) || /\.style\./.test(traceTs), false, 'TS modules must contain zero .style.');
-    assert.equal(/\.innerHTML\b/.test(hubTs) || /\.innerHTML\b/.test(traceTs), false, 'TS modules must contain zero .innerHTML');
-    assert.equal(/setAttribute\s*\(\s*['"]style['"]/.test(hubTs) || /setAttribute\s*\(\s*['"]style['"]/.test(traceTs), false, 'TS modules must not set inline style attributes');
+    assert.equal(/\.style\./.test(hubTsx) || /\.style\./.test(traceTsx), false, 'TSX modules must contain zero .style.');
+    assert.equal(/\.innerHTML\b/.test(hubTsx) || /\.innerHTML\b/.test(traceTsx), false, 'TSX modules must contain zero .innerHTML');
+    assert.equal(/dangerouslySetInnerHTML/.test(hubTsx) || /dangerouslySetInnerHTML/.test(traceTsx), false, 'TSX modules must contain zero dangerouslySetInnerHTML');
+    assert.equal(/setAttribute\s*\(\s*['"]style['"]/.test(hubTsx) || /setAttribute\s*\(\s*['"]style['"]/.test(traceTsx), false, 'TSX modules must not set inline style attributes');
   } finally {
     await web.close();
     await daemon.close();

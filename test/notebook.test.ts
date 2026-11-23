@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
@@ -427,31 +428,33 @@ test('Daemon RPC, Web REST API (with 409 conflict & promote-to-memory), CLI, and
       const token = new URLSearchParams(entry.hash.slice(1)).get('token')!;
       const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
 
-      // 1. Static HTML & JS asset hygiene (M1 merged into #memory-hub-dialog; standalone M5 removed)
-      const html = await (await fetch(`${base}/legacy`)).text();
+      // 1. Static HTML & React MemoryHub asset hygiene (M1 merged with notes/diary; legacy routes removed)
+      const htmlRes = await fetch(`${base}/`);
+      assert.equal(htmlRes.status, 200);
+      const html = await htmlRes.text();
       assert.equal(html.includes('id="open-notebook-hub-top"'), false);
       assert.equal(html.includes('id="notebook-hub-backdrop"'), false);
-      const m1Start = html.indexOf('<dialog id="memory-hub-dialog"');
-      const m1End = html.indexOf('</dialog>', m1Start);
-      assert.ok(m1Start >= 0 && m1End > m1Start, 'index.html must define native #memory-hub-dialog');
-      const m1Html = html.slice(m1Start, m1End);
+      assert.doesNotMatch(html, /\sstyle="/i);
+      assert.equal((await fetch(`${base}/legacy`)).status, 404);
+      assert.equal((await fetch(`${base}/hubs/notebook-hub.js`)).status, 404);
+
+      const hubShellSrc = await readFile(fileURLToPath(new URL('../web/src/components/HubShellDialog.tsx', import.meta.url)), 'utf8');
+      assert.match(hubShellSrc, /id="memory-hub-dialog"/);
+
+      const memoryHubSrc = await readFile(fileURLToPath(new URL('../web/src/components/hubs/MemoryHub.tsx', import.meta.url)), 'utf8');
       for (const marker of [
-        'id="memory-hub-tabs"',
+        'id="memory-tab-matrix"',
         'id="notebook-tab-notes"',
         'id="notebook-tab-diary"',
         'id="notebook-panel-notes"',
         'id="notebook-panel-diary"',
       ]) {
-        assert.ok(m1Html.includes(marker), `#memory-hub-dialog must contain ${marker}`);
+        assert.ok(memoryHubSrc.includes(marker), `MemoryHub.tsx must contain ${marker}`);
       }
-      assert.doesNotMatch(html, /\sstyle="/i);
-
-      const hubJsRes = await fetch(`${base}/hubs/notebook-hub.js`);
-      assert.equal(hubJsRes.status, 200);
-      const hubJs = await hubJsRes.text();
-      assert.doesNotMatch(hubJs, /\.style\./);
-      assert.doesNotMatch(hubJs, /\.innerHTML\b/);
-      assert.doesNotMatch(hubJs, /crypto\.randomUUID/);
+      assert.doesNotMatch(memoryHubSrc, /\.style\./);
+      assert.doesNotMatch(memoryHubSrc, /\.innerHTML\b/);
+      assert.doesNotMatch(memoryHubSrc, /dangerouslySetInnerHTML/);
+      assert.doesNotMatch(memoryHubSrc, /crypto\.randomUUID/);
 
       // routeLabel / routeState coverage
       assert.equal(routeLabel({ kind: 'note' }), '更新记事本');

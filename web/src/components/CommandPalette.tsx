@@ -3,7 +3,6 @@ import {
   BrainIcon,
   ClockIcon,
   CompassIcon,
-  ExternalLinkIcon,
   MonitorIcon,
   MoonIcon,
   PanelLeftIcon,
@@ -99,13 +98,6 @@ export function CommandPalette() {
       group: 'navigation',
       icon: <CompassIcon className="size-4" />,
       onSelect: () => { window.location.assign('/mindmap'); },
-    },
-    {
-      value: 'page-legacy',
-      label: '打开经典控制台',
-      group: 'navigation',
-      icon: <ExternalLinkIcon className="size-4" />,
-      onSelect: () => { window.location.assign('/legacy'); },
     },
     {
       value: 'ws-toggle-left',

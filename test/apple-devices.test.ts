@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import {
   completeAccountLogin,
   httpJson,
@@ -819,7 +820,7 @@ test('6. Voice fastpath handles Chinese battery, ring, and location intents whil
   }
 });
 
-test('7. Web console lazy-loads apple-devices-ui.js, renders panel cleanly, and handles /api/plugin-run', { timeout: 15000 }, async () => {
+test('7. Web console lazy-loads AppleDevicesSurface, renders cleanly under strict CSP, and handles /api/plugin-run', { timeout: 15000 }, async () => {
   const home = mkdtempSync(join(tmpdir(), 'friday-apple-web-'));
   const daemon = await serve({ home, mode: 'offline', offlineDelayMs: 30 });
   const web = await startWeb({ home });
@@ -829,25 +830,30 @@ test('7. Web console lazy-loads apple-devices-ui.js, renders panel cleanly, and 
     const token = new URLSearchParams(entry.hash.slice(1)).get('token')!;
     const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
 
-    const html = await (await fetch(`${base}/legacy`)).text();
-    assert.match(html, /id="plugin-tab-apple-devices"/);
-    assert.match(html, /id="plugin-panel-apple-devices"/);
-    assert.match(html, /id="apple-cfg-include-family"/);
-    assert.match(html, /id="apple-geo-status-hint"/);
-    assert.match(html, /id="apple-open-geo-btn"/);
+    const pageRes = await fetch(`${base}/`);
+    assert.equal(pageRes.status, 200);
+    const html = await pageRes.text();
     assert.doesNotMatch(html, /\sstyle="/i);
+    assert.equal((await fetch(`${base}/legacy`)).status, 404);
+    assert.equal((await fetch(`${base}/plugins/apple-devices-ui.js`)).status, 404);
 
-    const clientJs = await (await fetch(`${base}/client.js`)).text();
-    assert.match(clientJs, /import\(\s*['"]\.\/plugins\/apple-devices-ui\.js['"]\s*\)/);
+    const pluginHubSrc = readFileSync(fileURLToPath(new URL('../web/src/components/hubs/PluginHub.tsx', import.meta.url)), 'utf8');
+    assert.match(pluginHubSrc, /lazy\(\(\)\s*=>\s*import\(['"]@\/components\/plugins\/AppleDevicesSurface['"]\)\)/);
 
-    const appleUiResp = await fetch(`${base}/plugins/apple-devices-ui.js`);
+    const surfaceSrc = readFileSync(fileURLToPath(new URL('../web/src/components/plugins/AppleDevicesSurface.tsx', import.meta.url)), 'utf8');
+    assert.match(surfaceSrc, /cacheOnly:\s*true/);
+    assert.doesNotMatch(surfaceSrc, /\.style\./);
+    assert.doesNotMatch(surfaceSrc, /\.innerHTML\b/);
+    assert.doesNotMatch(surfaceSrc, /dangerouslySetInnerHTML/);
+
+    const distAssetsDir = fileURLToPath(new URL('../dist/web/assets/', import.meta.url));
+    const appleChunk = readdirSync(distAssetsDir).find(name => /^AppleDevicesSurface-.*\.js$/.test(name));
+    assert.ok(appleChunk, 'dist/web/assets must contain built AppleDevicesSurface-*.js chunk');
+    const appleUiResp = await fetch(`${base}/assets/${appleChunk}`);
     assert.equal(appleUiResp.status, 200);
     assert.match(appleUiResp.headers.get('content-type') ?? '', /javascript/);
     const appleUiJs = await appleUiResp.text();
-    assert.match(appleUiJs, /initAppleDevicesUi/);
-    assert.match(appleUiJs, /cacheOnly:\s*true/);
-    assert.doesNotMatch(appleUiJs, /\.style\./);
-    assert.doesNotMatch(appleUiJs, /\.innerHTML\b/);
+    assert.match(appleUiJs, /cacheOnly/);
 
     const statusRes = await (await fetch(`${base}/api/plugin-run`, {
       method: 'POST',

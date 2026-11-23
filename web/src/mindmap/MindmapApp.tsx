@@ -30,7 +30,6 @@ import { ApiError, createHttpClient, resolveBootstrapToken } from '@friday/web/s
 import { errorText } from '@friday/web/shared/format.js';
 import {
   ArrowLeftIcon,
-  ArrowUpRightIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
   ChevronsDownUpIcon,
@@ -538,10 +537,6 @@ export function MindmapApp() {
           )}
           <Button size="xs" variant="outline" disabled={loading || authExpired} onClick={() => void refreshMindmap()}>
             <RefreshCwIcon className="size-3.5" />
-          </Button>
-          <Button size="xs" variant="ghost" render={<a href="/mindmap-legacy" />}>
-            <span>经典视图</span>
-            <ArrowUpRightIcon className="size-3" />
           </Button>
         </div>
       </header>

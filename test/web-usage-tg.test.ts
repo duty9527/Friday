@@ -49,92 +49,82 @@ async function createWebFixture() {
 }
 
 test('Web usage and Telegram UI files strictly adhere to CSP and zero inline style rules', async () => {
-  const webRoot = fileURLToPath(new URL('../src/web/', import.meta.url));
+  const webRoot = fileURLToPath(new URL('../web/', import.meta.url));
   const indexHtml = await readFile(join(webRoot, 'index.html'), 'utf8');
-  const usageHubTs = await readFile(join(webRoot, 'hubs', 'usage-hub.ts'), 'utf8');
-  const systemHubTs = await readFile(join(webRoot, 'hubs', 'system-hub.ts'), 'utf8');
-  const servicesHubTs = await readFile(join(webRoot, 'hubs', 'services-hub.ts'), 'utf8');
-  const timerPluginHubTs = await readFile(join(webRoot, 'hubs', 'timer-plugin-hub.ts'), 'utf8');
-  const imVoiceHubTs = await readFile(join(webRoot, 'hubs', 'im-voice-hub.ts'), 'utf8');
-  const appleUiTs = await readFile(join(webRoot, 'plugins', 'apple-devices-ui.ts'), 'utf8');
-  const miotUiTs = await readFile(join(webRoot, 'plugins', 'miot-ui.ts'), 'utf8');
-  const ninebotUiTs = await readFile(join(webRoot, 'plugins', 'ninebot-ui.ts'), 'utf8');
-  const clientTs = await readFile(join(webRoot, 'client.ts'), 'utf8');
-  const styleCss = await readFile(join(webRoot, 'style.css'), 'utf8');
+  const topbarTsx = await readFile(join(webRoot, 'src/components/Topbar.tsx'), 'utf8');
+  const hubShellTsx = await readFile(join(webRoot, 'src/components/HubShellDialog.tsx'), 'utf8');
+  const traceTsx = await readFile(join(webRoot, 'src/components/TracePanel.tsx'), 'utf8');
+  const systemHubTsx = await readFile(join(webRoot, 'src/components/hubs/SystemHub.tsx'), 'utf8');
+  const imVoiceHubTsx = await readFile(join(webRoot, 'src/components/hubs/ImVoiceHub.tsx'), 'utf8');
+  const pluginHubTsx = await readFile(join(webRoot, 'src/components/hubs/PluginHub.tsx'), 'utf8');
+  const timerHubTsx = await readFile(join(webRoot, 'src/components/hubs/TimerHub.tsx'), 'utf8');
+  const appleSurfaceTsx = await readFile(join(webRoot, 'src/components/plugins/AppleDevicesSurface.tsx'), 'utf8');
+  const miotSurfaceTsx = await readFile(join(webRoot, 'src/components/plugins/MiotSurface.tsx'), 'utf8');
+  const ninebotSurfaceTsx = await readFile(join(webRoot, 'src/components/plugins/NinebotSurface.tsx'), 'utf8');
 
-  assert.match(indexHtml, /id="open-system-hub-top"/);
-  assert.match(indexHtml, /id="system-top-badge"/);
-  assert.match(indexHtml, /<dialog[^>]+id="system-hub-dialog"[^>]+closedby="any"/);
-  assert.doesNotMatch(indexHtml, /id="system-hub-backdrop"/);
-  assert.doesNotMatch(indexHtml, /id="open-notebook-hub-top"/);
-  assert.doesNotMatch(indexHtml, /id="notebook-hub-backdrop"/);
-  assert.match(indexHtml, /id="system-tab-models"/);
-  assert.match(indexHtml, /id="system-tab-usage"/);
-  assert.match(indexHtml, /id="system-tab-services"/);
-  assert.match(indexHtml, /id="system-panel-models"/);
-  assert.match(indexHtml, /id="system-panel-usage"/);
-  assert.match(indexHtml, /id="system-panel-services"/);
-  assert.match(indexHtml, /id="geo-amap-key-input"/);
-  assert.doesNotMatch(indexHtml, /id="ninebot-cfg-amap"/, 'AMap key input must live in System Base');
-  assert.match(indexHtml, /id="model-top-badge"/);
-  assert.match(indexHtml, /id="usage-top-badge"/);
-  assert.match(indexHtml, /id="open-mindmap-trace"/);
-  assert.doesNotMatch(indexHtml, /id="open-model-hub-top"/, 'model hub must live under SYS system base');
-  assert.doesNotMatch(indexHtml, /id="open-usage-hub-top"/, 'usage hub must live under SYS system base');
-  assert.doesNotMatch(indexHtml, /id="open-mindmap-top"/, 'mindmap link must live inside trace heading');
-  assert.match(indexHtml, /id="im-tg-token-input"/);
-  assert.match(indexHtml, /id="im-tg-allow-input"/);
-  assert.match(indexHtml, /id="im-tg-quick-btn"/);
-  assert.match(indexHtml, /id="im-tg-quick-status"/);
+  assert.match(topbarTsx, /id="open-system-hub-top"/);
+  assert.match(topbarTsx, /id="system-top-badge"/);
+  assert.doesNotMatch(topbarTsx, /id="open-notebook-hub-top"/);
+  assert.doesNotMatch(topbarTsx, /id="open-model-hub-top"/, 'model hub must live under SYS system base');
+  assert.doesNotMatch(topbarTsx, /id="open-usage-hub-top"/, 'usage hub must live under SYS system base');
+  assert.doesNotMatch(topbarTsx, /id="open-mindmap-top"/, 'mindmap link must live inside trace heading');
+
+  assert.match(hubShellTsx, /id="system-hub-dialog"/);
+  assert.match(traceTsx, /id="open-mindmap-trace"/);
+
+  assert.match(systemHubTsx, /id="system-tab-models"/);
+  assert.match(systemHubTsx, /id="system-tab-usage"/);
+  assert.match(systemHubTsx, /id="system-tab-services"/);
+  assert.match(systemHubTsx, /id="system-panel-models"/);
+  assert.match(systemHubTsx, /id="system-panel-usage"/);
+  assert.match(systemHubTsx, /id="system-panel-services"/);
+  assert.match(systemHubTsx, /id="geo-amap-key-input"/);
+  assert.doesNotMatch(ninebotSurfaceTsx, /id="ninebot-cfg-amap"/, 'AMap key input must live in System Base');
+
+  assert.match(imVoiceHubTsx, /id="im-tg-token-input"/);
+  assert.match(imVoiceHubTsx, /id="im-tg-allow-input"/);
+  assert.match(imVoiceHubTsx, /id="im-tg-quick-btn"/);
+  assert.match(imVoiceHubTsx, /id="im-tg-quick-status"/);
 
   assert.doesNotMatch(indexHtml, /\sstyle\s*=/i, 'index.html must not contain inline style attributes');
   assert.doesNotMatch(indexHtml, /<script(?![^>]*\bsrc=)[^>]*>/i, 'index.html must not contain inline scripts');
   assert.doesNotMatch(indexHtml, /\son[a-z]+\s*=/i, 'index.html must not contain inline event handlers');
 
   for (const [name, src] of [
-    ['usage-hub.ts', usageHubTs],
-    ['system-hub.ts', systemHubTs],
-    ['services-hub.ts', servicesHubTs],
-    ['timer-plugin-hub.ts', timerPluginHubTs],
-    ['im-voice-hub.ts', imVoiceHubTs],
-    ['apple-devices-ui.ts', appleUiTs],
-    ['miot-ui.ts', miotUiTs],
-    ['ninebot-ui.ts', ninebotUiTs],
-    ['client.ts', clientTs],
+    ['Topbar.tsx', topbarTsx],
+    ['HubShellDialog.tsx', hubShellTsx],
+    ['TracePanel.tsx', traceTsx],
+    ['SystemHub.tsx', systemHubTsx],
+    ['ImVoiceHub.tsx', imVoiceHubTsx],
+    ['PluginHub.tsx', pluginHubTsx],
+    ['TimerHub.tsx', timerHubTsx],
+    ['AppleDevicesSurface.tsx', appleSurfaceTsx],
+    ['MiotSurface.tsx', miotSurfaceTsx],
+    ['NinebotSurface.tsx', ninebotSurfaceTsx],
   ] as const) {
     assert.doesNotMatch(src, /\.style\./, `${name} must not mutate element.style`);
     assert.doesNotMatch(src, /setAttribute\(\s*['"]style['"]/, `${name} must not set style attributes`);
     assert.doesNotMatch(src, /\.innerHTML\b/, `${name} must not assign innerHTML`);
+    assert.doesNotMatch(src, /dangerouslySetInnerHTML/, `${name} must not use dangerouslySetInnerHTML`);
     assert.doesNotMatch(src, /style="/, `${name} must not emit inline style attributes`);
-  }
-
-  for (const selector of [
-    '.telegram-hero-card',
-    '.telegram-quick-status',
-    '.usage-chart-svg',
-    '.usage-share-progress',
-    '.usage-period-card',
-    '.usage-actor-card',
-    '.usage-cache-chip-hit',
-    '.usage-cache-chip-savings',
-    '.usage-cache-chip-surcharge',
-  ]) {
-    assert.ok(styleCss.includes(selector), `style.css must define ${selector}`);
   }
 });
 
 test('Web /api/view, /api/usage (day/week/month + tzOffsetMin), and /api/usage-prefs work end-to-end', { timeout: 15_000 }, async () => {
   const f = await createWebFixture();
   try {
-    // 1. Static CSP header & modular JS assets check
+    // 1. Static CSP header & built React entry JS bundle check
     const pageRes = await fetch(f.base);
     assert.equal(pageRes.status, 200);
     const csp = pageRes.headers.get('content-security-policy') ?? '';
     assert.match(csp, /script-src 'self'/);
     assert.match(csp, /style-src 'self'/);
-    const usageModuleRes = await fetch(`${f.base}/hubs/usage-hub.js`);
-    assert.equal(usageModuleRes.status, 200);
-    assert.match(usageModuleRes.headers.get('content-type') ?? '', /javascript/);
+    const pageHtml = await pageRes.text();
+    const mainMatch = pageHtml.match(/<script[^>]+src="(\/assets\/main-[^"]+\.js)"/);
+    assert.ok(mainMatch?.[1], 'index.html must reference built /assets/main-*.js');
+    const mainModuleRes = await fetch(`${f.base}${mainMatch![1]}`);
+    assert.equal(mainModuleRes.status, 200);
+    assert.match(mainModuleRes.headers.get('content-type') ?? '', /javascript/);
 
     // 2. Auth checks
     assert.equal((await fetch(`${f.base}/api/usage`)).status, 401);
