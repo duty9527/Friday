@@ -421,94 +421,103 @@ export default function Cs80FaceSurface() {
   };
 
   return (
-    <div
-      className="grid gap-4 lg:grid-cols-[268px_minmax(0,1fr)] xl:grid-cols-[288px_minmax(0,1fr)] lg:items-start"
-      onFocusCapture={() => { editingInsideRef.current = true; }}
-      onBlurCapture={() => { editingInsideRef.current = false; }}
-    >
-      {/* Left Sticky 800x1280 Portrait Mirror Column */}
-      <div className="lg:sticky lg:top-0 lg:self-start">
-        <Card>
-          <CardHeader className="pb-2">
-            <div className="flex flex-wrap items-center justify-between gap-1.5">
-              <CardTitle className="text-sm">物理副屏实时镜像</CardTitle>
-              <div className="flex items-center gap-1">
-                <Badge size="sm" variant={up ? (st?.standby ? 'warning' : 'success') : 'secondary'}>
-                  {up ? (st?.standby ? '待机' : `USB ${st?.usbSpeed ?? 480}M`) : '仅预览'}
-                </Badge>
-                <Badge size="sm" variant={dirty ? 'warning' : 'secondary'}>
-                  {dirty ? '同步中…' : '已同步'}
-                </Badge>
-              </div>
-            </div>
-            <CardDescription className="text-xs">
-              {localizeBotState(st?.botState)} · {localizeExpression(st?.expression)} · 亮度 {st?.brightness ?? 100}%
-              {st?.stats?.patchMs !== undefined ? ` · ${st.stats.patchMs}ms` : ''}
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            <div
-              data-testid="cs80-preview-frame"
-              className="mx-auto flex aspect-[800/1280] w-full max-w-[264px] items-center justify-center overflow-hidden rounded-2xl border-2 border-border bg-black shadow-inner"
-            >
-              {previewUrl ? (
-                <img
-                  src={previewUrl}
-                  alt="CS80 实时帧预览"
-                  className="block size-full object-contain"
-                  decoding="async"
-                />
-              ) : (
-                <div className="px-4 text-center text-xs text-zinc-400">
-                  暂无画面帧（请确认守护进程已响应）
+    <>
+      <div
+        className="flex flex-col gap-4 lg:grid lg:h-full lg:min-h-0 lg:flex-1 lg:grid-cols-[296px_minmax(0,1fr)] xl:grid-cols-[316px_minmax(0,1fr)] lg:overflow-hidden"
+        onFocusCapture={() => { editingInsideRef.current = true; }}
+        onBlurCapture={() => { editingInsideRef.current = false; }}
+      >
+        {/* Left Fixed Full-Height 800x1280 Portrait Mirror Column */}
+        <div
+          data-testid="cs80-left-panel"
+          className="lg:flex lg:h-full lg:min-h-0 lg:flex-col"
+        >
+          <Card className="flex flex-col lg:h-full lg:min-h-0">
+            <CardHeader className="shrink-0 px-4 pt-3.5 pb-2">
+              <div className="flex flex-wrap items-center justify-between gap-1.5">
+                <CardTitle className="text-sm">物理副屏实时镜像</CardTitle>
+                <div className="flex items-center gap-1">
+                  <Badge size="sm" variant={up ? (st?.standby ? 'warning' : 'success') : 'secondary'}>
+                    {up ? (st?.standby ? '待机' : `USB ${st?.usbSpeed ?? 480}M`) : '仅预览'}
+                  </Badge>
+                  <Badge size="sm" variant={dirty ? 'warning' : 'secondary'}>
+                    {dirty ? '同步中…' : '已同步'}
+                  </Badge>
                 </div>
-              )}
-            </div>
+              </div>
+              <CardDescription className="text-xs">
+                {localizeBotState(st?.botState)} · {localizeExpression(st?.expression)} · 亮度 {st?.brightness ?? 100}%
+                {st?.stats?.patchMs !== undefined ? ` · ${st.stats.patchMs}ms` : ''}
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="flex min-h-0 flex-1 flex-col gap-3 px-4 pb-3.5">
+              <div className="flex min-h-0 flex-1 items-center justify-center overflow-hidden lg:[container-type:size]">
+                <div
+                  data-testid="cs80-preview-frame"
+                  className="flex aspect-[800/1280] items-center justify-center overflow-hidden rounded-2xl border-2 border-border bg-black shadow-inner lg:h-[min(100cqh,calc(100cqw*1280/800))] lg:w-[min(100cqw,calc(100cqh*800/1280))] max-lg:w-full max-lg:max-w-[264px]"
+                >
+                  {previewUrl ? (
+                    <img
+                      src={previewUrl}
+                      alt="CS80 实时帧预览"
+                      className="block size-full object-contain"
+                      decoding="async"
+                    />
+                  ) : (
+                    <div className="px-4 text-center text-xs text-zinc-400">
+                      暂无画面帧（请确认守护进程已响应）
+                    </div>
+                  )}
+                </div>
+              </div>
 
-            <div className="flex flex-wrap items-center justify-between gap-1.5">
-              <Button size="xs" variant="outline" disabled={busy} onClick={() => void runSimpleAction('重绘屏幕失败', async () => {
-                await callFace('screen', { refresh: true });
-                await refreshDashboard(false);
-              })}>
-                <RefreshCwIcon className="size-3" />
-                <span>重绘屏幕</span>
-              </Button>
-              <Button size="xs" variant="outline" disabled={busy} onClick={() => void runSimpleAction('切换息屏失败', async () => {
-                await callFace('screen', { standby: !(st?.standby ?? false) });
-                await refreshDashboard(false);
-              })}>
-                <span>{st?.standby ? '唤醒副屏' : '待机息屏'}</span>
-              </Button>
-              <Button
-                size="xs"
-                variant="ghost"
-                disabled={busy}
-                onClick={() => void runSimpleAction('重置默认布局失败', async () => {
-                  const res = await callFace<{ layout?: Cs80LayoutConfig; previewDataUrl?: string }>('layout', {
-                    reset: true,
-                    refreshWidgets: true,
-                    includePreview: true,
-                  });
-                  if (res.ok && res.data?.layout) {
-                    setDraftLayout(cloneLayout(res.data.layout));
-                    setDirty(false);
-                    setWeatherCityDirty(false);
-                  }
-                  if (isSafePreviewImageUrl(res.data?.previewDataUrl)) {
-                    setPreviewUrl(res.data!.previewDataUrl!);
-                  }
-                })}
-              >
-                <RotateCcwIcon className="size-3" />
-                <span>恢复默认</span>
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
+              <div className="flex shrink-0 flex-wrap items-center justify-between gap-1.5">
+                <Button size="xs" variant="outline" disabled={busy} onClick={() => void runSimpleAction('重绘屏幕失败', async () => {
+                  await callFace('screen', { refresh: true });
+                  await refreshDashboard(false);
+                })}>
+                  <RefreshCwIcon className="size-3" />
+                  <span>重绘屏幕</span>
+                </Button>
+                <Button size="xs" variant="outline" disabled={busy} onClick={() => void runSimpleAction('切换息屏失败', async () => {
+                  await callFace('screen', { standby: !(st?.standby ?? false) });
+                  await refreshDashboard(false);
+                })}>
+                  <span>{st?.standby ? '唤醒副屏' : '待机息屏'}</span>
+                </Button>
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  disabled={busy}
+                  onClick={() => void runSimpleAction('重置默认布局失败', async () => {
+                    const res = await callFace<{ layout?: Cs80LayoutConfig; previewDataUrl?: string }>('layout', {
+                      reset: true,
+                      refreshWidgets: true,
+                      includePreview: true,
+                    });
+                    if (res.ok && res.data?.layout) {
+                      setDraftLayout(cloneLayout(res.data.layout));
+                      setDirty(false);
+                      setWeatherCityDirty(false);
+                    }
+                    if (isSafePreviewImageUrl(res.data?.previewDataUrl)) {
+                      setPreviewUrl(res.data!.previewDataUrl!);
+                    }
+                  })}
+                >
+                  <RotateCcwIcon className="size-3" />
+                  <span>恢复默认</span>
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
 
-      {/* Right Studio Toolbar, Telemetry Controls & Bento Card Layout */}
-      <div className="min-w-0 space-y-4">
+        {/* Right Independently Scrollable Studio Toolbar & Controls */}
+        <div
+          data-testid="plugin-hub-scroll"
+          className="min-w-0 space-y-4 lg:h-full lg:min-h-0 lg:overflow-y-auto lg:overscroll-contain lg:pe-1"
+        >
         <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border bg-card px-3.5 py-2.5">
           <div className="flex flex-wrap items-center gap-2">
             <MonitorIcon className="size-4 text-primary" />
@@ -960,6 +969,7 @@ export default function Cs80FaceSurface() {
             </CardContent>
           </Card>
         )}
+        </div>
       </div>
 
       <ConfirmActionDialog
@@ -995,6 +1005,6 @@ export default function Cs80FaceSurface() {
           await syncLayout(next, { pages: next.pages, activePage: next.activePage });
         }}
       />
-    </div>
+    </>
   );
 }

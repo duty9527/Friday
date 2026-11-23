@@ -82,6 +82,8 @@ interface ApplePluginStatusData {
   authenticatedAt: number | null;
   trustedPhones?: Array<{ id: number; numberWithDialCode: string; pushMode: string }>;
   fetchedAt?: number | null;
+  cacheAgeSec?: number | null;
+  fromCache?: boolean;
   devices?: AppleDeviceItem[];
   config?: ApplePluginConfig;
   geoConfigured?: boolean;
@@ -164,28 +166,30 @@ function resolveBatteryVisual(
   percent: number | null,
   status: string | undefined,
   statusLabel: string,
-  minBatteryPct: number,
 ) {
   const charging = status === 'Charging' || status === 'Charged' || statusLabel.includes('充');
-  if (charging) {
-    return { barClass: 'fill-sky-500', textClass: 'text-sky-600 dark:text-sky-400', Icon: BatteryChargingIcon };
-  }
+  const Icon = charging
+    ? BatteryChargingIcon
+    : percent === null
+      ? BatteryIcon
+      : percent < 20
+        ? BatteryLowIcon
+        : percent < 50
+          ? BatteryMediumIcon
+          : BatteryFullIcon;
   if (percent === null) {
-    return { barClass: 'fill-muted-foreground/40', textClass: 'text-muted-foreground', Icon: BatteryIcon };
+    return { barClass: 'fill-muted-foreground/40', textClass: 'text-muted-foreground', Icon };
   }
-  if (percent < minBatteryPct) {
-    return { barClass: 'fill-destructive', textClass: 'text-destructive-foreground', Icon: BatteryLowIcon };
-  }
-  if (percent < 50) {
-    return { barClass: 'fill-warning', textClass: 'text-warning-foreground', Icon: BatteryMediumIcon };
-  }
-  return { barClass: 'fill-success', textClass: 'text-success-foreground', Icon: BatteryFullIcon };
+  return { barClass: 'fill-emerald-500', textClass: 'text-emerald-600 dark:text-emerald-400', Icon };
 }
+
+let cachedAppleStatus: ApplePluginStatusData | null = null;
 
 export default function AppleDevicesSurface() {
   const { authExpired, api, openSystemHub } = useFriday();
-  const [data, setData] = useState<ApplePluginStatusData | null>(null);
+  const [data, setData] = useState<ApplePluginStatusData | null>(() => cachedAppleStatus);
   const [busy, setBusy] = useState(false);
+  const [syncing, setSyncing] = useState(false);
   const [status, setStatus] = useState<{ text: string; tone: 'ok' | 'warn' | 'err' } | null>(null);
 
   // Auth inputs
@@ -229,6 +233,7 @@ export default function AppleDevicesSurface() {
 
   const applyData = useCallback(
     (d: ApplePluginStatusData, forceConfig = false) => {
+      cachedAppleStatus = d;
       setData(d);
       if (!cfgDirty || forceConfig) {
         if (d.appleId) setAppleId(prev => prev || d.appleId);
@@ -251,12 +256,54 @@ export default function AppleDevicesSurface() {
     async (mode: 'auto' | 'cache' | 'refresh', preserveBanner = false) => {
       if (authExpired) return;
       const seq = ++seqRef.current;
+      if (mode === 'auto') {
+        if (!cachedAppleStatus) setBusy(true);
+        try {
+          const cacheRes = await callApple('status', { cacheOnly: true });
+          if (!mountedRef.current || seq !== seqRef.current || authExpired) return;
+          if (cacheRes.data) applyData(cacheRes.data);
+          setBusy(false);
+
+          const cached = cacheRes.data;
+          const ttl = cached?.config?.cacheTtlSec ?? 120;
+          const staleOrEmpty =
+            cached?.authState === 'authenticated'
+            && (!(cached.devices?.length) || cached.cacheAgeSec === null || cached.cacheAgeSec === undefined || cached.cacheAgeSec > ttl);
+
+          if (!staleOrEmpty) {
+            if (!preserveBanner && !cacheRes.ok) {
+              setStatus({ text: cacheRes.message, tone: 'err' });
+            }
+            return;
+          }
+
+          setSyncing(true);
+          try {
+            const liveRes = await callApple('status', {});
+            if (!mountedRef.current || seq !== seqRef.current || authExpired) return;
+            if (liveRes.data) applyData(liveRes.data);
+            if (!preserveBanner && !liveRes.ok) {
+              setStatus({ text: liveRes.message, tone: 'err' });
+            }
+          } finally {
+            if (mountedRef.current && seq === seqRef.current) setSyncing(false);
+          }
+          return;
+        } catch (err) {
+          if (!mountedRef.current || seq !== seqRef.current) return;
+          if (!preserveBanner) setStatus({ text: `读取 Apple Find My 失败：${errorText(err)}`, tone: 'err' });
+        } finally {
+          if (mountedRef.current && seq === seqRef.current) setBusy(false);
+        }
+        return;
+      }
+
       setBusy(true);
       try {
         const res =
           mode === 'refresh'
             ? await callApple('devices', { refresh: true })
-            : await callApple('status', mode === 'cache' ? { cacheOnly: true } : {});
+            : await callApple('status', { cacheOnly: true });
         if (!mountedRef.current || seq !== seqRef.current || authExpired) return;
         if (res.data) applyData(res.data);
         if (!preserveBanner && (mode === 'refresh' || !res.ok)) {
@@ -364,6 +411,7 @@ export default function AppleDevicesSurface() {
           <SmartphoneIcon className="size-4 text-primary" />
           <h3 className="text-sm font-semibold">苹果生态 · Find My 设备定位与电控</h3>
           <Badge variant={authBadge.variant}>{authBadge.label}</Badge>
+          {syncing && <Badge variant="secondary">后台同步中…</Badge>}
         </div>
         <div className="flex flex-wrap items-center gap-1.5">
           <Button size="xs" variant="outline" onClick={() => openSystemHub('services')}>
@@ -499,11 +547,10 @@ export default function AppleDevicesSurface() {
           data.devices.map(dev => {
             const CategoryIcon = resolveCategoryIcon(dev.category);
             const devBadge = resolveDeviceBadge(dev);
-            const minPct = data.config?.minBatteryPct ?? (Number(cfgMinBattery) || 20);
             const clampedPct = typeof dev.batteryPercent === 'number'
               ? Math.max(0, Math.min(100, Math.round(dev.batteryPercent)))
               : null;
-            const bat = resolveBatteryVisual(clampedPct, dev.batteryStatus, dev.batteryStatusLabel || '', minPct);
+            const bat = resolveBatteryVisual(clampedPct, dev.batteryStatus, dev.batteryStatusLabel || '');
             const BatteryStateIcon = bat.Icon;
             const batDesc = clampedPct !== null
               ? `${dev.batteryStatusLabel || '电量'}${dev.batteryIsCached ? '（休眠前记录）' : ''}`

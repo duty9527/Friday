@@ -589,8 +589,10 @@ function hasFamilyModeChanged(session, includeFamily) {
  */
 function isCacheIncomplete(entries) {
   if (!Array.isArray(entries) || entries.length === 0) return true;
-  if (entries.some(e => Boolean(e?.device?.isLocating))) return true;
-  return entries.every(e => !e?.device?.online && typeof e?.device?.batteryPercent !== 'number');
+  if (entries.every(e => !e?.device?.online && typeof e?.device?.batteryPercent !== 'number')) return true;
+  return entries.some(
+    e => Boolean(e?.device?.isLocating) && !e?.device?.online && typeof e?.device?.batteryPercent !== 'number' && !e?.device?.location,
+  );
 }
 
 /**

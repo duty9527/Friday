@@ -78,13 +78,14 @@ interface SurfaceMeta {
   label: string;
   icon: ComponentType<{ className?: string }>;
   Component: ReturnType<typeof lazy<ComponentType>>;
+  selfScrolling?: boolean;
 }
 
 const SURFACE_LIST: SurfaceMeta[] = [
   { name: 'health-scale', label: '健康管理 · 沃莱 A1', icon: ScaleIcon, Component: lazy(() => import('@/components/plugins/HealthScaleSurface')) },
   { name: 'fund-tracker', label: '投资管理 · 基金持仓', icon: TrendingUpIcon, Component: lazy(() => import('@/components/plugins/FundTrackerSurface')) },
   { name: 'miot', label: '米家中枢 · BE6500', icon: HomeIcon, Component: lazy(() => import('@/components/plugins/MiotSurface')) },
-  { name: 'cs80-face', label: 'CS80 实体副屏', icon: MonitorIcon, Component: lazy(() => import('@/components/plugins/Cs80FaceSurface')) },
+  { name: 'cs80-face', label: 'CS80 实体副屏', icon: MonitorIcon, Component: lazy(() => import('@/components/plugins/Cs80FaceSurface')), selfScrolling: true },
   { name: 'apple-devices', label: '苹果设备 · Find My', icon: SmartphoneIcon, Component: lazy(() => import('@/components/plugins/AppleDevicesSurface')) },
   { name: 'laifen', label: '口腔护理 · 徕芬牙刷', icon: BluetoothIcon, Component: lazy(() => import('@/components/plugins/LaifenSurface')) },
   { name: 'ninebot', label: '九号守护 · 智能电摩', icon: BikeIcon, Component: lazy(() => import('@/components/plugins/NinebotSurface')) },
@@ -377,7 +378,14 @@ export function PluginHub() {
                 </Button>
               )}
             </div>
-            <div data-testid="plugin-hub-scroll" className="min-h-0 flex-1 overflow-y-auto overscroll-contain pe-1 pt-3">
+            <div
+              data-testid={activeSurfaceMeta.selfScrolling ? 'plugin-hub-stage' : 'plugin-hub-scroll'}
+              className={
+                activeSurfaceMeta.selfScrolling
+                  ? 'flex min-h-0 flex-1 flex-col pt-3 lg:overflow-hidden max-lg:overflow-y-auto max-lg:overscroll-contain max-lg:pe-1'
+                  : 'min-h-0 flex-1 overflow-y-auto overscroll-contain pe-1 pt-3'
+              }
+            >
               <PluginSurfaceErrorBoundary
                 key={pluginSurface}
                 surfaceName={pluginSurface}

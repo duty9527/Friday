@@ -131,14 +131,17 @@ function formatCustomAliases(aliases?: Record<string, string[]>): string {
     .join('\n');
 }
 
+let cachedMiotData: MiotDashboardData | null = null;
+
 export default function MiotSurface() {
   const { authExpired, api } = useFriday();
-  const [data, setData] = useState<MiotDashboardData | null>(null);
+  const [data, setData] = useState<MiotDashboardData | null>(() => cachedMiotData);
   const [tab, setTab] = useState<MiotTab>('mesh');
   const [selectedRoom, setSelectedRoom] = useState('');
   const [selectedChannel, setSelectedChannel] = useState('all');
   const [logFilterGraphId, setLogFilterGraphId] = useState('');
   const [busy, setBusy] = useState(false);
+  const [syncing, setSyncing] = useState(false);
   const [status, setStatus] = useState<{ text: string; tone: 'ok' | 'warn' | 'err' } | null>(null);
 
   // Create geek schedule form
@@ -212,6 +215,47 @@ export default function MiotSurface() {
     async (mode: 'cache' | 'auto' | 'refresh' | 'live', preserveBanner = false) => {
       if (authExpired) return;
       const seq = ++seqRef.current;
+
+      if (mode === 'auto') {
+        if (!cachedMiotData) setBusy(true);
+        try {
+          const cacheRes = await runMiot('dashboard', { cacheOnly: true });
+          if (!mountedRef.current || seq !== seqRef.current || authExpired) return;
+          if (cacheRes.data) {
+            cachedMiotData = cacheRes.data;
+            setData(cacheRes.data);
+            syncConfigFields(cacheRes.data.config);
+          }
+          setBusy(false);
+
+          if (cacheRes.data?.configured === false) return;
+
+          setSyncing(true);
+          try {
+            const liveRes = await runMiot('dashboard', { refresh: false, live: false });
+            if (!mountedRef.current || seq !== seqRef.current || authExpired) return;
+            if (liveRes.data) {
+              cachedMiotData = liveRes.data;
+              setData(liveRes.data);
+              syncConfigFields(liveRes.data.config);
+            }
+            if (!preserveBanner) {
+              if (!liveRes.ok) setStatus({ text: liveRes.message || '读取米家中枢失败', tone: 'err' });
+              else if (liveRes.data?.degraded) setStatus({ text: liveRes.message, tone: 'warn' });
+            }
+          } finally {
+            if (mountedRef.current && seq === seqRef.current) setSyncing(false);
+          }
+          return;
+        } catch (err) {
+          if (!mountedRef.current || seq !== seqRef.current) return;
+          if (!preserveBanner) setStatus({ text: `加载米家中枢失败：${errorText(err)}`, tone: 'err' });
+        } finally {
+          if (mountedRef.current && seq === seqRef.current) setBusy(false);
+        }
+        return;
+      }
+
       setBusy(true);
       try {
         const args =
@@ -219,12 +263,11 @@ export default function MiotSurface() {
             ? { cacheOnly: true }
             : mode === 'live'
               ? { refresh: true, live: true }
-              : mode === 'refresh'
-                ? { refresh: true, live: false }
-                : { refresh: false, live: false };
+              : { refresh: true, live: false };
         const res = await runMiot('dashboard', args);
         if (!mountedRef.current || seq !== seqRef.current || authExpired) return;
         if (res.data) {
+          cachedMiotData = res.data;
           setData(res.data);
           syncConfigFields(res.data.config);
         }
@@ -370,6 +413,7 @@ export default function MiotSurface() {
           <Badge variant={data?.gateway?.online ? 'success' : data?.degraded ? 'warning' : 'secondary'}>
             {data?.configured === false ? '未配置' : data?.degraded ? '缓存降级' : data?.gateway?.online ? '在线' : '状态未知'}
           </Badge>
+          {syncing && <Badge variant="secondary">同步中…</Badge>}
         </div>
         <div className="flex flex-wrap items-center gap-1.5">
           {safeGeekHref && (

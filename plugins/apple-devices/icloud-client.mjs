@@ -1448,10 +1448,12 @@ function collectUnsettledState(payload, includeFamily) {
 
   for (const d of content) {
     const id = String(d?.id ?? '');
-    if (Boolean(d?.isLocating)) {
+    const statusCode = String(d?.deviceStatus ?? '');
+    const hasBattery = Boolean(d?.batteryStatus && d.batteryStatus !== 'Unknown' && typeof d?.batteryLevel === 'number' && d.batteryLevel >= 0);
+    const hasLocation = Boolean(d?.location && typeof d.location.latitude === 'number' && typeof d.location.longitude === 'number');
+    if (Boolean(d?.isLocating) && (statusCode !== '200' || !hasBattery || !hasLocation)) {
       locatingIds.add(id);
     }
-    const statusCode = String(d?.deviceStatus ?? '');
     if (statusCode === '203') {
       pendingIds.add(id);
     } else if (statusCode === '200' && (!d?.batteryStatus || d.batteryStatus === 'Unknown')) {

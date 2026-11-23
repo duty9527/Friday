@@ -1859,3 +1859,59 @@ test('11. Native HTTP transport avoids 421 retry, failed accountLogin preserves 
     }
   }
 });
+
+test('17. settled online devices with isLocating=true honor cacheTtlSec without re-polling iCloud', async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'friday-apple-settled-'));
+  let now = 1_760_500_000_000;
+  try {
+    const mock = createMockAppleFetch({
+      appleId: 'settled@icloud.com',
+      password: 'Password123!',
+      require2fa: false,
+      fmipResponder: () => ({
+        content: [
+          {
+            id: 'RAW-WATCH-SETTLED',
+            name: 'Apple Watch S10',
+            deviceDisplayName: 'Apple Watch Series 10',
+            rawDeviceModel: 'Watch7,1',
+            deviceClass: 'Watch',
+            deviceStatus: '200',
+            batteryLevel: 0.63,
+            batteryStatus: 'NotCharging',
+            isLocating: true,
+            location: { latitude: 31.2304, longitude: 121.4737, horizontalAccuracy: 15, timeStamp: now },
+            features: { SND: true, LOC: true },
+          },
+        ],
+      }),
+    });
+
+    await runAppleAction('config', { cacheTtlSec: 300, minRefreshIntervalSec: 30 }, { dataDir, nowFn: () => now });
+    const loginRes = await runAppleAction('auth-login', {
+      appleId: 'settled@icloud.com',
+      password: 'Password123!',
+    }, { dataDir, fetchFn: mock.fetchFn, nowFn: () => now, locatePollDelayMs: 5 });
+    assert.equal(loginRes.ok, true);
+
+    // Initial login with locate=true sends initClient + 1 initial refreshClient, and 0 follow-up locate polls
+    const refreshCallsDuringLogin = mock.calls.filter(c => c.url.includes('/fmipservice/client/web/refreshClient'));
+    assert.equal(refreshCallsDuringLogin.length, 1, 'settled device with isLocating=true must skip extra locate poll loops');
+
+    // Within cacheTtlSec (60s < 300s), regular status must hit cache with zero iCloud calls
+    now += 60_000;
+    const callsBefore = mock.calls.length;
+    const cachedRes = await runAppleAction('status', {}, {
+      dataDir,
+      fetchFn: mock.fetchFn,
+      nowFn: () => now,
+      locatePollDelayMs: 5,
+    });
+    assert.equal(cachedRes.ok, true);
+    assert.equal(cachedRes.data.fromCache, true);
+    assert.equal(mock.calls.length, callsBefore, 'settled cached watch must not trigger background iCloud sync');
+    assert.equal(cachedRes.data.devices[0].batteryPercent, 63);
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});

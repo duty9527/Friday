@@ -2319,59 +2319,68 @@ function buildDevicesView(ctx, devices, live = new Map()) {
 }
 
 async function fetchVariablesForScopes(ctx, scopes) {
-  /** @type {any[]} */
-  const variables = [];
-  for (const rawScope of (Array.isArray(scopes) ? scopes : []).slice(0, 16)) {
-    const scope = String(rawScope ?? '').trim();
-    if (!scope || !VAR_IDENT_RE.test(scope)) continue;
-    try {
-      const listRes = await ctx.centralMipsCall('local/autoLocal/getVarList', { scope });
-      const rawList = Array.isArray(listRes)
-        ? listRes
-        : Array.isArray(listRes?.list)
-          ? listRes.list
-          : Array.isArray(listRes?.vars)
-            ? listRes.vars
-            : Array.isArray(listRes?.variables)
-              ? listRes.variables
-              : [];
-      for (const item of rawList) {
-        if (typeof item === 'string') {
-          const id = item.trim();
-          if (!id) continue;
-          let value;
-          try {
-            const valRes = await ctx.centralMipsCall('local/autoLocal/getVarValue', { scope, id });
-            value = valRes?.value ?? valRes?.result;
-          } catch {
-            value = undefined;
-          }
-          variables.push({ scope, id, type: typeof value === 'number' ? 'number' : 'string', value });
-        } else if (item && typeof item === 'object') {
-          const id = String(item.id ?? item.name ?? '').trim();
-          if (!id) continue;
-          let value = item.value;
-          if (value === undefined) {
-            try {
-              const valRes = await ctx.centralMipsCall('local/autoLocal/getVarValue', { scope, id });
-              value = valRes?.value ?? valRes?.result;
-            } catch {
-              value = undefined;
+  const validScopes = (Array.isArray(scopes) ? scopes : [])
+    .slice(0, 16)
+    .map(raw => String(raw ?? '').trim())
+    .filter(s => s && VAR_IDENT_RE.test(s));
+  if (validScopes.length === 0) return [];
+
+  const perScope = await Promise.all(
+    validScopes.map(async scope => {
+      try {
+        const listRes = await ctx.centralMipsCall('local/autoLocal/getVarList', { scope });
+        const rawList = Array.isArray(listRes)
+          ? listRes
+          : Array.isArray(listRes?.list)
+            ? listRes.list
+            : Array.isArray(listRes?.vars)
+              ? listRes.vars
+              : Array.isArray(listRes?.variables)
+                ? listRes.variables
+                : [];
+        const items = await Promise.all(
+          rawList.map(async item => {
+            if (typeof item === 'string') {
+              const id = item.trim();
+              if (!id) return null;
+              let value;
+              try {
+                const valRes = await ctx.centralMipsCall('local/autoLocal/getVarValue', { scope, id });
+                value = valRes?.value ?? valRes?.result;
+              } catch {
+                value = undefined;
+              }
+              return { scope, id, type: typeof value === 'number' ? 'number' : 'string', value };
             }
-          }
-          variables.push({
-            scope,
-            id,
-            type: String(item.type ?? item.varType ?? (typeof value === 'number' ? 'number' : 'string')),
-            value,
-          });
-        }
+            if (item && typeof item === 'object') {
+              const id = String(item.id ?? item.name ?? '').trim();
+              if (!id) return null;
+              let value = item.value;
+              if (value === undefined) {
+                try {
+                  const valRes = await ctx.centralMipsCall('local/autoLocal/getVarValue', { scope, id });
+                  value = valRes?.value ?? valRes?.result;
+                } catch {
+                  value = undefined;
+                }
+              }
+              return {
+                scope,
+                id,
+                type: String(item.type ?? item.varType ?? (typeof value === 'number' ? 'number' : 'string')),
+                value,
+              };
+            }
+            return null;
+          }),
+        );
+        return items.filter(Boolean);
+      } catch {
+        return [];
       }
-    } catch {
-      // skip unreadable scope
-    }
-  }
-  return variables;
+    }),
+  );
+  return perScope.flat();
 }
 
 async function resolveSpeakerViewSafe(paths, args = {}) {
@@ -3147,27 +3156,51 @@ async function handleDashboard(ctx) {
     });
   }
 
-  const { snap, error: hubError } = await loadSnapshotBestEffort(ctx, { refresh: wantRefresh, needHotData: true });
+  const cachedHub = !wantRefresh ? readHubCache(ctx.paths) : null;
+  const cachedRouterDid = cachedHub?.devices?.find(d => d.category === 'router')?.did ?? '';
+  let snapResult;
+  let overview = null;
+  let centralError;
+
+  if (!wantRefresh && cachedRouterDid) {
+    const [hubRes, centralRes] = await Promise.all([
+      loadSnapshotBestEffort(ctx, { refresh: false, needHotData: true }),
+      ctx.fetchCentralOverview({
+        routerDid: cachedRouterDid,
+        includeLogs: true,
+        logLimit,
+        includeCloudScenes: true,
+        includeGraphContents: true,
+      }).then(
+        val => ({ ok: true, val }),
+        err => ({ ok: false, err: errMsg(err) }),
+      ),
+    ]);
+    snapResult = hubRes;
+    if (centralRes.ok) overview = centralRes.val;
+    else centralError = centralRes.err;
+  } else {
+    snapResult = await loadSnapshotBestEffort(ctx, { refresh: wantRefresh, needHotData: true });
+    const routerDev = snapResult.snap.devices.find(d => d.category === 'router');
+    try {
+      overview = await ctx.fetchCentralOverview({
+        routerDid: routerDev?.did ?? '',
+        includeLogs: true,
+        logLimit,
+        includeCloudScenes: true,
+        includeGraphContents: true,
+      });
+    } catch (err) {
+      centralError = errMsg(err);
+    }
+  }
+
+  const { snap, error: hubError } = snapResult;
   let live = new Map();
   let liveFetchedAt = snap.liveFetchedAt ?? null;
   if (wantLive && snap.devices.length > 0) {
     live = await liveForDevices(ctx, snap.devices);
     liveFetchedAt = persistLiveStates(ctx, snap, live, true).liveFetchedAt ?? liveFetchedAt;
-  }
-
-  const routerDev = snap.devices.find(d => d.category === 'router');
-  let overview = null;
-  let centralError;
-  try {
-    overview = await ctx.fetchCentralOverview({
-      routerDid: routerDev?.did ?? '',
-      includeLogs: true,
-      logLimit,
-      includeCloudScenes: true,
-      includeGraphContents: true,
-    });
-  } catch (err) {
-    centralError = errMsg(err);
   }
 
   const devicesByDid = buildDevicesByDid(snap.devices);
