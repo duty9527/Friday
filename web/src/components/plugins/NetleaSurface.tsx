@@ -72,7 +72,7 @@ interface NetleaCatalogScene {
 
 interface NetleaDashboardPayload {
   device: { address: string; name: string; rssi: number | null; connected: boolean } | null;
-  state: { on: boolean; runModeLabel?: string; scheduleRunning?: boolean; channels: NetleaChannels; powerWatts?: number } | null;
+  state: { on: boolean; runModeLabel?: string; scheduleRunning?: boolean; channels: NetleaChannels; powerWatts?: number; maxWatts?: number } | null;
   schedule?: NetleaSchedule | null;
   tempConfig?: { onMinutes: number; offMinutes: number } | null;
   config: {
@@ -85,13 +85,55 @@ interface NetleaDashboardPayload {
     savedCustomPresets: NetleaSavedPreset[];
   };
   catalog?: {
+    maxWatts?: number;
     scenes: NetleaCatalogScene[];
     cultivationPresets: Array<{ id: string; name: string; totalHours: number }>;
   };
 }
 
 const DAY_NAMES = ['一', '二', '三', '四', '五', '六', '日'];
+const SUN_PRESET_MINUTES = [0, 15, 20, 30, 60] as const;
 const pad2 = (n: number) => String(Math.max(0, Math.min(99, Math.round(n)))).padStart(2, '0');
+
+function clampInt(raw: number, min: number, max: number): number {
+  if (!Number.isFinite(raw)) return min;
+  return Math.max(min, Math.min(max, Math.round(raw)));
+}
+
+function getTodayIdx(): number {
+  const d = new Date().getDay();
+  return d === 0 ? 6 : d - 1;
+}
+
+function formatDaySummary(dayList: number[]): string {
+  const days = Array.isArray(dayList) ? dayList : [1, 1, 1, 1, 1, 1, 1];
+  const activeCount = days.filter(Boolean).length;
+  if (activeCount === 7) return '每天';
+  if (activeCount === 0) return '未选';
+  if (days.slice(0, 5).every(Boolean) && !days[5] && !days[6]) return '工作日';
+  if (days.slice(0, 5).every(v => !v) && days[5] && days[6]) return '周末';
+  return `周${days.map((v, i) => (v ? DAY_NAMES[i] : '')).filter(Boolean).join('')}`;
+}
+
+function mixSpectrumRgb(ch: NetleaChannels): [number, number, number] {
+  const r = Math.min(255, Math.round((ch.red / 100) * 245 + (ch.white / 100) * 180));
+  const g = Math.min(255, Math.round((ch.green / 100) * 235 + (ch.white / 100) * 185));
+  const b = Math.min(255, Math.round((ch.blue / 100) * 245 + (ch.white / 100) * 185));
+  return [r, g, b];
+}
+
+function resolveCurveColors(ch: NetleaChannels): { fill: string; stroke: string } {
+  const [r, g, b] = mixSpectrumRgb(ch);
+  const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+  const fill = `rgb(${r}, ${g}, ${b})`;
+  if (luminance > 190) {
+    return {
+      fill,
+      stroke: `rgb(${Math.round(r * 0.65)}, ${Math.round(g * 0.68)}, ${Math.round(b * 0.78)})`,
+    };
+  }
+  return { fill, stroke: fill };
+}
 
 export default function NetleaSurface() {
   const { authExpired, api } = useFriday();
@@ -106,6 +148,11 @@ export default function NetleaSurface() {
 
   // Schedule state & trip editor
   const [schedDirty, setSchedDirty] = useState(false);
+  const [previewDayIdx, setPreviewDayIdx] = useState<number>(() => getTodayIdx());
+  const [nowMin, setNowMin] = useState<number>(() => {
+    const n = new Date();
+    return n.getHours() * 60 + n.getMinutes();
+  });
   const [draftTravelModel, setDraftTravelModel] = useState(0);
   const [draftSunrise, setDraftSunrise] = useState(20);
   const [draftSunset, setDraftSunset] = useState(20);
@@ -203,6 +250,11 @@ export default function NetleaSurface() {
 
   useEffect(() => {
     void refresh(true);
+    const clockTimer = setInterval(() => {
+      const n = new Date();
+      setNowMin(n.getHours() * 60 + n.getMinutes());
+    }, 60_000);
+    return () => clearInterval(clockTimer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -331,6 +383,140 @@ export default function NetleaSurface() {
     [channels],
   );
 
+  // 24h lighting curve SVG plot derived from draftTrips + sunrise/sunset ramp minutes
+  const timelinePlot = useMemo(() => {
+    const svgW = 880;
+    const svgH = 212;
+    const padL = 44;
+    const padR = 16;
+    const padT = 22;
+    const padB = 28;
+    const plotW = svgW - padL - padR;
+    const plotH = svgH - padT - padB;
+    const safeMaxW = Math.max(
+      10,
+      data?.catalog?.maxWatts ?? 0,
+      data?.state?.maxWatts ?? 0,
+      ...draftTrips.map(t => Number(t.powerWatts ?? 0)),
+      22,
+    );
+    const xForMin = (min: number) => padL + (Math.max(0, Math.min(1440, min)) / 1440) * plotW;
+    const yForWatts = (watts: number) => padT + plotH - (Math.max(0, Math.min(safeMaxW, watts)) / safeMaxW) * plotH;
+    const yBase = yForWatts(0);
+
+    interface RawSeg {
+      start: number;
+      end: number;
+      watts: number;
+      trip: NetleaTrip;
+      hasRise: boolean;
+      hasSet: boolean;
+    }
+
+    const prevDayIdx = (previewDayIdx + 6) % 7;
+    const rawSegs: RawSeg[] = [];
+    for (const t of draftTrips) {
+      if (!t.enable) continue;
+      const days = Array.isArray(t.dayList) ? t.dayList : [1, 1, 1, 1, 1, 1, 1];
+      const s = clampInt(t.startH, 0, 23) * 60 + clampInt(t.startM, 0, 59);
+      const rawE = clampInt(t.endH, 0, 23) * 60 + clampInt(t.endM, 0, 59);
+      const e = rawE === 0 && s > 0 ? 1440 : rawE;
+      if (s === e) continue;
+      const watts = Math.max(1, Number(t.powerWatts ?? 12));
+      if (e > s) {
+        if (days[previewDayIdx]) rawSegs.push({ start: s, end: e, watts, trip: t, hasRise: false, hasSet: false });
+      } else {
+        if (days[previewDayIdx]) rawSegs.push({ start: s, end: 1440, watts, trip: t, hasRise: false, hasSet: false });
+        if (days[prevDayIdx] && e > 0) rawSegs.push({ start: 0, end: e, watts, trip: t, hasRise: false, hasSet: false });
+      }
+    }
+    rawSegs.sort((a, b) => a.start - b.start || a.end - b.end);
+
+    const rise = clampInt(draftSunrise, 0, 300);
+    const set = clampInt(draftSunset, 0, 300);
+    for (let i = 0; i < rawSegs.length; i++) {
+      const cur = rawSegs[i]!;
+      const prev = i > 0 ? rawSegs[i - 1] : null;
+      const next = i < rawSegs.length - 1 ? rawSegs[i + 1] : null;
+      const dur = cur.end - cur.start;
+      let canRise = rise > 0 && (!prev || prev.end < cur.start);
+      let canSet = set > 0 && (!next || cur.end < next.start);
+      if (canRise && canSet && dur < rise + set) {
+        if (dur >= rise) canSet = false;
+        else if (dur < set) { canRise = false; canSet = false; }
+        else canRise = false;
+      } else {
+        if (canRise && dur < rise) canRise = false;
+        if (canSet && dur < set) canSet = false;
+      }
+      cur.hasRise = canRise;
+      cur.hasSet = canSet;
+    }
+
+    const shapes = rawSegs.map((seg, i) => {
+      const prev = i > 0 ? rawSegs[i - 1] : null;
+      const startWatts = (prev && prev.end === seg.start) ? prev.watts : (seg.hasRise ? 0 : seg.watts);
+      const riseLen = seg.hasRise ? Math.min(rise, seg.end - seg.start) : 0;
+      const setLen = seg.hasSet ? Math.min(set, seg.end - seg.start - riseLen) : 0;
+
+      const x0 = xForMin(seg.start);
+      const x1 = xForMin(seg.start + riseLen);
+      const x2 = xForMin(seg.end - setLen);
+      const x3 = xForMin(seg.end);
+      const y0 = yForWatts(startWatts);
+      const yTop = yForWatts(seg.watts);
+
+      const linePts: Array<[number, number]> = [[x0, y0]];
+      if (riseLen > 0) linePts.push([x1, yTop]);
+      else linePts.push([x0, yTop]);
+      linePts.push([x2, yTop]);
+      if (setLen > 0) linePts.push([x3, yBase]);
+      else linePts.push([x3, yTop]);
+
+      const polyPts: Array<[number, number]> = [[x0, yBase], ...linePts, [x3, yBase]];
+      const colors = resolveCurveColors(seg.trip);
+      const tag = `${seg.trip.name || '时段'} ${seg.watts}W`;
+      const showTag = x3 - x0 > 54;
+      const tagX = Math.max(padL + 36, Math.min(svgW - padR - 36, (x0 + x3) / 2));
+      const tagY = Math.max(padT + 14, yTop - 6);
+      const timeRange = `${pad2(seg.trip.startH)}:${pad2(seg.trip.startM)}–${pad2(seg.trip.endH)}:${pad2(seg.trip.endM)}`;
+
+      return {
+        key: `${seg.start}-${seg.end}-${i}`,
+        polyPoints: polyPts.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' '),
+        linePoints: linePts.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' '),
+        fill: colors.fill,
+        stroke: colors.stroke,
+        tag,
+        showTag,
+        tagX,
+        tagY,
+        tooltip: `${timeRange} · ${seg.trip.seriesName ? `${seg.trip.seriesName} ` : ''}${tag} (R${seg.trip.red}/G${seg.trip.green}/W${seg.trip.white}/B${seg.trip.blue})`,
+      };
+    });
+
+    return {
+      svgW,
+      svgH,
+      padL,
+      padR,
+      padT,
+      padB,
+      plotW,
+      plotH,
+      safeMaxW,
+      yBase,
+      xForMin,
+      yForWatts,
+      shapes,
+      enabledCount: draftTrips.filter(t => t.enable).length,
+    };
+  }, [data?.catalog?.maxWatts, data?.state?.maxWatts, draftSunrise, draftSunset, draftTrips, previewDayIdx]);
+
+  const todayIdx = getTodayIdx();
+  const nowX = timelinePlot.xForMin(nowMin);
+  const nowLabel = `现在 ${pad2(Math.floor(nowMin / 60))}:${pad2(nowMin % 60)}`;
+
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -384,41 +570,177 @@ export default function NetleaSurface() {
         </TabsList>
 
         <TabsPanel value="schedule" className="mt-3 space-y-3">
-          {/* 24h SVG Timeline Preview */}
+          {/* 24h Sunrise/Sunset Lighting Curve */}
           <Card>
-            <CardHeader className="pb-1">
-              <CardTitle className="flex items-center gap-1.5 text-xs">
-                <ClockIcon className="size-3.5" />
-                <span>24h 光照日程时间轴 (日出渐亮 {draftSunrise}m / 日落渐暗 {draftSunset}m)</span>
-              </CardTitle>
+            <CardHeader className="pb-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <CardTitle className="flex items-center gap-1.5 text-xs">
+                    <ClockIcon className="size-3.5 text-primary" />
+                    <span>24 小时日出/日落光照曲线</span>
+                  </CardTitle>
+                  <Badge variant={timelinePlot.enabledCount > 0 ? 'info' : 'secondary'}>
+                    {timelinePlot.enabledCount > 0
+                      ? `已配置 ${timelinePlot.enabledCount} 段 · 日出 ${draftSunrise}m / 日落 ${draftSunset}m`
+                      : '未配置行程'}
+                  </Badge>
+                  {schedDirty && <Badge variant="warning">待下发改动</Badge>}
+                </div>
+                <div className="flex items-center gap-1" role="group" aria-label="切换预览星期">
+                  {DAY_NAMES.map((d, idx) => (
+                    <Button
+                      key={d}
+                      type="button"
+                      size="xs"
+                      variant={previewDayIdx === idx ? 'default' : idx === todayIdx ? 'secondary' : 'ghost'}
+                      onClick={() => setPreviewDayIdx(idx)}
+                      title={idx === todayIdx ? `周${d} (今日)` : `周${d}`}
+                    >
+                      {d}
+                    </Button>
+                  ))}
+                </div>
+              </div>
             </CardHeader>
-            <CardContent>
-              <svg viewBox="0 0 480 48" className="h-12 w-full" aria-label="24小时日照时间轴">
-                <rect x="0" y="14" width="480" height="14" rx="4" fill="var(--muted)" />
-                {draftTrips.map((t, idx) => {
-                  const sMin = t.startH * 60 + t.startM;
-                  const eMin = Math.max(sMin + 5, t.endH * 60 + t.endM);
-                  const x = (sMin / 1440) * 480;
-                  const w = Math.max(4, ((eMin - sMin) / 1440) * 480);
-                  return (
-                    <rect
-                      key={`${sMin}-${idx}`}
-                      x={x.toFixed(1)}
-                      y="12"
-                      width={w.toFixed(1)}
-                      height="18"
-                      rx="3"
-                      fill={t.enable ? 'var(--primary)' : 'var(--muted-foreground)'}
-                      fillOpacity={t.enable ? 0.85 : 0.35}
-                    />
-                  );
-                })}
-                {[0, 6, 12, 18, 24].map(h => (
-                  <text key={h} x={h === 24 ? 476 : h * 20 + 2} y="44" textAnchor={h === 24 ? 'end' : 'start'} fill="var(--muted-foreground)" fontSize="9">
-                    {pad2(h)}:00
-                  </text>
-                ))}
-              </svg>
+            <CardContent className="space-y-2">
+              <div className="overflow-hidden rounded-lg border bg-muted/30 p-2 dark:bg-zinc-950/70">
+                <svg
+                  data-testid="netlea-timeline-svg"
+                  viewBox={`0 0 ${timelinePlot.svgW} ${timelinePlot.svgH}`}
+                  className="block h-auto w-full"
+                  role="img"
+                  aria-label="24小时日出日落功率与光谱曲线图"
+                >
+                  {/* Horizontal wattage grid lines */}
+                  {[0, 0.5, 1].map(frac => {
+                    const wy = timelinePlot.yForWatts(timelinePlot.safeMaxW * frac);
+                    return (
+                      <g key={frac}>
+                        <line
+                          x1={timelinePlot.padL}
+                          y1={wy}
+                          x2={timelinePlot.svgW - timelinePlot.padR}
+                          y2={wy}
+                          stroke="var(--border)"
+                          strokeWidth="1"
+                          strokeDasharray={frac > 0 ? '3 3' : undefined}
+                        />
+                        <text
+                          x={6}
+                          y={wy + 4}
+                          fill="var(--muted-foreground)"
+                          fontSize="11"
+                          fontFamily="var(--font-mono)"
+                        >
+                          {Math.round(timelinePlot.safeMaxW * frac)}W
+                        </text>
+                      </g>
+                    );
+                  })}
+
+                  {/* Vertical 3h ticks */}
+                  {[0, 3, 6, 9, 12, 15, 18, 21, 24].map(hr => {
+                    const tx = timelinePlot.xForMin(hr * 60);
+                    return (
+                      <g key={hr}>
+                        <line
+                          x1={tx}
+                          y1={timelinePlot.padT}
+                          x2={tx}
+                          y2={timelinePlot.padT + timelinePlot.plotH}
+                          stroke="var(--border)"
+                          strokeWidth="1"
+                        />
+                        <text
+                          x={hr === 24 ? timelinePlot.svgW - timelinePlot.padR : hr === 0 ? timelinePlot.padL : tx}
+                          y={timelinePlot.svgH - 8}
+                          textAnchor={hr === 24 ? 'end' : hr === 0 ? 'start' : 'middle'}
+                          fill="var(--muted-foreground)"
+                          fontSize="11"
+                          fontFamily="var(--font-mono)"
+                        >
+                          {pad2(hr)}:00
+                        </text>
+                      </g>
+                    );
+                  })}
+
+                  {/* Empty state or Curve segments */}
+                  {timelinePlot.shapes.length === 0 ? (
+                    <text
+                      x={timelinePlot.padL + timelinePlot.plotW / 2}
+                      y={timelinePlot.padT + timelinePlot.plotH / 2 + 4}
+                      textAnchor="middle"
+                      fill="var(--muted-foreground)"
+                      fontSize="13"
+                    >
+                      周{DAY_NAMES[previewDayIdx]}暂无启用的定时行程（新增时段或选择官方缸体预设即可预览日出/日落曲线）
+                    </text>
+                  ) : (
+                    timelinePlot.shapes.map(seg => (
+                      <g key={seg.key}>
+                        <title>{seg.tooltip}</title>
+                        <polygon
+                          points={seg.polyPoints}
+                          fill={seg.fill}
+                          fillOpacity="0.28"
+                        />
+                        <polyline
+                          points={seg.linePoints}
+                          fill="none"
+                          stroke={seg.stroke}
+                          strokeWidth="2.4"
+                          strokeLinejoin="round"
+                          strokeLinecap="round"
+                        />
+                        {seg.showTag && (
+                          <text
+                            x={seg.tagX}
+                            y={seg.tagY}
+                            textAnchor="middle"
+                            fill="var(--foreground)"
+                            fontSize="11"
+                            fontWeight="600"
+                          >
+                            {seg.tag}
+                          </text>
+                        )}
+                      </g>
+                    ))
+                  )}
+
+                  {/* Current time indicator when viewing today */}
+                  {previewDayIdx === todayIdx && (
+                    <g>
+                      <line
+                        x1={nowX}
+                        y1={timelinePlot.padT}
+                        x2={nowX}
+                        y2={timelinePlot.padT + timelinePlot.plotH}
+                        stroke="#f59e0b"
+                        strokeWidth="1.6"
+                        strokeDasharray="4 2"
+                      />
+                      <circle cx={nowX} cy={timelinePlot.padT} r="3" fill="#f59e0b" />
+                      <text
+                        x={Math.min(timelinePlot.svgW - 86, Math.max(timelinePlot.padL + 4, nowX + 5))}
+                        y={timelinePlot.padT + 12}
+                        fill="#f59e0b"
+                        fontSize="11"
+                        fontWeight="600"
+                        fontFamily="var(--font-mono)"
+                      >
+                        {nowLabel}
+                      </text>
+                    </g>
+                  )}
+                </svg>
+              </div>
+              <p className="text-[11px] text-muted-foreground">
+                {timelinePlot.shapes.length === 0
+                  ? `周${DAY_NAMES[previewDayIdx]}尚未设置启用的定时时段；新增时段或使用「官方缸体预设」即可开启 24h 日出日落曲线。`
+                  : `周${DAY_NAMES[previewDayIdx]}${previewDayIdx === todayIdx ? '（今日）' : ''}共 ${timelinePlot.shapes.length} 段生效曲线（总启用 ${timelinePlot.enabledCount}/${draftTrips.length} 段）；相邻时段自动平滑衔接。`}
+              </p>
             </CardContent>
           </Card>
 
@@ -428,6 +750,23 @@ export default function NetleaSurface() {
               <Input size="sm" className="w-16" type="number" value={draftSunrise} onChange={e => { setSchedDirty(true); setDraftSunrise(Number(e.target.value) || 0); }} />
               <Label className="text-xs">日落(分)</Label>
               <Input size="sm" className="w-16" type="number" value={draftSunset} onChange={e => { setSchedDirty(true); setDraftSunset(Number(e.target.value) || 0); }} />
+              <div className="flex flex-wrap items-center gap-1" role="group" aria-label="常用渐变时长">
+                {SUN_PRESET_MINUTES.map(minVal => (
+                  <Button
+                    key={minVal}
+                    type="button"
+                    size="xs"
+                    variant={draftSunrise === minVal && draftSunset === minVal ? 'secondary' : 'ghost'}
+                    onClick={() => {
+                      setSchedDirty(true);
+                      setDraftSunrise(minVal);
+                      setDraftSunset(minVal);
+                    }}
+                  >
+                    {minVal === 0 ? '无渐变' : `${minVal}m`}
+                  </Button>
+                ))}
+              </div>
             </div>
             <div className="flex flex-wrap gap-1.5">
               <Button size="xs" variant="outline" disabled={busy} onClick={() => void runAndRefresh('schedule', { op: 'get' }, '回读灯内定时行程…')}>回读行程</Button>
@@ -516,19 +855,26 @@ export default function NetleaSurface() {
           )}
 
           <div className="space-y-1.5">
-            {draftTrips.map((t, idx) => (
-              <div key={`${t.startH}-${t.startM}-${idx}`} className="flex flex-wrap items-center justify-between gap-2 rounded-md border px-3 py-2 text-xs">
-                <div className="flex flex-wrap items-center gap-2">
-                  <Badge variant={t.enable ? 'success' : 'secondary'}>{pad2(t.startH)}:{pad2(t.startM)} ~ {pad2(t.endH)}:{pad2(t.endM)}</Badge>
-                  <span className="font-medium">{t.seriesName || ''} {t.name || '时段'}</span>
-                  <span className="font-mono text-muted-foreground">R{t.red}/G{t.green}/W{t.white}/B{t.blue} · {t.powerWatts ?? 0}W</span>
+            {draftTrips.map((t, idx) => {
+              const { fill: swatchFill } = resolveCurveColors(t);
+              return (
+                <div key={`${t.startH}-${t.startM}-${idx}`} className="flex flex-wrap items-center justify-between gap-2 rounded-md border px-3 py-2 text-xs">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <svg viewBox="0 0 6 24" className="h-5 w-1.5 shrink-0" aria-hidden="true">
+                      <rect x="0" y="0" width="6" height="24" rx="3" fill={swatchFill} fillOpacity={t.enable ? 0.95 : 0.3} />
+                    </svg>
+                    <Badge variant={t.enable ? 'success' : 'secondary'}>{pad2(t.startH)}:{pad2(t.startM)} ~ {pad2(t.endH)}:{pad2(t.endM)}</Badge>
+                    <span className="font-medium">{t.seriesName || ''} {t.name || '时段'}</span>
+                    <Badge variant="outline">{formatDaySummary(t.dayList)}</Badge>
+                    <span className="font-mono text-muted-foreground">R{t.red}/G{t.green}/W{t.white}/B{t.blue} · {t.powerWatts ?? 0}W</span>
+                  </div>
+                  <div className="flex gap-1">
+                    <Button size="xs" variant="ghost" onClick={() => openEditor(idx)} aria-label="编辑时段"><PencilIcon className="size-3" /></Button>
+                    <Button size="xs" variant="ghost" onClick={() => deleteTripAt(idx)} aria-label="删除时段"><Trash2Icon className="size-3 text-destructive" /></Button>
+                  </div>
                 </div>
-                <div className="flex gap-1">
-                  <Button size="xs" variant="ghost" onClick={() => openEditor(idx)} aria-label="编辑时段"><PencilIcon className="size-3" /></Button>
-                  <Button size="xs" variant="ghost" onClick={() => deleteTripAt(idx)} aria-label="删除时段"><Trash2Icon className="size-3 text-destructive" /></Button>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </TabsPanel>
 

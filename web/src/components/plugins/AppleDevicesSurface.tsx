@@ -1,11 +1,20 @@
 import { errorText, timestamp } from '@friday/web/shared/format.js';
 import {
+  BatteryChargingIcon,
+  BatteryFullIcon,
+  BatteryIcon,
+  BatteryLowIcon,
+  BatteryMediumIcon,
   BellRingIcon,
+  HeadphonesIcon,
+  LaptopIcon,
   LogOutIcon,
   MapPinIcon,
   RefreshCwIcon,
   ShieldAlertIcon,
   SmartphoneIcon,
+  TabletIcon,
+  WatchIcon,
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ConfirmActionDialog } from '@/components/shared/ConfirmActionDialog';
@@ -41,11 +50,14 @@ interface AppleDeviceItem {
   model: string;
   category: string;
   online: boolean;
+  deviceStatus?: string;
   deviceStatusLabel?: string;
   batteryPercent: number | null;
+  batteryStatus?: string;
   batteryStatusLabel: string;
   batteryIsCached?: boolean;
   lowPowerMode: boolean;
+  isLocating?: boolean;
   soundCapable?: boolean;
   isFamily?: boolean;
   location: AppleDeviceLocation | null;
@@ -117,6 +129,57 @@ function parsePlaces(raw: string): Record<string, { lat: number; lng: number; ra
     }
   }
   return out;
+}
+
+function resolveCategoryIcon(category: string) {
+  switch (category) {
+    case 'ipad':
+      return TabletIcon;
+    case 'mac':
+      return LaptopIcon;
+    case 'watch':
+      return WatchIcon;
+    case 'airpods':
+      return HeadphonesIcon;
+    default:
+      return SmartphoneIcon;
+  }
+}
+
+function resolveDeviceBadge(dev: AppleDeviceItem): { label: string; variant: 'success' | 'warning' | 'secondary' } {
+  if (dev.online) return { label: '在线', variant: 'success' };
+  if (dev.deviceStatus === 'pending' && dev.isLocating) {
+    return { label: '唤醒同步中', variant: 'warning' };
+  }
+  if (dev.deviceStatus === 'pending') {
+    return { label: '待机', variant: 'warning' };
+  }
+  if (dev.deviceStatus === 'offline') {
+    return { label: '离线休眠', variant: 'secondary' };
+  }
+  return { label: dev.deviceStatusLabel || '离线', variant: 'secondary' };
+}
+
+function resolveBatteryVisual(
+  percent: number | null,
+  status: string | undefined,
+  statusLabel: string,
+  minBatteryPct: number,
+) {
+  const charging = status === 'Charging' || status === 'Charged' || statusLabel.includes('充');
+  if (charging) {
+    return { barClass: 'fill-sky-500', textClass: 'text-sky-600 dark:text-sky-400', Icon: BatteryChargingIcon };
+  }
+  if (percent === null) {
+    return { barClass: 'fill-muted-foreground/40', textClass: 'text-muted-foreground', Icon: BatteryIcon };
+  }
+  if (percent < minBatteryPct) {
+    return { barClass: 'fill-destructive', textClass: 'text-destructive-foreground', Icon: BatteryLowIcon };
+  }
+  if (percent < 50) {
+    return { barClass: 'fill-warning', textClass: 'text-warning-foreground', Icon: BatteryMediumIcon };
+  }
+  return { barClass: 'fill-success', textClass: 'text-success-foreground', Icon: BatteryFullIcon };
 }
 
 export default function AppleDevicesSurface() {
@@ -433,55 +496,107 @@ export default function AppleDevicesSurface() {
             </CardContent>
           </Card>
         ) : (
-          data.devices.map(dev => (
-            <Card key={dev.id}>
-              <CardHeader className="pb-1">
-                <div className="flex items-center justify-between gap-2">
-                  <CardTitle className="text-xs font-semibold truncate">
-                    {dev.name}
-                    {dev.isFamily && <Badge variant="secondary" className="ms-1.5">家人</Badge>}
-                  </CardTitle>
-                  <Badge variant={dev.online ? 'success' : 'secondary'}>
-                    {dev.deviceStatusLabel || (dev.online ? '在线' : '离线')}
-                  </Badge>
-                </div>
-                <CardDescription className="text-[11px]">
-                  {dev.displayName || dev.model} · 电量 {dev.batteryPercent !== null ? `${dev.batteryPercent}%` : '未知'}
-                  {dev.lowPowerMode ? ' · 低电量模式' : ''}
-                </CardDescription>
-              </CardHeader>
-              <CardContent className="space-y-2 text-xs">
-                <div className="text-muted-foreground">
-                  {dev.place ? (
-                    <Badge variant={dev.place.inside ? 'success' : 'outline'} className="me-1.5">
-                      {dev.place.inside ? `位于 ${dev.place.name}` : `距 ${dev.place.name} ${Math.round(dev.place.distanceMeters)}m`}
+          data.devices.map(dev => {
+            const CategoryIcon = resolveCategoryIcon(dev.category);
+            const devBadge = resolveDeviceBadge(dev);
+            const minPct = data.config?.minBatteryPct ?? (Number(cfgMinBattery) || 20);
+            const clampedPct = typeof dev.batteryPercent === 'number'
+              ? Math.max(0, Math.min(100, Math.round(dev.batteryPercent)))
+              : null;
+            const bat = resolveBatteryVisual(clampedPct, dev.batteryStatus, dev.batteryStatusLabel || '', minPct);
+            const BatteryStateIcon = bat.Icon;
+            const batDesc = clampedPct !== null
+              ? `${dev.batteryStatusLabel || '电量'}${dev.batteryIsCached ? '（休眠前记录）' : ''}`
+              : '暂无电量上报（休眠或关机）';
+
+            return (
+              <Card key={dev.id} className="flex flex-col">
+                <CardHeader className="pb-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex min-w-0 items-center gap-1.5">
+                      <CategoryIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                      <CardTitle className="text-xs font-semibold truncate">{dev.name}</CardTitle>
+                      {dev.isFamily && <Badge size="sm" variant="secondary" className="shrink-0">家人</Badge>}
+                      {dev.lowPowerMode && <Badge size="sm" variant="warning" className="shrink-0">低电量</Badge>}
+                    </div>
+                    <Badge size="sm" variant={devBadge.variant} className="shrink-0">
+                      {devBadge.label}
                     </Badge>
-                  ) : null}
-                  <span>{dev.location?.shortAddress || dev.location?.address || '暂无定位坐标'}</span>
-                  {dev.location?.timestamp ? <span className="ms-1 font-mono text-[10px]">({timestamp(dev.location.timestamp)})</span> : null}
-                </div>
-                {dev.soundCapable && (
-                  <Button
-                    size="xs"
-                    variant="outline"
-                    disabled={busy}
-                    onClick={async () => {
-                      setBusy(true);
-                      try {
-                        const res = await callApple('play-sound', { device: dev.id });
-                        setStatus({ text: res.message || `已向 ${dev.name} 发送响铃指令`, tone: res.ok ? 'ok' : 'err' });
-                      } finally {
-                        setBusy(false);
-                      }
-                    }}
-                  >
-                    <BellRingIcon className="size-3.5" />
-                    <span>播放查找提示音</span>
-                  </Button>
-                )}
-              </CardContent>
-            </Card>
-          ))
+                  </div>
+                  <CardDescription className="text-[11px] truncate">
+                    {dev.displayName || dev.model}
+                  </CardDescription>
+                </CardHeader>
+
+                <CardContent className="flex flex-1 flex-col gap-2.5 text-xs">
+                  {/* Battery progress bar */}
+                  <div className="space-y-1.5 rounded-lg border bg-muted/20 px-2.5 py-2">
+                    <div className="flex items-center justify-between gap-2 text-[11px]">
+                      <span className="flex min-w-0 items-center gap-1.5 text-muted-foreground">
+                        <BatteryStateIcon className={`size-3.5 shrink-0 ${bat.textClass}`} />
+                        <span className="truncate">{batDesc}</span>
+                      </span>
+                      <span className={`shrink-0 font-mono font-semibold tabular-nums ${bat.textClass}`}>
+                        {clampedPct !== null ? `${clampedPct}%` : '--'}
+                      </span>
+                    </div>
+                    <div
+                      role="progressbar"
+                      aria-label={`${dev.name} 电量`}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={clampedPct ?? undefined}
+                      className="h-2 w-full overflow-hidden rounded-full bg-input"
+                    >
+                      <svg viewBox="0 0 200 8" preserveAspectRatio="none" className="block size-full" aria-hidden="true">
+                        {clampedPct !== null && (
+                          <rect
+                            x="0"
+                            y="0"
+                            width={Math.max(clampedPct > 0 ? 4 : 0, Math.round((clampedPct / 100) * 200))}
+                            height="8"
+                            className={bat.barClass}
+                          />
+                        )}
+                      </svg>
+                    </div>
+                  </div>
+
+                  <div className="text-muted-foreground leading-relaxed">
+                    {dev.place ? (
+                      <Badge variant={dev.place.inside ? 'success' : 'outline'} className="me-1.5">
+                        {dev.place.inside ? `位于 ${dev.place.name}` : `距 ${dev.place.name} ${Math.round(dev.place.distanceMeters)}m`}
+                      </Badge>
+                    ) : null}
+                    <span className="break-words">{dev.location?.shortAddress || dev.location?.address || '暂无定位坐标'}</span>
+                    {dev.location?.timestamp ? <span className="ms-1 font-mono text-[10px]">({timestamp(dev.location.timestamp)})</span> : null}
+                  </div>
+
+                  {dev.soundCapable && (
+                    <div className="mt-auto flex justify-end pt-0.5">
+                      <Button
+                        size="xs"
+                        variant="outline"
+                        disabled={busy}
+                        onClick={async () => {
+                          setBusy(true);
+                          try {
+                            const res = await callApple('play-sound', { device: dev.id });
+                            setStatus({ text: res.message || `已向 ${dev.name} 发送响铃指令`, tone: res.ok ? 'ok' : 'err' });
+                          } finally {
+                            setBusy(false);
+                          }
+                        }}
+                      >
+                        <BellRingIcon className="size-3.5" />
+                        <span>播放查找提示音</span>
+                      </Button>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            );
+          })
         )}
       </div>
 

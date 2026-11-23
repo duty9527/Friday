@@ -103,6 +103,57 @@ const CARD_SIZES: CardSize[] = ['1x1', '2x1', '1x2', '2x2'];
 const BRIGHTNESS_OPTS = [100, 80, 60, 35, 15];
 const VOLUME_OPTS = [100, 85, 65, 45, 25, 0];
 
+const BOT_STATE_LABELS: Record<string, string> = {
+  idle: '待机守候',
+  listening: '正在倾听',
+  speaking: '语音播报',
+  sending_msg: '发送消息',
+  printing: '正在打印',
+  operating_xiaoai: '操控小爱',
+  operating_tv: '操控电视',
+  managing_laifen: '牙刷管理',
+  weighing_scale: '体脂测重',
+  thinking: '思考推演',
+  searching: '记忆检索',
+  streaming: '正在回复',
+  working: '协同执行',
+  waiting: '等待指示',
+  finished: '执行完成',
+  failed: '执行受阻',
+  sleeping: '静默休眠',
+};
+
+const EXPRESSION_LABELS: Record<string, string> = {
+  auto: '自动表情',
+  happy: '开心',
+  listening: '专注倾听',
+  speaking: '语音播报',
+  sending_msg: '发送消息',
+  printing: '正在打印',
+  operating_xiaoai: '操控小爱',
+  operating_tv: '操控电视',
+  managing_laifen: '牙刷管理',
+  weighing_scale: '体脂测重',
+  inspecting: '打量',
+  surprised: '惊喜',
+  calm: '平静',
+  sleepy: '困倦',
+  neutral: '默认',
+  squinted: '专注眯眼',
+  confused: '疑惑',
+  sad: '失落',
+};
+
+function localizeBotState(state?: string): string {
+  const key = (state ?? 'idle').trim().toLowerCase();
+  return BOT_STATE_LABELS[key] ?? state ?? '待机守候';
+}
+
+function localizeExpression(expr?: string): string {
+  const key = (expr ?? 'auto').trim().toLowerCase();
+  return EXPRESSION_LABELS[key] ?? expr ?? '自动表情';
+}
+
 const EXPRESSIONS: Array<{ expr: string; label: string; poke?: string; channel?: string }> = [
   { expr: 'listening', label: '倾听状态', poke: 'nod' },
   { expr: 'speaking', label: '小爱说话' },
@@ -371,70 +422,120 @@ export default function Cs80FaceSurface() {
 
   return (
     <div
-      className="space-y-4"
+      className="grid gap-4 lg:grid-cols-[268px_minmax(0,1fr)] xl:grid-cols-[288px_minmax(0,1fr)] lg:items-start"
       onFocusCapture={() => { editingInsideRef.current = true; }}
       onBlurCapture={() => { editingInsideRef.current = false; }}
     >
-      {/* Header */}
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center gap-2">
-          <MonitorIcon className="size-4 text-primary" />
-          <h3 className="text-sm font-semibold">桌面副屏 · CS80 互动工作台</h3>
-          <Badge variant={up ? (st?.standby ? 'warning' : 'success') : 'secondary'}>
-            {up ? (st?.standby ? '待机息屏中' : `USB ${st?.usbSpeed ?? 480} Mbps 在线`) : '未接入屏幕 / 仅渲染预览'}
-          </Badge>
-        </div>
-        <div className="flex flex-wrap items-center gap-1.5">
-          <label className="flex items-center gap-1.5 text-xs me-1">
-            <Switch checked={autoPreview} onCheckedChange={setAutoPreview} />
-            <span>3.5s 实时图传</span>
-          </label>
-          <Button size="xs" variant="outline" disabled={busy} onClick={() => void runSimpleAction('刷新副屏失败', async () => {
-            await callFace('screen', { refresh: true });
-            await refreshDashboard(false);
-          })}>
-            <RefreshCwIcon className="size-3.5" />
-            <span>重绘屏幕</span>
-          </Button>
-          <Button size="xs" variant="outline" disabled={busy} onClick={() => void runSimpleAction('切换息屏失败', async () => {
-            await callFace('screen', { standby: !(st?.standby ?? false) });
-            await refreshDashboard(false);
-          })}>
-            <span>{st?.standby ? '唤醒副屏' : '待机息屏'}</span>
-          </Button>
-        </div>
-      </div>
-
-      {status && (
-        <Alert variant={status.tone === 'err' ? 'error' : status.tone === 'warn' ? 'warning' : 'success'}>
-          <AlertDescription className="text-xs">{status.text}</AlertDescription>
-        </Alert>
-      )}
-
-      {/* Preview + Hardware Controls */}
-      <div className="grid gap-3 lg:grid-cols-5">
-        <Card className="lg:col-span-2">
+      {/* Left Sticky 800x1280 Portrait Mirror Column */}
+      <div className="lg:sticky lg:top-0 lg:self-start">
+        <Card>
           <CardHeader className="pb-2">
-            <div className="flex items-center justify-between">
-              <CardTitle className="text-sm">副屏实时镜像</CardTitle>
-              <Badge variant={dirty ? 'warning' : 'secondary'}>{dirty ? '同步中…' : '已与副屏同步'}</Badge>
+            <div className="flex flex-wrap items-center justify-between gap-1.5">
+              <CardTitle className="text-sm">物理副屏实时镜像</CardTitle>
+              <div className="flex items-center gap-1">
+                <Badge size="sm" variant={up ? (st?.standby ? 'warning' : 'success') : 'secondary'}>
+                  {up ? (st?.standby ? '待机' : `USB ${st?.usbSpeed ?? 480}M`) : '仅预览'}
+                </Badge>
+                <Badge size="sm" variant={dirty ? 'warning' : 'secondary'}>
+                  {dirty ? '同步中…' : '已同步'}
+                </Badge>
+              </div>
             </div>
             <CardDescription className="text-xs">
-              状态 {st?.botState || 'idle'} · 表情 {st?.expression || 'auto'} · 亮度 {st?.brightness ?? 100}%
+              {localizeBotState(st?.botState)} · {localizeExpression(st?.expression)} · 亮度 {st?.brightness ?? 100}%
+              {st?.stats?.patchMs !== undefined ? ` · ${st.stats.patchMs}ms` : ''}
             </CardDescription>
           </CardHeader>
-          <CardContent className="flex flex-col items-center justify-center">
-            {previewUrl ? (
-              <img src={previewUrl} alt="CS80 实时帧预览" className="max-h-56 w-full rounded-md border object-contain bg-black" />
-            ) : (
-              <div className="flex h-40 w-full items-center justify-center rounded-md border bg-muted/20 text-xs text-muted-foreground">
-                暂无画面帧（请确认守护进程已响应）
-              </div>
-            )}
+          <CardContent className="space-y-3">
+            <div
+              data-testid="cs80-preview-frame"
+              className="mx-auto flex aspect-[800/1280] w-full max-w-[264px] items-center justify-center overflow-hidden rounded-2xl border-2 border-border bg-black shadow-inner"
+            >
+              {previewUrl ? (
+                <img
+                  src={previewUrl}
+                  alt="CS80 实时帧预览"
+                  className="block size-full object-contain"
+                  decoding="async"
+                />
+              ) : (
+                <div className="px-4 text-center text-xs text-zinc-400">
+                  暂无画面帧（请确认守护进程已响应）
+                </div>
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-1.5">
+              <Button size="xs" variant="outline" disabled={busy} onClick={() => void runSimpleAction('重绘屏幕失败', async () => {
+                await callFace('screen', { refresh: true });
+                await refreshDashboard(false);
+              })}>
+                <RefreshCwIcon className="size-3" />
+                <span>重绘屏幕</span>
+              </Button>
+              <Button size="xs" variant="outline" disabled={busy} onClick={() => void runSimpleAction('切换息屏失败', async () => {
+                await callFace('screen', { standby: !(st?.standby ?? false) });
+                await refreshDashboard(false);
+              })}>
+                <span>{st?.standby ? '唤醒副屏' : '待机息屏'}</span>
+              </Button>
+              <Button
+                size="xs"
+                variant="ghost"
+                disabled={busy}
+                onClick={() => void runSimpleAction('重置默认布局失败', async () => {
+                  const res = await callFace<{ layout?: Cs80LayoutConfig; previewDataUrl?: string }>('layout', {
+                    reset: true,
+                    refreshWidgets: true,
+                    includePreview: true,
+                  });
+                  if (res.ok && res.data?.layout) {
+                    setDraftLayout(cloneLayout(res.data.layout));
+                    setDirty(false);
+                    setWeatherCityDirty(false);
+                  }
+                  if (isSafePreviewImageUrl(res.data?.previewDataUrl)) {
+                    setPreviewUrl(res.data!.previewDataUrl!);
+                  }
+                })}
+              >
+                <RotateCcwIcon className="size-3" />
+                <span>恢复默认</span>
+              </Button>
+            </div>
           </CardContent>
         </Card>
+      </div>
 
-        <Card className="lg:col-span-3">
+      {/* Right Studio Toolbar, Telemetry Controls & Bento Card Layout */}
+      <div className="min-w-0 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border bg-card px-3.5 py-2.5">
+          <div className="flex flex-wrap items-center gap-2">
+            <MonitorIcon className="size-4 text-primary" />
+            <h3 className="text-sm font-semibold">桌面副屏 · CS80 互动工作台</h3>
+            <Badge variant={up ? (st?.standby ? 'warning' : 'success') : 'secondary'}>
+              {up ? (st?.standby ? '待机息屏中' : `USB ${st?.usbSpeed ?? 480} Mbps 在线`) : '未接入屏幕 / 仅渲染预览'}
+            </Badge>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="flex items-center gap-1.5 text-xs">
+              <Switch checked={autoPreview} onCheckedChange={setAutoPreview} />
+              <span>3.5s 实时图传</span>
+            </label>
+            <Button size="xs" variant="outline" disabled={busy} onClick={() => void refreshDashboard(false)}>
+              <RefreshCwIcon className="size-3.5" />
+              <span>刷新状态</span>
+            </Button>
+          </div>
+        </div>
+
+        {status && (
+          <Alert variant={status.tone === 'err' ? 'error' : status.tone === 'warn' ? 'warning' : 'success'}>
+            <AlertDescription className="text-xs">{status.text}</AlertDescription>
+          </Alert>
+        )}
+
+        <Card>
           <CardHeader className="pb-2">
             <CardTitle className="flex items-center gap-1.5 text-sm">
               <SparklesIcon className="size-4" />
@@ -562,42 +663,21 @@ export default function Cs80FaceSurface() {
             </div>
           </CardContent>
         </Card>
-      </div>
 
-      {/* Bento Layout Config */}
-      {draftLayout && (
-        <Card>
-          <CardHeader className="pb-2">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <CardTitle className="flex items-center gap-1.5 text-sm">
-                <LayoutGridIcon className="size-4" />
-                <span>多屏卡片布局</span>
-              </CardTitle>
-              <Button
-                size="xs"
-                variant="outline"
-                disabled={busy}
-                onClick={() => void runSimpleAction('重置默认布局失败', async () => {
-                  const res = await callFace<{ layout?: Cs80LayoutConfig; previewDataUrl?: string }>('layout', {
-                    reset: true,
-                    refreshWidgets: true,
-                    includePreview: true,
-                  });
-                  if (res.ok && res.data?.layout) {
-                    setDraftLayout(cloneLayout(res.data.layout));
-                    setDirty(false);
-                    setWeatherCityDirty(false);
-                  }
-                })}
-              >
-                <RotateCcwIcon className="size-3.5" />
-                <span>恢复默认</span>
-              </Button>
-            </div>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            {/* Global layout settings */}
-            <div className="grid gap-2 sm:grid-cols-5 text-xs">
+        {/* Bento Layout Config */}
+        {draftLayout && (
+          <Card>
+            <CardHeader className="pb-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <CardTitle className="flex items-center gap-1.5 text-sm">
+                  <LayoutGridIcon className="size-4" />
+                  <span>多屏卡片布局</span>
+                </CardTitle>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {/* Global layout settings */}
+              <div className="grid gap-2.5 sm:grid-cols-2 xl:grid-cols-3 text-xs">
               <div className="space-y-1">
                 <Label className="text-[11px]">网格行数</Label>
                 <div className="flex gap-1">
@@ -839,47 +919,48 @@ export default function Cs80FaceSurface() {
               </div>
             )}
 
-            {/* Catalog Picker */}
-            <div className="space-y-2 border-t pt-3">
-              <div className="text-xs font-medium text-muted-foreground">添加副屏数据卡片 ({payload?.catalog.length ?? 0} 个可用源)</div>
-              <div className="grid gap-1.5 sm:grid-cols-3">
-                {(payload?.catalog ?? []).map(item => (
-                  <div key={item.kind} className="flex items-center justify-between gap-2 rounded-md border px-2.5 py-1.5 text-xs">
-                    <div className="min-w-0 truncate">
-                      <div className="font-medium truncate">{item.title}</div>
-                      <div className="text-[10px] text-muted-foreground">{item.category}</div>
+              {/* Catalog Picker */}
+              <div className="space-y-2 border-t pt-3">
+                <div className="text-xs font-medium text-muted-foreground">添加副屏数据卡片 ({payload?.catalog.length ?? 0} 个可用源)</div>
+                <div className="grid gap-1.5 sm:grid-cols-2">
+                  {(payload?.catalog ?? []).map(item => (
+                    <div key={item.kind} className="flex items-center justify-between gap-2 rounded-md border px-2.5 py-1.5 text-xs">
+                      <div className="min-w-0 truncate">
+                        <div className="font-medium truncate">{item.title}</div>
+                        <div className="text-[10px] text-muted-foreground">{item.category}</div>
+                      </div>
+                      <Button
+                        size="xs"
+                        variant="outline"
+                        disabled={busy || (curPage?.cards.length ?? 0) >= 8}
+                        onClick={() => {
+                          const next = cloneLayout(draftLayout);
+                          const pg = next.pages[activePageIdx];
+                          if (!pg || pg.cards.length >= 8) {
+                            setStatus({ text: '单页最多配置 8 张卡片，请新增副页。', tone: 'warn' });
+                            return;
+                          }
+                          pg.cards.push({
+                            id: `c-${Date.now().toString(36).slice(-5)}-${pg.cards.length + 1}`,
+                            kind: item.kind,
+                            size: item.defaultSize || '1x1',
+                            ...(item.plugin ? { plugin: item.plugin } : {}),
+                            ...(item.defaultAction ? { action: item.defaultAction } : {}),
+                            ...(item.category === 'custom_plugin' ? { title: item.title, ttlSec: 120 } : {}),
+                          });
+                          void syncLayout(next, { pages: next.pages, activePage: next.activePage, refreshWidgets: true });
+                        }}
+                      >
+                        添加
+                      </Button>
                     </div>
-                    <Button
-                      size="xs"
-                      variant="outline"
-                      disabled={busy || (curPage?.cards.length ?? 0) >= 8}
-                      onClick={() => {
-                        const next = cloneLayout(draftLayout);
-                        const pg = next.pages[activePageIdx];
-                        if (!pg || pg.cards.length >= 8) {
-                          setStatus({ text: '单页最多配置 8 张卡片，请新增副页。', tone: 'warn' });
-                          return;
-                        }
-                        pg.cards.push({
-                          id: `c-${Date.now().toString(36).slice(-5)}-${pg.cards.length + 1}`,
-                          kind: item.kind,
-                          size: item.defaultSize || '1x1',
-                          ...(item.plugin ? { plugin: item.plugin } : {}),
-                          ...(item.defaultAction ? { action: item.defaultAction } : {}),
-                          ...(item.category === 'custom_plugin' ? { title: item.title, ttlSec: 120 } : {}),
-                        });
-                        void syncLayout(next, { pages: next.pages, activePage: next.activePage, refreshWidgets: true });
-                      }}
-                    >
-                      添加
-                    </Button>
-                  </div>
-                ))}
+                  ))}
+                </div>
               </div>
-            </div>
-          </CardContent>
-        </Card>
-      )}
+            </CardContent>
+          </Card>
+        )}
+      </div>
 
       <ConfirmActionDialog
         open={deletePageOpen}

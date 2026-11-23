@@ -263,14 +263,14 @@ export function PluginHub() {
   const detailSpecs = detailPlugin ? getPluginSpecs(detailPlugin) : [];
 
   return (
-    <div className="flex flex-col gap-3 md:flex-row md:min-h-[560px]">
+    <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden md:flex-row">
       {/* Left Collapsible Sidebar */}
       <aside
-        className={`shrink-0 rounded-xl border bg-muted/20 p-2 flex flex-col justify-between gap-2 transition-[width] ${
+        className={`shrink-0 rounded-xl border bg-muted/20 p-2 flex flex-col justify-between gap-2 transition-[width] max-md:max-h-36 md:h-full md:min-h-0 md:overflow-hidden ${
           sidebarCollapsed ? 'md:w-14' : 'md:w-56'
         }`}
       >
-        <div className="space-y-1.5">
+        <div className="flex min-h-0 flex-1 flex-col gap-1.5 overflow-hidden">
           <div className="flex items-center justify-between px-1">
             {!sidebarCollapsed && <span className="text-[11px] font-medium text-muted-foreground">专属硬件与应用</span>}
             <div className="flex items-center gap-0.5">
@@ -285,7 +285,7 @@ export function PluginHub() {
             </div>
           </div>
 
-          <div className="flex flex-wrap gap-1 md:flex-col">
+          <div className="flex flex-wrap gap-1 overflow-y-auto md:min-h-0 md:flex-1 md:flex-col md:flex-nowrap">
             {orderedSurfaceNames.map((name, idx) => {
               const meta = SURFACE_BY_NAME.get(name);
               if (!meta) return null;
@@ -329,7 +329,7 @@ export function PluginHub() {
         </div>
 
         {/* Pinned Catalog Button */}
-        <div className="border-t pt-2">
+        <div className="shrink-0 border-t pt-2">
           <Button
             size="xs"
             variant={pluginSurface === 'catalog' || !activeSurfaceMeta ? 'default' : 'outline'}
@@ -351,10 +351,10 @@ export function PluginHub() {
       </aside>
 
       {/* Right Main Stage */}
-      <div className="min-w-0 flex-1">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         {activeSurfaceMeta ? (
-          <div className="space-y-3">
-            <div className="flex flex-wrap items-center justify-between gap-2 border-b pb-2">
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+            <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b pb-2">
               <div className="flex items-center gap-2">
                 <Button size="xs" variant="ghost" onClick={() => setPluginSurface('catalog')}>
                   <ArrowLeftIcon className="size-3.5" />
@@ -377,27 +377,29 @@ export function PluginHub() {
                 </Button>
               )}
             </div>
-            <PluginSurfaceErrorBoundary
-              key={pluginSurface}
-              surfaceName={pluginSurface}
-              onBack={() => setPluginSurface('catalog')}
-            >
-              <Suspense
-                fallback={
-                  <div className="flex h-64 items-center justify-center gap-2 text-xs text-muted-foreground">
-                    <Spinner className="size-4" />
-                    <span>正在加载 {activeSurfaceMeta.label}…</span>
-                  </div>
-                }
+            <div data-testid="plugin-hub-scroll" className="min-h-0 flex-1 overflow-y-auto overscroll-contain pe-1 pt-3">
+              <PluginSurfaceErrorBoundary
+                key={pluginSurface}
+                surfaceName={pluginSurface}
+                onBack={() => setPluginSurface('catalog')}
               >
-                <activeSurfaceMeta.Component />
-              </Suspense>
-            </PluginSurfaceErrorBoundary>
+                <Suspense
+                  fallback={
+                    <div className="flex h-64 items-center justify-center gap-2 text-xs text-muted-foreground">
+                      <Spinner className="size-4" />
+                      <span>正在加载 {activeSurfaceMeta.label}…</span>
+                    </div>
+                  }
+                >
+                  <activeSurfaceMeta.Component />
+                </Suspense>
+              </PluginSurfaceErrorBoundary>
+            </div>
           </div>
         ) : detailPlugin ? (
           /* Plugin Detail + Dev Runner */
-          <div className="space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-2 border-b pb-2">
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+            <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b pb-2">
               <div className="flex items-center gap-2">
                 <Button size="xs" variant="ghost" onClick={() => setDetailPluginName(null)}>
                   <ArrowLeftIcon className="size-3.5" />
@@ -415,7 +417,8 @@ export function PluginHub() {
               )}
             </div>
 
-            <p className="text-xs text-muted-foreground">{getPluginSummary(detailPlugin)}</p>
+            <div data-testid="plugin-hub-scroll" className="min-h-0 flex-1 overflow-y-auto overscroll-contain space-y-4 pe-1 pt-3">
+              <p className="text-xs text-muted-foreground">{getPluginSummary(detailPlugin)}</p>
 
             <Tabs value={detailTab} onValueChange={v => setDetailTab(v as 'overview' | 'dev')}>
               <TabsList>
@@ -590,11 +593,12 @@ export function PluginHub() {
                 </Card>
               );
             })()}
+            </div>
           </div>
         ) : (
           /* Catalog View */
-          <div className="space-y-3">
-            <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden">
+            <div className="flex shrink-0 flex-wrap items-center justify-between gap-2">
               <div className="relative flex-1 min-w-44">
                 <SearchIcon className="pointer-events-none absolute start-2.5 top-2 size-3.5 text-muted-foreground" />
                 <Input
@@ -627,72 +631,74 @@ export function PluginHub() {
               </div>
             </div>
 
-            {filteredResult.items.length === 0 ? (
-              <div className="flex h-40 flex-col items-center justify-center gap-1 rounded-xl border border-dashed text-xs text-muted-foreground">
-                <PlugIcon className="size-5" />
-                <span>没有匹配条件的插件</span>
-              </div>
-            ) : (
-              <div className="grid gap-2.5 sm:grid-cols-2">
-                {filteredResult.items.map(p => {
-                  const hasSurface = SURFACE_NAMES.has(p.name);
-                  const qc = quickChecks[p.name];
-                  const stInfo = getPluginStatusInfo(p);
-                  return (
-                    <Card key={p.name}>
-                      <CardHeader className="pb-1">
-                        <div className="flex items-center justify-between gap-2">
-                          <CardTitle className="text-xs font-semibold truncate">{getPluginDisplayTitle(p)}</CardTitle>
-                          <div className="flex shrink-0 items-center gap-1">
-                            <Badge variant="outline">{getPluginDomainLabel(p, hasSurface)}</Badge>
-                            <Badge variant={p.enabled === false ? 'secondary' : 'success'}>{stInfo.label}</Badge>
+            <div data-testid="plugin-hub-scroll" className="min-h-0 flex-1 overflow-y-auto overscroll-contain pe-1">
+              {filteredResult.items.length === 0 ? (
+                <div className="flex h-40 flex-col items-center justify-center gap-1 rounded-xl border border-dashed text-xs text-muted-foreground">
+                  <PlugIcon className="size-5" />
+                  <span>没有匹配条件的插件</span>
+                </div>
+              ) : (
+                <div className="grid gap-2.5 sm:grid-cols-2">
+                  {filteredResult.items.map(p => {
+                    const hasSurface = SURFACE_NAMES.has(p.name);
+                    const qc = quickChecks[p.name];
+                    const stInfo = getPluginStatusInfo(p);
+                    return (
+                      <Card key={p.name}>
+                        <CardHeader className="pb-1">
+                          <div className="flex items-center justify-between gap-2">
+                            <CardTitle className="text-xs font-semibold truncate">{getPluginDisplayTitle(p)}</CardTitle>
+                            <div className="flex shrink-0 items-center gap-1">
+                              <Badge variant="outline">{getPluginDomainLabel(p, hasSurface)}</Badge>
+                              <Badge variant={p.enabled === false ? 'secondary' : 'success'}>{stInfo.label}</Badge>
+                            </div>
                           </div>
-                        </div>
-                        <CardDescription className="line-clamp-2 text-[11px]">{getPluginSummary(p)}</CardDescription>
-                      </CardHeader>
-                      <CardContent className="space-y-2 text-xs">
-                        {qc?.summary && (
-                          <div className={`flex items-start justify-between gap-2 rounded border px-2 py-1 text-[11px] ${qc.ok ? 'border-success/30 bg-success/5 text-foreground' : 'border-warning/30 bg-warning/5 text-muted-foreground'}`}>
-                            <span className="min-w-0 flex-1 break-words">{qc.summary}</span>
-                            {(qc.fullMessage || qc.data !== undefined) && (
-                              <ViewFullButton
-                                className="shrink-0"
-                                onClick={() =>
-                                  setViewerPayload({
-                                    title: `${getPluginDisplayTitle(p)} · 快速自检完整结果`,
-                                    badges: [{ label: qc.ok ? '通过' : '异常', variant: qc.ok ? 'success' : 'warning' }],
-                                    content: [
-                                      qc.fullMessage ?? qc.summary ?? '',
-                                      qc.data !== undefined ? JSON.stringify(qc.data, null, 2) : '',
-                                    ].filter(Boolean).join('\n\n'),
-                                    mode: 'code',
-                                  })
-                                }
-                              />
-                            )}
+                          <CardDescription className="line-clamp-2 text-[11px]">{getPluginSummary(p)}</CardDescription>
+                        </CardHeader>
+                        <CardContent className="space-y-2 text-xs">
+                          {qc?.summary && (
+                            <div className={`flex items-start justify-between gap-2 rounded border px-2 py-1 text-[11px] ${qc.ok ? 'border-success/30 bg-success/5 text-foreground' : 'border-warning/30 bg-warning/5 text-muted-foreground'}`}>
+                              <span className="min-w-0 flex-1 break-words">{qc.summary}</span>
+                              {(qc.fullMessage || qc.data !== undefined) && (
+                                <ViewFullButton
+                                  className="shrink-0"
+                                  onClick={() =>
+                                    setViewerPayload({
+                                      title: `${getPluginDisplayTitle(p)} · 快速自检完整结果`,
+                                      badges: [{ label: qc.ok ? '通过' : '异常', variant: qc.ok ? 'success' : 'warning' }],
+                                      content: [
+                                        qc.fullMessage ?? qc.summary ?? '',
+                                        qc.data !== undefined ? JSON.stringify(qc.data, null, 2) : '',
+                                      ].filter(Boolean).join('\n\n'),
+                                      mode: 'code',
+                                    })
+                                  }
+                                />
+                              )}
+                            </div>
+                          )}
+                          <div className="flex flex-wrap items-center justify-between gap-1.5 pt-0.5">
+                            <span className="font-mono text-[10px] text-muted-foreground">{p.actions.length} 个动作</span>
+                            <div className="flex flex-wrap gap-1">
+                              {p.enabled !== false && (
+                                <Button size="xs" variant="ghost" disabled={qc?.busy} onClick={() => void runQuickCheck(p)}>
+                                  <ActivityIcon className="size-3" />
+                                  <span>{qc?.busy ? '自检中…' : '快速自检'}</span>
+                                </Button>
+                              )}
+                              <Button size="xs" variant="outline" onClick={() => openDetail(p, 'overview')}>详情</Button>
+                              {hasSurface && (
+                                <Button size="xs" onClick={() => setPluginSurface(p.name)}>打开面板</Button>
+                              )}
+                            </div>
                           </div>
-                        )}
-                        <div className="flex flex-wrap items-center justify-between gap-1.5 pt-0.5">
-                          <span className="font-mono text-[10px] text-muted-foreground">{p.actions.length} 个动作</span>
-                          <div className="flex flex-wrap gap-1">
-                            {p.enabled !== false && (
-                              <Button size="xs" variant="ghost" disabled={qc?.busy} onClick={() => void runQuickCheck(p)}>
-                                <ActivityIcon className="size-3" />
-                                <span>{qc?.busy ? '自检中…' : '快速自检'}</span>
-                              </Button>
-                            )}
-                            <Button size="xs" variant="outline" onClick={() => openDetail(p, 'overview')}>详情</Button>
-                            {hasSurface && (
-                              <Button size="xs" onClick={() => setPluginSurface(p.name)}>打开面板</Button>
-                            )}
-                          </div>
-                        </div>
-                      </CardContent>
-                    </Card>
-                  );
-                })}
-              </div>
-            )}
+                        </CardContent>
+                      </Card>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
           </div>
         )}
       </div>

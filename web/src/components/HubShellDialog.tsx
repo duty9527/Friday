@@ -72,9 +72,12 @@ export function HubShellDialog() {
               <span>应用与插件</span>
             </DialogTitle>
           </DialogHeader>
-          <DialogPanel>
+          <div
+            data-slot="dialog-panel"
+            className="flex min-h-0 flex-1 flex-col overflow-hidden px-6 pb-6 pt-1 max-sm:px-4 max-sm:pb-4"
+          >
             <PluginHub />
-          </DialogPanel>
+          </div>
         </DialogPopup>
       </Dialog>
 
