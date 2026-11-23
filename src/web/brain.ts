@@ -739,6 +739,13 @@ export class GoldenBrainStage {
     this.pauseRaf();
   }
 
+  resize() {
+    this.syncCanvasSize();
+    if (!this.rafId && this.running) {
+      this.renderFrame(0);
+    }
+  }
+
   dispose() {
     this.stop();
     this.abortController?.abort();
@@ -754,11 +761,26 @@ export class GoldenBrainStage {
   }
 
   private syncCanvasSize() {
-    const rect = typeof this.canvas.getBoundingClientRect === 'function'
-      ? this.canvas.getBoundingClientRect()
-      : { width: 620, height: 412 };
-    const w = Math.max(260, Math.round(rect.width || 620));
-    const h = Math.max(240, Math.round(rect.height || 412));
+    const hasDOMRect = typeof this.canvas.getBoundingClientRect === 'function';
+    const cw = this.canvas.clientWidth ?? 0;
+    const ch = this.canvas.clientHeight ?? 0;
+    let rawW = cw;
+    let rawH = ch;
+    if (rawW <= 0 || rawH <= 0) {
+      if (hasDOMRect) {
+        const rect = this.canvas.getBoundingClientRect();
+        rawW = rect.width;
+        rawH = rect.height;
+      } else {
+        rawW = 620;
+        rawH = 412;
+      }
+    }
+    if (hasDOMRect && (rawW <= 0 || rawH <= 0)) {
+      return;
+    }
+    const w = Math.max(120, Math.round(rawW));
+    const h = Math.max(120, Math.round(rawH));
     this.cssWidth = w;
     this.cssHeight = h;
     const dpr = typeof window !== 'undefined' ? Math.min(2, window.devicePixelRatio || 1) : 1;
@@ -1812,7 +1834,9 @@ export class GoldenBrainStage {
     ctx.font = '10.5px "IBM Plex Mono", monospace';
     ctx.fillStyle = 'rgba(251, 191, 36, 0.68)';
     ctx.fillText('J.A.R.V.I.S. / F.R.I.D.A.Y. // AMBER MATRIX', 14, 20);
-    const statLine = `NEURONS ${this.graph.nodes.length}  ·  SYNAPSES ${this.graph.edges.length}  ·  CORE LOCKED`;
+    const statLine = w < 430
+      ? `NEURONS ${this.graph.nodes.length} · SYNAPSES ${this.graph.edges.length}`
+      : `NEURONS ${this.graph.nodes.length}  ·  SYNAPSES ${this.graph.edges.length}  ·  CORE LOCKED`;
     ctx.fillStyle = 'rgba(245, 158, 11, 0.56)';
     ctx.fillText(statLine, 14, h - 13);
     ctx.restore();
@@ -1820,8 +1844,9 @@ export class GoldenBrainStage {
 
   private hitTest(clientX: number, clientY: number): BrainNode | undefined {
     const rect = this.canvas.getBoundingClientRect();
-    const x = clientX - rect.left;
-    const y = clientY - rect.top;
+    if (rect.width <= 0 || rect.height <= 0) return undefined;
+    const x = (clientX - rect.left) * (this.cssWidth / rect.width);
+    const y = (clientY - rect.top) * (this.cssHeight / rect.height);
     let best: { node: BrainNode; dist: number; z: number } | undefined;
     for (const entry of this.projectedNodes.values()) {
       const hitR = Math.max(12, entry.radius * 3.2);
@@ -1919,6 +1944,7 @@ export class GoldenBrainStage {
           if (!this.onScreen) {
             this.pauseRaf();
           } else {
+            this.syncCanvasSize();
             if (!this.rafId && this.running) this.renderFrame(0);
             this.wakeAnimation();
           }

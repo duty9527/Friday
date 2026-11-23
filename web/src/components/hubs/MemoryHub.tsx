@@ -3,7 +3,6 @@ import type {
   DiaryEntry,
   DiaryMood,
   MemoryCard,
-  MemoryDirectoryItem,
   NoteItem,
   NoteTagCount,
   NotebookSummaryView,
@@ -11,7 +10,7 @@ import type {
 import { GoldenBrainStage, type BrainMemoryItem } from '@friday/web/brain.js';
 import { ApiError } from '@friday/web/shared/auth-http.js';
 import { BOT_EXPRESSION_META, normalizeBotExpression } from '@friday/web/shared/bot-expressions.js';
-import { errorText, timestamp } from '@friday/web/shared/format.js';
+import { errorText, synapseRelationNames, timestamp } from '@friday/web/shared/format.js';
 import {
   BrainIcon,
   EyeIcon,
@@ -32,12 +31,10 @@ import { ConfirmActionDialog } from '@/components/shared/ConfirmActionDialog';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Card } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
 import { Tabs, TabsList, TabsPanel, TabsTab } from '@/components/ui/tabs';
-import { Textarea } from '@/components/ui/textarea';
 import { useFriday } from '@/lib/friday-store';
 import { cn } from '@/lib/utils';
 
@@ -59,13 +56,21 @@ function safeDiaryMood(raw: string | undefined): DiaryMood {
   return normalizeBotExpression(raw) ?? 'neutral';
 }
 
-function MemoryMatrixPanel() {
+const SELECT_SM_CLASS =
+  'h-8 sm:h-7 rounded-lg border border-input bg-background px-2.5 text-xs text-foreground shadow-xs/5 outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/24 disabled:opacity-64 dark:bg-input/32';
+
+const EDITOR_TEXTAREA_CLASS =
+  'block size-full resize-none overflow-y-auto rounded-lg border border-input bg-background px-3 py-2.5 font-mono text-sm leading-relaxed text-foreground shadow-xs/5 outline-none placeholder:text-muted-foreground/72 focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/24 disabled:opacity-64 dark:bg-input/32';
+
+const BRAIN_STAGE_BTN_CLASS =
+  'inline-flex h-6 cursor-pointer items-center gap-1 rounded-md border border-amber-400/25 bg-neutral-950/80 px-2 text-[11px] font-medium text-amber-100 backdrop-blur-sm transition-colors hover:border-amber-400/50 hover:bg-neutral-900 hover:text-amber-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/60';
+
+function MemoryMatrixPanel({ active }: { active: boolean }) {
   const { view, ready, authExpired, api, refreshView, selectTrace, setActiveHub, setMobilePanel, jumpMessage } = useFriday();
-  const directoryItems = view?.memoryDirectory?.items ?? [];
 
   const [fullMemories, setFullMemories] = useState<MemoryCard[] | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
-  const [searchScope, setSearchScope] = useState<'all' | 'memory' | 'work' | 'message'>('all');
+  const [searchScope, setSearchScope] = useState<'all' | 'memories' | 'works' | 'messages'>('all');
   const [searchHits, setSearchHits] = useState<ContextSearchHit[] | null>(null);
   const [selectedMemId, setSelectedMemId] = useState<string | undefined>(undefined);
   const [filterMode, setFilterMode] = useState<'all' | 'pinned'>('all');
@@ -84,14 +89,25 @@ function MemoryMatrixPanel() {
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const brainRef = useRef<GoldenBrainStage | null>(null);
+  const lastBrainSigRef = useRef('');
+  const memFetchSeqRef = useRef(0);
   const searchSeqRef = useRef(0);
   const searchAbortRef = useRef<AbortController | null>(null);
 
+  const directorySig = useMemo(() => {
+    const dir = view?.memoryDirectory;
+    if (!dir) return 'empty';
+    return `${dir.totalActive}:${dir.items.map(i => `${i.id}:${i.updatedAt}:${i.pinned ? 1 : 0}:${i.synapses?.length ?? 0}`).join(',')}`;
+  }, [view?.memoryDirectory]);
+
   const loadMemories = useCallback(async () => {
     if (!ready || authExpired) return;
+    const seq = ++memFetchSeqRef.current;
     try {
       const list = await api<MemoryCard[]>('/api/memories', undefined, { priority: 'low' });
-      if (Array.isArray(list)) setFullMemories(list);
+      if (seq === memFetchSeqRef.current && Array.isArray(list)) {
+        setFullMemories(list);
+      }
     } catch {
       // Fallback to directoryItems
     }
@@ -99,20 +115,55 @@ function MemoryMatrixPanel() {
 
   useEffect(() => {
     void loadMemories();
-  }, [loadMemories]);
+  }, [loadMemories, directorySig]);
 
-  const items: BrainMemoryItem[] = useMemo(() => {
-    const base: BrainMemoryItem[] = fullMemories ?? directoryItems;
-    return filterMode === 'pinned' ? base.filter(m => m.pinned) : base;
-  }, [directoryItems, filterMode, fullMemories]);
+  const allItems: BrainMemoryItem[] = useMemo(
+    () => fullMemories ?? view?.memoryDirectory?.items ?? [],
+    [fullMemories, view?.memoryDirectory?.items],
+  );
 
-  const matchedMemoryIds = useMemo(() => {
-    if (!searchHits) return undefined;
-    return searchHits
-      .filter(h => h.kind === 'memory')
-      .map(h => h.memoryId ?? h.id)
-      .filter(Boolean);
-  }, [searchHits]);
+  const allItemsById = useMemo(
+    () => new Map(allItems.map(m => [m.id, m])),
+    [allItems],
+  );
+
+  const visibleItems = useMemo(
+    () => (filterMode === 'pinned' ? allItems.filter(m => m.pinned) : allItems),
+    [allItems, filterMode],
+  );
+
+  const stats = useMemo(() => {
+    let pinnedCount = 0;
+    let synapseTotal = 0;
+    for (const m of allItems) {
+      if (m.pinned) pinnedCount += 1;
+      synapseTotal += m.synapses?.length ?? 0;
+    }
+    return { pinnedCount, synapseTotal };
+  }, [allItems]);
+
+  const highlightedIds = useMemo(() => {
+    if (searchHits) {
+      return searchHits
+        .filter(h => h.kind === 'memory')
+        .map(h => h.memoryId ?? h.id)
+        .filter(Boolean);
+    }
+    if (filterMode === 'pinned') {
+      return visibleItems.map(m => m.id);
+    }
+    return undefined;
+  }, [filterMode, searchHits, visibleItems]);
+
+  const filterActive = Boolean(searchHits) || filterMode === 'pinned';
+
+  const brainDataSig = useMemo(() => {
+    const itemSig = allItems
+      .map(m => `${m.id}:${m.updatedAt}:${m.pinned ? 1 : 0}:${m.synapses?.length ?? 0}`)
+      .join('|');
+    const hlSig = highlightedIds ? highlightedIds.join(',') : '';
+    return `${fullMemories ? 'full' : 'dir'}|${itemSig}|hl:${hlSig}|f:${filterActive ? 1 : 0}`;
+  }, [allItems, filterActive, fullMemories, highlightedIds]);
 
   // Mount and clean up 3D GoldenBrainStage canvas
   useEffect(() => {
@@ -124,16 +175,41 @@ function MemoryMatrixPanel() {
       },
     });
     brainRef.current = stage;
+    lastBrainSigRef.current = '';
+    setAutoRotate(stage.isAutoRotating());
     stage.start();
     return () => {
       stage.dispose();
       brainRef.current = null;
+      lastBrainSigRef.current = '';
     };
   }, []);
 
+  // Re-measure canvas after switching back to Matrix tab
   useEffect(() => {
-    brainRef.current?.setData(items, matchedMemoryIds, Boolean(searchHits));
-  }, [items, matchedMemoryIds, searchHits]);
+    if (!active) return;
+    const raf = requestAnimationFrame(() => {
+      brainRef.current?.resize();
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [active]);
+
+  useEffect(() => {
+    if (lastBrainSigRef.current === brainDataSig) return;
+    lastBrainSigRef.current = brainDataSig;
+    brainRef.current?.setData(allItems, highlightedIds, filterActive);
+  }, [allItems, brainDataSig, filterActive, highlightedIds]);
+
+  const focusItem = useCallback((id: string) => {
+    const target = allItemsById.get(id);
+    if (filterMode === 'pinned' && target && !target.pinned) {
+      setFilterMode('all');
+    }
+    setSelectedMemId(id);
+    setShowForm(false);
+    setLinkTargetId('');
+    brainRef.current?.focusMemory(id, true);
+  }, [allItemsById, filterMode]);
 
   const runSearch = async () => {
     const q = searchQuery.trim();
@@ -159,7 +235,10 @@ function MemoryMatrixPanel() {
       const hits = Array.isArray(res) ? res : (res.hits ?? []);
       setSearchHits(hits);
       const firstId = hits.find(h => h.kind === 'memory')?.memoryId ?? hits.find(h => h.kind === 'memory')?.id;
-      if (firstId) brainRef.current?.focusMemory(firstId, true);
+      if (firstId) {
+        setSelectedMemId(firstId);
+        brainRef.current?.focusMemory(firstId, true);
+      }
     } catch (e) {
       if (seq === searchSeqRef.current && !(e instanceof Error && e.name === 'AbortError')) {
         setErrMsg(`检索失败：${errorText(e)}`);
@@ -168,9 +247,13 @@ function MemoryMatrixPanel() {
   };
 
   const selectedItem = useMemo(
-    () => items.find(m => m.id === selectedMemId) ?? items[0],
-    [items, selectedMemId],
+    () => (selectedMemId ? allItemsById.get(selectedMemId) : undefined) ?? visibleItems[0] ?? allItems[0],
+    [allItems, allItemsById, selectedMemId, visibleItems],
   );
+
+  useEffect(() => {
+    setLinkTargetId('');
+  }, [selectedItem?.id]);
 
   const openEdit = (item: BrainMemoryItem) => {
     setEditingId(item.id);
@@ -190,7 +273,7 @@ function MemoryMatrixPanel() {
     setErrMsg('');
     try {
       const tags = tagsText.split(/[,，\s]+/).map(t => t.trim()).filter(Boolean);
-      await api<MemoryCard>('/api/memory-save', {
+      const saved = await api<MemoryCard>('/api/memory-save', {
         ...(editingId ? { id: editingId } : {}),
         topic: topic.trim(),
         content: content.trim(),
@@ -203,6 +286,7 @@ function MemoryMatrixPanel() {
       setContent('');
       setTagsText('');
       setPinned(false);
+      if (saved?.id) setSelectedMemId(saved.id);
       await Promise.all([refreshView(), loadMemories()]);
     } catch (e) {
       setErrMsg(errorText(e));
@@ -214,10 +298,10 @@ function MemoryMatrixPanel() {
   const disabled = !ready || authExpired || busy;
 
   return (
-    <div className="space-y-3">
-      {/* Search Bar */}
-      <div className="flex flex-wrap items-center gap-2">
-        <div className="relative min-w-48 flex-1">
+    <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden">
+      {/* Aligned Search & Action Bar */}
+      <div className="flex shrink-0 flex-wrap items-center gap-2">
+        <div className="min-w-48 flex-1">
           <Input
             id="memory-search-input"
             size="sm"
@@ -242,31 +326,32 @@ function MemoryMatrixPanel() {
           />
         </div>
         <select
+          aria-label="检索维度"
           value={searchScope}
           disabled={disabled}
           onChange={e => setSearchScope(e.target.value as typeof searchScope)}
-          className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+          className={SELECT_SM_CLASS}
         >
           <option value="all">全部维度</option>
-          <option value="memory">仅语义记忆</option>
-          <option value="work">历史工作</option>
-          <option value="message">历史对话</option>
+          <option value="memories">仅语义记忆</option>
+          <option value="works">历史工作</option>
+          <option value="messages">历史对话</option>
         </select>
-        <Button size="xs" variant="outline" disabled={disabled} onClick={() => void runSearch()}>
+        <Button size="sm" variant="outline" disabled={disabled} onClick={() => void runSearch()}>
           <SearchIcon className="size-3.5" />
           <span>检索</span>
         </Button>
         <Button
-          size="xs"
+          size="sm"
           variant={filterMode === 'pinned' ? 'secondary' : 'outline'}
           onClick={() => setFilterMode(prev => (prev === 'all' ? 'pinned' : 'all'))}
         >
-          <PinIcon className="size-3" />
+          <PinIcon className="size-3.5" />
           <span>仅置顶</span>
         </Button>
         <Button
-          size="xs"
-          variant="default"
+          size="sm"
+          variant={showForm ? 'secondary' : 'default'}
           disabled={disabled}
           onClick={() => {
             setEditingId(null);
@@ -283,209 +368,293 @@ function MemoryMatrixPanel() {
       </div>
 
       {errMsg && (
-        <Alert variant="error">
+        <Alert variant="error" className="shrink-0">
           <AlertDescription className="text-xs">{errMsg}</AlertDescription>
         </Alert>
       )}
 
-      {/* Search Hits */}
+      {/* Bounded Search Hits */}
       {searchHits && (
-        <Card className="p-3 space-y-2 text-xs">
-          <div className="flex items-center justify-between">
-            <span className="font-semibold">联想检索命中 {searchHits.length} 条</span>
+        <Card className="flex max-h-36 shrink-0 flex-col overflow-hidden text-xs">
+          <div className="flex shrink-0 items-center justify-between border-b px-3 py-1.5">
+            <span className="font-semibold text-foreground">联想检索命中 {searchHits.length} 条</span>
             <Button size="xs" variant="ghost" onClick={() => { setSearchQuery(''); setSearchHits(null); }}>
               清空结果
             </Button>
           </div>
-          {searchHits.length === 0 ? (
-            <p className="text-muted-foreground">未命中相关条目。</p>
-          ) : (
-            <div className="grid gap-1.5 sm:grid-cols-2">
-              {searchHits.slice(0, 8).map(hit => (
-                <button
-                  key={`${hit.kind}-${hit.id}`}
-                  type="button"
-                  onClick={() => {
-                    if (hit.kind === 'memory') {
-                      const memId = hit.memoryId ?? hit.id;
-                      setSelectedMemId(memId);
-                      brainRef.current?.focusMemory(memId, true);
-                    } else if (hit.kind === 'work' && hit.taskId) {
-                      selectTrace({ type: 'task', id: hit.taskId, label: hit.title }, true);
-                      setMobilePanel('trace');
-                      setActiveHub(null);
-                    } else if (hit.kind === 'message' && hit.messageId) {
-                      setActiveHub(null);
-                      void jumpMessage(hit.messageId);
-                    }
-                  }}
-                  className="flex flex-col items-start gap-0.5 rounded-lg border bg-background p-2 text-start hover:bg-accent cursor-pointer"
-                >
-                  <div className="flex items-center gap-1.5 font-medium text-foreground">
-                    <Badge size="sm" variant="outline">{hit.kind}</Badge>
-                    <span className="truncate">{hit.title}</span>
-                  </div>
-                  <p className="line-clamp-2 text-muted-foreground">{hit.snippet}</p>
-                </button>
-              ))}
-            </div>
-          )}
-        </Card>
-      )}
-
-      {/* Create/Edit Memory Form */}
-      {showForm && (
-        <Card className="p-3 space-y-2 text-xs">
-          <div className="font-semibold">{editingId ? '编辑记忆卡片' : '写入新记忆'}</div>
-          <Input size="sm" placeholder="主题（如：项目构建规范）" value={topic} onChange={e => setTopic(e.target.value)} />
-          <Textarea size="sm" rows={3} placeholder="记忆详情内容…" value={content} onChange={e => setContent(e.target.value)} />
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <Input size="sm" className="max-w-xs" placeholder="标签（逗号分隔）" value={tagsText} onChange={e => setTagsText(e.target.value)} />
-            <label className="flex items-center gap-1.5 cursor-pointer">
-              <Checkbox checked={pinned} onCheckedChange={v => setPinned(Boolean(v))} />
-              <span>置顶（免艾宾浩斯遗忘衰减）</span>
-            </label>
-          </div>
-          <div className="flex justify-end gap-2">
-            <Button size="xs" variant="ghost" onClick={() => setShowForm(false)}>取消</Button>
-            <Button size="xs" disabled={disabled} onClick={() => void saveMemory()}>保存记忆</Button>
+          <div className="min-h-0 flex-1 overflow-y-auto p-2">
+            {searchHits.length === 0 ? (
+              <p className="py-2 text-center text-muted-foreground">未命中相关条目。</p>
+            ) : (
+              <div className="grid gap-1.5 sm:grid-cols-2">
+                {searchHits.slice(0, 8).map(hit => (
+                  <button
+                    key={`${hit.kind}-${hit.id}`}
+                    type="button"
+                    onClick={() => {
+                      if (hit.kind === 'memory') {
+                        focusItem(hit.memoryId ?? hit.id);
+                      } else if (hit.kind === 'work' && hit.taskId) {
+                        selectTrace({ type: 'task', id: hit.taskId, label: hit.title }, true);
+                        setMobilePanel('trace');
+                        setActiveHub(null);
+                      } else if (hit.kind === 'message' && hit.messageId) {
+                        setActiveHub(null);
+                        void jumpMessage(hit.messageId);
+                      }
+                    }}
+                    className="flex cursor-pointer flex-col items-start gap-0.5 rounded-lg border bg-background p-2 text-start hover:bg-accent"
+                  >
+                    <div className="flex w-full items-center gap-1.5 font-medium text-foreground">
+                      <Badge size="sm" variant="outline">{hit.kind}</Badge>
+                      <span className="truncate">{hit.title}</span>
+                    </div>
+                    <p className="line-clamp-2 text-muted-foreground">{hit.snippet}</p>
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         </Card>
       )}
 
-      {/* 3D Brain Stage + Selected Inspector */}
-      <div className="grid gap-3 lg:grid-cols-[1.2fr_1fr]">
-        <div className="space-y-2">
-          <div className="relative overflow-hidden rounded-xl border bg-neutral-950">
-            <canvas ref={canvasRef} className="block h-72 w-full cursor-grab active:cursor-grabbing" />
-            <div className="absolute bottom-2 end-2 flex gap-1">
-              <Button
-                size="xs"
-                variant="secondary"
+      {/* Strictly Aligned Two-Column Stage & Directory */}
+      <div className="grid min-h-0 flex-1 gap-3 overflow-hidden max-lg:flex max-lg:flex-col lg:grid-cols-[minmax(0,1.25fr)_minmax(0,1fr)]">
+        {/* Left Column: 3D Brain Canvas + Selected Memory Inspector */}
+        <div className="flex min-h-0 flex-col gap-3 overflow-hidden max-lg:flex-1">
+          <div className="relative h-44 shrink-0 overflow-hidden rounded-xl border bg-black sm:h-56 lg:h-64">
+            <canvas
+              ref={canvasRef}
+              className="block size-full cursor-grab active:cursor-grabbing"
+              aria-label="F.R.I.D.A.Y. 金色全息记忆球体"
+            />
+            <div className="absolute bottom-2.5 end-2.5 flex items-center gap-1.5">
+              <button
+                type="button"
+                className={BRAIN_STAGE_BTN_CLASS}
                 onClick={() => {
                   const next = !autoRotate;
-                  setAutoRotate(next);
-                  brainRef.current?.setAutoRotate(next);
+                  const applied = brainRef.current?.setAutoRotate(next) ?? next;
+                  setAutoRotate(applied);
                 }}
               >
                 {autoRotate ? '暂停旋转' : '自动旋转'}
-              </Button>
-              <Button size="xs" variant="secondary" onClick={() => brainRef.current?.resetView()}>
+              </button>
+              <button
+                type="button"
+                className={BRAIN_STAGE_BTN_CLASS}
+                onClick={() => {
+                  brainRef.current?.resetView();
+                  setAutoRotate(brainRef.current?.isAutoRotating() ?? true);
+                }}
+              >
                 <RotateCcwIcon className="size-3" />
                 <span>重置视角</span>
-              </Button>
+              </button>
             </div>
           </div>
 
-          {selectedItem && (
-            <Card className="p-3 text-xs space-y-2">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="flex items-center gap-1.5 font-semibold text-foreground">
-                  <BrainIcon className="size-3.5 text-amber-500" />
-                  <span>{selectedItem.topic}</span>
-                  {selectedItem.pinned && <Badge size="sm" variant="warning">置顶</Badge>}
-                </div>
-                <div className="flex items-center gap-1">
-                  <Button
-                    size="xs"
-                    variant="ghost"
-                    disabled={disabled}
-                    onClick={async () => {
-                      await api('/api/memory-pin', { id: selectedItem.id, pinned: !selectedItem.pinned });
-                      await Promise.all([refreshView(), loadMemories()]);
-                    }}
-                  >
-                    <PinIcon className="size-3" />
-                    <span>{selectedItem.pinned ? '取消置顶' : '置顶'}</span>
-                  </Button>
-                  <Button size="xs" variant="ghost" disabled={disabled} onClick={() => openEdit(selectedItem)}>
-                    <PencilIcon className="size-3" />
-                  </Button>
-                  <Button size="xs" variant="ghost" disabled={disabled} onClick={() => setDeleteTarget(selectedItem)}>
-                    <Trash2Icon className="size-3 text-destructive-foreground" />
-                  </Button>
-                </div>
+          <Card className="flex min-h-0 flex-1 flex-col overflow-hidden text-xs">
+            {!selectedItem ? (
+              <div className="flex flex-1 flex-col items-center justify-center gap-1 p-4 text-center text-muted-foreground">
+                <BrainIcon className="size-5 text-amber-500/70" />
+                <span>选择神经元节点或右侧目录条目查看记忆详情</span>
               </div>
-              <p className="whitespace-pre-wrap text-muted-foreground">
-                {'content' in selectedItem ? selectedItem.content : selectedItem.preview}
-              </p>
-              {selectedItem.synapses && selectedItem.synapses.length > 0 && (
-                <div className="flex flex-wrap gap-1 pt-1">
-                  {selectedItem.synapses.map(syn => (
+            ) : (
+              <>
+                <div className="flex shrink-0 items-center justify-between gap-2 border-b px-3.5 py-2.5">
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    <BrainIcon className="size-3.5 shrink-0 text-amber-500" />
+                    <span className="truncate text-sm font-semibold text-foreground">{selectedItem.topic}</span>
+                    {selectedItem.pinned && <Badge size="sm" variant="warning" className="shrink-0">置顶</Badge>}
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1">
                     <Button
-                      key={syn.targetId}
                       size="xs"
-                      variant="outline"
-                      onClick={() => {
-                        setSelectedMemId(syn.targetId);
-                        brainRef.current?.focusMemory(syn.targetId, true);
+                      variant="ghost"
+                      disabled={disabled}
+                      onClick={async () => {
+                        await api('/api/memory-pin', { id: selectedItem.id, pinned: !selectedItem.pinned });
+                        await Promise.all([refreshView(), loadMemories()]);
                       }}
                     >
-                      <Link2Icon className="size-3" />
-                      <span>{syn.targetTopic ?? syn.targetId} ({syn.weight.toFixed(2)})</span>
+                      <PinIcon className="size-3" />
+                      <span>{selectedItem.pinned ? '取消置顶' : '置顶'}</span>
                     </Button>
-                  ))}
+                    <Button
+                      size="xs"
+                      variant="ghost"
+                      aria-label="编辑记忆"
+                      disabled={disabled}
+                      onClick={() => openEdit(selectedItem)}
+                    >
+                      <PencilIcon className="size-3" />
+                    </Button>
+                    <Button
+                      size="xs"
+                      variant="ghost"
+                      aria-label="遗忘记忆"
+                      disabled={disabled}
+                      onClick={() => setDeleteTarget(selectedItem)}
+                    >
+                      <Trash2Icon className="size-3 text-destructive-foreground" />
+                    </Button>
+                  </div>
                 </div>
-              )}
-              {items.length > 1 && (
-                <div className="flex items-center gap-1.5 border-t pt-2">
-                  <select
-                    value={linkTargetId}
-                    onChange={e => setLinkTargetId(e.target.value)}
-                    className="h-7 flex-1 rounded border border-input bg-background px-2 text-xs"
-                  >
-                    <option value="">选择另一条记忆建立突触关联…</option>
-                    {items.filter(m => m.id !== selectedItem.id).map(m => (
-                      <option key={m.id} value={m.id}>{m.topic}</option>
-                    ))}
-                  </select>
-                  <Button
-                    size="xs"
-                    variant="secondary"
-                    disabled={!linkTargetId || disabled}
-                    onClick={async () => {
-                      await api('/api/memory-link', { sourceId: selectedItem.id, targetId: linkTargetId });
-                      setLinkTargetId('');
-                      await Promise.all([refreshView(), loadMemories()]);
-                    }}
-                  >
-                    连接突触
-                  </Button>
+
+                <div className="min-h-0 flex-1 space-y-2.5 overflow-y-auto px-3.5 py-2.5">
+                  <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground/90">
+                    {'content' in selectedItem ? selectedItem.content : selectedItem.preview}
+                  </p>
+
+                  {(selectedItem.tags.length > 0 || selectedItem.updatedAt) && (
+                    <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+                      {selectedItem.tags.map(tag => (
+                        <Badge key={tag} size="sm" variant="secondary">{tag}</Badge>
+                      ))}
+                      <span>提取 {selectedItem.accessCount ?? 0} 次 · 更新于 {timestamp(selectedItem.updatedAt)}</span>
+                    </div>
+                  )}
+
+                  {selectedItem.synapses && selectedItem.synapses.length > 0 && (
+                    <div className="space-y-1.5 border-t pt-2">
+                      <div className="text-[11px] font-medium text-muted-foreground">
+                        突触关联 ({selectedItem.synapses.length})
+                      </div>
+                      <div className="flex flex-wrap gap-1">
+                        {selectedItem.synapses.map(syn => {
+                          const targetTopic = syn.targetTopic ?? allItemsById.get(syn.targetId)?.topic ?? syn.targetId;
+                          const relLabel = synapseRelationNames[syn.relation] ?? syn.relation;
+                          return (
+                            <Button
+                              key={`${syn.targetId}-${syn.relation}`}
+                              size="xs"
+                              variant="outline"
+                              title={`${targetTopic} · ${relLabel} (${syn.weight.toFixed(2)})`}
+                              onClick={() => focusItem(syn.targetId)}
+                            >
+                              <Link2Icon className="size-3" />
+                              <span className="max-w-44 truncate">{targetTopic}</span>
+                              <span className="font-mono text-[10px] text-muted-foreground">({syn.weight.toFixed(2)})</span>
+                            </Button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
                 </div>
-              )}
-            </Card>
-          )}
+
+                {allItems.length > 1 && (
+                  <div className="flex shrink-0 items-center gap-1.5 border-t bg-muted/20 px-3.5 py-2">
+                    <select
+                      aria-label="选择目标记忆"
+                      value={linkTargetId}
+                      onChange={e => setLinkTargetId(e.target.value)}
+                      className="h-7 min-w-0 flex-1 rounded-md border border-input bg-background px-2 text-xs text-foreground outline-none focus-visible:border-ring dark:bg-input/32"
+                    >
+                      <option value="">选择另一条记忆建立突触关联…</option>
+                      {allItems.filter(m => m.id !== selectedItem.id).map(m => (
+                        <option key={m.id} value={m.id}>{m.topic}</option>
+                      ))}
+                    </select>
+                    <Button
+                      size="xs"
+                      variant="secondary"
+                      disabled={!linkTargetId || disabled}
+                      onClick={async () => {
+                        await api('/api/memory-link', { id: selectedItem.id, targetId: linkTargetId });
+                        setLinkTargetId('');
+                        await Promise.all([refreshView(), loadMemories()]);
+                      }}
+                    >
+                      连接突触
+                    </Button>
+                  </div>
+                )}
+              </>
+            )}
+          </Card>
         </div>
 
-        {/* Memory Cards List */}
-        <div className="max-h-112 space-y-1.5 overflow-y-auto pe-1">
-          {items.length === 0 ? (
-            <p className="py-10 text-center text-xs text-muted-foreground">暂无记忆条目。</p>
+        {/* Right Column: Aligned Memory Directory or Create/Edit Form */}
+        <Card className="flex min-h-0 flex-col overflow-hidden text-xs max-lg:h-36 max-lg:shrink-0">
+          {showForm ? (
+            <>
+              <div className="flex shrink-0 items-center justify-between gap-2 border-b px-3.5 py-2.5">
+                <span className="font-semibold text-foreground">{editingId ? '编辑记忆卡片' : '写入新记忆'}</span>
+                <Button size="xs" variant="ghost" onClick={() => setShowForm(false)}>返回目录</Button>
+              </div>
+              <div className="min-h-0 flex-1 space-y-2.5 overflow-y-auto p-3.5">
+                <Input size="sm" placeholder="主题（如：项目构建规范）" value={topic} onChange={e => setTopic(e.target.value)} />
+                <textarea
+                  aria-label="记忆详情内容"
+                  placeholder="记忆详情内容…"
+                  value={content}
+                  onChange={e => setContent(e.target.value)}
+                  className="block min-h-36 w-full resize-y rounded-lg border border-input bg-background px-3 py-2 text-sm leading-relaxed text-foreground shadow-xs/5 outline-none placeholder:text-muted-foreground/72 focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/24 dark:bg-input/32"
+                />
+                <Input size="sm" placeholder="标签（逗号分隔）" value={tagsText} onChange={e => setTagsText(e.target.value)} />
+                <label className="flex cursor-pointer items-center gap-1.5 text-muted-foreground">
+                  <Checkbox checked={pinned} onCheckedChange={v => setPinned(Boolean(v))} />
+                  <span>置顶（免艾宾浩斯遗忘衰减）</span>
+                </label>
+              </div>
+              <div className="flex shrink-0 items-center justify-end gap-2 border-t bg-muted/20 px-3.5 py-2.5">
+                <Button size="xs" variant="ghost" onClick={() => setShowForm(false)}>取消</Button>
+                <Button size="xs" disabled={disabled} onClick={() => void saveMemory()}>保存记忆</Button>
+              </div>
+            </>
           ) : (
-            items.map(item => (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => {
-                  setSelectedMemId(item.id);
-                  brainRef.current?.focusMemory(item.id, true);
-                }}
-                className={cn(
-                  'w-full cursor-pointer rounded-lg border p-2.5 text-start text-xs transition-colors',
-                  selectedItem?.id === item.id ? 'border-ring bg-accent' : 'bg-card hover:bg-accent/50',
-                )}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="font-medium text-foreground truncate">{item.topic}</span>
-                  {item.pinned && <Badge size="sm" variant="warning">置顶</Badge>}
+            <>
+              <div className="flex shrink-0 items-center justify-between gap-2 border-b px-3.5 py-2.5">
+                <div className="flex items-center gap-1.5">
+                  <span className="font-semibold text-foreground">记忆目录</span>
+                  <Badge size="sm" variant="secondary">
+                    {filterMode === 'pinned' ? `${visibleItems.length} / ${allItems.length}` : visibleItems.length}
+                  </Badge>
                 </div>
-                <p className="mt-1 line-clamp-2 text-muted-foreground">
-                  {'content' in item ? item.content : item.preview}
-                </p>
-              </button>
-            ))
+                <span className="text-[11px] text-muted-foreground">
+                  置顶 {stats.pinnedCount} · 突触 {stats.synapseTotal}
+                </span>
+              </div>
+              <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto p-2.5">
+                {visibleItems.length === 0 ? (
+                  <div className="flex h-full items-center justify-center py-8 text-center text-muted-foreground">
+                    {filterMode === 'pinned' && allItems.length > 0 ? '暂无置顶记忆。' : '暂无记忆条目。'}
+                  </div>
+                ) : (
+                  visibleItems.map(item => (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => focusItem(item.id)}
+                      className={cn(
+                        'w-full cursor-pointer rounded-lg border p-2.5 text-start text-xs transition-colors',
+                        selectedItem?.id === item.id ? 'border-ring bg-accent' : 'bg-card hover:bg-accent/50',
+                      )}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="truncate font-medium text-foreground">{item.topic}</span>
+                        {item.pinned && <Badge size="sm" variant="warning" className="shrink-0">置顶</Badge>}
+                      </div>
+                      <p className="mt-1 line-clamp-2 text-muted-foreground">
+                        {'content' in item ? item.content : item.preview}
+                      </p>
+                      {(item.tags.length > 0 || (item.synapses?.length ?? 0) > 0) && (
+                        <div className="mt-1.5 flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
+                          <span className="truncate">{item.tags.slice(0, 3).join(' · ')}</span>
+                          {(item.synapses?.length ?? 0) > 0 && (
+                            <span className="shrink-0 font-mono">突触 {item.synapses?.length ?? 0}</span>
+                          )}
+                        </div>
+                      )}
+                    </button>
+                  ))
+                )}
+              </div>
+            </>
           )}
-        </div>
+        </Card>
       </div>
 
       <ConfirmActionDialog
@@ -526,7 +695,7 @@ function NotesPanel() {
   const [tagsDraft, setTagsDraft] = useState('');
   const [baseUpdatedAt, setBaseUpdatedAt] = useState<number | undefined>(undefined);
   const [dirty, setDirty] = useState(false);
-  const [previewMode, setPreviewMode] = useState(false);
+  const [previewMode, setPreviewMode] = useState(true);
   const [saveStatus, setSaveStatus] = useState('');
   const [conflictNote, setConflictNote] = useState<NoteItem | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<NoteItem | null>(null);
@@ -629,24 +798,31 @@ function NotesPanel() {
   };
 
   const selectedNote = notes.find(n => n.id === selectedId);
+  const parsedTags = useMemo(
+    () => tagsDraft.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean),
+    [tagsDraft],
+  );
   const disabled = !ready || authExpired || busy;
+  const inPreview = previewMode && !isNew;
 
   return (
-    <div className="space-y-3">
-      <div className="flex flex-wrap items-center gap-2">
-        <Input
-          size="sm"
-          className="min-w-44 flex-1"
-          placeholder="检索记事本…"
-          value={query}
-          onChange={e => setQuery(e.target.value)}
-        />
-        <Button size="xs" variant={pinnedOnly ? 'secondary' : 'outline'} onClick={() => setPinnedOnly(v => !v)}>
-          <PinIcon className="size-3" />
+    <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden">
+      {/* Fixed Search & Create Toolbar */}
+      <div className="flex shrink-0 flex-wrap items-center gap-2">
+        <div className="min-w-44 flex-1">
+          <Input
+            size="sm"
+            placeholder="检索记事本…"
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+          />
+        </div>
+        <Button size="sm" variant={pinnedOnly ? 'secondary' : 'outline'} onClick={() => setPinnedOnly(v => !v)}>
+          <PinIcon className="size-3.5" />
           <span>仅置顶</span>
         </Button>
         <Button
-          size="xs"
+          size="sm"
           variant="default"
           disabled={disabled}
           onClick={() => {
@@ -666,9 +842,12 @@ function NotesPanel() {
         </Button>
       </div>
 
+      {/* Fixed Optional Tag Strip */}
       {tagsList.length > 0 && (
-        <div className="flex flex-wrap gap-1">
-          <Button size="xs" variant={!filterTag ? 'secondary' : 'ghost'} onClick={() => setFilterTag('')}>全部标签</Button>
+        <div className="flex shrink-0 items-center gap-1 overflow-x-auto pb-0.5">
+          <Button size="xs" variant={!filterTag ? 'secondary' : 'ghost'} onClick={() => setFilterTag('')}>
+            全部标签
+          </Button>
           {tagsList.slice(0, 10).map(t => (
             <Button
               key={t.tag}
@@ -682,121 +861,181 @@ function NotesPanel() {
         </div>
       )}
 
-      <div className="grid gap-3 md:grid-cols-[220px_1fr]">
-        <div className="max-h-96 space-y-1.5 overflow-y-auto pe-1">
-          {notes.length === 0 ? (
-            <p className="py-6 text-center text-xs text-muted-foreground">暂无笔记。</p>
-          ) : (
-            notes.map(n => (
-              <button
-                key={n.id}
-                type="button"
-                onClick={() => { populate(n); setPreviewMode(false); }}
-                className={cn(
-                  'w-full cursor-pointer rounded-lg border p-2 text-start text-xs',
-                  selectedId === n.id ? 'border-ring bg-accent' : 'bg-card hover:bg-accent/50',
-                )}
-              >
-                <div className="flex items-center justify-between gap-1">
-                  <span className="truncate font-medium">{n.title || '无标题笔记'}</span>
-                  {n.pinned && <PinIcon className="size-3 shrink-0 text-amber-500" />}
-                </div>
-                <p className="mt-0.5 line-clamp-2 text-[11px] text-muted-foreground">{n.content}</p>
-              </button>
-            ))
-          )}
-        </div>
+      {/* Split Sidebar + Fixed-Header Internal-Scroll Reader/Editor */}
+      <div className="grid min-h-0 flex-1 gap-3 overflow-hidden max-md:flex max-md:flex-col md:grid-cols-[240px_1fr]">
+        <Card className="flex min-h-0 flex-col overflow-hidden text-xs max-md:h-36 max-md:shrink-0">
+          <div className="flex shrink-0 items-center justify-between border-b px-3 py-2">
+            <span className="font-semibold text-foreground">笔记列表</span>
+            <span className="text-[11px] text-muted-foreground">{notes.length} 篇</span>
+          </div>
+          <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto p-2">
+            {notes.length === 0 ? (
+              <div className="flex h-full items-center justify-center py-6 text-center text-muted-foreground">
+                暂无笔记。
+              </div>
+            ) : (
+              notes.map(n => (
+                <button
+                  key={n.id}
+                  type="button"
+                  onClick={() => {
+                    populate(n);
+                    setPreviewMode(true);
+                  }}
+                  className={cn(
+                    'w-full cursor-pointer rounded-lg border p-2 text-start text-xs transition-colors',
+                    selectedId === n.id ? 'border-ring bg-accent' : 'bg-card hover:bg-accent/50',
+                  )}
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="truncate font-medium text-foreground">{n.title || '无标题笔记'}</span>
+                    {n.pinned && <PinIcon className="size-3 shrink-0 text-amber-500" />}
+                  </div>
+                  <p className="mt-0.5 line-clamp-2 text-[11px] text-muted-foreground">{n.content}</p>
+                </button>
+              ))
+            )}
+          </div>
+        </Card>
 
-        <Card className="p-3 space-y-2.5 text-xs">
+        <Card className="flex min-h-0 flex-1 flex-col overflow-hidden text-xs">
           {!isNew && !selectedId ? (
-            <p className="py-12 text-center text-muted-foreground">选择左侧笔记或点击「新建笔记」开始记录。</p>
+            <div className="flex flex-1 items-center justify-center p-6 text-center text-muted-foreground">
+              选择左侧笔记或点击「新建笔记」开始记录。
+            </div>
           ) : (
             <>
-              {conflictNote && (
-                <Alert variant="warning">
-                  <AlertDescription className="flex flex-wrap items-center justify-between gap-2 text-xs">
-                    <span>远端笔记已更新（{timestamp(conflictNote.updatedAt)}）。</span>
-                    <div className="flex gap-1.5">
-                      <Button size="xs" variant="outline" onClick={() => populate(conflictNote)}>加载远端版本</Button>
-                      <Button size="xs" variant="destructive" onClick={() => void saveNote(true)}>覆盖保存</Button>
-                    </div>
-                  </AlertDescription>
-                </Alert>
-              )}
+              {/* Fixed Note Header */}
+              <div className="shrink-0 space-y-2 border-b px-4 py-3">
+                {conflictNote && (
+                  <Alert variant="warning">
+                    <AlertDescription className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                      <span>远端笔记已更新（{timestamp(conflictNote.updatedAt)}）。</span>
+                      <div className="flex gap-1.5">
+                        <Button size="xs" variant="outline" onClick={() => populate(conflictNote)}>加载远端版本</Button>
+                        <Button size="xs" variant="destructive" onClick={() => void saveNote(true)}>覆盖保存</Button>
+                      </div>
+                    </AlertDescription>
+                  </Alert>
+                )}
 
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <Input
-                  size="sm"
-                  className="min-w-44 flex-1 font-semibold"
-                  placeholder="笔记标题…"
-                  value={title}
-                  onChange={e => { setTitle(e.target.value); setDirty(true); }}
-                />
-                <div className="flex items-center gap-1">
-                  <Button size="xs" variant="outline" onClick={() => setPreviewMode(v => !v)}>
-                    <EyeIcon className="size-3" />
-                    <span>{previewMode ? '编辑' : '预览'}</span>
-                  </Button>
-                  <Button size="xs" variant="default" disabled={disabled} onClick={() => void saveNote(false)}>
-                    保存
-                  </Button>
-                  {selectedNote && (
-                    <>
-                      <Button
-                        size="xs"
-                        variant="ghost"
-                        disabled={disabled}
-                        onClick={async () => {
-                          const res = await api<{ note: NoteItem }>('/api/note-pin', { id: selectedNote.id, pinned: !selectedNote.pinned });
-                          populate(res.note);
-                          await Promise.all([loadNotes(false), refreshView()]);
-                        }}
-                      >
-                        <PinIcon className="size-3" />
-                      </Button>
-                      <Button
-                        size="xs"
-                        variant="outline"
-                        disabled={disabled}
-                        onClick={async () => {
-                          const res = await api<{ note: NoteItem }>('/api/note-promote-memory', { id: selectedNote.id });
-                          populate(res.note);
-                          setSaveStatus('已转存至全息记忆');
-                          await Promise.all([loadNotes(false), refreshView()]);
-                        }}
-                      >
-                        <SparklesIcon className="size-3" />
-                        <span>转存记忆</span>
-                      </Button>
-                      <Button size="xs" variant="ghost" disabled={disabled} onClick={() => setDeleteTarget(selectedNote)}>
-                        <Trash2Icon className="size-3 text-destructive-foreground" />
-                      </Button>
-                    </>
+                <div className="flex items-center justify-between gap-2">
+                  {inPreview ? (
+                    <div className="flex min-w-0 flex-1 items-center gap-2">
+                      <h3 className="truncate text-base font-semibold text-foreground">{title || '无标题笔记'}</h3>
+                      {selectedNote?.pinned && <Badge size="sm" variant="warning" className="shrink-0">置顶</Badge>}
+                    </div>
+                  ) : (
+                    <Input
+                      size="sm"
+                      className="min-w-40 flex-1 font-semibold"
+                      placeholder="笔记标题…"
+                      value={title}
+                      onChange={e => { setTitle(e.target.value); setDirty(true); }}
+                    />
                   )}
+
+                  <div className="flex shrink-0 items-center gap-1">
+                    {inPreview ? (
+                      <Button size="xs" variant="outline" onClick={() => setPreviewMode(false)}>
+                        <PencilIcon className="size-3" />
+                        <span>编辑</span>
+                      </Button>
+                    ) : (
+                      <>
+                        {!isNew && (
+                          <Button size="xs" variant="outline" onClick={() => setPreviewMode(true)}>
+                            <EyeIcon className="size-3" />
+                            <span>预览</span>
+                          </Button>
+                        )}
+                        <Button size="xs" variant="default" disabled={disabled} onClick={() => void saveNote(false)}>
+                          保存
+                        </Button>
+                      </>
+                    )}
+                    {selectedNote && (
+                      <>
+                        <Button
+                          size="xs"
+                          variant="ghost"
+                          aria-label={selectedNote.pinned ? '取消置顶笔记' : '置顶笔记'}
+                          disabled={disabled}
+                          onClick={async () => {
+                            const res = await api<{ note: NoteItem }>('/api/note-pin', { id: selectedNote.id, pinned: !selectedNote.pinned });
+                            populate(res.note);
+                            await Promise.all([loadNotes(false), refreshView()]);
+                          }}
+                        >
+                          <PinIcon className={cn('size-3', selectedNote.pinned && 'text-amber-500')} />
+                        </Button>
+                        <Button
+                          size="xs"
+                          variant="outline"
+                          disabled={disabled}
+                          onClick={async () => {
+                            const res = await api<{ note: NoteItem }>('/api/note-promote-memory', { id: selectedNote.id });
+                            populate(res.note);
+                            setSaveStatus('已转存至全息记忆');
+                            await Promise.all([loadNotes(false), refreshView()]);
+                          }}
+                        >
+                          <SparklesIcon className="size-3" />
+                          <span>转存记忆</span>
+                        </Button>
+                        <Button
+                          size="xs"
+                          variant="ghost"
+                          aria-label="删除笔记"
+                          disabled={disabled}
+                          onClick={() => setDeleteTarget(selectedNote)}
+                        >
+                          <Trash2Icon className="size-3 text-destructive-foreground" />
+                        </Button>
+                      </>
+                    )}
+                  </div>
                 </div>
+
+                {inPreview ? (
+                  parsedTags.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-1">
+                      {parsedTags.map(tag => (
+                        <Badge key={tag} size="sm" variant="secondary">{tag}</Badge>
+                      ))}
+                    </div>
+                  )
+                ) : (
+                  <Input
+                    size="sm"
+                    placeholder="标签（逗号分隔）"
+                    value={tagsDraft}
+                    onChange={e => { setTagsDraft(e.target.value); setDirty(true); }}
+                  />
+                )}
               </div>
 
-              <Input
-                size="sm"
-                placeholder="标签（逗号分隔）"
-                value={tagsDraft}
-                onChange={e => { setTagsDraft(e.target.value); setDirty(true); }}
-              />
+              {/* Internally Scrollable Markdown Preview or Editor */}
+              <div className="min-h-0 flex-1 overflow-hidden">
+                {inPreview ? (
+                  <div className="h-full overflow-y-auto px-4 py-3.5" data-testid="note-markdown-scroll">
+                    <MarkdownContent text={content || '*空笔记*'} mode="assistant" />
+                  </div>
+                ) : (
+                  <div className="h-full p-3">
+                    <textarea
+                      aria-label="笔记 Markdown 正文"
+                      placeholder="支持 Markdown 格式编写…"
+                      value={content}
+                      onChange={e => { setContent(e.target.value); setDirty(true); }}
+                      className={EDITOR_TEXTAREA_CLASS}
+                    />
+                  </div>
+                )}
+              </div>
 
-              {previewMode ? (
-                <div className="min-h-48 rounded-lg border bg-background p-3">
-                  <MarkdownContent text={content || '*空笔记*'} mode="assistant" />
-                </div>
-              ) : (
-                <Textarea
-                  rows={10}
-                  placeholder="支持 Markdown 格式编写…"
-                  value={content}
-                  onChange={e => { setContent(e.target.value); setDirty(true); }}
-                />
-              )}
-
-              <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+              {/* Fixed Status Footer */}
+              <div className="flex shrink-0 items-center justify-between border-t bg-muted/20 px-4 py-2 text-[11px] text-muted-foreground">
                 <span>{saveStatus || (dirty ? '有未保存更改' : '已同步')}</span>
                 {selectedNote && <span>更新于 {timestamp(selectedNote.updatedAt)}</span>}
               </div>
@@ -871,139 +1110,191 @@ function DiaryPanel() {
   const disabled = !ready || authExpired || busy;
 
   return (
-    <div className="space-y-3">
-      <div className="flex flex-wrap items-center gap-2">
-        <Input size="sm" className="min-w-44 flex-1" placeholder="搜索 F.R.I.D.A.Y. 日记…" value={query} onChange={e => setQuery(e.target.value)} />
+    <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden">
+      {/* Fixed Search & Mood Toolbar */}
+      <div className="flex shrink-0 flex-wrap items-center gap-2">
+        <div className="min-w-44 flex-1">
+          <Input
+            size="sm"
+            placeholder="搜索 F.R.I.D.A.Y. 日记…"
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+          />
+        </div>
         <select
+          aria-label="按心情筛选"
           value={moodFilter}
           onChange={e => setMoodFilter(e.target.value as 'all' | DiaryMood)}
-          className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+          className={SELECT_SM_CLASS}
         >
           <option value="all">全部心情</option>
           {DIARY_MOODS.map(m => (
             <option key={m} value={m}>{BOT_EXPRESSION_META[m].plainEmoji} {BOT_EXPRESSION_META[m].label}</option>
           ))}
         </select>
-        <Button size="xs" variant="outline" onClick={() => setShowWrite(v => !v)}>
+        <Button
+          size="sm"
+          variant={showWrite ? 'secondary' : 'outline'}
+          onClick={() => setShowWrite(v => !v)}
+        >
           <PlusIcon className="size-3.5" />
           <span>手动写一篇</span>
         </Button>
-        <Button size="xs" variant="ghost" onClick={() => void loadDiary(true)}>
+        <Button size="icon-sm" variant="ghost" aria-label="刷新日记" onClick={() => void loadDiary(true)}>
           <RefreshCwIcon className="size-3.5" />
         </Button>
       </div>
 
-      {showWrite && (
-        <Card className="p-3 space-y-2 text-xs">
-          <div className="grid gap-2 sm:grid-cols-[1fr_140px]">
-            <Input size="sm" placeholder="日记标题" value={newTitle} onChange={e => setNewTitle(e.target.value)} />
-            <select
-              value={newMood}
-              onChange={e => setNewMood(e.target.value as DiaryMood)}
-              className="h-8 rounded-md border border-input bg-background px-2 text-xs"
-            >
-              {DIARY_MOODS.map(m => (
-                <option key={m} value={m}>{BOT_EXPRESSION_META[m].plainEmoji} {BOT_EXPRESSION_META[m].label}</option>
-              ))}
-            </select>
+      {/* Split Diary Archive + Fixed-Header Internal-Scroll Reader/Writer */}
+      <div className="grid min-h-0 flex-1 gap-3 overflow-hidden max-md:flex max-md:flex-col md:grid-cols-[240px_1fr]">
+        <Card className="flex min-h-0 flex-col overflow-hidden text-xs max-md:h-36 max-md:shrink-0">
+          <div className="flex shrink-0 items-center justify-between border-b px-3 py-2">
+            <span className="font-semibold text-foreground">日记归档</span>
+            <span className="text-[11px] text-muted-foreground">{entries.length} 篇</span>
           </div>
-          <Textarea size="sm" rows={4} placeholder="写点什么…" value={newContent} onChange={e => setNewContent(e.target.value)} />
-          <div className="flex justify-end gap-2">
-            <Button size="xs" variant="ghost" onClick={() => setShowWrite(false)}>取消</Button>
-            <Button
-              size="xs"
-              disabled={disabled || !newContent.trim()}
-              onClick={async () => {
-                setBusy(true);
-                try {
-                  const res = await api<{ entry: DiaryEntry }>('/api/diary-write', {
-                    title: newTitle.trim() || '日常随记',
-                    content: newContent.trim(),
-                    mood: newMood,
-                    source: 'manual',
-                  });
-                  setNewTitle('');
-                  setNewContent('');
-                  setShowWrite(false);
-                  setSelectedId(res.entry.id);
-                  await Promise.all([loadDiary(false), refreshView()]);
-                } catch (e) {
-                  setStatusMsg(errorText(e));
-                } finally {
-                  setBusy(false);
-                }
-              }}
-            >
-              写入日记
-            </Button>
+          <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto p-2">
+            {entries.length === 0 ? (
+              <div className="flex h-full items-center justify-center py-6 text-center text-muted-foreground">
+                暂无日记记录。
+              </div>
+            ) : (
+              entries.map(entry => {
+                const mood = safeDiaryMood(entry.mood);
+                return (
+                  <button
+                    key={entry.id}
+                    type="button"
+                    onClick={() => {
+                      setSelectedId(entry.id);
+                      setShowWrite(false);
+                    }}
+                    className={cn(
+                      'w-full cursor-pointer rounded-lg border p-2 text-start text-xs transition-colors',
+                      selected?.id === entry.id && !showWrite ? 'border-ring bg-accent' : 'bg-card hover:bg-accent/50',
+                    )}
+                  >
+                    <div className="flex items-center justify-between gap-1">
+                      <span className="font-mono text-[11px] text-muted-foreground">{entry.date}</span>
+                      <span>{BOT_EXPRESSION_META[mood].plainEmoji}</span>
+                    </div>
+                    <div className="mt-0.5 truncate font-medium text-foreground">{entry.title}</div>
+                  </button>
+                );
+              })
+            )}
           </div>
         </Card>
-      )}
 
-      <div className="grid gap-3 md:grid-cols-[220px_1fr]">
-        <div className="max-h-96 space-y-1.5 overflow-y-auto pe-1">
-          {entries.length === 0 ? (
-            <p className="py-6 text-center text-xs text-muted-foreground">暂无日记记录。</p>
-          ) : (
-            entries.map(entry => {
-              const mood = safeDiaryMood(entry.mood);
-              return (
-                <button
-                  key={entry.id}
-                  type="button"
-                  onClick={() => setSelectedId(entry.id)}
-                  className={cn(
-                    'w-full cursor-pointer rounded-lg border p-2 text-start text-xs',
-                    selected?.id === entry.id ? 'border-ring bg-accent' : 'bg-card hover:bg-accent/50',
-                  )}
-                >
-                  <div className="flex items-center justify-between gap-1">
-                    <span className="font-mono text-[11px] text-muted-foreground">{entry.date}</span>
-                    <span>{BOT_EXPRESSION_META[mood].plainEmoji}</span>
-                  </div>
-                  <div className="mt-0.5 truncate font-medium">{entry.title}</div>
-                </button>
-              );
-            })
-          )}
-        </div>
-
-        <Card className="p-4 text-xs space-y-3">
-          {!selected ? (
-            <p className="py-12 text-center text-muted-foreground">暂无日记选中。</p>
-          ) : (
+        <Card className="flex min-h-0 flex-1 flex-col overflow-hidden text-xs">
+          {showWrite ? (
             <>
-              <div className="flex flex-wrap items-start justify-between gap-2 border-b pb-2.5">
-                <div className="flex items-center gap-2.5">
-                  <StaticBotAvatar expr={safeDiaryMood(selected.mood)} size={32} />
-                  <div>
-                    <h4 className="text-sm font-semibold">{selected.title}</h4>
-                    <div className="text-[11px] text-muted-foreground">
-                      {selected.date} · 来源 {selected.source} · {BOT_EXPRESSION_META[safeDiaryMood(selected.mood)].label}
-                    </div>
+              <div className="shrink-0 space-y-2 border-b px-4 py-3">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-sm font-semibold text-foreground">写一篇新日记</span>
+                  <div className="flex items-center gap-1.5">
+                    <Button size="xs" variant="ghost" onClick={() => setShowWrite(false)}>取消</Button>
+                    <Button
+                      size="xs"
+                      disabled={disabled || !newContent.trim()}
+                      onClick={async () => {
+                        setBusy(true);
+                        try {
+                          const res = await api<{ entry: DiaryEntry }>('/api/diary-write', {
+                            title: newTitle.trim() || '日常随记',
+                            content: newContent.trim(),
+                            mood: newMood,
+                            source: 'manual',
+                          });
+                          setNewTitle('');
+                          setNewContent('');
+                          setShowWrite(false);
+                          setSelectedId(res.entry.id);
+                          await Promise.all([loadDiary(false), refreshView()]);
+                        } catch (e) {
+                          setStatusMsg(errorText(e));
+                        } finally {
+                          setBusy(false);
+                        }
+                      }}
+                    >
+                      写入日记
+                    </Button>
                   </div>
                 </div>
-                <div className="flex items-center gap-1">
-                  <Button
-                    size="xs"
-                    variant="outline"
-                    disabled={disabled}
-                    onClick={async () => {
-                      await api('/api/diary-promote-memory', { id: selected.id });
-                      setStatusMsg('已转存至全息记忆');
-                      await Promise.all([loadDiary(false), refreshView()]);
-                    }}
+                <div className="grid gap-2 sm:grid-cols-[1fr_140px]">
+                  <Input size="sm" placeholder="日记标题" value={newTitle} onChange={e => setNewTitle(e.target.value)} />
+                  <select
+                    aria-label="日记心情"
+                    value={newMood}
+                    onChange={e => setNewMood(e.target.value as DiaryMood)}
+                    className={SELECT_SM_CLASS}
                   >
-                    <SparklesIcon className="size-3" />
-                    <span>{selected.promotedMemoryId ? '同步记忆' : '转存记忆'}</span>
-                  </Button>
-                  <Button size="xs" variant="ghost" disabled={disabled} onClick={() => setDeleteTarget(selected)}>
-                    <Trash2Icon className="size-3 text-destructive-foreground" />
-                  </Button>
+                    {DIARY_MOODS.map(m => (
+                      <option key={m} value={m}>{BOT_EXPRESSION_META[m].plainEmoji} {BOT_EXPRESSION_META[m].label}</option>
+                    ))}
+                  </select>
                 </div>
               </div>
-              {statusMsg && <p className="text-muted-foreground">{statusMsg}</p>}
-              <MarkdownContent text={selected.content} mode="assistant" />
+              <div className="min-h-0 flex-1 p-3">
+                <textarea
+                  aria-label="日记 Markdown 正文"
+                  placeholder="写点什么（支持 Markdown）…"
+                  value={newContent}
+                  onChange={e => setNewContent(e.target.value)}
+                  className={EDITOR_TEXTAREA_CLASS}
+                />
+              </div>
+            </>
+          ) : !selected ? (
+            <div className="flex flex-1 items-center justify-center p-6 text-center text-muted-foreground">
+              暂无日记选中。
+            </div>
+          ) : (
+            <>
+              {/* Fixed Diary Header */}
+              <div className="shrink-0 space-y-1.5 border-b px-4 py-3">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex min-w-0 flex-1 items-center gap-2.5">
+                    <StaticBotAvatar expr={safeDiaryMood(selected.mood)} size={32} />
+                    <div className="min-w-0 flex-1">
+                      <h4 className="truncate text-base font-semibold text-foreground">{selected.title}</h4>
+                      <div className="truncate text-[11px] text-muted-foreground">
+                        {selected.date} · 来源 {selected.source} · {BOT_EXPRESSION_META[safeDiaryMood(selected.mood)].label}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1">
+                    <Button
+                      size="xs"
+                      variant="outline"
+                      disabled={disabled}
+                      onClick={async () => {
+                        await api('/api/diary-promote-memory', { id: selected.id });
+                        setStatusMsg('已转存至全息记忆');
+                        await Promise.all([loadDiary(false), refreshView()]);
+                      }}
+                    >
+                      <SparklesIcon className="size-3" />
+                      <span>{selected.promotedMemoryId ? '同步记忆' : '转存记忆'}</span>
+                    </Button>
+                    <Button
+                      size="xs"
+                      variant="ghost"
+                      aria-label="删除日记"
+                      disabled={disabled}
+                      onClick={() => setDeleteTarget(selected)}
+                    >
+                      <Trash2Icon className="size-3 text-destructive-foreground" />
+                    </Button>
+                  </div>
+                </div>
+                {statusMsg && <p className="text-[11px] text-muted-foreground">{statusMsg}</p>}
+              </div>
+
+              {/* Internally Scrollable Diary Markdown Body */}
+              <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3.5" data-testid="diary-markdown-scroll">
+                <MarkdownContent text={selected.content} mode="assistant" />
+              </div>
             </>
           )}
         </Card>
@@ -1035,26 +1326,47 @@ export function MemoryHub() {
   const { view, memoryTab, setMemoryTab } = useFriday();
 
   return (
-    <Tabs value={memoryTab} onValueChange={v => setMemoryTab(v as 'matrix' | 'notes' | 'diary')}>
-      <TabsList activateOnFocus>
-        <TabsTab id="memory-tab-matrix" value="matrix">
-          全息突触矩阵 ({view?.memoryDirectory?.totalActive ?? 0})
-        </TabsTab>
-        <TabsTab id="notebook-tab-notes" value="notes">
-          记事本 ({view?.notebookSummary?.noteCount ?? 0})
-        </TabsTab>
-        <TabsTab id="notebook-tab-diary" value="diary">
-          F.R.I.D.A.Y. 日记 ({view?.notebookSummary?.diaryCount ?? 0})
-        </TabsTab>
-      </TabsList>
+    <Tabs
+      value={memoryTab}
+      onValueChange={v => setMemoryTab(v as 'matrix' | 'notes' | 'diary')}
+      className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden"
+    >
+      <div className="max-w-full shrink-0 overflow-x-auto">
+        <TabsList activateOnFocus>
+          <TabsTab id="memory-tab-matrix" value="matrix" className="max-sm:px-2 max-sm:text-xs">
+            全息突触矩阵 ({view?.memoryDirectory?.totalActive ?? 0})
+          </TabsTab>
+          <TabsTab id="notebook-tab-notes" value="notes" className="max-sm:px-2 max-sm:text-xs">
+            记事本 ({view?.notebookSummary?.noteCount ?? 0})
+          </TabsTab>
+          <TabsTab id="notebook-tab-diary" value="diary" className="max-sm:px-2 max-sm:text-xs">
+            F.R.I.D.A.Y. 日记 ({view?.notebookSummary?.diaryCount ?? 0})
+          </TabsTab>
+        </TabsList>
+      </div>
 
-      <TabsPanel id="memory-panel-matrix" value="matrix" keepMounted className="mt-3">
-        <MemoryMatrixPanel />
+      <TabsPanel
+        id="memory-panel-matrix"
+        value="matrix"
+        keepMounted
+        className="mt-0 min-h-0 flex-1 flex-col overflow-hidden [&:not([hidden])]:flex"
+      >
+        <MemoryMatrixPanel active={memoryTab === 'matrix'} />
       </TabsPanel>
-      <TabsPanel id="notebook-panel-notes" value="notes" keepMounted className="mt-3">
+      <TabsPanel
+        id="notebook-panel-notes"
+        value="notes"
+        keepMounted
+        className="mt-0 min-h-0 flex-1 flex-col overflow-hidden [&:not([hidden])]:flex"
+      >
         <NotesPanel />
       </TabsPanel>
-      <TabsPanel id="notebook-panel-diary" value="diary" keepMounted className="mt-3">
+      <TabsPanel
+        id="notebook-panel-diary"
+        value="diary"
+        keepMounted
+        className="mt-0 min-h-0 flex-1 flex-col overflow-hidden [&:not([hidden])]:flex"
+      >
         <DiaryPanel />
       </TabsPanel>
     </Tabs>
