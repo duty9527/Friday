@@ -1,6 +1,6 @@
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createReadStream, createWriteStream, existsSync } from 'node:fs';
-import { mkdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { basename, extname, join, relative, resolve, sep } from 'node:path';
 import { resolvePluginDataDir } from './paths.js';
@@ -16,11 +16,14 @@ export const AUDIO_MIME_BY_EXT: Readonly<Record<string, string>> = {
 };
 
 export const MAX_MUSIC_UPLOAD_BYTES = 100 * 1024 * 1024;
+export const MAX_MUSIC_COOKIES_BYTES = 2 * 1024 * 1024;
 export const TRACK_ID_RE = /^[a-f0-9]{12,32}$/;
 const SECRET_HEX_RE = /^[a-f0-9]{64}$/i;
 const FOLDER_NAME_RE = /^[A-Za-z0-9._\u4e00-\u9fff-]{1,48}$/;
 const STREAM_PATH_RE = /^\/media\/music\/([a-f0-9]{12,32})(\.[a-z0-9]{2,5})$/i;
 const UPLOAD_TIMEOUT_MS = 120_000;
+const COOKIES_UPLOAD_TIMEOUT_MS = 30_000;
+const NETSCAPE_HEADER_RE = /^#\s*(?:Netscape\s+)?HTTP Cookie File/i;
 
 export class MusicMediaError extends Error {
   constructor(readonly status: number, message: string) {
@@ -453,6 +456,185 @@ export async function handleMusicUpload(
       relPath: relative(musicDirReal, finalPath).split(sep).join('/'),
       filename: basename(finalPath),
       sizeBytes: received,
+    };
+  } catch (err) {
+    await unlink(tmpPath).catch(() => {});
+    throw err;
+  }
+}
+
+export interface MusicCookiesSummary {
+  configured: boolean;
+  cookieCount: number;
+  updatedAt: number | null;
+  hasYouTube: boolean;
+  hasBilibili: boolean;
+  domains: string[];
+}
+
+function isPriorityCookieDomain(domain: string): number {
+  if (domain === 'youtube.com' || domain.endsWith('.youtube.com') || domain === 'youtu.be') return 0;
+  if (domain === 'bilibili.com' || domain.endsWith('.bilibili.com')) return 1;
+  if (domain === 'soundcloud.com' || domain.endsWith('.soundcloud.com')) return 2;
+  if (domain === 'google.com' || domain.endsWith('.google.com')) return 3;
+  return 4;
+}
+
+export function normalizeAndInspectNetscapeCookies(rawText: string): {
+  normalizedText: string;
+  summary: Omit<MusicCookiesSummary, 'configured' | 'updatedAt'>;
+} {
+  const cleaned = String(rawText ?? '').replace(/^\uFEFF/, '');
+  if (cleaned.includes('\0')) {
+    throw new MusicMediaError(400, 'cookies.txt 不能包含二进制空字节');
+  }
+
+  const lines = cleaned.split(/\r?\n/);
+  const seenDomains = new Set<string>();
+  let hasHeader = false;
+  let sawFirstNonEmpty = false;
+  let cookieCount = 0;
+  let hasYouTube = false;
+  let hasBilibili = false;
+
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+    if (!sawFirstNonEmpty) {
+      sawFirstNonEmpty = true;
+      if (NETSCAPE_HEADER_RE.test(trimmed)) hasHeader = true;
+    }
+    let parseLine = rawLine;
+    if (parseLine.startsWith('#HttpOnly_')) {
+      parseLine = parseLine.slice('#HttpOnly_'.length);
+    } else if (parseLine.trimStart().startsWith('#')) {
+      if (NETSCAPE_HEADER_RE.test(trimmed)) hasHeader = true;
+      continue;
+    }
+    const cols = parseLine.split('\t');
+    if (cols.length < 7) continue;
+    const domain = (cols[0] ?? '').trim().replace(/^\.+/, '').toLowerCase();
+    const name = (cols[5] ?? '').trim();
+    if (!domain || /\s/.test(domain) || !name) continue;
+    cookieCount += 1;
+    seenDomains.add(domain);
+    if (domain === 'youtube.com' || domain.endsWith('.youtube.com') || domain === 'youtu.be' || domain === 'google.com' || domain.endsWith('.google.com')) {
+      hasYouTube = true;
+    }
+    if (domain === 'bilibili.com' || domain.endsWith('.bilibili.com') || domain === 'biligame.com' || domain.endsWith('.biligame.com')) {
+      hasBilibili = true;
+    }
+  }
+
+  if (cookieCount === 0) {
+    throw new MusicMediaError(400, '未识别到有效的 Netscape cookies.txt 条目，请使用浏览器扩展导出 Netscape 格式');
+  }
+
+  const domains = [...seenDomains]
+    .sort((a, b) => isPriorityCookieDomain(a) - isPriorityCookieDomain(b))
+    .slice(0, 6);
+
+  let normalizedText = cleaned.replace(/\r\n/g, '\n');
+  if (!hasHeader) {
+    normalizedText = `# Netscape HTTP Cookie File\n${normalizedText}`;
+  }
+  if (!normalizedText.endsWith('\n')) {
+    normalizedText += '\n';
+  }
+
+  return {
+    normalizedText,
+    summary: {
+      cookieCount,
+      hasYouTube,
+      hasBilibili,
+      domains,
+    },
+  };
+}
+
+export async function handleMusicCookiesUpload(
+  home: string,
+  incoming: IncomingMessage,
+): Promise<MusicCookiesSummary> {
+  const declaredRaw = incoming.headers['content-length'];
+  if (declaredRaw !== undefined) {
+    const declared = Number(declaredRaw);
+    if (!Number.isFinite(declared) || declared < 0) {
+      throw new MusicMediaError(400, 'Invalid Content-Length');
+    }
+    if (declared > MAX_MUSIC_COOKIES_BYTES) {
+      throw new MusicMediaError(413, `cookies.txt 超过 ${Math.round(MAX_MUSIC_COOKIES_BYTES / (1024 * 1024))} MiB 限制`);
+    }
+  }
+
+  const rawBuf = await new Promise<Buffer>((resolveBuf, rejectBuf) => {
+    const chunks: Buffer[] = [];
+    let received = 0;
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      incoming.off('data', onData);
+      incoming.off('end', onEnd);
+      incoming.off('error', onError);
+      incoming.off('aborted', onAborted);
+    };
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      rejectBuf(err);
+    };
+    const timer = setTimeout(() => {
+      incoming.pause();
+      fail(new MusicMediaError(408, 'cookies.txt 上传超时'));
+    }, COOKIES_UPLOAD_TIMEOUT_MS);
+    timer.unref?.();
+
+    const onData = (chunk: Buffer) => {
+      received += chunk.length;
+      if (received > MAX_MUSIC_COOKIES_BYTES) {
+        incoming.pause();
+        fail(new MusicMediaError(413, `cookies.txt 超过 ${Math.round(MAX_MUSIC_COOKIES_BYTES / (1024 * 1024))} MiB 限制`));
+        return;
+      }
+      chunks.push(chunk);
+    };
+    const onEnd = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolveBuf(Buffer.concat(chunks));
+    };
+    const onAborted = () => fail(new MusicMediaError(400, 'cookies.txt 上传被中断'));
+    const onError = (err: Error) => fail(new MusicMediaError(400, err.message));
+
+    incoming.on('data', onData);
+    incoming.once('end', onEnd);
+    incoming.once('aborted', onAborted);
+    incoming.once('error', onError);
+  });
+
+  if (rawBuf.length === 0) {
+    throw new MusicMediaError(400, 'cookies.txt 内容不能为空');
+  }
+
+  const { normalizedText, summary } = normalizeAndInspectNetscapeCookies(rawBuf.toString('utf8'));
+  const dataDir = resolvePluginDataDir(home, 'music');
+  await mkdir(dataDir, { recursive: true, mode: 0o700 });
+  await chmod(dataDir, 0o700).catch(() => {});
+
+  const finalPath = join(dataDir, 'cookies.txt');
+  const tmpPath = join(dataDir, `.cookies-${randomUUID()}.tmp`);
+  try {
+    await writeFile(tmpPath, normalizedText, { encoding: 'utf8', mode: 0o600 });
+    await chmod(tmpPath, 0o600);
+    await rename(tmpPath, finalPath);
+    await chmod(finalPath, 0o600);
+    return {
+      configured: true,
+      ...summary,
+      updatedAt: Date.now(),
     };
   } catch (err) {
     await unlink(tmpPath).catch(() => {});

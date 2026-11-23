@@ -8,7 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { brotliCompressSync, gzipSync, constants as zlibConstants } from 'node:zlib';
 import type { Socket } from 'node:net';
 import { integer, request, REQUEST_LIMIT } from './protocol.js';
-import { handleMusicUpload, MusicMediaError, serveMusicStream } from './music-media.js';
+import { handleMusicCookiesUpload, handleMusicUpload, MusicMediaError, serveMusicStream } from './music-media.js';
 import type { TraceEvent } from './view.js';
 
 class HttpFailure extends Error { constructor(readonly status: number, message: string) { super(message); } }
@@ -706,6 +706,11 @@ export async function startWeb(options: StartWebOptions): Promise<{ url: string;
             args: { quick: true },
           });
           send(response, 200, { ok: true, uploaded: saved, scan });
+          return;
+        }
+        if (url.pathname === '/api/music/cookies') {
+          const cookies = await handleMusicCookiesUpload(home, incoming);
+          send(response, 200, { ok: true, cookies });
           return;
         }
         const commands: Record<string, string> = {

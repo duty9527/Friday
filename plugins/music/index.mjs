@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHmac, randomBytes, randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { networkInterfaces } from 'node:os';
 import { dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,7 +18,10 @@ import {
 import {
   downloadOnlineAudioFile,
   findYtDlp,
+  formatYtDlpError,
+  inspectNetscapeCookiesFile,
   loadDownloadJobs,
+  normalizeNetscapeCookiesText,
   searchOnlineTracks,
   upsertDownloadJob,
 } from './downloader.mjs';
@@ -99,6 +102,31 @@ function buildDefaultConfig(homeDir) {
 }
 
 /**
+ * @param {unknown} raw
+ * @returns {'youtube' | 'bilibili' | 'soundcloud'}
+ */
+function normalizeSearchSource(raw) {
+  const s = String(raw ?? 'youtube').trim().toLowerCase();
+  if (s === 'bilibili' || s === 'soundcloud') return s;
+  return 'youtube';
+}
+
+/**
+ * @param {string} pluginDataDir
+ * @returns {string}
+ */
+function resolveCookiesPath(pluginDataDir) {
+  const filePath = join(pluginDataDir, 'cookies.txt');
+  if (!existsSync(filePath)) return '';
+  try {
+    const st = statSync(filePath);
+    return st.isFile() && st.size > 0 ? filePath : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
  * @param {string} configPath
  * @param {string} homeDir
  */
@@ -111,7 +139,7 @@ function loadEffectiveConfig(configPath, homeDir) {
     speakerSsh: typeof raw.speakerSsh === 'string' ? raw.speakerSsh.trim() : '',
     defaultVolume: clampInt(raw.defaultVolume, 0, 100) ?? 45,
     downloadFormat: String(raw.downloadFormat ?? 'mp3').trim().toLowerCase() === 'm4a' ? 'm4a' : 'mp3',
-    defaultSearchSource: String(raw.defaultSearchSource ?? 'youtube').trim().toLowerCase() === 'bilibili' ? 'bilibili' : 'youtube',
+    defaultSearchSource: normalizeSearchSource(raw.defaultSearchSource),
     ytDlpPath: typeof raw.ytDlpPath === 'string' ? raw.ytDlpPath.trim() : '',
     autoDownloadOnVoiceMiss: Boolean(raw.autoDownloadOnVoiceMiss),
   };
@@ -483,7 +511,16 @@ async function buildDashboard(pluginDataDir, homeDir, configPath, options = {}, 
   reconcileQueue(lib.tracks, state);
   const secret = ensureStreamSecretSync(pluginDataDir);
   const playlists = loadPlaylists(pluginDataDir).playlists;
-  const downloads = loadDownloadJobs(pluginDataDir);
+  const cookies = inspectNetscapeCookiesFile(join(pluginDataDir, 'cookies.txt'));
+  const downloads = loadDownloadJobs(pluginDataDir).map((job) => {
+    if (job.status === 'error' && typeof job.error === 'string' && /^Command failed:/i.test(job.error)) {
+      return {
+        ...job,
+        error: formatYtDlpError(job.error, { source: job.source, hasCookies: cookies.configured }),
+      };
+    }
+    return job;
+  });
   const speaker = resolveMusicSpeakerTarget(config.speakerSsh, homeDir);
 
   let speakerLive = null;
@@ -544,6 +581,7 @@ async function buildDashboard(pluginDataDir, homeDir, configPath, options = {}, 
       : { configured: false, id: '', userHost: '', source: 'none', live: null },
     ytDlpAvailable: Boolean(ytDlpBin),
     ytDlpPath: ytDlpBin || '',
+    cookies,
     streamBaseUrl: resolveStreamBaseUrl(config.streamBaseUrl, asEnvRecord(deps.env)),
     config,
   };
@@ -985,19 +1023,33 @@ export async function runAction(action, args = {}, context = {}, deps = {}) {
     const query = String(safeArgs.query ?? '').trim();
     const source = String(safeArgs.source ?? config.defaultSearchSource ?? 'youtube').trim().toLowerCase();
     const limit = clampInt(safeArgs.limit, 1, 12) ?? 6;
-    const res = await searchOnlineTracks(query, {
-      source,
-      limit,
-      ytDlpPath: config.ytDlpPath,
-      signal: context.signal,
-    }, deps);
-    return {
-      ok: true,
-      notify: false,
-      title: '在线搜索结果',
-      message: `从 ${res.source === 'bilibili' ? 'Bilibili' : 'YouTube'} 找到 ${res.candidates.length} 个候选音源`,
-      data: res,
-    };
+    const cookiesPath = resolveCookiesPath(pluginDataDir);
+    const sourceLabelMap = { bilibili: 'Bilibili', soundcloud: 'SoundCloud', youtube: 'YouTube' };
+    try {
+      const res = await searchOnlineTracks(query, {
+        source,
+        limit,
+        ytDlpPath: config.ytDlpPath,
+        cookiesPath,
+        signal: context.signal,
+      }, deps);
+      const sourceLabel = sourceLabelMap[/** @type {keyof typeof sourceLabelMap} */ (res.source)] ?? 'YouTube';
+      return {
+        ok: true,
+        notify: false,
+        title: '在线搜索结果',
+        message: `从 ${sourceLabel} 找到 ${res.candidates.length} 个候选音源`,
+        data: res,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        notify: false,
+        title: '在线搜索失败',
+        message: errMsg(err),
+        data: { source, candidates: [] },
+      };
+    }
   }
 
   if (cleanAction === 'download') {
@@ -1010,6 +1062,7 @@ export async function runAction(action, args = {}, context = {}, deps = {}) {
     const artistHint = typeof safeArgs.artistHint === 'string' ? safeArgs.artistHint.trim() : '';
     const playAfter = Boolean(safeArgs.playAfter);
     const isAsync = Boolean(safeArgs.async);
+    const cookiesPath = resolveCookiesPath(pluginDataDir);
 
     const jobId = `dl-${randomUUID().slice(0, 8)}`;
     const initialJob = {
@@ -1036,6 +1089,7 @@ export async function runAction(action, args = {}, context = {}, deps = {}) {
           artistHint,
           musicDir: config.musicDir,
           ytDlpPath: config.ytDlpPath,
+          cookiesPath,
           signal: isAsync ? undefined : context.signal,
         }, deps);
         const scanned = await scanLibrary(pluginDataDir, config.musicDir, { quick: true }, deps);
@@ -1081,22 +1135,32 @@ export async function runAction(action, args = {}, context = {}, deps = {}) {
       };
     }
 
-    const done = await runDownloadTask();
-    return {
-      ok: true,
-      notify: true,
-      title: '下载完成并已入库',
-      message: done.playRes?.ok
-        ? `已下载《${done.track?.title || done.downloaded.title}》并开始在小爱音箱播放`
-        : `已下载《${done.track?.title || done.downloaded.title}》到本地曲库`,
-      data: {
-        jobId,
-        status: 'done',
-        track: done.track,
-        filePath: done.downloaded.filePath,
-        played: Boolean(done.playRes?.ok),
-      },
-    };
+    try {
+      const done = await runDownloadTask();
+      return {
+        ok: true,
+        notify: true,
+        title: '下载完成并已入库',
+        message: done.playRes?.ok
+          ? `已下载《${done.track?.title || done.downloaded.title}》并开始在小爱音箱播放`
+          : `已下载《${done.track?.title || done.downloaded.title}》到本地曲库`,
+        data: {
+          jobId,
+          status: 'done',
+          track: done.track,
+          filePath: done.downloaded.filePath,
+          played: Boolean(done.playRes?.ok),
+        },
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        notify: true,
+        title: '下载失败',
+        message: errMsg(err),
+        data: { jobId, status: 'error' },
+      };
+    }
   }
 
   if (cleanAction === 'delete-track') {
@@ -1114,41 +1178,79 @@ export async function runAction(action, args = {}, context = {}, deps = {}) {
 
   if (cleanAction === 'config') {
     const current = loadEffectiveConfig(configPath, homeDir);
-    const hasUpdates = ['musicDir', 'streamBaseUrl', 'speakerSsh', 'defaultVolume', 'downloadFormat', 'defaultSearchSource', 'ytDlpPath', 'autoDownloadOnVoiceMiss']
+    const cookiesFilePath = join(pluginDataDir, 'cookies.txt');
+    const clearCookies = Boolean(safeArgs.clearCookies);
+    const rawCookiesContent = typeof safeArgs.cookiesContent === 'string' ? safeArgs.cookiesContent : undefined;
+    const hasFieldUpdates = ['musicDir', 'streamBaseUrl', 'speakerSsh', 'defaultVolume', 'downloadFormat', 'defaultSearchSource', 'ytDlpPath', 'autoDownloadOnVoiceMiss']
       .some((k) => safeArgs[k] !== undefined);
-    if (hasUpdates) {
-      const next = {
-        ...current,
-        ...(typeof safeArgs.musicDir === 'string' && safeArgs.musicDir.trim() ? { musicDir: resolve(safeArgs.musicDir.trim()) } : {}),
-        ...(typeof safeArgs.streamBaseUrl === 'string' ? { streamBaseUrl: safeArgs.streamBaseUrl.trim().replace(/\/+$/, '') } : {}),
-        ...(typeof safeArgs.speakerSsh === 'string' ? { speakerSsh: safeArgs.speakerSsh.trim() } : {}),
-        ...(safeArgs.defaultVolume !== undefined ? { defaultVolume: clampInt(safeArgs.defaultVolume, 0, 100) ?? current.defaultVolume } : {}),
-        ...(safeArgs.downloadFormat !== undefined ? { downloadFormat: String(safeArgs.downloadFormat).trim().toLowerCase() === 'm4a' ? 'm4a' : 'mp3' } : {}),
-        ...(safeArgs.defaultSearchSource !== undefined ? { defaultSearchSource: String(safeArgs.defaultSearchSource).trim().toLowerCase() === 'bilibili' ? 'bilibili' : 'youtube' } : {}),
-        ...(typeof safeArgs.ytDlpPath === 'string' ? { ytDlpPath: safeArgs.ytDlpPath.trim() } : {}),
-        ...(safeArgs.autoDownloadOnVoiceMiss !== undefined ? { autoDownloadOnVoiceMiss: Boolean(safeArgs.autoDownloadOnVoiceMiss) } : {}),
-      };
+
+    if (clearCookies) {
+      rmSync(cookiesFilePath, { force: true });
+    } else if (rawCookiesContent !== undefined) {
+      if (!rawCookiesContent.trim()) {
+        return { ok: false, notify: true, title: 'Cookie 导入失败', message: 'cookies.txt 内容不能为空' };
+      }
+      let tmpCookiesPath = '';
+      try {
+        const { normalizedText } = normalizeNetscapeCookiesText(rawCookiesContent);
+        ensurePrivateDir(pluginDataDir);
+        tmpCookiesPath = join(pluginDataDir, `.cookies-${randomUUID()}.tmp`);
+        writeFileSync(tmpCookiesPath, normalizedText, { encoding: 'utf8', mode: 0o600 });
+        chmodSync(tmpCookiesPath, 0o600);
+        renameSync(tmpCookiesPath, cookiesFilePath);
+        chmodSync(cookiesFilePath, 0o600);
+      } catch (err) {
+        if (tmpCookiesPath) rmSync(tmpCookiesPath, { force: true });
+        return { ok: false, notify: true, title: 'Cookie 导入失败', message: errMsg(err) };
+      }
+    }
+
+    const next = hasFieldUpdates
+      ? {
+          ...current,
+          ...(typeof safeArgs.musicDir === 'string' && safeArgs.musicDir.trim() ? { musicDir: resolve(safeArgs.musicDir.trim()) } : {}),
+          ...(typeof safeArgs.streamBaseUrl === 'string' ? { streamBaseUrl: safeArgs.streamBaseUrl.trim().replace(/\/+$/, '') } : {}),
+          ...(typeof safeArgs.speakerSsh === 'string' ? { speakerSsh: safeArgs.speakerSsh.trim() } : {}),
+          ...(safeArgs.defaultVolume !== undefined ? { defaultVolume: clampInt(safeArgs.defaultVolume, 0, 100) ?? current.defaultVolume } : {}),
+          ...(safeArgs.downloadFormat !== undefined ? { downloadFormat: String(safeArgs.downloadFormat).trim().toLowerCase() === 'm4a' ? 'm4a' : 'mp3' } : {}),
+          ...(safeArgs.defaultSearchSource !== undefined ? { defaultSearchSource: normalizeSearchSource(safeArgs.defaultSearchSource) } : {}),
+          ...(typeof safeArgs.ytDlpPath === 'string' ? { ytDlpPath: safeArgs.ytDlpPath.trim() } : {}),
+          ...(safeArgs.autoDownloadOnVoiceMiss !== undefined ? { autoDownloadOnVoiceMiss: Boolean(safeArgs.autoDownloadOnVoiceMiss) } : {}),
+        }
+      : current;
+
+    let scanRes = null;
+    if (hasFieldUpdates) {
       writeConfig(configPath, next);
-      let scanRes = null;
       if (next.musicDir !== current.musicDir) {
         scanRes = await scanLibrary(pluginDataDir, next.musicDir, { quick: false, signal: context.signal }, deps);
       }
+    }
+
+    const cookies = inspectNetscapeCookiesFile(cookiesFilePath);
+    if (hasFieldUpdates || clearCookies || rawCookiesContent !== undefined) {
+      const msg = clearCookies
+        ? '已清除已保存的 yt-dlp cookies.txt'
+        : rawCookiesContent !== undefined
+          ? `已保存 ${cookies.cookieCount} 条 Cookie 认证条目`
+          : scanRes
+            ? `曲库目录已切换为 ${next.musicDir}（扫描 ${scanRes.total} 首曲目）`
+            : `曲库目录：${next.musicDir}`;
       return {
         ok: true,
         notify: true,
-        title: '音乐插件配置已更新',
-        message: scanRes
-          ? `曲库目录已切换为 ${next.musicDir}（扫描 ${scanRes.total} 首曲目）`
-          : `曲库目录：${next.musicDir}`,
-        data: { config: next, ...(scanRes ? { scan: scanRes } : {}) },
+        title: clearCookies ? '已清除 Cookie 认证' : rawCookiesContent !== undefined ? '已导入 Cookie 认证' : '音乐插件配置已更新',
+        message: msg,
+        data: { config: next, cookies, ...(scanRes ? { scan: scanRes } : {}) },
       };
     }
+
     return {
       ok: true,
       notify: false,
       title: '音乐插件配置',
       message: `曲库目录：${current.musicDir}`,
-      data: { config: current },
+      data: { config: current, cookies },
     };
   }
 

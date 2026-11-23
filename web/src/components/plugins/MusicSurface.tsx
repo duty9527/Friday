@@ -6,6 +6,7 @@ import {
   FolderPlusIcon,
   HeadphonesIcon,
   HeartIcon,
+  KeyRoundIcon,
   ListMusicIcon,
   MusicIcon,
   PauseIcon,
@@ -35,7 +36,19 @@ import { Label } from '@/components/ui/label';
 import { Slider } from '@/components/ui/slider';
 import { Spinner } from '@/components/ui/spinner';
 import { Tabs, TabsList, TabsPanel, TabsTab } from '@/components/ui/tabs';
+import { Textarea } from '@/components/ui/textarea';
 import { useFriday } from '@/lib/friday-store';
+
+type OnlineSource = 'youtube' | 'bilibili' | 'soundcloud';
+
+interface MusicCookiesSummary {
+  configured: boolean;
+  cookieCount: number;
+  updatedAt: number | null;
+  hasYouTube: boolean;
+  hasBilibili: boolean;
+  domains: string[];
+}
 
 interface MusicTrackView {
   id: string;
@@ -80,7 +93,7 @@ interface OnlineCandidate {
   artist: string;
   durationSec: number | null;
   url: string;
-  source: 'youtube' | 'bilibili' | 'direct';
+  source: OnlineSource | 'direct';
 }
 
 interface MusicDashboardPayload {
@@ -106,6 +119,7 @@ interface MusicDashboardPayload {
     live?: { status?: number | null; volume?: number | null; error?: string } | null;
   };
   ytDlpAvailable: boolean;
+  cookies?: MusicCookiesSummary;
   streamBaseUrl: string;
   config: {
     musicDir: string;
@@ -113,7 +127,7 @@ interface MusicDashboardPayload {
     speakerSsh: string;
     defaultVolume: number;
     downloadFormat: 'mp3' | 'm4a';
-    defaultSearchSource: 'youtube' | 'bilibili';
+    defaultSearchSource: OnlineSource;
     ytDlpPath: string;
     autoDownloadOnVoiceMiss: boolean;
   };
@@ -150,7 +164,7 @@ export default function MusicSurface() {
   const [volumeDirty, setVolumeDirty] = useState(false);
 
   const [onlineInput, setOnlineInput] = useState('');
-  const [onlineSource, setOnlineSource] = useState<'youtube' | 'bilibili'>('youtube');
+  const [onlineSource, setOnlineSource] = useState<OnlineSource>('youtube');
   const [searchingOnline, setSearchingOnline] = useState(false);
   const [candidates, setCandidates] = useState<OnlineCandidate[]>([]);
 
@@ -164,10 +178,14 @@ export default function MusicSurface() {
   const [cfgSpeakerSsh, setCfgSpeakerSsh] = useState('');
   const [cfgDefaultVolume, setCfgDefaultVolume] = useState('45');
   const [cfgFormat, setCfgFormat] = useState<'mp3' | 'm4a'>('mp3');
-  const [cfgSource, setCfgSource] = useState<'youtube' | 'bilibili'>('youtube');
+  const [cfgSource, setCfgSource] = useState<OnlineSource>('youtube');
   const [cfgAutoMiss, setCfgAutoMiss] = useState(false);
 
+  const [cookiesDraft, setCookiesDraft] = useState('');
+  const [cookiesBusy, setCookiesBusy] = useState(false);
+
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const cookiesFileInputRef = useRef<HTMLInputElement | null>(null);
   const mountedRef = useRef(true);
   const seqRef = useRef(0);
   const onlineSourceInitRef = useRef(false);
@@ -287,6 +305,14 @@ export default function MusicSurface() {
     );
   }, [data?.playlists, data?.tracks, libQuery, selectedPlaylistId]);
 
+  const buildUploadAuthHeaders = useCallback((): Record<string, string> => {
+    const headers: Record<string, string> = {};
+    if (token && !(token === OPEN_AUTH_SENTINEL_TOKEN && hasOpenAuthCookie())) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+    return headers;
+  }, [token]);
+
   const handleUploadFiles = async (e: ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files ?? []);
     e.target.value = '';
@@ -298,12 +324,10 @@ export default function MusicSurface() {
     try {
       for (const file of files) {
         const headers: Record<string, string> = {
+          ...buildUploadAuthHeaders(),
           'x-music-filename': encodeURIComponent(file.name),
           'content-type': 'application/octet-stream',
         };
-        if (token && !(token === OPEN_AUTH_SENTINEL_TOKEN && hasOpenAuthCookie())) {
-          headers.Authorization = `Bearer ${token}`;
-        }
         const res = await fetch('/api/music/upload', {
           method: 'POST',
           headers,
@@ -333,6 +357,55 @@ export default function MusicSurface() {
     }
   };
 
+  const uploadCookiesText = async (rawText: string) => {
+    if (!rawText.trim() || authExpired || cookiesBusy) return;
+    setCookiesBusy(true);
+    setStatus({ text: '正在校验并保存 cookies.txt…', tone: 'warn' });
+    try {
+      const headers: Record<string, string> = {
+        ...buildUploadAuthHeaders(),
+        'content-type': 'text/plain; charset=utf-8',
+      };
+      const res = await fetch('/api/music/cookies', {
+        method: 'POST',
+        headers,
+        body: rawText,
+        credentials: 'omit',
+        cache: 'no-store',
+      });
+      const payload = await res.json().catch(() => ({})) as { ok?: boolean; error?: string; cookies?: MusicCookiesSummary };
+      if (!res.ok || !payload.ok) {
+        if (mountedRef.current) setStatus({ text: payload.error || `导入 Cookie 失败 (${res.status})`, tone: 'err' });
+        return;
+      }
+      if (mountedRef.current) setCookiesDraft('');
+      await refreshDashboard(false, true);
+      if (mountedRef.current) {
+        setStatus({ text: `已导入 ${payload.cookies?.cookieCount ?? 0} 条 Cookie`, tone: 'ok' });
+      }
+    } catch (err) {
+      if (mountedRef.current) setStatus({ text: errorText(err), tone: 'err' });
+    } finally {
+      if (mountedRef.current) setCookiesBusy(false);
+    }
+  };
+
+  const handleCookiesFileChange = async (ev: ChangeEvent<HTMLInputElement>) => {
+    const file = ev.target.files?.[0];
+    ev.target.value = '';
+    if (!file) return;
+    const text = await file.text();
+    await uploadCookiesText(text);
+  };
+
+  const handleClearCookies = async () => {
+    await runAction('正在清除 Cookie 认证…', async () => {
+      const res = await callMusic('config', { clearCookies: true });
+      setStatus({ text: res.message || '已清除 Cookie', tone: res.ok ? 'ok' : 'err' });
+      await refreshDashboard(false, true);
+    });
+  };
+
   const handleOnlineSearchOrDownload = async (e: FormEvent) => {
     e.preventDefault();
     const trimmed = onlineInput.trim();
@@ -355,6 +428,11 @@ export default function MusicSurface() {
         limit: 8,
       }, 45_000);
       if (!mountedRef.current) return;
+      if (!res.ok) {
+        setCandidates([]);
+        setStatus({ text: res.message || '在线搜索失败', tone: 'err' });
+        return;
+      }
       const list = res.data?.candidates ?? [];
       setCandidates(list);
       setStatus({
@@ -821,12 +899,25 @@ export default function MusicSurface() {
                 <div>
                   <CardTitle className="text-sm">在线搜歌与链接下载</CardTitle>
                   <CardDescription className="text-xs">
-                    支持输入歌名/歌手关键词搜索，或直接粘贴 YouTube / Bilibili / 音频直链下载到 {data?.config?.musicDir || '/mnt/data/music'}
+                    SoundCloud 搜索与 B 站 BV 直链可免登录下载到 {data?.config?.musicDir || '/mnt/data/music'}；YouTube / B 站关键词搜索如触发风控，请在「设置」导入 Netscape cookies.txt
                   </CardDescription>
                 </div>
-                <Badge variant={data?.ytDlpAvailable ? 'success' : 'warning'}>
-                  {data?.ytDlpAvailable ? 'yt-dlp 就绪' : '未检测到 yt-dlp'}
-                </Badge>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {data?.cookies?.configured ? (
+                    <Badge variant="success">Cookie 已配置 ({data.cookies.cookieCount})</Badge>
+                  ) : (
+                    <>
+                      <Badge variant="outline">未配置 Cookie</Badge>
+                      <Button type="button" size="xs" variant="outline" onClick={() => setActiveTab('config')}>
+                        <KeyRoundIcon className="size-3" />
+                        <span>配置 Cookie</span>
+                      </Button>
+                    </>
+                  )}
+                  <Badge variant={data?.ytDlpAvailable ? 'success' : 'warning'}>
+                    {data?.ytDlpAvailable ? 'yt-dlp 就绪' : '未检测到 yt-dlp'}
+                  </Badge>
+                </div>
               </div>
             </CardHeader>
             <CardContent className="space-y-3">
@@ -834,13 +925,14 @@ export default function MusicSurface() {
                 <Input
                   value={onlineInput}
                   onChange={(ev) => setOnlineInput(ev.target.value)}
-                  placeholder="输入歌名（如：晴天 周杰伦）或粘贴视频/音频链接…"
+                  placeholder="输入歌名（如：晴天 周杰伦）或粘贴 YouTube / B站 BV / SoundCloud / 音频链接…"
                   className="min-w-60 flex-1"
                 />
                 <div className="flex items-center gap-1">
                   <Button
                     type="button"
                     size="xs"
+                    aria-pressed={onlineSource === 'youtube'}
                     variant={onlineSource === 'youtube' ? 'default' : 'outline'}
                     onClick={() => setOnlineSource('youtube')}
                   >
@@ -849,10 +941,20 @@ export default function MusicSurface() {
                   <Button
                     type="button"
                     size="xs"
+                    aria-pressed={onlineSource === 'bilibili'}
                     variant={onlineSource === 'bilibili' ? 'default' : 'outline'}
                     onClick={() => setOnlineSource('bilibili')}
                   >
                     Bilibili
+                  </Button>
+                  <Button
+                    type="button"
+                    size="xs"
+                    aria-pressed={onlineSource === 'soundcloud'}
+                    variant={onlineSource === 'soundcloud' ? 'default' : 'outline'}
+                    onClick={() => setOnlineSource('soundcloud')}
+                  >
+                    SoundCloud
                   </Button>
                 </div>
                 <Button type="submit" size="sm" disabled={searchingOnline || busy || !onlineInput.trim()}>
@@ -869,7 +971,7 @@ export default function MusicSurface() {
                         <div className="flex items-center gap-2">
                           <span className="truncate text-sm font-medium">{cand.title}</span>
                           <Badge variant="outline" className="text-[10px]">
-                            {cand.source === 'bilibili' ? 'B站' : 'YouTube'}
+                            {cand.source === 'bilibili' ? 'B站' : cand.source === 'soundcloud' ? 'SoundCloud' : 'YouTube'}
                           </Badge>
                         </div>
                         <p className="truncate text-xs text-muted-foreground">
@@ -894,17 +996,31 @@ export default function MusicSurface() {
               {(data?.downloads?.length ?? 0) > 0 && (
                 <div className="space-y-1.5 pt-2">
                   <div className="text-xs font-medium text-muted-foreground">最近下载任务</div>
-                  {(data?.downloads ?? []).slice(0, 8).map(job => (
-                    <div key={job.id} className="flex flex-wrap items-center justify-between gap-2 rounded-md border px-2.5 py-1.5 text-xs">
-                      <div className="min-w-0 flex-1 truncate">
-                        <span className="font-medium">{job.title}</span>
-                        {job.error && <span className="ml-2 text-destructive">{job.error}</span>}
+                  {(data?.downloads ?? []).slice(0, 8).map(job => {
+                    const needsCookieHint = job.status === 'error' && /cookie|风控|not a bot|412/i.test(job.error || '');
+                    return (
+                      <div key={job.id} className="rounded-md border px-2.5 py-2 text-xs">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="min-w-0 flex-1 truncate font-medium">{job.title}</span>
+                          <div className="flex shrink-0 items-center gap-1.5">
+                            {needsCookieHint && (
+                              <Button type="button" size="xs" variant="outline" onClick={() => setActiveTab('config')}>
+                                去导入 Cookie
+                              </Button>
+                            )}
+                            <Badge variant={job.status === 'done' ? 'success' : job.status === 'error' ? 'error' : 'warning'}>
+                              {job.status === 'done' ? '已完成' : job.status === 'error' ? '失败' : '下载中'}
+                            </Badge>
+                          </div>
+                        </div>
+                        {job.error && (
+                          <p className="mt-1 break-words text-[11px] leading-relaxed text-destructive">
+                            {job.error}
+                          </p>
+                        )}
                       </div>
-                      <Badge variant={job.status === 'done' ? 'success' : job.status === 'error' ? 'error' : 'warning'}>
-                        {job.status === 'done' ? '已完成' : job.status === 'error' ? '失败' : '下载中'}
-                      </Badge>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </CardContent>
@@ -1050,7 +1166,7 @@ export default function MusicSurface() {
           </div>
         </TabsPanel>
 
-        <TabsPanel value="config" className="pt-2">
+        <TabsPanel value="config" className="space-y-3 pt-2">
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm">曲库与音箱参数配置</CardTitle>
@@ -1116,11 +1232,16 @@ export default function MusicSurface() {
                     <select
                       id="music-cfg-src"
                       value={cfgSource}
-                      onChange={(ev) => { setCfgDirty(true); setCfgSource(ev.target.value === 'bilibili' ? 'bilibili' : 'youtube'); }}
+                      onChange={(ev) => {
+                        setCfgDirty(true);
+                        const v = ev.target.value;
+                        setCfgSource(v === 'bilibili' || v === 'soundcloud' ? v : 'youtube');
+                      }}
                       className="h-9 w-full rounded-md border bg-background px-2.5 text-sm"
                     >
                       <option value="youtube">YouTube / YouTube Music</option>
                       <option value="bilibili">Bilibili</option>
+                      <option value="soundcloud">SoundCloud（免登录）</option>
                     </select>
                   </div>
                 </div>
@@ -1135,6 +1256,90 @@ export default function MusicSurface() {
 
                 <div className="flex justify-end">
                   <Button type="submit" size="sm" disabled={busy}>保存配置</Button>
+                </div>
+              </form>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader className="pb-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <CardTitle className="flex items-center gap-1.5 text-sm">
+                    <KeyRoundIcon className="size-4 text-primary" />
+                    <span>yt-dlp Cookie 认证（YouTube / Bilibili）</span>
+                  </CardTitle>
+                  <CardDescription className="text-xs">
+                    YouTube 下载及 B 站关键词搜索在代理出口 IP 下通常需要登录态，请上传或粘贴 Netscape 格式 cookies.txt（文件以 0600 权限保存在主机私有目录，界面不回显明细）。
+                  </CardDescription>
+                </div>
+                <Badge variant={data?.cookies?.configured ? 'success' : 'outline'}>
+                  {data?.cookies?.configured ? `已配置 · ${data.cookies.cookieCount} 条` : '未配置'}
+                </Badge>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {data?.cookies?.configured && (data.cookies.domains?.length ?? 0) > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                  <span className="text-muted-foreground">已识别域名：</span>
+                  {data.cookies.domains.map(domain => (
+                    <Badge key={domain} variant="outline" className="text-[10px]">{domain}</Badge>
+                  ))}
+                </div>
+              )}
+
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="outline"
+                  disabled={cookiesBusy || busy}
+                  onClick={() => cookiesFileInputRef.current?.click()}
+                >
+                  <UploadIcon className="size-3.5" />
+                  <span>{cookiesBusy ? '导入中…' : '选择 cookies.txt 文件'}</span>
+                </Button>
+                {data?.cookies?.configured && (
+                  <Button
+                    type="button"
+                    size="xs"
+                    variant="ghost"
+                    disabled={cookiesBusy || busy}
+                    onClick={() => void handleClearCookies()}
+                  >
+                    <Trash2Icon className="size-3.5 text-destructive" />
+                    <span>清除 Cookie</span>
+                  </Button>
+                )}
+                <input
+                  ref={cookiesFileInputRef}
+                  type="file"
+                  accept=".txt,text/plain"
+                  className="hidden"
+                  onChange={(ev) => void handleCookiesFileChange(ev)}
+                />
+              </div>
+
+              <form
+                onSubmit={(ev) => {
+                  ev.preventDefault();
+                  void uploadCookiesText(cookiesDraft);
+                }}
+                className="space-y-2"
+              >
+                <Label htmlFor="music-cookies-text" className="text-xs">或直接粘贴 Netscape cookies.txt 文本</Label>
+                <Textarea
+                  id="music-cookies-text"
+                  rows={4}
+                  value={cookiesDraft}
+                  onChange={(ev) => setCookiesDraft(ev.target.value)}
+                  placeholder={'# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t1893456000\tSID\t...'}
+                  className="font-mono text-xs"
+                />
+                <div className="flex justify-end">
+                  <Button type="submit" size="sm" disabled={cookiesBusy || busy || !cookiesDraft.trim()}>
+                    保存粘贴的 Cookie
+                  </Button>
                 </div>
               </form>
             </CardContent>

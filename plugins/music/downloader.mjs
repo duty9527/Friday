@@ -1,16 +1,20 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
+  chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
+  readFileSync,
   realpathSync,
   renameSync,
   rmSync,
   statSync,
 } from 'node:fs';
 import { isIP } from 'node:net';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { basename, extname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { readJsonSafe, writeJsonAtomic } from '../_shared/config-store.mjs';
@@ -20,6 +24,7 @@ const execFileAsync = promisify(execFile);
 const MAX_DOWNLOAD_JOBS = 30;
 const DOWNLOAD_TIMEOUT_MS = 180_000;
 const SEARCH_TIMEOUT_MS = 25_000;
+const NETSCAPE_HEADER_RE = /^#\s*(?:Netscape\s+)?HTTP Cookie File/i;
 
 /**
  * @typedef {{
@@ -28,9 +33,18 @@ const SEARCH_TIMEOUT_MS = 25_000;
  *   artist: string;
  *   durationSec: number | null;
  *   url: string;
- *   source: 'youtube' | 'bilibili' | 'direct';
+ *   source: 'youtube' | 'bilibili' | 'soundcloud' | 'direct';
  *   thumbnail?: string;
  * }} OnlineSearchCandidate
+ *
+ * @typedef {{
+ *   configured: boolean;
+ *   cookieCount: number;
+ *   updatedAt: number | null;
+ *   hasYouTube: boolean;
+ *   hasBilibili: boolean;
+ *   domains: string[];
+ * }} CookiesSummary
  *
  * @typedef {{
  *   id: string;
@@ -111,7 +125,7 @@ export function isPrivateOrLoopbackHost(hostname) {
 
 /**
  * @param {string} rawUrl
- * @returns {{ url: string; source: 'youtube' | 'bilibili' | 'direct' }}
+ * @returns {{ url: string; source: 'youtube' | 'bilibili' | 'soundcloud' | 'direct' }}
  */
 export function detectSourceFromUrl(rawUrl) {
   const trimmed = String(rawUrl ?? '').trim();
@@ -138,7 +152,251 @@ export function detectSourceFromUrl(rawUrl) {
   if (host === 'b23.tv' || host.endsWith('.bilibili.com') || host === 'bilibili.com') {
     return { url: parsed.toString(), source: 'bilibili' };
   }
+  if (host === 'soundcloud.com' || host.endsWith('.soundcloud.com') || host === 'on.soundcloud.com') {
+    return { url: parsed.toString(), source: 'soundcloud' };
+  }
   return { url: parsed.toString(), source: 'direct' };
+}
+
+/**
+ * @param {string} domain
+ * @returns {number}
+ */
+function cookieDomainPriority(domain) {
+  if (domain === 'youtube.com' || domain.endsWith('.youtube.com') || domain === 'youtu.be') return 0;
+  if (domain === 'bilibili.com' || domain.endsWith('.bilibili.com')) return 1;
+  if (domain === 'soundcloud.com' || domain.endsWith('.soundcloud.com')) return 2;
+  if (domain === 'google.com' || domain.endsWith('.google.com')) return 3;
+  return 4;
+}
+
+/**
+ * @param {string} rawText
+ */
+function parseNetscapeCookiesText(rawText) {
+  const cleaned = String(rawText ?? '').replace(/^\uFEFF/, '');
+  if (cleaned.includes('\0')) {
+    throw new Error('cookies.txt 不能包含二进制空字节');
+  }
+
+  const lines = cleaned.split(/\r?\n/);
+  /** @type {Set<string>} */
+  const seenDomains = new Set();
+  let hasHeader = false;
+  let sawFirstNonEmpty = false;
+  let cookieCount = 0;
+  let hasYouTube = false;
+  let hasBilibili = false;
+
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+    if (!sawFirstNonEmpty) {
+      sawFirstNonEmpty = true;
+      if (NETSCAPE_HEADER_RE.test(trimmed)) hasHeader = true;
+    }
+    let parseLine = rawLine;
+    if (parseLine.startsWith('#HttpOnly_')) {
+      parseLine = parseLine.slice('#HttpOnly_'.length);
+    } else if (parseLine.trimStart().startsWith('#')) {
+      if (NETSCAPE_HEADER_RE.test(trimmed)) hasHeader = true;
+      continue;
+    }
+    const cols = parseLine.split('\t');
+    if (cols.length < 7) continue;
+    const domain = String(cols[0] ?? '').trim().replace(/^\.+/, '').toLowerCase();
+    const name = String(cols[5] ?? '').trim();
+    if (!domain || /\s/.test(domain) || !name) continue;
+    cookieCount += 1;
+    seenDomains.add(domain);
+    if (domain === 'youtube.com' || domain.endsWith('.youtube.com') || domain === 'youtu.be' || domain === 'google.com' || domain.endsWith('.google.com')) {
+      hasYouTube = true;
+    }
+    if (domain === 'bilibili.com' || domain.endsWith('.bilibili.com') || domain === 'biligame.com' || domain.endsWith('.biligame.com')) {
+      hasBilibili = true;
+    }
+  }
+
+  const domains = [...seenDomains]
+    .sort((a, b) => cookieDomainPriority(a) - cookieDomainPriority(b))
+    .slice(0, 6);
+
+  return { cleaned, hasHeader, cookieCount, hasYouTube, hasBilibili, domains };
+}
+
+/**
+ * @param {string} rawText
+ * @returns {{
+ *   normalizedText: string;
+ *   summary: { cookieCount: number; hasYouTube: boolean; hasBilibili: boolean; domains: string[] };
+ * }}
+ */
+export function normalizeNetscapeCookiesText(rawText) {
+  const parsed = parseNetscapeCookiesText(rawText);
+  if (parsed.cookieCount === 0) {
+    throw new Error('未识别到有效的 Netscape cookies.txt 条目，请使用浏览器扩展导出 Netscape 格式');
+  }
+  let normalizedText = parsed.cleaned.replace(/\r\n/g, '\n');
+  if (!parsed.hasHeader) {
+    normalizedText = `# Netscape HTTP Cookie File\n${normalizedText}`;
+  }
+  if (!normalizedText.endsWith('\n')) {
+    normalizedText += '\n';
+  }
+  return {
+    normalizedText,
+    summary: {
+      cookieCount: parsed.cookieCount,
+      hasYouTube: parsed.hasYouTube,
+      hasBilibili: parsed.hasBilibili,
+      domains: parsed.domains,
+    },
+  };
+}
+
+/**
+ * @param {string} filePath
+ * @returns {CookiesSummary}
+ */
+export function inspectNetscapeCookiesFile(filePath) {
+  /** @type {CookiesSummary} */
+  const empty = {
+    configured: false,
+    cookieCount: 0,
+    updatedAt: null,
+    hasYouTube: false,
+    hasBilibili: false,
+    domains: [],
+  };
+  if (!filePath || !existsSync(filePath)) return empty;
+  try {
+    const st = statSync(filePath);
+    if (!st.isFile() || st.size <= 0) return empty;
+    const raw = readFileSync(filePath, 'utf8');
+    const parsed = parseNetscapeCookiesText(raw);
+    return {
+      configured: parsed.cookieCount > 0,
+      cookieCount: parsed.cookieCount,
+      updatedAt: Math.round(st.mtimeMs),
+      hasYouTube: parsed.hasYouTube,
+      hasBilibili: parsed.hasBilibili,
+      domains: parsed.domains,
+    };
+  } catch {
+    return empty;
+  }
+}
+
+/**
+ * @param {unknown} err
+ * @param {{ source?: string; hasCookies?: boolean }} [opts]
+ * @returns {string}
+ */
+export function formatYtDlpError(err, opts = {}) {
+  let stderr = '';
+  let message = '';
+  let killed = false;
+
+  if (typeof err === 'string') {
+    message = err;
+  } else if (err && typeof err === 'object') {
+    const rec = /** @type {Record<string, unknown>} */ (err);
+    stderr = typeof rec.stderr === 'string' ? rec.stderr : '';
+    message = typeof rec.message === 'string' ? rec.message : '';
+    killed = Boolean(rec.killed);
+  }
+
+  const combined = [stderr, message].filter(Boolean).join('\n').trim();
+  const hasCookies = Boolean(opts.hasCookies);
+
+  if (/sign in to confirm you.?re not a bot|confirm you.?re not a bot|use --cookies-from-browser or --cookies/i.test(combined)) {
+    return hasCookies
+      ? 'YouTube 登录态校验未通过（cookies.txt 可能已过期或缺少登录态），请在「设置」重新导入最新的 cookies.txt，或改用 SoundCloud / B站直链'
+      : 'YouTube 触发风控校验（需要登录态），请在「设置」导入 cookies.txt，或改用免登录的 SoundCloud 搜索 / 直接粘贴 B站 BV 链接';
+  }
+
+  if (/http error 412|precondition failed/i.test(combined)) {
+    return hasCookies
+      ? 'Bilibili 请求触发风控 (HTTP 412)，当前 Cookie 可能已失效；可直接粘贴 B站 BV 视频链接下载，或在「设置」重新导入含 B站登录态的 cookies.txt'
+      : 'Bilibili 搜索触发风控 (HTTP 412)，可直接粘贴 B站 BV 视频链接下载，或在「设置」导入含 B站登录态的 cookies.txt';
+  }
+
+  if (/does not look like a netscape format cookies file|loaderror/i.test(combined)) {
+    return 'cookies.txt 格式无效，请重新导出 Netscape 格式的 cookies.txt 并在「设置」导入';
+  }
+
+  if (/video unavailable|this video is private|members-only|sign in to view|account associated with this video|requires payment|premium/i.test(combined)) {
+    return '该音源不可访问（私密、会员专属或已下架），请尝试其他候选或音源';
+  }
+
+  if (killed || /timed out|etimedout/i.test(combined)) {
+    return '搜索或下载超时，请检查主机网络代理后重试';
+  }
+
+  if (/ffmpeg|ffprobe.*not found|postprocessing.*ffmpeg/i.test(combined)) {
+    return '音频转码失败：未找到可用的 ffmpeg';
+  }
+
+  const lines = combined
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const errorLine = [...lines].reverse().find((line) => /^ERROR:/i.test(line));
+  if (errorLine) {
+    const cleaned = errorLine
+      .replace(/^ERROR:\s*/i, '')
+      .replace(/\b(?:Also\s+)?See\s+https?:\/\/\S+.*$/i, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 220);
+    if (cleaned) return cleaned;
+  }
+
+  const filtered = lines
+    .filter((line) => !/^Command failed:/i.test(line))
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 220);
+  if (filtered) return filtered;
+
+  return combined.replace(/^Command failed:\s*/i, '').replace(/\s+/g, ' ').trim().slice(0, 220) || '在线搜歌或下载失败';
+}
+
+/**
+ * yt-dlp writes updated cookies back to `--cookies FILE` on exit; pass an ephemeral
+ * copy so concurrent searches/downloads never corrupt the stored `cookies.txt`.
+ * @template T
+ * @param {string | undefined} cookiesPath
+ * @param {(ephemeralCookiesPath: string) => Promise<T>} fn
+ * @returns {Promise<T>}
+ */
+async function withEphemeralCookiesCopy(cookiesPath, fn) {
+  const cleanPath = typeof cookiesPath === 'string' ? cookiesPath.trim() : '';
+  if (!cleanPath || !existsSync(cleanPath)) {
+    return fn('');
+  }
+  try {
+    const st = statSync(cleanPath);
+    if (!st.isFile() || st.size <= 0) return fn('');
+  } catch {
+    return fn('');
+  }
+
+  const dir = mkdtempSync(join(tmpdir(), 'friday-ytdlp-cookie-'));
+  try {
+    chmodSync(dir, 0o700);
+    const ephemeralPath = join(dir, 'cookies.txt');
+    copyFileSync(cleanPath, ephemeralPath);
+    chmodSync(ephemeralPath, 0o600);
+    return await fn(ephemeralPath);
+  } finally {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // ignore temp cleanup failure
+    }
+  }
 }
 
 /**
@@ -171,33 +429,41 @@ function pickUniqueTarget(dir, stem, ext) {
 }
 
 /**
- * @param {'youtube' | 'bilibili'} source
+ * @param {'youtube' | 'bilibili' | 'soundcloud'} source
  * @param {string} query
  * @param {number} limit
  * @param {string} ytDlpBin
  * @param {{
  *   execFileFn?: (cmd: string, args: string[], opts?: Record<string, unknown>) => Promise<{ stdout?: unknown; stderr?: unknown }>;
+ *   cookiesPath?: string;
  *   signal?: AbortSignal;
  * }} [deps]
  * @returns {Promise<OnlineSearchCandidate[]>}
  */
 async function runYtDlpSearch(source, query, limit, ytDlpBin, deps = {}) {
-  const prefix = source === 'bilibili' ? 'bilisearch' : 'ytsearch';
+  const prefix = source === 'bilibili' ? 'bilisearch' : source === 'soundcloud' ? 'scsearch' : 'ytsearch';
   const execFn = deps.execFileFn ?? ((cmd, args, opts) => execFileAsync(cmd, args, opts));
-  const args = [
-    '--flat-playlist',
-    '--dump-json',
-    '--no-warnings',
-    '--ignore-errors',
-    '--js-runtimes',
-    'node',
-    `${prefix}${limit}:${query}`,
-  ];
-  const res = await execFn(ytDlpBin, args, {
-    encoding: 'utf8',
-    timeout: SEARCH_TIMEOUT_MS,
-    maxBuffer: 4 * 1024 * 1024,
-    ...(deps.signal ? { signal: deps.signal } : {}),
+  const res = await withEphemeralCookiesCopy(deps.cookiesPath, async (ephemeralCookies) => {
+    const args = [
+      '--flat-playlist',
+      '--dump-json',
+      '--no-warnings',
+      '--ignore-errors',
+      '--js-runtimes',
+      'node',
+      ...(ephemeralCookies ? ['--cookies', ephemeralCookies] : []),
+      `${prefix}${limit}:${query}`,
+    ];
+    try {
+      return await execFn(ytDlpBin, args, {
+        encoding: 'utf8',
+        timeout: SEARCH_TIMEOUT_MS,
+        maxBuffer: 4 * 1024 * 1024,
+        ...(deps.signal ? { signal: deps.signal } : {}),
+      });
+    } catch (err) {
+      throw new Error(formatYtDlpError(err, { source, hasCookies: Boolean(ephemeralCookies) }));
+    }
   });
   const lines = String(res?.stdout ?? '')
     .split(/\r?\n/)
@@ -249,9 +515,10 @@ async function runYtDlpSearch(source, query, limit, ytDlpBin, deps = {}) {
 
 /**
  * @param {string} query
- * @param {{ source?: string; limit?: number; ytDlpPath?: string; signal?: AbortSignal }} [options]
+ * @param {{ source?: string; limit?: number; ytDlpPath?: string; cookiesPath?: string; signal?: AbortSignal }} [options]
  * @param {{
  *   ytDlpPath?: string;
+ *   cookiesPath?: string;
  *   execFileFn?: (cmd: string, args: string[], opts?: Record<string, unknown>) => Promise<{ stdout?: unknown; stderr?: unknown }>;
  * }} [deps]
  * @returns {Promise<{ source: string; candidates: OnlineSearchCandidate[] }>}
@@ -265,19 +532,29 @@ export async function searchOnlineTracks(query, options = {}, deps = {}) {
   }
   const limit = Math.max(1, Math.min(12, Math.round(Number(options.limit ?? 6) || 6)));
   const reqSource = String(options.source ?? 'youtube').trim().toLowerCase();
+  const cookiesPath = options.cookiesPath ?? deps.cookiesPath;
+  const searchDeps = { ...deps, cookiesPath, signal: options.signal };
 
   if (reqSource === 'bilibili') {
-    const candidates = await runYtDlpSearch('bilibili', cleanQuery, limit, ytDlpBin, { ...deps, signal: options.signal });
+    const candidates = await runYtDlpSearch('bilibili', cleanQuery, limit, ytDlpBin, searchDeps);
     return { source: 'bilibili', candidates };
   }
+  if (reqSource === 'soundcloud') {
+    const candidates = await runYtDlpSearch('soundcloud', cleanQuery, limit, ytDlpBin, searchDeps);
+    return { source: 'soundcloud', candidates };
+  }
+  if (reqSource === 'youtube') {
+    const candidates = await runYtDlpSearch('youtube', cleanQuery, limit, ytDlpBin, searchDeps);
+    return { source: 'youtube', candidates };
+  }
 
-  const ytCandidates = await runYtDlpSearch('youtube', cleanQuery, limit, ytDlpBin, { ...deps, signal: options.signal });
-  if (ytCandidates.length > 0 || reqSource === 'youtube') {
+  const ytCandidates = await runYtDlpSearch('youtube', cleanQuery, limit, ytDlpBin, searchDeps);
+  if (ytCandidates.length > 0) {
     return { source: 'youtube', candidates: ytCandidates };
   }
 
-  const biliCandidates = await runYtDlpSearch('bilibili', cleanQuery, limit, ytDlpBin, { ...deps, signal: options.signal });
-  return { source: 'bilibili', candidates: biliCandidates };
+  const scCandidates = await runYtDlpSearch('soundcloud', cleanQuery, limit, ytDlpBin, searchDeps);
+  return { source: 'soundcloud', candidates: scCandidates };
 }
 
 /**
@@ -323,10 +600,12 @@ export function upsertDownloadJob(pluginDataDir, job) {
  *   artistHint?: string;
  *   musicDir: string;
  *   ytDlpPath?: string;
+ *   cookiesPath?: string;
  *   signal?: AbortSignal;
  * }} params
  * @param {{
  *   ytDlpPath?: string;
+ *   cookiesPath?: string;
  *   execFileFn?: (cmd: string, args: string[], opts?: Record<string, unknown>) => Promise<{ stdout?: unknown; stderr?: unknown }>;
  * }} [deps]
  * @returns {Promise<{ filePath: string; title: string; artist: string; source: string; url: string }>}
@@ -337,6 +616,7 @@ export async function downloadOnlineAudioFile(params, deps = {}) {
     throw new Error('未找到 yt-dlp 可执行文件，请先安装 yt-dlp');
   }
 
+  const cookiesPath = params.cookiesPath ?? deps.cookiesPath;
   let targetUrl = '';
   let resolvedSource = String(params.source ?? 'youtube').trim().toLowerCase() || 'youtube';
   let title = String(params.titleHint ?? '').trim();
@@ -351,6 +631,7 @@ export async function downloadOnlineAudioFile(params, deps = {}) {
       source: resolvedSource === 'auto' ? 'auto' : resolvedSource,
       limit: 3,
       ytDlpPath: ytDlpBin,
+      cookiesPath,
       signal: params.signal,
     }, deps);
     const best = searchRes.candidates[0];
@@ -381,30 +662,37 @@ export async function downloadOnlineAudioFile(params, deps = {}) {
   const execFn = deps.execFileFn ?? ((cmd, args, opts) => execFileAsync(cmd, args, opts));
 
   try {
-    const args = [
-      '--no-playlist',
-      '--no-warnings',
-      '--no-progress',
-      '--js-runtimes',
-      'node',
-      '-x',
-      '--audio-format',
-      audioFormat,
-      '--audio-quality',
-      '0',
-      '--embed-metadata',
-      '--add-metadata',
-      '-o',
-      join(tmpDir, '%(title).100B.%(ext)s'),
-      '--print',
-      'after_move:filepath',
-      targetUrl,
-    ];
-    const res = await execFn(ytDlpBin, args, {
-      encoding: 'utf8',
-      timeout: DOWNLOAD_TIMEOUT_MS,
-      maxBuffer: 4 * 1024 * 1024,
-      ...(params.signal ? { signal: params.signal } : {}),
+    const res = await withEphemeralCookiesCopy(cookiesPath, async (ephemeralCookies) => {
+      const args = [
+        '--no-playlist',
+        '--no-warnings',
+        '--no-progress',
+        '--js-runtimes',
+        'node',
+        '-x',
+        '--audio-format',
+        audioFormat,
+        '--audio-quality',
+        '0',
+        '--embed-metadata',
+        '--add-metadata',
+        '-o',
+        join(tmpDir, '%(title).100B.%(ext)s'),
+        '--print',
+        'after_move:filepath',
+        ...(ephemeralCookies ? ['--cookies', ephemeralCookies] : []),
+        targetUrl,
+      ];
+      try {
+        return await execFn(ytDlpBin, args, {
+          encoding: 'utf8',
+          timeout: DOWNLOAD_TIMEOUT_MS,
+          maxBuffer: 4 * 1024 * 1024,
+          ...(params.signal ? { signal: params.signal } : {}),
+        });
+      } catch (err) {
+        throw new Error(formatYtDlpError(err, { source: resolvedSource, hasCookies: Boolean(ephemeralCookies) }));
+      }
     });
 
     const printedLines = String(res?.stdout ?? '')

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -11,6 +11,7 @@ import { serve } from '../src/server.js';
 import { startWeb } from '../src/web-server.js';
 import {
   ensureMusicStreamSecret,
+  MAX_MUSIC_COOKIES_BYTES,
   MAX_MUSIC_UPLOAD_BYTES,
   signMusicStreamToken,
   verifyMusicStreamToken,
@@ -18,7 +19,7 @@ import {
 import { tryPluginVoiceFastpath } from '../src/plugin.js';
 import { runAction, stopAllMusicWatchers } from '../plugins/music/index.mjs';
 import { parseMusicVoiceUtterance, handleMusicVoiceFastpath } from '../plugins/music/fastpath.mjs';
-import { detectSourceFromUrl, searchOnlineTracks } from '../plugins/music/downloader.mjs';
+import { detectSourceFromUrl, formatYtDlpError, searchOnlineTracks } from '../plugins/music/downloader.mjs';
 import { scanLibrary, searchLocalTracks } from '../plugins/music/library.mjs';
 
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -373,7 +374,220 @@ test('online music search, SSRF URL rejection, and download-to-library', async (
     assert.equal(dlRes.ok, true);
     assert.equal(dlRes.data?.track?.title, '稻香');
     assert.equal(existsSync(String(dlRes.data?.filePath)), true);
+
+    // SoundCloud URL detection & scsearch routing
+    assert.equal(detectSourceFromUrl('https://soundcloud.com/artist/track-name').source, 'soundcloud');
+    assert.equal(detectSourceFromUrl('https://on.soundcloud.com/abc123').source, 'soundcloud');
+    let sawScSearch = false;
+    const scRes = await searchOnlineTracks('晴天 周杰伦', { source: 'soundcloud', limit: 3 }, {
+      ytDlpPath: '/usr/bin/yt-dlp',
+      execFileFn: async (_cmd: string, args: string[]) => {
+        sawScSearch = args.some(a => a.startsWith('scsearch3:'));
+        return {
+          stdout: JSON.stringify({
+            id: 'sc1',
+            title: '晴天（SoundCloud）',
+            uploader: 'ArtistSC',
+            duration: 210,
+            webpage_url: 'https://soundcloud.com/artist/qingtian',
+          }),
+        };
+      },
+    });
+    assert.equal(sawScSearch, true);
+    assert.equal(scRes.source, 'soundcloud');
+    assert.equal(scRes.candidates[0]?.source, 'soundcloud');
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('yt-dlp error formatting, ephemeral cookies.txt handling, legacy job normalization, and /api/music/cookies endpoint', async () => {
+  // 1. formatYtDlpError unit checks
+  const ytNoCookie = formatYtDlpError({
+    message: 'Command failed: /home/duty/.local/bin/yt-dlp ...',
+    stderr: 'ERROR: [youtube] L3GughXEmyY: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication.',
+  }, { source: 'youtube', hasCookies: false });
+  assert.match(ytNoCookie, /YouTube 触发风控校验.*SoundCloud/);
+
+  const ytWithCookie = formatYtDlpError(
+    'ERROR: [youtube] abc: Sign in to confirm you\'re not a bot.',
+    { source: 'youtube', hasCookies: true },
+  );
+  assert.match(ytWithCookie, /cookies\.txt 可能已过期/);
+
+  const biliNoCookie = formatYtDlpError('ERROR: HTTP Error 412: Precondition Failed', { source: 'bilibili', hasCookies: false });
+  assert.match(biliNoCookie, /HTTP 412.*BV/);
+
+  const biliWithCookie = formatYtDlpError('ERROR: HTTP Error 412: Precondition Failed', { source: 'bilibili', hasCookies: true });
+  assert.match(biliWithCookie, /HTTP 412.*已失效/);
+
+  const badCookieErr = formatYtDlpError('ERROR: cookies.txt does not look like a Netscape format cookies file', {});
+  assert.match(badCookieErr, /cookies\.txt 格式无效/);
+
+  const genericErr = formatYtDlpError({
+    message: 'Command failed: /usr/bin/yt-dlp https://example.com/a',
+    stderr: 'ERROR: [generic] Unsupported URL: https://example.com/a See https://github.com/yt-dlp/yt-dlp',
+  });
+  assert.equal(genericErr.includes('Command failed:'), false);
+  assert.match(genericErr, /Unsupported URL/);
+
+  // 2. HTTP /api/music/cookies upload, ephemeral --cookies copy, legacy error normalization, and clearCookies
+  const root = mkdtempSync(join(tmpdir(), 'friday-music-cookies-'));
+  const home = join(root, 'home');
+  const musicDir = join(root, 'music');
+  mkdirSync(home, { recursive: true, mode: 0o700 });
+  mkdirSync(musicDir, { recursive: true });
+  const daemon = await serve({ home, mode: 'offline', offlineDelayMs: 20 });
+  const web = await startWeb({ home });
+  const entry = new URL(web.url);
+  const base = entry.origin;
+  const token = new URLSearchParams(entry.hash.slice(1)).get('token')!;
+  const authHeaders = { authorization: `Bearer ${token}` };
+
+  try {
+    await runAction('config', { musicDir }, { homeDir: home });
+
+    // Auth required
+    const unauth = await fetch(`${base}/api/music/cookies`, {
+      method: 'POST',
+      body: '.youtube.com\tTRUE\t/\tTRUE\t1893456000\tSID\tsecretval\n',
+    });
+    assert.equal(unauth.status, 401);
+
+    // Reject empty, binary NUL, invalid format, and oversized body
+    const emptyRes = await fetch(`${base}/api/music/cookies`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: '',
+    });
+    assert.equal(emptyRes.status, 400);
+
+    const nulRes = await fetch(`${base}/api/music/cookies`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: '.youtube.com\tTRUE\t/\tTRUE\t1893456000\tSID\tabc\0def\n',
+    });
+    assert.equal(nulRes.status, 400);
+
+    const badFormatRes = await fetch(`${base}/api/music/cookies`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: '{"not":"netscape"}\nhello world\n',
+    });
+    assert.equal(badFormatRes.status, 400);
+
+    const overRes = await fetch(`${base}/api/music/cookies`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: 'x'.repeat(MAX_MUSIC_COOKIES_BYTES + 10),
+    });
+    assert.equal(overRes.status, 413);
+
+    // Valid Netscape lines WITHOUT header -> auto-prepends header, sets 0600, redacts secret values
+    const sampleCookies = [
+      '#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t1893456000\tHSID\tsuper-secret-yt-cookie',
+      '.bilibili.com\tTRUE\t/\tFALSE\t1893456000\tSESSDATA\tsuper-secret-bili-cookie',
+    ].join('\n');
+    const okCookies = await fetch(`${base}/api/music/cookies`, {
+      method: 'POST',
+      headers: { ...authHeaders, 'content-type': 'text/plain; charset=utf-8' },
+      body: sampleCookies,
+    });
+    assert.equal(okCookies.status, 200);
+    const cookiesPayload = await okCookies.json() as {
+      ok: boolean;
+      cookies: { configured: boolean; cookieCount: number; hasYouTube: boolean; hasBilibili: boolean; domains: string[] };
+    };
+    const serialized = JSON.stringify(cookiesPayload);
+    assert.equal(cookiesPayload.ok, true);
+    assert.equal(cookiesPayload.cookies.configured, true);
+    assert.equal(cookiesPayload.cookies.cookieCount, 2);
+    assert.equal(cookiesPayload.cookies.hasYouTube, true);
+    assert.equal(cookiesPayload.cookies.hasBilibili, true);
+    assert.equal(serialized.includes('super-secret'), false, 'cookie values must never be echoed');
+    assert.equal(serialized.includes('SESSDATA'), false, 'cookie names must never be echoed');
+
+    const pluginDataDir = join(home, 'plugins', 'music');
+    const savedCookiesPath = join(pluginDataDir, 'cookies.txt');
+    assert.equal(existsSync(savedCookiesPath), true);
+    assert.equal(statSync(savedCookiesPath).mode & 0o777, 0o600);
+    const savedText = readFileSync(savedCookiesPath, 'utf8');
+    assert.match(savedText, /^# Netscape HTTP Cookie File\n/);
+
+    // Verify ephemeral --cookies copy is passed to yt-dlp during search-online & download, then cleaned up
+    const seenCookiePaths: string[] = [];
+    const mockExecFile = async (_cmd: string, args: string[]) => {
+      const idx = args.indexOf('--cookies');
+      assert.ok(idx >= 0, 'yt-dlp must receive --cookies flag when cookies.txt is configured');
+      const passedCookiePath = args[idx + 1]!;
+      assert.notEqual(passedCookiePath, savedCookiesPath, 'must use ephemeral copy rather than mutating stored cookies.txt');
+      assert.equal(existsSync(passedCookiePath), true);
+      seenCookiePaths.push(passedCookiePath);
+
+      if (args.includes('--flat-playlist')) {
+        return {
+          stdout: JSON.stringify({ id: 'yt1', title: '晴天', artist: '周杰伦', duration: 269, webpage_url: 'https://www.youtube.com/watch?v=yt1' }),
+        };
+      }
+      const outIdx = args.indexOf('-o');
+      const outDir = resolve(args[outIdx + 1]!, '..');
+      const outFile = join(outDir, '晴天.mp3');
+      writeFileSync(outFile, Buffer.from('ID3mock-mp3-data'));
+      return { stdout: `${outFile}\n`, stderr: '' };
+    };
+
+    const searchActionRes = await runAction('search-online', { query: '晴天', source: 'youtube' }, { homeDir: home }, {
+      ytDlpPath: '/usr/bin/yt-dlp',
+      execFileFn: mockExecFile,
+    });
+    assert.equal(searchActionRes.ok, true);
+
+    const dlActionRes = await runAction('download', { url: 'https://www.youtube.com/watch?v=yt1', playAfter: false }, { homeDir: home }, {
+      ytDlpPath: '/usr/bin/yt-dlp',
+      execFileFn: mockExecFile,
+    });
+    assert.equal(dlActionRes.ok, true);
+    assert.equal(seenCookiePaths.length, 2);
+    for (const tmpCookie of seenCookiePaths) {
+      assert.equal(existsSync(tmpCookie), false, 'ephemeral cookie copy must be cleaned up after yt-dlp finishes');
+    }
+
+    // Legacy raw Command failed error in downloads.json is normalized on dashboard
+    writeFileSync(join(pluginDataDir, 'downloads.json'), JSON.stringify({
+      updatedAt: Date.now(),
+      jobs: [{
+        id: 'dl-legacy',
+        status: 'error',
+        query: '',
+        url: 'https://www.youtube.com/watch?v=L3GughXEmyY',
+        source: 'youtube',
+        title: '慌啥子嘛',
+        artist: 'Z Y',
+        error: 'Command failed: /home/duty/.local/bin/yt-dlp ... https://www.youtube.com/watch?v=L3GughXEmyY\nERROR: [youtube] L3GughXEmyY: Sign in to confirm you’re not a bot.',
+        startedAt: Date.now() - 1000,
+        finishedAt: Date.now(),
+      }],
+    }));
+
+    const dashBeforeClear = await runAction('dashboard', { live: false }, { homeDir: home });
+    assert.equal(dashBeforeClear.ok, true);
+    assert.equal(dashBeforeClear.data?.cookies?.configured, true);
+    assert.equal(dashBeforeClear.data?.downloads?.[0]?.error.includes('Command failed:'), false);
+    assert.match(String(dashBeforeClear.data?.downloads?.[0]?.error), /cookies\.txt 可能已过期/);
+
+    // Clear cookies via config action
+    const cleared = await runAction('config', { clearCookies: true }, { homeDir: home });
+    assert.equal(cleared.ok, true);
+    assert.equal(existsSync(savedCookiesPath), false);
+    assert.equal(cleared.data?.cookies?.configured, false);
+    const dashAfterClear = await runAction('dashboard', { live: false }, { homeDir: home });
+    assert.equal(dashAfterClear.data?.cookies?.configured, false);
+    assert.match(String(dashAfterClear.data?.downloads?.[0]?.error), /YouTube 触发风控校验/);
+  } finally {
+    stopAllMusicWatchers();
+    await web.close();
+    await daemon.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

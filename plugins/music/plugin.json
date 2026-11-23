@@ -1,7 +1,7 @@
 {
   "name": "music",
   "title": "音乐点播 · 小爱曲库",
-  "description": "管理本地音乐曲库与歌单、通过 yt-dlp 搜索并下载在线歌曲（YouTube / Bilibili / 音频直链）、支持网页试听与文件上传，并将本地音频经纯内网流媒体推送至小爱音箱 Pro (LX06) 排队连播与语音快通道点歌。",
+  "description": "管理本地音乐曲库与歌单、通过 yt-dlp 搜索并下载在线歌曲（YouTube / Bilibili / SoundCloud / 音频直链，支持导入 cookies.txt 认证）、支持网页试听与文件上传，并将本地音频经纯内网流媒体推送至小爱音箱 Pro (LX06) 排队连播与语音快通道点歌。",
   "entry": "index.mjs",
   "runtime": "in-process",
   "voiceFastpath": true,
@@ -121,13 +121,13 @@
     {
       "name": "search-online",
       "label": "在线搜索音源",
-      "description": "使用 yt-dlp 在 YouTube / Bilibili 搜索在线音乐候选列表（返回标题、作者、时长与链接，不直接下载）。",
+      "description": "使用 yt-dlp 在 YouTube / Bilibili / SoundCloud 搜索在线音乐候选列表（返回标题、作者、时长与链接，不直接下载；支持已导入的 cookies.txt）。",
       "defaultArgs": { "query": "", "source": "youtube", "limit": 6 }
     },
     {
       "name": "download",
       "label": "下载音乐到本地",
-      "description": "按链接（url）或关键词（query）自动提取并转码音频保存到本地曲库，支持 playAfter=true 下载完成后立即播放，async=true 后台异步下载。",
+      "description": "按链接（url）或关键词（query）自动提取并转码音频保存到本地曲库（支持 YouTube / Bilibili / SoundCloud / 音频直链及 cookies.txt），支持 playAfter=true 下载完成后立即播放，async=true 后台异步下载。",
       "defaultArgs": { "query": "", "url": "", "source": "youtube", "playAfter": false }
     },
     {
@@ -139,7 +139,7 @@
     {
       "name": "config",
       "label": "插件配置",
-      "description": "查看或更新音乐目录（musicDir）、局域网流地址（streamBaseUrl）、音箱 SSH（speakerSsh）、默认音量、下载格式与搜索源。",
+      "description": "查看或更新音乐目录（musicDir）、局域网流地址（streamBaseUrl）、音箱 SSH（speakerSsh）、默认音量、下载格式、搜索源及 cookies.txt 认证管理。",
       "defaultArgs": {}
     }
   ]
