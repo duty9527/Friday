@@ -19,6 +19,7 @@ import {
   type SearchContextResult,
 } from './store/memory-store.js';
 import {
+  formatDiaryLogicalDate,
   formatLocalDate,
   NotebookStore,
   NoteConflictError,
@@ -113,7 +114,7 @@ export type {
   UsageTodaySummary,
   UsageTotalsView,
 };
-export { formatLocalDate, memoryDocumentText, normalizeDiaryMood, NoteConflictError, TaskConflictError, validateDateString };
+export { formatDiaryLogicalDate, formatLocalDate, memoryDocumentText, normalizeDiaryMood, NoteConflictError, TaskConflictError, validateDateString };
 
 /**
  * Unified persistence facade delegating to specialized SQLite sub-stores while
@@ -428,16 +429,24 @@ export class Store {
     return this.notebook.getDiaryEntry(idOrDate);
   }
 
-  getDiaryByDate(date: string): DiaryEntry | undefined {
-    return this.notebook.getDiaryByDate(date);
+  listDiaryByDate(date: string): DiaryEntry[] {
+    return this.notebook.listDiaryByDate(date);
+  }
+
+  listDiaryTags(): NoteTagCount[] {
+    return this.notebook.listDiaryTags();
+  }
+
+  listDiaryMonths(): string[] {
+    return this.notebook.listDiaryMonths();
   }
 
   writeDiaryEntry(input: WriteDiaryInput): DiaryEntry {
     return this.notebook.writeDiaryEntry(input);
   }
 
-  deleteDiaryEntry(idOrDate: string): boolean {
-    return this.notebook.deleteDiaryEntry(idOrDate);
+  deleteDiaryEntry(id: string): boolean {
+    return this.notebook.deleteDiaryEntry(id);
   }
 
   private resolveActivePromotedMemoryId(candidateId?: string): string | undefined {
@@ -463,23 +472,6 @@ export class Store {
     });
     const updatedNote = this.notebook.setNotePromotedMemory(note.id, memory.id);
     return { note: updatedNote, memory };
-  }
-
-  async promoteDiaryToMemory(idOrDate: string): Promise<{ entry: DiaryEntry; memory: MemoryCard }> {
-    const entry = this.notebook.getDiaryEntry(idOrDate);
-    const contentText = (entry.content.trim() || entry.title.trim()).slice(0, 8192);
-    const existingMemoryId = this.resolveActivePromotedMemoryId(entry.promotedMemoryId);
-    const topicPrefix = `F.R.I.D.A.Y. 日记 · ${entry.date}`;
-    const rawTopic = entry.title.includes(entry.date) ? `F.R.I.D.A.Y. 日记 · ${entry.title}` : `${topicPrefix} ${entry.title}`;
-    const memory = await this.memories.saveMemoryAsync({
-      id: existingMemoryId,
-      topic: rawTopic.trim().slice(0, 160),
-      content: contentText,
-      tags: [...new Set(['日记', ...entry.tags])].slice(0, 12),
-      sourceMessageId: entry.sourceMessageId,
-    });
-    const updatedEntry = this.notebook.setDiaryPromotedMemory(entry.id, memory.id);
-    return { entry: updatedEntry, memory };
   }
 
   // --- Distiller & Subconscious / Dreamer State ---

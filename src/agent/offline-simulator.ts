@@ -338,6 +338,12 @@ export function offlineFactory(delayMs = 100): AgentFactory {
             return respond(JSON.stringify({ operations: [] }));
           }
           if (role === 'dreamer') {
+            if (event.kind === 'EVENING_DIARY') {
+              return respond(JSON.stringify({
+                written: false,
+                reason: 'offline simulator skipped',
+              }));
+            }
             const mat = (event.material ?? {}) as {
               rawStubs?: Array<{ id: string; topic: string; content: string; cwd?: string; tags?: string[] }>;
               distantMemories?: Array<{ id: string; topic: string }>;

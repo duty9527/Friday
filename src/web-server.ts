@@ -667,6 +667,7 @@ export async function startWeb(options: StartWebOptions): Promise<{ url: string;
               mood: search.get('mood') || undefined,
               tag: search.get('tag') || undefined,
               month: search.get('month') || undefined,
+              date: search.get('date') || undefined,
               limit: numeric('limit'),
             };
             break;
@@ -686,7 +687,7 @@ export async function startWeb(options: StartWebOptions): Promise<{ url: string;
           '/api/chat': 'chat', '/api/stop': 'stop', '/api/resume': 'resume', '/api/chat-stop': 'chat-stop',
           '/api/memory-save': 'memory-save', '/api/memory-link': 'memory-link', '/api/memory-pin': 'memory-pin', '/api/memory-remove': 'memory-remove',
           '/api/note-save': 'note-save', '/api/note-pin': 'note-pin', '/api/note-remove': 'note-remove', '/api/note-promote-memory': 'note-promote-memory',
-          '/api/diary-write': 'diary-write', '/api/diary-remove': 'diary-remove', '/api/diary-promote-memory': 'diary-promote-memory',
+          '/api/diary-remove': 'diary-remove',
           '/api/timer-add': 'timer-add', '/api/timer-toggle': 'timer-toggle', '/api/timer-complete': 'timer-complete', '/api/timer-remove': 'timer-remove',
           '/api/plugin-run': 'plugin-run',
           '/api/im-save': 'im-save', '/api/im-toggle': 'im-toggle', '/api/im-remove': 'im-remove', '/api/im-test': 'im-test',

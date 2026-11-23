@@ -526,7 +526,7 @@ export interface VoiceListeningView {
 }
 
 export type NoteAuthor = 'friday' | 'user';
-export type DiarySource = 'chat' | 'sleep' | 'manual';
+export type DiarySource = 'chat' | 'evening' | 'sleep';
 export type DiaryMood =
   | 'neutral'
   | 'happy'
@@ -566,7 +566,6 @@ export interface DiaryEntry {
   tags: string[];
   source: DiarySource;
   sourceMessageId?: string;
-  promotedMemoryId?: string;
   createdAt: number;
   updatedAt: number;
 }

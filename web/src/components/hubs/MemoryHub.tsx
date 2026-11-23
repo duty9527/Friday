@@ -2,6 +2,7 @@ import type {
   ContextSearchHit,
   DiaryEntry,
   DiaryMood,
+  DiarySource,
   MemoryCard,
   NoteItem,
   NoteTagCount,
@@ -55,10 +56,23 @@ const DIARY_MOODS: readonly DiaryMood[] = [
   'sad',
 ];
 
+const DIARY_SOURCE_LABELS: Record<DiarySource, string> = {
+  chat: '对话随兴',
+  evening: '晚间自省',
+  sleep: '潜意识夜记',
+};
+
 function safeDiaryMood(raw: string | undefined): DiaryMood {
-  if (!raw) return 'neutral';
+  if (!raw) return 'calm';
   if ((DIARY_MOODS as readonly string[]).includes(raw)) return raw as DiaryMood;
-  return normalizeBotExpression(raw) ?? 'neutral';
+  return normalizeBotExpression(raw) ?? 'calm';
+}
+
+function formatTimeHHMM(at: number): string {
+  if (!Number.isFinite(at)) return '--:--';
+  const dt = new Date(at);
+  if (Number.isNaN(dt.getTime())) return '--:--';
+  return `${String(dt.getHours()).padStart(2, '0')}:${String(dt.getMinutes()).padStart(2, '0')}`;
 }
 
 const SELECT_SM_CLASS =
@@ -1177,22 +1191,27 @@ function NotesPanel() {
 }
 
 function DiaryPanel() {
-  const { ready, authExpired, api, refreshView } = useFriday();
+  const { view, ready, authExpired, api, refreshView } = useFriday();
   const [entries, setEntries] = useState<DiaryEntry[]>([]);
+  const [diaryTags, setDiaryTags] = useState<NoteTagCount[]>([]);
+  const [diaryMonths, setDiaryMonths] = useState<string[]>([]);
   const [query, setQuery] = useState('');
   const [moodFilter, setMoodFilter] = useState<'all' | DiaryMood>('all');
+  const [monthFilter, setMonthFilter] = useState('');
+  const [tagFilter, setTagFilter] = useState('');
+  const [showAllTags, setShowAllTags] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [statusMsg, setStatusMsg] = useState('');
   const [deleteTarget, setDeleteTarget] = useState<DiaryEntry | null>(null);
   const [busy, setBusy] = useState(false);
-
-  const [showWrite, setShowWrite] = useState(false);
-  const [newTitle, setNewTitle] = useState('');
-  const [newContent, setNewContent] = useState('');
-  const [newMood, setNewMood] = useState<DiaryMood>('calm');
   const [viewerPayload, setViewerPayload] = useState<FullContentPayload | null>(null);
 
   const seqRef = useRef(0);
+
+  const diarySyncSig = useMemo(() => {
+    const s = view?.notebookSummary;
+    return `${s?.diaryCount ?? 0}:${s?.latestDiaryDate ?? ''}:${s?.latestDiaryUpdatedAt ?? ''}`;
+  }, [view?.notebookSummary]);
 
   const loadDiary = useCallback(async (selectFirst = false) => {
     if (!ready || authExpired) return;
@@ -1200,27 +1219,44 @@ function DiaryPanel() {
     const params = new URLSearchParams();
     if (query.trim()) params.set('query', query.trim());
     if (moodFilter !== 'all') params.set('mood', moodFilter);
+    if (monthFilter.trim()) params.set('month', monthFilter.trim());
+    if (tagFilter.trim()) params.set('tag', tagFilter.trim());
     try {
-      const res = await api<{ items?: DiaryEntry[] }>(`/api/diary${params.size ? `?${params}` : ''}`);
+      const res = await api<{ items?: DiaryEntry[]; tags?: NoteTagCount[]; months?: string[] }>(
+        `/api/diary${params.size ? `?${params}` : ''}`,
+      );
       if (seq !== seqRef.current) return;
       const items = res.items ?? [];
       setEntries(items);
-      if (selectFirst && items[0]) setSelectedId(prev => (prev && items.some(i => i.id === prev) ? prev : items[0]!.id));
+      setDiaryTags(res.tags ?? []);
+      setDiaryMonths(res.months ?? []);
+      if (selectFirst) {
+        if (items[0]) {
+          setSelectedId(prev => (prev && items.some(i => i.id === prev) ? prev : items[0]!.id));
+        } else {
+          setSelectedId(null);
+        }
+      }
     } catch (e) {
       if (seq === seqRef.current) setStatusMsg(`加载失败：${errorText(e)}`);
     }
-  }, [api, authExpired, moodFilter, query, ready]);
+  }, [api, authExpired, monthFilter, moodFilter, query, ready, tagFilter]);
 
   useEffect(() => {
     void loadDiary(true);
-  }, [loadDiary]);
+  }, [loadDiary, diarySyncSig]);
+
+  useEffect(() => {
+    setStatusMsg('');
+  }, [selectedId]);
 
   const selected = entries.find(e => e.id === selectedId) ?? entries[0];
   const disabled = !ready || authExpired || busy;
+  const hasFilters = Boolean(query.trim() || moodFilter !== 'all' || monthFilter.trim() || tagFilter.trim());
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden">
-      {/* Fixed Search & Mood Toolbar */}
+      {/* Fixed Search, Mood & Month Toolbar */}
       <div className="flex shrink-0 flex-wrap items-center gap-2">
         <div className="min-w-44 flex-1">
           <Input
@@ -1241,21 +1277,48 @@ function DiaryPanel() {
             <option key={m} value={m}>{BOT_EXPRESSION_META[m].plainEmoji} {BOT_EXPRESSION_META[m].label}</option>
           ))}
         </select>
-        <Button
-          size="sm"
-          variant={showWrite ? 'secondary' : 'outline'}
-          onClick={() => setShowWrite(v => !v)}
+        <select
+          aria-label="按月份筛选"
+          value={monthFilter}
+          onChange={e => setMonthFilter(e.target.value)}
+          className={SELECT_SM_CLASS}
         >
-          <PlusIcon className="size-3.5" />
-          <span>手动写一篇</span>
-        </Button>
+          <option value="">全部月份</option>
+          {diaryMonths.map(m => (
+            <option key={m} value={m}>{m}</option>
+          ))}
+        </select>
         <Button size="icon-sm" variant="ghost" aria-label="刷新日记" onClick={() => void loadDiary(true)}>
           <RefreshCwIcon className="size-3.5" />
         </Button>
       </div>
 
-      {/* Split Diary Archive + Fixed-Header Internal-Scroll Reader/Writer */}
-      <div className="grid min-h-0 flex-1 gap-3 overflow-hidden max-md:flex max-md:flex-col md:grid-cols-[240px_1fr]">
+      {/* Optional Tag Filter Strip */}
+      {diaryTags.length > 0 && (
+        <div className="flex shrink-0 items-center gap-1 overflow-x-auto pb-0.5">
+          <Button size="xs" variant={!tagFilter ? 'secondary' : 'ghost'} onClick={() => setTagFilter('')}>
+            全部标签
+          </Button>
+          {(showAllTags ? diaryTags : diaryTags.slice(0, 10)).map(t => (
+            <Button
+              key={t.tag}
+              size="xs"
+              variant={tagFilter === t.tag ? 'secondary' : 'outline'}
+              onClick={() => setTagFilter(prev => (prev === t.tag ? '' : t.tag))}
+            >
+              {t.tag} ({t.count})
+            </Button>
+          ))}
+          {diaryTags.length > 10 && (
+            <Button size="xs" variant="ghost" onClick={() => setShowAllTags(v => !v)}>
+              {showAllTags ? '收起标签' : `全部 (${diaryTags.length})`}
+            </Button>
+          )}
+        </div>
+      )}
+
+      {/* Split Diary Archive + Fixed-Header Internal-Scroll Reader */}
+      <div className="grid min-h-0 flex-1 gap-3 overflow-hidden max-md:flex max-md:flex-col md:grid-cols-[260px_1fr]">
         <Card className="flex min-h-0 flex-col overflow-hidden text-xs max-md:h-36 max-md:shrink-0">
           <div className="flex shrink-0 items-center justify-between border-b px-3 py-2">
             <span className="font-semibold text-foreground">日记归档</span>
@@ -1263,30 +1326,36 @@ function DiaryPanel() {
           </div>
           <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto p-2">
             {entries.length === 0 ? (
-              <div className="flex h-full items-center justify-center py-6 text-center text-muted-foreground">
-                暂无日记记录。
+              <div className="flex h-full items-center justify-center px-3 py-6 text-center text-muted-foreground">
+                {hasFilters ? '没有符合当前筛选条件的日记。' : 'F.R.I.D.A.Y. 还没有写下日记，她会在对话、晚间自省或梦境时随兴记录。'}
               </div>
             ) : (
               entries.map(entry => {
                 const mood = safeDiaryMood(entry.mood);
+                const sourceLabel = DIARY_SOURCE_LABELS[entry.source] ?? entry.source;
                 return (
                   <button
                     key={entry.id}
                     type="button"
-                    onClick={() => {
-                      setSelectedId(entry.id);
-                      setShowWrite(false);
-                    }}
+                    onClick={() => setSelectedId(entry.id)}
                     className={cn(
                       'w-full cursor-pointer rounded-lg border p-2 text-start text-xs transition-colors',
-                      selected?.id === entry.id && !showWrite ? 'border-ring bg-accent' : 'bg-card hover:bg-accent/50',
+                      selected?.id === entry.id ? 'border-ring bg-accent' : 'bg-card hover:bg-accent/50',
                     )}
                   >
                     <div className="flex items-center justify-between gap-1">
-                      <span className="font-mono text-[11px] text-muted-foreground">{entry.date}</span>
+                      <span className="font-mono text-[11px] text-muted-foreground">
+                        {entry.date} · {formatTimeHHMM(entry.createdAt)}
+                      </span>
                       <span>{BOT_EXPRESSION_META[mood].plainEmoji}</span>
                     </div>
                     <div className="mt-0.5 truncate font-medium text-foreground">{entry.title}</div>
+                    <div className="mt-1 flex items-center gap-1 overflow-hidden text-[10px] text-muted-foreground">
+                      <span className="shrink-0">{sourceLabel}</span>
+                      {entry.tags.slice(0, 2).map(tag => (
+                        <Badge key={tag} size="sm" variant="secondary" className="max-w-20 truncate">{tag}</Badge>
+                      ))}
+                    </div>
                   </button>
                 );
               })
@@ -1295,108 +1364,43 @@ function DiaryPanel() {
         </Card>
 
         <Card className="flex min-h-0 flex-1 flex-col overflow-hidden text-xs">
-          {showWrite ? (
-            <>
-              <div className="shrink-0 space-y-2 border-b px-4 py-3">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-sm font-semibold text-foreground">写一篇新日记</span>
-                  <div className="flex items-center gap-1.5">
-                    <Button size="xs" variant="ghost" onClick={() => setShowWrite(false)}>取消</Button>
-                    <Button
-                      size="xs"
-                      disabled={disabled || !newContent.trim()}
-                      onClick={async () => {
-                        setBusy(true);
-                        try {
-                          const res = await api<{ entry: DiaryEntry }>('/api/diary-write', {
-                            title: newTitle.trim() || '日常随记',
-                            content: newContent.trim(),
-                            mood: newMood,
-                            source: 'manual',
-                          });
-                          setNewTitle('');
-                          setNewContent('');
-                          setShowWrite(false);
-                          setSelectedId(res.entry.id);
-                          await Promise.all([loadDiary(false), refreshView()]);
-                        } catch (e) {
-                          setStatusMsg(errorText(e));
-                        } finally {
-                          setBusy(false);
-                        }
-                      }}
-                    >
-                      写入日记
-                    </Button>
-                  </div>
-                </div>
-                <div className="grid gap-2 sm:grid-cols-[1fr_140px]">
-                  <Input size="sm" placeholder="日记标题" value={newTitle} onChange={e => setNewTitle(e.target.value)} />
-                  <select
-                    aria-label="日记心情"
-                    value={newMood}
-                    onChange={e => setNewMood(e.target.value as DiaryMood)}
-                    className={SELECT_SM_CLASS}
-                  >
-                    {DIARY_MOODS.map(m => (
-                      <option key={m} value={m}>{BOT_EXPRESSION_META[m].plainEmoji} {BOT_EXPRESSION_META[m].label}</option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-              <div className="min-h-0 flex-1 p-3">
-                <textarea
-                  aria-label="日记 Markdown 正文"
-                  placeholder="写点什么（支持 Markdown）…"
-                  value={newContent}
-                  onChange={e => setNewContent(e.target.value)}
-                  className={EDITOR_TEXTAREA_CLASS}
-                />
-              </div>
-            </>
-          ) : !selected ? (
+          {!selected ? (
             <div className="flex flex-1 items-center justify-center p-6 text-center text-muted-foreground">
-              暂无日记选中。
+              {hasFilters ? '没有符合当前筛选条件的日记。' : 'F.R.I.D.A.Y. 还没有写下日记，她会在对话、晚间自省或梦境时随兴记录。'}
             </div>
           ) : (
             <>
               {/* Fixed Diary Header */}
-              <div className="shrink-0 space-y-1.5 border-b px-4 py-3">
+              <div className="shrink-0 space-y-2 border-b px-4 py-3">
                 <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
                   <div className="flex min-w-0 flex-1 items-center gap-2.5">
                     <StaticBotAvatar expr={safeDiaryMood(selected.mood)} size={32} />
                     <div className="min-w-0 flex-1">
                       <h4 title={selected.title} className="line-clamp-2 text-base font-semibold text-foreground">{selected.title}</h4>
                       <div className="truncate text-[11px] text-muted-foreground">
-                        {selected.date} · 来源 {selected.source} · {BOT_EXPRESSION_META[safeDiaryMood(selected.mood)].label}
+                        {selected.date} {formatTimeHHMM(selected.createdAt)} · {DIARY_SOURCE_LABELS[selected.source] ?? selected.source} · {BOT_EXPRESSION_META[safeDiaryMood(selected.mood)].label}
                       </div>
                     </div>
                   </div>
                   <div className="flex shrink-0 flex-wrap items-center gap-1">
                     <ViewFullButton
                       label="全屏阅读"
-                      onClick={() =>
+                      onClick={() => {
+                        const mood = safeDiaryMood(selected.mood);
+                        const sourceLabel = DIARY_SOURCE_LABELS[selected.source] ?? selected.source;
                         setViewerPayload({
                           title: selected.title,
-                          subtitle: `${selected.date} · 来源 ${selected.source} · ${BOT_EXPRESSION_META[safeDiaryMood(selected.mood)].label}`,
+                          badges: [
+                            { label: `${BOT_EXPRESSION_META[mood].plainEmoji} ${BOT_EXPRESSION_META[mood].label}`, variant: 'secondary' as const },
+                            { label: sourceLabel, variant: 'outline' as const },
+                            ...selected.tags.map(tag => ({ label: tag, variant: 'secondary' as const })),
+                          ],
+                          subtitle: `${selected.date} ${formatTimeHHMM(selected.createdAt)} · ${sourceLabel} · ${BOT_EXPRESSION_META[mood].label}`,
                           content: selected.content,
                           mode: 'markdown',
-                        })
-                      }
-                    />
-                    <Button
-                      size="xs"
-                      variant="outline"
-                      disabled={disabled}
-                      onClick={async () => {
-                        await api('/api/diary-promote-memory', { id: selected.id });
-                        setStatusMsg('已转存至全息记忆');
-                        await Promise.all([loadDiary(false), refreshView()]);
+                        });
                       }}
-                    >
-                      <SparklesIcon className="size-3" />
-                      <span>{selected.promotedMemoryId ? '同步记忆' : '转存记忆'}</span>
-                    </Button>
+                    />
                     <Button
                       size="xs"
                       variant="ghost"
@@ -1408,6 +1412,13 @@ function DiaryPanel() {
                     </Button>
                   </div>
                 </div>
+                {selected.tags.length > 0 && (
+                  <div className="flex flex-wrap items-center gap-1">
+                    {selected.tags.map(tag => (
+                      <Badge key={tag} size="sm" variant="secondary">{tag}</Badge>
+                    ))}
+                  </div>
+                )}
                 {statusMsg && <p className="text-[11px] text-muted-foreground">{statusMsg}</p>}
               </div>
 
@@ -1433,6 +1444,8 @@ function DiaryPanel() {
             await api('/api/diary-remove', { id: deleteTarget.id });
             setDeleteTarget(null);
             await Promise.all([loadDiary(true), refreshView()]);
+          } catch (e) {
+            setStatusMsg(`删除失败：${errorText(e)}`);
           } finally {
             setBusy(false);
           }

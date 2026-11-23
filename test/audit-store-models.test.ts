@@ -63,7 +63,7 @@ test('SqliteDb migrations tolerate malformed JSON in legacy memories rows', asyn
       assert.equal(corrupt.access_count, 0);
       assert.equal(corrupt.pinned, 0);
       const ver = db.db.prepare('PRAGMA user_version').get() as { user_version: number };
-      assert.equal(ver.user_version, 4);
+      assert.equal(ver.user_version, 5);
     } finally {
       db.close();
     }

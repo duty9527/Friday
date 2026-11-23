@@ -2688,6 +2688,7 @@ export class Coordinator {
     this.pluginRefresh.tick();
     this.subconscious.tickDistiller();
     this.subconscious.tickSubconscious();
+    this.subconscious.tickEveningDiary();
   }
 
   async close() {

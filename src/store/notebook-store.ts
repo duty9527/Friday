@@ -115,6 +115,7 @@ export interface WriteDiaryInput {
   source?: DiarySource;
   sourceMessageId?: string;
   append?: boolean;
+  createdAt?: number;
 }
 
 export interface ListDiaryOptions {
@@ -122,6 +123,7 @@ export interface ListDiaryOptions {
   mood?: string;
   tag?: string;
   month?: string;
+  date?: string;
   limit?: number;
 }
 
@@ -131,6 +133,14 @@ export function formatLocalDate(ts = Date.now()): string {
   const m = String(dt.getMonth() + 1).padStart(2, '0');
   const d = String(dt.getDate()).padStart(2, '0');
   return `${y}-${m}-${d}`;
+}
+
+export function formatDiaryLogicalDate(ts = Date.now(), nightCutoffHour = 5): string {
+  const dt = new Date(ts);
+  if (dt.getHours() < nightCutoffHour) {
+    return formatLocalDate(new Date(dt.getFullYear(), dt.getMonth(), dt.getDate() - 1).getTime());
+  }
+  return formatLocalDate(ts);
 }
 
 export function validateDateString(raw: string): string {
@@ -154,7 +164,7 @@ export function normalizeDiaryMood(raw?: string): DiaryMood {
 }
 
 function normalizeDiarySource(raw?: string): DiarySource {
-  if (raw === 'sleep' || raw === 'manual' || raw === 'chat') return raw;
+  if (raw === 'sleep' || raw === 'evening' || raw === 'chat') return raw;
   return 'chat';
 }
 
@@ -237,7 +247,6 @@ function decodeDiaryRow(row: Record<string, unknown>): DiaryEntry {
     tags: parseTagsJson(row.tags_json),
     source: normalizeDiarySource(typeof row.source === 'string' ? row.source : undefined),
     ...(typeof row.source_message_id === 'string' && row.source_message_id ? { sourceMessageId: row.source_message_id } : {}),
-    ...(typeof row.promoted_memory_id === 'string' && row.promoted_memory_id ? { promotedMemoryId: row.promoted_memory_id } : {}),
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
   };
@@ -469,10 +478,14 @@ export class NotebookStore {
 
   // --- Diary Entries ---
   listDiaryEntries(options?: ListDiaryOptions): DiaryEntry[] {
-    const limit = Math.max(1, Math.min(365, options?.limit ?? 120));
-    const rows = this.db.prepare('SELECT * FROM diary_entries ORDER BY entry_date DESC, updated_at DESC').all() as Array<Record<string, unknown>>;
+    const limit = Math.max(1, Math.min(500, options?.limit ?? 200));
+    const rows = this.db.prepare('SELECT * FROM diary_entries ORDER BY entry_date DESC, created_at DESC, updated_at DESC').all() as Array<Record<string, unknown>>;
     let items = rows.map(decodeDiaryRow);
 
+    if (options?.date?.trim()) {
+      const validDate = validateDateString(options.date);
+      items = items.filter(item => item.date === validDate);
+    }
     if (options?.month?.trim()) {
       const month = options.month.trim();
       items = items.filter(item => item.date.startsWith(month));
@@ -492,7 +505,7 @@ export class NotebookStore {
         .filter(entry => entry.score > 0)
         .sort((a, b) => {
           if (b.score !== a.score) return b.score - a.score;
-          return b.item.date.localeCompare(a.item.date);
+          return b.item.date.localeCompare(a.item.date) || (b.item.createdAt - a.item.createdAt);
         });
       return scored.slice(0, limit).map(entry => entry.item);
     }
@@ -500,16 +513,41 @@ export class NotebookStore {
     return items.slice(0, limit);
   }
 
-  getDiaryByDate(date: string): DiaryEntry | undefined {
+  listDiaryByDate(date: string): DiaryEntry[] {
     const validDate = validateDateString(date);
-    const row = this.db.prepare('SELECT * FROM diary_entries WHERE entry_date=?').get(validDate) as Record<string, unknown> | undefined;
-    return row ? decodeDiaryRow(row) : undefined;
+    const rows = this.db.prepare(
+      'SELECT * FROM diary_entries WHERE entry_date=? ORDER BY created_at DESC, updated_at DESC',
+    ).all(validDate) as Array<Record<string, unknown>>;
+    return rows.map(decodeDiaryRow);
+  }
+
+  listDiaryTags(): NoteTagCount[] {
+    const rows = this.db.prepare('SELECT tags_json FROM diary_entries').all() as Array<Record<string, unknown>>;
+    const counts = new Map<string, { tag: string; count: number }>();
+    for (const row of rows) {
+      for (const tag of parseTagsJson(row.tags_json)) {
+        const key = tag.toLowerCase();
+        const existing = counts.get(key);
+        if (existing) existing.count++;
+        else counts.set(key, { tag, count: 1 });
+      }
+    }
+    return [...counts.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag));
+  }
+
+  listDiaryMonths(): string[] {
+    const rows = this.db.prepare(
+      'SELECT DISTINCT substr(entry_date, 1, 7) AS m FROM diary_entries WHERE length(entry_date) >= 7 ORDER BY m DESC',
+    ).all() as Array<Record<string, unknown>>;
+    return rows.map(row => String(row.m ?? '')).filter(Boolean);
   }
 
   getDiaryEntry(idOrDate: string): DiaryEntry {
     const clean = idOrDate.trim();
     const row = /^\d{4}-\d{2}-\d{2}$/.test(clean)
-      ? (this.db.prepare('SELECT * FROM diary_entries WHERE entry_date=?').get(validateDateString(clean)) as Record<string, unknown> | undefined)
+      ? (this.db.prepare(
+          'SELECT * FROM diary_entries WHERE entry_date=? ORDER BY created_at DESC, updated_at DESC LIMIT 1',
+        ).get(validateDateString(clean)) as Record<string, unknown> | undefined)
       : (this.db.prepare('SELECT * FROM diary_entries WHERE id=?').get(clean) as Record<string, unknown> | undefined);
     if (!row) throw new Error(`Diary entry not found: ${idOrDate}`);
     return decodeDiaryRow(row);
@@ -523,17 +561,10 @@ export class NotebookStore {
         throw new Error('Diary content must be non-empty');
       }
 
-      let existing: DiaryEntry | undefined;
       if (input.id) {
         const row = this.db.prepare('SELECT * FROM diary_entries WHERE id=?').get(input.id) as Record<string, unknown> | undefined;
         if (!row) throw new Error(`Diary entry not found: ${input.id}`);
-        existing = decodeDiaryRow(row);
-      } else {
-        const targetDate = input.date ? validateDateString(input.date) : formatLocalDate(now);
-        existing = this.getDiaryByDate(targetDate);
-      }
-
-      if (existing) {
+        const existing = decodeDiaryRow(row);
         const isAppend = input.append === true;
         let nextContent = incomingContent;
         if (isAppend && existing.content.trim()) {
@@ -572,15 +603,19 @@ export class NotebookStore {
       }
 
       const entryDate = input.date ? validateDateString(input.date) : formatLocalDate(now);
+      const createdAt = typeof input.createdAt === 'number' && Number.isFinite(input.createdAt)
+        ? Math.round(input.createdAt)
+        : now;
       const id = randomUUID();
-      const title = input.title?.trim().slice(0, DIARY_TITLE_MAX) || `${entryDate} 日记`;
+      const title = input.title?.trim().slice(0, DIARY_TITLE_MAX)
+        || deriveFallbackTitle(incomingContent, `${entryDate} 随记`).slice(0, DIARY_TITLE_MAX);
       const mood = normalizeDiaryMood(input.mood);
       const tags = normalizeTags(input.tags);
       const source = normalizeDiarySource(input.source);
 
       this.db.prepare(
-        `INSERT INTO diary_entries(id, entry_date, title, content, mood, tags_json, source, source_message_id, promoted_memory_id, created_at, updated_at)
-         VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+        `INSERT INTO diary_entries(id, entry_date, title, content, mood, tags_json, source, source_message_id, created_at, updated_at)
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         id,
         entryDate,
@@ -590,28 +625,18 @@ export class NotebookStore {
         JSON.stringify(tags),
         source,
         input.sourceMessageId ?? null,
-        now,
-        now,
+        createdAt,
+        createdAt,
       );
       return this.getDiaryEntry(id);
     });
   }
 
-  setDiaryPromotedMemory(idOrDate: string, memoryId: string): DiaryEntry {
+  deleteDiaryEntry(id: string): boolean {
     return this.atomic(() => {
-      const existing = this.getDiaryEntry(idOrDate);
-      const updatedAt = Math.max(Date.now(), existing.updatedAt + 1);
-      this.db.prepare('UPDATE diary_entries SET promoted_memory_id=?, updated_at=? WHERE id=?').run(memoryId, updatedAt, existing.id);
-      return this.getDiaryEntry(existing.id);
-    });
-  }
-
-  deleteDiaryEntry(idOrDate: string): boolean {
-    return this.atomic(() => {
-      const clean = idOrDate.trim();
-      const res = /^\d{4}-\d{2}-\d{2}$/.test(clean)
-        ? (this.db.prepare('DELETE FROM diary_entries WHERE entry_date=?').run(validateDateString(clean)) as { changes?: number | bigint })
-        : (this.db.prepare('DELETE FROM diary_entries WHERE id=?').run(clean) as { changes?: number | bigint });
+      const clean = id.trim();
+      if (!clean) return false;
+      const res = this.db.prepare('DELETE FROM diary_entries WHERE id=?').run(clean) as { changes?: number | bigint };
       return Number(res.changes ?? 0) > 0;
     });
   }

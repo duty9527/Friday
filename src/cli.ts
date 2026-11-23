@@ -23,7 +23,7 @@ const help = `F.R.I.D.A.Y. (friday) — Local persistent personal AI assistant &
   plugin list | run NAME [ACTION] [--args JSON]
   memory list | search [--scope all|memories|works|messages] [--cwd DIR] "query" | save --topic TOPIC [--tag TAG ...] [--link ID ...] [--pinned] [--cwd DIR] "content" | link ID TARGET_ID | pin ID [--unpin] | remove ID
   note list [--tag TAG] [--pinned] ["query"] | get ID | save [--id ID] [--title TITLE] [--tag TAG ...] [--pinned] [--append] "content" | pin ID [--unpin] | promote ID | remove ID
-  diary list [--mood MOOD] [--month YYYY-MM] ["query"] | get [YYYY-MM-DD|ID] | write [--date YYYY-MM-DD] [--title TITLE] [--mood MOOD] [--tag TAG ...] [--append] "content" | promote [YYYY-MM-DD|ID] | remove [YYYY-MM-DD|ID]
+  diary list [--mood MOOD] [--month YYYY-MM] [--tag TAG] ["query"] | get ID | remove ID
   im list | login [CHANNEL_ID] [--name NAME] [--api-base URL] [--no-wait] | add --platform telegram|dingtalk|wechat|xiaoai --name NAME [--bot-token TOKEN] [--account-id ID] [--webhook-url URL] [--secret SECRET] [--target CHAT_ID] [--allow SENDER ...] [--telegram-mention-exempt=CHAT_ID[:THREAD_ID] ...] [--api-base URL] [--every-ms MS] | toggle ID [--enabled|--no-enabled] | test ID ["message"] | remove ID | voice ...
   voice status | list | model | enroll [NAME] [--role owner|member] [--append] [--channel ID] [--target ID] [--no-wait] | remove NAME_OR_ID | clear | enable | disable | config [--threshold N] [--wake-precheck|--no-wake-precheck] | rename TARGET NEW_NAME | role TARGET owner|member
   model list | probe [PROVIDER/]MODEL ["prompt"] | set [--provider PROVIDER] [--router MODEL] [--router-provider PROVIDER] [--worker-provider PROVIDER] [--fast MODEL] [--balanced MODEL] [--strong MODEL] [--base-url URL] [--api-key KEY]
@@ -366,24 +366,9 @@ async function main() {
       } else if (sub === 'get') {
         const target = args[1] ?? values.id ?? values.date;
         message = { command: 'diary-get', id: target, date: values.date };
-      } else if (sub === 'write') {
-        message = {
-          command: 'diary-write',
-          id: values.id,
-          date: values.date,
-          title: values.title,
-          content: args.slice(1).join(' '),
-          mood: values.mood,
-          tags: values.tag,
-          source: 'manual',
-          append: values.append,
-        };
-      } else if (sub === 'promote') {
-        const target = args[1] ?? values.id ?? values.date;
-        message = { command: 'diary-promote-memory', id: target, date: values.date };
       } else if (sub === 'remove' || sub === 'rm' || sub === 'delete') {
-        const target = args[1] ?? values.id ?? values.date;
-        message = { command: 'diary-remove', id: target, date: values.date };
+        const target = args[1] ?? values.id;
+        message = { command: 'diary-remove', id: target };
       } else {
         throw new Error(`Unknown diary subcommand: ${sub}`);
       }

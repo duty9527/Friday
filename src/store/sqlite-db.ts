@@ -108,18 +108,17 @@ export class SqliteDb {
       CREATE INDEX IF NOT EXISTS notes_order ON notes(pinned DESC, updated_at DESC);
       CREATE TABLE IF NOT EXISTS diary_entries(
         id TEXT PRIMARY KEY,
-        entry_date TEXT NOT NULL UNIQUE,
+        entry_date TEXT NOT NULL,
         title TEXT NOT NULL,
         content TEXT NOT NULL DEFAULT '',
         mood TEXT NOT NULL DEFAULT 'calm',
         tags_json TEXT NOT NULL DEFAULT '[]',
         source TEXT NOT NULL DEFAULT 'chat',
         source_message_id TEXT,
-        promoted_memory_id TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
-      CREATE INDEX IF NOT EXISTS diary_entries_date ON diary_entries(entry_date DESC, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS diary_entries_date ON diary_entries(entry_date DESC, created_at DESC, updated_at DESC);
     `);
     this.runSchemaMigrations();
   }
@@ -149,6 +148,46 @@ export class SqliteDb {
       this.migrateNotebookTables();
       this.db.exec('PRAGMA user_version = 4;');
     }
+    if (version < 5) {
+      this.migrateDiaryMultiEntry();
+      this.db.exec('PRAGMA user_version = 5;');
+    }
+  }
+
+  private migrateDiaryMultiEntry(): void {
+    this.transaction(() => {
+      this.db.exec(`
+        DROP INDEX IF EXISTS diary_entries_date;
+        CREATE TABLE diary_entries_new(
+          id TEXT PRIMARY KEY,
+          entry_date TEXT NOT NULL,
+          title TEXT NOT NULL,
+          content TEXT NOT NULL DEFAULT '',
+          mood TEXT NOT NULL DEFAULT 'calm',
+          tags_json TEXT NOT NULL DEFAULT '[]',
+          source TEXT NOT NULL DEFAULT 'chat',
+          source_message_id TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+        INSERT INTO diary_entries_new(id, entry_date, title, content, mood, tags_json, source, source_message_id, created_at, updated_at)
+        SELECT
+          id,
+          entry_date,
+          title,
+          content,
+          mood,
+          tags_json,
+          CASE WHEN source IN ('chat', 'evening', 'sleep') THEN source ELSE 'chat' END,
+          source_message_id,
+          created_at,
+          updated_at
+        FROM diary_entries;
+        DROP TABLE diary_entries;
+        ALTER TABLE diary_entries_new RENAME TO diary_entries;
+        CREATE INDEX IF NOT EXISTS diary_entries_date ON diary_entries(entry_date DESC, created_at DESC, updated_at DESC);
+      `);
+    });
   }
 
   private migrateNotebookTables(): void {

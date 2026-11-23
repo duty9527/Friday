@@ -50,6 +50,17 @@ const BINARY_ATTACHMENT_EXTS = new Set([
 export const READONLY_ROUTER_TOOLS = new Set(['recall_messages', 'search_memory', 'inspect_work']);
 export const MEMBER_ALLOWED_PLUGINS = new Set(['miot', 'tv-ir', 'tv-agent']);
 
+export function isReadonlyNotebookAction(input: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(input);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+    const action = (parsed as Record<string, unknown>).action;
+    return action === undefined || (typeof action === 'string' && ['list', 'search', 'get'].includes(action));
+  } catch {
+    return false;
+  }
+}
+
 export interface RouterToolsOptions {
   allowedPlugins?: ReadonlySet<string>;
   toolNames?: ReadonlySet<string>;
@@ -501,7 +512,9 @@ export function createRouterTools(
       }
       return res;
     }
-    if (turn?.chatContext && !READONLY_ROUTER_TOOLS.has(name)) {
+    const isReadonlyCall = READONLY_ROUTER_TOOLS.has(name)
+      || ((name === 'manage_note' || name === 'manage_diary') && isReadonlyNotebookAction(input));
+    if (turn?.chatContext && !isReadonlyCall) {
       const ctx = turn.chatContext;
       if (ctx.activeAttemptVersion !== undefined
         && (ctx.mergeVersion !== ctx.activeAttemptVersion || host.hasInboundHold(ctx.message.origin))) {
@@ -1007,7 +1020,7 @@ export function createRouterTools(
     },
   }, {
     name: 'manage_diary',
-    description: 'Read or write F.R.I.D.A.Y.\'s own personal first-person daily diary (one entry per calendar date YYYY-MM-DD; separate from Boss notes and holographic memory). Input JSON {action?: "list"|"search"|"get"|"write"|"append"|"delete", id?, date?, title?, content?, mood?: "neutral"|"happy"|"calm"|"surprised"|"inspecting"|"squinted"|"sleepy"|"confused"|"sad", tags?, query?, limit?}.',
+    description: 'Read or write F.R.I.D.A.Y.\'s own personal first-person daily diary for the Boss to read (separate from Boss notes and holographic memory; multiple entries per calendar date are welcome). Input JSON {action?: "list"|"search"|"get"|"write"|"append"|"delete", id?, date?, title?, content?, mood?: "neutral"|"happy"|"calm"|"surprised"|"inspecting"|"squinted"|"sleepy"|"confused"|"sad", tags?, query?, tag?, month?, limit?}. "write" creates a new standalone entry (unless id is specified); "append" appends to a specific entry id (or creates a new entry if id is omitted); "delete" requires id.',
     execute: async input => {
       if (host.isClosing()) throw new Error('Service is shutting down');
       const turn = host.getTurn();
@@ -1017,7 +1030,7 @@ export function createRouterTools(
       if (callerOrigin?.speakerRole === 'member') {
         throw new Error('权限不足：当前声纹成员无权访问 F.R.I.D.A.Y. 日记本');
       }
-      const args = toolInput(input, ['action', 'id', 'date', 'title', 'content', 'mood', 'tags', 'query', 'limit', 'summary']);
+      const args = toolInput(input, ['action', 'id', 'date', 'title', 'content', 'mood', 'tags', 'query', 'tag', 'month', 'limit', 'summary']);
       const action = args.action === undefined ? 'list' : text(args.action, 'action', 32);
       const summarizeDiary = (entry: ReturnType<Store['getDiaryEntry']>) => ({
         id: entry.id,
@@ -1026,8 +1039,8 @@ export function createRouterTools(
         mood: entry.mood,
         tags: entry.tags,
         source: entry.source,
+        createdAt: entry.createdAt,
         updatedAt: entry.updatedAt,
-        ...(entry.promotedMemoryId ? { promotedMemoryId: entry.promotedMemoryId } : {}),
         preview: entry.content.slice(0, 180),
       });
 
@@ -1036,20 +1049,29 @@ export function createRouterTools(
         const entries = host.store.listDiaryEntries({
           query: args.query === undefined ? undefined : text(args.query, 'query', 512),
           mood: args.mood === undefined ? undefined : text(args.mood, 'mood', 32),
+          tag: args.tag === undefined ? undefined : text(args.tag, 'tag', 32),
+          month: args.month === undefined ? undefined : text(args.month, 'month', 16),
+          date: args.date === undefined ? undefined : text(args.date, 'date', 32),
           limit,
         });
         return JSON.stringify({
           action: 'list',
           summary: host.store.notebookSummary(),
+          tags: host.store.listDiaryTags(),
           entries: entries.map(summarizeDiary),
         });
       }
       if (action === 'search') {
         const query = args.query === undefined ? undefined : text(args.query, 'query', 512);
         const mood = args.mood === undefined ? undefined : text(args.mood, 'mood', 32);
-        if (!query && !mood) throw new Error('manage_diary search requires query or mood');
+        const tag = args.tag === undefined ? undefined : text(args.tag, 'tag', 32);
+        const month = args.month === undefined ? undefined : text(args.month, 'month', 16);
+        const date = args.date === undefined ? undefined : text(args.date, 'date', 32);
+        if (!query && !mood && !tag && !month && !date) {
+          throw new Error('manage_diary search requires query, mood, tag, month, or date');
+        }
         const limit = args.limit === undefined ? 20 : integer(args.limit, 20, 1, 120);
-        const entries = host.store.listDiaryEntries({ query, mood, limit });
+        const entries = host.store.listDiaryEntries({ query, mood, tag, month, date, limit });
         return JSON.stringify({
           action: 'search',
           total: entries.length,
@@ -1065,17 +1087,16 @@ export function createRouterTools(
         return JSON.stringify({ action: 'get', entry: host.store.getDiaryEntry(target) });
       }
       if (action === 'delete') {
-        const target = args.id !== undefined
-          ? text(args.id, 'id', 128)
-          : text(args.date, 'date', 32);
-        return JSON.stringify({ action: 'delete', removed: host.store.deleteDiaryEntry(target) });
+        const targetId = text(args.id, 'id', 128);
+        return JSON.stringify({ action: 'delete', removedId: targetId, removed: host.store.deleteDiaryEntry(targetId) });
       }
       if (action !== 'write' && action !== 'append') {
         throw new Error(`Unknown manage_diary action: ${action}`);
       }
       const sourceMessageId = turn?.chatContext?.message.id ?? turn?.activeReportTask?.originMessageId;
+      const entryId = args.id !== undefined ? text(args.id, 'id', 128) : undefined;
       const entry = host.store.writeDiaryEntry({
-        ...(args.id !== undefined ? { id: text(args.id, 'id', 128) } : {}),
+        ...(entryId ? { id: entryId } : {}),
         ...(args.date !== undefined ? { date: text(args.date, 'date', 32) } : {}),
         ...(args.title !== undefined ? { title: text(args.title, 'title', 160) } : {}),
         content: text(args.content, 'content', 16_384),
@@ -1083,7 +1104,7 @@ export function createRouterTools(
         tags: parseStringArray(args.tags, 'tags', 12, 32),
         source: 'chat',
         sourceMessageId,
-        append: action === 'append',
+        append: action === 'append' && Boolean(entryId),
       });
       return JSON.stringify({ action, entry });
     },

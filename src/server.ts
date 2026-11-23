@@ -416,40 +416,18 @@ export async function serve(options: ServiceOptions): Promise<{ home: string; cl
               mood: command.mood === undefined ? undefined : text(command.mood, 'mood', 32),
               tag: command.tag === undefined ? undefined : text(command.tag, 'tag', 32),
               month: command.month === undefined ? undefined : text(command.month, 'month', 16),
-              limit: integer(command.limit, 120, 1, 365),
+              date: command.date === undefined ? undefined : text(command.date, 'date', 32),
+              limit: integer(command.limit, 200, 1, 500),
             }),
+            tags: store.listDiaryTags(),
+            months: store.listDiaryMonths(),
             summary: store.notebookSummary(),
           };
           case 'diary-get': return store.getDiaryEntry(text(command.id ?? command.date, 'id or date', 128));
-          case 'diary-write': {
-            const tags = command.tags === undefined
-              ? undefined
-              : Array.isArray(command.tags)
-                ? command.tags.map(tag => text(tag, 'tag', 32))
-                : (() => { throw new Error('tags must be a string array'); })();
-            const source = command.source === 'sleep' || command.source === 'manual' || command.source === 'chat'
-              ? command.source
-              : undefined;
-            const entry = store.writeDiaryEntry({
-              id: command.id === undefined ? undefined : text(command.id, 'id', 128),
-              date: command.date === undefined ? undefined : text(command.date, 'date', 32),
-              title: command.title === undefined ? undefined : text(command.title, 'title', 160),
-              content: text(command.content, 'content', 16_384),
-              mood: command.mood === undefined ? undefined : text(command.mood, 'mood', 32),
-              tags,
-              source,
-              append: command.append === undefined ? undefined : Boolean(command.append),
-            });
-            return { entry, summary: store.notebookSummary() };
-          }
           case 'diary-remove': return {
-            removed: store.deleteDiaryEntry(text(command.id ?? command.date, 'id or date', 128)),
+            removed: store.deleteDiaryEntry(text(command.id, 'id', 128)),
             summary: store.notebookSummary(),
           };
-          case 'diary-promote-memory': {
-            const result = await store.promoteDiaryToMemory(text(command.id ?? command.date, 'id or date', 128));
-            return { ...result, summary: store.notebookSummary() };
-          }
           case 'im-list': return coordinator.im.listChannels();
           case 'im-save': {
             const platform = text(command.platform, 'platform', 32);

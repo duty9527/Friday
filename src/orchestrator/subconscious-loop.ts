@@ -1,12 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { realpath, stat } from 'node:fs/promises';
 import type { AgentFactory, AgentTool } from '../agent.js';
+import { publicData } from '../conversation.js';
 import { distillCompletedTask, distillIdleConversation, resolveDistillIdleMs } from '../distiller.js';
 import type { ModelHub } from '../model-hub.js';
 import { resolveEnv } from '../paths.js';
 import { text } from '../protocol.js';
 import type { SemanticEmbedder } from '../semantic.js';
-import { formatLocalDate, type DreamMaterial, type Store, type Task } from '../store.js';
+import { formatDiaryLogicalDate, formatLocalDate, type DreamMaterial, type Store, type Task } from '../store.js';
 import type { ChatMessage, ModelTier, SubconsciousStatusView, ThinkingLevel } from '../view.js';
 import { parseStringArray, toolInput } from './router-tools.js';
 
@@ -71,6 +72,87 @@ export function isRunningUnderNodeTest(): boolean {
 
 const HOMEOSTASIS_LAST_AT_META_KEY = 'subconscious_homeostasis_at';
 const HOMEOSTASIS_MIN_INTERVAL_MS = 12 * 3600_000;
+const EVENING_DIARY_STATE_META_KEY = 'evening_diary_state';
+
+export interface EveningDiaryState {
+  lastEvaluatedDate?: string;
+  scheduledDate?: string;
+  scheduledMinute?: number;
+  idleLatencyMs?: number;
+  lastRunAt?: number;
+  lastOutcome?: 'written' | 'skipped';
+}
+
+export interface EveningDiaryWindowDecision {
+  action: 'wait' | 'schedule' | 'run';
+  logicalDate?: string;
+  nextState?: EveningDiaryState;
+}
+
+export function evaluateEveningDiaryWindow(input: {
+  now: number;
+  idleMs: number;
+  state: EveningDiaryState;
+  random: () => number;
+}): EveningDiaryWindowDecision {
+  const dt = new Date(input.now);
+  const localHour = dt.getHours() + dt.getMinutes() / 60;
+  const minuteOfDay = dt.getHours() * 60 + dt.getMinutes();
+
+  let logicalDate: string;
+  let isSpillover = false;
+  if (localHour >= 21.5) {
+    logicalDate = formatLocalDate(input.now);
+  } else if (localHour < 1.0) {
+    logicalDate = formatDiaryLogicalDate(input.now);
+    isSpillover = true;
+  } else {
+    return { action: 'wait' };
+  }
+
+  if (input.state.lastEvaluatedDate === logicalDate) {
+    return { action: 'wait' };
+  }
+
+  let activeState = input.state;
+  let scheduledNow = false;
+  if (activeState.scheduledDate !== logicalDate) {
+    const scheduledMinute = 21 * 60 + 30 + Math.floor(input.random() * 135);
+    const idleLatencyMs = Math.round((10 + input.random() * 15) * 60_000);
+    activeState = {
+      ...activeState,
+      scheduledDate: logicalDate,
+      scheduledMinute,
+      idleLatencyMs,
+    };
+    scheduledNow = true;
+  }
+
+  const timeReady = isSpillover || minuteOfDay >= (activeState.scheduledMinute ?? (21 * 60 + 30));
+  const idleReady = input.idleMs >= (activeState.idleLatencyMs ?? 15 * 60_000);
+  if (timeReady && idleReady) {
+    return {
+      action: 'run',
+      logicalDate,
+      ...(scheduledNow ? { nextState: activeState } : {}),
+    };
+  }
+
+  return scheduledNow
+    ? { action: 'schedule', logicalDate, nextState: activeState }
+    : { action: 'wait' };
+}
+
+function formatLocalHHMM(ts: number): string {
+  const dt = new Date(ts);
+  return `${String(dt.getHours()).padStart(2, '0')}:${String(dt.getMinutes()).padStart(2, '0')}`;
+}
+
+function sanitizeDreamTags(tags?: string[]): string[] {
+  return (tags ?? [])
+    .map(t => t.trim())
+    .filter(t => t && !/^(?:auto-consolidated|dream|dreaming|梦境|做梦)$/i.test(t));
+}
 
 function extractBalancedJsonObjects(raw: string): string[] {
   const out: string[] = [];
@@ -146,6 +228,11 @@ export class SubconsciousController {
   private nextLatencyMs?: number;
   private dreamRun?: { controller: AbortController; promise: Promise<void>; startedAt: number; phase: 'nrem' | 'rem' };
   private readonly activeDreamPromises = new Set<Promise<void>>();
+  private lastEveningDiaryCheckAt = 0;
+  private eveningDiaryFailureStreak = 0;
+  private eveningDiaryRetryAfter = 0;
+  private eveningDiaryRun?: { controller: AbortController; promise: Promise<void>; startedAt: number; logicalDate: string };
+  private readonly activeEveningDiaryPromises = new Set<Promise<void>>();
   private readonly pendingDistillTaskIds: string[] = [];
   private readonly queuedDistillTaskSet = new Set<string>();
   private distillRun?: { kind: 'task' | 'chat'; controller: AbortController; promise: Promise<void> };
@@ -181,6 +268,11 @@ export class SubconsciousController {
     if (this.dreamRun) {
       const run = this.dreamRun;
       this.dreamRun = undefined;
+      run.controller.abort(new Error(reason));
+    }
+    if (this.eveningDiaryRun) {
+      const run = this.eveningDiaryRun;
+      this.eveningDiaryRun = undefined;
       run.controller.abort(new Error(reason));
     }
     if (this.distillRun?.kind === 'chat') {
@@ -391,7 +483,7 @@ export class SubconsciousController {
   }
 
   tickSubconscious(): void {
-    if (this.host.isClosing() || !this.host.hasRouter() || this.dreamRun) return;
+    if (this.host.isClosing() || !this.host.hasRouter() || this.dreamRun || this.eveningDiaryRun) return;
     const now = this.now();
     if (this.host.hasActiveWork()) {
       this.lastActivityAt = now;
@@ -437,6 +529,38 @@ export class SubconsciousController {
     this.activeDreamPromises.add(promise);
   }
 
+  private async resolveResearchModel(instruction: string): Promise<{
+    model?: string;
+    tier?: ModelTier;
+    thinkingLevel?: ThinkingLevel;
+  }> {
+    return this.host.modelHub.getModelPool().length > 0
+      ? await this.host.modelHub.decideWorkerModel({ profile: 'research', instruction })
+      : this.host.factory.resolveWorkerModel
+        ? this.host.factory.resolveWorkerModel({ tier: 'balanced', profile: 'research' })
+        : { model: undefined, tier: 'balanced' as ModelTier, thinkingLevel: 'medium' as ThinkingLevel };
+  }
+
+  private createConsolidateMemoryTool(controller: AbortController): AgentTool {
+    return {
+      name: 'consolidate_memory',
+      description: 'Distill durable preferences, architectural knowledge, or merge noisy raw stubs into a clean semantic memory card. Input JSON: {topic, content, tags?, cwd?, supersedeIds?, linkedMemoryIds?}.',
+      execute: async input => {
+        controller.signal.throwIfAborted();
+        const args = toolInput(input, ['topic', 'content', 'tags', 'cwd', 'supersedeIds', 'linkedMemoryIds']);
+        const card = await this.host.store.saveMemoryAsync({
+          topic: text(args.topic, 'topic', 160).replace(/^(?:梦境|做梦|Dream)\s*[·:：-]\s*/i, ''),
+          content: text(args.content, 'content', 8192),
+          tags: sanitizeDreamTags(parseStringArray(args.tags, 'tags', 16, 64)),
+          cwd: args.cwd === undefined ? undefined : text(args.cwd, 'cwd', 4096),
+          supersedeIds: parseStringArray(args.supersedeIds, 'supersedeIds', 12, 128),
+          linkedMemoryIds: parseStringArray(args.linkedMemoryIds, 'linkedMemoryIds', 12, 128),
+        });
+        return JSON.stringify({ memory: { id: card.id, topic: card.topic } });
+      },
+    };
+  }
+
   private async runSleepCycle(
     controller: AbortController,
     enterRem: boolean,
@@ -479,33 +603,10 @@ export class SubconsciousController {
       }
       if (controller.signal.aborted || this.host.isClosing()) return;
 
-      const resolvedModel: { model?: string; tier?: ModelTier; thinkingLevel?: ThinkingLevel } = this.host.modelHub.getModelPool().length > 0
-        ? await this.host.modelHub.decideWorkerModel({ profile: 'research', instruction: '潜意识记忆巩固与跨上下文突触关联分析' })
-        : this.host.factory.resolveWorkerModel
-          ? this.host.factory.resolveWorkerModel({ tier: 'balanced', profile: 'research' })
-          : { model: undefined, tier: 'balanced' as ModelTier, thinkingLevel: 'medium' as ThinkingLevel };
+      const resolvedModel = await this.resolveResearchModel('潜意识记忆巩固与跨上下文突触关联分析');
 
-      const sanitizeTags = (tags?: string[]) => (tags ?? [])
-        .map(t => t.trim())
-        .filter(t => t && !/^(?:auto-consolidated|dream|dreaming|梦境|做梦)$/i.test(t));
-
-      const dreamerTools: AgentTool[] = [{
-        name: 'consolidate_memory',
-        description: 'Distill durable preferences, architectural knowledge, or merge noisy raw stubs into a clean semantic memory card. Input JSON: {topic, content, tags?, cwd?, supersedeIds?, linkedMemoryIds?}.',
-        execute: async input => {
-          controller.signal.throwIfAborted();
-          const args = toolInput(input, ['topic', 'content', 'tags', 'cwd', 'supersedeIds', 'linkedMemoryIds']);
-          const card = await this.host.store.saveMemoryAsync({
-            topic: text(args.topic, 'topic', 160).replace(/^(?:梦境|做梦|Dream)\s*[·:：-]\s*/i, ''),
-            content: text(args.content, 'content', 8192),
-            tags: sanitizeTags(parseStringArray(args.tags, 'tags', 16, 64)),
-            cwd: args.cwd === undefined ? undefined : text(args.cwd, 'cwd', 4096),
-            supersedeIds: parseStringArray(args.supersedeIds, 'supersedeIds', 12, 128),
-            linkedMemoryIds: parseStringArray(args.linkedMemoryIds, 'linkedMemoryIds', 12, 128),
-          });
-          return JSON.stringify({ memory: { id: card.id, topic: card.topic } });
-        },
-      }, {
+      const diaryDate = formatDiaryLogicalDate(this.now());
+      const dreamerTools: AgentTool[] = [this.createConsolidateMemoryTool(controller), {
         name: 'connect_synapse',
         description: 'Wire or gently reinforce a weak associative synapse between two memory cards that genuinely resonated together (max weight 0.40; "explicit" is forbidden). Input JSON: {id, targetId, relation?: "co_activated"|"semantic"}.',
         execute: async input => {
@@ -549,18 +650,19 @@ export class SubconsciousController {
         },
       }, {
         name: 'write_diary',
-        description: 'Write or append a first-person personal reflection in F.R.I.D.A.Y.\'s own daily diary (separate from Boss notes and factual memories). Input JSON: {date?, title?, content, mood?, tags?, append?}.',
+        description: 'Write a standalone first-person personal reflection entry in F.R.I.D.A.Y.\'s own diary (separate from Boss notes and factual memories). Input JSON: {date?, title?, content, mood?, tags?}.',
         execute: async input => {
           controller.signal.throwIfAborted();
-          const args = toolInput(input, ['date', 'title', 'content', 'mood', 'tags', 'append']);
+          const args = toolInput(input, ['date', 'title', 'content', 'mood', 'tags']);
+          const nowTs = this.now();
           const entry = this.host.store.writeDiaryEntry({
-            date: args.date === undefined ? formatLocalDate(this.now()) : text(args.date, 'date', 32),
+            date: args.date === undefined ? formatDiaryLogicalDate(nowTs) : text(args.date, 'date', 32),
             ...(args.title !== undefined ? { title: text(args.title, 'title', 160) } : {}),
             content: text(args.content, 'content', 16_384),
             ...(args.mood !== undefined ? { mood: text(args.mood, 'mood', 32) } : {}),
-            tags: sanitizeTags(parseStringArray(args.tags, 'tags', 12, 32)),
+            tags: sanitizeDreamTags(parseStringArray(args.tags, 'tags', 12, 32)),
             source: 'sleep',
-            append: args.append === undefined ? true : Boolean(args.append),
+            createdAt: nowTs,
           });
           return JSON.stringify({ entry: { id: entry.id, date: entry.date, title: entry.title, mood: entry.mood } });
         },
@@ -576,16 +678,32 @@ export class SubconsciousController {
       const timeoutSignal = AbortSignal.timeout(90_000);
       const combinedSignal = AbortSignal.any([controller.signal, timeoutSignal]);
       try {
-        const recentDiary = this.host.store.listDiaryEntries({ limit: 3 }).map(entry => ({
+        const nowWall = this.now();
+        const logicalDate = formatDiaryLogicalDate(nowWall);
+        const todayDiaryEntries = this.host.store.listDiaryByDate(logicalDate).map(entry => ({
+          id: entry.id,
           date: entry.date,
           title: entry.title,
           mood: entry.mood,
+          source: entry.source,
+          createdAt: entry.createdAt,
+          preview: entry.content.slice(0, 180),
+        }));
+        const recentDiary = this.host.store.listDiaryEntries({ limit: 4 }).map(entry => ({
+          id: entry.id,
+          date: entry.date,
+          title: entry.title,
+          mood: entry.mood,
+          source: entry.source,
           preview: entry.content.slice(0, 180),
         }));
         const rawOutput = await dreamer.prompt(JSON.stringify({
           kind: 'DREAM',
           cwd: dreamCwd,
-          todayDate: formatLocalDate(this.now()),
+          diaryDate: logicalDate,
+          todayDate: logicalDate,
+          currentLocalTime: formatLocalHHMM(nowWall),
+          todayDiaryEntries,
           recentDiary,
           material: {
             candidateCwds: material.candidateCwds,
@@ -641,10 +759,201 @@ export class SubconsciousController {
     }
   }
 
+  tickEveningDiary(): void {
+    if (this.host.isClosing() || !this.host.hasRouter() || this.dreamRun || this.eveningDiaryRun) return;
+    const now = this.now();
+    if (this.host.hasActiveWork()) {
+      this.lastActivityAt = now;
+      return;
+    }
+    if (now < this.eveningDiaryRetryAfter) return;
+    const checkIntervalMs = this.host.runtime?.checkIntervalMs ?? 60_000;
+    if (now - this.lastEveningDiaryCheckAt < checkIntervalMs) return;
+    this.lastEveningDiaryCheckAt = now;
+
+    const savedState = this.host.store.conversation.meta<EveningDiaryState>(EVENING_DIARY_STATE_META_KEY) ?? {};
+    const idleMs = Math.max(0, now - this.lastActivityAt);
+    const decision = evaluateEveningDiaryWindow({
+      now,
+      idleMs,
+      state: savedState,
+      random: () => this.rand(),
+    });
+    if (decision.nextState) {
+      this.host.store.conversation.setMeta(EVENING_DIARY_STATE_META_KEY, decision.nextState);
+    }
+    if (decision.action !== 'run' || !decision.logicalDate) return;
+
+    const logicalDate = decision.logicalDate;
+    const baseState = decision.nextState ?? savedState;
+    const dayMessages = this.host.store.conversation.allMessages(120)
+      .filter(m =>
+        m.status === 'completed'
+        && m.source !== 'system'
+        && m.origin?.speakerRole !== 'member'
+        && m.text.trim().length > 0
+        && formatDiaryLogicalDate(m.at) === logicalDate,
+      )
+      .sort((a, b) => a.seq - b.seq)
+      .slice(-32)
+      .map(m => ({ id: m.id, seq: m.seq, role: m.role, at: m.at, text: String(publicData(m.text.slice(0, 600))) }));
+
+    const dayTasks = this.host.store.list(60)
+      .filter(t =>
+        t.status === 'completed'
+        && t.origin?.speakerRole !== 'member'
+        && Boolean(t.report)
+        && formatDiaryLogicalDate(t.createdAt) === logicalDate,
+      )
+      .slice(0, 10)
+      .map(t => ({
+        id: t.id,
+        prompt: String(publicData(t.prompt.slice(0, 240))),
+        cwd: t.cwd,
+        profile: t.profile,
+        reportSnippet: String(publicData((t.report ?? '').slice(0, 600))),
+        createdAt: t.createdAt,
+      }));
+
+    if (dayMessages.length < 2 && dayTasks.length < 1) {
+      this.host.store.conversation.setMeta(EVENING_DIARY_STATE_META_KEY, {
+        ...baseState,
+        lastEvaluatedDate: logicalDate,
+        lastRunAt: now,
+        lastOutcome: 'skipped',
+      });
+      return;
+    }
+
+    const todayEntries = this.host.store.listDiaryByDate(logicalDate);
+    if (todayEntries.some(e => {
+      const hour = new Date(e.createdAt).getHours();
+      return e.source === 'evening' || hour >= 20 || hour < 5;
+    })) {
+      this.host.store.conversation.setMeta(EVENING_DIARY_STATE_META_KEY, {
+        ...baseState,
+        lastEvaluatedDate: logicalDate,
+        lastRunAt: now,
+        lastOutcome: 'skipped',
+      });
+      return;
+    }
+
+    const controller = new AbortController();
+    const run = { controller, promise: Promise.resolve(), startedAt: now, logicalDate };
+    this.eveningDiaryRun = run;
+    const promise = this.runEveningDiaryCycle(controller, logicalDate, dayMessages, dayTasks, todayEntries).finally(() => {
+      this.activeEveningDiaryPromises.delete(promise);
+      if (this.eveningDiaryRun === run) this.eveningDiaryRun = undefined;
+    });
+    run.promise = promise;
+    this.activeEveningDiaryPromises.add(promise);
+  }
+
+  private async runEveningDiaryCycle(
+    controller: AbortController,
+    logicalDate: string,
+    dayMessages: Array<{ id: string; seq: number; role: 'user' | 'assistant'; at: number; text: string }>,
+    dayTasks: Array<{ id: string; prompt: string; cwd?: string; profile?: string; reportSnippet: string; createdAt: number }>,
+    todayEntries: ReturnType<Store['listDiaryByDate']>,
+  ): Promise<void> {
+    try {
+      const resolvedModel = await this.resolveResearchModel('晚间个人日记自省与可复用经验沉淀');
+      if (controller.signal.aborted || this.host.isClosing()) return;
+
+      let wroteDiary = false;
+      const eveningTools: AgentTool[] = [{
+        name: 'write_diary',
+        description: 'Write a standalone first-person personal reflection entry in F.R.I.D.A.Y.\'s own diary for the Boss to read (separate from factual memory cards). Input JSON: {date?, title?, content, mood?, tags?}.',
+        execute: async input => {
+          controller.signal.throwIfAborted();
+          const args = toolInput(input, ['date', 'title', 'content', 'mood', 'tags']);
+          const nowTs = this.now();
+          const entry = this.host.store.writeDiaryEntry({
+            date: args.date === undefined ? logicalDate : text(args.date, 'date', 32),
+            ...(args.title !== undefined ? { title: text(args.title, 'title', 160) } : {}),
+            content: text(args.content, 'content', 16_384),
+            ...(args.mood !== undefined ? { mood: text(args.mood, 'mood', 32) } : {}),
+            tags: sanitizeDreamTags(parseStringArray(args.tags, 'tags', 12, 32)),
+            source: 'evening',
+            createdAt: nowTs,
+          });
+          wroteDiary = true;
+          return JSON.stringify({ entry: { id: entry.id, date: entry.date, title: entry.title, mood: entry.mood } });
+        },
+      }, this.createConsolidateMemoryTool(controller)];
+
+      const agent = await this.host.factory.create('dreamer', `evening-diary-${randomUUID()}`, eveningTools, {
+        execution: 'snapshot',
+        cwd: process.cwd(),
+        tier: resolvedModel.tier,
+        thinkingLevel: resolvedModel.thinkingLevel,
+        model: resolvedModel.model,
+      });
+      const timeoutSignal = AbortSignal.timeout(90_000);
+      const combinedSignal = AbortSignal.any([controller.signal, timeoutSignal]);
+      try {
+        const nowWall = this.now();
+        const recentDiary = this.host.store.listDiaryEntries({ limit: 5 }).map(entry => ({
+          id: entry.id,
+          date: entry.date,
+          title: entry.title,
+          mood: entry.mood,
+          source: entry.source,
+          preview: entry.content.slice(0, 180),
+        }));
+        await agent.prompt(JSON.stringify({
+          kind: 'EVENING_DIARY',
+          diaryDate: logicalDate,
+          currentLocalTime: formatLocalHHMM(nowWall),
+          todayEntries: todayEntries.map(e => ({
+            id: e.id,
+            title: e.title,
+            mood: e.mood,
+            source: e.source,
+            createdAt: e.createdAt,
+            preview: e.content.slice(0, 180),
+          })),
+          recentDiary,
+          memoryDirectory: this.host.store.memoryDirectory(24),
+          dayMessages,
+          dayTasks,
+        }), combinedSignal);
+        if (controller.signal.aborted || this.host.isClosing()) return;
+
+        this.eveningDiaryFailureStreak = 0;
+        this.eveningDiaryRetryAfter = 0;
+        const currentState = this.host.store.conversation.meta<EveningDiaryState>(EVENING_DIARY_STATE_META_KEY) ?? {};
+        this.host.store.conversation.setMeta(EVENING_DIARY_STATE_META_KEY, {
+          ...currentState,
+          lastEvaluatedDate: logicalDate,
+          lastRunAt: this.now(),
+          lastOutcome: wroteDiary ? 'written' : 'skipped',
+        });
+      } finally {
+        agent.close();
+      }
+    } catch (error) {
+      if (controller.signal.aborted || this.host.isClosing()) return;
+      this.eveningDiaryFailureStreak = Math.min(this.eveningDiaryFailureStreak + 1, 6);
+      const backoffMs = Math.min(2 * 3600_000, 5 * 60_000 * (2 ** (this.eveningDiaryFailureStreak - 1)));
+      this.eveningDiaryRetryAfter = this.now() + backoffMs;
+      console.warn(
+        `[friday] Evening diary cycle failed (streak=${this.eveningDiaryFailureStreak}, retryInMs=${backoffMs}):`,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
   abortAll(reason = 'Service shutdown'): void {
     if (this.dreamRun) {
       const run = this.dreamRun;
       this.dreamRun = undefined;
+      run.controller.abort(new Error(reason));
+    }
+    if (this.eveningDiaryRun) {
+      const run = this.eveningDiaryRun;
+      this.eveningDiaryRun = undefined;
       run.controller.abort(new Error(reason));
     }
     this.distillRun?.controller.abort(new Error(reason));
@@ -652,6 +961,7 @@ export class SubconsciousController {
 
   async awaitSettled(): Promise<void> {
     await Promise.all([...this.activeDreamPromises].map(p => p.catch(() => {})));
+    await Promise.all([...this.activeEveningDiaryPromises].map(p => p.catch(() => {})));
     await this.distillRun?.promise.catch(() => {});
   }
 }
