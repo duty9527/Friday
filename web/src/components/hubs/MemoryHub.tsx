@@ -93,6 +93,12 @@ function MemoryMatrixPanel({ active }: { active: boolean }) {
   const [deleteTarget, setDeleteTarget] = useState<BrainMemoryItem | null>(null);
   const [showAllHits, setShowAllHits] = useState(false);
   const [viewerPayload, setViewerPayload] = useState<FullContentPayload | null>(null);
+  const [viewerMounted, setViewerMounted] = useState(false);
+
+  if (viewerPayload && !viewerMounted) {
+    setViewerMounted(true);
+  }
+  const brainSuspended = !active || Boolean(viewerPayload) || viewerMounted;
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const brainRef = useRef<GoldenBrainStage | null>(null);
@@ -184,7 +190,6 @@ function MemoryMatrixPanel({ active }: { active: boolean }) {
     brainRef.current = stage;
     lastBrainSigRef.current = '';
     setAutoRotate(stage.isAutoRotating());
-    stage.start();
     return () => {
       stage.dispose();
       brainRef.current = null;
@@ -192,14 +197,20 @@ function MemoryMatrixPanel({ active }: { active: boolean }) {
     };
   }, []);
 
-  // Re-measure canvas after switching back to Matrix tab
+  // Suspend canvas animation while viewer is open/closing or Matrix tab is inactive
   useEffect(() => {
-    if (!active) return;
+    const stage = brainRef.current;
+    if (!stage) return;
+    if (brainSuspended) {
+      stage.stop();
+      return;
+    }
+    stage.start();
     const raf = requestAnimationFrame(() => {
       brainRef.current?.resize();
     });
     return () => cancelAnimationFrame(raf);
-  }, [active]);
+  }, [brainSuspended]);
 
   useEffect(() => {
     if (lastBrainSigRef.current === brainDataSig) return;
@@ -745,7 +756,11 @@ function MemoryMatrixPanel({ active }: { active: boolean }) {
         }}
       />
 
-      <FullContentDialog payload={viewerPayload} onClose={() => setViewerPayload(null)} />
+      <FullContentDialog
+        payload={viewerPayload}
+        onClose={() => setViewerPayload(null)}
+        onOpenChangeComplete={open => { if (!open) setViewerMounted(false); }}
+      />
     </div>
   );
 }

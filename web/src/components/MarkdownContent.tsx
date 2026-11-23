@@ -30,6 +30,17 @@ function CodeBlock({
   const collapsible = lineCount >= CODE_COLLAPSE_LINES;
   const canOpenModal = allowCodeModal && (lineCount >= 16 || code.length >= 600);
   const [expanded, setExpanded] = useState(!collapsible);
+  const modalPayload = useMemo(
+    () =>
+      modalOpen
+        ? {
+            title: `代码块 · ${lang || 'text'}`,
+            content: code,
+            mode: 'code' as const,
+          }
+        : null,
+    [modalOpen, lang, code],
+  );
 
   const handleCopy = async () => {
     try {
@@ -77,15 +88,7 @@ function CodeBlock({
       )}
       {canOpenModal && (
         <FullContentDialog
-          payload={
-            modalOpen
-              ? {
-                  title: `代码块 · ${lang || 'text'}`,
-                  content: code,
-                  mode: 'code',
-                }
-              : null
-          }
+          payload={modalPayload}
           onClose={() => setModalOpen(false)}
         />
       )}

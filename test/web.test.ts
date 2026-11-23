@@ -649,6 +649,13 @@ test('Web console lazy-loads plugin surfaces, serves redacted PluginView metadat
     ]) {
       assert.ok(memoryHubTsx.includes(marker), `MemoryHub.tsx must contain ${marker}`);
     }
+    assert.match(memoryHubTsx, /onOpenChangeComplete/, 'MemoryHub.tsx must wire onOpenChangeComplete to resume brain stage after close animation');
+    assert.match(memoryHubTsx, /stage\.stop\(\)/, 'MemoryHub.tsx must pause GoldenBrainStage while suspended');
+
+    const fullContentViewerTsx = await readFile(fileURLToPath(new URL('../web/src/components/shared/FullContentViewer.tsx', import.meta.url)), 'utf8');
+    assert.doesNotMatch(fullContentViewerTsx, /\.style\.|setAttribute\(\s*['"]style['"]|\.innerHTML\b|dangerouslySetInnerHTML/, 'FullContentViewer.tsx must obey strict CSP');
+    assert.match(fullContentViewerTsx, /retainedPayload/, 'FullContentViewer.tsx must retain payload during close animation');
+    assert.match(fullContentViewerTsx, /onOpenChangeComplete/, 'FullContentViewer.tsx must clear retained payload after close transition completes');
 
     const pluginHubTsx = await readFile(fileURLToPath(new URL('../web/src/components/hubs/PluginHub.tsx', import.meta.url)), 'utf8');
     const distAssetFiles = await readdir(fileURLToPath(new URL('../dist/web/assets/', import.meta.url)));

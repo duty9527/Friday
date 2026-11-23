@@ -8,7 +8,7 @@ import {
   RefreshCwIcon,
   WrapTextIcon,
 } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { MarkdownContent } from '@/components/MarkdownContent';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
@@ -41,10 +41,13 @@ export interface FullContentPayload {
 export function FullContentDialog({
   payload,
   onClose,
+  onOpenChangeComplete,
 }: {
   payload: FullContentPayload | null;
   onClose: () => void;
+  onOpenChangeComplete?: (open: boolean) => void;
 }) {
+  const [retainedPayload, setRetainedPayload] = useState<FullContentPayload | null>(payload);
   const [loadedText, setLoadedText] = useState<string | null>(null);
   const [loadingFull, setLoadingFull] = useState(false);
   const [loadError, setLoadError] = useState('');
@@ -52,30 +55,63 @@ export function FullContentDialog({
   const [rawSource, setRawSource] = useState(false);
   const [softWrap, setSoftWrap] = useState(true);
 
+  const payloadRef = useRef(payload);
+  payloadRef.current = payload;
+  const loadSeqRef = useRef(0);
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Retain the last non-null payload across the close animation so exiting never flashes blank content.
+  if (payload && payload !== retainedPayload) {
+    setRetainedPayload(payload);
+    if (loadedText !== null) setLoadedText(null);
+    if (loadingFull) setLoadingFull(false);
+    if (loadError !== '') setLoadError('');
+    if (copied) setCopied(false);
+    if (rawSource) setRawSource(false);
+    if (!softWrap) setSoftWrap(true);
+  }
+
   useEffect(() => {
-    setLoadedText(null);
-    setLoadingFull(false);
-    setLoadError('');
-    setCopied(false);
-    setRawSource(false);
-    setSoftWrap(true);
+    if (!payload) return;
+    loadSeqRef.current += 1;
+    if (copyTimerRef.current !== null) {
+      clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = null;
+    }
   }, [payload]);
 
-  const mode = payload?.mode ?? 'text';
-  const displayText = loadedText ?? payload?.content ?? '';
+  useEffect(() => {
+    return () => {
+      loadSeqRef.current += 1;
+      if (copyTimerRef.current !== null) {
+        clearTimeout(copyTimerRef.current);
+        copyTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const open = Boolean(payload);
+  const activePayload = payload ?? retainedPayload;
+  const mode = activePayload?.mode ?? 'text';
+  const displayText = loadedText ?? activePayload?.content ?? '';
   const lineCount = displayText ? displayText.split('\n').length : 0;
 
   const handleLoadFull = async () => {
-    if (!payload?.loadFull || loadingFull) return;
+    if (!activePayload?.loadFull || loadingFull) return;
+    const seq = ++loadSeqRef.current;
     setLoadingFull(true);
     setLoadError('');
     try {
-      const full = await payload.loadFull();
+      const full = await activePayload.loadFull();
+      if (seq !== loadSeqRef.current) return;
       setLoadedText(full);
     } catch (err) {
+      if (seq !== loadSeqRef.current) return;
       setLoadError(errorText(err));
     } finally {
-      setLoadingFull(false);
+      if (seq === loadSeqRef.current) {
+        setLoadingFull(false);
+      }
     }
   };
 
@@ -83,32 +119,60 @@ export function FullContentDialog({
     if (!displayText) return;
     try {
       await navigator.clipboard?.writeText(displayText);
+      if (copyTimerRef.current !== null) {
+        clearTimeout(copyTimerRef.current);
+      }
       setCopied(true);
-      setTimeout(() => setCopied(false), 1600);
+      copyTimerRef.current = setTimeout(() => {
+        copyTimerRef.current = null;
+        setCopied(false);
+      }, 1600);
     } catch {
       // ignore clipboard errors
     }
   };
 
+  const handleOpenChangeComplete = (nextOpen: boolean) => {
+    if (!nextOpen && !payloadRef.current) {
+      loadSeqRef.current += 1;
+      if (copyTimerRef.current !== null) {
+        clearTimeout(copyTimerRef.current);
+        copyTimerRef.current = null;
+      }
+      setRetainedPayload(null);
+      setLoadedText(null);
+      setLoadingFull(false);
+      setLoadError('');
+      setCopied(false);
+      setRawSource(false);
+      setSoftWrap(true);
+    }
+    onOpenChangeComplete?.(nextOpen);
+  };
+
   return (
-    <Dialog open={Boolean(payload)} onOpenChange={open => { if (!open) onClose(); }}>
+    <Dialog
+      open={open}
+      onOpenChange={nextOpen => { if (!nextOpen) onClose(); }}
+      onOpenChangeComplete={handleOpenChangeComplete}
+    >
       <DialogPopup
         className="h-[min(84dvh,780px)] max-w-4xl max-sm:h-[88dvh]"
         closeProps={{ 'aria-label': '关闭窗口' }}
       >
         <DialogHeader className="shrink-0 gap-2 border-b pb-3 pe-12">
           <DialogTitle className="break-words text-base leading-snug">
-            {payload?.title ?? '完整内容'}
+            {activePayload?.title ?? '完整内容'}
           </DialogTitle>
 
-          {(payload?.subtitle || (payload?.badges && payload.badges.length > 0)) && (
+          {(activePayload?.subtitle || (activePayload?.badges && activePayload.badges.length > 0)) && (
             <div className="flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
-              {payload?.badges?.map((b, idx) => (
+              {activePayload?.badges?.map((b, idx) => (
                 <Badge key={`${b.label}-${idx}`} size="sm" variant={b.variant ?? 'secondary'}>
                   {b.label}
                 </Badge>
               ))}
-              {payload?.subtitle && <span className="break-all">{payload.subtitle}</span>}
+              {activePayload?.subtitle && <span className="break-all">{activePayload.subtitle}</span>}
             </div>
           )}
 
@@ -119,7 +183,7 @@ export function FullContentDialog({
             </span>
 
             <div className="flex flex-wrap items-center gap-1.5">
-              {payload?.loadFull && loadedText === null && (
+              {activePayload?.loadFull && loadedText === null && (
                 <Button
                   type="button"
                   size="xs"
@@ -169,15 +233,15 @@ export function FullContentDialog({
             </div>
           </div>
 
-          {payload?.truncatedHint && loadedText === null && (
-            <p className="text-[11px] text-warning-foreground">{payload.truncatedHint}</p>
+          {activePayload?.truncatedHint && loadedText === null && (
+            <p className="text-[11px] text-warning-foreground">{activePayload.truncatedHint}</p>
           )}
 
           {loadError && (
             <Alert variant="error" className="mt-1">
               <AlertDescription className="flex items-center justify-between gap-2 text-xs">
                 <span>拉取全文失败：{loadError}</span>
-                {payload?.loadFull && (
+                {activePayload?.loadFull && (
                   <Button size="xs" variant="outline" onClick={() => void handleLoadFull()}>
                     重试
                   </Button>
