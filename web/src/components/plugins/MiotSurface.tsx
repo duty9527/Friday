@@ -760,11 +760,11 @@ export default function MiotSurface() {
             <CardContent>
               <form onSubmit={e => void saveConfig(e)} className="grid gap-2 sm:grid-cols-2">
                 <div className="space-y-1">
-                  <Label className="text-xs">路由器 SSH (routerSsh)</Label>
+                  <Label className="text-xs">路由器 SSH 地址</Label>
                   <Input size="sm" value={cfgRouter} onChange={e => { setCfgDirty(true); setCfgRouter(e.target.value); }} />
                 </div>
                 <div className="space-y-1">
-                  <Label className="text-xs">小爱音箱 SSH (speakerSsh)</Label>
+                  <Label className="text-xs">小爱音箱 SSH 地址</Label>
                   <Input size="sm" value={cfgSpeaker} onChange={e => { setCfgDirty(true); setCfgSpeaker(e.target.value); }} />
                 </div>
                 <div className="space-y-1 sm:col-span-2">

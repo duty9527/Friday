@@ -223,7 +223,7 @@ export default function AppleDevicesSurface() {
     const pwd = password;
     setPassword('');
     setBusy(true);
-    setStatus({ text: '正在通过 SRP-6a 连接苹果认证服务器…', tone: 'warn' });
+    setStatus({ text: '正在连接苹果认证服务器…', tone: 'warn' });
     try {
       const res = await callApple('auth-login', { appleId: appleId.trim(), password: pwd, region });
       if (!mountedRef.current) return;
@@ -337,7 +337,7 @@ export default function AppleDevicesSurface() {
               <ShieldAlertIcon className="size-4 text-warning" />
               <span>Apple ID 会话认证</span>
             </CardTitle>
-            <CardDescription className="text-xs">支持国区/国际区 SRP-6a 登录、受信任设备推送或短信双重认证</CardDescription>
+            <CardDescription className="text-xs">支持国区 / 国际区 Apple ID 登录、受信任设备弹窗或短信双重认证</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
             <form onSubmit={e => void handleLogin(e)} className="grid gap-2 sm:grid-cols-4 items-end">

@@ -51,8 +51,8 @@ interface AmapProbeResultView {
 }
 
 const ACTOR_LABELS: Record<UsageActor, string> = {
-  router: '主控 (Router)',
-  worker: 'Worker 执行',
+  router: '主控模型',
+  worker: '后台任务',
   decision: '决策引擎',
   distiller: '记忆提炼',
   dreamer: '潜意识做梦',
@@ -264,7 +264,7 @@ function ModelsTabPanel() {
       });
       setPoolDirty(false);
       await refreshView();
-      setProvStatus({ ok: true, text: `已保存 Worker 模型池勾选（${selectedModels.length} 款）` });
+      setProvStatus({ ok: true, text: `已保存调度池模型勾选（${selectedModels.length} 款）` });
     } catch (e) {
       setProvStatus({ ok: false, text: errorText(e) });
     } finally {
@@ -338,13 +338,13 @@ function ModelsTabPanel() {
         <CardHeader className="pb-2">
           <CardTitle className="flex items-center gap-2 text-sm">
             <CpuIcon className="size-4" />
-            <span>主控 Router 模型调度</span>
-            <Badge size="sm" variant={hub.mode === 'real' ? 'success' : 'secondary'}>
-              {hub.mode === 'real' ? 'REAL 模式' : 'OFFLINE 演示'}
-            </Badge>
+            <span>主控模型</span>
+            {hub.mode !== 'real' && (
+              <Badge size="sm" variant="secondary">离线演示</Badge>
+            )}
           </CardTitle>
           <CardDescription className="text-xs">
-            当前：{hub.routerProvider}/{hub.routerModel} · Worker 调度池就绪 {hub.modelPool?.length ?? 0} 款模型
+            当前：{hub.routerProvider}/{hub.routerModel} · 调度池就绪 {hub.modelPool?.length ?? 0} 款模型
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
@@ -417,8 +417,8 @@ function ModelsTabPanel() {
         <CardHeader className="pb-2">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div>
-              <CardTitle className="text-sm">提供方凭据与 Worker 模型池</CardTitle>
-              <CardDescription className="text-xs">勾选模型纳入 Worker 异构调度池</CardDescription>
+              <CardTitle className="text-sm">模型提供方与调度池</CardTitle>
+              <CardDescription className="text-xs">勾选启用供后台任务调度的模型</CardDescription>
             </div>
             <Button size="xs" variant="outline" onClick={() => setShowCustomProv(v => !v)}>
               <PlusIcon className="size-3.5" />
@@ -565,7 +565,7 @@ function ModelsTabPanel() {
               {/* Worker Model Pool Checkboxes */}
               <div className="border-t pt-3 space-y-2">
                 <div className="flex items-center justify-between">
-                  <span className="text-xs font-medium">Worker 模型池勾选（已选 {selectedPoolIds.size} 款）</span>
+                  <span className="text-xs font-medium">调度池模型勾选（已选 {selectedPoolIds.size} 款）</span>
                   <Button size="xs" variant="secondary" disabled={disabled || provBusy || activeProv.models.length === 0} onClick={() => void savePoolSelection()}>
                     保存模型池勾选
                   </Button>

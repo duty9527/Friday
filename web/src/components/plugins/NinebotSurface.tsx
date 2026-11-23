@@ -443,8 +443,8 @@ export default function NinebotSurface() {
                   onChange={e => { setDraftDirty(true); setPreferredLine(e.target.value === 'ebike' ? 'ebike' : 'motor'); }}
                   className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs outline-none"
                 >
-                  <option value="motor">电摩 (motor)</option>
-                  <option value="ebike">新国标电自 (ebike)</option>
+                  <option value="motor">电摩</option>
+                  <option value="ebike">新国标电自</option>
                 </select>
               </div>
               <div className="space-y-1">

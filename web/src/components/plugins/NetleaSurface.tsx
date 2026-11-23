@@ -646,7 +646,7 @@ export default function NetleaSurface() {
 
           <div className="grid gap-3 sm:grid-cols-2">
             <Card>
-              <CardHeader className="pb-1"><CardTitle className="text-xs">硬件临时参数 (0x1A)</CardTitle></CardHeader>
+              <CardHeader className="pb-1"><CardTitle className="text-xs">临时开关灯默认时长</CardTitle></CardHeader>
               <CardContent className="flex items-end gap-2 text-xs">
                 <div className="space-y-1 flex-1"><Label className="text-[11px]">开灯(分)</Label><Input size="sm" value={cfgOnMin} onChange={e => setCfgOnMin(e.target.value)} /></div>
                 <div className="space-y-1 flex-1"><Label className="text-[11px]">关灯(分)</Label><Input size="sm" value={cfgOffMin} onChange={e => setCfgOffMin(e.target.value)} /></div>

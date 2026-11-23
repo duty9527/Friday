@@ -87,7 +87,7 @@ export function Topbar() {
   const timerBadgeCount = (view?.timers ?? []).filter(t => t.enabled).length;
   const pluginBadgeCount = (view?.plugins ?? []).filter(p => p.enabled !== false).length;
   const imBadgeCount = (view?.imChannels ?? []).filter(c => c.enabled).length;
-  const sysBadgeText = view?.modelHub?.mode === 'real' ? 'REAL' : view?.modelHub ? 'OFF' : '—';
+  const isOfflineDemo = Boolean(view?.modelHub && view.modelHub.mode !== 'real');
 
   const openHub = (hub: HubKey) => {
     setMobileNavOpen(false);
@@ -138,7 +138,7 @@ export function Topbar() {
           </Button>
         </div>
 
-        {/* Center: M1 ~ M4 Primitives */}
+        {/* Center: Primary Navigation */}
         <nav
           className="topbar-hub-bar hidden items-center gap-1 md:flex"
           role="toolbar"
@@ -151,13 +151,14 @@ export function Topbar() {
             size="xs"
             onClick={() => openHub('memory')}
           >
-            <span className="font-mono text-[10px] text-amber-600 dark:text-amber-400" aria-hidden="true">M1</span>
-            <BrainIcon className="size-3.5" />
+            <BrainIcon className="size-3.5 text-amber-500" />
             <span className="hidden xl:inline">全息记忆</span>
             <span className="xl:hidden">记忆</span>
-            <Badge id="memory-top-badge" variant="secondary" size="sm" className="font-mono">
-              {memoryBadgeCount}
-            </Badge>
+            {memoryBadgeCount > 0 && (
+              <Badge id="memory-top-badge" variant="secondary" size="sm" className="font-mono">
+                {memoryBadgeCount}
+              </Badge>
+            )}
           </Button>
 
           <Button
@@ -167,13 +168,14 @@ export function Topbar() {
             size="xs"
             onClick={() => openHub('timer')}
           >
-            <span className="font-mono text-[10px] text-muted-foreground" aria-hidden="true">M2</span>
             <ClockIcon className="size-3.5" />
             <span className="hidden xl:inline">定时与目标</span>
             <span className="xl:hidden">定时</span>
-            <Badge id="timer-top-badge" variant="secondary" size="sm" className="font-mono">
-              {timerBadgeCount}
-            </Badge>
+            {timerBadgeCount > 0 && (
+              <Badge id="timer-top-badge" variant="secondary" size="sm" className="font-mono">
+                {timerBadgeCount}
+              </Badge>
+            )}
           </Button>
 
           <Button
@@ -183,13 +185,14 @@ export function Topbar() {
             size="xs"
             onClick={() => openHub('plugin')}
           >
-            <span className="font-mono text-[10px] text-muted-foreground" aria-hidden="true">M3</span>
             <PlugIcon className="size-3.5" />
             <span className="hidden xl:inline">应用与插件</span>
             <span className="xl:hidden">插件</span>
-            <Badge id="plugin-top-badge" variant="secondary" size="sm" className="font-mono">
-              {pluginBadgeCount}
-            </Badge>
+            {pluginBadgeCount > 0 && (
+              <Badge id="plugin-top-badge" variant="secondary" size="sm" className="font-mono">
+                {pluginBadgeCount}
+              </Badge>
+            )}
           </Button>
 
           <Button
@@ -199,17 +202,18 @@ export function Topbar() {
             size="xs"
             onClick={() => openHub('im')}
           >
-            <span className="font-mono text-[10px] text-muted-foreground" aria-hidden="true">M4</span>
             <RadioIcon className="size-3.5" />
             <span className="hidden xl:inline">IM 与声纹</span>
             <span className="xl:hidden">IM</span>
-            <Badge id="im-top-badge" variant="secondary" size="sm" className="font-mono">
-              {imBadgeCount}
-            </Badge>
+            {imBadgeCount > 0 && (
+              <Badge id="im-top-badge" variant="secondary" size="sm" className="font-mono">
+                {imBadgeCount}
+              </Badge>
+            )}
           </Button>
         </nav>
 
-        {/* Right: Command Palette, SYS, Theme, Trace Fold */}
+        {/* Right: Command Palette, System Base, Theme, Trace Fold */}
         <div className="flex items-center gap-1.5">
           <Button
             type="button"
@@ -232,12 +236,13 @@ export function Topbar() {
             title="系统底座：模型与提供方、用量账本、位置与地图底座"
             onClick={() => openHub('system')}
           >
-            <span className="font-mono text-[10px] text-muted-foreground" aria-hidden="true">SYS</span>
             <Settings2Icon className="size-3.5" />
             <span className="hidden sm:inline">系统底座</span>
-            <Badge id="system-top-badge" variant="outline" size="sm" className="font-mono">
-              {sysBadgeText}
-            </Badge>
+            {isOfflineDemo && (
+              <Badge id="system-top-badge" variant="secondary" size="sm">
+                离线演示
+              </Badge>
+            )}
           </Button>
 
           <div
@@ -351,25 +356,25 @@ export function Topbar() {
 
             <div className="flex flex-col gap-1">
               <Button variant="ghost" size="sm" className="justify-between" onClick={() => openHub('memory')}>
-                <span className="flex items-center gap-2"><BrainIcon className="size-4 text-amber-500" />M1 全息记忆</span>
-                <Badge variant="secondary" size="sm">{memoryBadgeCount}</Badge>
+                <span className="flex items-center gap-2"><BrainIcon className="size-4 text-amber-500" />全息记忆</span>
+                {memoryBadgeCount > 0 && <Badge variant="secondary" size="sm">{memoryBadgeCount}</Badge>}
               </Button>
               <Button variant="ghost" size="sm" className="justify-between" onClick={() => openHub('timer')}>
-                <span className="flex items-center gap-2"><ClockIcon className="size-4" />M2 定时与目标</span>
-                <Badge variant="secondary" size="sm">{timerBadgeCount}</Badge>
+                <span className="flex items-center gap-2"><ClockIcon className="size-4" />定时与目标</span>
+                {timerBadgeCount > 0 && <Badge variant="secondary" size="sm">{timerBadgeCount}</Badge>}
               </Button>
               <Button variant="ghost" size="sm" className="justify-between" onClick={() => openHub('plugin')}>
-                <span className="flex items-center gap-2"><PlugIcon className="size-4" />M3 应用与插件</span>
-                <Badge variant="secondary" size="sm">{pluginBadgeCount}</Badge>
+                <span className="flex items-center gap-2"><PlugIcon className="size-4" />应用与插件</span>
+                {pluginBadgeCount > 0 && <Badge variant="secondary" size="sm">{pluginBadgeCount}</Badge>}
               </Button>
               <Button variant="ghost" size="sm" className="justify-between" onClick={() => openHub('im')}>
-                <span className="flex items-center gap-2"><RadioIcon className="size-4" />M4 IM 与声纹</span>
-                <Badge variant="secondary" size="sm">{imBadgeCount}</Badge>
+                <span className="flex items-center gap-2"><RadioIcon className="size-4" />IM 与声纹</span>
+                {imBadgeCount > 0 && <Badge variant="secondary" size="sm">{imBadgeCount}</Badge>}
               </Button>
               <Separator className="my-1" />
               <Button variant="ghost" size="sm" className="justify-between" onClick={() => openHub('system')}>
-                <span className="flex items-center gap-2"><Settings2Icon className="size-4" />SYS 系统底座</span>
-                <Badge variant="outline" size="sm">{sysBadgeText}</Badge>
+                <span className="flex items-center gap-2"><Settings2Icon className="size-4" />系统底座</span>
+                {isOfflineDemo && <Badge variant="secondary" size="sm">离线演示</Badge>}
               </Button>
             </div>
 

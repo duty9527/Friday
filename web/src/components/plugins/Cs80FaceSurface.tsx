@@ -571,7 +571,7 @@ export default function Cs80FaceSurface() {
             <div className="flex flex-wrap items-center justify-between gap-2">
               <CardTitle className="flex items-center gap-1.5 text-sm">
                 <LayoutGridIcon className="size-4" />
-                <span>Bento 多屏布局编排</span>
+                <span>多屏卡片布局</span>
               </CardTitle>
               <Button
                 size="xs"

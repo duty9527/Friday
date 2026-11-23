@@ -114,13 +114,13 @@ interface FundPluginResponse<T = unknown> {
 const PRIVACY_KEY = 'friday.fund.privacy';
 
 const FUND_TYPES = [
-  { value: 'a_index', label: 'A股指数基金 (a_index)' },
-  { value: 'a_etf_feeder', label: 'A股ETF联接 (a_etf_feeder)' },
-  { value: 'hk_etf_feeder', label: '港股ETF联接 QDII (hk_etf_feeder)' },
-  { value: 'us_qdii', label: '美股QDII基金 (us_qdii)' },
-  { value: 'gold_feeder', label: '黄金ETF联接 (gold_feeder)' },
-  { value: 'a_stock', label: 'A股股票 (a_stock)' },
-  { value: 'other', label: '其他混合/主动基金 (other)' },
+  { value: 'a_index', label: 'A股指数基金' },
+  { value: 'a_etf_feeder', label: 'A股ETF联接' },
+  { value: 'hk_etf_feeder', label: '港股ETF联接 (QDII)' },
+  { value: 'us_qdii', label: '美股 QDII 基金' },
+  { value: 'gold_feeder', label: '黄金ETF联接' },
+  { value: 'a_stock', label: 'A股股票' },
+  { value: 'other', label: '其他混合/主动基金' },
 ];
 
 type TrendMetric = 'asset' | 'totalPnl' | 'dailyPnl' | 'holdingNav';

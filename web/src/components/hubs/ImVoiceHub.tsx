@@ -35,7 +35,7 @@ import { Tabs, TabsList, TabsPanel, TabsTab } from '@/components/ui/tabs';
 import { useFriday } from '@/lib/friday-store';
 
 const PLATFORM_LABELS: Record<string, string> = {
-  wechat: '微信 (iLink)',
+  wechat: '微信',
   telegram: 'Telegram',
   dingtalk: '钉钉',
   xiaoai: '小爱音箱',
@@ -145,7 +145,7 @@ export function ImVoiceHub() {
     stopQrPoll();
     const seq = ++qrSeqRef.current;
     setQrBusy(true);
-    setQrStatusText('⏳ 正在向腾讯 iLink 申请微信登录二维码…');
+    setQrStatusText('⏳ 正在申请微信登录二维码…');
     try {
       const session = await api<WechatQrLoginSession>('/api/im-wechat-qr-start', {
         ...(channelId ? { id: channelId } : {}),
@@ -309,7 +309,7 @@ export function ImVoiceHub() {
             <CardHeader className="pb-2">
               <CardTitle className="flex items-center gap-2 text-sm">
                 <QrCodeIcon className="size-4 text-success-foreground" />
-                <span>微信 iLink 扫码绑定</span>
+                <span>微信扫码绑定</span>
               </CardTitle>
               <CardDescription className="text-xs">支持个人微信收发图文/文件与多账号绑定</CardDescription>
             </CardHeader>
@@ -412,7 +412,7 @@ export function ImVoiceHub() {
                     onChange={e => setPlatform(e.target.value as typeof platform)}
                     className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs"
                   >
-                    <option value="wechat">微信 (iLink)</option>
+                    <option value="wechat">微信</option>
                     <option value="telegram">Telegram</option>
                     <option value="dingtalk">钉钉</option>
                     <option value="xiaoai">小爱音箱</option>
@@ -567,7 +567,7 @@ export function ImVoiceHub() {
             <div className="flex flex-wrap items-center justify-between gap-2">
               <CardTitle className="flex items-center gap-2 text-sm">
                 <ShieldCheckIcon className="size-4" />
-                <span>CAM++ 本地声纹防串音门禁</span>
+                <span>本地声纹门禁</span>
               </CardTitle>
               <div className="flex items-center gap-2 text-xs">
                 <span>{vp?.enabled ? '门禁已启用' : '门禁已暂停'}</span>
@@ -591,7 +591,7 @@ export function ImVoiceHub() {
               </div>
             </div>
             <CardDescription className="text-xs">
-              模型状态：{vp?.modelReady ? 'CAM++ 就绪' : '未加载'} · 门限 {vp?.threshold ?? '—'} · 唤醒前检 {vp?.wakePrecheck ? '开启' : '关闭'}
+              模型状态：{vp?.modelReady ? '声纹模型已就绪' : '未加载'} · 门限 {vp?.threshold ?? '—'} · 唤醒前检 {vp?.wakePrecheck ? '开启' : '关闭'}
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
