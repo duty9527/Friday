@@ -881,6 +881,219 @@ function medianNumber(values: readonly number[]): number {
   return sorted[Math.floor(sorted.length / 2)] ?? 0;
 }
 
+const ONLINE_BEAM_ANGLES_DEG = [0, 60, 120, 180, 240, 300] as const;
+const ONLINE_BEAM_HISTORY = 4;
+const ONLINE_BEAM_CROSSFADE_SAMPLES = 64;
+
+/**
+ * Lightweight causal 6-beam hexagonal shift-and-sum beamformer for always-on streaming KWS & VAD.
+ * Evaluates 6 cardinal azimuths (60° spacing), tracks per-beam noise floors,
+ * and smoothly switches toward higher-SNR speech directions while ignoring dead channels.
+ */
+export class OnlineHexBeamformer {
+  private readonly micCount: number;
+  private readonly delayInt: Int32Array[];
+  private readonly delayFrac: Float64Array[];
+  private readonly micHist: Float32Array[];
+  private readonly prevBeamSample = new Float64Array(ONLINE_BEAM_ANGLES_DEG.length);
+  private readonly beamAmbientRms = new Float64Array(ONLINE_BEAM_ANGLES_DEG.length);
+  private readonly beamSnrBuf = new Float64Array(ONLINE_BEAM_ANGLES_DEG.length);
+  private activeBeam = 0;
+
+  private paddedMics: Float32Array[] = [];
+  private beamOutputs: Float32Array[] = [];
+
+  constructor(
+    sampleRate = FRONTEND_SAMPLE_RATE,
+    coords = LX06_HEX_MIC_COORDS,
+  ) {
+    this.micCount = coords.length;
+    this.micHist = Array.from({ length: this.micCount }, () => new Float32Array(ONLINE_BEAM_HISTORY));
+    this.delayInt = [];
+    this.delayFrac = [];
+
+    for (let b = 0; b < ONLINE_BEAM_ANGLES_DEG.length; b++) {
+      const rad = (ONLINE_BEAM_ANGLES_DEG[b]! * Math.PI) / 180;
+      const cosT = Math.cos(rad);
+      const sinT = Math.sin(rad);
+      const rawTau = coords.map(([xm, ym]) => ((xm * cosT + ym * sinT) / SPEED_OF_SOUND_MPS) * sampleRate);
+      let minTau = Infinity;
+      for (const t of rawTau) {
+        if (t < minTau) minTau = t;
+      }
+      const dInt = new Int32Array(this.micCount);
+      const dFrac = new Float64Array(this.micCount);
+      for (let m = 0; m < this.micCount; m++) {
+        // Wavefront from +u reaches closer mics earlier -> delay closer mics more so all align at tau_min
+        const d = Math.max(0, Math.min(ONLINE_BEAM_HISTORY - 0.001, rawTau[m]! - minTau));
+        const k = Math.floor(d);
+        dInt[m] = k;
+        dFrac[m] = d - k;
+      }
+      this.delayInt.push(dInt);
+      this.delayFrac.push(dFrac);
+    }
+  }
+
+  reset(): void {
+    for (const h of this.micHist) h.fill(0);
+    this.prevBeamSample.fill(0);
+    this.beamAmbientRms.fill(0);
+    this.beamSnrBuf.fill(0);
+    this.activeBeam = 0;
+  }
+
+  process(mics: readonly Float32Array[]): { samples: Float32Array; activeBeam: number; azimuthDeg: number } {
+    const numSamples = mics[0]?.length ?? 0;
+    if (numSamples === 0 || mics.length === 0) {
+      return {
+        samples: new Float32Array(0),
+        activeBeam: this.activeBeam,
+        azimuthDeg: ONLINE_BEAM_ANGLES_DEG[this.activeBeam] ?? 0,
+      };
+    }
+
+    const activeMics = Math.min(mics.length, this.micCount);
+    if (activeMics < 2) {
+      return {
+        samples: new Float32Array(mics[0]!),
+        activeBeam: this.activeBeam,
+        azimuthDeg: ONLINE_BEAM_ANGLES_DEG[this.activeBeam] ?? 0,
+      };
+    }
+
+    const rmsList: number[] = [];
+    for (let m = 0; m < activeMics; m++) {
+      rmsList.push(calcRms(mics[m]!));
+    }
+    const medRms = medianNumber(rmsList);
+    const healthyIndices: number[] = [];
+    for (let m = 0; m < activeMics; m++) {
+      const r = rmsList[m]!;
+      if (r > 1e-6 && (medRms <= 0 || (r >= medRms * 0.2 && r <= medRms * 5.0))) {
+        healthyIndices.push(m);
+      }
+    }
+
+    const paddedLen = ONLINE_BEAM_HISTORY + numSamples;
+    while (this.paddedMics.length < activeMics) {
+      this.paddedMics.push(new Float32Array(paddedLen));
+    }
+    for (let m = 0; m < activeMics; m++) {
+      if (this.paddedMics[m]!.length < paddedLen) {
+        this.paddedMics[m] = new Float32Array(paddedLen);
+      }
+      const dst = this.paddedMics[m]!;
+      const hist = this.micHist[m]!;
+      const src = mics[m]!;
+      dst.set(hist, 0);
+      dst.set(src, ONLINE_BEAM_HISTORY);
+      if (numSamples >= ONLINE_BEAM_HISTORY) {
+        hist.set(src.subarray(numSamples - ONLINE_BEAM_HISTORY));
+      } else {
+        hist.copyWithin(0, numSamples);
+        hist.set(src, ONLINE_BEAM_HISTORY - numSamples);
+      }
+    }
+
+    if (healthyIndices.length < 2) {
+      return {
+        samples: new Float32Array(mics[0]!),
+        activeBeam: this.activeBeam,
+        azimuthDeg: ONLINE_BEAM_ANGLES_DEG[this.activeBeam] ?? 0,
+      };
+    }
+
+    while (this.beamOutputs.length < ONLINE_BEAM_ANGLES_DEG.length) {
+      this.beamOutputs.push(new Float32Array(numSamples));
+    }
+
+    const invM = 1 / healthyIndices.length;
+    for (let b = 0; b < ONLINE_BEAM_ANGLES_DEG.length; b++) {
+      if (this.beamOutputs[b]!.length !== numSamples) {
+        this.beamOutputs[b] = new Float32Array(numSamples);
+      }
+      const out = this.beamOutputs[b]!;
+      out.fill(0);
+      const dInt = this.delayInt[b]!;
+      const dFrac = this.delayFrac[b]!;
+      for (let hPos = 0; hPos < healthyIndices.length; hPos++) {
+        const m = healthyIndices[hPos]!;
+        const pad = this.paddedMics[m]!;
+        const k = dInt[m]!;
+        const f = dFrac[m]!;
+        const w0 = (1 - f) * invM;
+        const w1 = f * invM;
+        const base = ONLINE_BEAM_HISTORY - k;
+        for (let t = 0; t < numSamples; t++) {
+          out[t] = out[t]! + pad[base + t]! * w0 + pad[base + t - 1]! * w1;
+        }
+      }
+
+      // Score beam directivity after pre-emphasis so sub-800Hz omnidirectional rumble
+      // does not mask crisp 1.5-4.5kHz array directivity when selecting active beam.
+      let hpSumSq = 0;
+      let prev = this.prevBeamSample[b]!;
+      for (let t = 0; t < numSamples; t++) {
+        const s = out[t]!;
+        const hp = s - 0.85 * prev;
+        prev = s;
+        hpSumSq += hp * hp;
+      }
+      this.prevBeamSample[b] = prev;
+      const rms = Math.sqrt(hpSumSq / numSamples);
+      const amb = this.beamAmbientRms[b]!;
+      if (amb <= 0) {
+        this.beamAmbientRms[b] = Math.max(0.00012, rms);
+      } else if (rms < amb) {
+        this.beamAmbientRms[b] = 0.85 * amb + 0.15 * rms;
+      } else if (rms <= amb * 2.2) {
+        this.beamAmbientRms[b] = 0.97 * amb + 0.03 * rms;
+      }
+      this.beamSnrBuf[b] = rms / Math.max(0.00012, this.beamAmbientRms[b]!);
+    }
+
+    let bestBeam = 0;
+    let bestSnr = -1;
+    for (let b = 0; b < ONLINE_BEAM_ANGLES_DEG.length; b++) {
+      const snr = this.beamSnrBuf[b]!;
+      if (snr > bestSnr) {
+        bestSnr = snr;
+        bestBeam = b;
+      }
+    }
+
+    const prevBeam = this.activeBeam;
+    const prevSnr = this.beamSnrBuf[prevBeam] ?? 0;
+    if (
+      bestBeam !== prevBeam
+      && bestSnr >= 1.35
+      && bestSnr > prevSnr * 1.18
+    ) {
+      this.activeBeam = bestBeam;
+      const prevArr = this.beamOutputs[prevBeam]!;
+      const nextArr = this.beamOutputs[bestBeam]!;
+      const out = new Float32Array(nextArr);
+      const fadeLen = Math.min(ONLINE_BEAM_CROSSFADE_SAMPLES, numSamples);
+      for (let i = 0; i < fadeLen; i++) {
+        const alpha = (i + 1) / (fadeLen + 1);
+        out[i] = prevArr[i]! * (1 - alpha) + nextArr[i]! * alpha;
+      }
+      return {
+        samples: out,
+        activeBeam: bestBeam,
+        azimuthDeg: ONLINE_BEAM_ANGLES_DEG[bestBeam]!,
+      };
+    }
+
+    return {
+      samples: new Float32Array(this.beamOutputs[this.activeBeam]!),
+      activeBeam: this.activeBeam,
+      azimuthDeg: ONLINE_BEAM_ANGLES_DEG[this.activeBeam] ?? 0,
+    };
+  }
+}
+
 /**
  * 6-mic GCC-PHAT DOA estimation + STFT Delay-and-Sum beamforming using LX06 hexagonal geometry.
  * Eliminates high-frequency comb filtering across arbitrary azimuths while rejecting dead channels.
@@ -1042,12 +1255,12 @@ export function beamformHexArray(
     return score;
   };
 
-  // Coarse SRP-PHAT grid search across azimuths and elevation projections + broadside
+  // Coarse SRP-PHAT grid search across azimuths and elevation projections without broadside zero collapse
   let bestAz = 0;
-  let bestElev = 0;
-  let bestScore = scoreCandidate(0, 0);
+  let bestElev = 1.0;
+  let bestScore = -Infinity;
 
-  for (const elevScale of [1.0, 0.72]) {
+  for (const elevScale of [1.0, 0.78]) {
     for (let az = 0; az < 360; az += 15) {
       const s = scoreCandidate(az, elevScale);
       if (s > bestScore) {
@@ -1056,6 +1269,10 @@ export function beamformHexArray(
         bestElev = elevScale;
       }
     }
+  }
+  if (!Number.isFinite(bestScore)) {
+    bestAz = 0;
+    bestElev = 0;
   }
 
   // Fine azimuth refinement around coarse peak

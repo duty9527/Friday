@@ -15,6 +15,7 @@ import {
   decodeInterleavedPcm16le,
   FRONTEND_SAMPLE_RATE,
   LX06_HEX_MIC_COORDS,
+  OnlineHexBeamformer,
   parseAudioStreamHeader,
   PartitionedBlockAec,
   runOfflineAec,
@@ -334,6 +335,86 @@ test('audio-frontend: beamformHexArray recovers LX06 DOA within +-15deg, elimina
   assert.ok(circularAzimuthDiffDeg(deadRes.azimuthDeg, 60) <= 15);
 });
 
+test('audio-frontend: OnlineHexBeamformer tracks speech azimuth across 640-sample frames, suppresses directional noise, and survives dead mics', () => {
+  const beamformer = new OnlineHexBeamformer(FRONTEND_SAMPLE_RATE);
+  const frameLen = 640;
+
+  // Phase 1: 0.48s (12 x 40ms frames) stationary directional noise from 210deg to adapt per-beam noise floors
+  const noiseOnly = synthHexPlaneWave({
+    durationSec: 0.48,
+    azimuthDeg: 210,
+    signalAtTime: t => 0.05 * Math.sin(2 * Math.PI * 1950 * t) + 0.04 * Math.cos(2 * Math.PI * 2650 * t),
+    noiseAmp: 0.015,
+    seed: 101,
+  });
+  for (let off = 0; off + frameLen <= noiseOnly[0]!.length; off += frameLen) {
+    const out = beamformer.process(noiseOnly.map(m => m.subarray(off, off + frameLen)));
+    assert.equal(out.samples.length, frameLen);
+  }
+
+  // Phase 2: 0.48s directional speech at 0deg with strong 3.65kHz mixed with the 210deg noise
+  const speech0Only = synthHexPlaneWave({
+    durationSec: 0.48,
+    azimuthDeg: 0,
+    signalAtTime: t => 0.14 * Math.sin(2 * Math.PI * 520 * t) + 0.18 * Math.sin(2 * Math.PI * 3650 * t),
+  });
+  const mixMics = speech0Only.map((m, idx) => {
+    const combined = new Float32Array(m.length);
+    for (let i = 0; i < m.length; i++) {
+      combined[i] = m[i]! + noiseOnly[idx]![i]!;
+    }
+    return combined;
+  });
+
+  const outSpeech0 = new Float32Array(mixMics[0]!.length);
+  let lastAz0 = -1;
+  for (let off = 0; off + frameLen <= mixMics[0]!.length; off += frameLen) {
+    const res = beamformer.process(mixMics.map(m => m.subarray(off, off + frameLen)));
+    outSpeech0.set(res.samples, off);
+    lastAz0 = res.azimuthDeg;
+  }
+  assert.equal(lastAz0, 0, `Expected OnlineHexBeamformer to lock onto 0deg speech, got ${lastAz0}deg`);
+
+  const steady = outSpeech0.subarray(frameLen * 2);
+  const pureRef3650 = goertzelAmplitude(speech0Only[0]!.subarray(frameLen * 2), 3650, FRONTEND_SAMPLE_RATE);
+  const beam3650 = goertzelAmplitude(steady, 3650, FRONTEND_SAMPLE_RATE);
+  assert.ok(beam3650 / Math.max(1e-6, pureRef3650) >= 0.85, `Expected 3.65kHz preserved >=0.85, got ${(beam3650 / pureRef3650).toFixed(3)}`);
+
+  const ch0Steady = mixMics[0]!.subarray(frameLen * 2);
+  const ch0Noise1950 = goertzelAmplitude(ch0Steady, 1950, FRONTEND_SAMPLE_RATE);
+  const beamNoise1950 = goertzelAmplitude(steady, 1950, FRONTEND_SAMPLE_RATE);
+  const snrCh0 = pureRef3650 / Math.max(1e-6, ch0Noise1950);
+  const snrBeam = beam3650 / Math.max(1e-6, beamNoise1950);
+  assert.ok(snrBeam > snrCh0 * 1.4, `Expected beamformer SNR > 1.4x ch0 (beam=${snrBeam.toFixed(2)}, ch0=${snrCh0.toFixed(2)})`);
+
+  // Phase 3: 0.4s quiet gap followed by 0.4s speech from 120deg with dead ch2 (smooth crossfade, no NaN)
+  const quietGap = synthHexPlaneWave({
+    durationSec: 0.40,
+    azimuthDeg: 210,
+    signalAtTime: t => 0.02 * Math.sin(2 * Math.PI * 1950 * t),
+    noiseAmp: 0.005,
+    seed: 202,
+  });
+  for (let off = 0; off + frameLen <= quietGap[0]!.length; off += frameLen) {
+    beamformer.process(quietGap.map(m => m.subarray(off, off + frameLen)));
+  }
+  const speech120 = synthHexPlaneWave({
+    durationSec: 0.40,
+    azimuthDeg: 120,
+    signalAtTime: t => 0.16 * Math.sin(2 * Math.PI * 620 * t) + 0.16 * Math.sin(2 * Math.PI * 3650 * t),
+  });
+  speech120[2]!.fill(0); // dead channel must be excluded gracefully
+  let lastAz120 = -1;
+  for (let off = 0; off + frameLen <= speech120[0]!.length; off += frameLen) {
+    const res = beamformer.process(speech120.map(m => m.subarray(off, off + frameLen)));
+    lastAz120 = res.azimuthDeg;
+    for (let i = 0; i < res.samples.length; i++) {
+      assert.ok(Number.isFinite(res.samples[i]!), 'Beamformer output sample must be finite');
+    }
+  }
+  assert.equal(lastAz120, 120, `Expected OnlineHexBeamformer to switch cleanly to 120deg, got ${lastAz120}deg`);
+});
+
 test('asr-engine: transcribeWithGemini, collectVoiceHotwords, and createHybridAsrRecognizer work with local fallback and key redaction', async () => {
   const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-asr-engine-'));
   const secretKey = 'AIzaSyTestSecretKey_DoNotLeak999';
@@ -379,7 +460,7 @@ test('asr-engine: transcribeWithGemini, collectVoiceHotwords, and createHybridAs
     );
     await writeFile(
       join(home, 'plugins', 'music', 'library.json'),
-      JSON.stringify({ tracks: [{ artist: '周杰伦 / 梁静茹' }, { artist: '陈奕迅' }] }),
+      JSON.stringify({ tracks: [{ artist: '周杰伦 / 梁静茹' }, { artist: '陈奕迅' }, { artist: '乱码\uFFFD歌手' }, { artist: 'ctrl\u0007term' }] }),
     );
 
     const hotwords = collectVoiceHotwords(home, { forceRefresh: true, maxTerms: 120 });
@@ -392,6 +473,7 @@ test('asr-engine: transcribeWithGemini, collectVoiceHotwords, and createHybridAs
     assert.ok(hotwords.indexOf('小九一号') < hotwords.indexOf('水草造景模式'));
     assert.ok(hotwords.includes('周杰伦') && hotwords.includes('梁静茹') && hotwords.includes('陈奕迅'));
     assert.ok(!hotwords.includes('lumi_sensor_998877'));
+    assert.ok(!hotwords.some(w => /[\uFFFD\u0000-\u001F]/.test(w)), 'Replacement/control characters must be filtered');
     assert.equal(hotwords.filter(w => w === '小宝').length, 1);
 
     // 2. transcribeWithGemini request format and response variants

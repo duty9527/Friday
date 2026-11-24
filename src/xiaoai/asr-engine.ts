@@ -121,6 +121,7 @@ function pushHotword(out: string[], seen: Set<string>, raw: unknown, maxTerms: n
   if (out.length >= maxTerms || typeof raw !== 'string') return;
   const term = raw.trim();
   if (term.length < 2 || term.length > 24) return;
+  if (/[\uFFFD\u0000-\u001F]/.test(term)) return;
   const key = term.toLowerCase();
   if (seen.has(key)) return;
   seen.add(key);

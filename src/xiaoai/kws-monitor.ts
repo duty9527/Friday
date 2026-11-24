@@ -23,6 +23,7 @@ import {
   decodeInterleavedPcm16le,
   ensureXiaoaiDenoiserModel,
   normalizeUtteranceSamples,
+  OnlineHexBeamformer,
   parseAudioStreamHeader,
   PartitionedBlockAec,
   processMultiChannelUtterance,
@@ -148,6 +149,7 @@ export const SHORT_UTTERANCE_SPEECH_MS = 1_800;
 const DEFAULT_MAX_UTTERANCE_MS = 10_000;
 const DEFAULT_PRE_ROLL_MS = 240;
 const DEFAULT_SPEECH_RMS_THRESHOLD = 0.008;
+const MULTI_COALESCE_SAMPLES = 640;
 const STREAM_KILL_ESCALATION_MS = 1_500;
 
 let nextStreamSessionSeq = 0;
@@ -406,7 +408,11 @@ interface ActiveWorker {
   resolvedSampleFormat: 's16le' | 's32le';
   resolvedChannels: number;
   multiDcStates: FrontendDcBlockerState[];
+  onlineBeamformer?: OnlineHexBeamformer;
   onlineAec?: PartitionedBlockAec;
+  multiCoalesceMics: Float32Array[][];
+  multiCoalesceRef: Float32Array[];
+  multiCoalesceSamples: number;
   dcState: DcBlockerState;
   ambientRms: number;
   recentKwsRms: number[];
@@ -1286,6 +1292,9 @@ export class XiaoaiKwsMonitor {
         resolvedSampleFormat: 's16le',
         resolvedChannels: 1,
         multiDcStates: Array.from({ length: 6 }, () => ({ prevX: 0, prevY: 0 })),
+        multiCoalesceMics: createEmptyMicArrays(),
+        multiCoalesceRef: [],
+        multiCoalesceSamples: 0,
         dcState: { prevX: 0, prevY: 0 },
         ambientRms: 0,
         recentKwsRms: [],
@@ -1584,6 +1593,10 @@ export class XiaoaiKwsMonitor {
       worker.resolvedChannels = Math.max(1, streamHandle.channels ?? 1);
       worker.resolvedSampleFormat = streamHandle.sampleFormat ?? 's16le';
       worker.multiDcStates = Array.from({ length: 6 }, () => ({ prevX: 0, prevY: 0 }));
+      worker.multiCoalesceMics = createEmptyMicArrays();
+      worker.multiCoalesceRef = [];
+      worker.multiCoalesceSamples = 0;
+      worker.onlineBeamformer = worker.resolvedChannels >= 6 ? new OnlineHexBeamformer() : undefined;
       worker.onlineAec = worker.resolvedChannels >= 6 ? new PartitionedBlockAec() : undefined;
       worker.dcState = { prevX: 0, prevY: 0 };
       worker.ambientRms = 0;
@@ -1629,8 +1642,9 @@ export class XiaoaiKwsMonitor {
           worker.resolvedChannels = parsedHeader.channels;
           worker.resolvedSampleFormat = parsedHeader.sampleFormat;
           dataBuf = worker.headerBuf.subarray(parsedHeader.consumed);
-          if (worker.resolvedChannels >= 6 && !worker.onlineAec) {
-            worker.onlineAec = new PartitionedBlockAec();
+          if (worker.resolvedChannels >= 6) {
+            worker.onlineBeamformer ??= new OnlineHexBeamformer();
+            worker.onlineAec ??= new PartitionedBlockAec();
           }
         } else {
           dataBuf = worker.headerBuf;
@@ -1639,8 +1653,6 @@ export class XiaoaiKwsMonitor {
         if (dataBuf.length === 0) return;
       }
 
-      let samples: Float32Array;
-      let multiChunk: MultiChannelAudioChunk | undefined;
       if (worker.resolvedChannels >= 2 && worker.resolvedSampleFormat === 's16le') {
         const decoded = decodeInterleavedPcm16le(
           dataBuf,
@@ -1651,11 +1663,71 @@ export class XiaoaiKwsMonitor {
         worker.leftoverBytes = decoded.leftover;
         const ch0 = decoded.mics[0];
         if (!ch0 || ch0.length === 0) return;
-        multiChunk = { mics: decoded.mics, ref: decoded.ref, refRms: decoded.refRms };
-        samples = worker.onlineAec && decoded.ref.length > 0
-          ? worker.onlineAec.process(ch0, decoded.ref)
-          : ch0;
-      } else if (worker.resolvedSampleFormat === 's32le') {
+
+        appendMultiChunk(worker.multiCoalesceMics, worker.multiCoalesceRef, {
+          mics: decoded.mics,
+          ref: decoded.ref,
+          refRms: decoded.refRms,
+        });
+        worker.multiCoalesceSamples += ch0.length;
+        if (worker.multiCoalesceSamples < MULTI_COALESCE_SAMPLES) {
+          return;
+        }
+
+        const coalesced = concatMultiArrays(worker.multiCoalesceMics, worker.multiCoalesceRef);
+        worker.multiCoalesceMics = createEmptyMicArrays();
+        worker.multiCoalesceRef = [];
+        worker.multiCoalesceSamples = 0;
+        if (!coalesced || coalesced.mics.length === 0) return;
+
+        const fullLen = coalesced.mics[0]!.length;
+        let offset = 0;
+        while (offset + MULTI_COALESCE_SAMPLES <= fullLen) {
+          const end = offset + MULTI_COALESCE_SAMPLES;
+          const chunkMics = coalesced.mics.map(m => m.subarray(offset, end));
+          const chunkRef = coalesced.ref && coalesced.ref.length >= end
+            ? coalesced.ref.subarray(offset, end)
+            : new Float32Array(0);
+          const chunkRefRms = chunkRef.length > 0 ? computeRms(chunkRef) : 0;
+          const beamOut = worker.onlineBeamformer
+            ? worker.onlineBeamformer.process(chunkMics).samples
+            : chunkMics[0]!;
+          const frameSamples = worker.onlineAec && chunkRef.length > 0
+            ? worker.onlineAec.process(beamOut, chunkRef)
+            : beamOut;
+          try {
+            this.processWorkerSamples(worker, spotter, frameSamples, {
+              mics: chunkMics,
+              ref: chunkRef,
+              refRms: chunkRefRms,
+            });
+          } catch (error) {
+            this.options.onError?.(worker.channel.id, error);
+          }
+          if (this.closed || worker.stopped || worker.stream !== streamHandle || !worker.kwsStream) {
+            return;
+          }
+          offset = end;
+        }
+
+        const remLen = fullLen - offset;
+        if (remLen > 0) {
+          const remMics = coalesced.mics.map(m => m.slice(offset));
+          const remRef = coalesced.ref && coalesced.ref.length > offset
+            ? coalesced.ref.slice(offset)
+            : new Float32Array(0);
+          appendMultiChunk(worker.multiCoalesceMics, worker.multiCoalesceRef, {
+            mics: remMics,
+            ref: remRef,
+            refRms: remRef.length > 0 ? computeRms(remRef) : 0,
+          });
+          worker.multiCoalesceSamples = remLen;
+        }
+        return;
+      }
+
+      let samples: Float32Array;
+      if (worker.resolvedSampleFormat === 's32le') {
         const decoded = decodePcm32leToFloat32(dataBuf, worker.leftoverBytes, worker.dcState);
         worker.leftoverBytes = decoded.leftover;
         samples = decoded.samples;
@@ -1667,7 +1739,7 @@ export class XiaoaiKwsMonitor {
       if (samples.length === 0) return;
 
       try {
-        this.processWorkerSamples(worker, spotter, samples, multiChunk);
+        this.processWorkerSamples(worker, spotter, samples);
       } catch (error) {
         this.options.onError?.(worker.channel.id, error);
       }
@@ -2073,12 +2145,24 @@ export class XiaoaiKwsMonitor {
       if (!recognizer || this.closed || worker.stopped || worker.mode !== 'kws' || worker.kwsRescueId !== rescueId) {
         return;
       }
-      const rawText = await recognizer.transcribe(burstSamples, SAMPLE_RATE, { localOnly: true });
+      let rescueAsrSamples = burstSamples;
+      if (this.denoiserManager && burstSamples.length <= msToSamples(3_500)) {
+        rescueAsrSamples = await this.denoiserManager.denoiseAsync(burstSamples, SAMPLE_RATE);
+        if (this.closed || worker.stopped || worker.mode !== 'kws' || worker.kwsRescueId !== rescueId) {
+          return;
+        }
+      }
+      const rawText = await recognizer.transcribe(rescueAsrSamples, SAMPLE_RATE, { localOnly: true });
       if (this.closed || worker.stopped || worker.mode !== 'kws' || worker.kwsRescueId !== rescueId) {
         return;
       }
       const match = extractLeadingXiaoaiWakeKeyword(rawText);
       if (!match) {
+        if (rawText.trim()) {
+          console.log(
+            `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: asr-rescue ignored (dur=${(burstSamples.length / SAMPLE_RATE).toFixed(2)}s maxRms=${burstMaxRms.toFixed(5)} raw=${JSON.stringify(rawText)})`,
+          );
+        }
         return;
       }
       const now = Date.now();
