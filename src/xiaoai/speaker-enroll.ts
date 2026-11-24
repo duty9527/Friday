@@ -158,7 +158,7 @@ export function isEnrollCancelPhrase(rawText: string): boolean {
 
 function buildStepPrompt(step: number, totalSteps: number, speakerName: string, mode: 'replace' | 'append'): string {
   const examples = [
-    '星期五，今天天气怎么样',
+    '今天北京的天气怎么样',
     '帮我看一下家里哪些灯开着',
     '请把客厅的电视声音调小一点',
     '明天早上八点记得叫我起床',

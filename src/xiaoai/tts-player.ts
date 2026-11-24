@@ -323,12 +323,17 @@ function isXiaoaiPlayerPlaying(stdout: string): boolean {
   return /\\?"status\\?"\s*:\s*1\b/i.test(stdout) || /\\?"state\\?"\s*:\s*\\?"playing\\?"/i.test(stdout);
 }
 
+function estimateXiaoaiSpeechMs(textLength: number): number {
+  return Math.min(28_000, Math.max(2_800, textLength * 260 + 2_200));
+}
+
 async function waitForXiaoaiSegmentPlayback(
   target: XiaoaiSshTarget,
   sshRunner: XiaoaiSshRunner,
   segmentLength: number,
   isCancelled?: () => boolean,
   shutdownSignal?: AbortSignal,
+  onPlaying?: () => void,
 ): Promise<'completed' | 'unknown' | 'cancelled'> {
   if (isCancelled?.() || shutdownSignal?.aborted) return 'cancelled';
   const probe = await sshRunner(target, SSH_PLAY_STATUS_COMMAND, { timeoutMs: 4_000 }).catch(() => undefined);
@@ -336,6 +341,9 @@ async function waitForXiaoaiSegmentPlayback(
 
   const startedAt = Date.now();
   let sawPlaying = isXiaoaiPlayerPlaying(probe.stdout);
+  if (sawPlaying) {
+    onPlaying?.();
+  }
   const startGraceMs = 1_200;
   const maxWaitMs = Math.min(45_000, Math.max(6_000, segmentLength * 350));
 
@@ -355,6 +363,7 @@ async function waitForXiaoaiSegmentPlayback(
     const playing = isXiaoaiPlayerPlaying(res.stdout);
     if (playing) {
       sawPlaying = true;
+      onPlaying?.();
       continue;
     }
     if (sawPlaying) return 'completed';
@@ -377,7 +386,7 @@ export async function sendXiaoaiSpeech(
     || (sshTargets.length === 0 ? channel.webhookUrl?.trim() : undefined);
   const cs80Opts = { skipWhenMocked: Boolean(options?.sshRunner || options?.fetchImpl) };
   const estimateTotalSpeechSec = (segs: readonly string[]) => {
-    const ms = segs.reduce((sum, s) => sum + Math.min(18_000, Math.max(2_200, s.length * 190 + 900)), 0);
+    const ms = segs.reduce((sum, s) => sum + estimateXiaoaiSpeechMs(s.length), 0);
     return Math.min(45, Math.max(3.5, ms / 1000 + 1.2));
   };
 
@@ -472,7 +481,7 @@ export async function sendXiaoaiSpeech(
         if (isEpochCancelled() || options?.shutdownSignal?.aborted) break;
         const seg = segments[i]!;
         const spokenSeg = smoothXiaoaiTtsProsody(seg) || seg;
-        const estimatedSpeechMs = Math.min(18_000, Math.max(2_200, spokenSeg.length * 190 + 900));
+        const estimatedSpeechMs = estimateXiaoaiSpeechMs(spokenSeg.length);
         lastEstimatedMs = estimatedSpeechMs;
         const segStartedAt = Date.now();
         markXiaoaiSpeakingGuard(channel.id, target.id, estimatedSpeechMs);
@@ -489,15 +498,16 @@ export async function sendXiaoaiSpeech(
             spokenSeg.length,
             isEpochCancelled,
             options?.shutdownSignal,
+            () => markXiaoaiSpeakingGuard(channel.id, target.id, 1_500),
           );
           if (outcome === 'completed') {
             if (i === segments.length - 1) waitedLastSegment = true;
             if (i === segments.length - 1 && !isEpochCancelled()) {
-              markXiaoaiSpeakingGuard(channel.id, target.id, 350, true);
+              markXiaoaiSpeakingGuard(channel.id, target.id, 750, true);
             }
           } else if (outcome === 'unknown' && !isEpochCancelled()) {
             // Playback status could not be confirmed: preserve remaining estimated speech guard
-            // (do NOT shrink to 350ms), and wait remainingMs before starting any subsequent segment.
+            // (do NOT shrink to 750ms), and wait remainingMs before starting any subsequent segment.
             const remainingMs = Math.max(0, estimatedSpeechMs - (Date.now() - segStartedAt));
             if (i < segments.length - 1 && remainingMs > 0) {
               await delay(
@@ -507,7 +517,7 @@ export async function sendXiaoaiSpeech(
               ).catch(() => {});
             }
             if (i === segments.length - 1) {
-              lastEstimatedMs = Math.max(350, remainingMs);
+              lastEstimatedMs = Math.max(750, remainingMs);
               markXiaoaiSpeakingGuard(channel.id, target.id, lastEstimatedMs, true);
             }
           }
@@ -559,13 +569,13 @@ export async function sendXiaoaiSpeech(
       { scene: 'speaking', phase: 'start', channel: 'xiaoai', holdSec: estHoldSec, caption: '小爱音箱正在播报回复…' },
       cs80Opts,
     );
-    let lastCloudMs = 2_500;
+    let lastCloudMs = 2_800;
     try {
       for (let i = 0; i < segments.length; i++) {
         if (isEpochCancelled() || options?.shutdownSignal?.aborted) break;
         const seg = segments[i]!;
         const spokenSeg = smoothXiaoaiTtsProsody(seg) || seg;
-        const estimatedSpeechMs = Math.min(18_000, Math.max(1_800, spokenSeg.length * 190 + 700));
+        const estimatedSpeechMs = estimateXiaoaiSpeechMs(spokenSeg.length);
         lastCloudMs = estimatedSpeechMs;
         markXiaoaiSpeakingGuard(channel.id, targetDeviceId, estimatedSpeechMs);
         await callMinaRemoteUbus(

@@ -500,6 +500,7 @@ interface ActiveWorker {
   captureMaxRms: number;
   captureMaxRefRms: number;
   loggedLoopbackActive: boolean;
+  lastLoopbackActiveAt: number;
   liveAsrSession?: LiveAsrSession;
   liveAsrSampleCount: number;
   lastSpeechRms: number;
@@ -1402,6 +1403,7 @@ export class XiaoaiKwsMonitor {
         captureMaxRms: 0,
         captureMaxRefRms: 0,
         loggedLoopbackActive: false,
+        lastLoopbackActiveAt: 0,
         liveAsrSampleCount: 0,
         lastSpeechRms: 0,
       };
@@ -1422,6 +1424,19 @@ export class XiaoaiKwsMonitor {
 
   private isHardwareLowGainStream(worker: ActiveWorker): boolean {
     return worker.resolvedSampleFormat === 's32le' || worker.resolvedChannels >= 6;
+  }
+
+  private isBypassedLoopbackSelfEcho(worker: ActiveWorker, keyword: string, now = Date.now()): boolean {
+    if (keyword.trim() !== '星期五') {
+      return false;
+    }
+    if (!this.options.speakerGate?.isBypassed?.(worker.channel.id, worker.target.id)) {
+      return false;
+    }
+    if (isXiaoaiSpeakingSelfEcho(worker.channel.id, worker.target.id, '星期五', now)) {
+      return true;
+    }
+    return worker.lastLoopbackActiveAt > 0 && now - worker.lastLoopbackActiveAt < 900;
   }
 
   enterFollowUpCapture(
@@ -1761,6 +1776,7 @@ export class XiaoaiKwsMonitor {
     worker.utteranceSamples = 0;
     worker.captureMaxRms = 0;
     worker.captureMaxRefRms = 0;
+    worker.lastLoopbackActiveAt = 0;
     worker.liveAsrSession?.abort();
     worker.liveAsrSession = undefined;
     worker.liveAsrSampleCount = 0;
@@ -1801,6 +1817,7 @@ export class XiaoaiKwsMonitor {
       worker.kwsRingSamples = 0;
       worker.kwsPrevSample = 0;
       worker.kwsGainState = 0;
+      worker.lastLoopbackActiveAt = 0;
       this.resetWorkerCapture(worker, spotter);
     } catch (error) {
       if (streamHandle) {
@@ -1886,6 +1903,9 @@ export class XiaoaiKwsMonitor {
             ? coalesced.ref.subarray(offset, end)
             : new Float32Array(0);
           const chunkRefRms = chunkRef.length > 0 ? computeRms(chunkRef) : 0;
+          if (chunkRefRms >= 0.0006) {
+            worker.lastLoopbackActiveAt = Date.now();
+          }
           if (!worker.loggedLoopbackActive && chunkRefRms >= 1e-4) {
             worker.loggedLoopbackActive = true;
             console.log(
@@ -2185,7 +2205,10 @@ export class XiaoaiKwsMonitor {
         this.resetKwsIdleGate(worker);
         return true;
       }
-      if (isXiaoaiSpeakingSelfEcho(worker.channel.id, worker.target.id, keyword, now)) {
+      if (
+        isXiaoaiSpeakingSelfEcho(worker.channel.id, worker.target.id, keyword, now)
+        || this.isBypassedLoopbackSelfEcho(worker, keyword, now)
+      ) {
         worker.lastWakeAt = Math.max(worker.lastWakeAt, now - Math.max(0, this.cooldownMs - 500));
         spotter.reset(worker.kwsStream);
         this.resetKwsBurst(worker, true);
@@ -2430,7 +2453,7 @@ export class XiaoaiKwsMonitor {
     try {
       const isRescueValid = () =>
         !this.closed && !worker.stopped && worker.mode === 'kws' && worker.kwsRescueId === rescueId;
-      if (!isRescueValid()) {
+      if (!isRescueValid() || this.isBypassedLoopbackSelfEcho(worker, '星期五')) {
         return;
       }
 
@@ -2497,6 +2520,7 @@ export class XiaoaiKwsMonitor {
       if (
         now - worker.lastWakeAt < this.cooldownMs
         || isXiaoaiSpeakingSelfEcho(worker.channel.id, worker.target.id, match.keyword, now)
+        || this.isBypassedLoopbackSelfEcho(worker, match.keyword, now)
       ) {
         return;
       }
@@ -2762,7 +2786,10 @@ export class XiaoaiKwsMonitor {
     if (now - worker.lastWakeAt < this.cooldownMs) {
       return;
     }
-    if (isXiaoaiSpeakingSelfEcho(worker.channel.id, worker.target.id, keyword, now)) {
+    if (
+      isXiaoaiSpeakingSelfEcho(worker.channel.id, worker.target.id, keyword, now)
+      || this.isBypassedLoopbackSelfEcho(worker, keyword, now)
+    ) {
       worker.lastWakeAt = Math.max(worker.lastWakeAt, now - Math.max(0, this.cooldownMs - 500));
       return;
     }
@@ -3066,7 +3093,10 @@ export class XiaoaiKwsMonitor {
             spotter.decode(worker.kwsStream);
             const reWakeKeyword = spotter.getResult(worker.kwsStream).trim();
             if (reWakeKeyword) {
-              if (isXiaoaiSpeakingSelfEcho(worker.channel.id, worker.target.id, reWakeKeyword)) {
+              if (
+                isXiaoaiSpeakingSelfEcho(worker.channel.id, worker.target.id, reWakeKeyword)
+                || this.isBypassedLoopbackSelfEcho(worker, reWakeKeyword)
+              ) {
                 spotter.reset(worker.kwsStream);
                 break;
               }

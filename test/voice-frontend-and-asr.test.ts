@@ -49,6 +49,14 @@ import {
   XiaoaiSpeakerManager,
   type XiaoaiSpeakerExtractor,
 } from '../src/xiaoai/speaker-verify.js';
+import { XiaoaiSpeakerEnrollController } from '../src/xiaoai/speaker-enroll.js';
+import {
+  bumpXiaoaiSpeechEpoch,
+  isXiaoaiSpeakingSelfEcho,
+  markXiaoaiSpeakingGuard,
+  resetXiaoaiRuntimeState,
+  sendXiaoaiSpeech,
+} from '../src/xiaoai/tts-player.js';
 import { enrichWechatVoice } from '../src/wechat/media-enrich.js';
 import { until } from './helpers/async.js';
 
@@ -1697,6 +1705,199 @@ test('XiaoaiKwsMonitor: asr-rescue runs 6-mic beamforming + bounded GTCRN speake
     assert.equal(cancels.length, 0, 'Chime tail guard must prevent spurious echo trigger');
     monitor.close();
   } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('self-wake prevention: enrollment prompt avoids wake word, TTS guard stays live while playing, and bypassed loopback suppresses bare self-wake', async () => {
+  resetXiaoaiRuntimeState();
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-self-echo-'));
+  let monitor: XiaoaiKwsMonitor | undefined;
+  try {
+    // 1. Enrollment prompt must not speak Friday's own wake word aloud
+    const enrollCtrl = new XiaoaiSpeakerEnrollController();
+    const prep = enrollCtrl.createPreparingSession({
+      channelId: 'xiaoai-self-echo',
+      targetId: 'lx06',
+      speakerName: '主人',
+      role: 'owner',
+      mode: 'replace',
+    });
+    const activated = enrollCtrl.activateSession(prep.sessionId);
+    assert.ok(activated, 'Enrollment session should activate cleanly');
+    assert.ok(!activated.prompt.includes('星期五'), `Enrollment prompt must omit wake word, got: ${activated.prompt}`);
+
+    // 2. sendXiaoaiSpeech refreshes speaking guard while playback status reports playing, then keeps 750ms tail
+    const ttsChannel: ImChannelConfig = {
+      id: 'xiaoai-self-echo',
+      platform: 'xiaoai',
+      name: 'LX06 Self Echo',
+      enabled: true,
+      notifyAll: false,
+      apiBase: 'ssh://lx06=root@127.0.0.1?kws=1&chime=1',
+      allowedSenders: [],
+      inboundCount: 0,
+      outboundCount: 0,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    bumpXiaoaiSpeechEpoch('xiaoai-self-echo', 'lx06');
+    let statusPollCount = 0;
+    let guardRefreshedMidPlayback = false;
+    await sendXiaoaiSpeech(ttsChannel, '测试播报。', {
+      target: 'lx06',
+      waitForCompletion: true,
+      sshRunner: async (_target, cmd) => {
+        if (!cmd.includes('player_get_play_status')) {
+          return { stdout: '', stderr: '', code: 0 };
+        }
+        statusPollCount++;
+        if (statusPollCount === 1) {
+          return { stdout: '{"status":1}', stderr: '', code: 0 };
+        }
+        if (statusPollCount === 2) {
+          // Simulate initial estimatedSpeechMs having expired, then verify onPlaying restores >=1000ms guard
+          markXiaoaiSpeakingGuard('xiaoai-self-echo', 'lx06', 5, true);
+          await delay(20);
+          guardRefreshedMidPlayback = true;
+          return { stdout: '{"status":1}', stderr: '', code: 0 };
+        }
+        if (guardRefreshedMidPlayback) {
+          assert.equal(
+            isXiaoaiSpeakingSelfEcho('xiaoai-self-echo', 'lx06', '星期五', Date.now() + 1_000),
+            true,
+            'onPlaying callback must extend speaking guard while player status is active',
+          );
+          guardRefreshedMidPlayback = false;
+        }
+        return { stdout: '{"status":0}', stderr: '', code: 0 };
+      },
+    });
+    const doneAt = Date.now();
+    assert.equal(isXiaoaiSpeakingSelfEcho('xiaoai-self-echo', 'lx06', '星期五', doneAt + 500), true);
+    assert.equal(isXiaoaiSpeakingSelfEcho('xiaoai-self-echo', 'lx06', '星期五', doneAt + 900), false);
+    resetXiaoaiRuntimeState();
+
+    // 3. Bypassed speaker gate (enrollment) + active loopback suppresses bare '星期五' KWS & asr-rescue, then recovers
+    let audioStream: PassThrough | undefined;
+    let triggerBareWake = false;
+    let asrCalls = 0;
+    const wakeEvents: string[] = [];
+    const utterances: string[] = [];
+
+    monitor = new XiaoaiKwsMonitor({
+      homeDir: home,
+      modelsDir: join(home, 'kws'),
+      asrModelsDir: join(home, 'asr'),
+      vadModelPath: join(home, 'vad.onnx'),
+      cooldownMs: 30,
+      probeDurationMs: 40,
+      chimeDiscardMs: 20,
+      maxWaitSpeechMs: 1_500,
+      endSilenceMs: 100,
+      asrWakeRescue: true,
+      idleEnergyGate: false,
+      sshRunner: async () => ({ stdout: '', stderr: '', code: 0 }),
+      spotterFactory: () => ({
+        createStream: () => ({}),
+        acceptWaveform: () => {},
+        isReady: () => triggerBareWake,
+        decode: () => {},
+        getResult: () => {
+          if (!triggerBareWake) return '';
+          triggerBareWake = false;
+          return '星期五';
+        },
+        reset: () => { triggerBareWake = false; },
+      }),
+      vadFactory: () => ({
+        isSpeech: (samples) => computeRms(samples) >= 0.008,
+        reset: () => {},
+      }),
+      recognizerFactory: async (): Promise<XiaoaiAsrRecognizer> => ({
+        transcribe: async () => {
+          asrCalls++;
+          return '测试声纹句子。';
+        },
+      }),
+      streamFactory: () => {
+        audioStream = new PassThrough();
+        return {
+          stdout: audioStream,
+          sampleFormat: 's16le',
+          channels: 8,
+          kill: () => audioStream?.end(),
+          onClose: () => {},
+        };
+      },
+      speakerGate: {
+        isActive: () => true,
+        isBypassed: () => true,
+        verifyWake: () => ({ matched: true, score: 1, threshold: 0.3 }),
+        verifyUtterance: () => ({ matched: true, score: 1, threshold: 0.3 }),
+      },
+      onWake: async (ev) => {
+        wakeEvents.push(ev.keyword);
+        return { woken: true, suppressed: false };
+      },
+      onUtterance: async (ev) => {
+        utterances.push(ev.text);
+      },
+    });
+
+    await monitor.sync([ttsChannel]);
+    await until(() => Boolean(audioStream));
+    audioStream!.write(Buffer.from(AUDIO_STREAM_MAGIC_8CH_S16, 'latin1'));
+
+    const sr = FRONTEND_SAMPLE_RATE;
+    const write8Ch = async (mics: Float32Array[], refAmp = 0) => {
+      const len = mics[0]!.length;
+      const ref = new Float32Array(len);
+      if (refAmp > 0) {
+        for (let i = 0; i < len; i++) ref[i] = refAmp * Math.sin((2 * Math.PI * 500 * i) / sr);
+      }
+      const buf = encodeInterleavedInt16Frames([...mics, ref, ref]);
+      for (let off = 0; off < buf.length; off += 1280) {
+        audioStream!.write(buf.subarray(off, Math.min(buf.length, off + 1280)));
+        await delay(2);
+      }
+    };
+    const silence = (sec: number) => Array.from({ length: 6 }, () => new Float32Array(Math.round(sr * sec)));
+    const toneBurst = (sec: number, amp: number, freqHz = 900) =>
+      synthHexPlaneWave({
+        durationSec: sec,
+        azimuthDeg: 90,
+        signalAtTime: t => amp * Math.sin(2 * Math.PI * freqHz * t),
+        seed: 205,
+      });
+
+    // Active playback loopback (refAmp=0.05) -> both bare KWS wake and asr-rescue must be suppressed!
+    await write8Ch(toneBurst(0.16, 0.04), 0.05);
+    triggerBareWake = true;
+    await write8Ch(toneBurst(0.40, 0.04), 0.05);
+    await write8Ch(silence(0.40), 0.05);
+    await delay(80);
+    assert.equal(wakeEvents.length, 0, 'Bare 星期五 KWS wake must be suppressed during bypassed loopback');
+    assert.equal(asrCalls, 0, 'asr-rescue must skip self-echo audio during bypassed loopback');
+
+    // Wait >900ms with zero loopback so lastLoopbackActiveAt cooldown expires, then wake cleanly
+    for (let k = 0; k < 5; k++) {
+      await write8Ch(silence(0.20), 0);
+      await delay(210);
+    }
+    triggerBareWake = true;
+    await write8Ch(toneBurst(0.12, 0.04), 0);
+    await until(() => wakeEvents.length === 1);
+    await write8Ch(silence(0.08), 0);
+    await write8Ch(toneBurst(0.32, 0.05, 1100), 0);
+    await write8Ch(silence(0.24), 0);
+
+    await until(() => utterances.length === 1);
+    assert.equal(wakeEvents[0], '星期五');
+    assert.equal(utterances[0], '测试声纹句子。');
+    monitor.close();
+  } finally {
+    resetXiaoaiRuntimeState();
     await rm(home, { recursive: true, force: true });
   }
 });
