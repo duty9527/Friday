@@ -16,6 +16,26 @@ import {
   type XiaoaiSshRunner,
   type XiaoaiSshTarget,
 } from './ssh.js';
+import {
+  AUDIO_STREAM_MAGIC_1CH_S32,
+  AUDIO_STREAM_MAGIC_8CH_S16,
+  computeRms,
+  decodeInterleavedPcm16le,
+  ensureXiaoaiDenoiserModel,
+  normalizeUtteranceSamples,
+  parseAudioStreamHeader,
+  PartitionedBlockAec,
+  processMultiChannelUtterance,
+  XiaoaiSpeechDenoiserManager,
+  type DcBlockerState as FrontendDcBlockerState,
+  type MultiChannelAudioChunk,
+  type XiaoaiAudioDenoiser,
+} from './audio-frontend.js';
+import {
+  createHybridAsrRecognizer,
+  type AsrTranscribeOptions,
+  type GoogleApiCredentials,
+} from './asr-engine.js';
 import { handleXiaoaiKeywordWake, isXiaoaiSpeakingSelfEcho } from './tts-player.js';
 import { measureWakeSpeechDurationMs } from './speaker-verify.js';
 import {
@@ -24,6 +44,8 @@ import {
   hasLeadingXiaoaiWakeWord,
   isXiaoaiFollowUpCancel,
 } from './utterance-utils.js';
+
+export { computeRms, normalizeUtteranceSamples };
 
 export const XIAOAI_KEYWORDS_VERSION = 'v5';
 
@@ -116,7 +138,7 @@ export const DEFAULT_XIAOAI_KEYWORDS = [
 
 const SAMPLE_RATE = 16_000;
 const DEFAULT_COOLDOWN_MS = 1_200;
-const DEFAULT_PROBE_DURATION_MS = 95;
+const DEFAULT_PROBE_DURATION_MS = 220;
 const DEFAULT_CHIME_DISCARD_MS = 320;
 const DEFAULT_MAX_WAIT_SPEECH_MS = 4_500;
 const DEFAULT_FOLLOWUP_WAIT_SPEECH_MS = 8_000;
@@ -138,6 +160,7 @@ export interface XiaoaiKwsStreamHandle {
   stdout: Readable;
   stderr?: Readable | null;
   sampleFormat?: 's16le' | 's32le';
+  channels?: number;
   kill: () => void;
   onClose: (cb: (code: number | null) => void) => void;
 }
@@ -153,7 +176,7 @@ export interface XiaoaiKwsSpotter {
 }
 
 export interface XiaoaiAsrRecognizer {
-  transcribe: (samples: Float32Array, sampleRate: number) => Promise<string>;
+  transcribe: (samples: Float32Array, sampleRate: number, options?: AsrTranscribeOptions) => Promise<string>;
   free?: () => void;
 }
 
@@ -247,6 +270,7 @@ export interface XiaoaiKwsMonitorOptions {
   keywordsFile?: string;
   asrModelsDir?: string;
   vadModelPath?: string;
+  denoiserModelsDir?: string;
   cooldownMs?: number;
   probeDurationMs?: number;
   chimeDiscardMs?: number;
@@ -258,6 +282,9 @@ export interface XiaoaiKwsMonitorOptions {
   idleEnergyGate?: boolean;
   sshRunner?: XiaoaiSshRunner;
   speakerGate?: XiaoaiKwsSpeakerGate;
+  resolveGoogleCredentials?: () => Promise<GoogleApiCredentials | undefined>;
+  asrFetchImpl?: typeof fetch;
+  preferFastLocalForTarget?: (channelId: string, targetId: string) => boolean;
   onWake?: (event: XiaoaiKwsWakeEvent) => Promise<{ woken: boolean; suppressed: boolean }>;
   onTranscribing?: (event: { channel: ImChannelConfig; target: XiaoaiSshTarget; keyword: string }) => Promise<void> | void;
   onCaptureCancel?: (event: {
@@ -276,6 +303,7 @@ export interface XiaoaiKwsMonitorOptions {
   spotterFactory?: (config: { modelsDir: string; keywordsFile: string }) => XiaoaiKwsSpotter;
   recognizerFactory?: (config: { asrModelsDir: string }) => Promise<XiaoaiAsrRecognizer> | XiaoaiAsrRecognizer;
   vadFactory?: (config: { vadModelPath: string; speechRmsThreshold: number }) => XiaoaiSpeechDetector;
+  denoiserFactory?: (config: { modelPath: string }) => XiaoaiAudioDenoiser;
 }
 
 interface SherpaOnlineStream {
@@ -373,11 +401,20 @@ interface ActiveWorker {
   vad?: XiaoaiSpeechDetector;
   leftoverByte: number | null;
   leftoverBytes: Buffer;
+  headerPending: boolean;
+  headerBuf: Buffer;
+  resolvedSampleFormat: 's16le' | 's32le';
+  resolvedChannels: number;
+  multiDcStates: FrontendDcBlockerState[];
+  onlineAec?: PartitionedBlockAec;
   dcState: DcBlockerState;
   ambientRms: number;
   recentKwsRms: number[];
   kwsRingChunks: Float32Array[];
   kwsRingSamples: number;
+  kwsMultiRingMics: Float32Array[][];
+  kwsMultiRingRef: Float32Array[];
+  kwsMultiRingSamples: number;
   kwsPrevSample: number;
   kwsGateActive: boolean;
   kwsGateHoldSamples: number;
@@ -413,13 +450,20 @@ interface ActiveWorker {
   lastLiveCheckSamples: number;
   liveCheckInFlight: boolean;
   probeChunks: Float32Array[];
+  probeMultiMics: Float32Array[][];
+  probeMultiRef: Float32Array[];
   probeSamples: number;
   probeSkipSamplesRemaining: number;
   probeSawSpeech: boolean;
   chimeDiscardSamples: number;
   preRollChunks: Float32Array[];
+  preRollMultiMics: Float32Array[][];
+  preRollMultiRef: Float32Array[];
   preRollSamples: number;
+  preRollMultiSamples: number;
   audioChunks: Float32Array[];
+  captureMultiMics: Float32Array[][];
+  captureMultiRef: Float32Array[];
   speechStarted: boolean;
   waitSamples: number;
   currentMaxWaitMs: number;
@@ -490,72 +534,94 @@ export function decodePcm32leToFloat32(
   return { samples, leftover: nextLeftover };
 }
 
-export function computeRms(samples: Float32Array): number {
-  if (samples.length === 0) return 0;
-  let sumSq = 0;
-  for (let i = 0; i < samples.length; i++) {
-    const v = samples[i] ?? 0;
-    sumSq += v * v;
-  }
-  return Math.sqrt(sumSq / samples.length);
+function createEmptyMicArrays(count = 6): Float32Array[][] {
+  return Array.from({ length: count }, () => []);
 }
 
-/**
- * Software AGC for local ASR: boosts ultra-quiet speaker captures
- * into `[-0.45, 0.45]` before feature extraction while ignoring isolated click spikes.
- */
-export function normalizeUtteranceSamples(samples: Float32Array): Float32Array {
-  let peak = 0;
-  for (let i = 0; i < samples.length; i++) {
-    const abs = Math.abs(samples[i] ?? 0);
-    if (abs > peak) peak = abs;
-  }
-  if (peak <= 1e-5) {
-    return samples;
-  }
+function sliceMultiChunk(
+  chunk: MultiChannelAudioChunk | undefined,
+  start: number,
+  end?: number,
+): MultiChannelAudioChunk | undefined {
+  if (!chunk) return undefined;
+  return {
+    mics: chunk.mics.map(m => m.subarray(start, end)),
+    ref: chunk.ref.length > 0 ? chunk.ref.subarray(start, end) : chunk.ref,
+    refRms: chunk.refRms,
+  };
+}
 
-  let refPeak = peak;
-  if (samples.length >= 512) {
-    const windowSize = 256;
-    const windowPeaks: number[] = [];
-    for (let start = 0; start < samples.length; start += windowSize) {
-      const end = Math.min(samples.length, start + windowSize);
-      let wPeak = 0;
-      for (let i = start; i < end; i++) {
-        const abs = Math.abs(samples[i] ?? 0);
-        if (abs > wPeak) wPeak = abs;
-      }
-      if (wPeak > 0) windowPeaks.push(wPeak);
-    }
-    if (windowPeaks.length > 0) {
-      windowPeaks.sort((a, b) => a - b);
-      const p95Idx = windowPeaks.length >= 4
-        ? Math.min(windowPeaks.length - 2, Math.floor(windowPeaks.length * 0.95))
-        : windowPeaks.length - 1;
-      const p95 = windowPeaks[p95Idx];
-      if (p95 !== undefined && p95 > 1e-5) {
-        refPeak = p95;
-      }
-    }
+function pushMultiBoundedSamples(
+  micArrays: Float32Array[][],
+  refArray: Float32Array[],
+  currentSamples: number,
+  chunk: MultiChannelAudioChunk,
+  limitSamples: number,
+): number {
+  const len = chunk.mics[0]?.length ?? 0;
+  if (len === 0) return currentSamples;
+  while (micArrays.length < chunk.mics.length) {
+    micArrays.push([]);
   }
+  for (let i = 0; i < chunk.mics.length; i++) {
+    micArrays[i]!.push(chunk.mics[i]!);
+  }
+  if (chunk.ref.length > 0) {
+    refArray.push(chunk.ref);
+  }
+  let total = currentSamples + len;
+  while (total > limitSamples && (micArrays[0]?.length ?? 0) > 1) {
+    const removed = micArrays[0]!.shift();
+    for (let i = 1; i < chunk.mics.length; i++) {
+      micArrays[i]!.shift();
+    }
+    if (refArray.length > 0) {
+      refArray.shift();
+    }
+    if (removed) total -= removed.length;
+  }
+  return total;
+}
 
-  if (refPeak >= 0.25) {
-    return samples;
+function appendMultiChunk(
+  micArrays: Float32Array[][],
+  refArray: Float32Array[],
+  chunk: MultiChannelAudioChunk,
+): void {
+  const len = chunk.mics[0]?.length ?? 0;
+  if (len === 0) return;
+  while (micArrays.length < chunk.mics.length) {
+    micArrays.push([]);
   }
+  for (let i = 0; i < chunk.mics.length; i++) {
+    micArrays[i]!.push(chunk.mics[i]!);
+  }
+  if (chunk.ref.length > 0) {
+    refArray.push(chunk.ref);
+  }
+}
 
-  const gain = Math.min(180, 0.45 / refPeak);
-  const out = new Float32Array(samples.length);
-  for (let i = 0; i < samples.length; i++) {
-    const v = (samples[i] ?? 0) * gain;
-    const abs = Math.abs(v);
-    if (abs <= 0.6) {
-      out[i] = v;
-    } else {
-      const sign = v < 0 ? -1 : 1;
-      out[i] = sign * (0.6 + 0.38 * Math.tanh((abs - 0.6) / 0.38));
-    }
+function concatMultiArrays(
+  micArrays: Float32Array[][],
+  refArray: Float32Array[],
+  trimTrailingSamples = 0,
+): { mics: Float32Array[]; ref?: Float32Array } | undefined {
+  if (micArrays.length === 0 || (micArrays[0]?.length ?? 0) === 0) {
+    return undefined;
   }
-  return out;
+  const mics = micArrays.map(chunks => concatFloat32Arrays(chunks));
+  const fullLen = mics[0]?.length ?? 0;
+  if (fullLen === 0) return undefined;
+  const keepLen = trimTrailingSamples > 0 && fullLen - trimTrailingSamples >= msToSamples(280)
+    ? fullLen - trimTrailingSamples
+    : fullLen;
+  const trimmedMics = keepLen < fullLen ? mics.map(m => m.subarray(0, keepLen)) : mics;
+  let ref: Float32Array | undefined;
+  if (refArray.length > 0) {
+    const rawRef = concatFloat32Arrays(refArray);
+    ref = keepLen < rawRef.length ? rawRef.subarray(0, keepLen) : rawRef;
+  }
+  return { mics: trimmedMics, ...(ref && ref.length > 0 ? { ref } : {}) };
 }
 
 function pushBoundedSamples(
@@ -647,9 +713,9 @@ function defaultStreamFactory(
     `fi`,
   ].join(' ');
   const recordPid = `if [ ! -L "$PIDFILE" ]; then printf '%s %s\\n' "$$" ${qTag} > "$PIDFILE"; fi`;
-  const singleMicCmd = `if [ "${safeDevice}" = "noop" ] && [ -r /usr/share/alsa/alsa.conf ] && grep -q 'pcm.Capture' /etc/asound.conf 2>/dev/null; then printf '%s\\n' '</usr/share/alsa/alsa.conf>' 'pcm.friday_mic {' '  type plug' '  slave {' '    pcm "Capture"' '    channels 8' '  }' '  ttable.0.0 0.34' '  ttable.0.2 0.33' '  ttable.0.4 0.33' '}' >/tmp/friday_asound.conf && ALSA_CONFIG_PATH=/tmp/friday_asound.conf exec arecord -D friday_mic -f S32_LE -r ${SAMPLE_RATE} -c 1 -t raw -q; fi`;
-  const fallbackCmd = `exec arecord -D ${safeDevice} -f S32_LE -r ${SAMPLE_RATE} -c 1 -t raw -q`;
-  const remoteCmd = [killPrevSession, recordPid, singleMicCmd, fallbackCmd].join('; ');
+  const arrayCaptureCmd = `if [ "${safeDevice}" = "noop" ] && grep -q 'pcm.Capture' /etc/asound.conf 2>/dev/null && grep -q 'channels 8' /etc/asound.conf 2>/dev/null; then printf '${AUDIO_STREAM_MAGIC_8CH_S16}'; exec arecord -D Capture -f S16_LE -r ${SAMPLE_RATE} -c 8 -t raw -q; fi`;
+  const fallbackCmd = `printf '${AUDIO_STREAM_MAGIC_1CH_S32}'; exec arecord -D ${safeDevice} -f S32_LE -r ${SAMPLE_RATE} -c 1 -t raw -q`;
+  const remoteCmd = [killPrevSession, recordPid, arrayCaptureCmd, fallbackCmd].join('; ');
 
   const args = [...buildStreamSshBaseArgs(target), remoteCmd];
   const child = spawnImpl('ssh', args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -974,6 +1040,9 @@ export class XiaoaiKwsMonitor {
   private spotter?: XiaoaiKwsSpotter;
   private recognizer?: XiaoaiAsrRecognizer;
   private recognizerPromise?: Promise<XiaoaiAsrRecognizer | undefined>;
+  private denoiserManager?: XiaoaiSpeechDenoiserManager;
+  private denoiserDownloadStarted = false;
+  private denoiserAbort?: AbortController;
   private closed = false;
   private warnedMissingModels = false;
   private warnedMissingAsr = false;
@@ -995,6 +1064,11 @@ export class XiaoaiKwsMonitor {
     this.speechRmsThreshold = options.speechRmsThreshold ?? DEFAULT_SPEECH_RMS_THRESHOLD;
     this.asrWakeRescue = options.asrWakeRescue ?? !options.spotterFactory;
     this.idleEnergyGate = options.idleEnergyGate ?? !options.spotterFactory;
+    this.denoiserManager = new XiaoaiSpeechDenoiserManager({
+      homeDir: options.homeDir,
+      denoiserModelsDir: options.denoiserModelsDir,
+      denoiserFactory: options.denoiserFactory,
+    });
   }
 
   getStatus(channelId?: string, targetId?: string): {
@@ -1084,7 +1158,27 @@ export class XiaoaiKwsMonitor {
   private ensureRecognizer(): Promise<XiaoaiAsrRecognizer | undefined> {
     if (this.recognizer) return Promise.resolve(this.recognizer);
     if (this.recognizerPromise) return this.recognizerPromise;
-    if (!this.isAsrReadyOnDisk()) {
+    const hasLocal = this.isAsrReadyOnDisk();
+    if (this.options.recognizerFactory) {
+      this.recognizerPromise = Promise.resolve(this.options.recognizerFactory({ asrModelsDir: this.asrModelsDir }))
+        .then((rec) => {
+          if (this.closed) {
+            rec.free?.();
+            return undefined;
+          }
+          this.recognizer = rec;
+          return rec;
+        })
+        .catch((error) => {
+          this.recognizerPromise = undefined;
+          this.options.onError?.('xiaoai-kws', error);
+          return undefined;
+        });
+      return this.recognizerPromise;
+    }
+
+    const hasCloud = Boolean(this.options.resolveGoogleCredentials);
+    if (!hasLocal && !hasCloud) {
       if (!this.warnedMissingAsr) {
         this.warnedMissingAsr = true;
         this.options.onError?.(
@@ -1094,21 +1188,17 @@ export class XiaoaiKwsMonitor {
       }
       return Promise.resolve(undefined);
     }
-    const factory = this.options.recognizerFactory ?? defaultRecognizerFactory;
-    this.recognizerPromise = Promise.resolve(factory({ asrModelsDir: this.asrModelsDir }))
-      .then((rec) => {
-        if (this.closed) {
-          rec.free?.();
-          return undefined;
-        }
-        this.recognizer = rec;
-        return rec;
-      })
-      .catch((error) => {
-        this.recognizerPromise = undefined;
-        this.options.onError?.('xiaoai-kws', error);
-        return undefined;
-      });
+
+    const hybrid = createHybridAsrRecognizer({
+      homeDir: this.options.homeDir,
+      resolveGoogleCredentials: this.options.resolveGoogleCredentials,
+      fetchImpl: this.options.asrFetchImpl,
+      localRecognizerFactory: () => (hasLocal
+        ? defaultRecognizerFactory({ asrModelsDir: this.asrModelsDir })
+        : Promise.resolve(undefined)),
+    });
+    this.recognizer = hybrid;
+    this.recognizerPromise = Promise.resolve(hybrid);
     return this.recognizerPromise;
   }
 
@@ -1160,6 +1250,24 @@ export class XiaoaiKwsMonitor {
     const spotter = this.ensureSpotter();
     if (!spotter) return;
     void this.ensureRecognizer();
+    if (
+      !this.options.streamFactory
+      && !this.options.streamSpawn
+      && !this.options.spotterFactory
+      && !this.options.denoiserFactory
+      && !this.denoiserDownloadStarted
+    ) {
+      this.denoiserDownloadStarted = true;
+      this.denoiserAbort = new AbortController();
+      void ensureXiaoaiDenoiserModel({
+        homeDir: this.options.homeDir,
+        denoiserModelsDir: this.options.denoiserModelsDir,
+        signal: this.denoiserAbort.signal,
+      }).catch((err) => {
+        if (this.closed) return;
+        console.warn(`[xiaoai-denoiser] 下载降噪模型失败（将使用未降噪音频）: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }
 
     for (const [key, spec] of desired.entries()) {
       if (this.workers.has(key)) continue;
@@ -1173,11 +1281,19 @@ export class XiaoaiKwsMonitor {
         captureEpoch: 0,
         leftoverByte: null,
         leftoverBytes: Buffer.alloc(0),
+        headerPending: false,
+        headerBuf: Buffer.alloc(0),
+        resolvedSampleFormat: 's16le',
+        resolvedChannels: 1,
+        multiDcStates: Array.from({ length: 6 }, () => ({ prevX: 0, prevY: 0 })),
         dcState: { prevX: 0, prevY: 0 },
         ambientRms: 0,
         recentKwsRms: [],
         kwsRingChunks: [],
         kwsRingSamples: 0,
+        kwsMultiRingMics: createEmptyMicArrays(),
+        kwsMultiRingRef: [],
+        kwsMultiRingSamples: 0,
         kwsPrevSample: 0,
         kwsGateActive: false,
         kwsGateHoldSamples: 0,
@@ -1212,13 +1328,20 @@ export class XiaoaiKwsMonitor {
         lastLiveCheckSamples: 0,
         liveCheckInFlight: false,
         probeChunks: [],
+        probeMultiMics: createEmptyMicArrays(),
+        probeMultiRef: [],
         probeSamples: 0,
         probeSkipSamplesRemaining: 0,
         probeSawSpeech: false,
         chimeDiscardSamples: 0,
         preRollChunks: [],
+        preRollMultiMics: createEmptyMicArrays(),
+        preRollMultiRef: [],
         preRollSamples: 0,
+        preRollMultiSamples: 0,
         audioChunks: [],
+        captureMultiMics: createEmptyMicArrays(),
+        captureMultiRef: [],
         speechStarted: false,
         waitSamples: 0,
         currentMaxWaitMs: this.maxWaitSpeechMs,
@@ -1243,6 +1366,10 @@ export class XiaoaiKwsMonitor {
       }
     }
     return false;
+  }
+
+  private isHardwareLowGainStream(worker: ActiveWorker): boolean {
+    return worker.resolvedSampleFormat === 's32le' || worker.resolvedChannels >= 6;
   }
 
   enterFollowUpCapture(
@@ -1272,12 +1399,19 @@ export class XiaoaiKwsMonitor {
     worker.activeWakeSilent = false;
     worker.isFollowUpCapture = true;
     worker.probeChunks = [];
+    worker.probeMultiMics = createEmptyMicArrays();
+    worker.probeMultiRef = [];
     worker.probeSamples = 0;
     worker.probeSkipSamplesRemaining = 0;
     worker.probeSawSpeech = false;
     worker.preRollChunks = [];
+    worker.preRollMultiMics = createEmptyMicArrays();
+    worker.preRollMultiRef = [];
     worker.preRollSamples = 0;
+    worker.preRollMultiSamples = 0;
     worker.audioChunks = [];
+    worker.captureMultiMics = createEmptyMicArrays();
+    worker.captureMultiRef = [];
     worker.speechStarted = false;
     worker.waitSamples = 0;
     worker.currentMaxWaitMs = Math.max(200, options?.waitMs ?? DEFAULT_FOLLOWUP_WAIT_SPEECH_MS);
@@ -1294,7 +1428,7 @@ export class XiaoaiKwsMonitor {
     worker.vad?.reset();
     const refRms = worker.lastSpeechRms > 0
       ? Math.max(0.004, worker.lastSpeechRms * 0.75)
-      : (worker.stream?.sampleFormat === 's32le' ? 0.0045 : 0);
+      : (this.isHardwareLowGainStream(worker) ? 0.0045 : 0);
     worker.vad?.markWake?.(refRms);
     console.log(
       `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: follow-up listening (${worker.currentMaxWaitMs}ms)`,
@@ -1327,12 +1461,19 @@ export class XiaoaiKwsMonitor {
     worker.lastLiveCheckSamples = 0;
     worker.liveCheckInFlight = false;
     worker.probeChunks = [];
+    worker.probeMultiMics = createEmptyMicArrays();
+    worker.probeMultiRef = [];
     worker.probeSamples = 0;
     worker.probeSkipSamplesRemaining = 0;
     worker.probeSawSpeech = false;
     worker.preRollChunks = [];
+    worker.preRollMultiMics = createEmptyMicArrays();
+    worker.preRollMultiRef = [];
     worker.preRollSamples = 0;
+    worker.preRollMultiSamples = 0;
     worker.audioChunks = [];
+    worker.captureMultiMics = createEmptyMicArrays();
+    worker.captureMultiRef = [];
     worker.speechStarted = false;
     worker.waitSamples = 0;
     worker.currentMaxWaitMs = Math.max(350, remainingMs);
@@ -1392,8 +1533,13 @@ export class XiaoaiKwsMonitor {
     worker.currentMaxUtteranceMs = this.maxUtteranceMs;
     this.resetLiveCaptureTracking(worker, false);
     worker.probeChunks = [];
+    worker.probeMultiMics = createEmptyMicArrays();
+    worker.probeMultiRef = [];
     worker.kwsRingChunks = [];
     worker.kwsRingSamples = 0;
+    worker.kwsMultiRingMics = createEmptyMicArrays();
+    worker.kwsMultiRingRef = [];
+    worker.kwsMultiRingSamples = 0;
     this.resetKwsBurst(worker, true);
     this.resetKwsIdleGate(worker);
     worker.probeSamples = 0;
@@ -1401,8 +1547,13 @@ export class XiaoaiKwsMonitor {
     worker.probeSawSpeech = false;
     worker.chimeDiscardSamples = 0;
     worker.preRollChunks = [];
+    worker.preRollMultiMics = createEmptyMicArrays();
+    worker.preRollMultiRef = [];
     worker.preRollSamples = 0;
+    worker.preRollMultiSamples = 0;
     worker.audioChunks = [];
+    worker.captureMultiMics = createEmptyMicArrays();
+    worker.captureMultiRef = [];
     worker.speechStarted = false;
     worker.waitSamples = 0;
     worker.silenceSamples = 0;
@@ -1428,6 +1579,12 @@ export class XiaoaiKwsMonitor {
       worker.vad = worker.vad ?? this.createWorkerVad();
       worker.leftoverByte = null;
       worker.leftoverBytes = Buffer.alloc(0);
+      worker.headerPending = true;
+      worker.headerBuf = Buffer.alloc(0);
+      worker.resolvedChannels = Math.max(1, streamHandle.channels ?? 1);
+      worker.resolvedSampleFormat = streamHandle.sampleFormat ?? 's16le';
+      worker.multiDcStates = Array.from({ length: 6 }, () => ({ prevX: 0, prevY: 0 }));
+      worker.onlineAec = worker.resolvedChannels >= 6 ? new PartitionedBlockAec() : undefined;
       worker.dcState = { prevX: 0, prevY: 0 };
       worker.ambientRms = 0;
       worker.recentKwsRms = [];
@@ -1460,20 +1617,57 @@ export class XiaoaiKwsMonitor {
       const buf = typeof rawChunk === 'string' ? Buffer.from(rawChunk) : rawChunk;
       if (buf.length === 0) return;
 
+      let dataBuf = buf;
+      if (worker.headerPending) {
+        worker.headerBuf = worker.headerBuf.length > 0 ? Buffer.concat([worker.headerBuf, buf]) : buf;
+        const parsedHeader = parseAudioStreamHeader(worker.headerBuf);
+        if (parsedHeader === 'need_more') {
+          return;
+        }
+        worker.headerPending = false;
+        if (parsedHeader !== 'none') {
+          worker.resolvedChannels = parsedHeader.channels;
+          worker.resolvedSampleFormat = parsedHeader.sampleFormat;
+          dataBuf = worker.headerBuf.subarray(parsedHeader.consumed);
+          if (worker.resolvedChannels >= 6 && !worker.onlineAec) {
+            worker.onlineAec = new PartitionedBlockAec();
+          }
+        } else {
+          dataBuf = worker.headerBuf;
+        }
+        worker.headerBuf = Buffer.alloc(0);
+        if (dataBuf.length === 0) return;
+      }
+
       let samples: Float32Array;
-      if (streamHandle.sampleFormat === 's32le') {
-        const decoded = decodePcm32leToFloat32(buf, worker.leftoverBytes, worker.dcState);
+      let multiChunk: MultiChannelAudioChunk | undefined;
+      if (worker.resolvedChannels >= 2 && worker.resolvedSampleFormat === 's16le') {
+        const decoded = decodeInterleavedPcm16le(
+          dataBuf,
+          worker.leftoverBytes,
+          worker.resolvedChannels,
+          worker.multiDcStates,
+        );
+        worker.leftoverBytes = decoded.leftover;
+        const ch0 = decoded.mics[0];
+        if (!ch0 || ch0.length === 0) return;
+        multiChunk = { mics: decoded.mics, ref: decoded.ref, refRms: decoded.refRms };
+        samples = worker.onlineAec && decoded.ref.length > 0
+          ? worker.onlineAec.process(ch0, decoded.ref)
+          : ch0;
+      } else if (worker.resolvedSampleFormat === 's32le') {
+        const decoded = decodePcm32leToFloat32(dataBuf, worker.leftoverBytes, worker.dcState);
         worker.leftoverBytes = decoded.leftover;
         samples = decoded.samples;
       } else {
-        const decoded = decodePcm16leToFloat32(buf, worker.leftoverByte);
+        const decoded = decodePcm16leToFloat32(dataBuf, worker.leftoverByte);
         worker.leftoverByte = decoded.leftoverByte;
         samples = decoded.samples;
       }
       if (samples.length === 0) return;
 
       try {
-        this.processWorkerSamples(worker, spotter, samples);
+        this.processWorkerSamples(worker, spotter, samples, multiChunk);
       } catch (error) {
         this.options.onError?.(worker.channel.id, error);
       }
@@ -1500,7 +1694,7 @@ export class XiaoaiKwsMonitor {
   }
 
   private prepareKwsSamples(worker: ActiveWorker, samples: Float32Array): Float32Array {
-    if (worker.stream?.sampleFormat !== 's32le') {
+    if (!this.isHardwareLowGainStream(worker)) {
       return samples;
     }
     const kwsGain = computeKwsGain(samples, worker.ambientRms);
@@ -1523,6 +1717,7 @@ export class XiaoaiKwsMonitor {
     worker: ActiveWorker,
     spotter: XiaoaiKwsSpotter,
     samples: Float32Array,
+    multiChunk?: MultiChannelAudioChunk,
   ): void {
     if (worker.mode === 'chime_wait') {
       // Discard microphone frames while chime playback/SSH trigger executes
@@ -1530,12 +1725,12 @@ export class XiaoaiKwsMonitor {
     }
 
     if (worker.mode === 'probing') {
-      this.handleProbeSamples(worker, spotter, samples);
+      this.handleProbeSamples(worker, spotter, samples, multiChunk);
       return;
     }
 
     if (worker.mode === 'capturing') {
-      this.handleCaptureSamples(worker, spotter, samples);
+      this.handleCaptureSamples(worker, spotter, samples, multiChunk);
       return;
     }
 
@@ -1545,10 +1740,14 @@ export class XiaoaiKwsMonitor {
     if (worker.recentKwsRms.length > 16) {
       worker.recentKwsRms.shift();
     }
-    this.pushKwsRingSamples(worker, samples);
+    this.pushKwsRingSamples(worker, samples, multiChunk);
 
     if (this.idleEnergyGate && !worker.kwsRescueInFlight) {
-      const gateRms = computeKwsIdleGateRms(worker.ambientRms, worker.stream?.sampleFormat, this.speechRmsThreshold);
+      const gateRms = computeKwsIdleGateRms(
+        worker.ambientRms,
+        this.isHardwareLowGainStream(worker) ? 's32le' : 's16le',
+        this.speechRmsThreshold,
+      );
       const aboveGate = chunkRms >= (worker.kwsGateActive ? gateRms * 0.85 : gateRms);
       if (!worker.kwsGateActive && !aboveGate) {
         worker.ambientRms = updateAmbientNoiseRms(worker.ambientRms, chunkRms);
@@ -1673,6 +1872,9 @@ export class XiaoaiKwsMonitor {
         spotter.reset(worker.kwsStream);
         worker.kwsRingChunks = [];
         worker.kwsRingSamples = 0;
+        worker.kwsMultiRingMics = createEmptyMicArrays();
+        worker.kwsMultiRingRef = [];
+        worker.kwsMultiRingSamples = 0;
         this.resetKwsBurst(worker, true);
         this.resetKwsIdleGate(worker);
         return true;
@@ -1750,7 +1952,7 @@ export class XiaoaiKwsMonitor {
       if (
         speechLen >= msToSamples(300)
         && Date.now() - worker.lastWakeAt >= this.cooldownMs
-        && (worker.stream?.sampleFormat !== 's32le' || maxRms >= 0.0013)
+        && (!this.isHardwareLowGainStream(worker) || maxRms >= 0.0013)
       ) {
         const rescueId = ++worker.kwsRescueId;
         worker.kwsRescueInFlight = true;
@@ -1787,8 +1989,21 @@ export class XiaoaiKwsMonitor {
     this.resetKwsIdleGate(worker);
   }
 
-  private pushKwsRingSamples(worker: ActiveWorker, samples: Float32Array): void {
+  private pushKwsRingSamples(
+    worker: ActiveWorker,
+    samples: Float32Array,
+    multiChunk?: MultiChannelAudioChunk,
+  ): void {
     worker.kwsRingSamples = pushBoundedSamples(worker.kwsRingChunks, worker.kwsRingSamples, samples, msToSamples(1_800));
+    if (multiChunk) {
+      worker.kwsMultiRingSamples = pushMultiBoundedSamples(
+        worker.kwsMultiRingMics,
+        worker.kwsMultiRingRef,
+        worker.kwsMultiRingSamples,
+        multiChunk,
+        msToSamples(1_800),
+      );
+    }
   }
 
   private evaluateWakeSpeakerGate(
@@ -1803,13 +2018,20 @@ export class XiaoaiKwsMonitor {
     threshold: number;
     wakeSlice: Float32Array;
   } {
-    const wakeSlice = customSlice ?? concatFloat32Arrays(worker.kwsRingChunks);
+    const rawWakeSlice = customSlice ?? concatFloat32Arrays(worker.kwsRingChunks);
     const gate = this.options.speakerGate;
     if (!gate?.verifyWake || !gate.isActive(worker.channel, worker.target)) {
-      return { matched: true, score: 1, threshold: 0, wakeSlice };
+      return { matched: true, score: 1, threshold: 0, wakeSlice: rawWakeSlice };
     }
     if (gate.isBypassed?.(worker.channel.id, worker.target.id)) {
-      return { matched: true, score: 1, threshold: 0, wakeSlice };
+      return { matched: true, score: 1, threshold: 0, wakeSlice: rawWakeSlice };
+    }
+    let wakeSlice = rawWakeSlice;
+    if (!customSlice && worker.kwsMultiRingSamples >= msToSamples(450)) {
+      const multi = concatMultiArrays(worker.kwsMultiRingMics, worker.kwsMultiRingRef);
+      if (multi && multi.mics.length >= 2) {
+        wakeSlice = processMultiChannelUtterance(multi.mics, multi.ref, SAMPLE_RATE).samples;
+      }
     }
     const verdict = gate.verifyWake({
       channel: worker.channel,
@@ -1851,7 +2073,7 @@ export class XiaoaiKwsMonitor {
       if (!recognizer || this.closed || worker.stopped || worker.mode !== 'kws' || worker.kwsRescueId !== rescueId) {
         return;
       }
-      const rawText = await recognizer.transcribe(burstSamples, SAMPLE_RATE);
+      const rawText = await recognizer.transcribe(burstSamples, SAMPLE_RATE, { localOnly: true });
       if (this.closed || worker.stopped || worker.mode !== 'kws' || worker.kwsRescueId !== rescueId) {
         return;
       }
@@ -1925,6 +2147,8 @@ export class XiaoaiKwsMonitor {
           this.resetLiveCaptureTracking(worker, false);
           worker.speechStarted = true;
           worker.audioChunks = postChunks;
+          worker.captureMultiMics = createEmptyMicArrays();
+          worker.captureMultiRef = [];
           worker.utteranceSamples = postTotal;
           worker.silenceSamples = 0;
           worker.waitSamples = 0;
@@ -2124,8 +2348,10 @@ export class XiaoaiKwsMonitor {
     worker.activeWakeSpeaker = meta?.speaker;
     worker.currentMaxWaitMs = this.maxWaitSpeechMs;
     worker.probeChunks = [];
+    worker.probeMultiMics = createEmptyMicArrays();
+    worker.probeMultiRef = [];
     worker.probeSamples = 0;
-    worker.probeSkipSamplesRemaining = Math.min(msToSamples(45), Math.floor(probeTarget / 2));
+    worker.probeSkipSamplesRemaining = Math.min(msToSamples(35), Math.floor(probeTarget / 4));
     worker.probeSawSpeech = false;
     worker.vad?.reset();
     void spotter;
@@ -2146,10 +2372,17 @@ export class XiaoaiKwsMonitor {
     const apiOptions = parseXiaoaiApiOptions(worker.channel.apiBase);
     worker.activeWakeSilent = false;
     worker.probeChunks = [];
+    worker.probeMultiMics = createEmptyMicArrays();
+    worker.probeMultiRef = [];
     worker.probeSamples = 0;
     worker.preRollChunks = [];
+    worker.preRollMultiMics = createEmptyMicArrays();
+    worker.preRollMultiRef = [];
     worker.preRollSamples = 0;
+    worker.preRollMultiSamples = 0;
     worker.audioChunks = [];
+    worker.captureMultiMics = createEmptyMicArrays();
+    worker.captureMultiRef = [];
     worker.speechStarted = false;
     worker.waitSamples = 0;
     worker.silenceSamples = 0;
@@ -2237,8 +2470,12 @@ export class XiaoaiKwsMonitor {
     worker: ActiveWorker,
     spotter: XiaoaiKwsSpotter,
     samples: Float32Array,
+    multiChunk?: MultiChannelAudioChunk,
   ): void {
     worker.probeChunks.push(samples);
+    if (multiChunk) {
+      appendMultiChunk(worker.probeMultiMics, worker.probeMultiRef, multiChunk);
+    }
     worker.probeSamples += samples.length;
 
     let checkSlice = samples;
@@ -2279,11 +2516,15 @@ export class XiaoaiKwsMonitor {
       this.resetLiveCaptureTracking(worker, false);
       worker.speechStarted = true;
       worker.audioChunks = [...worker.probeChunks];
+      worker.captureMultiMics = worker.probeMultiMics.map(arr => [...arr]);
+      worker.captureMultiRef = [...worker.probeMultiRef];
       worker.utteranceSamples = worker.probeSamples;
       worker.silenceSamples = 0;
       worker.waitSamples = 0;
       worker.chimeDiscardSamples = 0;
       worker.probeChunks = [];
+      worker.probeMultiMics = createEmptyMicArrays();
+      worker.probeMultiRef = [];
       worker.probeSamples = 0;
 
       void this.invokeWake(worker, keyword, false, wakeMeta)
@@ -2303,21 +2544,37 @@ export class XiaoaiKwsMonitor {
     this.armTwoStepCapture(worker, spotter, keyword, epoch, wakeMeta);
   }
 
-  private pushPreRoll(worker: ActiveWorker, samples: Float32Array): void {
+  private pushPreRoll(
+    worker: ActiveWorker,
+    samples: Float32Array,
+    multiChunk?: MultiChannelAudioChunk,
+  ): void {
     worker.preRollSamples = pushBoundedSamples(worker.preRollChunks, worker.preRollSamples, samples, msToSamples(DEFAULT_PRE_ROLL_MS));
+    if (multiChunk) {
+      worker.preRollMultiSamples = pushMultiBoundedSamples(
+        worker.preRollMultiMics,
+        worker.preRollMultiRef,
+        worker.preRollMultiSamples,
+        multiChunk,
+        msToSamples(DEFAULT_PRE_ROLL_MS),
+      );
+    }
   }
 
   private handleCaptureSamples(
     worker: ActiveWorker,
     spotter: XiaoaiKwsSpotter,
     rawSamples: Float32Array,
+    rawMultiChunk?: MultiChannelAudioChunk,
   ): void {
     let samples = rawSamples;
+    let multiChunk = rawMultiChunk;
     if (worker.chimeDiscardSamples > 0) {
       if (samples.length <= worker.chimeDiscardSamples) {
         worker.chimeDiscardSamples -= samples.length;
         return;
       }
+      multiChunk = sliceMultiChunk(multiChunk, worker.chimeDiscardSamples);
       samples = samples.subarray(worker.chimeDiscardSamples);
       worker.chimeDiscardSamples = 0;
     }
@@ -2330,19 +2587,24 @@ export class XiaoaiKwsMonitor {
     const speech = worker.vad?.isSpeech(samples, SAMPLE_RATE) ?? (rms >= this.speechRmsThreshold);
 
     if (!worker.speechStarted) {
-      this.pushPreRoll(worker, samples);
+      this.pushPreRoll(worker, samples, multiChunk);
       if (speech) {
         worker.speechStarted = true;
         worker.audioChunks = [...worker.preRollChunks];
+        worker.captureMultiMics = worker.preRollMultiMics.map(arr => [...arr]);
+        worker.captureMultiRef = [...worker.preRollMultiRef];
         worker.utteranceSamples = worker.preRollSamples;
         worker.preRollChunks = [];
+        worker.preRollMultiMics = createEmptyMicArrays();
+        worker.preRollMultiRef = [];
         worker.preRollSamples = 0;
+        worker.preRollMultiSamples = 0;
         worker.silenceSamples = 0;
       } else {
         worker.ambientRms = updateAmbientNoiseRms(worker.ambientRms, rms);
         worker.vad?.observeAmbient?.(samples);
         if (worker.kwsStream && (worker.activeKeyword === '连续对话' || worker.waitSamples >= msToSamples(500))) {
-          this.pushKwsRingSamples(worker, samples);
+          this.pushKwsRingSamples(worker, samples, multiChunk);
           spotter.acceptWaveform(worker.kwsStream, this.prepareKwsSamples(worker, samples), SAMPLE_RATE);
           while (spotter.isReady(worker.kwsStream)) {
             spotter.decode(worker.kwsStream);
@@ -2357,6 +2619,9 @@ export class XiaoaiKwsMonitor {
                 spotter.reset(worker.kwsStream);
                 worker.kwsRingChunks = [];
                 worker.kwsRingSamples = 0;
+                worker.kwsMultiRingMics = createEmptyMicArrays();
+                worker.kwsMultiRingRef = [];
+                worker.kwsMultiRingSamples = 0;
                 break;
               }
               const wakeDurationMs = measureWakeSpeechDurationMs(gateRes.wakeSlice, SAMPLE_RATE);
@@ -2386,6 +2651,9 @@ export class XiaoaiKwsMonitor {
       }
     } else {
       worker.audioChunks.push(samples);
+      if (multiChunk) {
+        appendMultiChunk(worker.captureMultiMics, worker.captureMultiRef, multiChunk);
+      }
       worker.utteranceSamples += samples.length;
       if (speech) {
         worker.silenceSamples = 0;
@@ -2456,25 +2724,33 @@ export class XiaoaiKwsMonitor {
         worker.liveNonOwnerStreak = liveCheck.trimmed ? 1 : 0;
         return;
       }
-      worker.liveNonOwnerStreak++;
-      if (!worker.sawOwnerInLiveCapture && worker.isFollowUpCapture && worker.liveNonOwnerStreak >= 1) {
-        const remaining = worker.captureDeadlineAt - Date.now();
-        const savedMeta: CaptureMeta = {
-          isFollowUp: worker.isFollowUpCapture,
-          deadlineAt: worker.captureDeadlineAt,
-          endSilenceMs: worker.currentEndSilenceMs,
-          maxUtteranceMs: worker.currentMaxUtteranceMs,
-        };
-        if (this.rearmRemainingCaptureWindow(worker, spotter, remaining, savedMeta)) {
+      if (!worker.sawOwnerInLiveCapture) {
+        worker.liveNonOwnerStreak++;
+        if (worker.isFollowUpCapture && worker.liveNonOwnerStreak >= 1) {
+          const remaining = worker.captureDeadlineAt - Date.now();
+          const savedMeta: CaptureMeta = {
+            isFollowUp: worker.isFollowUpCapture,
+            deadlineAt: worker.captureDeadlineAt,
+            endSilenceMs: worker.currentEndSilenceMs,
+            maxUtteranceMs: worker.currentMaxUtteranceMs,
+          };
+          if (this.rearmRemainingCaptureWindow(worker, spotter, remaining, savedMeta)) {
+            return;
+          }
+          const keyword = worker.activeKeyword;
+          worker.captureEpoch++;
+          this.resetWorkerCapture(worker, spotter);
+          this.cancelSpeakerLed(worker, keyword, 'speaker_rejected');
           return;
         }
-        const keyword = worker.activeKeyword;
-        worker.captureEpoch++;
-        this.resetWorkerCapture(worker, spotter);
-        this.cancelSpeakerLed(worker, keyword, 'speaker_rejected');
         return;
       }
-      if (worker.sawOwnerInLiveCapture && worker.liveNonOwnerStreak >= 2) {
+      const tailRms = computeRms(checkSamples);
+      const activeTailSpeech = worker.captureMaxRms <= 0 || tailRms >= Math.max(0.0005, worker.captureMaxRms * 0.18);
+      if (activeTailSpeech && liveCheck.score < Math.max(0.24, liveCheck.threshold - 0.14)) {
+        worker.liveNonOwnerStreak++;
+      }
+      if (worker.liveNonOwnerStreak >= 3) {
         console.log(
           `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: continuous non-member audio after member speech, endpointing early`,
         );
@@ -2508,13 +2784,15 @@ export class XiaoaiKwsMonitor {
     const rawCaptured = concatFloat32Arrays(worker.audioChunks);
     const excessSilence = forceEndCapture ? 0 : Math.max(0, worker.silenceSamples - msToSamples(180));
     const keepLength = rawCaptured.length - excessSilence;
-    const captured = excessSilence > 0 && keepLength >= msToSamples(280)
-      ? rawCaptured.subarray(0, keepLength)
+    const trimTrailing = excessSilence > 0 && keepLength >= msToSamples(280) ? excessSilence : 0;
+    const captured = trimTrailing > 0
+      ? rawCaptured.subarray(0, rawCaptured.length - trimTrailing)
       : rawCaptured;
+    const multiAudio = concatMultiArrays(worker.captureMultiMics, worker.captureMultiRef, trimTrailing);
     worker.lastWakeAt = Date.now();
     worker.captureEpoch++;
     this.resetWorkerCapture(worker, spotter);
-    void this.transcribeAndEmit(worker, keyword, captured, maxRms, savedMeta);
+    void this.transcribeAndEmit(worker, keyword, captured, maxRms, savedMeta, multiAudio);
   }
 
   private async transcribeAndEmit(
@@ -2523,16 +2801,27 @@ export class XiaoaiKwsMonitor {
     samples: Float32Array,
     maxRms = 0,
     captureMeta?: CaptureMeta,
+    multiAudio?: { mics: Float32Array[]; ref?: Float32Array },
   ): Promise<void> {
     worker.transcribingCount++;
     try {
       if (this.closed || worker.stopped) return;
-      if (worker.stream?.sampleFormat === 's32le' && maxRms > 0 && maxRms < 0.0010) {
+      if (this.isHardwareLowGainStream(worker) && maxRms > 0 && maxRms < 0.0010) {
         this.cancelSpeakerLed(worker, keyword, 'empty');
         return;
       }
 
       let audioForAsr = samples;
+      let frontendMeta: { azimuthDeg: number; aecApplied: boolean; echoReductionDb: number } | undefined;
+      if (multiAudio && multiAudio.mics.length >= 2 && multiAudio.mics[0]?.length === samples.length) {
+        const processed = processMultiChannelUtterance(multiAudio.mics, multiAudio.ref, SAMPLE_RATE);
+        audioForAsr = processed.samples;
+        frontendMeta = {
+          azimuthDeg: processed.azimuthDeg,
+          aecApplied: processed.aecApplied,
+          echoReductionDb: processed.echoReductionDb,
+        };
+      }
       let matchedSpeaker: XiaoaiMatchedSpeaker | undefined;
       const gate = this.options.speakerGate;
       const gateBypassed = gate?.isBypassed?.(worker.channel.id, worker.target.id) ?? false;
@@ -2552,8 +2841,8 @@ export class XiaoaiKwsMonitor {
         if (this.closed || worker.stopped) return;
         if (!verdict.matched) {
           if (
-            samples.length >= msToSamples(450)
-            && samples.length <= msToSamples(1_800)
+            audioForAsr.length >= msToSamples(450)
+            && audioForAsr.length <= msToSamples(1_800)
             && verdict.score >= 0.20
             && gate.verifyWake
           ) {
@@ -2561,12 +2850,12 @@ export class XiaoaiKwsMonitor {
               channel: worker.channel,
               target: worker.target,
               keyword: '星期五',
-              samples,
+              samples: audioForAsr,
               sampleRate: SAMPLE_RATE,
             });
             if (wakeFallback.matched && wakeFallback.speaker) {
               const recognizer = await this.ensureRecognizer();
-              const probeRaw = recognizer ? await recognizer.transcribe(samples, SAMPLE_RATE) : '';
+              const probeRaw = recognizer ? await recognizer.transcribe(audioForAsr, SAMPLE_RATE, { localOnly: true }) : '';
               const reWake = extractLeadingXiaoaiWakeKeyword(probeRaw);
               if (reWake && !reWake.remainder && !this.closed && !worker.stopped) {
                 this.retriggerBareWake(worker, this.spotter, reWake.keyword, wakeFallback.speaker);
@@ -2615,12 +2904,22 @@ export class XiaoaiKwsMonitor {
           this.cancelSpeakerLed(worker, keyword, 'error');
           return;
         }
-        const rawText = await recognizer.transcribe(audioForAsr, SAMPLE_RATE);
+        const asrSamples = this.denoiserManager
+          ? await this.denoiserManager.denoiseAsync(audioForAsr, SAMPLE_RATE)
+          : audioForAsr;
+        if (this.closed || worker.stopped) return;
+        const preferFastLocal = this.options.preferFastLocalForTarget?.(worker.channel.id, worker.target.id) ?? false;
+        const rawText = preferFastLocal
+          ? await recognizer.transcribe(asrSamples, SAMPLE_RATE, { preferFastLocal: true })
+          : await recognizer.transcribe(asrSamples, SAMPLE_RATE);
         const explicitWake = keyword !== '连续对话' || hasLeadingXiaoaiWakeWord(rawText);
         const cleanText = cleanXiaoaiAsrUtterance(rawText);
         const durationSec = (audioForAsr.length / SAMPLE_RATE).toFixed(2);
+        const frontendLog = frontendMeta
+          ? ` doa=${frontendMeta.azimuthDeg}°${frontendMeta.aecApplied ? ` aec=-${frontendMeta.echoReductionDb.toFixed(1)}dB` : ''}`
+          : '';
         console.log(
-          `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: wake="${keyword}" dur=${durationSec}s maxRms=${maxRms.toFixed(5)} raw=${JSON.stringify(rawText)} clean=${JSON.stringify(cleanText)}`,
+          `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: wake="${keyword}" dur=${durationSec}s maxRms=${maxRms.toFixed(5)}${frontendLog} raw=${JSON.stringify(rawText)} clean=${JSON.stringify(cleanText)}`,
         );
         if (this.closed || worker.stopped) return;
         if (!cleanText) {
@@ -2703,6 +3002,8 @@ export class XiaoaiKwsMonitor {
 
   close(): void {
     this.closed = true;
+    this.denoiserAbort?.abort();
+    this.denoiserAbort = undefined;
     for (const worker of this.workers.values()) {
       this.stopWorker(worker);
     }
@@ -2712,5 +3013,6 @@ export class XiaoaiKwsMonitor {
     this.recognizer?.free?.();
     this.recognizer = undefined;
     this.recognizerPromise = undefined;
+    this.denoiserManager?.close();
   }
 }

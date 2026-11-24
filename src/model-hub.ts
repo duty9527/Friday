@@ -848,6 +848,30 @@ export class ModelHub {
     };
   }
 
+  /**
+   * Resolve Google Gemini API credentials for voice transcription when running in real mode.
+   * Respects provider enablement and enforces safe transport checks on custom base URLs.
+   */
+  async resolveGoogleApiCredentials(): Promise<{ apiKey: string; baseUrl?: string } | undefined> {
+    if (this.mode !== 'real' || !this.isProviderEnabled('google')) {
+      return undefined;
+    }
+    const runtime = await this.ensureRuntime();
+    const apiKey = (await this.resolveProviderApiKey(runtime, 'google'))
+      ?? resolveEnv('GEMINI_API_KEY', 'GOOGLE_API_KEY')?.trim()
+      ?? undefined;
+    if (!apiKey) {
+      return undefined;
+    }
+    const baseUrl = this.state.providers['google']?.baseUrl?.trim() || undefined;
+    try {
+      assertSafeBaseUrlForCredentials(baseUrl ?? DEFAULT_GEMINI_DECISION_BASE_URL, true);
+    } catch {
+      return undefined;
+    }
+    return { apiKey, ...(baseUrl ? { baseUrl } : {}) };
+  }
+
   hasDecisionEngine(): boolean {
     if (this.state.decision?.enabled === false) return false;
     if (this.state.decision?.apiKey?.trim()) return true;

@@ -1722,6 +1722,7 @@ export class ImGateway {
         inboundDir,
         homeDir: this.homeDir,
         ilinkText,
+        resolveGoogleCredentials: () => this.coordinator.modelHub.resolveGoogleApiCredentials(),
       });
       if (voiceRes.wavPath) {
         att.path = voiceRes.wavPath;

@@ -13,7 +13,7 @@ import { createRequire } from 'node:module';
 import { cpus } from 'node:os';
 import { join } from 'node:path';
 import { cosineSimilarity, l2Normalize } from '../semantic.js';
-import { normalizeUtteranceSamples } from './kws-monitor.js';
+import { computeRms, normalizeUtteranceSamples } from './audio-frontend.js';
 
 export const SPEAKER_SAMPLE_RATE = 16_000;
 export const DEFAULT_SPEAKER_THRESHOLD = 0.45;
@@ -589,7 +589,7 @@ function finalizeTrimmedUtterance(params: {
     bestAnchorScore,
     windowScores,
   } = params;
-  const sustainFloor = Math.max(0.22, threshold - 0.05);
+  const sustainFloor = Math.max(0.22, threshold - 0.12);
   const anchorStart = starts[anchorStartIdx] ?? 0;
   let lastGoodWindowEnd = anchorStart + winLen;
   let lowStreak = 0;
@@ -611,8 +611,8 @@ function finalizeTrimmedUtterance(params: {
     break;
   }
 
-  const cutEnd = Math.min(samples.length, lastGoodWindowEnd + Math.round(sampleRate * 0.15));
-  const trimmed = cutEnd < samples.length - Math.round(sampleRate * 0.35);
+  const cutEnd = Math.min(samples.length, lastGoodWindowEnd + Math.round(sampleRate * 0.18));
+  const trimmed = cutEnd < samples.length - Math.round(sampleRate * 0.50);
   const finalSamples = trimmed ? samples.subarray(0, cutEnd) : samples;
 
   return {
@@ -1131,8 +1131,14 @@ export class XiaoaiSpeakerManager {
     opts?: { speakerVerify?: boolean },
   ): XiaoaiSpeakerMatchResult {
     const tailLen = Math.round(sampleRate * 1.2);
-    const tailSlice = samples.subarray(Math.max(0, samples.length - tailLen));
-    const tailThreshold = Math.max(0.22, threshold - 0.06);
+    const tailSliceRaw = samples.subarray(Math.max(0, samples.length - tailLen));
+    const fullRms = computeRms(samples);
+    const tailRms = computeRms(tailSliceRaw);
+    if (fullRms > 0 && tailRms < Math.max(0.0005, fullRms * 0.22)) {
+      return { matched: true, score: 1, threshold, reason: 'too_short' };
+    }
+    const tailSlice = trimShortUtteranceSilence(tailSliceRaw, sampleRate);
+    const tailThreshold = Math.max(0.22, threshold - 0.10);
     return this.matchSamples(tailSlice, sampleRate, {
       speakerVerify: opts?.speakerVerify,
       thresholdOverride: tailThreshold,
@@ -1206,15 +1212,22 @@ export class XiaoaiSpeakerManager {
       };
     }
 
-    const sustainFloor = Math.max(0.22, threshold - 0.05);
+    const sustainFloor = Math.max(0.22, threshold - 0.12);
+    const fullRms = computeRms(samples);
     const windowScores: number[] = [bestAnchorScore];
     let lowStreak = 0;
     for (let i = anchorStartIdx + 1; i < starts.length; i++) {
       const start = starts[i];
       if (start === undefined) continue;
       const slice = samples.subarray(start, start + winLen);
-      const emb = this.extractEmbedding(slice, sampleRate);
-      const score = emb ? scoreEmbeddingAgainstProfile(emb, anchorProfile) : 0;
+      let score: number;
+      if (fullRms > 0 && computeRms(slice) < Math.max(0.0005, fullRms * 0.20)) {
+        score = sustainFloor;
+      } else {
+        const evalSlice = trimShortUtteranceSilence(slice, sampleRate);
+        const emb = this.extractEmbedding(evalSlice, sampleRate);
+        score = emb ? scoreEmbeddingAgainstProfile(emb, anchorProfile) : 0;
+      }
       if (score > bestAnchorScore) bestAnchorScore = score;
       windowScores.push(score);
       if (score < sustainFloor) {
@@ -1314,7 +1327,8 @@ export class XiaoaiSpeakerManager {
       };
     }
 
-    const sustainFloor = Math.max(0.22, threshold - 0.05);
+    const sustainFloor = Math.max(0.22, threshold - 0.12);
+    const fullRms = computeRms(samples);
     const windowScores: number[] = [bestAnchorScore];
     let lowStreak = 0;
     for (let i = anchorStartIdx + 1; i < starts.length; i++) {
@@ -1322,8 +1336,14 @@ export class XiaoaiSpeakerManager {
       if (start === undefined) continue;
       await yieldEventLoop();
       const slice = samples.subarray(start, start + winLen);
-      const emb = this.extractEmbedding(slice, sampleRate);
-      const score = emb ? scoreEmbeddingAgainstProfile(emb, anchorProfile) : 0;
+      let score: number;
+      if (fullRms > 0 && computeRms(slice) < Math.max(0.0005, fullRms * 0.20)) {
+        score = sustainFloor;
+      } else {
+        const evalSlice = trimShortUtteranceSilence(slice, sampleRate);
+        const emb = this.extractEmbedding(evalSlice, sampleRate);
+        score = emb ? scoreEmbeddingAgainstProfile(emb, anchorProfile) : 0;
+      }
       if (score > bestAnchorScore) bestAnchorScore = score;
       windowScores.push(score);
       if (score < sustainFloor) {

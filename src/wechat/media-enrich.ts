@@ -11,6 +11,12 @@ import { promisify } from 'node:util';
 import zlib from 'node:zlib';
 import { BoundedMap, buildRequestSignal, isPrivateOrLocalHostname, sanitizeImError } from '../im/types.js';
 import { resolveEnv } from '../paths.js';
+import {
+  collectVoiceHotwords,
+  DEFAULT_GEMINI_TRANSCRIBE_MODEL,
+  transcribeWithGemini,
+  type GoogleApiCredentials,
+} from '../xiaoai/asr-engine.js';
 import { stripLeadingAsrControlTags } from '../xiaoai/utterance-utils.js';
 
 const execFileAsync = promisify(execFile);
@@ -211,14 +217,15 @@ export interface WechatVoiceEnrichResult {
   wavBytes?: number;
   durationSeconds?: number;
   transcript?: string;
-  transcriptSource?: 'local_asr' | 'ilink_text';
+  transcriptSource?: 'local_asr' | 'cloud_asr' | 'ilink_text';
   transcriptError?: string;
   promptNote: string;
 }
 
 /**
- * Transcode an inbound `.silk` voice note to `.wav` and run local Sherpa-ONNX ASR
- * (falling back to iLink `voice_item.text` or explicit graceful degradation).
+ * Transcode an inbound `.silk` voice note to `.wav` and run ASR
+ * (cloud Gemini Transcribe when configured with automatic fallback to local Sherpa-ONNX ASR
+ * or iLink `voice_item.text`).
  */
 export async function enrichWechatVoice(params: {
   silkPath: string;
@@ -226,6 +233,8 @@ export async function enrichWechatVoice(params: {
   homeDir?: string;
   asrModelsDir?: string;
   ilinkText?: string;
+  resolveGoogleCredentials?: () => Promise<GoogleApiCredentials | undefined>;
+  fetchImpl?: typeof fetch;
   deps?: WechatVoiceEnrichDeps;
 }): Promise<WechatVoiceEnrichResult> {
   const ilinkFallback = params.ilinkText?.trim() || undefined;
@@ -291,7 +300,56 @@ export async function enrichWechatVoice(params: {
 
   const samples16k = resamplePcm16ToFloat32(pcmBytes, WECHAT_SILK_SAMPLE_RATE, WECHAT_ASR_SAMPLE_RATE);
   let transcribePcm = params.deps?.transcribePcm;
+  let cloudTriedEmpty = false;
+  let cloudError: string | undefined;
+
   if (!transcribePcm) {
+    const providerMode = resolveEnv('FRIDAY_ASR_PROVIDER')?.trim().toLowerCase();
+    if (providerMode !== 'local' && params.resolveGoogleCredentials) {
+      let creds: GoogleApiCredentials | undefined;
+      try {
+        creds = await params.resolveGoogleCredentials();
+      } catch {
+        creds = undefined;
+      }
+      if (creds?.apiKey) {
+        try {
+          const timeoutRaw = Number(resolveEnv('FRIDAY_ASR_TIMEOUT_MS'));
+          const timeoutMs = Number.isFinite(timeoutRaw) && timeoutRaw >= 1000 && timeoutRaw <= 30_000
+            ? Math.round(timeoutRaw)
+            : undefined;
+          const model = resolveEnv('FRIDAY_ASR_MODEL')?.trim() || DEFAULT_GEMINI_TRANSCRIBE_MODEL;
+          const hotwords = params.homeDir ? collectVoiceHotwords(params.homeDir) : undefined;
+          const cloudRes = await transcribeWithGemini({
+            samples: samples16k,
+            sampleRate: WECHAT_ASR_SAMPLE_RATE,
+            apiKey: creds.apiKey,
+            baseUrl: creds.baseUrl,
+            model,
+            ...(hotwords && hotwords.length > 0 ? { hotwords } : {}),
+            ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+            fetchImpl: params.fetchImpl,
+          });
+          const cloudText = stripLeadingAsrControlTags(cloudRes.text);
+          if (cloudText) {
+            return {
+              transcoded: true,
+              wavPath,
+              wavBytes,
+              ...(durationSeconds !== undefined ? { durationSeconds } : {}),
+              transcript: cloudText,
+              transcriptSource: 'cloud_asr',
+              promptNote: `[语音已转码为 WAV：${wavPath}]\n【语音转写】以下为语音识别结果，均按用户原话处理：\n${cloudText}`,
+            };
+          }
+          cloudTriedEmpty = true;
+        } catch (err) {
+          cloudError = sanitizeImError(err, [creds.apiKey]);
+          console.warn(`[wechat-voice] cloud ASR failed (${cloudError}), falling back to local ASR`);
+        }
+      }
+    }
+
     const modelDir = findReadyAsrModelsDir({ asrModelsDir: params.asrModelsDir, homeDir: params.homeDir });
     if (modelDir) {
       transcribePcm = async (samples, rate) => {
@@ -313,16 +371,31 @@ export async function enrichWechatVoice(params: {
         ...(durationSeconds !== undefined ? { durationSeconds } : {}),
         transcript: ilinkFallback,
         transcriptSource: 'ilink_text',
+        ...(cloudError ? { transcriptError: cloudError } : {}),
         promptNote: `[语音已转码为 WAV：${wavPath}]\n【语音转写（来自微信文本字段）】以下为语音识别结果，均按用户原话处理：\n${ilinkFallback}`,
       };
     }
+    if (cloudTriedEmpty) {
+      return {
+        transcoded: true,
+        wavPath,
+        wavBytes,
+        ...(durationSeconds !== undefined ? { durationSeconds } : {}),
+        transcript: '',
+        transcriptSource: 'cloud_asr',
+        promptNote: `[语音已转码为 WAV：${wavPath}]\n【语音转写】语音识别未能识别出任何内容（可能是静音、音乐或环境噪音），请据此说明你没有听清，不要臆测内容。`,
+      };
+    }
+    const unavailableReason = cloudError ?? '本地离线 ASR 模型未就绪';
     return {
       transcoded: true,
       wavPath,
       wavBytes,
       ...(durationSeconds !== undefined ? { durationSeconds } : {}),
-      transcriptError: '本地离线 ASR 模型未就绪',
-      promptNote: `[语音已转码为 WAV：${wavPath}]\n这是一段已转码为 WAV 的语音（本地离线 ASR 模型未配置），无法自动转写；如需内容请告知用户。`,
+      transcriptError: unavailableReason,
+      promptNote: cloudError
+        ? `[语音已转码为 WAV：${wavPath}]\n这是一段已转码为 WAV 的语音（云端转写失败且本地离线 ASR 模型未配置：${cloudError}），请说明无法识别语音内容。`
+        : `[语音已转码为 WAV：${wavPath}]\n这是一段已转码为 WAV 的语音（本地离线 ASR 模型未配置），无法自动转写；如需内容请告知用户。`,
     };
   }
 
@@ -346,7 +419,7 @@ export async function enrichWechatVoice(params: {
         wavBytes,
         ...(durationSeconds !== undefined ? { durationSeconds } : {}),
         transcript: '',
-        transcriptSource: 'local_asr',
+        transcriptSource: cloudTriedEmpty ? 'cloud_asr' : 'local_asr',
         promptNote: `[语音已转码为 WAV：${wavPath}]\n【语音转写】本机语音识别未能识别出任何内容（可能是静音、音乐或环境噪音），请据此说明你没有听清，不要臆测内容。`,
       };
     }

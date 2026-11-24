@@ -272,6 +272,9 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
         spotterFactory: this.deps?.kwsSpotterFactory,
         recognizerFactory: this.deps?.kwsRecognizerFactory,
         vadFactory: this.deps?.kwsVadFactory,
+        resolveGoogleCredentials: () => this.ctx.coordinator.modelHub.resolveGoogleApiCredentials(),
+        asrFetchImpl: this.deps?.fetchImpl,
+        preferFastLocalForTarget: (chId, targetId) => this.isContinuousFastpathActive(chId, targetId),
         speakerGate: {
           isActive: ch => this.isSpeakerGateEnforced(ch),
           isBypassed: (chId, targetId) => this.speakerEnroll.isActive(chId, targetId),
