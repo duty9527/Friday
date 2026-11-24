@@ -11,6 +11,7 @@
     "status",
     "scan",
     "tracks",
+    "lyrics",
     "play",
     "pause",
     "resume",
@@ -52,6 +53,12 @@
       "label": "检索本地曲目",
       "description": "按关键词 query 或歌单 playlistId 检索本地曲库，返回匹配歌曲与试听地址。",
       "defaultArgs": { "query": "", "playlistId": "" }
+    },
+    {
+      "name": "lyrics",
+      "label": "读取歌词",
+      "description": "读取指定曲目（trackId，省略则读取当前播放曲目）的同步 LRC 或内嵌歌词。",
+      "defaultArgs": { "trackId": "" }
     },
     {
       "name": "play",

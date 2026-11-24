@@ -28,7 +28,7 @@ import {
   searchOnlineTracks,
   upsertDownloadJob,
 } from '../plugins/music/downloader.mjs';
-import { scanLibrary, searchLocalTracks } from '../plugins/music/library.mjs';
+import { parseLrcText, readTrackLyrics, scanLibrary, searchLocalTracks } from '../plugins/music/library.mjs';
 
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 
@@ -241,6 +241,24 @@ test('music HTTP streaming (HMAC, 200/206/416, path traversal) & upload (/api/mu
     assert.equal(existsSync(upJson.uploaded.filePath), true);
     assert.deepEqual(readFileSync(upJson.uploaded.filePath), payload);
     assert.equal(upJson.scan?.data?.total, 2);
+
+    // 6. Upload .lrc sidecar lyrics via /api/music/upload -> accepted and linked to track
+    const lrcPayload = Buffer.from('[ti:江南]\n[00:10.00]风到这里就是黏\n[00:15.50]黏住过客的思念\n', 'utf8');
+    const okLrcUpload = await fetch(`${base}/api/music/upload`, {
+      method: 'POST',
+      headers: { ...authHeaders, 'x-music-filename': encodeURIComponent('林俊杰 - 江南.lrc') },
+      body: lrcPayload,
+    });
+    assert.equal(okLrcUpload.status, 200);
+    const lrcUpJson = await okLrcUpload.json() as {
+      ok: boolean;
+      uploaded: { filePath: string };
+      scan?: { data?: { tracks?: Array<{ filename: string; hasLyrics?: boolean }> } };
+    };
+    assert.equal(lrcUpJson.ok, true);
+    assert.equal(existsSync(lrcUpJson.uploaded.filePath), true);
+    const jiangnanTrack = lrcUpJson.scan?.data?.tracks?.find(t => t.filename === '林俊杰 - 江南.mp3');
+    assert.equal(jiangnanTrack?.hasLyrics, true);
   } finally {
     stopAllMusicWatchers();
     await web.close();
@@ -877,16 +895,121 @@ test('music voice fastpath parses playback commands silently and bails out on TV
   }
 });
 
+test('LRC parser, 3-tier LRC matching, embedded lyrics fallback, and lyrics action', async () => {
+  // 1. parseLrcText unit tests
+  const synced = parseLrcText(
+    '\uFEFF[ti:测试曲目]\n[ar:许嵩]\n[al:专辑]\n[offset:500]\n[00:01.00]\n[00:10.50][01:00.00]重复副歌\n[00:05.00]第一句\n',
+  );
+  assert.equal(synced.synced, true);
+  assert.equal(synced.title, '测试曲目');
+  assert.equal(synced.artist, '许嵩');
+  assert.equal(synced.album, '专辑');
+  assert.equal(synced.lines.length, 3);
+  assert.equal(synced.lines[0]?.text, '第一句');
+  assert.equal(synced.lines[0]?.timeSec, 4.5);
+  assert.equal(synced.lines[1]?.text, '重复副歌');
+  assert.equal(synced.lines[1]?.timeSec, 10);
+  assert.equal(synced.lines[2]?.timeSec, 59.5);
+
+  const plain = parseLrcText('[ti:纯文本歌词]\n第一行歌词\n第二行歌词\n');
+  assert.equal(plain.synced, false);
+  assert.equal(plain.lines.length, 2);
+  assert.equal(plain.lines[0]?.timeSec, null);
+
+  // 2. 3-tier matching in scanLibrary + lyrics action
+  const { root, homeDir, musicDir } = makeTempWorkspace('friday-music-lrc-');
+  try {
+    const pluginDataDir = join(homeDir, 'plugins', 'music');
+    await runAction('config', { musicDir }, { homeDir, pluginDataDir });
+
+    const dirArtist = join(musicDir, '许嵩');
+    const dirSub1 = join(dirArtist, 'Music', '许嵩单曲集');
+    const dirSub2 = join(dirArtist, 'Music', 'Unknown Album');
+    mkdirSync(dirSub1, { recursive: true });
+    mkdirSync(dirSub2, { recursive: true });
+
+    // Tier 1 exact match
+    writeFileSync(join(dirArtist, '许嵩 - 雨幕.flac'), Buffer.from('fLaCmock1'));
+    writeFileSync(join(dirArtist, '许嵩 - 雨幕.lrc'), '[00:12.00]桃花岛屿之巅\n[00:15.00]一座残碑镇住想念\n');
+
+    // Tier 2 cross-subdir + track prefix + comma normalization matches
+    writeFileSync(join(dirSub1, '1-15 安琪.mp3'), Buffer.from('ID3mock2'));
+    writeFileSync(join(dirArtist, '许嵩 - 安琪.lrc'), '[00:08.00]安琪请告诉我\n');
+
+    writeFileSync(join(dirSub2, '墨尔本晴.mp3'), Buffer.from('ID3mock3'));
+    writeFileSync(join(dirArtist, '墨尔本,晴.lrc'), '[00:10.00]墨尔本的天空\n');
+
+    // Tier 3 embedded lyrics fallback (no sidecar .lrc)
+    writeFileSync(join(dirArtist, '内嵌曲.flac'), Buffer.from('fLaCembedded'));
+
+    const mockExecFile = async (_cmd: string, args: string[]) => {
+      const targetFile = String(args.at(-1) ?? '');
+      if (targetFile.endsWith('内嵌曲.flac')) {
+        return {
+          stdout: JSON.stringify({
+            format: {
+              duration: '180.0',
+              tags: {
+                title: '内嵌曲',
+                artist: '测试',
+                UNSYNCEDLYRICS: '[00:05.00]内嵌歌词第一句\n[00:10.00]内嵌歌词第二句\n',
+              },
+            },
+            streams: [{ codec_type: 'audio', codec_name: 'flac' }],
+          }),
+        };
+      }
+      throw new Error('fallback filename metadata');
+    };
+
+    const scanned = await scanLibrary(pluginDataDir, musicDir, { quick: false }, { execFileFn: mockExecFile });
+    assert.equal(scanned.total, 4);
+
+    const t1 = scanned.tracks.find(t => t.filename === '许嵩 - 雨幕.flac')!;
+    const t2 = scanned.tracks.find(t => t.filename === '1-15 安琪.mp3')!;
+    const t3 = scanned.tracks.find(t => t.filename === '墨尔本晴.mp3')!;
+    const tEmb = scanned.tracks.find(t => t.filename === '内嵌曲.flac')!;
+    assert.equal(t1.hasLyrics, true);
+    assert.equal(t2.hasLyrics, true);
+    assert.equal(t3.hasLyrics, true);
+    assert.equal(tEmb.hasLyrics, true);
+    assert.equal(tEmb.hasEmbeddedLyrics, true);
+
+    const r2 = await runAction('lyrics', { trackId: t2.id }, { homeDir, pluginDataDir });
+    assert.equal(r2.ok, true);
+    assert.equal(r2.data?.source, 'lrc');
+    assert.equal(r2.data?.lines?.[0]?.text, '安琪请告诉我');
+
+    const r3 = await runAction('lyrics', { trackId: t3.id }, { homeDir, pluginDataDir });
+    assert.equal(r3.ok, true);
+    assert.equal(r3.data?.lines?.[0]?.text, '墨尔本的天空');
+
+    const rEmb = await readTrackLyrics(tEmb, musicDir, { execFileFn: mockExecFile });
+    assert.equal(rEmb.source, 'embedded');
+    assert.equal(rEmb.synced, true);
+    assert.equal(rEmb.lines[0]?.text, '内嵌歌词第一句');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('CS80 music widget collector reads playback-state/library and renderer handles all 4 card spans', () => {
   const { root, homeDir } = makeTempWorkspace('friday-cs80-music-');
   try {
     const musicPluginData = join(homeDir, 'plugins', 'music');
     mkdirSync(musicPluginData, { recursive: true });
+    const lrcFile = join(root, '晴天.lrc');
+    writeFileSync(lrcFile, [
+      '[00:10.00]故事的小黄花',
+      '[00:44.00]从出生那年就飘着',
+      '[00:50.00]童年的荡秋千',
+      '[00:56.00]随记忆一直晃到现在',
+    ].join('\n'));
     writeFileSync(join(musicPluginData, 'library.json'), JSON.stringify({
       updatedAt: Date.now(),
       musicDir: '/mnt/data/music',
       tracks: [
-        { id: 't111111111111', title: '晴天', artist: '周杰伦', album: '叶惠美', durationSec: 269 },
+        { id: 't111111111111', title: '晴天', artist: '周杰伦', album: '叶惠美', durationSec: 269, lrcPath: lrcFile },
         { id: 't222222222222', title: '稻香', artist: '周杰伦', album: '魔杰座', durationSec: 223 },
       ],
     }));
@@ -923,6 +1046,11 @@ assert data["title"] == "晴天"
 assert data["artist"] == "周杰伦"
 assert data["trackCount"] == 2
 assert data["volume"] == 52
+assert data["hasLyrics"] is True
+assert len(data["lyricLines"]) == 4
+
+win = renderer._pick_lyric_window(data["lyricLines"], 45.0)
+assert win == ("故事的小黄花", "从出生那年就飘着", "童年的荡秋千"), f"unexpected window: {win}"
 
 if renderer.cairo is not None:
     fr = renderer.FaceRenderer()

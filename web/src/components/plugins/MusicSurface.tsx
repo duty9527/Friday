@@ -3,6 +3,7 @@ import { errorText } from '@friday/web/shared/format.js';
 import {
   ClockIcon,
   DownloadIcon,
+  FileTextIcon,
   FolderPlusIcon,
   HeadphonesIcon,
   HeartIcon,
@@ -66,6 +67,22 @@ interface MusicTrackView {
   bitrateKbps: number | null;
   sizeBytes: number;
   previewUrl: string;
+  hasLyrics?: boolean;
+}
+
+interface LyricLine {
+  timeSec: number | null;
+  text: string;
+}
+
+interface TrackLyricsPayload {
+  trackId: string;
+  title: string;
+  artist: string;
+  album?: string;
+  source: 'lrc' | 'embedded' | 'none';
+  synced: boolean;
+  lines: LyricLine[];
 }
 
 interface MusicPlaylistView {
@@ -111,6 +128,8 @@ interface MusicDashboardPayload {
   updatedAt: number;
   status: 'stopped' | 'playing' | 'paused';
   positionSec: number;
+  positionMs?: number;
+  startedAtMs?: number | null;
   loopMode: 'list' | 'single' | 'shuffle' | 'once';
   loopLabel: string;
   volume: number;
@@ -195,8 +214,21 @@ export default function MusicSurface() {
   const [cookiesDraft, setCookiesDraft] = useState('');
   const [cookiesBusy, setCookiesBusy] = useState(false);
 
+  const [lyricsOpen, setLyricsOpen] = useState(false);
+  const [inspectLyricsTrack, setInspectLyricsTrack] = useState<MusicTrackView | null>(null);
+  const [lyricsData, setLyricsData] = useState<TrackLyricsPayload | null>(null);
+  const [lyricsLoading, setLyricsLoading] = useState(false);
+  const [lyricOffsetSec, setLyricOffsetSec] = useState(0);
+  const [previewTimeSec, setPreviewTimeSec] = useState(0);
+  const [speakerLiveSec, setSpeakerLiveSec] = useState(0);
+
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const cookiesFileInputRef = useRef<HTMLInputElement | null>(null);
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+  const activeLyricLineRef = useRef<HTMLElement | null>(null);
+  const lyricsCacheRef = useRef<Map<string, TrackLyricsPayload>>(new Map());
+  const lastAutoLyricsTrackRef = useRef<string | null>(null);
+  const speakerClockRef = useRef<{ baseSec: number; syncedAtPerf: number }>({ baseSec: 0, syncedAtPerf: 0 });
   const mountedRef = useRef(true);
   const seqRef = useRef(0);
   const onlineSourceInitRef = useRef(false);
@@ -221,6 +253,10 @@ export default function MusicSurface() {
 
   const applyDashboard = useCallback((d: MusicDashboardPayload, forceSync = false) => {
     setData(d);
+    const posMs = typeof d.positionMs === 'number' ? d.positionMs : (d.positionSec ?? 0) * 1000;
+    const baseSec = Math.max(0, posMs / 1000);
+    speakerClockRef.current = { baseSec, syncedAtPerf: performance.now() };
+    setSpeakerLiveSec(baseSec);
     if (forceSync || !volumeDirty) {
       setVolumeDraft(d.volume ?? 45);
     }
@@ -329,7 +365,7 @@ export default function MusicSurface() {
     e.target.value = '';
     if (files.length === 0 || authExpired) return;
     setUploading(true);
-    setStatus({ text: `正在上传 ${files.length} 个音频文件…`, tone: 'warn' });
+    setStatus({ text: `正在上传 ${files.length} 个音乐/歌词文件…`, tone: 'warn' });
     let okCount = 0;
     let lastError = '';
     try {
@@ -353,10 +389,11 @@ export default function MusicSurface() {
         }
         okCount += 1;
       }
+      lyricsCacheRef.current.clear();
       await refreshDashboard(false, true);
       if (mountedRef.current) {
         if (okCount === files.length) {
-          setStatus({ text: `已上传并入库 ${okCount} 首歌曲`, tone: 'ok' });
+          setStatus({ text: `已上传并扫描入库 ${okCount} 个文件`, tone: 'ok' });
         } else {
           setStatus({ text: `成功 ${okCount}/${files.length} 首${lastError ? `：${lastError}` : ''}`, tone: 'err' });
         }
@@ -500,6 +537,92 @@ export default function MusicSurface() {
   const curTrack = data?.currentTrack ?? null;
   const isPlaying = data?.status === 'playing';
   const isPaused = data?.status === 'paused';
+  const lyricsTargetTrack = inspectLyricsTrack ?? previewTrack ?? curTrack;
+  const isTargetPreview = Boolean(previewTrack && lyricsTargetTrack?.id === previewTrack.id);
+  const isTargetSpeaker = Boolean(!isTargetPreview && curTrack && lyricsTargetTrack?.id === curTrack.id && (isPlaying || isPaused));
+
+  useEffect(() => {
+    const autoId = previewTrack?.hasLyrics
+      ? previewTrack.id
+      : (curTrack?.hasLyrics && (isPlaying || isPaused) ? curTrack.id : null);
+    if (autoId && lastAutoLyricsTrackRef.current !== autoId) {
+      lastAutoLyricsTrackRef.current = autoId;
+      setLyricsOpen(true);
+    }
+  }, [curTrack?.hasLyrics, curTrack?.id, isPaused, isPlaying, previewTrack?.hasLyrics, previewTrack?.id]);
+
+  useEffect(() => {
+    if (!lyricsOpen || !isPlaying || isTargetPreview) return;
+    const timer = setInterval(() => {
+      const elapsed = (performance.now() - speakerClockRef.current.syncedAtPerf) / 1000;
+      setSpeakerLiveSec(speakerClockRef.current.baseSec + Math.max(0, elapsed));
+    }, 250);
+    return () => clearInterval(timer);
+  }, [isPlaying, isTargetPreview, lyricsOpen]);
+
+  useEffect(() => {
+    if (!lyricsOpen || !lyricsTargetTrack || authExpired) {
+      if (!lyricsTargetTrack) setLyricsData(null);
+      return;
+    }
+    const targetId = lyricsTargetTrack.id;
+    const cached = lyricsCacheRef.current.get(targetId);
+    if (cached) {
+      setLyricsData(cached);
+      return;
+    }
+    let cancelled = false;
+    setLyricsLoading(true);
+    void callMusic<TrackLyricsPayload>('lyrics', { trackId: targetId })
+      .then((res) => {
+        if (cancelled || !mountedRef.current) return;
+        if (res.ok && res.data) {
+          lyricsCacheRef.current.set(targetId, res.data);
+          setLyricsData(res.data);
+        } else {
+          setLyricsData({
+            trackId: targetId,
+            title: lyricsTargetTrack.title,
+            artist: lyricsTargetTrack.artist,
+            source: 'none',
+            synced: false,
+            lines: [],
+          });
+        }
+      })
+      .catch(() => {
+        if (!cancelled && mountedRef.current) setLyricsData(null);
+      })
+      .finally(() => {
+        if (!cancelled && mountedRef.current) setLyricsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [authExpired, callMusic, lyricsOpen, lyricsTargetTrack]);
+
+  const effectiveLyricSec = isTargetPreview
+    ? previewTimeSec
+    : (isTargetSpeaker ? speakerLiveSec + lyricOffsetSec : -1);
+
+  const activeLineIndex = useMemo(() => {
+    if (!lyricsOpen || !lyricsData?.synced || effectiveLyricSec < 0 || lyricsData.lines.length === 0) {
+      return -1;
+    }
+    let idx = -1;
+    for (let i = 0; i < lyricsData.lines.length; i += 1) {
+      const t = lyricsData.lines[i]?.timeSec;
+      if (typeof t === 'number' && t <= effectiveLyricSec + 0.2) {
+        idx = i;
+      }
+    }
+    return idx;
+  }, [effectiveLyricSec, lyricsData, lyricsOpen]);
+
+  useEffect(() => {
+    if (!lyricsOpen || activeLineIndex < 0) return;
+    activeLyricLineRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+  }, [activeLineIndex, lyricsOpen, lyricsTargetTrack?.id]);
 
   return (
     <div className="space-y-4">
@@ -536,6 +659,7 @@ export default function MusicSurface() {
             disabled={busy}
             onClick={() => void runAction('正在扫描本地曲库…', async () => {
               const res = await callMusic('scan', { quick: true });
+              lyricsCacheRef.current.clear();
               setStatus({ text: res.message || '扫描完成', tone: res.ok ? 'ok' : 'err' });
               await refreshDashboard(false, true);
             })}
@@ -555,7 +679,7 @@ export default function MusicSurface() {
             ref={fileInputRef}
             type="file"
             multiple
-            accept=".mp3,.flac,.m4a,.wav,.ogg,.opus,.aac,audio/*"
+            accept=".mp3,.flac,.m4a,.wav,.ogg,.opus,.aac,.lrc,audio/*"
             className="hidden"
             onChange={(ev) => void handleUploadFiles(ev)}
           />
@@ -661,6 +785,24 @@ export default function MusicSurface() {
                 <LoopIcon className="size-3.5" />
                 <span>{data?.loopLabel ?? '列表循环'}</span>
               </Button>
+              {lyricsTargetTrack && (
+                <Button
+                  size="xs"
+                  variant={lyricsOpen ? 'secondary' : 'outline'}
+                  aria-pressed={lyricsOpen}
+                  onClick={() => {
+                    if (lyricsOpen) {
+                      setLyricsOpen(false);
+                      setInspectLyricsTrack(null);
+                    } else {
+                      setLyricsOpen(true);
+                    }
+                  }}
+                >
+                  <FileTextIcon className="size-3.5" />
+                  <span>歌词</span>
+                </Button>
+              )}
             </div>
           </div>
         </CardHeader>
@@ -733,8 +875,110 @@ export default function MusicSurface() {
             <div className="flex flex-wrap items-center gap-2 rounded-lg border bg-muted/30 p-2">
               <HeadphonesIcon className="size-4 text-primary" />
               <span className="max-w-56 truncate text-xs font-medium">{previewTrack.title}</span>
-              <audio controls preload="none" src={previewTrack.previewUrl} className="h-8 min-w-52 flex-1" />
-              <Button size="xs" variant="ghost" onClick={() => setPreviewTrack(null)}>收起试听</Button>
+              <audio
+                ref={previewAudioRef}
+                controls
+                preload="none"
+                src={previewTrack.previewUrl}
+                onTimeUpdate={(ev) => setPreviewTimeSec(ev.currentTarget.currentTime)}
+                onSeeked={(ev) => setPreviewTimeSec(ev.currentTarget.currentTime)}
+                onLoadedMetadata={(ev) => setPreviewTimeSec(ev.currentTarget.currentTime)}
+                className="h-8 min-w-52 flex-1"
+              />
+              <Button size="xs" variant="ghost" onClick={() => { setPreviewTrack(null); setPreviewTimeSec(0); }}>收起试听</Button>
+            </div>
+          )}
+
+          {lyricsOpen && lyricsTargetTrack && (
+            <div className="space-y-2 rounded-lg border bg-muted/20 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                  <FileTextIcon className="size-3.5 shrink-0 text-primary" />
+                  <span className="truncate text-xs font-medium">{lyricsTargetTrack.title}</span>
+                  <Badge variant={lyricsData && lyricsData.lines.length > 0 ? 'outline' : 'secondary'} className="text-[10px]">
+                    {lyricsLoading
+                      ? '加载中…'
+                      : lyricsData?.source === 'lrc'
+                        ? (lyricsData.synced ? 'LRC 同步歌词' : 'LRC 文本歌词')
+                        : lyricsData?.source === 'embedded'
+                          ? (lyricsData.synced ? '内嵌同步歌词' : '内嵌歌词')
+                          : '暂无歌词'}
+                  </Badge>
+                </div>
+                <div className="flex flex-wrap items-center gap-1">
+                  {isTargetSpeaker && lyricsData?.synced && (
+                    <>
+                      <Button type="button" size="xs" variant="outline" onClick={() => setLyricOffsetSec(v => Math.round((v - 0.5) * 10) / 10)}>
+                        -0.5s
+                      </Button>
+                      <Button type="button" size="xs" variant="ghost" onClick={() => setLyricOffsetSec(0)}>
+                        {lyricOffsetSec === 0 ? '同步' : `${lyricOffsetSec > 0 ? '+' : ''}${lyricOffsetSec.toFixed(1)}s`}
+                      </Button>
+                      <Button type="button" size="xs" variant="outline" onClick={() => setLyricOffsetSec(v => Math.round((v + 0.5) * 10) / 10)}>
+                        +0.5s
+                      </Button>
+                    </>
+                  )}
+                  <Button
+                    type="button"
+                    size="xs"
+                    variant="ghost"
+                    onClick={() => {
+                      setLyricsOpen(false);
+                      setInspectLyricsTrack(null);
+                    }}
+                  >
+                    收起
+                  </Button>
+                </div>
+              </div>
+
+              {lyricsLoading && (!lyricsData || lyricsData.trackId !== lyricsTargetTrack.id) ? (
+                <div className="flex items-center gap-2 py-4 text-xs text-muted-foreground">
+                  <Spinner className="size-3.5" />
+                  <span>正在读取歌词…</span>
+                </div>
+              ) : lyricsData && lyricsData.lines.length > 0 ? (
+                <div className="max-h-52 space-y-1 overflow-y-auto pr-1 text-center">
+                  {lyricsData.lines.map((line, idx) => {
+                    const isActive = idx === activeLineIndex;
+                    const canSeekPreview = isTargetPreview && typeof line.timeSec === 'number';
+                    if (canSeekPreview) {
+                      return (
+                        <button
+                          key={`${idx}-${line.timeSec}`}
+                          ref={isActive ? (el) => { activeLyricLineRef.current = el; } : undefined}
+                          type="button"
+                          onClick={() => {
+                            const audio = previewAudioRef.current;
+                            if (audio && typeof line.timeSec === 'number') {
+                              audio.currentTime = line.timeSec;
+                              setPreviewTimeSec(line.timeSec);
+                              void audio.play().catch(() => {});
+                            }
+                          }}
+                          className={`block w-full rounded px-2 py-1 text-xs transition-colors hover:bg-muted/60 ${isActive ? 'bg-primary/10 font-semibold text-primary' : 'text-muted-foreground'}`}
+                        >
+                          {line.text}
+                        </button>
+                      );
+                    }
+                    return (
+                      <p
+                        key={`${idx}-${line.timeSec ?? 'plain'}`}
+                        ref={isActive ? (el) => { activeLyricLineRef.current = el; } : undefined}
+                        className={`rounded px-2 py-1 text-xs ${isActive ? 'bg-primary/10 font-semibold text-primary' : 'text-muted-foreground'}`}
+                      >
+                        {line.text}
+                      </p>
+                    );
+                  })}
+                </div>
+              ) : (
+                <p className="py-3 text-center text-xs text-muted-foreground">
+                  未匹配到歌词，可点击右上角「上传音乐」上传同名 `.lrc` 文件并扫描。
+                </p>
+              )}
             </div>
           )}
         </CardContent>
@@ -829,11 +1073,28 @@ export default function MusicSurface() {
                       <Button
                         size="xs"
                         variant="outline"
-                        onClick={() => setPreviewTrack(track)}
+                        onClick={() => {
+                          setInspectLyricsTrack(null);
+                          setPreviewTimeSec(0);
+                          setPreviewTrack(track);
+                        }}
                       >
                         <HeadphonesIcon className="size-3.5" />
                         <span>试听</span>
                       </Button>
+                      {track.hasLyrics && (
+                        <Button
+                          size="xs"
+                          variant={lyricsOpen && lyricsTargetTrack?.id === track.id ? 'secondary' : 'outline'}
+                          aria-label={`查看歌词 ${track.title}`}
+                          onClick={() => {
+                            setInspectLyricsTrack(previewTrack?.id === track.id ? null : track);
+                            setLyricsOpen(true);
+                          }}
+                        >
+                          词
+                        </Button>
+                      )}
                       <Button
                         size="xs"
                         variant={isFav ? 'secondary' : 'outline'}

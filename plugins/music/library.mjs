@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
+  readFileSync,
   realpathSync,
   renameSync,
   statSync,
@@ -27,6 +28,11 @@ export const SUPPORTED_AUDIO_EXTS = new Set([
 
 export const DIRECT_LX06_EXTS = new Set(['.mp3', '.m4a', '.wav', '.aac']);
 const FAVORITES_PLAYLIST_ID = 'favorites';
+const MAX_LRC_BYTES = 512 * 1024;
+const LRC_TIME_TAG_RE = /\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]/g;
+const LRC_META_TAG_RE = /^\[(ti|ar|al|offset):([^\]]*)\]$/i;
+const LRC_ANY_TAG_RE = /^\[[a-z_]+:[^\]]*\]$/i;
+const TRACK_NUM_PREFIX_RE = /^\d+(?:[-._]\d+)?[\s._-]+/;
 
 /**
  * @typedef {{
@@ -46,7 +52,15 @@ const FAVORITES_PLAYLIST_ID = 'favorites';
  *   mtimeMs: number;
  *   addedAt: number;
  *   transcodePath?: string;
+ *   lrcPath?: string;
+ *   hasEmbeddedLyrics?: boolean;
+ *   hasLyrics?: boolean;
  * }} MusicTrack
+ *
+ * @typedef {{
+ *   timeSec: number | null;
+ *   text: string;
+ * }} LyricLine
  *
  * @typedef {{
  *   id: string;
@@ -122,13 +136,156 @@ function pickTag(tags, key) {
 }
 
 /**
+ * @param {Record<string, unknown> | undefined} fmtTags
+ * @param {Record<string, unknown> | undefined} streamTags
+ * @returns {string}
+ */
+function extractEmbeddedLyrics(fmtTags, streamTags) {
+  for (const tags of [fmtTags, streamTags]) {
+    if (!tags || typeof tags !== 'object') continue;
+    for (const [k, v] of Object.entries(tags)) {
+      if (/lyric|uslt|sylt/i.test(k) && v !== undefined && v !== null) {
+        const s = String(v).trim();
+        if (s) return s;
+      }
+    }
+  }
+  return '';
+}
+
+/**
+ * @param {string} raw
+ * @returns {string}
+ */
+export function normalizeLrcMatchKey(raw) {
+  let s = String(raw ?? '').trim();
+  const ext = extname(s).toLowerCase();
+  if (ext === '.lrc' || SUPPORTED_AUDIO_EXTS.has(ext)) {
+    s = s.slice(0, s.length - ext.length).trim();
+  }
+  s = s.replace(TRACK_NUM_PREFIX_RE, '').trim();
+  return normalizeSearchText(s);
+}
+
+/**
+ * @param {string} stem
+ * @param {string} [titleTag]
+ * @returns {string[]}
+ */
+function extractLrcCandidateKeys(stem, titleTag = '') {
+  /** @type {string[]} */
+  const keys = [];
+  /** @param {string} candidate */
+  const add = (candidate) => {
+    const k = normalizeLrcMatchKey(candidate);
+    if (k && !keys.includes(k)) keys.push(k);
+  };
+  add(stem);
+  const sepIdx = stem.indexOf(' - ');
+  if (sepIdx > 0 && sepIdx < stem.length - 3) {
+    add(stem.slice(sepIdx + 3));
+  }
+  if (titleTag) {
+    add(titleTag);
+  }
+  return keys;
+}
+
+/**
+ * @param {string} rawText
+ * @returns {{ synced: boolean; lines: LyricLine[]; title: string; artist: string; album: string }}
+ */
+export function parseLrcText(rawText) {
+  const cleaned = String(rawText ?? '').replace(/^\uFEFF/, '');
+  const rawLines = cleaned.split(/\r?\n/);
+
+  let title = '';
+  let artist = '';
+  let album = '';
+  let offsetMs = 0;
+
+  /** @type {Map<number, { timeSec: number; texts: string[] }>} */
+  const syncedByKey = new Map();
+  /** @type {string[]} */
+  const plainLines = [];
+
+  for (const line of rawLines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    LRC_TIME_TAG_RE.lastIndex = 0;
+    const matches = [...trimmed.matchAll(LRC_TIME_TAG_RE)];
+    if (matches.length > 0) {
+      const text = trimmed.replace(LRC_TIME_TAG_RE, '').trim();
+      if (!text) continue;
+      for (const m of matches) {
+        const mins = Number(m[1]);
+        const secs = Number(m[2]);
+        const fracStr = m[3] ?? '';
+        const fracSec = fracStr ? Number(`0.${fracStr}`) : 0;
+        const rawSec = mins * 60 + secs + fracSec;
+        if (!Number.isFinite(rawSec)) continue;
+        const adjusted = Math.max(0, rawSec - offsetMs / 1000);
+        const key = Math.round(adjusted * 100);
+        const existing = syncedByKey.get(key);
+        if (existing) {
+          if (!existing.texts.includes(text)) existing.texts.push(text);
+        } else {
+          syncedByKey.set(key, { timeSec: Math.round(adjusted * 1000) / 1000, texts: [text] });
+        }
+      }
+      continue;
+    }
+
+    const meta = LRC_META_TAG_RE.exec(trimmed);
+    if (meta) {
+      const tag = String(meta[1] ?? '').toLowerCase();
+      const val = String(meta[2] ?? '').trim();
+      if (tag === 'ti' && val) title = val;
+      else if (tag === 'ar' && val) artist = val;
+      else if (tag === 'al' && val) album = val;
+      else if (tag === 'offset' && val) {
+        const parsedOffset = Number(val);
+        if (Number.isFinite(parsedOffset)) offsetMs = parsedOffset;
+      }
+      continue;
+    }
+
+    if (LRC_ANY_TAG_RE.test(trimmed)) continue;
+    plainLines.push(trimmed);
+  }
+
+  if (syncedByKey.size > 0) {
+    const lines = [...syncedByKey.values()]
+      .sort((a, b) => a.timeSec - b.timeSec)
+      .map((entry) => ({
+        timeSec: entry.timeSec,
+        text: entry.texts.join(' / '),
+      }));
+    return { synced: true, lines, title, artist, album };
+  }
+
+  if (plainLines.length > 0) {
+    return {
+      synced: false,
+      lines: plainLines.map((text) => ({ timeSec: null, text })),
+      title,
+      artist,
+      album,
+    };
+  }
+
+  return { synced: false, lines: [], title, artist, album };
+}
+
+/**
  * @param {string} filePath
  * @param {{
  *   ffprobePath?: string;
  *   execFileFn?: (cmd: string, args: string[], opts?: Record<string, unknown>) => Promise<{ stdout?: unknown; stderr?: unknown }>;
  *   signal?: AbortSignal;
  * }} [deps]
- * @returns {Promise<{ title: string; artist: string; album: string; durationSec: number | null; bitrateKbps: number | null; codec: string }>}
+ * @returns {Promise<{ title: string; artist: string; album: string; durationSec: number | null; bitrateKbps: number | null; codec: string; hasEmbeddedLyrics: boolean }>}
  */
 export async function probeAudioMetadata(filePath, deps = {}) {
   const fallback = parseFallbackTitleArtist(filePath);
@@ -157,7 +314,8 @@ export async function probeAudioMetadata(filePath, deps = {}) {
     const rawBitrate = Number(fmt.bit_rate ?? audioStream?.bit_rate);
     const bitrateKbps = Number.isFinite(rawBitrate) && rawBitrate > 0 ? Math.round(rawBitrate / 1000) : null;
     const codec = typeof audioStream?.codec_name === 'string' ? audioStream.codec_name.trim() : '';
-    return { title, artist, album, durationSec, bitrateKbps, codec };
+    const hasEmbeddedLyrics = Boolean(extractEmbeddedLyrics(fmt?.tags, audioStream?.tags));
+    return { title, artist, album, durationSec, bitrateKbps, codec, hasEmbeddedLyrics };
   } catch {
     return {
       title: fallback.title,
@@ -166,6 +324,7 @@ export async function probeAudioMetadata(filePath, deps = {}) {
       durationSec: null,
       bitrateKbps: null,
       codec: extname(filePath).slice(1).toLowerCase(),
+      hasEmbeddedLyrics: false,
     };
   }
 }
@@ -261,6 +420,8 @@ export async function scanLibrary(pluginDataDir, musicDir, options = {}, deps = 
 
   /** @type {Array<{ relPath: string; filePath: string; filename: string; folder: string; ext: string; sizeBytes: number; mtimeMs: number }>} */
   const discovered = [];
+  /** @type {Array<{ filePath: string; folder: string; stem: string }>} */
+  const discoveredLrcs = [];
   const visitedDirs = new Set([rootReal]);
   const stack = [rootReal];
 
@@ -298,10 +459,18 @@ export async function scanLibrary(pluginDataDir, musicDir, options = {}, deps = 
       }
       if (!st.isFile() || st.size <= 0) continue;
       const ext = extname(entry.name).toLowerCase();
-      if (!SUPPORTED_AUDIO_EXTS.has(ext)) continue;
       const relPath = relative(rootReal, real).split(sep).join('/');
       const relSlash = relPath.lastIndexOf('/');
       const folder = relSlash > 0 ? relPath.slice(0, relSlash) : '';
+      if (ext === '.lrc' && st.size <= MAX_LRC_BYTES) {
+        discoveredLrcs.push({
+          filePath: real,
+          folder,
+          stem: basename(entry.name, ext),
+        });
+        continue;
+      }
+      if (!SUPPORTED_AUDIO_EXTS.has(ext)) continue;
       discovered.push({
         relPath,
         filePath: real,
@@ -313,6 +482,58 @@ export async function scanLibrary(pluginDataDir, musicDir, options = {}, deps = 
       });
     }
   }
+
+  /** @type {Map<string, string>} */
+  const lrcByDirStem = new Map();
+  /** @type {Map<string, Array<{ filePath: string; folder: string }>>} */
+  const lrcByNormKey = new Map();
+  for (const lrc of discoveredLrcs) {
+    lrcByDirStem.set(`${lrc.folder.toLowerCase()}/${lrc.stem.toLowerCase()}`, lrc.filePath);
+    let titleTag = '';
+    try {
+      const head = readFileSync(lrc.filePath, 'utf8').slice(0, 512);
+      const tiMatch = /\[ti:([^\]]+)\]/i.exec(head);
+      if (tiMatch?.[1]) titleTag = tiMatch[1].trim();
+    } catch {
+      // ignore tag peek error
+    }
+    for (const key of extractLrcCandidateKeys(lrc.stem, titleTag)) {
+      const bucket = lrcByNormKey.get(key);
+      const entry = { filePath: lrc.filePath, folder: lrc.folder.toLowerCase() };
+      if (bucket) bucket.push(entry);
+      else lrcByNormKey.set(key, [entry]);
+    }
+  }
+
+  /**
+   * @param {string} folder
+   * @param {string} stem
+   * @param {string} titleTag
+   * @returns {string | undefined}
+   */
+  const resolveLrcPath = (folder, stem, titleTag) => {
+    const folderLower = folder.toLowerCase();
+    const exact = lrcByDirStem.get(`${folderLower}/${stem.toLowerCase()}`);
+    if (exact) return exact;
+    for (const key of extractLrcCandidateKeys(stem, titleTag)) {
+      const cands = lrcByNormKey.get(key);
+      if (!cands || cands.length === 0) continue;
+      if (cands.length === 1) return cands[0].filePath;
+      let best = cands[0];
+      let bestOverlap = -1;
+      for (const c of cands) {
+        let overlap = 0;
+        const maxLen = Math.min(folderLower.length, c.folder.length);
+        while (overlap < maxLen && folderLower[overlap] === c.folder[overlap]) overlap += 1;
+        if (overlap > bestOverlap) {
+          bestOverlap = overlap;
+          best = c;
+        }
+      }
+      return best.filePath;
+    }
+    return undefined;
+  };
 
   const now = Date.now();
   const transcodeCacheDir = join(pluginDataDir, 'transcode-cache');
@@ -331,21 +552,32 @@ export async function scanLibrary(pluginDataDir, musicDir, options = {}, deps = 
     const validTranscode = existing?.transcodePath && existsSync(existing.transcodePath)
       ? existing.transcodePath
       : (existsSync(cachedTranscode) ? cachedTranscode : undefined);
+    const audioStem = basename(item.filename, item.ext);
 
     if (unchanged && existing) {
+      const { lrcPath: _prevLrc, ...existingRest } = existing;
+      const lrcPath = resolveLrcPath(item.folder, audioStem, existing.title);
+      const hasEmbeddedLyrics = Boolean(existing.hasEmbeddedLyrics);
+      const hasLyrics = Boolean(lrcPath || hasEmbeddedLyrics);
       return {
-        ...existing,
+        ...existingRest,
         id,
         filePath: item.filePath,
         filename: item.filename,
         folder: item.folder,
         ext: item.ext,
+        hasEmbeddedLyrics,
+        hasLyrics,
         ...(validTranscode ? { transcodePath: validTranscode } : {}),
+        ...(lrcPath ? { lrcPath } : {}),
       };
     }
 
     if (!existing) added += 1;
     const meta = await probeAudioMetadata(item.filePath, { ...deps, signal: options.signal });
+    const lrcPath = resolveLrcPath(item.folder, audioStem, meta.title);
+    const hasEmbeddedLyrics = Boolean(meta.hasEmbeddedLyrics);
+    const hasLyrics = Boolean(lrcPath || hasEmbeddedLyrics);
     return {
       id,
       relPath: item.relPath,
@@ -362,7 +594,10 @@ export async function scanLibrary(pluginDataDir, musicDir, options = {}, deps = 
       sizeBytes: item.sizeBytes,
       mtimeMs: item.mtimeMs,
       addedAt: existing?.addedAt ?? now,
+      hasEmbeddedLyrics,
+      hasLyrics,
       ...(validTranscode ? { transcodePath: validTranscode } : {}),
+      ...(lrcPath ? { lrcPath } : {}),
     };
   });
 
@@ -385,6 +620,101 @@ export async function scanLibrary(pluginDataDir, musicDir, options = {}, deps = 
     removed,
     total: tracks.length,
   };
+}
+
+/**
+ * @param {MusicTrack} track
+ * @param {string} musicDir
+ * @param {{
+ *   ffprobePath?: string;
+ *   execFileFn?: (cmd: string, args: string[], opts?: Record<string, unknown>) => Promise<{ stdout?: unknown; stderr?: unknown }>;
+ *   signal?: AbortSignal;
+ * }} [deps]
+ * @returns {Promise<{ source: 'lrc' | 'embedded' | 'none'; synced: boolean; lines: LyricLine[]; title: string; artist: string; album: string }>}
+ */
+export async function readTrackLyrics(track, musicDir, deps = {}) {
+  const empty = {
+    source: /** @type {const} */ ('none'),
+    synced: false,
+    lines: /** @type {LyricLine[]} */ ([]),
+    title: track.title,
+    artist: track.artist,
+    album: track.album,
+  };
+
+  let rootReal = '';
+  try {
+    rootReal = realpathSync(resolve(musicDir));
+  } catch {
+    rootReal = '';
+  }
+
+  const sidecarFallback = track.filePath
+    ? `${track.filePath.slice(0, track.filePath.length - extname(track.filePath).length)}.lrc`
+    : '';
+  const lrcCandidate = track.lrcPath || (sidecarFallback && existsSync(sidecarFallback) ? sidecarFallback : '');
+
+  if (lrcCandidate && existsSync(lrcCandidate) && rootReal) {
+    try {
+      const lrcReal = realpathSync(lrcCandidate);
+      if (isPathInside(rootReal, lrcReal)) {
+        const st = statSync(lrcReal);
+        if (st.isFile() && st.size > 0 && st.size <= MAX_LRC_BYTES) {
+          const rawLrc = readFileSync(lrcReal, 'utf8');
+          const parsed = parseLrcText(rawLrc);
+          if (parsed.lines.length > 0) {
+            return {
+              source: 'lrc',
+              synced: parsed.synced,
+              lines: parsed.lines,
+              title: parsed.title || track.title,
+              artist: parsed.artist || track.artist,
+              album: parsed.album || track.album,
+            };
+          }
+        }
+      }
+    } catch {
+      // fall through to embedded tags
+    }
+  }
+
+  if (track.filePath && existsSync(track.filePath)) {
+    const execFn = deps.execFileFn ?? ((cmd, args, opts) => execFileAsync(cmd, args, opts));
+    const ffprobeBin = deps.ffprobePath || (existsSync('/usr/bin/ffprobe') ? '/usr/bin/ffprobe' : 'ffprobe');
+    try {
+      const res = await execFn(
+        ffprobeBin,
+        ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', track.filePath],
+        { encoding: 'utf8', timeout: 8000, maxBuffer: 2 * 1024 * 1024, ...(deps.signal ? { signal: deps.signal } : {}) },
+      );
+      const raw = String(res?.stdout ?? '').trim();
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        const fmtTags = parsed?.format?.tags;
+        const streams = Array.isArray(parsed?.streams) ? parsed.streams : [];
+        const audioStream = streams.find((s) => s && s.codec_type === 'audio') ?? streams[0];
+        const embeddedRaw = extractEmbeddedLyrics(fmtTags, audioStream?.tags);
+        if (embeddedRaw) {
+          const parsedLyrics = parseLrcText(embeddedRaw);
+          if (parsedLyrics.lines.length > 0) {
+            return {
+              source: 'embedded',
+              synced: parsedLyrics.synced,
+              lines: parsedLyrics.lines,
+              title: parsedLyrics.title || track.title,
+              artist: parsedLyrics.artist || track.artist,
+              album: parsedLyrics.album || track.album,
+            };
+          }
+        }
+      }
+    } catch {
+      // ignore ffprobe failure
+    }
+  }
+
+  return empty;
 }
 
 /**

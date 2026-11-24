@@ -1179,6 +1179,60 @@ def _extract_miot_env(raw_devices: Sequence[Dict[str, Any]]) -> Tuple[Optional[f
     return temp_val, hum_val
 
 
+_LRC_TIME_TAG_RE = re.compile(r"\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]")
+_LRC_OFFSET_RE = re.compile(r"^\[offset:\s*([+-]?\d+)\s*\]$", re.IGNORECASE)
+
+
+def _parse_lrc_file(path: Path) -> List[List[Any]]:
+    """Parse synced timestamps from an .lrc file into [[time_sec, text], ...]."""
+    try:
+        st = path.stat()
+        if not path.is_file() or st.st_size <= 0 or st.st_size > 512 * 1024:
+            return []
+        raw = path.read_text(encoding="utf-8-sig", errors="replace")
+    except Exception:
+        return []
+
+    offset_ms = 0
+    by_cs: Dict[int, List[Any]] = {}
+    for line in raw.splitlines():
+        trimmed = line.strip()
+        if not trimmed:
+            continue
+        off_m = _LRC_OFFSET_RE.match(trimmed)
+        if off_m:
+            try:
+                offset_ms = int(off_m.group(1))
+            except Exception:
+                pass
+            continue
+        matches = list(_LRC_TIME_TAG_RE.finditer(trimmed))
+        if not matches:
+            continue
+        text = _LRC_TIME_TAG_RE.sub("", trimmed).strip()
+        if not text:
+            continue
+        for m in matches:
+            try:
+                mins = int(m.group(1))
+                secs = int(m.group(2))
+                frac = m.group(3) or ""
+                frac_sec = float(f"0.{frac}") if frac else 0.0
+                adj = max(0.0, mins * 60.0 + secs + frac_sec - (offset_ms / 1000.0))
+            except Exception:
+                continue
+            cs = int(round(adj * 100))
+            if cs in by_cs:
+                existing_txt = str(by_cs[cs][1])
+                if text not in existing_txt.split(" / "):
+                    by_cs[cs][1] = f"{existing_txt} / {text}"
+            else:
+                by_cs[cs] = [round(adj, 3), text]
+
+    ordered = sorted(by_cs.values(), key=lambda pair: float(pair[0]))
+    return ordered[:500]
+
+
 class WidgetDataHub:
     """Low-resource lazy TTL & local-cache-first telemetry collector for CS80 Bento cards."""
 
@@ -1202,6 +1256,7 @@ class WidgetDataHub:
         self._last_mtime: Dict[str, float] = {}
         self._last_live_attempt_at: Dict[str, float] = {}
         self._last_proc_cpu: Optional[Tuple[int, int]] = None
+        self._music_lrc_cache: Dict[str, Tuple[int, List[List[Any]]]] = {}
         self._force_kinds: Set[str] = set()
         self.data_rev: int = 1
 
@@ -3193,6 +3248,22 @@ class WidgetDataHub:
         started_raw = state_raw.get("startedAtMs")
         started_at_ms = float(started_raw) if isinstance(started_raw, (int, float)) and started_raw > 0 else None
 
+        lyric_lines: List[List[Any]] = []
+        lrc_path_raw = str((cur_track or {}).get("lrcPath") or "").strip()
+        if lrc_path_raw:
+            lrc_path = Path(lrc_path_raw)
+            try:
+                st_lrc = lrc_path.stat()
+                mtime_ns = int(st_lrc.st_mtime_ns)
+                cached = self._music_lrc_cache.get(lrc_path_raw)
+                if cached and cached[0] == mtime_ns:
+                    lyric_lines = cached[1]
+                else:
+                    lyric_lines = _parse_lrc_file(lrc_path)
+                    self._music_lrc_cache[lrc_path_raw] = (mtime_ns, lyric_lines)
+            except Exception:
+                lyric_lines = []
+
         upd_raw = state_raw.get("updatedAt") or lib_raw.get("updatedAt")
         updated_hm = ""
         if isinstance(upd_raw, (int, float)) and upd_raw > 0:
@@ -3222,6 +3293,8 @@ class WidgetDataHub:
                 "durationSec": duration_sec,
                 "positionSec": position_sec,
                 "startedAtMs": started_at_ms,
+                "lyricLines": lyric_lines,
+                "hasLyrics": bool(lyric_lines),
                 "volume": volume,
                 "loopMode": loop_mode,
                 "loopLabel": loop_label,

@@ -34,6 +34,7 @@ import {
   loadLibrary,
   loadPlaylists,
   mutatePlaylist,
+  readTrackLyrics,
   resolveDefaultMusicDir,
   scanLibrary,
   searchLocalTracks,
@@ -57,6 +58,7 @@ export const ACTIONS = [
   'status',
   'scan',
   'tracks',
+  'lyrics',
   'play',
   'pause',
   'resume',
@@ -266,6 +268,17 @@ function computePositionSec(state) {
 }
 
 /**
+ * @param {ReturnType<typeof loadPlaybackState>} state
+ * @returns {number}
+ */
+function computePositionMs(state) {
+  if (state.status === 'playing' && typeof state.startedAtMs === 'number') {
+    return Math.max(0, Date.now() - state.startedAtMs);
+  }
+  return Math.max(0, Math.round((state.positionSec || 0) * 1000));
+}
+
+/**
  * @param {import('./library.mjs').MusicTrack[]} tracks
  * @param {ReturnType<typeof loadPlaybackState>} state
  */
@@ -386,6 +399,9 @@ function startPlaybackWatcher(pluginDataDir, homeDir, configPath, epoch, deps = 
         }
 
         if (lx.status === 1) {
+          if (!curState.sawPlaying) {
+            curState.startedAtMs = Date.now() - Math.max(0, curState.positionSec || 0) * 1000 - 800;
+          }
           curState.sawPlaying = true;
           curState.stoppedPolls = 0;
           savePlaybackState(pluginDataDir, curState);
@@ -581,6 +597,8 @@ async function buildDashboard(pluginDataDir, homeDir, configPath, options = {}, 
     libraryUpdatedAt: lib.updatedAt,
     status: state.status,
     positionSec: computePositionSec(state),
+    positionMs: computePositionMs(state),
+    startedAtMs: state.startedAtMs,
     loopMode: state.loopMode,
     loopLabel: LOOP_LABELS[state.loopMode] ?? '列表循环',
     volume: state.volume,
@@ -1270,6 +1288,39 @@ export async function runAction(action, args = {}, context = {}, deps = {}) {
       title: '下载记录列表',
       message: `共 ${jobs.length} 条下载记录`,
       data: { jobs },
+    };
+  }
+
+  if (cleanAction === 'lyrics') {
+    const config = loadEffectiveConfig(configPath, homeDir);
+    let lib = loadLibrary(pluginDataDir);
+    if (!lib.updatedAt && existsSync(config.musicDir)) {
+      const scanned = await scanLibrary(pluginDataDir, config.musicDir, { quick: true }, deps);
+      lib = { updatedAt: scanned.updatedAt, musicDir: scanned.musicDir, tracks: scanned.tracks };
+    }
+    const state = loadPlaybackState(pluginDataDir, config.defaultVolume);
+    const targetId = String(safeArgs.trackId ?? state.currentTrackId ?? '').trim().toLowerCase();
+    if (!targetId) {
+      return { ok: false, notify: false, title: '未指定曲目', message: '请先选择曲目或开始播放歌曲' };
+    }
+    const track = lib.tracks.find((t) => t.id === targetId);
+    if (!track) {
+      return { ok: false, notify: false, title: '曲目不存在', message: `未找到曲目 ${targetId}` };
+    }
+    const lyrics = await readTrackLyrics(track, config.musicDir, deps);
+    const lineCount = lyrics.lines.length;
+    return {
+      ok: true,
+      notify: false,
+      title: '歌词详情',
+      message: lineCount > 0 ? `已加载《${track.title}》的${lyrics.synced ? '同步' : '文本'}歌词（${lineCount} 行）` : `《${track.title}》暂无歌词`,
+      data: {
+        trackId: track.id,
+        title: track.title,
+        artist: track.artist,
+        album: track.album,
+        ...lyrics,
+      },
     };
   }
 

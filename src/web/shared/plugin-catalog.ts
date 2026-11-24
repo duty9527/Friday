@@ -100,6 +100,7 @@ const SAFE_QUICK_RUN_ACTIONS: ReadonlySet<string> = new Set([
   'scan',
   'tree',
   'tracks',
+  'lyrics',
 ]);
 
 const ACTION_FALLBACK_LABELS: Record<string, string> = {
@@ -147,6 +148,7 @@ const ACTION_FALLBACK_LABELS: Record<string, string> = {
   'watch-stop': '停止唤醒',
   'brushhead-reset': '重置刷头',
   tracks: '曲库检索',
+  lyrics: '读取歌词',
   play: '点歌播放',
   pause: '暂停播放',
   stop: '停止播放',

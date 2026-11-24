@@ -995,6 +995,43 @@ def _cairo_rounded_rect(ctx, x: float, y: float, w: float, h: float, r: float) -
     ctx.close_path()
 
 
+def _pick_lyric_window(lyric_lines: Any, pos_sec: float) -> Tuple[str, str, str]:
+    """Pick (prev, current, next) lyric lines around playback position."""
+    if not isinstance(lyric_lines, list) or not lyric_lines:
+        return ("", "", "")
+    entries: List[Tuple[float, str]] = []
+    for item in lyric_lines:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        try:
+            t_val = float(item[0])
+            txt = str(item[1] or "").strip()
+        except Exception:
+            continue
+        if txt:
+            entries.append((t_val, txt))
+    if not entries:
+        return ("", "", "")
+
+    idx = -1
+    target = pos_sec + 0.25
+    for i, (t_val, _txt) in enumerate(entries):
+        if t_val <= target:
+            idx = i
+        else:
+            break
+
+    if idx < 0:
+        first_txt = entries[0][1]
+        second_txt = entries[1][1] if len(entries) > 1 else ""
+        return ("", first_txt if entries[0][0] - pos_sec <= 3.0 else "", second_txt if entries[0][0] - pos_sec <= 3.0 else first_txt)
+
+    prev_txt = entries[idx - 1][1] if idx > 0 else ""
+    cur_txt = entries[idx][1]
+    next_txt = entries[idx + 1][1] if idx + 1 < len(entries) else ""
+    return (prev_txt, cur_txt, next_txt)
+
+
 def _fit_single_line_cairo(ctx, text: str, max_width: float) -> str:
     clean = " ".join(_sanitize_hud_text(text or "").replace("\r", "\n").split())
     if not clean:
@@ -4136,17 +4173,25 @@ class FaceRenderer:
         title = str(d.get("title") or "").strip() or (f"曲库共 {track_count} 首歌曲" if track_count > 0 else "曲库待添加歌曲")
         subline = str(d.get("subline") or "").strip() or "语音说“星期五，放首歌”"
 
-        pos_sec = max(0, int(d.get("positionSec") or 0))
+        pos_f = float(max(0, int(d.get("positionSec") or 0)))
         started_ms = d.get("startedAtMs")
         if playing and isinstance(started_ms, (int, float)) and started_ms > 0:
-            pos_sec = max(0, int((time.time() * 1000.0 - float(started_ms)) / 1000.0))
+            pos_f = max(0.0, (time.time() * 1000.0 - float(started_ms)) / 1000.0)
+        pos_sec = int(pos_f)
         dur_raw = d.get("durationSec")
         dur_sec = int(dur_raw) if isinstance(dur_raw, (int, float)) and dur_raw > 0 else None
         if dur_sec is not None:
+            pos_f = min(float(dur_sec), pos_f)
             pos_sec = min(dur_sec, pos_sec)
-            ratio = clamp(float(pos_sec) / float(dur_sec), 0.0, 1.0)
+            ratio = clamp(pos_f / float(dur_sec), 0.0, 1.0)
         else:
             ratio = 0.0
+
+        prev_lrc, cur_lrc, next_lrc = (
+            _pick_lyric_window(d.get("lyricLines"), pos_f)
+            if (playing or paused)
+            else ("", "", "")
+        )
 
         def fmt_mmss(sec: Optional[int]) -> str:
             if sec is None:
@@ -4157,7 +4202,7 @@ class FaceRenderer:
         time_str = f"{fmt_mmss(pos_sec)} / {fmt_mmss(dur_sec)}" if dur_sec else queue_str
 
         if card.w_span == 2 and card.h_span == 1:
-            # 2x1 horizontal layout: left song title + artist + pills, right progress + time/queue
+            # 2x1 horizontal layout: left song title + artist + pills, right progress + time + live lyric
             ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
             ctx.set_font_size(25.0)
             ctx.set_source_rgb(*(COL_WHITE if (playing or paused) else COL_AMBER_BRIGHT))
@@ -4188,10 +4233,10 @@ class FaceRenderer:
             ctx.move_to(rx, y + 112.0)
             ctx.show_text(_fit_single_line_cairo(ctx, time_str, rw))
             ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
-            ctx.set_font_size(13.5)
-            ctx.set_source_rgb(*COL_AMBER_DIM)
+            ctx.set_font_size(14.0 if cur_lrc else 13.5)
+            ctx.set_source_rgb(*(COL_WHITE if cur_lrc else COL_AMBER_DIM))
             ctx.move_to(rx, y + h - 24.0)
-            ctx.show_text(_fit_single_line_cairo(ctx, queue_str, rw))
+            ctx.show_text(_fit_single_line_cairo(ctx, f"♪ {cur_lrc}" if cur_lrc else queue_str, rw))
         elif card.h_span == 2:
             # 1x2 or 2x2 vertical layout
             ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
@@ -4224,6 +4269,34 @@ class FaceRenderer:
                     py_pill += 34.0
                 pw = _draw_pill(ctx, px, py_pill, 26.0, lbl, col, font_size=13.5, pad_x=10.0, font_family=self.font_family)
                 px += pw + 8.0
+
+            if prev_lrc or cur_lrc or next_lrc:
+                ly = py_pill + 54.0
+                max_lw = w - 48.0
+                max_ly = y + h - 18.0
+                if prev_lrc and ly <= max_ly:
+                    ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+                    ctx.set_font_size(14.5)
+                    ctx.set_source_rgb(*COL_AMBER_DIM)
+                    ctx.move_to(x + 30.0, ly)
+                    ctx.show_text(_fit_single_line_cairo(ctx, prev_lrc, max_lw))
+                    ly += 28.0
+                if cur_lrc and ly <= max_ly:
+                    ctx.set_source_rgb(*accent)
+                    ctx.rectangle(x + 18.0, ly - 17.0, 4.0, 22.0)
+                    ctx.fill()
+                    ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+                    ctx.set_font_size(18.5 if card.w_span == 2 else 16.0)
+                    ctx.set_source_rgb(*COL_WHITE)
+                    ctx.move_to(x + 30.0, ly)
+                    ctx.show_text(_fit_single_line_cairo(ctx, cur_lrc, max_lw))
+                    ly += 32.0
+                if next_lrc and ly <= max_ly:
+                    ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+                    ctx.set_font_size(14.5)
+                    ctx.set_source_rgb(*COL_AMBER)
+                    ctx.move_to(x + 30.0, ly)
+                    ctx.show_text(_fit_single_line_cairo(ctx, next_lrc, max_lw))
         else:
             # 1x1 compact layout
             ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
@@ -4234,9 +4307,9 @@ class FaceRenderer:
 
             ctx.select_font_face(self.font_family, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
             ctx.set_font_size(14.0)
-            ctx.set_source_rgb(*COL_AMBER)
+            ctx.set_source_rgb(*(COL_WHITE if cur_lrc else COL_AMBER))
             ctx.move_to(x + 16.0, y + 104.0)
-            ctx.show_text(_fit_single_line_cairo(ctx, subline, w - 32.0))
+            ctx.show_text(_fit_single_line_cairo(ctx, f"♪ {cur_lrc}" if cur_lrc else subline, w - 32.0))
 
             bar_y = y + (122.0 if h < 220 else 132.0)
             _draw_progress_bar(ctx, x + 16.0, bar_y, w - 32.0, 8.0, ratio, accent)

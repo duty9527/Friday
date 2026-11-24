@@ -17,6 +17,7 @@ export const AUDIO_MIME_BY_EXT: Readonly<Record<string, string>> = {
 
 export const MAX_MUSIC_UPLOAD_BYTES = 100 * 1024 * 1024;
 export const MAX_MUSIC_COOKIES_BYTES = 2 * 1024 * 1024;
+const ALLOWED_UPLOAD_EXTS = new Set([...Object.keys(AUDIO_MIME_BY_EXT), '.lrc']);
 export const TRACK_ID_RE = /^[a-f0-9]{12,32}$/;
 const SECRET_HEX_RE = /^[a-f0-9]{64}$/i;
 const FOLDER_NAME_RE = /^[A-Za-z0-9._\u4e00-\u9fff-]{1,48}$/;
@@ -319,8 +320,8 @@ function sanitizeUploadFilename(rawHeader: string | string[] | undefined): { fil
     throw new MusicMediaError(400, 'Invalid music filename');
   }
   const ext = extname(normalizedBase).toLowerCase();
-  if (!Object.hasOwn(AUDIO_MIME_BY_EXT, ext)) {
-    throw new MusicMediaError(400, `Unsupported audio extension "${ext || '(none)'}"`);
+  if (!ALLOWED_UPLOAD_EXTS.has(ext)) {
+    throw new MusicMediaError(400, `Unsupported audio/lyrics extension "${ext || '(none)'}"`);
   }
   const stemMax = Math.max(1, 180 - ext.length);
   const rawStem = normalizedBase.slice(0, normalizedBase.length - ext.length).trim() || 'track';
