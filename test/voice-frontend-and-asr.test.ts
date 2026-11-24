@@ -31,6 +31,7 @@ import {
   type LiveAsrWebSocketLike,
 } from '../src/xiaoai/asr-engine.js';
 import {
+  computeKwsIdleGateRms,
   XiaoaiKwsMonitor,
   type XiaoaiAsrRecognizer,
   type XiaoaiKwsSpotter,
@@ -1063,6 +1064,46 @@ test('asr-engine: createGeminiLiveTranscribeSession streams AGC audio, buffers p
   assert.equal(session3.isUsable(), false);
   assert.ok(loggedErrors.length >= 1);
   assert.ok(!loggedErrors.some(e => e.includes(secretKey)), 'API key must be redacted from Live ASR logs');
+
+  // 4. Ultra-quiet -56 dBFS (0.0015) speech AGC boost & immunity to premature empty turnComplete
+  let wsQuiet: MockLiveWebSocket | undefined;
+  const session4 = createGeminiLiveTranscribeSession({
+    apiKey: secretKey,
+    webSocketFactory: (url) => {
+      wsQuiet = new MockLiveWebSocket(url);
+      wsQuiet.readyState = 1;
+      return wsQuiet;
+    },
+  });
+  wsQuiet!.emit('open', {});
+  wsQuiet!.emitJson({ setupComplete: {} });
+  await delay(5);
+
+  const ultraQuiet = new Float32Array(1600);
+  for (let i = 0; i < ultraQuiet.length; i++) {
+    ultraQuiet[i] = 0.0015 * Math.sin((2 * Math.PI * 520 * i) / FRONTEND_SAMPLE_RATE);
+  }
+  session4.pushSamples(ultraQuiet);
+  assert.equal(wsQuiet!.sent.length, 2);
+  const quietAudioMsg = wsQuiet!.sent[1] as { realtimeInput: { audio: { data: string } } };
+  const quietPcm = Buffer.from(quietAudioMsg.realtimeInput.audio.data, 'base64');
+  let quietPeak = 0;
+  for (let i = 0; i < quietPcm.length; i += 2) {
+    quietPeak = Math.max(quietPeak, Math.abs(quietPcm.readInt16LE(i) / 32768));
+  }
+  assert.ok(
+    quietPeak >= 0.22 && quietPeak <= 0.96,
+    `Expected ultra-quiet 0.0015 speech boosted into [0.22, 0.96], got ${quietPeak.toFixed(3)}`,
+  );
+
+  // Premature empty turnComplete during mid-speech pause must NOT truncate finish() before audioStreamEnd
+  wsQuiet!.emitJson({ serverContent: { turnComplete: true } });
+  await delay(5);
+  const p4 = session4.finish({ timeoutMs: 600 });
+  await delay(60);
+  wsQuiet!.emitJson({ serverContent: { inputTranscription: { text: '打开鱼缸灯。' }, generationComplete: true } });
+  const res4 = await p4;
+  assert.equal(res4?.text, '打开鱼缸灯。');
 });
 
 test('XiaoaiKwsMonitor: Live ASR runs in parallel with speaker verification and falls back to batch when trimmed', async () => {
@@ -1354,4 +1395,54 @@ test('audio-frontend: beamformHexArray resists stationary 204deg room noise and 
   assert.equal(bf.usedChannels, 6);
   const errDeg = circularAzimuthDiffDeg(bf.azimuthDeg, 90);
   assert.ok(errDeg <= 15, `Expected transient speech DOA near 90deg despite 204deg stationary noise, got ${bf.azimuthDeg}deg`);
+});
+
+test('audio-frontend & kws-monitor: 12-beam OnlineHexBeamformer preserves 90deg low-gain speech and array8 idle gate unlocks quiet wake', () => {
+  const array8Gate = computeKwsIdleGateRms(0.00024, 'array8');
+  assert.ok(
+    array8Gate >= 0.00038 && array8Gate <= 0.00045,
+    `Expected array8 idle gate in [0.00038, 0.00045], got ${array8Gate}`,
+  );
+  assert.ok(
+    computeKwsIdleGateRms(0.00035, 's32le') >= 0.00075,
+    '1ch s32le idle gate floor must remain >= 0.00075',
+  );
+
+  const sr = FRONTEND_SAMPLE_RATE;
+  const frameLen = 640;
+  const beamformer = new OnlineHexBeamformer(sr);
+  const noiseFloor = synthHexPlaneWave({
+    durationSec: 0.48,
+    azimuthDeg: 210,
+    signalAtTime: t => 0.0002 * Math.sin(2 * Math.PI * 1500 * t),
+    noiseAmp: 0.00025,
+    seed: 91,
+  });
+  for (let off = 0; off + frameLen <= noiseFloor[0]!.length; off += frameLen) {
+    beamformer.process(noiseFloor.map(m => m.subarray(off, off + frameLen)));
+  }
+
+  const speech90 = synthHexPlaneWave({
+    durationSec: 0.40,
+    azimuthDeg: 90,
+    signalAtTime: t =>
+      0.0008 * Math.sin(2 * Math.PI * 1000 * t)
+      + 0.0008 * Math.sin(2 * Math.PI * 2500 * t)
+      + 0.0008 * Math.sin(2 * Math.PI * 3600 * t),
+    seed: 92,
+  });
+  const out90 = new Float32Array(speech90[0]!.length);
+  let lastAz90 = -1;
+  for (let off = 0; off + frameLen <= speech90[0]!.length; off += frameLen) {
+    const res = beamformer.process(speech90.map(m => m.subarray(off, off + frameLen)));
+    out90.set(res.samples, off);
+    lastAz90 = res.azimuthDeg;
+  }
+  assert.equal(lastAz90, 90, `Expected 12-beam OnlineHexBeamformer to lock onto 90deg speech, got ${lastAz90}deg`);
+  const inRms90 = computeRms(speech90[0]!.subarray(frameLen * 2));
+  const outRms90 = computeRms(out90.subarray(frameLen * 2));
+  assert.ok(
+    outRms90 / Math.max(1e-6, inRms90) >= 0.85,
+    `Expected >=0.85 RMS preservation at 90deg, got ${(outRms90 / Math.max(1e-6, inRms90)).toFixed(3)}`,
+  );
 });

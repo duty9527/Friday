@@ -920,9 +920,13 @@ export function computeForegroundSpeechGate(noiseRms: number, wakeRefRms: number
 
 export function computeKwsIdleGateRms(
   ambientRms: number,
-  sampleFormat?: 's16le' | 's32le',
+  sampleFormat?: 's16le' | 's32le' | 'array8',
   speechRmsThreshold = DEFAULT_SPEECH_RMS_THRESHOLD,
 ): number {
+  if (sampleFormat === 'array8') {
+    const safeAmbient = Math.max(0.00018, ambientRms || 0.00025);
+    return Math.max(0.00038, Math.min(0.0014, safeAmbient * 1.40));
+  }
   if (sampleFormat === 's32le') {
     const safeAmbient = Math.max(0.00025, ambientRms || 0.00035);
     return Math.max(0.00075, Math.min(0.0020, safeAmbient * 1.45));
@@ -982,8 +986,8 @@ function defaultVadFactory(config: { vadModelPath: string; speechRmsThreshold: n
       const rawRms = computeRms(samples);
       if (noiseRms <= 0) noiseRms = updateAmbientNoiseRms(0, rawRms);
       const vadActive = vad.isDetected();
-      // Enforce a minimum RMS floor so thermal room hiss (~0.0003) never latches Silero VAD
-      const minSpeechRms = Math.max(0.00095, computeForegroundSpeechGate(noiseRms, wakeRefRms));
+      // Enforce a minimum RMS floor so thermal room hiss (~0.00025) never latches Silero VAD
+      const minSpeechRms = Math.max(0.00048, computeForegroundSpeechGate(noiseRms, wakeRefRms));
       const lowGateFactor = vadActive ? 0.52 : 0.75;
       if (rawRms < minSpeechRms * lowGateFactor) {
         if (vadActive || trailingZeroFlushedSamples < trailingSilenceFlushSamples) {
@@ -1006,7 +1010,7 @@ function defaultVadFactory(config: { vadModelPath: string; speechRmsThreshold: n
       }
 
       trailingZeroFlushedSamples = 0;
-      const gain = Math.min(28, Math.max(1, 0.012 / Math.max(noiseRms, 0.00030)));
+      const gain = Math.min(60, Math.max(1, 0.020 / Math.max(noiseRms, 0.00022)));
       let vadInput = samples;
       if (gain > 1.05) {
         const boosted = new Float32Array(samples.length);
@@ -1971,7 +1975,7 @@ export class XiaoaiKwsMonitor {
     if (this.idleEnergyGate && !worker.kwsRescueInFlight) {
       const gateRms = computeKwsIdleGateRms(
         worker.ambientRms,
-        this.isHardwareLowGainStream(worker) ? 's32le' : 's16le',
+        worker.resolvedChannels >= 6 ? 'array8' : (this.isHardwareLowGainStream(worker) ? 's32le' : 's16le'),
         this.speechRmsThreshold,
       );
       const aboveGate = chunkRms >= (worker.kwsGateActive ? gateRms * 0.85 : gateRms);
@@ -2178,7 +2182,7 @@ export class XiaoaiKwsMonitor {
       if (
         speechLen >= msToSamples(300)
         && Date.now() - worker.lastWakeAt >= this.cooldownMs
-        && (!this.isHardwareLowGainStream(worker) || maxRms >= 0.0013)
+        && (!this.isHardwareLowGainStream(worker) || maxRms >= 0.00060)
       ) {
         const rescueId = ++worker.kwsRescueId;
         worker.kwsRescueInFlight = true;
@@ -2293,6 +2297,11 @@ export class XiaoaiKwsMonitor {
       }
       const wakeGate = this.evaluateWakeSpeakerGate(worker, '星期五', burstSamples, true);
       if (!wakeGate.matched) {
+        if (wakeGate.score >= 0.25) {
+          console.log(
+            `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: asr-rescue skipped by speaker precheck (score=${wakeGate.score.toFixed(3)} < ${wakeGate.threshold.toFixed(3)}, maxRms=${burstMaxRms.toFixed(5)})`,
+          );
+        }
         return;
       }
       const recognizer = await this.ensureRecognizer();
@@ -3055,7 +3064,7 @@ export class XiaoaiKwsMonitor {
     worker.liveAsrSession = undefined;
     worker.liveAsrSampleCount = 0;
 
-    const lowGainEmpty = this.isHardwareLowGainStream(worker) && maxRms > 0 && maxRms < 0.0010;
+    const lowGainEmpty = this.isHardwareLowGainStream(worker) && maxRms > 0 && maxRms < 0.00045;
     const preferFastLocal = this.options.preferFastLocalForTarget?.(worker.channel.id, worker.target.id) ?? false;
     let liveResultPromise: Promise<LiveAsrResult | undefined> | undefined;
     if (!lowGainEmpty && !preferFastLocal && liveSession && liveSamples > 0 && liveSession.isUsable()) {
@@ -3094,7 +3103,7 @@ export class XiaoaiKwsMonitor {
     worker.transcribingCount++;
     try {
       if (this.closed || worker.stopped) return;
-      if (this.isHardwareLowGainStream(worker) && maxRms > 0 && maxRms < 0.0010) {
+      if (this.isHardwareLowGainStream(worker) && maxRms > 0 && maxRms < 0.00045) {
         this.cancelSpeakerLed(worker, keyword, 'empty');
         return;
       }
@@ -3204,6 +3213,11 @@ export class XiaoaiKwsMonitor {
                 `[xiaoai-asr] engine=${liveModel} dur=${liveDurSec}s ms=${liveRes.latencyMs}${liveRes.interimFallback ? ' interim=1' : ''}`,
               );
             }
+          }
+          if (!rawText) {
+            console.log(
+              `[xiaoai-asr-live] fallback to batch (reason=${liveRes?.text ? 'empty_clean' : 'no_result'})`,
+            );
           }
         }
         if (!rawText) {

@@ -881,22 +881,26 @@ function medianNumber(values: readonly number[]): number {
   return sorted[Math.floor(sorted.length / 2)] ?? 0;
 }
 
-const ONLINE_BEAM_ANGLES_DEG = [0, 60, 120, 180, 240, 300] as const;
-const ONLINE_BEAM_HISTORY = 4;
+const ONLINE_BEAM_ANGLES_DEG = [0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330] as const;
+const ONLINE_BEAM_HISTORY = 8;
 const ONLINE_BEAM_CROSSFADE_SAMPLES = 64;
 
 /**
- * Lightweight causal 6-beam hexagonal shift-and-sum beamformer for always-on streaming KWS & VAD.
- * Evaluates 6 cardinal azimuths (60° spacing), tracks per-beam noise floors,
- * and smoothly switches toward higher-SNR speech directions while ignoring dead channels.
+ * Lightweight causal 12-beam hexagonal shift-and-sum beamformer for always-on streaming KWS & VAD.
+ * Evaluates 12 azimuths (30° spacing) with 4-tap Catmull-Rom cubic fractional-delay interpolation,
+ * tracks per-beam noise floors, and smoothly switches toward speech directions while ignoring dead channels.
  */
 export class OnlineHexBeamformer {
   private readonly micCount: number;
   private readonly delayInt: Int32Array[];
-  private readonly delayFrac: Float64Array[];
+  private readonly cubicW0: Float64Array[];
+  private readonly cubicW1: Float64Array[];
+  private readonly cubicW2: Float64Array[];
+  private readonly cubicW3: Float64Array[];
   private readonly micHist: Float32Array[];
   private readonly prevBeamSample = new Float64Array(ONLINE_BEAM_ANGLES_DEG.length);
   private readonly beamAmbientRms = new Float64Array(ONLINE_BEAM_ANGLES_DEG.length);
+  private readonly beamRmsBuf = new Float64Array(ONLINE_BEAM_ANGLES_DEG.length);
   private readonly beamSnrBuf = new Float64Array(ONLINE_BEAM_ANGLES_DEG.length);
   private activeBeam = 0;
 
@@ -910,7 +914,10 @@ export class OnlineHexBeamformer {
     this.micCount = coords.length;
     this.micHist = Array.from({ length: this.micCount }, () => new Float32Array(ONLINE_BEAM_HISTORY));
     this.delayInt = [];
-    this.delayFrac = [];
+    this.cubicW0 = [];
+    this.cubicW1 = [];
+    this.cubicW2 = [];
+    this.cubicW3 = [];
 
     for (let b = 0; b < ONLINE_BEAM_ANGLES_DEG.length; b++) {
       const rad = (ONLINE_BEAM_ANGLES_DEG[b]! * Math.PI) / 180;
@@ -922,16 +929,28 @@ export class OnlineHexBeamformer {
         if (t < minTau) minTau = t;
       }
       const dInt = new Int32Array(this.micCount);
-      const dFrac = new Float64Array(this.micCount);
+      const cw0 = new Float64Array(this.micCount);
+      const cw1 = new Float64Array(this.micCount);
+      const cw2 = new Float64Array(this.micCount);
+      const cw3 = new Float64Array(this.micCount);
       for (let m = 0; m < this.micCount; m++) {
-        // Wavefront from +u reaches closer mics earlier -> delay closer mics more so all align at tau_min
-        const d = Math.max(0, Math.min(ONLINE_BEAM_HISTORY - 0.001, rawTau[m]! - minTau));
+        // Wavefront from +u reaches closer mics earlier -> delay closer mics more (+1 sample lookahead for causal cubic stencil)
+        const d = Math.max(1, Math.min(ONLINE_BEAM_HISTORY - 2.001, 1 + rawTau[m]! - minTau));
         const k = Math.floor(d);
+        const f = d - k;
+        const f2 = f * f;
+        const f3 = f2 * f;
         dInt[m] = k;
-        dFrac[m] = d - k;
+        cw0[m] = -0.5 * f + f2 - 0.5 * f3;
+        cw1[m] = 1 - 2.5 * f2 + 1.5 * f3;
+        cw2[m] = 0.5 * f + 2 * f2 - 1.5 * f3;
+        cw3[m] = -0.5 * f2 + 0.5 * f3;
       }
       this.delayInt.push(dInt);
-      this.delayFrac.push(dFrac);
+      this.cubicW0.push(cw0);
+      this.cubicW1.push(cw1);
+      this.cubicW2.push(cw2);
+      this.cubicW3.push(cw3);
     }
   }
 
@@ -1016,17 +1035,22 @@ export class OnlineHexBeamformer {
       const out = this.beamOutputs[b]!;
       out.fill(0);
       const dInt = this.delayInt[b]!;
-      const dFrac = this.delayFrac[b]!;
+      const cw0 = this.cubicW0[b]!;
+      const cw1 = this.cubicW1[b]!;
+      const cw2 = this.cubicW2[b]!;
+      const cw3 = this.cubicW3[b]!;
       for (let hPos = 0; hPos < healthyIndices.length; hPos++) {
         const m = healthyIndices[hPos]!;
         const pad = this.paddedMics[m]!;
         const k = dInt[m]!;
-        const f = dFrac[m]!;
-        const w0 = (1 - f) * invM;
-        const w1 = f * invM;
+        const w0 = cw0[m]! * invM;
+        const w1 = cw1[m]! * invM;
+        const w2 = cw2[m]! * invM;
+        const w3 = cw3[m]! * invM;
         const base = ONLINE_BEAM_HISTORY - k;
         for (let t = 0; t < numSamples; t++) {
-          out[t] = out[t]! + pad[base + t]! * w0 + pad[base + t - 1]! * w1;
+          const idx = base + t;
+          out[t] = out[t]! + pad[idx + 1]! * w0 + pad[idx]! * w1 + pad[idx - 1]! * w2 + pad[idx - 2]! * w3;
         }
       }
 
@@ -1050,13 +1074,19 @@ export class OnlineHexBeamformer {
       } else if (rms <= amb * 2.2) {
         this.beamAmbientRms[b] = 0.97 * amb + 0.03 * rms;
       }
-      this.beamSnrBuf[b] = rms / Math.max(0.00012, this.beamAmbientRms[b]!);
+      this.beamRmsBuf[b] = rms;
     }
 
+    // Spatial grating/nulls on narrowband interference can depress a single beam's
+    // ambient floor well below surrounding beams; clamp ambient against median energy
+    // so an artificially tiny noise floor cannot boost an off-target beam's SNR.
+    const medAmb = medianNumber(Array.from(this.beamAmbientRms));
+    const ambFloor = Math.max(0.00012, medAmb * 0.85);
     let bestBeam = 0;
     let bestSnr = -1;
     for (let b = 0; b < ONLINE_BEAM_ANGLES_DEG.length; b++) {
-      const snr = this.beamSnrBuf[b]!;
+      const snr = this.beamRmsBuf[b]! / Math.max(ambFloor, this.beamAmbientRms[b]!);
+      this.beamSnrBuf[b] = snr;
       if (snr > bestSnr) {
         bestSnr = snr;
         bestBeam = b;
@@ -1067,8 +1097,8 @@ export class OnlineHexBeamformer {
     const prevSnr = this.beamSnrBuf[prevBeam] ?? 0;
     if (
       bestBeam !== prevBeam
-      && bestSnr >= 1.35
-      && bestSnr > prevSnr * 1.18
+      && bestSnr >= 1.25
+      && bestSnr > prevSnr * 1.08
     ) {
       this.activeBeam = bestBeam;
       const prevArr = this.beamOutputs[prevBeam]!;

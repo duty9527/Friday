@@ -592,11 +592,11 @@ class StreamingPcmEncoder {
     } else if (chunkPeak > this.envPeak) {
       this.envPeak = 0.65 * chunkPeak + 0.35 * this.envPeak;
     } else {
-      this.envPeak = Math.max(0.004, 0.96 * this.envPeak + 0.04 * chunkPeak);
+      this.envPeak = Math.max(0.001, 0.96 * this.envPeak + 0.04 * chunkPeak);
     }
 
-    const effectivePeak = this.initialized ? Math.max(0.004, this.envPeak) : 0.02;
-    const gain = Math.min(60, Math.max(1, 0.38 / effectivePeak));
+    const effectivePeak = this.initialized ? Math.max(0.001, this.envPeak) : 0.006;
+    const gain = Math.min(180, Math.max(1, 0.45 / effectivePeak));
     const pcm = Buffer.allocUnsafe(samples.length * 2);
     for (let i = 0; i < samples.length; i++) {
       const raw = samples[i] ?? 0;
@@ -962,6 +962,9 @@ export function createGeminiLiveTranscribeSession(params: {
         const tailPcm = encoder.flushRemaining();
         if (tailPcm && tailPcm.length > 0) {
           sendAudioB64(tailPcm.toString('base64'));
+        }
+        if (finalSegments.length === 0) {
+          sawTurnDone = false;
         }
         audioEndSent = true;
         if (!safeSend({ realtimeInput: { audioStreamEnd: true } })) {
