@@ -32,4 +32,5 @@ export {
   cleanXiaoaiAsrUtterance,
   extractLeadingXiaoaiWakeKeyword,
   isXiaoaiFollowUpCancel,
+  isXiaoaiSilenceCommand,
 } from './xiaoai/utterance-utils.js';

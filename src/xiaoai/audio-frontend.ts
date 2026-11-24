@@ -1143,34 +1143,20 @@ export function beamformHexArray(
   }
   if (frameStarts.length === 0) frameStarts.push(0);
 
-  // Measure reference energy on first healthy channel to select active speech frames for DOA
-  const refMic = mics[healthyIndices[0]!]!;
-  const frameRms = frameStarts.map((start) => {
-    const end = Math.min(numSamples, start + fftSize);
-    let sumSq = 0;
-    for (let i = start; i < end; i++) {
-      const v = refMic[i] ?? 0;
-      sumSq += v * v;
-    }
-    return Math.sqrt(sumSq / Math.max(1, end - start));
-  });
-  const sortedRms = [...frameRms].sort((a, b) => a - b);
-  const p90Rms = sortedRms[Math.min(sortedRms.length - 1, Math.floor(sortedRms.length * 0.9))] ?? 0;
-  const activeGate = p90Rms * 0.25;
-
   const healthySet = new Set(healthyIndices);
   const activePairs = HEX_ADJACENT_AND_DIAMETRIC_PAIRS.filter(([a, b]) => healthySet.has(a) && healthySet.has(b));
   const pairs = activePairs.length > 0
     ? activePairs
     : healthyIndices.slice(1).map((idx) => [healthyIndices[0]!, idx] as const);
 
-  // Accumulate PHAT-weighted cross-spectra on active frames
+  // Accumulate foreground-weighted PHAT cross-spectra across speech-band active frames
   const pairGRe = pairs.map(() => new Float64Array(kMax + 1));
   const pairGIm = pairs.map(() => new Float64Array(kMax + 1));
 
-  // Precompute per-frame STFT spectra across healthy channels so we only run FFT once per frame per channel
+  // Precompute per-frame STFT spectra across healthy channels and track speech-band energy
   const channelSpectraRe = healthyIndices.map(() => frameStarts.map(() => new Float64Array(halfBins)));
   const channelSpectraIm = healthyIndices.map(() => frameStarts.map(() => new Float64Array(halfBins)));
+  const frameSpeechEnergy = new Float64Array(frameStarts.length);
   const fftRe = new Float64Array(fftSize);
   const fftIm = new Float64Array(fftSize);
 
@@ -1179,7 +1165,7 @@ export function beamformHexArray(
 
   for (let f = 0; f < frameStarts.length; f++) {
     const start = frameStarts[f]!;
-    const isActiveFrame = (frameRms[f] ?? 0) >= activeGate && activeGate > 1e-7;
+    let speechEnergySum = 0;
     for (let hPos = 0; hPos < healthyIndices.length; hPos++) {
       const chIdx = healthyIndices[hPos]!;
       const micArr = mics[chIdx]!;
@@ -1193,12 +1179,31 @@ export function beamformHexArray(
       const outRe = channelSpectraRe[hPos]![f]!;
       const outIm = channelSpectraIm[hPos]![f]!;
       for (let k = 0; k < halfBins; k++) {
-        outRe[k] = fftRe[k]!;
-        outIm[k] = fftIm[k]!;
+        const re = fftRe[k]!;
+        const im = fftIm[k]!;
+        outRe[k] = re;
+        outIm[k] = im;
+        if (k >= kMin && k <= kMax) {
+          speechEnergySum += re * re + im * im;
+        }
       }
     }
+    frameSpeechEnergy[f] = speechEnergySum / healthyIndices.length;
+  }
 
-    if (isActiveFrame) {
+  const sortedE = Array.from(frameSpeechEnergy).sort((a, b) => a - b);
+  const noiseFloor = sortedE[Math.floor(sortedE.length * 0.15)] ?? 0;
+  const peakE = sortedE[Math.min(sortedE.length - 1, Math.floor(sortedE.length * 0.92))] ?? 0;
+  if (peakE > 1e-12) {
+    const hasBackgroundContrast = peakE > noiseFloor * 2.5;
+    for (let f = 0; f < frameStarts.length; f++) {
+      const frameE = frameSpeechEnergy[f]!;
+      const rawWeight = hasBackgroundContrast
+        ? Math.max(0, frameE - noiseFloor * 1.6)
+        : (frameE >= peakE * 0.15 ? frameE : 0);
+      const normW = rawWeight / peakE;
+      if (normW <= 1e-4) continue;
+
       for (let pIdx = 0; pIdx < pairs.length; pIdx++) {
         const [chA, chB] = pairs[pIdx]!;
         const posA = healthyPosByChannel.get(chA)!;
@@ -1219,8 +1224,8 @@ export function beamformHexArray(
           const ci = ai * br - ar * bi;
           const mag = Math.hypot(cr, ci);
           if (mag > 1e-12) {
-            gRe[k] = gRe[k]! + cr / mag;
-            gIm[k] = gIm[k]! + ci / mag;
+            gRe[k] = gRe[k]! + normW * (cr / mag);
+            gIm[k] = gIm[k]! + normW * (ci / mag);
           }
         }
       }

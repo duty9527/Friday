@@ -1390,7 +1390,7 @@ export function createRouterTools(
     },
   }, {
     name: 'switch_channel',
-    description: 'Route the current turn reply and new tasks to another configured endpoint. Input JSON {channel, target?, voiceNotice?}.',
+    description: 'Route the current turn reply and new tasks to another configured endpoint ONLY when the user explicitly requests switching/sending there or answers a channel-choice prompt (never on an isolated ambiguous word like bare "微信"). Input JSON {channel, target?, voiceNotice?}.',
     execute: async input => {
       if (host.isClosing()) throw new Error('Service is shutting down');
       const turn = host.getTurn();

@@ -144,6 +144,13 @@ export function stripLeadingAssistantWake(rawText: string): string {
 /**
  * Unified cancel-phrase recognizer shared by KWS follow-up capture and speaker enrollment cancellation.
  */
+/** Matches an explicit XiaoAI silence / shut-up command meant to stop playback silently. */
+export function isXiaoaiSilenceCommand(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  return /^(?:请)?闭嘴(?:吧|呗|啦|咯|呀)?[。，,！!？?\s]*$/i.test(trimmed);
+}
+
 export function isXiaoaiFollowUpCancel(
   text: string,
   options?: { includeEnrollVariants?: boolean },
@@ -157,7 +164,7 @@ export function isXiaoaiFollowUpCancel(
       cleaned,
     );
   }
-  return /^(?:不用了?(?:吧|呗|啦|咯|呀)?|算了?(?:吧|呗|啦|咯|呀)?|没事了?(?:吧|呗|啦|咯|呀)?|取消(?:对话)?(?:吧|呗|啦)?|退出(?:对话)?(?:吧|呗|啦)?|结束(?:对话)?(?:吧|呗|啦)?|退一?下(?:吧|呗|啦|咯|呀|啊)?|闭嘴(?:吧|呗|啦)?|没别的事了?(?:吧|呗|啦)?|先这样(?:吧|呗|啦)?)[。，,！!？?\s]*$/i.test(
+  return /^(?:不用了?(?:吧|呗|啦|咯|呀)?|算了?(?:吧|呗|啦|咯|呀)?|没事了?(?:吧|呗|啦|咯|呀)?|取消(?:对话)?(?:吧|呗|啦)?|退出(?:对话)?(?:吧|呗|啦)?|结束(?:对话)?(?:吧|呗|啦)?|退一?下(?:吧|呗|啦|咯|呀|啊)?|没别的事了?(?:吧|呗|啦)?|先这样(?:吧|呗|啦)?)[。，,！!？?\s]*$/i.test(
     trimmed,
   );
 }

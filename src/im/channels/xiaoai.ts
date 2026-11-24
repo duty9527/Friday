@@ -17,9 +17,11 @@ import {
 import { XiaoaiSpeakerManager, type XiaoaiSpeakerStatus } from '../../xiaoai/speaker-verify.js';
 import {
   closeXiaoaiSshConnections,
+  defaultSshRunner,
   parseXiaoaiApiOptions,
   parseXiaoaiSshTargets,
   setXiaoaiSpeakerLed,
+  SSH_PAUSE_COMMAND,
   type XiaoaiSshTarget,
 } from '../../xiaoai/ssh.js';
 import {
@@ -30,6 +32,7 @@ import {
   sendXiaoaiSpeech,
 } from '../../xiaoai/tts-player.js';
 import {
+  isXiaoaiSilenceCommand,
   shouldContinueXiaoaiDialog,
   stripXiaoaiDialogDirective,
 } from '../../xiaoai/utterance-utils.js';
@@ -401,6 +404,33 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
     if (inbound.mediaItems?.length) return undefined;
     const voiceResult = await this.tryHandleSpeakerVoice(channel, inbound);
     if (voiceResult) return voiceResult;
+    if (isXiaoaiSilenceCommand(inbound.text)) {
+      const targetId = inbound.target ?? inbound.senderId;
+      const sshTarget = resolveSshTarget(channel, targetId);
+      bumpXiaoaiSpeechEpoch(channel.id, targetId);
+      this.clearFastpathSession(channel.id, targetId);
+      this.notifyCs80Voice({ phase: 'idle' });
+      const stopMusicPromise = this.ctx.runVoiceFastpath({
+        text: '停止播放',
+        channelId: channel.id,
+        platform: channel.platform,
+        targetId,
+        senderId: inbound.senderId,
+        explicitWake: true,
+        allowedPlugins: ['music'],
+      }).catch(() => undefined);
+      if (sshTarget) {
+        const sshRunner = this.deps?.sshRunner ?? defaultSshRunner;
+        await Promise.all([
+          stopMusicPromise,
+          sshRunner(sshTarget, SSH_PAUSE_COMMAND, { timeoutMs: 4_000 }).catch(() => {}),
+          setXiaoaiSpeakerLed(sshTarget, 'off', this.deps?.sshRunner).catch(() => {}),
+        ]);
+      } else {
+        await stopMusicPromise;
+      }
+      return { ok: true, action: 'xiaoai_silence' };
+    }
     return this.tryHandleVoiceFastpath(channel, inbound, requestId);
   }
 

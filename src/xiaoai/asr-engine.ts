@@ -9,7 +9,9 @@ import { normalizeUtteranceSamples } from './audio-frontend.js';
 import { stripLeadingAsrControlTags } from './utterance-utils.js';
 
 export const DEFAULT_GEMINI_TRANSCRIBE_MODEL = 'gemini-3.5-transcribe';
+export const DEFAULT_GEMINI_LIVE_TRANSCRIBE_MODEL = 'gemini-3.5-transcribe-live';
 export const DEFAULT_GEMINI_TRANSCRIBE_TIMEOUT_MS = 6_500;
+export const DEFAULT_GEMINI_LIVE_FINISH_TIMEOUT_MS = 1_800;
 const HOTWORD_CACHE_TTL_MS = 60_000;
 const DEFAULT_MAX_HOTWORDS = 100;
 
@@ -70,6 +72,33 @@ export interface GoogleApiCredentials {
   baseUrl?: string;
 }
 
+export interface LiveAsrWebSocketLike {
+  readonly readyState: number;
+  send: (data: string) => void;
+  close: (code?: number, reason?: string) => void;
+  addEventListener?: (
+    type: 'open' | 'message' | 'error' | 'close',
+    listener: (event: unknown) => void,
+  ) => void;
+  onopen?: ((event: unknown) => void) | null;
+  onmessage?: ((event: unknown) => void) | null;
+  onerror?: ((event: unknown) => void) | null;
+  onclose?: ((event: unknown) => void) | null;
+}
+
+export interface LiveAsrResult {
+  text: string;
+  latencyMs: number;
+  interimFallback?: boolean;
+}
+
+export interface LiveAsrSession {
+  pushSamples: (samples: Float32Array) => void;
+  finish: (options?: { timeoutMs?: number }) => Promise<LiveAsrResult | undefined>;
+  abort: () => void;
+  isUsable: () => boolean;
+}
+
 /** Encode normalized `[-1, 1]` Float32 mono audio into a 44-byte RIFF/WAVE `pcm_s16le` Buffer. */
 export function encodeFloat32ToWavBuffer(samples: Float32Array, sampleRate = 16_000): Buffer {
   const safeRate = Math.max(8_000, Math.round(sampleRate));
@@ -103,6 +132,24 @@ export function resolveGeminiTranscribeEndpoint(baseUrl?: string): string {
   if (clean.endsWith('/interactions')) return clean;
   if (/\/v\d+(?:alpha|beta)?$/i.test(clean)) return `${clean}/interactions`;
   return `${clean}/v1beta/interactions`;
+}
+
+/** Resolve the Gemini Live BidiGenerateContent WebSocket URL for `gemini-3.5-transcribe-live`. */
+export function resolveGeminiLiveTranscribeWsUrl(baseUrl?: string, apiKey?: string): string {
+  const raw = (baseUrl?.trim() || DEFAULT_GEMINI_DECISION_BASE_URL).replace(/\/+$/, '');
+  const withScheme = raw.includes('://') ? raw : `https://${raw}`;
+  let host = 'generativelanguage.googleapis.com';
+  let wsProto = 'wss:';
+  try {
+    const parsed = new URL(withScheme);
+    if (parsed.host) host = parsed.host;
+    wsProto = parsed.protocol === 'http:' || parsed.protocol === 'ws:' ? 'ws:' : 'wss:';
+  } catch {
+    wsProto = withScheme.startsWith('http://') || withScheme.startsWith('ws://') ? 'ws:' : 'wss:';
+  }
+  const baseWs = `${wsProto}//${host}/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent`;
+  const trimmedKey = apiKey?.trim();
+  return trimmedKey ? `${baseWs}?key=${encodeURIComponent(trimmedKey)}` : baseWs;
 }
 
 function readJsonFileSafe(path: string): Record<string, unknown> | undefined {
@@ -517,5 +564,456 @@ export function createHybridAsrRecognizer(options: {
       localRecognizer = undefined;
       localRecognizerPromise = undefined;
     },
+  };
+}
+
+class StreamingPcmEncoder {
+  private readonly chunkBytes: number;
+  private envPeak = 0;
+  private initialized = false;
+  private tail: Buffer = Buffer.alloc(0);
+
+  constructor(chunkSamples = 1600) {
+    this.chunkBytes = Math.max(320, Math.trunc(chunkSamples) * 2);
+  }
+
+  push(samples: Float32Array): Buffer[] {
+    if (samples.length === 0) return [];
+    let chunkPeak = 0;
+    for (let i = 0; i < samples.length; i++) {
+      const abs = Math.abs(samples[i] ?? 0);
+      if (abs > chunkPeak) chunkPeak = abs;
+    }
+    if (!this.initialized) {
+      if (chunkPeak >= 1e-4) {
+        this.envPeak = chunkPeak;
+        this.initialized = true;
+      }
+    } else if (chunkPeak > this.envPeak) {
+      this.envPeak = 0.65 * chunkPeak + 0.35 * this.envPeak;
+    } else {
+      this.envPeak = Math.max(0.004, 0.96 * this.envPeak + 0.04 * chunkPeak);
+    }
+
+    const effectivePeak = this.initialized ? Math.max(0.004, this.envPeak) : 0.02;
+    const gain = Math.min(60, Math.max(1, 0.38 / effectivePeak));
+    const pcm = Buffer.allocUnsafe(samples.length * 2);
+    for (let i = 0; i < samples.length; i++) {
+      const raw = samples[i] ?? 0;
+      const safe = Number.isFinite(raw) ? raw : 0;
+      const limited = Math.tanh((safe * gain) / 0.92) * 0.92;
+      const intVal = Math.max(-32768, Math.min(32767, Math.round(limited * 32767)));
+      pcm.writeInt16LE(intVal, i * 2);
+    }
+
+    const merged = this.tail.length > 0 ? Buffer.concat([this.tail, pcm]) : pcm;
+    const out: Buffer[] = [];
+    let offset = 0;
+    while (offset + this.chunkBytes <= merged.length) {
+      out.push(Buffer.from(merged.subarray(offset, offset + this.chunkBytes)));
+      offset += this.chunkBytes;
+    }
+    this.tail = offset < merged.length ? Buffer.from(merged.subarray(offset)) : Buffer.alloc(0);
+    return out;
+  }
+
+  flushRemaining(): Buffer | undefined {
+    if (this.tail.length === 0) return undefined;
+    const rem = this.tail;
+    this.tail = Buffer.alloc(0);
+    return rem;
+  }
+}
+
+async function decodeWsMessageData(data: unknown): Promise<string | undefined> {
+  if (typeof data === 'string') return data;
+  if (Buffer.isBuffer(data)) return data.toString('utf8');
+  if (data instanceof ArrayBuffer) return Buffer.from(data).toString('utf8');
+  if (ArrayBuffer.isView(data)) {
+    return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString('utf8');
+  }
+  if (data && typeof (data as { text?: unknown }).text === 'function') {
+    return await (data as { text: () => Promise<string> }).text();
+  }
+  return undefined;
+}
+
+function createNoopLiveAsrSession(): LiveAsrSession {
+  return {
+    pushSamples: () => {},
+    finish: async () => undefined,
+    abort: () => {},
+    isUsable: () => false,
+  };
+}
+
+/**
+ * Open a streaming `gemini-3.5-transcribe-live` WebSocket session with causal AGC, pre-handshake
+ * audio queueing, live interim/final transcript tracking, and bounded post-speech timeout.
+ */
+export function createGeminiLiveTranscribeSession(params: {
+  apiKey: string;
+  baseUrl?: string;
+  model?: string;
+  hotwords?: readonly string[];
+  languageCodes?: readonly string[];
+  sampleRate?: number;
+  connectTimeoutMs?: number;
+  webSocketFactory?: (url: string) => LiveAsrWebSocketLike;
+  onLogError?: (message: string) => void;
+}): LiveAsrSession {
+  const apiKey = params.apiKey?.trim();
+  const WsCtor = (globalThis as { WebSocket?: new (url: string) => LiveAsrWebSocketLike }).WebSocket;
+  const createWs = params.webSocketFactory ?? (WsCtor ? (url: string) => new WsCtor(url) : undefined);
+  if (!apiKey || !createWs) {
+    return createNoopLiveAsrSession();
+  }
+
+  const secrets = [apiKey];
+  const sanitize = (err: unknown): string => sanitizeImError(err, secrets);
+  const sampleRate = Math.max(8_000, Math.round(params.sampleRate ?? 16_000));
+  const mimeType = `audio/pcm;rate=${sampleRate}`;
+  const rawModel = params.model?.trim() || DEFAULT_GEMINI_LIVE_TRANSCRIBE_MODEL;
+  const modelPath = rawModel.startsWith('models/') ? rawModel : `models/${rawModel}`;
+  const languageCodes = params.languageCodes?.length ? [...params.languageCodes] : ['cmn-Hans-CN'];
+  const hotwords = (params.hotwords ?? []).map(h => h.trim()).filter(Boolean).slice(0, 100);
+  const connectTimeoutMs = Math.max(250, params.connectTimeoutMs ?? 3_000);
+
+  let ws: LiveAsrWebSocketLike;
+  try {
+    ws = createWs(resolveGeminiLiveTranscribeWsUrl(params.baseUrl, apiKey));
+  } catch (err) {
+    params.onLogError?.(`Live ASR 连接创建失败: ${sanitize(err)}`);
+    return createNoopLiveAsrSession();
+  }
+
+  const encoder = new StreamingPcmEncoder(Math.round(sampleRate * 0.1));
+  const pendingChunks: string[] = [];
+  const finalSegments: string[] = [];
+  let latestInterim = '';
+  let setupComplete = false;
+  let audioEndSent = false;
+  let sawTurnDone = false;
+  let aborted = false;
+  let errored = false;
+  let closed = false;
+  let finishing = false;
+  let finishPromise: Promise<LiveAsrResult | undefined> | undefined;
+  let msgChain: Promise<void> = Promise.resolve();
+  let setupWaiters: Array<() => void> = [];
+  let turnWaiters: Array<() => void> = [];
+  let graceTimer: ReturnType<typeof setTimeout> | undefined;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const notifySetupWaiters = () => {
+    const waiters = setupWaiters;
+    setupWaiters = [];
+    for (const resolve of waiters) resolve();
+  };
+
+  const notifyTurnWaiters = () => {
+    if (graceTimer) {
+      clearTimeout(graceTimer);
+      graceTimer = undefined;
+    }
+    const waiters = turnWaiters;
+    turnWaiters = [];
+    for (const resolve of waiters) resolve();
+  };
+
+  const closeWsQuietly = () => {
+    try {
+      if (ws.readyState === 0 || ws.readyState === 1) {
+        ws.close(1000, 'done');
+      }
+    } catch {
+      // Ignore close errors
+    }
+  };
+
+  const safeSend = (payload: unknown): boolean => {
+    if (aborted || errored || closed || ws.readyState !== 1) return false;
+    try {
+      ws.send(JSON.stringify(payload));
+      return true;
+    } catch (err) {
+      errored = true;
+      params.onLogError?.(`Live ASR 发送失败: ${sanitize(err)}`);
+      notifySetupWaiters();
+      notifyTurnWaiters();
+      return false;
+    }
+  };
+
+  const sendAudioB64 = (b64: string) => {
+    safeSend({
+      realtimeInput: {
+        audio: {
+          data: b64,
+          mimeType,
+        },
+      },
+    });
+  };
+
+  const flushPendingChunks = () => {
+    while (pendingChunks.length > 0 && !aborted && !errored && !closed && ws.readyState === 1) {
+      const b64 = pendingChunks.shift();
+      if (b64) sendAudioB64(b64);
+    }
+  };
+
+  const abort = () => {
+    if (aborted) return;
+    aborted = true;
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = undefined;
+    }
+    pendingChunks.length = 0;
+    notifySetupWaiters();
+    notifyTurnWaiters();
+    closeWsQuietly();
+  };
+
+  idleTimer = setTimeout(() => {
+    idleTimer = undefined;
+    if (!finishing && !aborted) {
+      abort();
+    }
+  }, 25_000);
+  idleTimer.unref?.();
+
+  const handleOpen = () => {
+    if (aborted || errored || closed) return;
+    const transcriptionSetup: Record<string, unknown> = {
+      languageCodes,
+      ...(hotwords.length > 0 ? { customVocabulary: hotwords } : {}),
+    };
+    safeSend({
+      setup: {
+        model: modelPath,
+        generationConfig: { responseModalities: ['TEXT'] },
+        inputAudioTranscription: transcriptionSetup,
+      },
+    });
+  };
+
+  const handleParsedMessage = (raw: string) => {
+    if (aborted || !raw) return;
+    let msg: Record<string, unknown>;
+    try {
+      msg = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    if (!msg || typeof msg !== 'object') return;
+
+    if (msg.error !== undefined) {
+      errored = true;
+      const errDetail = typeof msg.error === 'string'
+        ? msg.error
+        : JSON.stringify(msg.error).slice(0, 240);
+      params.onLogError?.(`Live ASR 服务端错误: ${sanitize(errDetail)}`);
+      notifySetupWaiters();
+      notifyTurnWaiters();
+      return;
+    }
+
+    if (msg.setupComplete !== undefined && !setupComplete) {
+      setupComplete = true;
+      flushPendingChunks();
+      notifySetupWaiters();
+    }
+
+    const sc = msg.serverContent as {
+      inputTranscription?: { text?: unknown };
+      interimInputTranscription?: { text?: unknown };
+      generationComplete?: unknown;
+      turnComplete?: unknown;
+    } | undefined;
+    if (!sc || typeof sc !== 'object') return;
+
+    if (typeof sc.inputTranscription?.text === 'string' && sc.inputTranscription.text.length > 0) {
+      finalSegments.push(sc.inputTranscription.text);
+      latestInterim = '';
+    }
+    if (typeof sc.interimInputTranscription?.text === 'string') {
+      latestInterim = sc.interimInputTranscription.text;
+    }
+    if (sc.generationComplete === true || sc.turnComplete === true) {
+      sawTurnDone = true;
+    }
+
+    if (audioEndSent && sawTurnDone) {
+      if (finalSegments.length > 0) {
+        notifyTurnWaiters();
+      } else if (!graceTimer) {
+        graceTimer = setTimeout(() => {
+          graceTimer = undefined;
+          notifyTurnWaiters();
+        }, 35);
+        graceTimer.unref?.();
+      }
+    }
+  };
+
+  const handleMessage = (ev: unknown) => {
+    const rawData = (ev as { data?: unknown })?.data ?? ev;
+    msgChain = msgChain
+      .then(async () => {
+        const text = await decodeWsMessageData(rawData);
+        if (text !== undefined) handleParsedMessage(text);
+      })
+      .catch(() => {});
+  };
+
+  const handleError = (ev: unknown) => {
+    if (errored) return;
+    errored = true;
+    const rawErr = (ev as { error?: unknown; message?: unknown })?.error
+      ?? (ev as { message?: unknown })?.message
+      ?? 'WebSocket error';
+    params.onLogError?.(`Live ASR 连接异常: ${sanitize(rawErr)}`);
+    notifySetupWaiters();
+    notifyTurnWaiters();
+  };
+
+  const handleClose = (ev: unknown) => {
+    closed = true;
+    const closeEv = ev as { code?: unknown; reason?: unknown } | undefined;
+    if (!aborted && !finishing && typeof closeEv?.code === 'number' && closeEv.code !== 1000) {
+      const reason = typeof closeEv.reason === 'string' && closeEv.reason ? ` ${closeEv.reason}` : '';
+      params.onLogError?.(`Live ASR 连接关闭 (code=${closeEv.code}${sanitize(reason)})`);
+    }
+    notifySetupWaiters();
+    notifyTurnWaiters();
+  };
+
+  if (typeof ws.addEventListener === 'function') {
+    ws.addEventListener('open', handleOpen);
+    ws.addEventListener('message', handleMessage);
+    ws.addEventListener('error', handleError);
+    ws.addEventListener('close', handleClose);
+  } else {
+    ws.onopen = handleOpen;
+    ws.onmessage = handleMessage;
+    ws.onerror = handleError;
+    ws.onclose = handleClose;
+  }
+
+  return {
+    isUsable: () => !aborted && !errored && !closed,
+    pushSamples: (samples) => {
+      if (aborted || errored || closed || finishing || audioEndSent) return;
+      const packets = encoder.push(samples);
+      for (const packet of packets) {
+        const b64 = packet.toString('base64');
+        if (setupComplete && ws.readyState === 1) {
+          sendAudioB64(b64);
+        } else {
+          if (pendingChunks.length >= 150) {
+            pendingChunks.shift();
+          }
+          pendingChunks.push(b64);
+        }
+      }
+    },
+    finish: (options) => {
+      if (finishPromise) return finishPromise;
+      finishing = true;
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = undefined;
+      }
+
+      finishPromise = (async (): Promise<LiveAsrResult | undefined> => {
+        const timeoutMs = Math.max(200, options?.timeoutMs ?? DEFAULT_GEMINI_LIVE_FINISH_TIMEOUT_MS);
+        const startedAt = performance.now();
+
+        if (!setupComplete && !aborted && !errored && !closed) {
+          const setupWaitBudget = Math.min(timeoutMs, connectTimeoutMs, 800);
+          await new Promise<void>((resolve) => {
+            if (setupComplete || aborted || errored || closed) {
+              resolve();
+              return;
+            }
+            const timer = setTimeout(() => {
+              setupWaiters = setupWaiters.filter(fn => fn !== done);
+              done();
+            }, setupWaitBudget);
+            timer.unref?.();
+            const done = () => {
+              clearTimeout(timer);
+              resolve();
+            };
+            setupWaiters.push(done);
+          });
+          await msgChain;
+        }
+
+        if (!setupComplete || aborted || errored || closed || ws.readyState !== 1) {
+          await msgChain;
+          abort();
+          return undefined;
+        }
+
+        flushPendingChunks();
+        const tailPcm = encoder.flushRemaining();
+        if (tailPcm && tailPcm.length > 0) {
+          sendAudioB64(tailPcm.toString('base64'));
+        }
+        audioEndSent = true;
+        if (!safeSend({ realtimeInput: { audioStreamEnd: true } })) {
+          abort();
+          return undefined;
+        }
+
+        await new Promise<void>((resolve) => {
+          if (aborted || errored || closed || (sawTurnDone && finalSegments.length > 0)) {
+            resolve();
+            return;
+          }
+          const timer = setTimeout(() => {
+            turnWaiters = turnWaiters.filter(fn => fn !== done);
+            done();
+          }, timeoutMs);
+          timer.unref?.();
+          const done = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+          turnWaiters.push(done);
+          if (sawTurnDone && !graceTimer) {
+            graceTimer = setTimeout(() => {
+              graceTimer = undefined;
+              notifyTurnWaiters();
+            }, 35);
+            graceTimer.unref?.();
+          }
+        });
+
+        await msgChain;
+        if (graceTimer) {
+          clearTimeout(graceTimer);
+          graceTimer = undefined;
+        }
+        closeWsQuietly();
+
+        const finalText = stripLeadingAsrControlTags(finalSegments.join('')).trim();
+        const interimText = stripLeadingAsrControlTags(latestInterim).trim();
+        const latencyMs = Math.max(0, Math.round(performance.now() - startedAt));
+        if (finalText) {
+          return { text: finalText, latencyMs };
+        }
+        if (interimText) {
+          return { text: interimText, latencyMs, interimFallback: true };
+        }
+        return undefined;
+      })();
+
+      return finishPromise;
+    },
+    abort,
   };
 }

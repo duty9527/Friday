@@ -23,8 +23,12 @@ import {
 } from '../src/xiaoai/audio-frontend.js';
 import {
   collectVoiceHotwords,
+  createGeminiLiveTranscribeSession,
   createHybridAsrRecognizer,
+  resolveGeminiLiveTranscribeWsUrl,
   transcribeWithGemini,
+  type LiveAsrSession,
+  type LiveAsrWebSocketLike,
 } from '../src/xiaoai/asr-engine.js';
 import {
   XiaoaiKwsMonitor,
@@ -32,6 +36,13 @@ import {
   type XiaoaiKwsSpotter,
   type XiaoaiSpeechDetector,
 } from '../src/xiaoai/kws-monitor.js';
+import {
+  isXiaoaiFollowUpCancel,
+  isXiaoaiSilenceCommand,
+} from '../src/xiaoai-kws.js';
+import { XiaoaiChannelAdapter } from '../src/im/channels/xiaoai.js';
+import type { ImGatewayContext } from '../src/im/types.js';
+import { SSH_PAUSE_COMMAND } from '../src/xiaoai/ssh.js';
 import {
   SPEAKER_SAMPLE_RATE,
   XiaoaiSpeakerManager,
@@ -900,4 +911,447 @@ test('XiaoaiKwsMonitor: 8ch FRPCM8S2 stream runs AEC + beamformer + GTCRN denois
     monitor?.close();
     await rm(home, { recursive: true, force: true });
   }
+});
+
+test('asr-engine: createGeminiLiveTranscribeSession streams AGC audio, buffers pre-setup chunks, supports interim fallback, and redacts API keys', async () => {
+  const secretKey = 'AIzaSyLiveSecretKey_NeverExpose888';
+  assert.equal(
+    resolveGeminiLiveTranscribeWsUrl('https://generativelanguage.googleapis.com', secretKey),
+    `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(secretKey)}`,
+  );
+  assert.equal(
+    resolveGeminiLiveTranscribeWsUrl('http://127.0.0.1:8080/v1beta', 'abc'),
+    'ws://127.0.0.1:8080/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=abc',
+  );
+
+  class MockLiveWebSocket implements LiveAsrWebSocketLike {
+    readyState = 0; // CONNECTING
+    readonly sent: Record<string, unknown>[] = [];
+    closed = false;
+    private readonly listeners = new Map<string, Array<(ev: unknown) => void>>();
+
+    constructor(readonly url: string) {}
+
+    addEventListener(type: 'open' | 'message' | 'error' | 'close', listener: (ev: unknown) => void): void {
+      const list = this.listeners.get(type) ?? [];
+      list.push(listener);
+      this.listeners.set(type, list);
+    }
+
+    send(data: string): void {
+      this.sent.push(JSON.parse(data) as Record<string, unknown>);
+    }
+
+    close(): void {
+      if (this.closed) return;
+      this.closed = true;
+      this.readyState = 3;
+      this.emit('close', { code: 1000, reason: '' });
+    }
+
+    emit(type: string, ev: unknown): void {
+      for (const fn of this.listeners.get(type) ?? []) {
+        fn(ev);
+      }
+    }
+
+    emitJson(payload: unknown): void {
+      this.emit('message', { data: JSON.stringify(payload) });
+    }
+  }
+
+  // 1. Happy path: pre-setup buffering + AGC + audioStreamEnd + final transcription
+  let activeWs: MockLiveWebSocket | undefined;
+  const session = createGeminiLiveTranscribeSession({
+    apiKey: secretKey,
+    hotwords: ['尼特利', '星期五'],
+    webSocketFactory: (url) => {
+      activeWs = new MockLiveWebSocket(url);
+      return activeWs;
+    },
+  });
+  assert.equal(session.isUsable(), true);
+  assert.ok(activeWs);
+
+  const quietFrame = new Float32Array(1600);
+  for (let i = 0; i < quietFrame.length; i++) {
+    quietFrame[i] = 0.005 * Math.sin((2 * Math.PI * 440 * i) / FRONTEND_SAMPLE_RATE);
+  }
+  session.pushSamples(quietFrame);
+  session.pushSamples(quietFrame);
+  assert.equal(activeWs!.sent.length, 0, 'Pre-handshake audio must buffer locally before WebSocket open/setupComplete');
+
+  activeWs!.readyState = 1;
+  activeWs!.emit('open', {});
+  assert.equal(activeWs!.sent.length, 1);
+  const setupMsg = activeWs!.sent[0] as {
+    setup: {
+      model: string;
+      generationConfig: { responseModalities: string[] };
+      inputAudioTranscription: { languageCodes: string[]; customVocabulary: string[] };
+    };
+  };
+  assert.equal(setupMsg.setup.model, 'models/gemini-3.5-transcribe-live');
+  assert.deepEqual(setupMsg.setup.generationConfig.responseModalities, ['TEXT']);
+  assert.deepEqual(setupMsg.setup.inputAudioTranscription.languageCodes, ['cmn-Hans-CN']);
+  assert.deepEqual(setupMsg.setup.inputAudioTranscription.customVocabulary, ['尼特利', '星期五']);
+
+  activeWs!.emitJson({ setupComplete: {} });
+  await delay(10);
+  assert.equal(activeWs!.sent.length, 3, 'Queued 2 x 100ms chunks must flush immediately on setupComplete');
+
+  const audioMsg1 = activeWs!.sent[1] as { realtimeInput: { audio: { data: string; mimeType: string } } };
+  assert.equal(audioMsg1.realtimeInput.audio.mimeType, 'audio/pcm;rate=16000');
+  const pcm1 = Buffer.from(audioMsg1.realtimeInput.audio.data, 'base64');
+  let maxNorm = 0;
+  for (let i = 0; i < pcm1.length; i += 2) {
+    maxNorm = Math.max(maxNorm, Math.abs(pcm1.readInt16LE(i) / 32768));
+  }
+  assert.ok(maxNorm >= 0.25 && maxNorm <= 0.96, `Expected AGC to boost 0.005 input to [0.25, 0.96], got ${maxNorm.toFixed(3)}`);
+
+  // Push partial 50ms tail then finish() -> tail flushed + audioStreamEnd sent
+  session.pushSamples(quietFrame.subarray(0, 800));
+  const finishPromise = session.finish({ timeoutMs: 800 });
+  await delay(10);
+  const tailMsg = activeWs!.sent[3] as { realtimeInput?: { audio?: { data: string } } };
+  assert.equal(Buffer.from(tailMsg.realtimeInput!.audio!.data, 'base64').length, 1600);
+  assert.deepEqual(activeWs!.sent[4], { realtimeInput: { audioStreamEnd: true } });
+
+  activeWs!.emitJson({ serverContent: { interimInputTranscription: { text: '打开客厅' } } });
+  activeWs!.emitJson({ serverContent: { inputTranscription: { text: '<|zh|>打开客厅灯。' } } });
+  activeWs!.emitJson({ serverContent: { generationComplete: true } });
+  const res1 = await finishPromise;
+  assert.equal(res1?.text, '打开客厅灯。');
+  assert.equal(res1?.interimFallback, undefined);
+  assert.equal(activeWs!.readyState, 3);
+
+  // 2. Interim fallback when generationComplete arrives without final inputTranscription
+  let wsInterim: MockLiveWebSocket | undefined;
+  const session2 = createGeminiLiveTranscribeSession({
+    apiKey: secretKey,
+    webSocketFactory: (url) => {
+      wsInterim = new MockLiveWebSocket(url);
+      wsInterim.readyState = 1;
+      return wsInterim;
+    },
+  });
+  wsInterim!.emit('open', {});
+  wsInterim!.emitJson({ setupComplete: {} });
+  await delay(5);
+  session2.pushSamples(quietFrame);
+  const p2 = session2.finish({ timeoutMs: 800 });
+  await delay(5);
+  wsInterim!.emitJson({ serverContent: { interimInputTranscription: { text: '查询天气' }, generationComplete: true } });
+  const res2 = await p2;
+  assert.equal(res2?.text, '查询天气');
+  assert.equal(res2?.interimFallback, true);
+
+  // 3. Error redaction: API key inside WS error text must never leak into logs
+  const loggedErrors: string[] = [];
+  let wsErr: MockLiveWebSocket | undefined;
+  const session3 = createGeminiLiveTranscribeSession({
+    apiKey: secretKey,
+    onLogError: msg => loggedErrors.push(msg),
+    webSocketFactory: (url) => {
+      wsErr = new MockLiveWebSocket(url);
+      return wsErr;
+    },
+  });
+  wsErr!.emit('error', { message: `connect wss://example.com/?key=${secretKey} failed` });
+  const res3 = await session3.finish({ timeoutMs: 300 });
+  assert.equal(res3, undefined);
+  assert.equal(session3.isUsable(), false);
+  assert.ok(loggedErrors.length >= 1);
+  assert.ok(!loggedErrors.some(e => e.includes(secretKey)), 'API key must be redacted from Live ASR logs');
+});
+
+test('XiaoaiKwsMonitor: Live ASR runs in parallel with speaker verification and falls back to batch when trimmed', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-kws-live-asr-'));
+  let monitor: XiaoaiKwsMonitor | undefined;
+  try {
+    let audioStream: PassThrough | undefined;
+    let wakeAtSample = -1;
+    let processedSamples = 0;
+    let wakeFired = false;
+    let liveEnabledResult = '查询明天天气。';
+    let trimmedByGate = false;
+    let batchCalls = 0;
+    const liveStats: Array<{ pushed: number; finished: boolean; aborted: boolean }> = [];
+
+    const channel: ImChannelConfig = {
+      id: 'xiaoai-live-test',
+      platform: 'xiaoai',
+      name: 'Live ASR Monitor Test',
+      enabled: true,
+      notifyAll: false,
+      apiBase: 'ssh://lx06=root@127.0.0.1?kws=1&chime=0',
+      allowedSenders: [],
+      inboundCount: 0,
+      outboundCount: 0,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+
+    const emitted: string[] = [];
+    monitor = new XiaoaiKwsMonitor({
+      homeDir: home,
+      modelsDir: join(home, 'kws'),
+      cooldownMs: 30,
+      probeDurationMs: 40,
+      endSilenceMs: 120,
+      speechRmsThreshold: 0.01,
+      asrWakeRescue: false,
+      idleEnergyGate: false,
+      sshRunner: async () => ({ stdout: '', stderr: '', code: 0 }),
+      streamFactory: () => {
+        audioStream = new PassThrough();
+        return { stdout: audioStream, sampleFormat: 's16le', kill: () => audioStream?.end(), onClose: () => {} };
+      },
+      spotterFactory: (): XiaoaiKwsSpotter => ({
+        createStream: () => ({}),
+        acceptWaveform: (_s, samples) => {
+          processedSamples += samples.length;
+          if (!wakeFired && wakeAtSample >= 0 && processedSamples >= wakeAtSample) {
+            wakeFired = true;
+          }
+        },
+        isReady: () => wakeFired,
+        decode: () => {},
+        getResult: () => {
+          if (!wakeFired) return '';
+          wakeFired = false;
+          return '星期五';
+        },
+        reset: () => { wakeFired = false; },
+      }),
+      vadFactory: (): XiaoaiSpeechDetector => ({
+        isSpeech: (samples) => computeRms(samples) >= 0.01,
+        reset: () => {},
+      }),
+      liveAsrSessionFactory: (): LiveAsrSession => {
+        const st = { pushed: 0, finished: false, aborted: false };
+        liveStats.push(st);
+        return {
+          isUsable: () => !st.aborted,
+          pushSamples: (samples) => { st.pushed += samples.length; },
+          finish: async () => {
+            st.finished = true;
+            await delay(10);
+            return { text: liveEnabledResult, latencyMs: 120 };
+          },
+          abort: () => { st.aborted = true; },
+        };
+      },
+      recognizerFactory: () => ({
+        transcribe: async () => {
+          batchCalls++;
+          return '打开客厅灯';
+        },
+      }),
+      speakerGate: {
+        isActive: () => true,
+        verifyWake: () => ({ matched: true, score: 0.9, threshold: 0.3, speaker: { id: 'o1', name: '主人', role: 'owner', score: 0.9 } }),
+        verifyUtterance: () => ({ matched: true, score: 0.9, threshold: 0.3 }),
+        verifyUtteranceAsync: async ({ samples }) => {
+          await delay(15);
+          return trimmedByGate
+            ? {
+                matched: true,
+                speaker: { id: 'o1', name: '主人', role: 'owner', score: 0.85 },
+                score: 0.85,
+                threshold: 0.3,
+                samples: samples.subarray(0, Math.floor(samples.length * 0.6)),
+                trimmed: true,
+              }
+            : {
+                matched: true,
+                speaker: { id: 'o1', name: '主人', role: 'owner', score: 0.9 },
+                score: 0.9,
+                threshold: 0.3,
+                trimmed: false,
+              };
+        },
+      },
+      onWake: async () => ({ woken: true, suppressed: false }),
+      onUtterance: async (ev) => {
+        emitted.push(ev.text);
+      },
+    });
+
+    monitor.sync([channel]);
+    await until(() => Boolean(audioStream));
+
+    const writeTone = (amp: number, ms: number) => {
+      const count = Math.round((ms / 1000) * FRONTEND_SAMPLE_RATE);
+      const arr = new Float32Array(count);
+      if (amp > 0) {
+        for (let i = 0; i < count; i++) {
+          arr[i] = amp * Math.sin((2 * Math.PI * 500 * i) / FRONTEND_SAMPLE_RATE);
+        }
+      }
+      audioStream!.write(encodeInterleavedInt16Frames([arr]));
+    };
+
+    // 1. Live ASR happy path skips batch recognizer
+    wakeAtSample = processedSamples + Math.round(0.2 * FRONTEND_SAMPLE_RATE);
+    writeTone(0.2, 200);
+    await delay(10);
+    writeTone(0.25, 650);
+    writeTone(0, 220);
+    await until(() => emitted.length === 1);
+    assert.equal(emitted[0], '查询明天天气。');
+    assert.equal(batchCalls, 0, 'Batch recognizer must not run when Live ASR succeeds without trim');
+    assert.ok((liveStats[0]?.pushed ?? 0) > 8000);
+    assert.equal(liveStats[0]?.finished, true);
+
+    // 2. When speakerGate trims trailing crosstalk, Live ASR result is bypassed in favor of batch ASR on trimmed audio
+    await delay(40);
+    trimmedByGate = true;
+    liveEnabledResult = '打开客厅灯然后电视广告杂音';
+    wakeAtSample = processedSamples + Math.round(0.2 * FRONTEND_SAMPLE_RATE);
+    writeTone(0.2, 200);
+    await delay(10);
+    writeTone(0.25, 650);
+    writeTone(0, 220);
+    await until(() => emitted.length === 2);
+    assert.equal(emitted[1], '打开客厅灯');
+    assert.equal(batchCalls, 1, 'Trimmed utterances must re-transcribe trimmed audio via batch recognizer');
+
+    monitor.close();
+    monitor = undefined;
+  } finally {
+    monitor?.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('xiaoai silence command: "闭嘴。" stops music and pauses hardware silently without follow-up dismissal or TTS reply', async () => {
+  assert.equal(isXiaoaiSilenceCommand('闭嘴。'), true);
+  assert.equal(isXiaoaiSilenceCommand('请闭嘴吧！'), true);
+  assert.equal(isXiaoaiSilenceCommand('退下呗。'), false);
+  assert.equal(isXiaoaiSilenceCommand('打开客厅灯'), false);
+
+  assert.equal(isXiaoaiFollowUpCancel('闭嘴。'), false);
+  assert.equal(isXiaoaiFollowUpCancel('退下呗。'), true);
+  assert.equal(isXiaoaiFollowUpCancel('闭嘴', { includeEnrollVariants: true }), true);
+
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-silence-'));
+  try {
+    const fastpathCalls: Array<{ text: string; allowedPlugins?: readonly string[] | ReadonlySet<string> }> = [];
+    const sshCalls: string[] = [];
+    let sendCalls = 0;
+    let ingestCalls = 0;
+
+    const fakeCtx: ImGatewayContext = {
+      homeDir: home,
+      coordinator: {} as ImGatewayContext['coordinator'],
+      shutdownSignal: new AbortController().signal,
+      isClosing: () => false,
+      markMessageDelivered: () => {},
+      clearMessageDelivered: () => {},
+      getSeenMessageVersion: () => 0,
+      sendToChannel: async () => { sendCalls++; },
+      ingestMessage: async () => {
+        ingestCalls++;
+        return { ok: true, action: 'ok' };
+      },
+      markTrustedWechatInbound: () => {},
+      scheduleChannelPoll: () => {},
+      runVoiceFastpath: async (req) => {
+        fastpathCalls.push({ text: req.text, allowedPlugins: req.allowedPlugins });
+        return { handled: true, ok: true, plugin: 'music', action: 'stop' };
+      },
+    };
+
+    const adapter = new XiaoaiChannelAdapter(fakeCtx);
+    adapter.deps = {
+      sshRunner: async (_target, cmd) => {
+        sshCalls.push(cmd);
+        return { stdout: '', stderr: '', code: 0 };
+      },
+    };
+
+    const channel: ImChannelConfig = {
+      id: 'xiaoai-silence-test',
+      platform: 'xiaoai',
+      name: 'Silence Test',
+      enabled: true,
+      notifyAll: false,
+      apiBase: 'ssh://lx06=root@192.0.2.104?kws=1',
+      allowedSenders: [],
+      inboundCount: 0,
+      outboundCount: 0,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+
+    const res = await adapter.tryHandleInbound(
+      channel,
+      {
+        channelId: channel.id,
+        externalId: 'lx06:kws-1',
+        senderId: 'lx06',
+        senderName: 'lx06',
+        target: 'lx06',
+        text: '闭嘴。',
+        explicitWake: true,
+      },
+      'req-silence-1',
+    );
+
+    assert.deepEqual(res, { ok: true, action: 'xiaoai_silence' });
+    assert.equal(fastpathCalls.length, 1);
+    assert.equal(fastpathCalls[0]!.text, '停止播放');
+    assert.deepEqual(fastpathCalls[0]!.allowedPlugins, ['music']);
+    assert.ok(sshCalls.includes(SSH_PAUSE_COMMAND));
+    assert.ok(sshCalls.some(c => c.includes('/bin/shut_led 1')));
+    assert.equal(sendCalls, 0, 'Silence command must never talk back with TTS');
+    assert.equal(ingestCalls, 0, 'Silence command must handle locally without Router LLM turn');
+    await adapter.close();
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('audio-frontend: beamformHexArray resists stationary 204deg room noise and locks onto transient 90deg speech', () => {
+  const sr = FRONTEND_SAMPLE_RATE;
+  const totalSec = 1.6;
+  const stationaryNoise = synthHexPlaneWave({
+    durationSec: totalSec,
+    azimuthDeg: 204,
+    signalAtTime: t =>
+      0.04 * Math.sin(2 * Math.PI * 480 * t)
+      + 0.035 * Math.cos(2 * Math.PI * 1650 * t)
+      + 0.03 * Math.sin(2 * Math.PI * 2900 * t),
+    noiseAmp: 0.008,
+    seed: 204,
+  });
+
+  const transientSpeech90 = synthHexPlaneWave({
+    durationSec: totalSec,
+    azimuthDeg: 90,
+    signalAtTime: (t) => {
+      if (t < 0.50 || t > 1.00) return 0;
+      return (
+        0.15 * Math.sin(2 * Math.PI * 520 * t)
+        + 0.14 * Math.sin(2 * Math.PI * 1450 * t)
+        + 0.13 * Math.sin(2 * Math.PI * 2600 * t)
+      );
+    },
+    seed: 90,
+  });
+
+  const combined = stationaryNoise.map((noiseCh, idx) => {
+    const speechCh = transientSpeech90[idx]!;
+    const out = new Float32Array(noiseCh.length);
+    for (let i = 0; i < out.length; i++) {
+      out[i] = noiseCh[i]! + speechCh[i]!;
+    }
+    return out;
+  });
+
+  const bf = beamformHexArray(combined, sr);
+  assert.equal(bf.usedChannels, 6);
+  const errDeg = circularAzimuthDiffDeg(bf.azimuthDeg, 90);
+  assert.ok(errDeg <= 15, `Expected transient speech DOA near 90deg despite 204deg stationary noise, got ${bf.azimuthDeg}deg`);
 });

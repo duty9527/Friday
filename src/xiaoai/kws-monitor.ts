@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import { cpus } from 'node:os';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
+import { resolveEnv } from '../paths.js';
 import type { ImChannelConfig } from '../store.js';
 import type { XiaoaiMatchedSpeaker } from '../im/types.js';
 import {
@@ -33,9 +34,15 @@ import {
   type XiaoaiAudioDenoiser,
 } from './audio-frontend.js';
 import {
+  collectVoiceHotwords,
+  createGeminiLiveTranscribeSession,
   createHybridAsrRecognizer,
+  DEFAULT_GEMINI_LIVE_FINISH_TIMEOUT_MS,
+  DEFAULT_GEMINI_LIVE_TRANSCRIBE_MODEL,
   type AsrTranscribeOptions,
   type GoogleApiCredentials,
+  type LiveAsrResult,
+  type LiveAsrSession,
 } from './asr-engine.js';
 import { handleXiaoaiKeywordWake, isXiaoaiSpeakingSelfEcho } from './tts-player.js';
 import { measureWakeSpeechDurationMs } from './speaker-verify.js';
@@ -48,103 +55,103 @@ import {
 
 export { computeRms, normalizeUtteranceSamples };
 
-export const XIAOAI_KEYWORDS_VERSION = 'v5';
+export const XIAOAI_KEYWORDS_VERSION = 'v6';
 
 export const DEFAULT_XIAOAI_KEYWORDS = [
   // 星期五 (bare wake word + universal catch-all when prefix is slurred)
-  'x īng q ī w ǔ :1.45 #0.18 @星期五',
-  'x īng q ì w ǔ :1.45 #0.18 @星期五',
-  'x īng q í w ǔ :1.45 #0.18 @星期五',
-  'x īng q ǐ w ǔ :1.40 #0.19 @星期五',
-  'x īng q i w ǔ :1.40 #0.19 @星期五',
-  'x íng q ī w ǔ :1.40 #0.19 @星期五',
-  'x íng q í w ǔ :1.40 #0.19 @星期五',
-  'x īn q ī w ǔ :1.45 #0.18 @星期五',
-  'x īn q ì w ǔ :1.45 #0.18 @星期五',
-  'x īn q í w ǔ :1.45 #0.18 @星期五',
-  'x īn q ǐ w ǔ :1.40 #0.19 @星期五',
-  'x īn q i w ǔ :1.40 #0.19 @星期五',
-  'x ìn q ī w ǔ :1.40 #0.19 @星期五',
-  'x ìn q ì w ǔ :1.40 #0.19 @星期五',
-  'x ìn q í w ǔ :1.40 #0.19 @星期五',
-  'x īng q ī w ù :1.40 #0.19 @星期五',
-  'x īn q ī w ù :1.40 #0.19 @星期五',
-  'x īn q ì w ù :1.40 #0.19 @星期五',
-  'x īng q ī w ú :1.40 #0.19 @星期五',
-  'x īn q ī w ú :1.40 #0.19 @星期五',
-  'x īng q í w ú :1.40 #0.19 @星期五',
-  'x īn q í w ú :1.40 #0.19 @星期五',
+  'x īng q ī w ǔ :1.55 #0.14 @星期五',
+  'x īng q ì w ǔ :1.55 #0.14 @星期五',
+  'x īng q í w ǔ :1.55 #0.14 @星期五',
+  'x īng q ǐ w ǔ :1.50 #0.15 @星期五',
+  'x īng q i w ǔ :1.50 #0.15 @星期五',
+  'x íng q ī w ǔ :1.50 #0.15 @星期五',
+  'x íng q í w ǔ :1.50 #0.15 @星期五',
+  'x īn q ī w ǔ :1.55 #0.14 @星期五',
+  'x īn q ì w ǔ :1.55 #0.14 @星期五',
+  'x īn q í w ǔ :1.55 #0.14 @星期五',
+  'x īn q ǐ w ǔ :1.50 #0.15 @星期五',
+  'x īn q i w ǔ :1.50 #0.15 @星期五',
+  'x ìn q ī w ǔ :1.50 #0.15 @星期五',
+  'x ìn q ì w ǔ :1.50 #0.15 @星期五',
+  'x ìn q í w ǔ :1.50 #0.15 @星期五',
+  'x īng q ī w ù :1.50 #0.15 @星期五',
+  'x īn q ī w ù :1.50 #0.15 @星期五',
+  'x īn q ì w ù :1.50 #0.15 @星期五',
+  'x īng q ī w ú :1.50 #0.15 @星期五',
+  'x īn q ī w ú :1.50 #0.15 @星期五',
+  'x īng q í w ú :1.50 #0.15 @星期五',
+  'x īn q í w ú :1.50 #0.15 @星期五',
   // 你好星期五
-  'n ǐ h ǎo x īng q ī w ǔ :1.4 #0.18 @你好星期五',
-  'n í h ǎo x īng q ī w ǔ :1.4 #0.18 @你好星期五',
-  'n í h ǎo x īng q ì w ǔ :1.4 #0.18 @你好星期五',
-  'n í h ǎo x īng q i w ǔ :1.4 #0.18 @你好星期五',
-  'n ǐ h ǎo x īn q ī w ǔ :1.4 #0.18 @你好星期五',
-  'n ǐ h ǎo x īn q ì w ǔ :1.4 #0.18 @你好星期五',
-  'n í h ǎo x īn q ī w ǔ :1.4 #0.18 @你好星期五',
-  'n ǐ h ǎo x īn q ì w ù :1.4 #0.18 @你好星期五',
+  'n ǐ h ǎo x īng q ī w ǔ :1.5 #0.14 @你好星期五',
+  'n í h ǎo x īng q ī w ǔ :1.5 #0.14 @你好星期五',
+  'n í h ǎo x īng q ì w ǔ :1.5 #0.14 @你好星期五',
+  'n í h ǎo x īng q i w ǔ :1.5 #0.14 @你好星期五',
+  'n ǐ h ǎo x īn q ī w ǔ :1.5 #0.14 @你好星期五',
+  'n ǐ h ǎo x īn q ì w ǔ :1.5 #0.14 @你好星期五',
+  'n í h ǎo x īn q ī w ǔ :1.5 #0.14 @你好星期五',
+  'n ǐ h ǎo x īn q ì w ù :1.5 #0.14 @你好星期五',
   // 嘿星期五 / 诶星期五
-  'h ēi x īng q ī w ǔ :1.5 #0.18 @嘿星期五',
-  'h éi x īng q ī w ǔ :1.5 #0.18 @嘿星期五',
-  'h èi x īng q ī w ǔ :1.5 #0.18 @嘿星期五',
-  'h ěi x īng q ī w ǔ :1.5 #0.18 @嘿星期五',
-  'h ēi x īng q ì w ǔ :1.5 #0.18 @嘿星期五',
-  'h éi x īng q ì w ǔ :1.5 #0.18 @嘿星期五',
-  'h èi x īng q ì w ǔ :1.5 #0.18 @嘿星期五',
-  'h ēi x īng q i w ǔ :1.5 #0.18 @嘿星期五',
-  'h éi x īng q i w ǔ :1.5 #0.18 @嘿星期五',
-  'h ēi x íng q ī w ǔ :1.5 #0.18 @嘿星期五',
-  'h ēi x īn q ī w ǔ :1.5 #0.18 @嘿星期五',
-  'h ēi x īn q ì w ǔ :1.5 #0.18 @嘿星期五',
-  'h ēi x ìn q ī w ǔ :1.5 #0.18 @嘿星期五',
-  'h ēi x ìn q ì w ǔ :1.5 #0.18 @嘿星期五',
-  'h éi x īn q ī w ǔ :1.5 #0.18 @嘿星期五',
-  'h èi x īn q ī w ǔ :1.5 #0.18 @嘿星期五',
-  'ēi x īng q ī w ǔ :1.5 #0.18 @嘿星期五',
-  'éi x īng q ī w ǔ :1.5 #0.18 @嘿星期五',
-  'èi x īng q ī w ǔ :1.5 #0.18 @嘿星期五',
-  'ēi x īng q ì w ǔ :1.5 #0.18 @嘿星期五',
-  'éi x īng q ì w ǔ :1.5 #0.18 @嘿星期五',
-  'èi x īng q ì w ǔ :1.5 #0.18 @嘿星期五',
-  'ēi x īn q ī w ǔ :1.5 #0.18 @嘿星期五',
-  'éi x īn q ī w ǔ :1.5 #0.18 @嘿星期五',
-  'èi x īn q ī w ǔ :1.5 #0.18 @嘿星期五',
+  'h ēi x īng q ī w ǔ :1.6 #0.14 @嘿星期五',
+  'h éi x īng q ī w ǔ :1.6 #0.14 @嘿星期五',
+  'h èi x īng q ī w ǔ :1.6 #0.14 @嘿星期五',
+  'h ěi x īng q ī w ǔ :1.6 #0.14 @嘿星期五',
+  'h ēi x īng q ì w ǔ :1.6 #0.14 @嘿星期五',
+  'h éi x īng q ì w ǔ :1.6 #0.14 @嘿星期五',
+  'h èi x īng q ì w ǔ :1.6 #0.14 @嘿星期五',
+  'h ēi x īng q i w ǔ :1.6 #0.14 @嘿星期五',
+  'h éi x īng q i w ǔ :1.6 #0.14 @嘿星期五',
+  'h ēi x íng q ī w ǔ :1.6 #0.14 @嘿星期五',
+  'h ēi x īn q ī w ǔ :1.6 #0.14 @嘿星期五',
+  'h ēi x īn q ì w ǔ :1.6 #0.14 @嘿星期五',
+  'h ēi x ìn q ī w ǔ :1.6 #0.14 @嘿星期五',
+  'h ēi x ìn q ì w ǔ :1.6 #0.14 @嘿星期五',
+  'h éi x īn q ī w ǔ :1.6 #0.14 @嘿星期五',
+  'h èi x īn q ī w ǔ :1.6 #0.14 @嘿星期五',
+  'ēi x īng q ī w ǔ :1.6 #0.14 @嘿星期五',
+  'éi x īng q ī w ǔ :1.6 #0.14 @嘿星期五',
+  'èi x īng q ī w ǔ :1.6 #0.14 @嘿星期五',
+  'ēi x īng q ì w ǔ :1.6 #0.14 @嘿星期五',
+  'éi x īng q ì w ǔ :1.6 #0.14 @嘿星期五',
+  'èi x īng q ì w ǔ :1.6 #0.14 @嘿星期五',
+  'ēi x īn q ī w ǔ :1.6 #0.14 @嘿星期五',
+  'éi x īn q ī w ǔ :1.6 #0.14 @嘿星期五',
+  'èi x īn q ī w ǔ :1.6 #0.14 @嘿星期五',
   // 嗨星期五 / 唉星期五
-  'h āi x īng q ī w ǔ :1.5 #0.18 @嗨星期五',
-  'h ái x īng q ī w ǔ :1.5 #0.18 @嗨星期五',
-  'h ài x īng q ī w ǔ :1.5 #0.18 @嗨星期五',
-  'h āi x īng q ì w ǔ :1.5 #0.18 @嗨星期五',
-  'h ái x īng q ì w ǔ :1.5 #0.18 @嗨星期五',
-  'h ài x īng q ì w ǔ :1.5 #0.18 @嗨星期五',
-  'h āi x īn q ī w ǔ :1.5 #0.18 @嗨星期五',
-  'h ái x īn q ī w ǔ :1.5 #0.18 @嗨星期五',
-  'h ài x īn q ī w ǔ :1.5 #0.18 @嗨星期五',
-  'āi x īng q ī w ǔ :1.5 #0.18 @嗨星期五',
-  'ài x īng q ī w ǔ :1.5 #0.18 @嗨星期五',
-  'āi x īng q ì w ǔ :1.5 #0.18 @嗨星期五',
-  'ài x īng q ì w ǔ :1.5 #0.18 @嗨星期五',
+  'h āi x īng q ī w ǔ :1.6 #0.14 @嗨星期五',
+  'h ái x īng q ī w ǔ :1.6 #0.14 @嗨星期五',
+  'h ài x īng q ī w ǔ :1.6 #0.14 @嗨星期五',
+  'h āi x īng q ì w ǔ :1.6 #0.14 @嗨星期五',
+  'h ái x īng q ì w ǔ :1.6 #0.14 @嗨星期五',
+  'h ài x īng q ì w ǔ :1.6 #0.14 @嗨星期五',
+  'h āi x īn q ī w ǔ :1.6 #0.14 @嗨星期五',
+  'h ái x īn q ī w ǔ :1.6 #0.14 @嗨星期五',
+  'h ài x īn q ī w ǔ :1.6 #0.14 @嗨星期五',
+  'āi x īng q ī w ǔ :1.6 #0.14 @嗨星期五',
+  'ài x īng q ī w ǔ :1.6 #0.14 @嗨星期五',
+  'āi x īng q ì w ǔ :1.6 #0.14 @嗨星期五',
+  'ài x īng q ì w ǔ :1.6 #0.14 @嗨星期五',
   // 喂星期五
-  'w èi x īng q ī w ǔ :1.5 #0.18 @喂星期五',
-  'w éi x īng q ī w ǔ :1.5 #0.18 @喂星期五',
-  'w èi x īng q ì w ǔ :1.5 #0.18 @喂星期五',
-  'w éi x īng q ì w ǔ :1.5 #0.18 @喂星期五',
-  'w èi x īn q ī w ǔ :1.5 #0.18 @喂星期五',
-  'w éi x īn q ī w ǔ :1.5 #0.18 @喂星期五',
+  'w èi x īng q ī w ǔ :1.6 #0.14 @喂星期五',
+  'w éi x īng q ī w ǔ :1.6 #0.14 @喂星期五',
+  'w èi x īng q ì w ǔ :1.6 #0.14 @喂星期五',
+  'w éi x īng q ì w ǔ :1.6 #0.14 @喂星期五',
+  'w èi x īn q ī w ǔ :1.6 #0.14 @喂星期五',
+  'w éi x īn q ī w ǔ :1.6 #0.14 @喂星期五',
   // 呼叫星期五
-  'h ū j iào x īng q ī w ǔ :1.3 #0.20 @呼叫星期五',
-  'h ū j iào x īng q ì w ǔ :1.3 #0.20 @呼叫星期五',
-  'h ū j iāo x īng q ī w ǔ :1.3 #0.20 @呼叫星期五',
-  'h ù j iāo x īn q ī w ǔ :1.3 #0.20 @呼叫星期五',
+  'h ū j iào x īng q ī w ǔ :1.4 #0.16 @呼叫星期五',
+  'h ū j iào x īng q ì w ǔ :1.4 #0.16 @呼叫星期五',
+  'h ū j iāo x īng q ī w ǔ :1.4 #0.16 @呼叫星期五',
+  'h ù j iāo x īn q ī w ǔ :1.4 #0.16 @呼叫星期五',
 ];
 
 const SAMPLE_RATE = 16_000;
 const DEFAULT_COOLDOWN_MS = 1_200;
-const DEFAULT_PROBE_DURATION_MS = 220;
-const DEFAULT_CHIME_DISCARD_MS = 320;
+const DEFAULT_PROBE_DURATION_MS = 240;
+const DEFAULT_CHIME_DISCARD_MS = 260;
 const DEFAULT_MAX_WAIT_SPEECH_MS = 4_500;
 const DEFAULT_FOLLOWUP_WAIT_SPEECH_MS = 8_000;
 export const DEFAULT_END_SILENCE_MS = 900;
-export const DEFAULT_SHORT_UTTERANCE_END_SILENCE_MS = 1_350;
+export const DEFAULT_SHORT_UTTERANCE_END_SILENCE_MS = 1_150;
 export const SHORT_UTTERANCE_SPEECH_MS = 1_800;
 const DEFAULT_MAX_UTTERANCE_MS = 10_000;
 const DEFAULT_PRE_ROLL_MS = 240;
@@ -306,6 +313,7 @@ export interface XiaoaiKwsMonitorOptions {
   recognizerFactory?: (config: { asrModelsDir: string }) => Promise<XiaoaiAsrRecognizer> | XiaoaiAsrRecognizer;
   vadFactory?: (config: { vadModelPath: string; speechRmsThreshold: number }) => XiaoaiSpeechDetector;
   denoiserFactory?: (config: { modelPath: string }) => XiaoaiAudioDenoiser;
+  liveAsrSessionFactory?: (params: { hotwords: readonly string[]; sampleRate: number }) => LiveAsrSession | undefined;
 }
 
 interface SherpaOnlineStream {
@@ -479,6 +487,10 @@ interface ActiveWorker {
   utteranceSamples: number;
   transcribingCount: number;
   captureMaxRms: number;
+  captureMaxRefRms: number;
+  loggedLoopbackActive: boolean;
+  liveAsrSession?: LiveAsrSession;
+  liveAsrSampleCount: number;
   lastSpeechRms: number;
 }
 
@@ -813,8 +825,8 @@ function defaultSpotterFactory(config: { modelsDir: string; keywordsFile: string
     },
     maxActivePaths: 8,
     numTrailingBlanks: 0,
-    keywordsScore: 1.35,
-    keywordsThreshold: 0.19,
+    keywordsScore: 1.45,
+    keywordsThreshold: 0.15,
     keywordsFile: config.keywordsFile,
   });
   return {
@@ -1360,6 +1372,9 @@ export class XiaoaiKwsMonitor {
         utteranceSamples: 0,
         transcribingCount: 0,
         captureMaxRms: 0,
+        captureMaxRefRms: 0,
+        loggedLoopbackActive: false,
+        liveAsrSampleCount: 0,
         lastSpeechRms: 0,
       };
       this.workers.set(key, worker);
@@ -1433,7 +1448,12 @@ export class XiaoaiKwsMonitor {
     worker.silenceSamples = 0;
     worker.utteranceSamples = 0;
     worker.captureMaxRms = 0;
+    worker.captureMaxRefRms = 0;
+    worker.liveAsrSession?.abort();
+    worker.liveAsrSession = undefined;
+    worker.liveAsrSampleCount = 0;
     worker.chimeDiscardSamples = options?.discardMs === 0 ? 0 : msToSamples(options?.discardMs ?? 180);
+    this.startLiveAsrSession(worker);
     worker.vad?.reset();
     const refRms = worker.lastSpeechRms > 0
       ? Math.max(0.004, worker.lastSpeechRms * 0.75)
@@ -1493,13 +1513,137 @@ export class XiaoaiKwsMonitor {
     worker.silenceSamples = 0;
     worker.utteranceSamples = 0;
     worker.captureMaxRms = 0;
+    worker.captureMaxRefRms = 0;
+    worker.liveAsrSession?.abort();
+    worker.liveAsrSession = undefined;
+    worker.liveAsrSampleCount = 0;
     worker.chimeDiscardSamples = 0;
+    this.startLiveAsrSession(worker);
     worker.vad?.reset();
     spotter?.reset(worker.kwsStream);
     console.log(
       `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: re-arm follow-up after non-member rejection (${worker.currentMaxWaitMs}ms remaining)`,
     );
     return true;
+  }
+
+  private createDeferredLiveAsrSession(worker: ActiveWorker, hotwords: readonly string[]): LiveAsrSession | undefined {
+    const resolveCreds = this.options.resolveGoogleCredentials;
+    if (!resolveCreds) return undefined;
+    let inner: LiveAsrSession | undefined;
+    let aborted = false;
+    let failed = false;
+    const queued: Float32Array[] = [];
+    let queuedSamples = 0;
+    const maxQueued = msToSamples(15_000);
+
+    const initPromise = resolveCreds()
+      .then((creds) => {
+        if (aborted || this.closed || worker.stopped || !creds?.apiKey) {
+          failed = true;
+          queued.length = 0;
+          return undefined;
+        }
+        const model = resolveEnv('FRIDAY_ASR_LIVE_MODEL')?.trim() || DEFAULT_GEMINI_LIVE_TRANSCRIBE_MODEL;
+        const session = createGeminiLiveTranscribeSession({
+          apiKey: creds.apiKey,
+          baseUrl: creds.baseUrl,
+          model,
+          hotwords,
+          sampleRate: SAMPLE_RATE,
+          onLogError: (msg) => console.warn(`[xiaoai-asr-live] ${msg}`),
+        });
+        if (!session.isUsable()) {
+          failed = true;
+          queued.length = 0;
+          return undefined;
+        }
+        inner = session;
+        while (queued.length > 0 && !aborted) {
+          const chunk = queued.shift();
+          if (chunk) session.pushSamples(chunk);
+        }
+        queuedSamples = 0;
+        return session;
+      })
+      .catch(() => {
+        failed = true;
+        queued.length = 0;
+        return undefined;
+      });
+
+    return {
+      isUsable: () => !aborted && !failed && (inner ? inner.isUsable() : true),
+      pushSamples: (samples) => {
+        if (aborted || failed || samples.length === 0) return;
+        if (inner) {
+          inner.pushSamples(samples);
+          return;
+        }
+        const copy = new Float32Array(samples);
+        queued.push(copy);
+        queuedSamples += copy.length;
+        while (queuedSamples > maxQueued && queued.length > 1) {
+          const removed = queued.shift();
+          if (removed) queuedSamples -= removed.length;
+        }
+      },
+      finish: async (opts) => {
+        if (aborted || failed) return undefined;
+        const session = inner ?? await initPromise;
+        if (aborted || failed || !session) return undefined;
+        return session.finish(opts);
+      },
+      abort: () => {
+        if (aborted) return;
+        aborted = true;
+        queued.length = 0;
+        queuedSamples = 0;
+        inner?.abort();
+      },
+    };
+  }
+
+  private startLiveAsrSession(worker: ActiveWorker): void {
+    if (this.closed || worker.stopped) return;
+    const preferFastLocal = this.options.preferFastLocalForTarget?.(worker.channel.id, worker.target.id) ?? false;
+    if (preferFastLocal) return;
+    if (worker.liveAsrSession?.isUsable()) return;
+
+    worker.liveAsrSession?.abort();
+    worker.liveAsrSession = undefined;
+    worker.liveAsrSampleCount = 0;
+
+    const hotwords = collectVoiceHotwords(this.options.homeDir).slice(0, 100);
+    if (this.options.liveAsrSessionFactory) {
+      const custom = this.options.liveAsrSessionFactory({ hotwords, sampleRate: SAMPLE_RATE });
+      if (custom?.isUsable()) {
+        worker.liveAsrSession = custom;
+      }
+      return;
+    }
+
+    const providerMode = resolveEnv('FRIDAY_ASR_PROVIDER')?.trim().toLowerCase();
+    const liveEnabled = resolveEnv('FRIDAY_ASR_LIVE')?.trim() !== '0';
+    if (
+      this.options.recognizerFactory
+      || !this.options.resolveGoogleCredentials
+      || providerMode === 'local'
+      || !liveEnabled
+    ) {
+      return;
+    }
+    worker.liveAsrSession = this.createDeferredLiveAsrSession(worker, hotwords);
+  }
+
+  private pushChunksToLiveAsr(worker: ActiveWorker, chunks: readonly Float32Array[]): void {
+    const session = worker.liveAsrSession;
+    if (!session?.isUsable()) return;
+    for (const chunk of chunks) {
+      if (chunk.length === 0) continue;
+      session.pushSamples(chunk);
+      worker.liveAsrSampleCount += chunk.length;
+    }
   }
 
   private resetKwsIdleGate(worker: ActiveWorker): void {
@@ -1568,6 +1712,10 @@ export class XiaoaiKwsMonitor {
     worker.silenceSamples = 0;
     worker.utteranceSamples = 0;
     worker.captureMaxRms = 0;
+    worker.captureMaxRefRms = 0;
+    worker.liveAsrSession?.abort();
+    worker.liveAsrSession = undefined;
+    worker.liveAsrSampleCount = 0;
     worker.vad?.reset();
     worker.vad?.markWake?.(0);
     if (spotter && worker.kwsStream) {
@@ -1689,6 +1837,12 @@ export class XiaoaiKwsMonitor {
             ? coalesced.ref.subarray(offset, end)
             : new Float32Array(0);
           const chunkRefRms = chunkRef.length > 0 ? computeRms(chunkRef) : 0;
+          if (!worker.loggedLoopbackActive && chunkRefRms >= 1e-4) {
+            worker.loggedLoopbackActive = true;
+            console.log(
+              `[xiaoai-aec] ${worker.channel.id}/${worker.target.id}: hardware loopback active (refRms=${chunkRefRms.toFixed(4)})`,
+            );
+          }
           const beamOut = worker.onlineBeamformer
             ? worker.onlineBeamformer.process(chunkMics).samples
             : chunkMics[0]!;
@@ -2238,6 +2392,10 @@ export class XiaoaiKwsMonitor {
           worker.waitSamples = 0;
           worker.chimeDiscardSamples = 0;
           worker.captureMaxRms = burstMaxRms;
+          worker.captureMaxRefRms = 0;
+          worker.liveAsrSampleCount = 0;
+          this.startLiveAsrSession(worker);
+          this.pushChunksToLiveAsr(worker, worker.audioChunks);
           void this.invokeWake(worker, match.keyword, false, wakeMeta)
             .then((res) => {
               if (res.suppressed && worker.captureEpoch === epoch && worker.mode === 'capturing') {
@@ -2435,8 +2593,11 @@ export class XiaoaiKwsMonitor {
     worker.probeMultiMics = createEmptyMicArrays();
     worker.probeMultiRef = [];
     worker.probeSamples = 0;
-    worker.probeSkipSamplesRemaining = Math.min(msToSamples(35), Math.floor(probeTarget / 4));
+    worker.probeSkipSamplesRemaining = Math.min(msToSamples(25), Math.floor(probeTarget / 4));
     worker.probeSawSpeech = false;
+    worker.captureMaxRefRms = 0;
+    worker.liveAsrSampleCount = 0;
+    this.startLiveAsrSession(worker);
     worker.vad?.reset();
     void spotter;
   }
@@ -2472,6 +2633,11 @@ export class XiaoaiKwsMonitor {
     worker.silenceSamples = 0;
     worker.utteranceSamples = 0;
     worker.captureMaxRms = 0;
+    if (!worker.liveAsrSession?.isUsable()) {
+      worker.captureMaxRefRms = 0;
+      worker.liveAsrSampleCount = 0;
+      this.startLiveAsrSession(worker);
+    }
 
     const resetTwoStepVad = () => {
       worker.vad?.reset();
@@ -2559,6 +2725,9 @@ export class XiaoaiKwsMonitor {
     worker.probeChunks.push(samples);
     if (multiChunk) {
       appendMultiChunk(worker.probeMultiMics, worker.probeMultiRef, multiChunk);
+      if (multiChunk.refRms > worker.captureMaxRefRms) {
+        worker.captureMaxRefRms = multiChunk.refRms;
+      }
     }
     worker.probeSamples += samples.length;
 
@@ -2610,6 +2779,7 @@ export class XiaoaiKwsMonitor {
       worker.probeMultiMics = createEmptyMicArrays();
       worker.probeMultiRef = [];
       worker.probeSamples = 0;
+      this.pushChunksToLiveAsr(worker, worker.audioChunks);
 
       void this.invokeWake(worker, keyword, false, wakeMeta)
         .then((res) => {
@@ -2664,6 +2834,9 @@ export class XiaoaiKwsMonitor {
     }
     if (samples.length === 0) return;
 
+    if (multiChunk && multiChunk.refRms > worker.captureMaxRefRms) {
+      worker.captureMaxRefRms = multiChunk.refRms;
+    }
     const rms = computeRms(samples);
     if (rms > worker.captureMaxRms) {
       worker.captureMaxRms = rms;
@@ -2684,6 +2857,7 @@ export class XiaoaiKwsMonitor {
         worker.preRollSamples = 0;
         worker.preRollMultiSamples = 0;
         worker.silenceSamples = 0;
+        this.pushChunksToLiveAsr(worker, worker.audioChunks);
       } else {
         worker.ambientRms = updateAmbientNoiseRms(worker.ambientRms, rms);
         worker.vad?.observeAmbient?.(samples);
@@ -2738,6 +2912,7 @@ export class XiaoaiKwsMonitor {
       if (multiChunk) {
         appendMultiChunk(worker.captureMultiMics, worker.captureMultiRef, multiChunk);
       }
+      this.pushChunksToLiveAsr(worker, [samples]);
       worker.utteranceSamples += samples.length;
       if (speech) {
         worker.silenceSamples = 0;
@@ -2873,10 +3048,37 @@ export class XiaoaiKwsMonitor {
       ? rawCaptured.subarray(0, rawCaptured.length - trimTrailing)
       : rawCaptured;
     const multiAudio = concatMultiArrays(worker.captureMultiMics, worker.captureMultiRef, trimTrailing);
+    const liveSession = worker.liveAsrSession;
+    const liveSamples = worker.liveAsrSampleCount;
+    const maxRefRms = worker.captureMaxRefRms;
+    const isMultiChannel = worker.resolvedChannels >= 6;
+    worker.liveAsrSession = undefined;
+    worker.liveAsrSampleCount = 0;
+
+    const lowGainEmpty = this.isHardwareLowGainStream(worker) && maxRms > 0 && maxRms < 0.0010;
+    const preferFastLocal = this.options.preferFastLocalForTarget?.(worker.channel.id, worker.target.id) ?? false;
+    let liveResultPromise: Promise<LiveAsrResult | undefined> | undefined;
+    if (!lowGainEmpty && !preferFastLocal && liveSession && liveSamples > 0 && liveSession.isUsable()) {
+      liveResultPromise = liveSession
+        .finish({ timeoutMs: DEFAULT_GEMINI_LIVE_FINISH_TIMEOUT_MS })
+        .catch(() => undefined);
+    } else {
+      liveSession?.abort();
+    }
+
     worker.lastWakeAt = Date.now();
     worker.captureEpoch++;
     this.resetWorkerCapture(worker, spotter);
-    void this.transcribeAndEmit(worker, keyword, captured, maxRms, savedMeta, multiAudio);
+    void this.transcribeAndEmit(
+      worker,
+      keyword,
+      captured,
+      maxRms,
+      savedMeta,
+      multiAudio,
+      liveResultPromise,
+      isMultiChannel ? maxRefRms : undefined,
+    );
   }
 
   private async transcribeAndEmit(
@@ -2886,6 +3088,8 @@ export class XiaoaiKwsMonitor {
     maxRms = 0,
     captureMeta?: CaptureMeta,
     multiAudio?: { mics: Float32Array[]; ref?: Float32Array },
+    liveResultPromise?: Promise<LiveAsrResult | undefined>,
+    maxRefRms?: number,
   ): Promise<void> {
     worker.transcribingCount++;
     try {
@@ -2907,6 +3111,7 @@ export class XiaoaiKwsMonitor {
         };
       }
       let matchedSpeaker: XiaoaiMatchedSpeaker | undefined;
+      let speakerTrimmed = false;
       const gate = this.options.speakerGate;
       const gateBypassed = gate?.isBypassed?.(worker.channel.id, worker.target.id) ?? false;
       if (gate && !gateBypassed && gate.isActive(worker.channel, worker.target)) {
@@ -2973,6 +3178,7 @@ export class XiaoaiKwsMonitor {
         if (verdict.samples && verdict.samples.length > 0) {
           audioForAsr = verdict.samples;
           if (verdict.trimmed) {
+            speakerTrimmed = true;
             console.log(
               `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: trimmed trailing non-member audio ${(samples.length / SAMPLE_RATE).toFixed(2)}s -> ${(audioForAsr.length / SAMPLE_RATE).toFixed(2)}s`,
             );
@@ -2982,26 +3188,46 @@ export class XiaoaiKwsMonitor {
 
       this.notifySpeakerTranscribing(worker, keyword);
       try {
-        const recognizer = await this.ensureRecognizer();
-        if (this.closed || worker.stopped) return;
-        if (!recognizer) {
-          this.cancelSpeakerLed(worker, keyword, 'error');
-          return;
-        }
-        const asrSamples = this.denoiserManager
-          ? await this.denoiserManager.denoiseAsync(audioForAsr, SAMPLE_RATE)
-          : audioForAsr;
-        if (this.closed || worker.stopped) return;
         const preferFastLocal = this.options.preferFastLocalForTarget?.(worker.channel.id, worker.target.id) ?? false;
-        const rawText = preferFastLocal
-          ? await recognizer.transcribe(asrSamples, SAMPLE_RATE, { preferFastLocal: true })
-          : await recognizer.transcribe(asrSamples, SAMPLE_RATE);
+        let rawText = '';
+        if (liveResultPromise && !speakerTrimmed && !preferFastLocal) {
+          const liveRes = await liveResultPromise;
+          if (this.closed || worker.stopped) return;
+          if (liveRes?.text) {
+            const liveClean = cleanXiaoaiAsrUtterance(liveRes.text);
+            const liveReWake = !gateBypassed ? extractLeadingXiaoaiWakeKeyword(liveRes.text) : undefined;
+            if (liveClean || (liveReWake && !liveReWake.remainder)) {
+              rawText = liveRes.text;
+              const liveDurSec = (audioForAsr.length / SAMPLE_RATE).toFixed(2);
+              const liveModel = resolveEnv('FRIDAY_ASR_LIVE_MODEL')?.trim() || DEFAULT_GEMINI_LIVE_TRANSCRIBE_MODEL;
+              console.log(
+                `[xiaoai-asr] engine=${liveModel} dur=${liveDurSec}s ms=${liveRes.latencyMs}${liveRes.interimFallback ? ' interim=1' : ''}`,
+              );
+            }
+          }
+        }
+        if (!rawText) {
+          const recognizer = await this.ensureRecognizer();
+          if (this.closed || worker.stopped) return;
+          if (!recognizer) {
+            this.cancelSpeakerLed(worker, keyword, 'error');
+            return;
+          }
+          const asrSamples = this.denoiserManager
+            ? await this.denoiserManager.denoiseAsync(audioForAsr, SAMPLE_RATE)
+            : audioForAsr;
+          if (this.closed || worker.stopped) return;
+          rawText = preferFastLocal
+            ? await recognizer.transcribe(asrSamples, SAMPLE_RATE, { preferFastLocal: true })
+            : await recognizer.transcribe(asrSamples, SAMPLE_RATE);
+        }
         const explicitWake = keyword !== '连续对话' || hasLeadingXiaoaiWakeWord(rawText);
         const cleanText = cleanXiaoaiAsrUtterance(rawText);
         const durationSec = (audioForAsr.length / SAMPLE_RATE).toFixed(2);
+        const refLog = maxRefRms !== undefined ? ` refRms=${maxRefRms.toFixed(4)}` : '';
         const frontendLog = frontendMeta
-          ? ` doa=${frontendMeta.azimuthDeg}°${frontendMeta.aecApplied ? ` aec=-${frontendMeta.echoReductionDb.toFixed(1)}dB` : ''}`
-          : '';
+          ? ` doa=${frontendMeta.azimuthDeg}°${frontendMeta.aecApplied ? ` aec=-${frontendMeta.echoReductionDb.toFixed(1)}dB` : ''}${refLog}`
+          : refLog;
         console.log(
           `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: wake="${keyword}" dur=${durationSec}s maxRms=${maxRms.toFixed(5)}${frontendLog} raw=${JSON.stringify(rawText)} clean=${JSON.stringify(cleanText)}`,
         );
