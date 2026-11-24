@@ -1077,8 +1077,8 @@ export class XiaoaiSpeakerManager {
     const isBareWake = keyword.trim() === '星期五';
     const isUltraShortWake = wakeAudio.length <= Math.round(sampleRate * 0.95);
     const wakeThreshold = isBareWake
-      ? Math.max(0.25, baseThreshold - (isUltraShortWake ? 0.19 : 0.15))
-      : Math.max(0.24, baseThreshold - 0.15);
+      ? Math.max(0.23, baseThreshold - (isUltraShortWake ? 0.19 : 0.15))
+      : Math.max(0.23, baseThreshold - 0.15);
     return this.matchSamples(wakeAudio, sampleRate, {
       speakerVerify: opts?.speakerVerify,
       thresholdOverride: wakeThreshold,
@@ -1108,7 +1108,7 @@ export class XiaoaiSpeakerManager {
         const isUltraShort = evalSamples.length <= Math.round(sampleRate * 1.25);
         if (opts?.wakeVerified) {
           const relief = evalSamples.length <= Math.round(sampleRate * 1.45) ? 0.15 : 0.09;
-          effectiveThreshold = Math.max(0.29, threshold - relief);
+          effectiveThreshold = Math.max(0.24, threshold - relief);
         } else if (isUltraShort) {
           effectiveThreshold = Math.max(0.32, threshold - 0.09);
         } else {

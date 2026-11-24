@@ -1445,4 +1445,258 @@ test('audio-frontend & kws-monitor: 12-beam OnlineHexBeamformer preserves 90deg 
     outRms90 / Math.max(1e-6, inRms90) >= 0.85,
     `Expected >=0.85 RMS preservation at 90deg, got ${(outRms90 / Math.max(1e-6, inRms90)).toFixed(3)}`,
   );
+
+  // Stateless steerFixedBeam must recover 90deg audio without mutating online beamformer state
+  const bf2 = new OnlineHexBeamformer(sr);
+  for (let off = 0; off + frameLen <= noiseFloor[0]!.length; off += frameLen) {
+    bf2.process(noiseFloor.map(m => m.subarray(off, off + frameLen)));
+  }
+  const beforeBeam = bf2.getActiveBeam();
+  const steered90 = bf2.steerFixedBeam(speech90, 3);
+  assert.equal(bf2.getActiveBeam(), beforeBeam, 'steerFixedBeam must not mutate activeBeam');
+  assert.ok(
+    computeRms(steered90.subarray(frameLen)) / Math.max(1e-6, computeRms(speech90[0]!.subarray(frameLen))) >= 0.85,
+    'steerFixedBeam at beam index 3 (90deg) must preserve 90deg speech energy',
+  );
+  assert.equal(bf2.steerFixedBeam([], 3).length, 0);
+});
+
+test('XiaoaiSpeakerManager: threshold=0.38 unlocks bare wake (0.24) and wakeVerified short utterance (0.251) while rejecting non-members', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-spk-038-'));
+  try {
+    let score = 1;
+    const factory = (): XiaoaiSpeakerExtractor => ({
+      dim: 2,
+      extract: () => new Float32Array([score, Math.sqrt(Math.max(0, 1 - score * score))]),
+      free() {},
+    });
+    const manager = new XiaoaiSpeakerManager({ homeDir: home, extractorFactory: factory });
+    manager.enrollEmbeddings({ name: '主人', role: 'owner', embeddings: [new Float32Array([1, 0])] });
+    manager.configure({ threshold: 0.38 });
+
+    const bareWake = new Float32Array(Math.round(SPEAKER_SAMPLE_RATE * 0.65)).fill(0.05);
+    score = 0.24;
+    assert.equal(manager.verifyWakeSlice(bareWake, SPEAKER_SAMPLE_RATE, '星期五').matched, true);
+    score = 0.19;
+    assert.equal(manager.verifyWakeSlice(bareWake, SPEAKER_SAMPLE_RATE, '星期五').matched, false);
+
+    const shortCmd = new Float32Array(SPEAKER_SAMPLE_RATE).fill(0.05);
+    score = 0.251;
+    const verifiedRes = manager.verifyAndTrimUtterance(shortCmd, SPEAKER_SAMPLE_RATE, { wakeVerified: true });
+    const asyncVerifiedRes = await manager.verifyAndTrimUtteranceAsync(shortCmd, SPEAKER_SAMPLE_RATE, { wakeVerified: true });
+    assert.equal(verifiedRes.matched, true);
+    assert.equal(asyncVerifiedRes.matched, true);
+    assert.ok(Math.abs(verifiedRes.threshold - 0.24) < 1e-9, `expected 0.24 floor, got ${verifiedRes.threshold}`);
+
+    score = 0.22;
+    assert.equal(manager.verifyAndTrimUtterance(shortCmd, SPEAKER_SAMPLE_RATE, { wakeVerified: true }).matched, false);
+
+    // Without wakeVerified, floor remains 0.32
+    score = 0.251;
+    assert.equal(manager.verifyAndTrimUtterance(shortCmd, SPEAKER_SAMPLE_RATE).matched, false);
+    score = 0.33;
+    assert.equal(manager.verifyAndTrimUtterance(shortCmd, SPEAKER_SAMPLE_RATE).matched, true);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('XiaoaiKwsMonitor: asr-rescue runs 6-mic beamforming + bounded GTCRN speaker rescue, and chime tail guard blocks residual loopback echo', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-kws-rescue-guard-'));
+  let monitor: XiaoaiKwsMonitor | undefined;
+  try {
+    let audioStream: PassThrough | undefined;
+    let triggerKws = false;
+    let denoiserCalls = 0;
+    let asrCalls = 0;
+    let utteranceVerifyCalls = 0;
+    const wakeEvents: string[] = [];
+    const utterances: string[] = [];
+    const cancels: string[] = [];
+
+    monitor = new XiaoaiKwsMonitor({
+      homeDir: home,
+      modelsDir: join(home, 'kws'),
+      asrModelsDir: join(home, 'asr'),
+      vadModelPath: join(home, 'vad.onnx'),
+      cooldownMs: 30,
+      probeDurationMs: 40,
+      chimeDiscardMs: 20,
+      maxWaitSpeechMs: 2_500,
+      endSilenceMs: 120,
+      asrWakeRescue: true,
+      idleEnergyGate: false,
+      sshRunner: async () => ({ stdout: '', stderr: '', code: 0 }),
+      spotterFactory: () => ({
+        createStream: () => ({}),
+        acceptWaveform: () => {},
+        isReady: () => triggerKws,
+        decode: () => {},
+        getResult: () => {
+          if (!triggerKws) return '';
+          triggerKws = false;
+          return '星期五';
+        },
+        reset: () => { triggerKws = false; },
+      }),
+      vadFactory: () => ({
+        isSpeech: (samples) => computeRms(samples) >= 0.008,
+        reset: () => {},
+      }),
+      denoiserFactory: () => ({
+        denoise: (samples) => {
+          denoiserCalls++;
+          const out = new Float32Array(samples.length);
+          for (let i = 0; i < samples.length; i++) out[i] = samples[i]! * 0.5;
+          return out;
+        },
+      }),
+      recognizerFactory: async (): Promise<XiaoaiAsrRecognizer> => ({
+        transcribe: async (samples) => {
+          asrCalls++;
+          if (asrCalls === 1) {
+            return computeRms(samples) > 0.001 ? '星期五。' : '';
+          }
+          return '打开客厅灯';
+        },
+      }),
+      streamFactory: () => {
+        audioStream = new PassThrough();
+        return {
+          stdout: audioStream,
+          sampleFormat: 's16le',
+          channels: 8,
+          kill: () => audioStream?.end(),
+          onClose: () => {},
+        };
+      },
+      speakerGate: {
+        isActive: () => true,
+        verifyWake: ({ samples }) => {
+          const rms = computeRms(samples);
+          // 400Hz noise vs 1200Hz speech + 0.5x GTCRN fingerprint distinguish the two test phases
+          const tone400 = goertzelAmplitude(samples, 400, FRONTEND_SAMPLE_RATE);
+          const tone1200 = goertzelAmplitude(samples, 1200, FRONTEND_SAMPLE_RATE);
+          if (tone400 > tone1200 * 1.5) {
+            return { matched: false, score: 0.08, threshold: 0.26 };
+          }
+          if (rms > 0.02) {
+            return { matched: false, score: 0.22, threshold: 0.26 };
+          }
+          return {
+            matched: true,
+            score: 0.32,
+            threshold: 0.26,
+            speaker: { id: 'owner', name: '主人', role: 'owner', score: 0.32 },
+          };
+        },
+        verifyUtterance: ({ samples }) => {
+          utteranceVerifyCalls++;
+          const tone500 = goertzelAmplitude(samples, 500, FRONTEND_SAMPLE_RATE);
+          const tone1200 = goertzelAmplitude(samples, 1200, FRONTEND_SAMPLE_RATE);
+          if (tone500 > tone1200 * 1.5) {
+            return { matched: false, score: 0.05, threshold: 0.29 };
+          }
+          return {
+            matched: true,
+            score: 0.41,
+            threshold: 0.29,
+            speaker: { id: 'owner', name: '主人', role: 'owner', score: 0.41 },
+          };
+        },
+      },
+      onWake: async (ev) => {
+        wakeEvents.push(ev.keyword);
+        return { woken: true, suppressed: false };
+      },
+      onUtterance: async (ev) => {
+        utterances.push(ev.text);
+      },
+      onCaptureCancel: (ev) => {
+        cancels.push(ev.reason);
+      },
+    });
+
+    const channel: ImChannelConfig = {
+      id: 'xiaoai-rescue-test',
+      platform: 'xiaoai',
+      name: 'LX06 Rescue',
+      enabled: true,
+      notifyAll: false,
+      apiBase: 'ssh://lx06=root@127.0.0.1?kws=1&chime=1',
+      allowedSenders: [],
+      inboundCount: 0,
+      outboundCount: 0,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    await monitor.sync([channel]);
+    await until(() => Boolean(audioStream));
+    audioStream!.write(Buffer.from(AUDIO_STREAM_MAGIC_8CH_S16, 'latin1'));
+
+    const write8Ch = async (mics: Float32Array[], ref?: Float32Array) => {
+      const zeroRef = ref ?? new Float32Array(mics[0]!.length);
+      const buf = encodeInterleavedInt16Frames([...mics, zeroRef, zeroRef]);
+      for (let off = 0; off < buf.length; off += 1280) {
+        audioStream!.write(buf.subarray(off, Math.min(buf.length, off + 1280)));
+        await delay(2);
+      }
+    };
+    const sr = FRONTEND_SAMPLE_RATE;
+    const silence = (sec: number) => Array.from({ length: 6 }, () => new Float32Array(Math.round(sr * sec)));
+
+    // 1. 400Hz noise burst (score=0.08 < 0.18) -> blocked BEFORE denoiser and ASR
+    await write8Ch(synthHexPlaneWave({
+      durationSec: 0.44,
+      azimuthDeg: 180,
+      signalAtTime: t => 0.04 * Math.sin(2 * Math.PI * 400 * t),
+      seed: 101,
+    }));
+    await write8Ch(silence(0.40));
+    await until(() => true);
+    await delay(80);
+    assert.equal(denoiserCalls, 0, 'Low-score (<0.18) noise burst must skip GTCRN speaker rescue');
+    assert.equal(asrCalls, 0, 'Low-score (<0.18) noise burst must skip local ASR');
+
+    // 2. 1200Hz 90deg quiet wake burst: raw beamformed hits score=0.22 -> denoised (0.5x RMS) hits score=0.32 -> single denoiser pass reused by ASR -> wakes!
+    await write8Ch(synthHexPlaneWave({
+      durationSec: 0.52,
+      azimuthDeg: 90,
+      signalAtTime: t => 0.045 * Math.sin(2 * Math.PI * 1200 * t),
+      seed: 102,
+    }));
+    await write8Ch(silence(0.44));
+    await until(() => wakeEvents.length === 1 && monitor!.isCapturing('xiaoai-rescue-test', 'lx06'));
+    assert.equal(denoiserCalls, 1, 'asr-rescue must run GTCRN once and reuse it for local ASR');
+    assert.equal(asrCalls, 1);
+
+    // 3. During chime_wait -> capturing transition, feed 160ms chime tail (discard 20ms + 140ms with refRms >= 0.0004)
+    // Even though mic energy is loud enough for VAD, chimeTailGuardSamples must ignore it until refRms drops!
+    const tailLen = Math.round(sr * 0.16);
+    const echoRef = new Float32Array(tailLen);
+    const echoMics = Array.from({ length: 6 }, () => new Float32Array(tailLen));
+    for (let i = 0; i < tailLen; i++) {
+      echoRef[i] = 0.05 * Math.sin((2 * Math.PI * 500 * i) / sr);
+      for (const m of echoMics) m[i] = 0.03 * Math.sin((2 * Math.PI * 500 * i) / sr);
+    }
+    await write8Ch(echoMics, echoRef);
+    await write8Ch(silence(0.08));
+
+    // Now send real user command with ref=0
+    await write8Ch(synthHexPlaneWave({
+      durationSec: 0.32,
+      azimuthDeg: 90,
+      signalAtTime: t => 0.05 * Math.sin(2 * Math.PI * 1200 * t),
+      seed: 103,
+    }));
+    await write8Ch(silence(0.32));
+
+    await until(() => utterances.length === 1);
+    assert.equal(utterances[0], '打开客厅灯');
+    assert.equal(utteranceVerifyCalls, 1, 'Chime tail must not invoke utterance speaker verification');
+    assert.equal(cancels.length, 0, 'Chime tail guard must prevent spurious echo trigger');
+    monitor.close();
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
 });

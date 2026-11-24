@@ -430,14 +430,23 @@ interface ActiveWorker {
   kwsMultiRingRef: Float32Array[];
   kwsMultiRingSamples: number;
   kwsPrevSample: number;
+  kwsGainState: number;
   kwsGateActive: boolean;
   kwsGateHoldSamples: number;
   kwsIdlePreRoll: Float32Array[];
   kwsIdlePreRollSamples: number;
+  kwsIdlePreRollMultiMics: Float32Array[][];
+  kwsIdlePreRollMultiRef: Float32Array[];
+  kwsIdlePreRollMultiSamples: number;
   kwsBurstPreRoll: Float32Array[];
   kwsBurstPreRollSamples: number;
+  kwsBurstPreRollMultiMics: Float32Array[][];
+  kwsBurstPreRollMultiRef: Float32Array[];
+  kwsBurstPreRollMultiSamples: number;
   kwsBurstChunks: Float32Array[];
   kwsBurstSamples: number;
+  kwsBurstMultiMics: Float32Array[][];
+  kwsBurstMultiRef: Float32Array[];
   kwsBurstSpeechSamples: number;
   kwsBurstSilenceSamples: number;
   kwsBurstMaxRms: number;
@@ -470,6 +479,8 @@ interface ActiveWorker {
   probeSkipSamplesRemaining: number;
   probeSawSpeech: boolean;
   chimeDiscardSamples: number;
+  chimeTailGuardSamples: number;
+  rearmedAfterNoise: boolean;
   preRollChunks: Float32Array[];
   preRollMultiMics: Float32Array[][];
   preRollMultiRef: Float32Array[];
@@ -495,11 +506,13 @@ interface ActiveWorker {
 }
 
 interface CaptureMeta {
+  keyword?: string;
   isFollowUp: boolean;
   deadlineAt: number;
   endSilenceMs: number;
   maxUtteranceMs: number;
   silentWake?: boolean;
+  rearmedAfterNoise?: boolean;
   wakeSpeaker?: XiaoaiMatchedSpeaker;
 }
 
@@ -1320,14 +1333,23 @@ export class XiaoaiKwsMonitor {
         kwsMultiRingRef: [],
         kwsMultiRingSamples: 0,
         kwsPrevSample: 0,
+        kwsGainState: 0,
         kwsGateActive: false,
         kwsGateHoldSamples: 0,
         kwsIdlePreRoll: [],
         kwsIdlePreRollSamples: 0,
+        kwsIdlePreRollMultiMics: createEmptyMicArrays(),
+        kwsIdlePreRollMultiRef: [],
+        kwsIdlePreRollMultiSamples: 0,
         kwsBurstPreRoll: [],
         kwsBurstPreRollSamples: 0,
+        kwsBurstPreRollMultiMics: createEmptyMicArrays(),
+        kwsBurstPreRollMultiRef: [],
+        kwsBurstPreRollMultiSamples: 0,
         kwsBurstChunks: [],
         kwsBurstSamples: 0,
+        kwsBurstMultiMics: createEmptyMicArrays(),
+        kwsBurstMultiRef: [],
         kwsBurstSpeechSamples: 0,
         kwsBurstSilenceSamples: 0,
         kwsBurstMaxRms: 0,
@@ -1359,6 +1381,8 @@ export class XiaoaiKwsMonitor {
         probeSkipSamplesRemaining: 0,
         probeSawSpeech: false,
         chimeDiscardSamples: 0,
+        chimeTailGuardSamples: 0,
+        rearmedAfterNoise: false,
         preRollChunks: [],
         preRollMultiMics: createEmptyMicArrays(),
         preRollMultiRef: [],
@@ -1457,6 +1481,8 @@ export class XiaoaiKwsMonitor {
     worker.liveAsrSession = undefined;
     worker.liveAsrSampleCount = 0;
     worker.chimeDiscardSamples = options?.discardMs === 0 ? 0 : msToSamples(options?.discardMs ?? 180);
+    worker.chimeTailGuardSamples = 0;
+    worker.rearmedAfterNoise = false;
     this.startLiveAsrSession(worker);
     worker.vad?.reset();
     const refRms = worker.lastSpeechRms > 0
@@ -1478,16 +1504,18 @@ export class XiaoaiKwsMonitor {
     if (this.closed || worker.stopped || !worker.kwsStream || remainingMs < 350) {
       return false;
     }
+    const preserveTwoStep = meta !== undefined && !meta.isFollowUp;
     worker.captureEpoch++;
     this.resetKwsBurst(worker, true);
     this.resetKwsIdleGate(worker);
     worker.mode = 'capturing';
-    worker.activeKeyword = '连续对话';
+    worker.activeKeyword = preserveTwoStep ? (meta.keyword || '星期五') : '连续对话';
     worker.activeWakeDurationMs = 0;
     worker.activeWakeUrgent = undefined;
-    worker.activeWakeSpeaker = undefined;
+    worker.activeWakeSpeaker = preserveTwoStep ? meta.wakeSpeaker : undefined;
     worker.activeWakeSilent = false;
-    worker.isFollowUpCapture = true;
+    worker.isFollowUpCapture = !preserveTwoStep;
+    worker.rearmedAfterNoise = preserveTwoStep;
     worker.captureDeadlineAt = Date.now() + remainingMs;
     worker.sawOwnerInLiveCapture = false;
     worker.liveNonOwnerStreak = 0;
@@ -1522,11 +1550,16 @@ export class XiaoaiKwsMonitor {
     worker.liveAsrSession = undefined;
     worker.liveAsrSampleCount = 0;
     worker.chimeDiscardSamples = 0;
+    worker.chimeTailGuardSamples = 0;
     this.startLiveAsrSession(worker);
     worker.vad?.reset();
     spotter?.reset(worker.kwsStream);
     console.log(
-      `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: re-arm follow-up after non-member rejection (${worker.currentMaxWaitMs}ms remaining)`,
+      `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: ${
+        preserveTwoStep
+          ? `re-arm wake capture after brief noise rejection (${worker.currentMaxWaitMs}ms remaining)`
+          : `re-arm follow-up after non-member rejection (${worker.currentMaxWaitMs}ms remaining)`
+      }`,
     );
     return true;
   }
@@ -1655,14 +1688,23 @@ export class XiaoaiKwsMonitor {
     worker.kwsGateHoldSamples = 0;
     worker.kwsIdlePreRoll = [];
     worker.kwsIdlePreRollSamples = 0;
+    worker.kwsIdlePreRollMultiMics = createEmptyMicArrays();
+    worker.kwsIdlePreRollMultiRef = [];
+    worker.kwsIdlePreRollMultiSamples = 0;
     worker.kwsPrevSample = 0;
+    worker.kwsGainState = 0;
   }
 
   private resetKwsBurst(worker: ActiveWorker, abortInFlight = false): void {
     worker.kwsBurstPreRoll = [];
     worker.kwsBurstPreRollSamples = 0;
+    worker.kwsBurstPreRollMultiMics = createEmptyMicArrays();
+    worker.kwsBurstPreRollMultiRef = [];
+    worker.kwsBurstPreRollMultiSamples = 0;
     worker.kwsBurstChunks = [];
     worker.kwsBurstSamples = 0;
+    worker.kwsBurstMultiMics = createEmptyMicArrays();
+    worker.kwsBurstMultiRef = [];
     worker.kwsBurstSpeechSamples = 0;
     worker.kwsBurstSilenceSamples = 0;
     worker.kwsBurstMaxRms = 0;
@@ -1703,6 +1745,8 @@ export class XiaoaiKwsMonitor {
     worker.probeSkipSamplesRemaining = 0;
     worker.probeSawSpeech = false;
     worker.chimeDiscardSamples = 0;
+    worker.chimeTailGuardSamples = 0;
+    worker.rearmedAfterNoise = false;
     worker.preRollChunks = [];
     worker.preRollMultiMics = createEmptyMicArrays();
     worker.preRollMultiRef = [];
@@ -1756,6 +1800,7 @@ export class XiaoaiKwsMonitor {
       worker.kwsRingChunks = [];
       worker.kwsRingSamples = 0;
       worker.kwsPrevSample = 0;
+      worker.kwsGainState = 0;
       this.resetWorkerCapture(worker, spotter);
     } catch (error) {
       if (streamHandle) {
@@ -1927,13 +1972,22 @@ export class XiaoaiKwsMonitor {
     if (!this.isHardwareLowGainStream(worker)) {
       return samples;
     }
-    const kwsGain = computeKwsGain(samples, worker.ambientRms);
-    const blend = Math.max(0, Math.min(1, (kwsGain - 1.25) / 0.75));
-    const alpha = 0.50 * blend;
-    const scale = kwsGain * (1 + 0.15 * blend);
+    const targetGain = computeKwsGain(samples, worker.ambientRms);
+    const startGain = worker.kwsGainState > 0 ? worker.kwsGainState : targetGain;
+    const smoothAlpha = targetGain < startGain ? 0.65 : 0.15;
+    const endGain = worker.kwsGainState > 0
+      ? startGain + (targetGain - startGain) * smoothAlpha
+      : targetGain;
+    worker.kwsGainState = endGain;
     let prev = worker.kwsPrevSample;
-    const boosted = new Float32Array(samples.length);
-    for (let i = 0; i < samples.length; i++) {
+    const len = samples.length;
+    const denom = Math.max(1, len);
+    const boosted = new Float32Array(len);
+    for (let i = 0; i < len; i++) {
+      const g = startGain + (endGain - startGain) * (i / denom);
+      const blend = Math.max(0, Math.min(1, (g - 1.25) / 0.75));
+      const alpha = 0.50 * blend;
+      const scale = g * (1 + 0.15 * blend);
       const cur = samples[i] ?? 0;
       const hp = cur - alpha * prev;
       prev = cur;
@@ -1988,6 +2042,15 @@ export class XiaoaiKwsMonitor {
           samples,
           msToSamples(400),
         );
+        if (multiChunk) {
+          worker.kwsIdlePreRollMultiSamples = pushMultiBoundedSamples(
+            worker.kwsIdlePreRollMultiMics,
+            worker.kwsIdlePreRollMultiRef,
+            worker.kwsIdlePreRollMultiSamples,
+            multiChunk,
+            msToSamples(400),
+          );
+        }
         if (this.asrWakeRescue && worker.kwsBurstSpeechSamples === 0) {
           worker.kwsBurstPreRollSamples = pushBoundedSamples(
             worker.kwsBurstPreRoll,
@@ -1995,6 +2058,15 @@ export class XiaoaiKwsMonitor {
             samples,
             msToSamples(200),
           );
+          if (multiChunk) {
+            worker.kwsBurstPreRollMultiSamples = pushMultiBoundedSamples(
+              worker.kwsBurstPreRollMultiMics,
+              worker.kwsBurstPreRollMultiRef,
+              worker.kwsBurstPreRollMultiSamples,
+              multiChunk,
+              msToSamples(200),
+            );
+          }
         }
         return;
       }
@@ -2003,13 +2075,36 @@ export class XiaoaiKwsMonitor {
         worker.kwsGateActive = true;
         worker.kwsGateHoldSamples = msToSamples(900);
         worker.kwsPrevSample = 0;
+        worker.kwsGainState = 0;
         spotter.reset(worker.kwsStream);
         const preRoll = worker.kwsIdlePreRoll;
         worker.kwsIdlePreRoll = [];
         worker.kwsIdlePreRollSamples = 0;
-        for (const preChunk of preRoll) {
-          if (this.feedSpotterAndCheckWake(worker, spotter, this.prepareKwsSamples(worker, preChunk), computeRms(preChunk))) {
-            return;
+        const preMulti = concatMultiArrays(worker.kwsIdlePreRollMultiMics, worker.kwsIdlePreRollMultiRef);
+        worker.kwsIdlePreRollMultiMics = createEmptyMicArrays();
+        worker.kwsIdlePreRollMultiRef = [];
+        worker.kwsIdlePreRollMultiSamples = 0;
+        if (
+          worker.onlineBeamformer
+          && preMulti
+          && preMulti.mics.length >= 2
+          && (!preMulti.ref || computeRms(preMulti.ref) < 1e-4)
+        ) {
+          const steered = worker.onlineBeamformer.steerFixedBeam(
+            preMulti.mics,
+            worker.onlineBeamformer.getActiveBeam(),
+          );
+          for (let off = 0; off < steered.length; off += MULTI_COALESCE_SAMPLES) {
+            const slice = steered.subarray(off, Math.min(steered.length, off + MULTI_COALESCE_SAMPLES));
+            if (this.feedSpotterAndCheckWake(worker, spotter, this.prepareKwsSamples(worker, slice), computeRms(slice))) {
+              return;
+            }
+          }
+        } else {
+          for (const preChunk of preRoll) {
+            if (this.feedSpotterAndCheckWake(worker, spotter, this.prepareKwsSamples(worker, preChunk), computeRms(preChunk))) {
+              return;
+            }
           }
         }
       } else if (aboveGate) {
@@ -2054,7 +2149,7 @@ export class XiaoaiKwsMonitor {
     }
 
     if (this.asrWakeRescue) {
-      this.updateAsrWakeRescueBurst(worker, spotter, samples, chunkRms, isFgSpeech);
+      this.updateAsrWakeRescueBurst(worker, spotter, samples, chunkRms, isFgSpeech, multiChunk);
       if (
         !worker.kwsRescueInFlight
         && !worker.kwsBurstFlushedLookahead
@@ -2131,6 +2226,7 @@ export class XiaoaiKwsMonitor {
     samples: Float32Array,
     chunkRms: number,
     isFgSpeech: boolean,
+    multiChunk?: MultiChannelAudioChunk,
   ): void {
     if (worker.kwsBurstSpeechSamples === 0) {
       if (!isFgSpeech) {
@@ -2140,19 +2236,39 @@ export class XiaoaiKwsMonitor {
           samples,
           msToSamples(200),
         );
+        if (multiChunk) {
+          worker.kwsBurstPreRollMultiSamples = pushMultiBoundedSamples(
+            worker.kwsBurstPreRollMultiMics,
+            worker.kwsBurstPreRollMultiRef,
+            worker.kwsBurstPreRollMultiSamples,
+            multiChunk,
+            msToSamples(200),
+          );
+        }
         return;
       }
       worker.kwsBurstChunks = [...worker.kwsBurstPreRoll, samples];
       worker.kwsBurstSamples = worker.kwsBurstPreRollSamples + samples.length;
+      worker.kwsBurstMultiMics = worker.kwsBurstPreRollMultiMics.map(arr => [...arr]);
+      worker.kwsBurstMultiRef = [...worker.kwsBurstPreRollMultiRef];
+      if (multiChunk) {
+        appendMultiChunk(worker.kwsBurstMultiMics, worker.kwsBurstMultiRef, multiChunk);
+      }
       worker.kwsBurstSpeechSamples = samples.length;
       worker.kwsBurstSilenceSamples = 0;
       worker.kwsBurstMaxRms = chunkRms;
       worker.kwsBurstPreRoll = [];
       worker.kwsBurstPreRollSamples = 0;
+      worker.kwsBurstPreRollMultiMics = createEmptyMicArrays();
+      worker.kwsBurstPreRollMultiRef = [];
+      worker.kwsBurstPreRollMultiSamples = 0;
       return;
     }
 
     worker.kwsBurstChunks.push(samples);
+    if (multiChunk) {
+      appendMultiChunk(worker.kwsBurstMultiMics, worker.kwsBurstMultiRef, multiChunk);
+    }
     worker.kwsBurstSamples += samples.length;
     if (chunkRms > worker.kwsBurstMaxRms) {
       worker.kwsBurstMaxRms = chunkRms;
@@ -2175,15 +2291,18 @@ export class XiaoaiKwsMonitor {
       const silenceLen = worker.kwsBurstSilenceSamples;
       const maxRms = worker.kwsBurstMaxRms;
       const rawBurst = concatFloat32Arrays(worker.kwsBurstChunks);
-      this.resetKwsBurst(worker);
-
       const keep = Math.max(msToSamples(320), rawBurst.length - Math.max(0, silenceLen - msToSamples(160)));
-      const burstSamples = keep < rawBurst.length ? rawBurst.subarray(0, keep) : rawBurst;
-      if (
+      const shouldRescue =
         speechLen >= msToSamples(300)
         && Date.now() - worker.lastWakeAt >= this.cooldownMs
-        && (!this.isHardwareLowGainStream(worker) || maxRms >= 0.00060)
-      ) {
+        && (!this.isHardwareLowGainStream(worker) || maxRms >= 0.00060);
+      const burstMulti = shouldRescue
+        ? concatMultiArrays(worker.kwsBurstMultiMics, worker.kwsBurstMultiRef, Math.max(0, rawBurst.length - keep))
+        : undefined;
+      this.resetKwsBurst(worker);
+
+      const burstSamples = keep < rawBurst.length ? rawBurst.subarray(0, keep) : rawBurst;
+      if (shouldRescue) {
         const rescueId = ++worker.kwsRescueId;
         worker.kwsRescueInFlight = true;
         worker.kwsRescueBurstMaxRms = maxRms;
@@ -2191,9 +2310,25 @@ export class XiaoaiKwsMonitor {
         worker.kwsPostRescueSpeech = false;
         worker.kwsPostRescueSpeechSamples = 0;
         worker.kwsPostRescueMaxRms = 0;
-        void this.tryAsrWakeRescue(worker, spotter, burstSamples, maxRms, rescueId);
+        void this.tryAsrWakeRescue(worker, spotter, burstSamples, maxRms, rescueId, burstMulti);
       }
     }
+  }
+
+  private async tryRescueAudioWithDenoiser<TVerdict>(
+    samples: Float32Array,
+    initialScore: number,
+    isStillValid: () => boolean,
+    evaluateFn: (denoised: Float32Array) => TVerdict | Promise<TVerdict>,
+  ): Promise<{ denoised: Float32Array; verdict: TVerdict } | undefined> {
+    if (initialScore < 0.18 || !this.denoiserManager || samples.length > msToSamples(3_500)) {
+      return undefined;
+    }
+    const denoised = await this.denoiserManager.denoiseAsync(samples, SAMPLE_RATE);
+    if (!isStillValid() || denoised === samples) return undefined;
+    const verdict = await evaluateFn(denoised);
+    if (!isStillValid()) return undefined;
+    return { denoised, verdict };
   }
 
   private maybeHibernateKwsAfterChunk(
@@ -2272,7 +2407,7 @@ export class XiaoaiKwsMonitor {
     });
     if (!verdict.matched && !silentLog) {
       console.log(
-        `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: wake="${keyword}" rejected by speaker gate (score=${verdict.score.toFixed(3)} < ${verdict.threshold.toFixed(3)}, dur=${(wakeSlice.length / SAMPLE_RATE).toFixed(2)}s)`,
+        `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: wake="${keyword}" rejected by speaker gate (score=${verdict.score.toFixed(3)} < ${verdict.threshold.toFixed(3)}, dur=${(wakeSlice.length / SAMPLE_RATE).toFixed(2)}s maxRms=${computeRms(wakeSlice).toFixed(5)})`,
       );
     }
     return {
@@ -2290,40 +2425,70 @@ export class XiaoaiKwsMonitor {
     burstSamples: Float32Array,
     burstMaxRms: number,
     rescueId: number,
+    burstMulti?: { mics: Float32Array[]; ref?: Float32Array },
   ): Promise<void> {
     try {
-      if (this.closed || worker.stopped || worker.mode !== 'kws' || worker.kwsRescueId !== rescueId) {
+      const isRescueValid = () =>
+        !this.closed && !worker.stopped && worker.mode === 'kws' && worker.kwsRescueId === rescueId;
+      if (!isRescueValid()) {
         return;
       }
-      const wakeGate = this.evaluateWakeSpeakerGate(worker, '星期五', burstSamples, true);
+
+      let rescueSamples = burstSamples;
+      let rescueDoa: number | undefined;
+      if (burstMulti && burstMulti.mics.length >= 2 && burstMulti.mics[0]?.length === burstSamples.length) {
+        const processed = processMultiChannelUtterance(burstMulti.mics, burstMulti.ref, SAMPLE_RATE);
+        rescueSamples = processed.samples;
+        rescueDoa = processed.azimuthDeg;
+      }
+      const doaLog = rescueDoa !== undefined ? ` doa=${rescueDoa}°` : '';
+
+      let wakeGate = this.evaluateWakeSpeakerGate(worker, '星期五', rescueSamples, true);
+      let preDenoisedSamples: Float32Array | undefined;
       if (!wakeGate.matched) {
-        if (wakeGate.score >= 0.25) {
+        const rescued = await this.tryRescueAudioWithDenoiser(
+          rescueSamples,
+          wakeGate.score,
+          isRescueValid,
+          (denoised) => this.evaluateWakeSpeakerGate(worker, '星期五', denoised, true),
+        );
+        if (!isRescueValid()) return;
+        if (rescued) {
+          preDenoisedSamples = rescued.denoised;
+          if (rescued.verdict.matched && rescued.verdict.score > wakeGate.score) {
+            wakeGate = rescued.verdict;
+          }
+        }
+      }
+      if (!wakeGate.matched) {
+        if (wakeGate.score >= 0.18) {
           console.log(
-            `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: asr-rescue skipped by speaker precheck (score=${wakeGate.score.toFixed(3)} < ${wakeGate.threshold.toFixed(3)}, maxRms=${burstMaxRms.toFixed(5)})`,
+            `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: asr-rescue skipped by speaker precheck (score=${wakeGate.score.toFixed(3)} < ${wakeGate.threshold.toFixed(3)}, dur=${(rescueSamples.length / SAMPLE_RATE).toFixed(2)}s maxRms=${burstMaxRms.toFixed(5)}${doaLog})`,
           );
         }
         return;
       }
       const recognizer = await this.ensureRecognizer();
-      if (!recognizer || this.closed || worker.stopped || worker.mode !== 'kws' || worker.kwsRescueId !== rescueId) {
+      if (!recognizer || !isRescueValid()) {
         return;
       }
-      let rescueAsrSamples = burstSamples;
-      if (this.denoiserManager && burstSamples.length <= msToSamples(3_500)) {
-        rescueAsrSamples = await this.denoiserManager.denoiseAsync(burstSamples, SAMPLE_RATE);
-        if (this.closed || worker.stopped || worker.mode !== 'kws' || worker.kwsRescueId !== rescueId) {
+      let rescueAsrSamples = preDenoisedSamples ?? rescueSamples;
+      if (!preDenoisedSamples && this.denoiserManager && rescueSamples.length <= msToSamples(3_500)) {
+        rescueAsrSamples = await this.denoiserManager.denoiseAsync(rescueSamples, SAMPLE_RATE);
+        if (!isRescueValid()) {
           return;
         }
       }
       const rawText = await recognizer.transcribe(rescueAsrSamples, SAMPLE_RATE, { localOnly: true });
-      if (this.closed || worker.stopped || worker.mode !== 'kws' || worker.kwsRescueId !== rescueId) {
+      if (!isRescueValid()) {
         return;
       }
+      const spkLog = wakeGate.speaker ? ` spk=${wakeGate.score.toFixed(2)}` : '';
       const match = extractLeadingXiaoaiWakeKeyword(rawText);
       if (!match) {
         if (rawText.trim()) {
           console.log(
-            `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: asr-rescue ignored (dur=${(burstSamples.length / SAMPLE_RATE).toFixed(2)}s maxRms=${burstMaxRms.toFixed(5)} raw=${JSON.stringify(rawText)})`,
+            `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: asr-rescue ignored (dur=${(rescueSamples.length / SAMPLE_RATE).toFixed(2)}s maxRms=${burstMaxRms.toFixed(5)}${doaLog}${spkLog} raw=${JSON.stringify(rawText)})`,
           );
         }
         return;
@@ -2362,13 +2527,13 @@ export class XiaoaiKwsMonitor {
             }
           }
         }
-        const wakeDurationMs = measureWakeSpeechDurationMs(burstSamples, SAMPLE_RATE);
+        const wakeDurationMs = measureWakeSpeechDurationMs(rescueSamples, SAMPLE_RATE);
         const wakeMeta = {
           wakeDurationMs,
           speaker: wakeGate.speaker,
         };
         console.log(
-          `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: wake="${match.keyword}" mode=${postIsContinuation ? 'asr-rescue-live' : 'asr-rescue'} (maxRms=${burstMaxRms.toFixed(5)}, dur=${wakeDurationMs}ms, raw=${JSON.stringify(rawText)})`,
+          `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: wake="${match.keyword}" mode=${postIsContinuation ? 'asr-rescue-live' : 'asr-rescue'} (maxRms=${burstMaxRms.toFixed(5)}, dur=${wakeDurationMs}ms${doaLog}${spkLog}, raw=${JSON.stringify(rawText)})`,
         );
 
         const epoch = ++worker.captureEpoch;
@@ -2400,6 +2565,8 @@ export class XiaoaiKwsMonitor {
           worker.silenceSamples = 0;
           worker.waitSamples = 0;
           worker.chimeDiscardSamples = 0;
+          worker.chimeTailGuardSamples = 0;
+          worker.rearmedAfterNoise = false;
           worker.captureMaxRms = burstMaxRms;
           worker.captureMaxRefRms = 0;
           worker.liveAsrSampleCount = 0;
@@ -2424,22 +2591,32 @@ export class XiaoaiKwsMonitor {
       const gate = this.options.speakerGate;
       const gateBypassed = gate?.isBypassed?.(worker.channel.id, worker.target.id) ?? false;
       if (gate && !gateBypassed && gate.isActive(worker.channel, worker.target)) {
-        const gateParams = {
-          channel: worker.channel,
-          target: worker.target,
-          keyword: match.keyword,
-          samples: burstSamples,
-          sampleRate: SAMPLE_RATE,
+        const runUtteranceGate = async (candidate: Float32Array) => {
+          const gateParams = {
+            channel: worker.channel,
+            target: worker.target,
+            keyword: match.keyword,
+            samples: candidate,
+            sampleRate: SAMPLE_RATE,
+          };
+          return gate.verifyUtteranceAsync
+            ? await gate.verifyUtteranceAsync(gateParams)
+            : gate.verifyUtterance(gateParams);
         };
-        const verdict = await (gate.verifyUtteranceAsync
-          ? gate.verifyUtteranceAsync(gateParams)
-          : gate.verifyUtterance(gateParams));
-        if (this.closed || worker.stopped || worker.mode !== 'kws' || worker.kwsRescueId !== rescueId) {
+        let verdict = await runUtteranceGate(rescueSamples);
+        if (!isRescueValid()) {
           return;
+        }
+        if (!verdict.matched && verdict.score >= 0.18 && preDenoisedSamples) {
+          const denVerdict = await runUtteranceGate(preDenoisedSamples);
+          if (!isRescueValid()) return;
+          if (denVerdict.matched && denVerdict.score > verdict.score) {
+            verdict = denVerdict;
+          }
         }
         if (!verdict.matched) {
           console.log(
-            `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: utterance rejected by speaker gate (wake="${match.keyword}", score=${verdict.score.toFixed(3)} < ${verdict.threshold.toFixed(3)})`,
+            `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: utterance rejected by speaker gate (wake="${match.keyword}", score=${verdict.score.toFixed(3)} < ${verdict.threshold.toFixed(3)}, dur=${(rescueSamples.length / SAMPLE_RATE).toFixed(2)}s maxRms=${burstMaxRms.toFixed(5)}${doaLog})`,
           );
           return;
         }
@@ -2460,7 +2637,7 @@ export class XiaoaiKwsMonitor {
       }
 
       console.log(
-        `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: wake="${match.keyword}" mode=asr-rescue-utterance dur=${(burstSamples.length / SAMPLE_RATE).toFixed(2)}s maxRms=${burstMaxRms.toFixed(5)} raw=${JSON.stringify(rawText)} clean=${JSON.stringify(match.remainder)}`,
+        `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: wake="${match.keyword}" mode=asr-rescue-utterance dur=${(rescueSamples.length / SAMPLE_RATE).toFixed(2)}s maxRms=${burstMaxRms.toFixed(5)}${doaLog}${spkLog} raw=${JSON.stringify(rawText)} clean=${JSON.stringify(match.remainder)}`,
       );
       worker.lastWakeAt = Date.now();
       worker.lastSpeechRms = burstMaxRms;
@@ -2478,7 +2655,7 @@ export class XiaoaiKwsMonitor {
           text: match.remainder,
           explicitWake: true,
           ...(matchedSpeaker ? { speaker: matchedSpeaker } : {}),
-          ...(gateBypassed ? { samples: burstSamples, sampleRate: SAMPLE_RATE } : {}),
+          ...(gateBypassed ? { samples: rescueSamples, sampleRate: SAMPLE_RATE } : {}),
         });
       }
     } catch (error) {
@@ -2625,6 +2802,7 @@ export class XiaoaiKwsMonitor {
   ): void {
     const apiOptions = parseXiaoaiApiOptions(worker.channel.apiBase);
     worker.activeWakeSilent = false;
+    worker.rearmedAfterNoise = false;
     worker.probeChunks = [];
     worker.probeMultiMics = createEmptyMicArrays();
     worker.probeMultiRef = [];
@@ -2661,6 +2839,7 @@ export class XiaoaiKwsMonitor {
       worker.mode = 'capturing';
       this.resetLiveCaptureTracking(worker, false);
       worker.chimeDiscardSamples = 0;
+      worker.chimeTailGuardSamples = 0;
       resetTwoStepVad();
       void this.invokeWake(worker, keyword, false, meta).catch((error) => {
         this.options.onError?.(worker.channel.id, error);
@@ -2686,6 +2865,7 @@ export class XiaoaiKwsMonitor {
         worker.mode = 'capturing';
         this.resetLiveCaptureTracking(worker, false);
         worker.chimeDiscardSamples = msToSamples(this.chimeDiscardMs);
+        worker.chimeTailGuardSamples = msToSamples(650);
         resetTwoStepVad();
       })
       .catch((error) => {
@@ -2784,6 +2964,8 @@ export class XiaoaiKwsMonitor {
       worker.silenceSamples = 0;
       worker.waitSamples = 0;
       worker.chimeDiscardSamples = 0;
+      worker.chimeTailGuardSamples = 0;
+      worker.rearmedAfterNoise = false;
       worker.probeChunks = [];
       worker.probeMultiMics = createEmptyMicArrays();
       worker.probeMultiRef = [];
@@ -2842,6 +3024,13 @@ export class XiaoaiKwsMonitor {
       worker.chimeDiscardSamples = 0;
     }
     if (samples.length === 0) return;
+
+    if (!worker.speechStarted && worker.chimeTailGuardSamples > 0) {
+      worker.chimeTailGuardSamples = Math.max(0, worker.chimeTailGuardSamples - samples.length);
+      if (multiChunk && multiChunk.refRms >= 0.0004) {
+        return;
+      }
+    }
 
     if (multiChunk && multiChunk.refRms > worker.captureMaxRefRms) {
       worker.captureMaxRefRms = multiChunk.refRms;
@@ -3042,11 +3231,13 @@ export class XiaoaiKwsMonitor {
     const keyword = worker.activeKeyword;
     const maxRms = worker.captureMaxRms;
     const savedMeta: CaptureMeta = {
+      keyword,
       isFollowUp: worker.isFollowUpCapture,
       deadlineAt: worker.captureDeadlineAt,
       endSilenceMs: worker.currentEndSilenceMs,
       maxUtteranceMs: worker.currentMaxUtteranceMs,
       silentWake: worker.activeWakeSilent && !worker.isFollowUpCapture,
+      rearmedAfterNoise: worker.rearmedAfterNoise,
       ...(worker.activeWakeSpeaker ? { wakeSpeaker: worker.activeWakeSpeaker } : {}),
     };
     const rawCaptured = concatFloat32Arrays(worker.audioChunks);
@@ -3119,24 +3310,53 @@ export class XiaoaiKwsMonitor {
           echoReductionDb: processed.echoReductionDb,
         };
       }
+      const refLog = maxRefRms !== undefined ? ` refRms=${maxRefRms.toFixed(4)}` : '';
+      const frontendLog = frontendMeta
+        ? ` doa=${frontendMeta.azimuthDeg}°${frontendMeta.aecApplied ? ` aec=-${frontendMeta.echoReductionDb.toFixed(1)}dB` : ''}${refLog}`
+        : refLog;
+
       let matchedSpeaker: XiaoaiMatchedSpeaker | undefined;
       let speakerTrimmed = false;
+      let preDenoisedForAsr: Float32Array | undefined;
+      let usedDenoisedSamples = false;
       const gate = this.options.speakerGate;
       const gateBypassed = gate?.isBypassed?.(worker.channel.id, worker.target.id) ?? false;
       if (gate && !gateBypassed && gate.isActive(worker.channel, worker.target)) {
         const wakeVerified = Boolean(!captureMeta?.isFollowUp && captureMeta?.wakeSpeaker);
-        const gateParams = {
-          channel: worker.channel,
-          target: worker.target,
-          keyword,
-          samples: audioForAsr,
-          sampleRate: SAMPLE_RATE,
-          ...(wakeVerified ? { wakeVerified: true } : {}),
+        const runUtteranceGate = async (candidate: Float32Array) => {
+          const gateParams = {
+            channel: worker.channel,
+            target: worker.target,
+            keyword,
+            samples: candidate,
+            sampleRate: SAMPLE_RATE,
+            ...(wakeVerified ? { wakeVerified: true } : {}),
+          };
+          return gate.verifyUtteranceAsync
+            ? await gate.verifyUtteranceAsync(gateParams)
+            : gate.verifyUtterance(gateParams);
         };
-        const verdict = await (gate.verifyUtteranceAsync
-          ? gate.verifyUtteranceAsync(gateParams)
-          : gate.verifyUtterance(gateParams));
+        let verdict = await runUtteranceGate(audioForAsr);
         if (this.closed || worker.stopped) return;
+        if (!verdict.matched) {
+          const rescued = await this.tryRescueAudioWithDenoiser(
+            audioForAsr,
+            verdict.score,
+            () => !this.closed && !worker.stopped,
+            runUtteranceGate,
+          );
+          if (this.closed || worker.stopped) return;
+          if (rescued) {
+            preDenoisedForAsr = rescued.denoised;
+            if (rescued.verdict.matched && rescued.verdict.score > verdict.score) {
+              console.log(
+                `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: speaker gate rescued by denoiser (${verdict.score.toFixed(3)} -> ${rescued.verdict.score.toFixed(3)})`,
+              );
+              verdict = rescued.verdict;
+              usedDenoisedSamples = true;
+            }
+          }
+        }
         if (!verdict.matched) {
           if (
             audioForAsr.length >= msToSamples(450)
@@ -3162,7 +3382,7 @@ export class XiaoaiKwsMonitor {
             }
           }
           console.log(
-            `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: utterance rejected by speaker gate (wake="${keyword}", score=${verdict.score.toFixed(3)} < ${verdict.threshold.toFixed(3)})`,
+            `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: utterance rejected by speaker gate (wake="${keyword}", score=${verdict.score.toFixed(3)} < ${verdict.threshold.toFixed(3)}, dur=${(audioForAsr.length / SAMPLE_RATE).toFixed(2)}s maxRms=${maxRms.toFixed(5)}${frontendLog})`,
           );
           if (
             captureMeta?.isFollowUp
@@ -3176,6 +3396,23 @@ export class XiaoaiKwsMonitor {
               return;
             }
           }
+          if (
+            captureMeta
+            && !captureMeta.isFollowUp
+            && !captureMeta.silentWake
+            && !captureMeta.rearmedAfterNoise
+            && verdict.score < 0.15
+            && audioForAsr.length <= msToSamples(1_400)
+            && !this.closed
+            && !worker.stopped
+            && worker.mode === 'kws'
+            && worker.kwsStream
+          ) {
+            const remaining = captureMeta.deadlineAt - Date.now();
+            if (remaining >= 1_000 && this.rearmRemainingCaptureWindow(worker, this.spotter, remaining, captureMeta)) {
+              return;
+            }
+          }
           if (captureMeta?.silentWake && !this.closed && !worker.stopped && worker.mode === 'kws') {
             this.retriggerBareWake(worker, this.spotter, keyword, captureMeta.wakeSpeaker);
             return;
@@ -3184,7 +3421,7 @@ export class XiaoaiKwsMonitor {
           return;
         }
         matchedSpeaker = verdict.speaker;
-        if (verdict.samples && verdict.samples.length > 0) {
+        if (verdict.samples && verdict.samples.length > 0 && (verdict.trimmed || !usedDenoisedSamples)) {
           audioForAsr = verdict.samples;
           if (verdict.trimmed) {
             speakerTrimmed = true;
@@ -3227,9 +3464,13 @@ export class XiaoaiKwsMonitor {
             this.cancelSpeakerLed(worker, keyword, 'error');
             return;
           }
-          const asrSamples = this.denoiserManager
-            ? await this.denoiserManager.denoiseAsync(audioForAsr, SAMPLE_RATE)
-            : audioForAsr;
+          const asrSamples = !speakerTrimmed && preDenoisedForAsr
+            ? preDenoisedForAsr
+            : (usedDenoisedSamples && speakerTrimmed
+              ? audioForAsr
+              : (this.denoiserManager
+                ? await this.denoiserManager.denoiseAsync(audioForAsr, SAMPLE_RATE)
+                : audioForAsr));
           if (this.closed || worker.stopped) return;
           rawText = preferFastLocal
             ? await recognizer.transcribe(asrSamples, SAMPLE_RATE, { preferFastLocal: true })
@@ -3238,12 +3479,9 @@ export class XiaoaiKwsMonitor {
         const explicitWake = keyword !== '连续对话' || hasLeadingXiaoaiWakeWord(rawText);
         const cleanText = cleanXiaoaiAsrUtterance(rawText);
         const durationSec = (audioForAsr.length / SAMPLE_RATE).toFixed(2);
-        const refLog = maxRefRms !== undefined ? ` refRms=${maxRefRms.toFixed(4)}` : '';
-        const frontendLog = frontendMeta
-          ? ` doa=${frontendMeta.azimuthDeg}°${frontendMeta.aecApplied ? ` aec=-${frontendMeta.echoReductionDb.toFixed(1)}dB` : ''}${refLog}`
-          : refLog;
+        const spkLog = matchedSpeaker ? ` spk=${matchedSpeaker.score.toFixed(2)}` : '';
         console.log(
-          `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: wake="${keyword}" dur=${durationSec}s maxRms=${maxRms.toFixed(5)}${frontendLog} raw=${JSON.stringify(rawText)} clean=${JSON.stringify(cleanText)}`,
+          `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: wake="${keyword}" dur=${durationSec}s maxRms=${maxRms.toFixed(5)}${frontendLog}${spkLog} raw=${JSON.stringify(rawText)} clean=${JSON.stringify(cleanText)}`,
         );
         if (this.closed || worker.stopped) return;
         if (!cleanText) {

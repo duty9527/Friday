@@ -958,8 +958,88 @@ export class OnlineHexBeamformer {
     for (const h of this.micHist) h.fill(0);
     this.prevBeamSample.fill(0);
     this.beamAmbientRms.fill(0);
+    this.beamRmsBuf.fill(0);
     this.beamSnrBuf.fill(0);
     this.activeBeam = 0;
+  }
+
+  getActiveBeam(): number {
+    return this.activeBeam;
+  }
+
+  private findHealthyMicIndices(mics: readonly Float32Array[], activeMics: number): number[] {
+    const rmsList: number[] = [];
+    for (let m = 0; m < activeMics; m++) {
+      rmsList.push(calcRms(mics[m]!));
+    }
+    const medRms = medianNumber(rmsList);
+    const healthyIndices: number[] = [];
+    for (let m = 0; m < activeMics; m++) {
+      const r = rmsList[m]!;
+      if (r > 1e-6 && (medRms <= 0 || (r >= medRms * 0.2 && r <= medRms * 5.0))) {
+        healthyIndices.push(m);
+      }
+    }
+    return healthyIndices;
+  }
+
+  private accumulateCubicBeamChannel(
+    pad: Float32Array,
+    numSamples: number,
+    k: number,
+    w0: number,
+    w1: number,
+    w2: number,
+    w3: number,
+    out: Float32Array,
+  ): void {
+    const base = ONLINE_BEAM_HISTORY - k;
+    for (let t = 0; t < numSamples; t++) {
+      const idx = base + t;
+      out[t] = out[t]! + pad[idx + 1]! * w0 + pad[idx]! * w1 + pad[idx - 1]! * w2 + pad[idx - 2]! * w3;
+    }
+  }
+
+  /** Statelessly steer a multi-mic slice toward a fixed beam index without mutating online state. */
+  steerFixedBeam(mics: readonly Float32Array[], beamIndex: number): Float32Array {
+    const numSamples = mics[0]?.length ?? 0;
+    if (mics.length === 0 || numSamples === 0) {
+      return new Float32Array(0);
+    }
+    const activeMics = Math.min(mics.length, this.micCount);
+    if (activeMics < 2) {
+      return new Float32Array(mics[0]!);
+    }
+    const healthyIndices = this.findHealthyMicIndices(mics, activeMics);
+    if (healthyIndices.length < 2) {
+      return new Float32Array(mics[0]!);
+    }
+    const b = Math.max(0, Math.min(ONLINE_BEAM_ANGLES_DEG.length - 1, Math.trunc(beamIndex)));
+    const dInt = this.delayInt[b]!;
+    const cw0 = this.cubicW0[b]!;
+    const cw1 = this.cubicW1[b]!;
+    const cw2 = this.cubicW2[b]!;
+    const cw3 = this.cubicW3[b]!;
+    const out = new Float32Array(numSamples);
+    const invM = 1 / healthyIndices.length;
+    const pad = new Float32Array(ONLINE_BEAM_HISTORY + numSamples);
+    for (let hPos = 0; hPos < healthyIndices.length; hPos++) {
+      const m = healthyIndices[hPos]!;
+      const src = mics[m]!;
+      pad.fill(0, 0, ONLINE_BEAM_HISTORY);
+      pad.set(src.length > numSamples ? src.subarray(0, numSamples) : src, ONLINE_BEAM_HISTORY);
+      this.accumulateCubicBeamChannel(
+        pad,
+        numSamples,
+        dInt[m]!,
+        cw0[m]! * invM,
+        cw1[m]! * invM,
+        cw2[m]! * invM,
+        cw3[m]! * invM,
+        out,
+      );
+    }
+    return out;
   }
 
   process(mics: readonly Float32Array[]): { samples: Float32Array; activeBeam: number; azimuthDeg: number } {
@@ -981,18 +1061,7 @@ export class OnlineHexBeamformer {
       };
     }
 
-    const rmsList: number[] = [];
-    for (let m = 0; m < activeMics; m++) {
-      rmsList.push(calcRms(mics[m]!));
-    }
-    const medRms = medianNumber(rmsList);
-    const healthyIndices: number[] = [];
-    for (let m = 0; m < activeMics; m++) {
-      const r = rmsList[m]!;
-      if (r > 1e-6 && (medRms <= 0 || (r >= medRms * 0.2 && r <= medRms * 5.0))) {
-        healthyIndices.push(m);
-      }
-    }
+    const healthyIndices = this.findHealthyMicIndices(mics, activeMics);
 
     const paddedLen = ONLINE_BEAM_HISTORY + numSamples;
     while (this.paddedMics.length < activeMics) {
@@ -1041,17 +1110,16 @@ export class OnlineHexBeamformer {
       const cw3 = this.cubicW3[b]!;
       for (let hPos = 0; hPos < healthyIndices.length; hPos++) {
         const m = healthyIndices[hPos]!;
-        const pad = this.paddedMics[m]!;
-        const k = dInt[m]!;
-        const w0 = cw0[m]! * invM;
-        const w1 = cw1[m]! * invM;
-        const w2 = cw2[m]! * invM;
-        const w3 = cw3[m]! * invM;
-        const base = ONLINE_BEAM_HISTORY - k;
-        for (let t = 0; t < numSamples; t++) {
-          const idx = base + t;
-          out[t] = out[t]! + pad[idx + 1]! * w0 + pad[idx]! * w1 + pad[idx - 1]! * w2 + pad[idx - 2]! * w3;
-        }
+        this.accumulateCubicBeamChannel(
+          this.paddedMics[m]!,
+          numSamples,
+          dInt[m]!,
+          cw0[m]! * invM,
+          cw1[m]! * invM,
+          cw2[m]! * invM,
+          cw3[m]! * invM,
+          out,
+        );
       }
 
       // Score beam directivity after pre-emphasis so sub-800Hz omnidirectional rumble
