@@ -24,6 +24,7 @@
     "playlist",
     "search-online",
     "download",
+    "downloads",
     "delete-track",
     "config"
   ],
@@ -129,6 +130,12 @@
       "label": "下载音乐到本地",
       "description": "按链接（url）或关键词（query）自动提取并转码音频保存到本地曲库（支持 YouTube / Bilibili / SoundCloud / 音频直链及 cookies.txt），支持 playAfter=true 下载完成后立即播放，async=true 后台异步下载。",
       "defaultArgs": { "query": "", "url": "", "source": "youtube", "playAfter": false }
+    },
+    {
+      "name": "downloads",
+      "label": "管理下载记录",
+      "description": "查看或清理下载任务记录（op: list / remove / clear；scope: all / failed / done）。正在进行的下载受保护不会被误删。",
+      "defaultArgs": { "op": "list" }
     },
     {
       "name": "delete-track",

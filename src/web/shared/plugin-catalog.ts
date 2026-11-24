@@ -80,6 +80,7 @@ const INTERNAL_ACTION_NAMES: ReadonlySet<string> = new Set([
   'set-holding',
   'queue',
   'playlist',
+  'downloads',
   'delete-track',
   'search-online',
 ]);
@@ -157,6 +158,7 @@ const ACTION_FALLBACK_LABELS: Record<string, string> = {
   playlist: '歌单管理',
   'search-online': '在线搜歌',
   download: '下载音乐',
+  downloads: '下载记录',
   'delete-track': '删除曲目',
 };
 

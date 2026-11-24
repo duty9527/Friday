@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
   chmodSync,
@@ -52,6 +52,13 @@ const NETSCAPE_HEADER_RE = /^#\s*(?:Netscape\s+)?HTTP Cookie File/i;
  * @typedef {{
  *   id: string;
  *   status: 'queued' | 'downloading' | 'done' | 'error';
+ *   phase?: 'searching' | 'preparing' | 'downloading' | 'processing' | 'indexing' | 'done' | 'error';
+ *   progressPercent?: number | null;
+ *   progressText?: string;
+ *   downloadedBytes?: number | null;
+ *   totalBytes?: number | null;
+ *   speedText?: string;
+ *   etaText?: string;
  *   query: string;
  *   url: string;
  *   source: string;
@@ -62,6 +69,7 @@ const NETSCAPE_HEADER_RE = /^#\s*(?:Netscape\s+)?HTTP Cookie File/i;
  *   playAfter?: boolean;
  *   error?: string;
  *   startedAt: number;
+ *   updatedAt?: number;
  *   finishedAt?: number;
  * }} DownloadJob
  */
@@ -659,6 +667,329 @@ export function upsertDownloadJob(pluginDataDir, job) {
 }
 
 /**
+ * @param {string} pluginDataDir
+ * @param {string} jobId
+ * @param {{ has(id: string): boolean }} [activeJobIds]
+ * @returns {{ ok: boolean; removed: number; remaining: number; message: string; jobs: DownloadJob[] }}
+ */
+export function removeDownloadJob(pluginDataDir, jobId, activeJobIds) {
+  const cleanId = String(jobId ?? '').trim();
+  const jobs = loadDownloadJobs(pluginDataDir);
+  if (!cleanId) {
+    return { ok: false, removed: 0, remaining: jobs.length, message: '请指定要删除的下载记录 ID', jobs };
+  }
+  if (activeJobIds?.has(cleanId)) {
+    return { ok: false, removed: 0, remaining: jobs.length, message: '该下载任务正在进行中，暂不可删除', jobs };
+  }
+  const nextJobs = jobs.filter((j) => j.id !== cleanId);
+  const removed = jobs.length - nextJobs.length;
+  if (removed === 0) {
+    return { ok: false, removed: 0, remaining: jobs.length, message: '未找到对应的下载记录', jobs };
+  }
+  writeJsonAtomic(join(pluginDataDir, 'downloads.json'), {
+    updatedAt: Date.now(),
+    jobs: nextJobs,
+  });
+  return { ok: true, removed, remaining: nextJobs.length, message: '已删除 1 条下载记录', jobs: nextJobs };
+}
+
+/**
+ * @param {string} pluginDataDir
+ * @param {{ scope?: string }} [options]
+ * @param {{ has(id: string): boolean }} [activeJobIds]
+ * @returns {{ ok: boolean; removed: number; remaining: number; message: string; jobs: DownloadJob[] }}
+ */
+export function clearDownloadJobs(pluginDataDir, options = {}, activeJobIds) {
+  const scope = String(options?.scope ?? 'all').trim().toLowerCase();
+  const jobs = loadDownloadJobs(pluginDataDir);
+  const nextJobs = jobs.filter((j) => {
+    if (activeJobIds?.has(j.id)) return true;
+    if (scope === 'failed') return j.status !== 'error';
+    if (scope === 'done') return j.status !== 'done';
+    return false;
+  });
+  const removed = jobs.length - nextJobs.length;
+  if (removed > 0) {
+    writeJsonAtomic(join(pluginDataDir, 'downloads.json'), {
+      updatedAt: Date.now(),
+      jobs: nextJobs,
+    });
+  }
+  return {
+    ok: true,
+    removed,
+    remaining: nextJobs.length,
+    message: removed > 0 ? `已清理 ${removed} 条下载记录` : '没有可清理的历史下载记录',
+    jobs: nextJobs,
+  };
+}
+
+const ANSI_ESCAPE_RE = /[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><~]/g;
+
+/**
+ * @param {unknown} raw
+ * @returns {string}
+ */
+function cleanMetricText(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s || /^(?:NA|N\/A|Unknown|~|--:--|--)$/i.test(s)) return '';
+  return s;
+}
+
+/**
+ * @param {unknown} raw
+ * @returns {number | null}
+ */
+function parseNonNegInt(raw) {
+  const s = cleanMetricText(raw);
+  if (!s) return null;
+  const n = Number(s);
+  return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
+}
+
+/**
+ * @param {string} rawLine
+ * @returns {Partial<DownloadJob> | null}
+ */
+export function parseYtDlpProgressLine(rawLine) {
+  const line = String(rawLine ?? '').replace(ANSI_ESCAPE_RE, '').trim();
+  if (!line) return null;
+
+  const dlIdx = line.indexOf('FRIDAY_DL_PROGRESS:');
+  if (dlIdx >= 0) {
+    const payload = line.slice(dlIdx + 'FRIDAY_DL_PROGRESS:'.length);
+    const parts = payload.split('|');
+    const status = String(parts[0] ?? '').trim().toLowerCase();
+    const rawPercent = cleanMetricText(parts[1]).replace(/%$/, '');
+    const speedText = cleanMetricText(parts[2]);
+    const etaText = cleanMetricText(parts[3]);
+    const downloadedBytes = parseNonNegInt(parts[4]);
+    const totalBytes = parseNonNegInt(parts[5]) ?? parseNonNegInt(parts[6]);
+
+    let progressPercent = null;
+    if (rawPercent) {
+      const n = Number(rawPercent);
+      if (Number.isFinite(n)) {
+        progressPercent = Math.max(0, Math.min(100, Math.round(n * 10) / 10));
+      }
+    }
+    if (progressPercent === null && downloadedBytes !== null && totalBytes !== null && totalBytes > 0) {
+      progressPercent = Math.max(0, Math.min(100, Math.round((downloadedBytes / totalBytes) * 1000) / 10));
+    }
+
+    if (status === 'finished') {
+      return {
+        phase: 'processing',
+        progressPercent: 96,
+        downloadedBytes,
+        totalBytes,
+        ...(speedText ? { speedText } : {}),
+        progressText: '音频下载完成，正在转码与写入标签…',
+      };
+    }
+
+    const captionParts = [
+      progressPercent !== null ? `下载中 ${Math.round(progressPercent)}%` : '正在下载音频…',
+      ...(speedText ? [speedText] : []),
+      ...(etaText ? [`剩余 ${etaText}`] : []),
+    ];
+    return {
+      phase: 'downloading',
+      progressPercent,
+      downloadedBytes,
+      totalBytes,
+      ...(speedText ? { speedText } : {}),
+      ...(etaText ? { etaText } : {}),
+      progressText: captionParts.join(' · '),
+    };
+  }
+
+  const ppIdx = line.indexOf('FRIDAY_PP_PROGRESS:');
+  if (ppIdx >= 0) {
+    const payload = line.slice(ppIdx + 'FRIDAY_PP_PROGRESS:'.length);
+    const parts = payload.split('|');
+    const status = String(parts[0] ?? '').trim().toLowerCase();
+    const postprocessor = cleanMetricText(parts[1]);
+    if (status === 'finished') {
+      return {
+        phase: 'processing',
+        progressPercent: 99,
+        progressText: '转码完成，正在整理文件…',
+      };
+    }
+    const label = /extractaudio/i.test(postprocessor)
+      ? '正在提取并转码音频…'
+      : /metadata/i.test(postprocessor)
+        ? '正在写入歌曲元数据…'
+        : '正在处理音频文件…';
+    return {
+      phase: 'processing',
+      progressPercent: 97,
+      progressText: label,
+    };
+  }
+
+  const stdMatch = /^\[download\]\s+(\d+(?:\.\d+)?)%\s+of\s+~?\s*[\d.]+\s*[KMGTP]?i?B(?:\s+at\s+([^\s]+))?(?:\s+ETA\s+([^\s]+))?/i.exec(line);
+  if (stdMatch) {
+    const n = Number(stdMatch[1]);
+    const progressPercent = Number.isFinite(n) ? Math.max(0, Math.min(100, Math.round(n * 10) / 10)) : null;
+    const speedText = cleanMetricText(stdMatch[2]);
+    const etaText = cleanMetricText(stdMatch[3]);
+    const captionParts = [
+      progressPercent !== null ? `下载中 ${Math.round(progressPercent)}%` : '正在下载音频…',
+      ...(speedText ? [speedText] : []),
+      ...(etaText ? [`剩余 ${etaText}`] : []),
+    ];
+    return {
+      phase: 'downloading',
+      progressPercent,
+      ...(speedText ? { speedText } : {}),
+      ...(etaText ? { etaText } : {}),
+      progressText: captionParts.join(' · '),
+    };
+  }
+
+  return null;
+}
+
+/**
+ * @param {string} ytDlpBin
+ * @param {string[]} args
+ * @param {{
+ *   timeoutMs?: number;
+ *   signal?: AbortSignal;
+ *   onProgress?: (update: Partial<DownloadJob>) => void;
+ *   spawnFn?: typeof spawn;
+ * }} [opts]
+ * @returns {Promise<{ stdout: string; stderr: string }>}
+ */
+function runYtDlpDownloadStreaming(ytDlpBin, args, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? DOWNLOAD_TIMEOUT_MS;
+  const spawnImpl = opts.spawnFn ?? spawn;
+  const maxCaptureBytes = 2 * 1024 * 1024;
+
+  return new Promise((resolvePromise, rejectPromise) => {
+    if (opts.signal?.aborted) {
+      rejectPromise(new Error('下载已取消'));
+      return;
+    }
+
+    const child = spawnImpl(ytDlpBin, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    /** @type {string[]} */
+    const stdoutLines = [];
+    /** @type {string[]} */
+    const stderrLines = [];
+    let capturedBytes = 0;
+    let outRem = '';
+    let errRem = '';
+    let settled = false;
+    let timedOut = false;
+    let aborted = false;
+    /** @type {NodeJS.Timeout | undefined} */
+    let killTimer;
+
+    const pushCleanLine = (line, isStderr) => {
+      const parsed = parseYtDlpProgressLine(line);
+      if (parsed) {
+        try {
+          opts.onProgress?.(parsed);
+        } catch {
+          // ignore progress callback error
+        }
+        return;
+      }
+      const trimmed = line.replace(/\r$/, '');
+      if (!trimmed) return;
+      const bytes = Buffer.byteLength(trimmed, 'utf8') + 1;
+      if (capturedBytes + bytes > maxCaptureBytes) return;
+      capturedBytes += bytes;
+      if (isStderr) stderrLines.push(trimmed);
+      else stdoutLines.push(trimmed);
+    };
+
+    const feedChunk = (chunk, isStderr) => {
+      const text = (isStderr ? errRem : outRem) + String(chunk ?? '');
+      const parts = text.split(/\r?\n|\r/);
+      const tail = parts.pop() ?? '';
+      if (isStderr) errRem = tail;
+      else outRem = tail;
+      for (const part of parts) {
+        pushCleanLine(part, isStderr);
+      }
+    };
+
+    const killChild = () => {
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // ignore kill error
+      }
+      killTimer = setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // ignore kill error
+        }
+      }, 2000);
+      killTimer.unref?.();
+    };
+
+    const onTimeout = () => {
+      timedOut = true;
+      killChild();
+    };
+
+    const timeoutTimer = setTimeout(onTimeout, timeoutMs);
+    timeoutTimer.unref?.();
+
+    const onAbort = () => {
+      aborted = true;
+      killChild();
+    };
+    opts.signal?.addEventListener('abort', onAbort, { once: true });
+
+    const cleanup = () => {
+      clearTimeout(timeoutTimer);
+      if (killTimer) clearTimeout(killTimer);
+      opts.signal?.removeEventListener('abort', onAbort);
+    };
+
+    child.stdout?.on('data', (chunk) => feedChunk(chunk, false));
+    child.stderr?.on('data', (chunk) => feedChunk(chunk, true));
+
+    child.once('error', (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      rejectPromise(err);
+    });
+
+    child.once('close', (code) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (outRem) pushCleanLine(outRem, false);
+      if (errRem) pushCleanLine(errRem, true);
+      const stdout = stdoutLines.join('\n');
+      const stderr = stderrLines.join('\n');
+      if (code === 0 && !timedOut && !aborted) {
+        resolvePromise({ stdout, stderr });
+        return;
+      }
+      const err = new Error(timedOut ? `Command timed out after ${timeoutMs}ms` : aborted ? '下载已取消' : `yt-dlp exited with code ${code ?? 'unknown'}`);
+      /** @type {any} */ (err).stderr = stderr;
+      /** @type {any} */ (err).stdout = stdout;
+      /** @type {any} */ (err).code = code;
+      /** @type {any} */ (err).killed = timedOut;
+      rejectPromise(err);
+    });
+  });
+}
+
+/**
  * @param {{
  *   url?: string;
  *   query?: string;
@@ -670,11 +1001,13 @@ export function upsertDownloadJob(pluginDataDir, job) {
  *   ytDlpPath?: string;
  *   cookiesPath?: string;
  *   signal?: AbortSignal;
+ *   onProgress?: (update: Partial<DownloadJob>) => void;
  * }} params
  * @param {{
  *   ytDlpPath?: string;
  *   cookiesPath?: string;
  *   execFileFn?: (cmd: string, args: string[], opts?: Record<string, unknown>) => Promise<{ stdout?: unknown; stderr?: unknown }>;
+ *   spawnFn?: typeof spawn;
  * }} [deps]
  * @returns {Promise<{ filePath: string; title: string; artist: string; source: string; url: string }>}
  */
@@ -695,6 +1028,11 @@ export async function downloadOnlineAudioFile(params, deps = {}) {
     targetUrl = checked.url;
     resolvedSource = checked.source;
   } else if (params.query && String(params.query).trim()) {
+    params.onProgress?.({
+      phase: 'searching',
+      progressPercent: 0,
+      progressText: '正在搜索在线音源…',
+    });
     const searchRes = await searchOnlineTracks(String(params.query), {
       source: resolvedSource === 'auto' ? 'auto' : resolvedSource,
       limit: 3,
@@ -715,6 +1053,16 @@ export async function downloadOnlineAudioFile(params, deps = {}) {
     throw new Error('请提供下载链接（url）或歌曲搜索关键词（query）');
   }
 
+  params.onProgress?.({
+    phase: 'preparing',
+    progressPercent: 5,
+    progressText: '正在连接音源并准备下载…',
+    ...(title ? { title } : {}),
+    ...(artist ? { artist } : {}),
+    source: resolvedSource,
+    url: targetUrl,
+  });
+
   const audioFormat = String(params.format ?? 'mp3').trim().toLowerCase() === 'm4a' ? 'm4a' : 'mp3';
   const musicDir = resolve(params.musicDir);
   const downloadsDir = join(musicDir, 'downloads');
@@ -727,7 +1075,6 @@ export async function downloadOnlineAudioFile(params, deps = {}) {
 
   const tmpDir = join(downloadsReal, `.dl-${randomUUID().slice(0, 8)}`);
   mkdirSync(tmpDir, { recursive: true });
-  const execFn = deps.execFileFn ?? ((cmd, args, opts) => execFileAsync(cmd, args, opts));
 
   try {
     const res = await withEphemeralCookiesCopy(cookiesPath, async (ephemeralCookies) => {
@@ -735,7 +1082,14 @@ export async function downloadOnlineAudioFile(params, deps = {}) {
       const args = [
         '--no-playlist',
         '--no-warnings',
-        '--no-progress',
+        '--newline',
+        '--progress',
+        '--progress-delta',
+        '0.5',
+        '--progress-template',
+        'download:FRIDAY_DL_PROGRESS:%(progress.status)s|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s',
+        '--progress-template',
+        'postprocess:FRIDAY_PP_PROGRESS:%(progress.status)s|%(progress.postprocessor)s',
         '--js-runtimes',
         'node',
         '-x',
@@ -753,11 +1107,31 @@ export async function downloadOnlineAudioFile(params, deps = {}) {
         targetUrl,
       ];
       try {
-        return await execFn(ytDlpBin, args, {
-          encoding: 'utf8',
-          timeout: DOWNLOAD_TIMEOUT_MS,
-          maxBuffer: 4 * 1024 * 1024,
-          ...(params.signal ? { signal: params.signal } : {}),
+        if (deps.execFileFn) {
+          const mockRes = await deps.execFileFn(ytDlpBin, args, {
+            encoding: 'utf8',
+            timeout: DOWNLOAD_TIMEOUT_MS,
+            maxBuffer: 4 * 1024 * 1024,
+            ...(params.signal ? { signal: params.signal } : {}),
+          });
+          /** @type {string[]} */
+          const cleanOut = [];
+          for (const rawLine of String(mockRes?.stdout ?? '').split(/\r?\n|\r/)) {
+            const parsed = parseYtDlpProgressLine(rawLine);
+            if (parsed) params.onProgress?.(parsed);
+            else if (rawLine.trim()) cleanOut.push(rawLine.trim());
+          }
+          for (const rawLine of String(mockRes?.stderr ?? '').split(/\r?\n|\r/)) {
+            const parsed = parseYtDlpProgressLine(rawLine);
+            if (parsed) params.onProgress?.(parsed);
+          }
+          return { stdout: cleanOut.join('\n'), stderr: String(mockRes?.stderr ?? '') };
+        }
+        return await runYtDlpDownloadStreaming(ytDlpBin, args, {
+          timeoutMs: DOWNLOAD_TIMEOUT_MS,
+          signal: params.signal,
+          onProgress: params.onProgress,
+          spawnFn: deps.spawnFn,
         });
       } catch (err) {
         throw new Error(formatYtDlpError(err, {
@@ -771,7 +1145,7 @@ export async function downloadOnlineAudioFile(params, deps = {}) {
     const printedLines = String(res?.stdout ?? '')
       .split(/\r?\n/)
       .map((l) => l.trim())
-      .filter(Boolean);
+      .filter((l) => l && !l.startsWith('FRIDAY_DL_PROGRESS:') && !l.startsWith('FRIDAY_PP_PROGRESS:') && !l.startsWith('['));
     let producedPath = printedLines.at(-1) || '';
     if (!producedPath || !existsSync(producedPath)) {
       const files = readdirSync(tmpDir)

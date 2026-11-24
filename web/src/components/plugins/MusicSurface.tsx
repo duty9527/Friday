@@ -79,6 +79,13 @@ interface MusicPlaylistView {
 interface DownloadJobView {
   id: string;
   status: 'queued' | 'downloading' | 'done' | 'error';
+  phase?: 'searching' | 'preparing' | 'downloading' | 'processing' | 'indexing' | 'done' | 'error';
+  progressPercent?: number | null;
+  progressText?: string;
+  downloadedBytes?: number | null;
+  totalBytes?: number | null;
+  speedText?: string;
+  etaText?: string;
   query: string;
   url: string;
   source: string;
@@ -87,6 +94,7 @@ interface DownloadJobView {
   trackId?: string;
   error?: string;
   startedAt: number;
+  updatedAt?: number;
   finishedAt?: number;
 }
 
@@ -261,7 +269,7 @@ export default function MusicSurface() {
           if (mountedRef.current && res.ok && res.data) applyDashboard(res.data);
         })
         .catch(() => undefined);
-    }, hasActiveDownloads ? 2500 : 5000);
+    }, hasActiveDownloads ? 1000 : 5000);
     return () => {
       clearInterval(timer);
       ac.abort();
@@ -1004,36 +1012,119 @@ export default function MusicSurface() {
                 </div>
               )}
 
-              {(data?.downloads?.length ?? 0) > 0 && (
-                <div className="space-y-1.5 pt-2">
-                  <div className="text-xs font-medium text-muted-foreground">最近下载任务</div>
-                  {(data?.downloads ?? []).slice(0, 8).map(job => {
-                    const needsCookieHint = job.status === 'error' && /cookie|风控|not a bot|412/i.test(job.error || '');
-                    return (
-                      <div key={job.id} className="rounded-md border px-2.5 py-2 text-xs">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <span className="min-w-0 flex-1 truncate font-medium">{job.title}</span>
-                          <div className="flex shrink-0 items-center gap-1.5">
-                            {needsCookieHint && (
-                              <Button type="button" size="xs" variant="outline" onClick={() => setActiveTab('config')}>
-                                去导入 Cookie
-                              </Button>
-                            )}
-                            <Badge variant={job.status === 'done' ? 'success' : job.status === 'error' ? 'error' : 'warning'}>
-                              {job.status === 'done' ? '已完成' : job.status === 'error' ? '失败' : '下载中'}
-                            </Badge>
-                          </div>
-                        </div>
-                        {job.error && (
-                          <p className="mt-1 break-words text-[11px] leading-relaxed text-destructive">
-                            {job.error}
-                          </p>
+              {(data?.downloads?.length ?? 0) > 0 && (() => {
+                const downloadsList = data?.downloads ?? [];
+                const hasFailedDownloads = downloadsList.some(j => j.status === 'error');
+                const hasClearableDownloads = downloadsList.some(j => j.status === 'done' || j.status === 'error');
+                return (
+                  <div className="space-y-1.5 pt-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-xs font-medium text-muted-foreground">
+                        最近下载任务 ({downloadsList.length})
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        {hasFailedDownloads && (
+                          <Button
+                            type="button"
+                            size="xs"
+                            variant="outline"
+                            disabled={busy}
+                            onClick={() => void runAction('正在清理失败下载记录…', async () => {
+                              const res = await callMusic('downloads', { op: 'clear', scope: 'failed' });
+                              setStatus({ text: res.message || '已清理失败记录', tone: res.ok ? 'ok' : 'err' });
+                              await refreshDashboard(false, true);
+                            })}
+                          >
+                            清理失败
+                          </Button>
+                        )}
+                        {hasClearableDownloads && (
+                          <Button
+                            type="button"
+                            size="xs"
+                            variant="ghost"
+                            disabled={busy}
+                            onClick={() => void runAction('正在清空下载历史…', async () => {
+                              const res = await callMusic('downloads', { op: 'clear', scope: 'all' });
+                              setStatus({ text: res.message || '已清空下载历史', tone: res.ok ? 'ok' : 'err' });
+                              await refreshDashboard(false, true);
+                            })}
+                          >
+                            清空历史
+                          </Button>
                         )}
                       </div>
-                    );
-                  })}
-                </div>
-              )}
+                    </div>
+                    {downloadsList.slice(0, 15).map(job => {
+                      const isActive = job.status === 'downloading' || job.status === 'queued';
+                      const needsCookieHint = job.status === 'error' && /cookie|风控|not a bot|412/i.test(job.error || '');
+                      return (
+                        <div key={job.id} className="rounded-md border px-2.5 py-2 text-xs">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="min-w-0 flex-1 truncate font-medium">{job.title}</span>
+                            <div className="flex shrink-0 items-center gap-1.5">
+                              {isActive && <Spinner className="size-3" />}
+                              {needsCookieHint && (
+                                <Button type="button" size="xs" variant="outline" onClick={() => setActiveTab('config')}>
+                                  去导入 Cookie
+                                </Button>
+                              )}
+                              <Badge variant={job.status === 'done' ? 'success' : job.status === 'error' ? 'error' : 'warning'}>
+                                {job.status === 'done'
+                                  ? '已完成'
+                                  : job.status === 'error'
+                                    ? '失败'
+                                    : typeof job.progressPercent === 'number'
+                                      ? `${Math.round(job.progressPercent)}%`
+                                      : '下载中'}
+                              </Badge>
+                              {!isActive && (
+                                <Button
+                                  type="button"
+                                  size="xs"
+                                  variant="ghost"
+                                  disabled={busy}
+                                  aria-label={`删除下载记录 ${job.title}`}
+                                  onClick={() => void runAction('正在删除下载记录…', async () => {
+                                    const res = await callMusic('downloads', { op: 'remove', jobId: job.id });
+                                    setStatus({ text: res.message || '已删除下载记录', tone: res.ok ? 'ok' : 'err' });
+                                    await refreshDashboard(false, true);
+                                  })}
+                                >
+                                  <Trash2Icon className="size-3 text-muted-foreground" />
+                                </Button>
+                              )}
+                            </div>
+                          </div>
+                          {isActive && (
+                            <div className="mt-1.5 space-y-1">
+                              <progress
+                                aria-label={`下载进度 ${job.title}`}
+                                max={100}
+                                value={typeof job.progressPercent === 'number' ? Math.max(0, Math.min(100, Math.round(job.progressPercent))) : undefined}
+                                className="block h-1.5 w-full overflow-hidden rounded-full bg-input [&::-moz-progress-bar]:rounded-full [&::-moz-progress-bar]:bg-primary [&::-webkit-progress-bar]:rounded-full [&::-webkit-progress-bar]:bg-input [&::-webkit-progress-value]:rounded-full [&::-webkit-progress-value]:bg-primary"
+                              />
+                              <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground">
+                                <span className="truncate">{job.progressText || '正在下载…'}</span>
+                                {typeof job.downloadedBytes === 'number' && typeof job.totalBytes === 'number' && job.totalBytes > 0 && (
+                                  <span className="shrink-0 tabular-nums">
+                                    {formatBytes(job.downloadedBytes)} / {formatBytes(job.totalBytes)}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          )}
+                          {job.error && (
+                            <p className="mt-1 break-words text-[11px] leading-relaxed text-destructive">
+                              {job.error}
+                            </p>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
             </CardContent>
           </Card>
         </TabsPanel>

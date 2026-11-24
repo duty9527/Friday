@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -19,7 +21,13 @@ import {
 import { tryPluginVoiceFastpath } from '../src/plugin.js';
 import { runAction, stopAllMusicWatchers } from '../plugins/music/index.mjs';
 import { parseMusicVoiceUtterance, handleMusicVoiceFastpath } from '../plugins/music/fastpath.mjs';
-import { detectSourceFromUrl, formatYtDlpError, searchOnlineTracks } from '../plugins/music/downloader.mjs';
+import {
+  detectSourceFromUrl,
+  formatYtDlpError,
+  parseYtDlpProgressLine,
+  searchOnlineTracks,
+  upsertDownloadJob,
+} from '../plugins/music/downloader.mjs';
 import { scanLibrary, searchLocalTracks } from '../plugins/music/library.mjs';
 
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -651,6 +659,168 @@ test('yt-dlp error formatting, ephemeral cookies.txt handling, legacy job normal
     stopAllMusicWatchers();
     await web.close();
     await daemon.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('streaming download progress parsing, live dashboard progress, active-job protection, and downloads history cleanup', async () => {
+  // 1. Progress line parser checks
+  const dlProg = parseYtDlpProgressLine('FRIDAY_DL_PROGRESS:downloading| 42.3%| 1.25MiB/s|00:08|1500000|3500000|NA');
+  assert.equal(dlProg?.phase, 'downloading');
+  assert.equal(dlProg?.progressPercent, 42.3);
+  assert.equal(dlProg?.downloadedBytes, 1_500_000);
+  assert.equal(dlProg?.totalBytes, 3_500_000);
+  assert.match(String(dlProg?.progressText), /42%.*1\.25MiB\/s.*00:08/);
+
+  const dlFin = parseYtDlpProgressLine('FRIDAY_DL_PROGRESS:finished|100%|2.00MiB/s|00:00|3500000|3500000|NA');
+  assert.equal(dlFin?.phase, 'processing');
+  assert.equal(dlFin?.progressPercent, 96);
+
+  const ppProg = parseYtDlpProgressLine('FRIDAY_PP_PROGRESS:started|ExtractAudio');
+  assert.equal(ppProg?.phase, 'processing');
+  assert.equal(ppProg?.progressPercent, 97);
+  assert.match(String(ppProg?.progressText), /提取并转码音频/);
+
+  const stdProg = parseYtDlpProgressLine('[download]  65.0% of 4.00MiB at 2.00MiB/s ETA 00:01');
+  assert.equal(stdProg?.phase, 'downloading');
+  assert.equal(stdProg?.progressPercent, 65);
+  assert.match(String(stdProg?.progressText), /65%.*2\.00MiB\/s.*00:01/);
+
+  assert.equal(parseYtDlpProgressLine('/tmp/music/song.mp3'), null);
+
+  // 2. Live streaming download via mocked spawnFn + history cleanup via downloads action
+  const { root, homeDir, musicDir } = makeTempWorkspace('friday-music-prog-');
+  try {
+    const pluginDataDir = join(homeDir, 'plugins', 'music');
+    await runAction('config', { musicDir }, { homeDir, pluginDataDir });
+
+    const childOut = new PassThrough();
+    const childErr = new PassThrough();
+    const mockChild = Object.assign(new EventEmitter(), {
+      stdout: childOut,
+      stderr: childErr,
+      kill: () => {},
+    });
+    let spawned = false;
+    let capturedOutDir = '';
+
+    const mockSpawn = (_cmd: string, args: string[]) => {
+      const outIdx = args.indexOf('-o');
+      capturedOutDir = resolve(args[outIdx + 1]!, '..');
+      spawned = true;
+      return mockChild;
+    };
+
+    const dlStart = await runAction('download', {
+      url: 'https://soundcloud.com/artist/live-progress-song',
+      titleHint: '实时进度测试曲目',
+      artistHint: '测试歌手',
+      playAfter: false,
+      async: true,
+    }, { homeDir, pluginDataDir }, {
+      ytDlpPath: '/usr/bin/yt-dlp',
+      spawnFn: mockSpawn,
+    });
+    assert.equal(dlStart.ok, true);
+    const jobId = String(dlStart.data?.jobId ?? '');
+    assert.ok(jobId);
+
+    for (let i = 0; i < 20 && !spawned; i += 1) {
+      await delay(10);
+    }
+    assert.equal(spawned, true, 'mock child process must be spawned');
+
+    // Push live download progress chunk
+    childErr.write('FRIDAY_DL_PROGRESS:downloading| 48.0%| 1.50MiB/s|00:04|1680000|3500000|NA\n');
+    await delay(20);
+
+    const dashDownloading = await runAction('dashboard', { live: false }, { homeDir, pluginDataDir });
+    const liveJob = dashDownloading.data?.downloads?.find((j: any) => j.id === jobId);
+    assert.equal(liveJob?.status, 'downloading');
+    assert.equal(liveJob?.progressPercent, 48);
+    assert.equal(liveJob?.downloadedBytes, 1_680_000);
+    assert.equal(liveJob?.totalBytes, 3_500_000);
+    assert.match(String(liveJob?.progressText), /48%.*1\.50MiB\/s/);
+
+    // Active download must be protected from removal
+    const blockedRemove = await runAction('downloads', { op: 'remove', jobId }, { homeDir, pluginDataDir });
+    assert.equal(blockedRemove.ok, false);
+    assert.match(String(blockedRemove.message), /正在进行中/);
+
+    // Push postprocess chunk then finish
+    childErr.write('FRIDAY_PP_PROGRESS:started|ExtractAudio\n');
+    await delay(20);
+    const dashProcessing = await runAction('dashboard', { live: false }, { homeDir, pluginDataDir });
+    assert.equal(dashProcessing.data?.downloads?.find((j: any) => j.id === jobId)?.phase, 'processing');
+    assert.equal(dashProcessing.data?.downloads?.find((j: any) => j.id === jobId)?.progressPercent, 97);
+
+    const producedFile = join(capturedOutDir, '实时进度测试曲目.mp3');
+    writeFileSync(producedFile, Buffer.from('ID3streaming-progress-done'));
+    childOut.write(`${producedFile}\n`);
+    childOut.end();
+    childErr.end();
+    mockChild.emit('close', 0);
+
+    let finishedStatus = '';
+    let finishedPercent: unknown = null;
+    for (let i = 0; i < 40; i += 1) {
+      const d = await runAction('dashboard', { live: false }, { homeDir, pluginDataDir });
+      const j = d.data?.downloads?.find((item: any) => item.id === jobId);
+      if (j?.status === 'done') {
+        finishedStatus = j.status;
+        finishedPercent = j.progressPercent;
+        break;
+      }
+      await delay(15);
+    }
+    assert.equal(finishedStatus, 'done');
+    assert.equal(finishedPercent, 100);
+
+    // Seed two additional history jobs and test remove / clear failed / clear all
+    upsertDownloadJob(pluginDataDir, {
+      id: 'dl-err-1',
+      status: 'error',
+      query: '',
+      url: 'https://soundcloud.com/a/err1',
+      source: 'soundcloud',
+      title: '失败记录 1',
+      artist: '',
+      error: '[soundcloud] 1: This video is DRM protected',
+      startedAt: Date.now() - 2000,
+      finishedAt: Date.now() - 1000,
+    });
+    upsertDownloadJob(pluginDataDir, {
+      id: 'dl-err-2',
+      status: 'error',
+      query: '',
+      url: 'https://soundcloud.com/a/err2',
+      source: 'soundcloud',
+      title: '失败记录 2',
+      artist: '',
+      error: '超时',
+      startedAt: Date.now() - 1500,
+      finishedAt: Date.now() - 500,
+    });
+
+    const listRes = await runAction('downloads', { op: 'list' }, { homeDir, pluginDataDir });
+    assert.equal(listRes.data?.jobs?.length, 3);
+
+    const rmOne = await runAction('downloads', { op: 'remove', jobId: 'dl-err-2' }, { homeDir, pluginDataDir });
+    assert.equal(rmOne.ok, true);
+    assert.equal(rmOne.data?.removed, 1);
+    assert.equal(rmOne.data?.remaining, 2);
+
+    const clearFailed = await runAction('downloads', { op: 'clear', scope: 'failed' }, { homeDir, pluginDataDir });
+    assert.equal(clearFailed.ok, true);
+    assert.equal(clearFailed.data?.removed, 1);
+    assert.equal(clearFailed.data?.remaining, 1);
+    assert.equal(clearFailed.data?.jobs?.[0]?.id, jobId);
+
+    const clearAll = await runAction('downloads', { op: 'clear', scope: 'all' }, { homeDir, pluginDataDir });
+    assert.equal(clearAll.ok, true);
+    assert.equal(clearAll.data?.removed, 1);
+    assert.equal(clearAll.data?.remaining, 0);
+  } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });

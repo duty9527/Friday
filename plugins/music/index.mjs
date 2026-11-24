@@ -16,12 +16,14 @@ import {
   writeJsonAtomic,
 } from '../_shared/config-store.mjs';
 import {
+  clearDownloadJobs,
   downloadOnlineAudioFile,
   findYtDlp,
   formatYtDlpError,
   inspectNetscapeCookiesFile,
   loadDownloadJobs,
   normalizeNetscapeCookiesText,
+  removeDownloadJob,
   searchOnlineTracks,
   upsertDownloadJob,
 } from './downloader.mjs';
@@ -68,6 +70,7 @@ export const ACTIONS = [
   'playlist',
   'search-online',
   'download',
+  'downloads',
   'delete-track',
   'config',
 ];
@@ -83,6 +86,8 @@ const SECRET_HEX_RE = /^[a-f0-9]{64}$/i;
 
 /** @type {Map<string, Promise<unknown>>} */
 const ACTIVE_DOWNLOAD_PROMISES = new Map();
+/** @type {Map<string, import('./downloader.mjs').DownloadJob>} */
+const ACTIVE_DOWNLOAD_PROGRESS = new Map();
 
 /**
  * @param {string} homeDir
@@ -512,7 +517,9 @@ async function buildDashboard(pluginDataDir, homeDir, configPath, options = {}, 
   const secret = ensureStreamSecretSync(pluginDataDir);
   const playlists = loadPlaylists(pluginDataDir).playlists;
   const cookies = inspectNetscapeCookiesFile(join(pluginDataDir, 'cookies.txt'));
-  const downloads = loadDownloadJobs(pluginDataDir).map((job) => {
+  const downloads = loadDownloadJobs(pluginDataDir).map((rawJob) => {
+    const liveOverlay = ACTIVE_DOWNLOAD_PROGRESS.get(rawJob.id);
+    const job = liveOverlay ? { ...rawJob, ...liveOverlay } : rawJob;
     if (job.status !== 'error' || typeof job.error !== 'string') return job;
     if (/^(?:Command failed:|\[soundcloud\]|ERROR:)/i.test(job.error) || /drm protected|not a bot/i.test(job.error)) {
       return {
@@ -1080,18 +1087,48 @@ export async function runAction(action, args = {}, context = {}, deps = {}) {
     const cookiesPath = resolveCookiesPath(pluginDataDir);
 
     const jobId = `dl-${randomUUID().slice(0, 8)}`;
+    const startedAt = Date.now();
+    /** @type {import('./downloader.mjs').DownloadJob} */
     const initialJob = {
       id: jobId,
-      status: /** @type {const} */ ('downloading'),
+      status: 'downloading',
+      phase: query && !url ? 'searching' : 'preparing',
+      progressPercent: 0,
+      progressText: query && !url ? '正在搜索在线音源…' : '正在解析链接与音轨信息…',
       query,
       url,
       source,
       title: titleHint || query || url || '在线音频',
       artist: artistHint,
       playAfter,
-      startedAt: Date.now(),
+      startedAt,
+      updatedAt: startedAt,
     };
+    ACTIVE_DOWNLOAD_PROGRESS.set(jobId, initialJob);
     upsertDownloadJob(pluginDataDir, initialJob);
+
+    let liveJob = { ...initialJob };
+    let lastPersistedAt = startedAt;
+    let lastPersistedPhase = liveJob.phase;
+    const persistEveryMs = 450;
+
+    /** @param {Partial<import('./downloader.mjs').DownloadJob>} patch */
+    const reportProgress = (patch) => {
+      if (!patch || typeof patch !== 'object') return;
+      const now = Date.now();
+      liveJob = {
+        ...liveJob,
+        ...patch,
+        status: 'downloading',
+        updatedAt: now,
+      };
+      ACTIVE_DOWNLOAD_PROGRESS.set(jobId, liveJob);
+      if (liveJob.phase !== lastPersistedPhase || now - lastPersistedAt >= persistEveryMs) {
+        lastPersistedPhase = liveJob.phase;
+        lastPersistedAt = now;
+        upsertDownloadJob(pluginDataDir, liveJob);
+      }
+    };
 
     const runDownloadTask = async () => {
       try {
@@ -1106,19 +1143,33 @@ export async function runAction(action, args = {}, context = {}, deps = {}) {
           ytDlpPath: config.ytDlpPath,
           cookiesPath,
           signal: isAsync ? undefined : context.signal,
+          onProgress: reportProgress,
         }, deps);
+        reportProgress({
+          phase: 'indexing',
+          progressPercent: 99,
+          progressText: '正在扫描入库…',
+        });
         const scanned = await scanLibrary(pluginDataDir, config.musicDir, { quick: true }, deps);
         const addedTrack = scanned.tracks.find((t) => resolve(t.filePath) === resolve(downloaded.filePath));
+        const finishedAt = Date.now();
+        ACTIVE_DOWNLOAD_PROGRESS.delete(jobId);
         upsertDownloadJob(pluginDataDir, {
-          ...initialJob,
+          ...liveJob,
           status: 'done',
+          phase: 'done',
+          progressPercent: 100,
+          progressText: '已完成并入库',
+          speedText: undefined,
+          etaText: undefined,
           title: addedTrack?.title || downloaded.title,
           artist: addedTrack?.artist || downloaded.artist,
           source: downloaded.source,
           url: downloaded.url,
           filePath: downloaded.filePath,
           trackId: addedTrack?.id,
-          finishedAt: Date.now(),
+          updatedAt: finishedAt,
+          finishedAt,
         });
         let playRes = null;
         if (playAfter && addedTrack) {
@@ -1126,21 +1177,28 @@ export async function runAction(action, args = {}, context = {}, deps = {}) {
         }
         return { downloaded, scanned, track: addedTrack ?? null, playRes };
       } catch (err) {
+        const finishedAt = Date.now();
+        ACTIVE_DOWNLOAD_PROGRESS.delete(jobId);
         upsertDownloadJob(pluginDataDir, {
-          ...initialJob,
+          ...liveJob,
           status: 'error',
+          phase: 'error',
           error: errMsg(err),
-          finishedAt: Date.now(),
+          updatedAt: finishedAt,
+          finishedAt,
         });
         throw err;
       } finally {
+        ACTIVE_DOWNLOAD_PROGRESS.delete(jobId);
         ACTIVE_DOWNLOAD_PROMISES.delete(jobId);
       }
     };
 
+    const taskPromise = runDownloadTask();
+    ACTIVE_DOWNLOAD_PROMISES.set(jobId, taskPromise);
+
     if (isAsync) {
-      const taskPromise = runDownloadTask().catch(() => {});
-      ACTIVE_DOWNLOAD_PROMISES.set(jobId, taskPromise);
+      taskPromise.catch(() => {});
       return {
         ok: true,
         notify: false,
@@ -1151,7 +1209,7 @@ export async function runAction(action, args = {}, context = {}, deps = {}) {
     }
 
     try {
-      const done = await runDownloadTask();
+      const done = await taskPromise;
       return {
         ok: true,
         notify: true,
@@ -1176,6 +1234,43 @@ export async function runAction(action, args = {}, context = {}, deps = {}) {
         data: { jobId, status: 'error' },
       };
     }
+  }
+
+  if (cleanAction === 'downloads') {
+    const op = String(safeArgs.op ?? 'list').trim().toLowerCase();
+    if (op === 'remove') {
+      const jobId = String(safeArgs.jobId ?? safeArgs.id ?? '').trim();
+      const res = removeDownloadJob(pluginDataDir, jobId, ACTIVE_DOWNLOAD_PROMISES);
+      return {
+        ok: res.ok,
+        notify: false,
+        title: res.ok ? '下载记录已删除' : '删除下载记录失败',
+        message: res.message,
+        data: res,
+      };
+    }
+    if (op === 'clear') {
+      const scope = String(safeArgs.scope ?? 'all').trim().toLowerCase();
+      const res = clearDownloadJobs(pluginDataDir, { scope }, ACTIVE_DOWNLOAD_PROMISES);
+      return {
+        ok: res.ok,
+        notify: false,
+        title: '下载历史已清理',
+        message: res.message,
+        data: res,
+      };
+    }
+    const jobs = loadDownloadJobs(pluginDataDir).map((rawJob) => {
+      const liveOverlay = ACTIVE_DOWNLOAD_PROGRESS.get(rawJob.id);
+      return liveOverlay ? { ...rawJob, ...liveOverlay } : rawJob;
+    });
+    return {
+      ok: true,
+      notify: false,
+      title: '下载记录列表',
+      message: `共 ${jobs.length} 条下载记录`,
+      data: { jobs },
+    };
   }
 
   if (cleanAction === 'delete-track') {
