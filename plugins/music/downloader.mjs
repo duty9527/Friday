@@ -42,8 +42,11 @@ const NETSCAPE_HEADER_RE = /^#\s*(?:Netscape\s+)?HTTP Cookie File/i;
  *   cookieCount: number;
  *   updatedAt: number | null;
  *   hasYouTube: boolean;
+ *   hasYouTubeAuth: boolean;
  *   hasBilibili: boolean;
+ *   hasBilibiliAuth: boolean;
  *   domains: string[];
+ *   warning?: string;
  * }} CookiesSummary
  *
  * @typedef {{
@@ -158,6 +161,25 @@ export function detectSourceFromUrl(rawUrl) {
   return { url: parsed.toString(), source: 'direct' };
 }
 
+const YOUTUBE_AUTH_COOKIE_NAMES = new Set([
+  'LOGIN_INFO',
+  'SID',
+  'HSID',
+  'SSID',
+  'APISID',
+  'SAPISID',
+  '__Secure-1PSID',
+  '__Secure-3PSID',
+  '__Secure-1PAPISID',
+  '__Secure-3PAPISID',
+]);
+
+const BILIBILI_AUTH_COOKIE_NAMES = new Set([
+  'SESSDATA',
+  'DedeUserID',
+  'bili_jct',
+]);
+
 /**
  * @param {string} domain
  * @returns {number}
@@ -186,7 +208,9 @@ function parseNetscapeCookiesText(rawText) {
   let sawFirstNonEmpty = false;
   let cookieCount = 0;
   let hasYouTube = false;
+  let hasYouTubeAuth = false;
   let hasBilibili = false;
+  let hasBilibiliAuth = false;
 
   for (const rawLine of lines) {
     const trimmed = rawLine.trim();
@@ -209,11 +233,19 @@ function parseNetscapeCookiesText(rawText) {
     if (!domain || /\s/.test(domain) || !name) continue;
     cookieCount += 1;
     seenDomains.add(domain);
-    if (domain === 'youtube.com' || domain.endsWith('.youtube.com') || domain === 'youtu.be' || domain === 'google.com' || domain.endsWith('.google.com')) {
+    const isYtDomain = domain === 'youtube.com' || domain.endsWith('.youtube.com') || domain === 'youtu.be' || domain === 'google.com' || domain.endsWith('.google.com');
+    const isBiliDomain = domain === 'bilibili.com' || domain.endsWith('.bilibili.com') || domain === 'biligame.com' || domain.endsWith('.biligame.com');
+    if (isYtDomain) {
       hasYouTube = true;
+      if (YOUTUBE_AUTH_COOKIE_NAMES.has(name)) {
+        hasYouTubeAuth = true;
+      }
     }
-    if (domain === 'bilibili.com' || domain.endsWith('.bilibili.com') || domain === 'biligame.com' || domain.endsWith('.biligame.com')) {
+    if (isBiliDomain) {
       hasBilibili = true;
+      if (BILIBILI_AUTH_COOKIE_NAMES.has(name)) {
+        hasBilibiliAuth = true;
+      }
     }
   }
 
@@ -221,20 +253,35 @@ function parseNetscapeCookiesText(rawText) {
     .sort((a, b) => cookieDomainPriority(a) - cookieDomainPriority(b))
     .slice(0, 6);
 
-  return { cleaned, hasHeader, cookieCount, hasYouTube, hasBilibili, domains };
+  const warning = hasYouTube && !hasYouTubeAuth
+    ? '当前 cookies.txt 中的 YouTube Cookie 缺少登录态，无法通过 YouTube 下载校验'
+    : undefined;
+
+  return { cleaned, hasHeader, cookieCount, hasYouTube, hasYouTubeAuth, hasBilibili, hasBilibiliAuth, domains, warning };
 }
 
 /**
  * @param {string} rawText
  * @returns {{
  *   normalizedText: string;
- *   summary: { cookieCount: number; hasYouTube: boolean; hasBilibili: boolean; domains: string[] };
+ *   summary: {
+ *     cookieCount: number;
+ *     hasYouTube: boolean;
+ *     hasYouTubeAuth: boolean;
+ *     hasBilibili: boolean;
+ *     hasBilibiliAuth: boolean;
+ *     domains: string[];
+ *     warning?: string;
+ *   };
  * }}
  */
 export function normalizeNetscapeCookiesText(rawText) {
   const parsed = parseNetscapeCookiesText(rawText);
   if (parsed.cookieCount === 0) {
     throw new Error('未识别到有效的 Netscape cookies.txt 条目，请使用浏览器扩展导出 Netscape 格式');
+  }
+  if (parsed.hasYouTube && !parsed.hasYouTubeAuth && !parsed.hasBilibili) {
+    throw new Error('检测到该 cookies.txt 仅包含 YouTube 访客 Cookie，缺少账号登录态（常见于未登录浏览器或命令行导出失败）。请先在浏览器登录 YouTube，再使用「Get cookies.txt LOCALLY」等扩展导出 Netscape 格式后重新导入。');
   }
   let normalizedText = parsed.cleaned.replace(/\r\n/g, '\n');
   if (!parsed.hasHeader) {
@@ -248,8 +295,11 @@ export function normalizeNetscapeCookiesText(rawText) {
     summary: {
       cookieCount: parsed.cookieCount,
       hasYouTube: parsed.hasYouTube,
+      hasYouTubeAuth: parsed.hasYouTubeAuth,
       hasBilibili: parsed.hasBilibili,
+      hasBilibiliAuth: parsed.hasBilibiliAuth,
       domains: parsed.domains,
+      ...(parsed.warning ? { warning: parsed.warning } : {}),
     },
   };
 }
@@ -265,7 +315,9 @@ export function inspectNetscapeCookiesFile(filePath) {
     cookieCount: 0,
     updatedAt: null,
     hasYouTube: false,
+    hasYouTubeAuth: false,
     hasBilibili: false,
+    hasBilibiliAuth: false,
     domains: [],
   };
   if (!filePath || !existsSync(filePath)) return empty;
@@ -274,13 +326,17 @@ export function inspectNetscapeCookiesFile(filePath) {
     if (!st.isFile() || st.size <= 0) return empty;
     const raw = readFileSync(filePath, 'utf8');
     const parsed = parseNetscapeCookiesText(raw);
+    const configured = parsed.cookieCount > 0;
     return {
-      configured: parsed.cookieCount > 0,
+      configured,
       cookieCount: parsed.cookieCount,
       updatedAt: Math.round(st.mtimeMs),
       hasYouTube: parsed.hasYouTube,
+      hasYouTubeAuth: parsed.hasYouTubeAuth,
       hasBilibili: parsed.hasBilibili,
+      hasBilibiliAuth: parsed.hasBilibiliAuth,
       domains: parsed.domains,
+      ...(configured && parsed.warning ? { warning: parsed.warning } : {}),
     };
   } catch {
     return empty;
@@ -289,7 +345,7 @@ export function inspectNetscapeCookiesFile(filePath) {
 
 /**
  * @param {unknown} err
- * @param {{ source?: string; hasCookies?: boolean }} [opts]
+ * @param {{ source?: string; hasCookies?: boolean; hasYouTubeAuth?: boolean }} [opts]
  * @returns {string}
  */
 export function formatYtDlpError(err, opts = {}) {
@@ -310,6 +366,9 @@ export function formatYtDlpError(err, opts = {}) {
   const hasCookies = Boolean(opts.hasCookies);
 
   if (/sign in to confirm you.?re not a bot|confirm you.?re not a bot|use --cookies-from-browser or --cookies/i.test(combined)) {
+    if (hasCookies && opts.hasYouTubeAuth === false) {
+      return '当前导入的 cookies.txt 仅包含 YouTube 访客 Cookie（缺少账号登录态），无法通过校验；请在已登录 YouTube 的浏览器中用扩展（如 Get cookies.txt LOCALLY）重新导出后在「设置」导入';
+    }
     return hasCookies
       ? 'YouTube 登录态校验未通过（cookies.txt 可能已过期或缺少登录态），请在「设置」重新导入最新的 cookies.txt，或改用 SoundCloud / B站直链'
       : 'YouTube 触发风控校验（需要登录态），请在「设置」导入 cookies.txt，或改用免登录的 SoundCloud 搜索 / 直接粘贴 B站 BV 链接';
@@ -319,6 +378,10 @@ export function formatYtDlpError(err, opts = {}) {
     return hasCookies
       ? 'Bilibili 请求触发风控 (HTTP 412)，当前 Cookie 可能已失效；可直接粘贴 B站 BV 视频链接下载，或在「设置」重新导入含 B站登录态的 cookies.txt'
       : 'Bilibili 搜索触发风控 (HTTP 412)，可直接粘贴 B站 BV 视频链接下载，或在「设置」导入含 B站登录态的 cookies.txt';
+  }
+
+  if (/drm protected|this video is drm/i.test(combined)) {
+    return '该曲目受平台 DRM 版权加密保护，无法下载；请换其他非版权加密版本，或改用已登录的 YouTube / B站直链';
   }
 
   if (/does not look like a netscape format cookies file|loaderror/i.test(combined)) {
@@ -444,6 +507,7 @@ async function runYtDlpSearch(source, query, limit, ytDlpBin, deps = {}) {
   const prefix = source === 'bilibili' ? 'bilisearch' : source === 'soundcloud' ? 'scsearch' : 'ytsearch';
   const execFn = deps.execFileFn ?? ((cmd, args, opts) => execFileAsync(cmd, args, opts));
   const res = await withEphemeralCookiesCopy(deps.cookiesPath, async (ephemeralCookies) => {
+    const cookieMeta = ephemeralCookies ? inspectNetscapeCookiesFile(ephemeralCookies) : null;
     const args = [
       '--flat-playlist',
       '--dump-json',
@@ -462,7 +526,11 @@ async function runYtDlpSearch(source, query, limit, ytDlpBin, deps = {}) {
         ...(deps.signal ? { signal: deps.signal } : {}),
       });
     } catch (err) {
-      throw new Error(formatYtDlpError(err, { source, hasCookies: Boolean(ephemeralCookies) }));
+      throw new Error(formatYtDlpError(err, {
+        source,
+        hasCookies: Boolean(ephemeralCookies),
+        ...(cookieMeta ? { hasYouTubeAuth: cookieMeta.hasYouTubeAuth } : {}),
+      }));
     }
   });
   const lines = String(res?.stdout ?? '')
@@ -663,6 +731,7 @@ export async function downloadOnlineAudioFile(params, deps = {}) {
 
   try {
     const res = await withEphemeralCookiesCopy(cookiesPath, async (ephemeralCookies) => {
+      const cookieMeta = ephemeralCookies ? inspectNetscapeCookiesFile(ephemeralCookies) : null;
       const args = [
         '--no-playlist',
         '--no-warnings',
@@ -691,7 +760,11 @@ export async function downloadOnlineAudioFile(params, deps = {}) {
           ...(params.signal ? { signal: params.signal } : {}),
         });
       } catch (err) {
-        throw new Error(formatYtDlpError(err, { source: resolvedSource, hasCookies: Boolean(ephemeralCookies) }));
+        throw new Error(formatYtDlpError(err, {
+          source: resolvedSource,
+          hasCookies: Boolean(ephemeralCookies),
+          ...(cookieMeta ? { hasYouTubeAuth: cookieMeta.hasYouTubeAuth } : {}),
+        }));
       }
     });
 

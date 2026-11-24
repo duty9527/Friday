@@ -513,10 +513,25 @@ async function buildDashboard(pluginDataDir, homeDir, configPath, options = {}, 
   const playlists = loadPlaylists(pluginDataDir).playlists;
   const cookies = inspectNetscapeCookiesFile(join(pluginDataDir, 'cookies.txt'));
   const downloads = loadDownloadJobs(pluginDataDir).map((job) => {
-    if (job.status === 'error' && typeof job.error === 'string' && /^Command failed:/i.test(job.error)) {
+    if (job.status !== 'error' || typeof job.error !== 'string') return job;
+    if (/^(?:Command failed:|\[soundcloud\]|ERROR:)/i.test(job.error) || /drm protected|not a bot/i.test(job.error)) {
       return {
         ...job,
-        error: formatYtDlpError(job.error, { source: job.source, hasCookies: cookies.configured }),
+        error: formatYtDlpError(job.error, {
+          source: job.source,
+          hasCookies: cookies.configured,
+          hasYouTubeAuth: cookies.hasYouTubeAuth,
+        }),
+      };
+    }
+    if (job.source === 'youtube' && cookies.configured && !cookies.hasYouTubeAuth && /登录态校验未通过/.test(job.error)) {
+      return {
+        ...job,
+        error: formatYtDlpError('Sign in to confirm you’re not a bot', {
+          source: job.source,
+          hasCookies: cookies.configured,
+          hasYouTubeAuth: cookies.hasYouTubeAuth,
+        }),
       };
     }
     return job;

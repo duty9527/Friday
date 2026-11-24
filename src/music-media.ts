@@ -468,9 +468,31 @@ export interface MusicCookiesSummary {
   cookieCount: number;
   updatedAt: number | null;
   hasYouTube: boolean;
+  hasYouTubeAuth: boolean;
   hasBilibili: boolean;
+  hasBilibiliAuth: boolean;
   domains: string[];
+  warning?: string;
 }
+
+const YOUTUBE_AUTH_COOKIE_NAMES = new Set([
+  'LOGIN_INFO',
+  'SID',
+  'HSID',
+  'SSID',
+  'APISID',
+  'SAPISID',
+  '__Secure-1PSID',
+  '__Secure-3PSID',
+  '__Secure-1PAPISID',
+  '__Secure-3PAPISID',
+]);
+
+const BILIBILI_AUTH_COOKIE_NAMES = new Set([
+  'SESSDATA',
+  'DedeUserID',
+  'bili_jct',
+]);
 
 function isPriorityCookieDomain(domain: string): number {
   if (domain === 'youtube.com' || domain.endsWith('.youtube.com') || domain === 'youtu.be') return 0;
@@ -495,7 +517,9 @@ export function normalizeAndInspectNetscapeCookies(rawText: string): {
   let sawFirstNonEmpty = false;
   let cookieCount = 0;
   let hasYouTube = false;
+  let hasYouTubeAuth = false;
   let hasBilibili = false;
+  let hasBilibiliAuth = false;
 
   for (const rawLine of lines) {
     const trimmed = rawLine.trim();
@@ -518,16 +542,31 @@ export function normalizeAndInspectNetscapeCookies(rawText: string): {
     if (!domain || /\s/.test(domain) || !name) continue;
     cookieCount += 1;
     seenDomains.add(domain);
-    if (domain === 'youtube.com' || domain.endsWith('.youtube.com') || domain === 'youtu.be' || domain === 'google.com' || domain.endsWith('.google.com')) {
+    const isYtDomain = domain === 'youtube.com' || domain.endsWith('.youtube.com') || domain === 'youtu.be' || domain === 'google.com' || domain.endsWith('.google.com');
+    const isBiliDomain = domain === 'bilibili.com' || domain.endsWith('.bilibili.com') || domain === 'biligame.com' || domain.endsWith('.biligame.com');
+    if (isYtDomain) {
       hasYouTube = true;
+      if (YOUTUBE_AUTH_COOKIE_NAMES.has(name)) {
+        hasYouTubeAuth = true;
+      }
     }
-    if (domain === 'bilibili.com' || domain.endsWith('.bilibili.com') || domain === 'biligame.com' || domain.endsWith('.biligame.com')) {
+    if (isBiliDomain) {
       hasBilibili = true;
+      if (BILIBILI_AUTH_COOKIE_NAMES.has(name)) {
+        hasBilibiliAuth = true;
+      }
     }
   }
 
   if (cookieCount === 0) {
     throw new MusicMediaError(400, '未识别到有效的 Netscape cookies.txt 条目，请使用浏览器扩展导出 Netscape 格式');
+  }
+
+  if (hasYouTube && !hasYouTubeAuth && !hasBilibili) {
+    throw new MusicMediaError(
+      400,
+      '检测到该 cookies.txt 仅包含 YouTube 访客 Cookie，缺少账号登录态（常见于未登录浏览器或命令行导出失败）。请先在浏览器登录 YouTube，再使用「Get cookies.txt LOCALLY」等扩展导出 Netscape 格式后重新导入。',
+    );
   }
 
   const domains = [...seenDomains]
@@ -542,13 +581,20 @@ export function normalizeAndInspectNetscapeCookies(rawText: string): {
     normalizedText += '\n';
   }
 
+  const warning = hasYouTube && !hasYouTubeAuth
+    ? '当前 cookies.txt 中的 YouTube Cookie 缺少登录态，无法通过 YouTube 下载校验'
+    : undefined;
+
   return {
     normalizedText,
     summary: {
       cookieCount,
       hasYouTube,
+      hasYouTubeAuth,
       hasBilibili,
+      hasBilibiliAuth,
       domains,
+      ...(warning ? { warning } : {}),
     },
   };
 }

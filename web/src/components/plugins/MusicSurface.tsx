@@ -46,8 +46,11 @@ interface MusicCookiesSummary {
   cookieCount: number;
   updatedAt: number | null;
   hasYouTube: boolean;
+  hasYouTubeAuth?: boolean;
   hasBilibili: boolean;
+  hasBilibiliAuth?: boolean;
   domains: string[];
+  warning?: string;
 }
 
 interface MusicTrackView {
@@ -903,7 +906,15 @@ export default function MusicSurface() {
                   </CardDescription>
                 </div>
                 <div className="flex flex-wrap items-center gap-1.5">
-                  {data?.cookies?.configured ? (
+                  {data?.cookies?.configured && data.cookies.warning ? (
+                    <>
+                      <Badge variant="warning">Cookie 缺少登录态</Badge>
+                      <Button type="button" size="xs" variant="outline" onClick={() => setActiveTab('config')}>
+                        <KeyRoundIcon className="size-3" />
+                        <span>重新导入 Cookie</span>
+                      </Button>
+                    </>
+                  ) : data?.cookies?.configured ? (
                     <Badge variant="success">Cookie 已配置 ({data.cookies.cookieCount})</Badge>
                   ) : (
                     <>
@@ -1270,21 +1281,35 @@ export default function MusicSurface() {
                     <span>yt-dlp Cookie 认证（YouTube / Bilibili）</span>
                   </CardTitle>
                   <CardDescription className="text-xs">
-                    YouTube 下载及 B 站关键词搜索在代理出口 IP 下通常需要登录态，请上传或粘贴 Netscape 格式 cookies.txt（文件以 0600 权限保存在主机私有目录，界面不回显明细）。
+                    建议在已登录 YouTube/B 站的浏览器中通过「Get cookies.txt LOCALLY」等扩展导出 Netscape 格式（不要使用未登录浏览器的访客 Cookie；文件以 0600 权限保存在主机私有目录，界面不回显明细）。
                   </CardDescription>
                 </div>
-                <Badge variant={data?.cookies?.configured ? 'success' : 'outline'}>
-                  {data?.cookies?.configured ? `已配置 · ${data.cookies.cookieCount} 条` : '未配置'}
+                <Badge variant={data?.cookies?.configured ? (data.cookies.warning ? 'warning' : 'success') : 'outline'}>
+                  {data?.cookies?.configured
+                    ? (data.cookies.warning ? `缺少登录态 · ${data.cookies.cookieCount} 条` : `已配置 · ${data.cookies.cookieCount} 条`)
+                    : '未配置'}
                 </Badge>
               </div>
             </CardHeader>
             <CardContent className="space-y-3">
-              {data?.cookies?.configured && (data.cookies.domains?.length ?? 0) > 0 && (
+              {data?.cookies?.warning && (
+                <Alert variant="warning">
+                  <AlertDescription className="text-xs">{data.cookies.warning}</AlertDescription>
+                </Alert>
+              )}
+
+              {data?.cookies?.configured && ((data.cookies.domains?.length ?? 0) > 0 || data.cookies.hasYouTubeAuth || data.cookies.hasBilibiliAuth) && (
                 <div className="flex flex-wrap items-center gap-1.5 text-xs">
-                  <span className="text-muted-foreground">已识别域名：</span>
-                  {data.cookies.domains.map(domain => (
-                    <Badge key={domain} variant="outline" className="text-[10px]">{domain}</Badge>
-                  ))}
+                  {data.cookies.hasYouTubeAuth && <Badge variant="success" className="text-[10px]">YouTube 已登录</Badge>}
+                  {data.cookies.hasBilibiliAuth && <Badge variant="success" className="text-[10px]">Bilibili 已登录</Badge>}
+                  {(data.cookies.domains?.length ?? 0) > 0 && (
+                    <>
+                      <span className="text-muted-foreground">已识别域名：</span>
+                      {data.cookies.domains.map(domain => (
+                        <Badge key={domain} variant="outline" className="text-[10px]">{domain}</Badge>
+                      ))}
+                    </>
+                  )}
                 </div>
               )}
 

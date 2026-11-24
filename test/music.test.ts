@@ -422,6 +422,15 @@ test('yt-dlp error formatting, ephemeral cookies.txt handling, legacy job normal
   const biliWithCookie = formatYtDlpError('ERROR: HTTP Error 412: Precondition Failed', { source: 'bilibili', hasCookies: true });
   assert.match(biliWithCookie, /HTTP 412.*已失效/);
 
+  const ytGuestCookieErr = formatYtDlpError(
+    'ERROR: [youtube] abc: Sign in to confirm you\'re not a bot.',
+    { source: 'youtube', hasCookies: true, hasYouTubeAuth: false },
+  );
+  assert.match(ytGuestCookieErr, /访客 Cookie（缺少账号登录态）/);
+
+  const drmErr = formatYtDlpError('[soundcloud] 2439405147: This video is DRM protected');
+  assert.match(drmErr, /DRM 版权加密保护/);
+
   const badCookieErr = formatYtDlpError('ERROR: cookies.txt does not look like a Netscape format cookies file', {});
   assert.match(badCookieErr, /cookies\.txt 格式无效/);
 
@@ -484,6 +493,20 @@ test('yt-dlp error formatting, ephemeral cookies.txt handling, legacy job normal
     });
     assert.equal(overRes.status, 413);
 
+    // Reject YouTube guest-only cookies (no SID/HSID/SAPISID/LOGIN_INFO)
+    const guestOnlyRes = await fetch(`${base}/api/music/cookies`, {
+      method: 'POST',
+      headers: { ...authHeaders, 'content-type': 'text/plain; charset=utf-8' },
+      body: [
+        '.youtube.com\tTRUE\t/\tFALSE\t0\tPREF\ttz=Asia.Shanghai',
+        '.youtube.com\tTRUE\t/\tTRUE\t0\tYSC\tabcdef12345',
+        '.youtube.com\tTRUE\t/\tTRUE\t1811008334\tVISITOR_INFO1_LIVE\txyz12345678',
+      ].join('\n'),
+    });
+    assert.equal(guestOnlyRes.status, 400);
+    const guestErrJson = await guestOnlyRes.json() as { error?: string };
+    assert.match(String(guestErrJson.error), /访客 Cookie|缺少账号登录态/);
+
     // Valid Netscape lines WITHOUT header -> auto-prepends header, sets 0600, redacts secret values
     const sampleCookies = [
       '#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t1893456000\tHSID\tsuper-secret-yt-cookie',
@@ -497,14 +520,26 @@ test('yt-dlp error formatting, ephemeral cookies.txt handling, legacy job normal
     assert.equal(okCookies.status, 200);
     const cookiesPayload = await okCookies.json() as {
       ok: boolean;
-      cookies: { configured: boolean; cookieCount: number; hasYouTube: boolean; hasBilibili: boolean; domains: string[] };
+      cookies: {
+        configured: boolean;
+        cookieCount: number;
+        hasYouTube: boolean;
+        hasYouTubeAuth: boolean;
+        hasBilibili: boolean;
+        hasBilibiliAuth: boolean;
+        warning?: string;
+        domains: string[];
+      };
     };
     const serialized = JSON.stringify(cookiesPayload);
     assert.equal(cookiesPayload.ok, true);
     assert.equal(cookiesPayload.cookies.configured, true);
     assert.equal(cookiesPayload.cookies.cookieCount, 2);
     assert.equal(cookiesPayload.cookies.hasYouTube, true);
+    assert.equal(cookiesPayload.cookies.hasYouTubeAuth, true);
     assert.equal(cookiesPayload.cookies.hasBilibili, true);
+    assert.equal(cookiesPayload.cookies.hasBilibiliAuth, true);
+    assert.equal(cookiesPayload.cookies.warning, undefined);
     assert.equal(serialized.includes('super-secret'), false, 'cookie values must never be echoed');
     assert.equal(serialized.includes('SESSDATA'), false, 'cookie names must never be echoed');
 
@@ -553,28 +588,56 @@ test('yt-dlp error formatting, ephemeral cookies.txt handling, legacy job normal
       assert.equal(existsSync(tmpCookie), false, 'ephemeral cookie copy must be cleaned up after yt-dlp finishes');
     }
 
-    // Legacy raw Command failed error in downloads.json is normalized on dashboard
+    // Legacy raw errors (YouTube bot-check + SoundCloud DRM) in downloads.json are normalized on dashboard
     writeFileSync(join(pluginDataDir, 'downloads.json'), JSON.stringify({
       updatedAt: Date.now(),
-      jobs: [{
-        id: 'dl-legacy',
-        status: 'error',
-        query: '',
-        url: 'https://www.youtube.com/watch?v=L3GughXEmyY',
-        source: 'youtube',
-        title: '慌啥子嘛',
-        artist: 'Z Y',
-        error: 'Command failed: /home/duty/.local/bin/yt-dlp ... https://www.youtube.com/watch?v=L3GughXEmyY\nERROR: [youtube] L3GughXEmyY: Sign in to confirm you’re not a bot.',
-        startedAt: Date.now() - 1000,
-        finishedAt: Date.now(),
-      }],
+      jobs: [
+        {
+          id: 'dl-sc-drm',
+          status: 'error',
+          query: '',
+          url: 'https://soundcloud.com/artist/drm-track',
+          source: 'soundcloud',
+          title: 'DRM 曲目',
+          artist: '歌手',
+          error: '[soundcloud] 2439405147: This video is DRM protected',
+          startedAt: Date.now() - 500,
+          finishedAt: Date.now() - 100,
+        },
+        {
+          id: 'dl-legacy',
+          status: 'error',
+          query: '',
+          url: 'https://www.youtube.com/watch?v=L3GughXEmyY',
+          source: 'youtube',
+          title: '慌啥子嘛',
+          artist: 'Z Y',
+          error: 'Command failed: /home/duty/.local/bin/yt-dlp ... https://www.youtube.com/watch?v=L3GughXEmyY\nERROR: [youtube] L3GughXEmyY: Sign in to confirm you’re not a bot.',
+          startedAt: Date.now() - 1000,
+          finishedAt: Date.now(),
+        },
+      ],
     }));
 
     const dashBeforeClear = await runAction('dashboard', { live: false }, { homeDir: home });
     assert.equal(dashBeforeClear.ok, true);
     assert.equal(dashBeforeClear.data?.cookies?.configured, true);
-    assert.equal(dashBeforeClear.data?.downloads?.[0]?.error.includes('Command failed:'), false);
-    assert.match(String(dashBeforeClear.data?.downloads?.[0]?.error), /cookies\.txt 可能已过期/);
+    assert.equal(dashBeforeClear.data?.cookies?.hasYouTubeAuth, true);
+    assert.match(String(dashBeforeClear.data?.downloads?.[0]?.error), /DRM 版权加密保护/);
+    assert.equal(dashBeforeClear.data?.downloads?.[1]?.error.includes('Command failed:'), false);
+    assert.match(String(dashBeforeClear.data?.downloads?.[1]?.error), /cookies\.txt 可能已过期/);
+
+    // Pre-existing guest-only cookies.txt on disk reports warning and guest-cookie guidance
+    writeFileSync(savedCookiesPath, [
+      '# Netscape HTTP Cookie File',
+      '.youtube.com\tTRUE\t/\tTRUE\t0\tYSC\tguest-only',
+      '.youtube.com\tTRUE\t/\tTRUE\t1811008334\tVISITOR_INFO1_LIVE\tvisitor123',
+    ].join('\n'), { mode: 0o600 });
+    const dashGuestCookies = await runAction('dashboard', { live: false }, { homeDir: home });
+    assert.equal(dashGuestCookies.data?.cookies?.configured, true);
+    assert.equal(dashGuestCookies.data?.cookies?.hasYouTubeAuth, false);
+    assert.ok(String(dashGuestCookies.data?.cookies?.warning || '').length > 0);
+    assert.match(String(dashGuestCookies.data?.downloads?.[1]?.error), /访客 Cookie（缺少账号登录态）/);
 
     // Clear cookies via config action
     const cleared = await runAction('config', { clearCookies: true }, { homeDir: home });
@@ -583,7 +646,7 @@ test('yt-dlp error formatting, ephemeral cookies.txt handling, legacy job normal
     assert.equal(cleared.data?.cookies?.configured, false);
     const dashAfterClear = await runAction('dashboard', { live: false }, { homeDir: home });
     assert.equal(dashAfterClear.data?.cookies?.configured, false);
-    assert.match(String(dashAfterClear.data?.downloads?.[0]?.error), /YouTube 触发风控校验/);
+    assert.match(String(dashAfterClear.data?.downloads?.[1]?.error), /YouTube 触发风控校验/);
   } finally {
     stopAllMusicWatchers();
     await web.close();
