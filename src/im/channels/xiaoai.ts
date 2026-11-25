@@ -281,11 +281,12 @@ export class XiaoaiChannelAdapter implements ImChannelAdapter {
         speakerGate: {
           isActive: ch => this.isSpeakerGateEnforced(ch),
           isBypassed: (chId, targetId) => this.speakerEnroll.isActive(chId, targetId),
-          verifyWake: ({ channel, keyword, samples, sampleRate }) => {
+          verifyWake: ({ channel, keyword, samples, sampleRate, source }) => {
             const opts = parseXiaoaiApiOptions(channel.apiBase);
             return this.getSpeakerManager().verifyWakeSlice(samples, sampleRate, keyword, {
               speakerVerify: opts.speakerVerify,
               thresholdOverride: opts.speakerThreshold,
+              ...(source ? { source } : {}),
             });
           },
           verifyUtterance: ({ channel, samples, sampleRate, wakeVerified }) => {

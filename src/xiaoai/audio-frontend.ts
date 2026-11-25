@@ -1194,6 +1194,17 @@ export class OnlineHexBeamformer {
   }
 }
 
+export interface HexBeamformOptions {
+  steerAzimuthDeg?: number;
+  nullAzimuthDeg?: number;
+  excludeAzimuthDeg?: number;
+  excludeMinSepDeg?: number;
+}
+
+function circularAzimuthDiffDeg(a: number, b: number): number {
+  return Math.abs(((a - b + 540) % 360) - 180);
+}
+
 /**
  * 6-mic GCC-PHAT DOA estimation + STFT Delay-and-Sum beamforming using LX06 hexagonal geometry.
  * Eliminates high-frequency comb filtering across arbitrary azimuths while rejecting dead channels.
@@ -1202,6 +1213,7 @@ export function beamformHexArray(
   mics: readonly Float32Array[],
   sampleRate = FRONTEND_SAMPLE_RATE,
   coords = LX06_HEX_MIC_COORDS,
+  options?: HexBeamformOptions,
 ): { samples: Float32Array; azimuthDeg: number; usedChannels: number } {
   if (mics.length === 0) {
     return { samples: new Float32Array(0), azimuthDeg: 0, usedChannels: 0 };
@@ -1365,30 +1377,43 @@ export function beamformHexArray(
   let bestElev = 1.0;
   let bestScore = -Infinity;
 
-  for (const elevScale of [1.0, 0.78]) {
-    for (let az = 0; az < 360; az += 15) {
-      const s = scoreCandidate(az, elevScale);
-      if (s > bestScore) {
-        bestScore = s;
-        bestAz = az;
-        bestElev = elevScale;
+  if (options?.steerAzimuthDeg !== undefined && Number.isFinite(options.steerAzimuthDeg)) {
+    bestAz = ((Math.round(options.steerAzimuthDeg) % 360) + 360) % 360;
+    bestElev = 1.0;
+  } else {
+    const excludeAz = options?.excludeAzimuthDeg;
+    const excludeMinSep = options?.excludeMinSepDeg ?? 60;
+    for (const elevScale of [1.0, 0.78]) {
+      for (let az = 0; az < 360; az += 15) {
+        if (excludeAz !== undefined && circularAzimuthDiffDeg(az, excludeAz) < excludeMinSep) {
+          continue;
+        }
+        const s = scoreCandidate(az, elevScale);
+        if (s > bestScore) {
+          bestScore = s;
+          bestAz = az;
+          bestElev = elevScale;
+        }
       }
     }
-  }
-  if (!Number.isFinite(bestScore)) {
-    bestAz = 0;
-    bestElev = 0;
-  }
+    if (!Number.isFinite(bestScore)) {
+      bestAz = 0;
+      bestElev = 0;
+    }
 
-  // Fine azimuth refinement around coarse peak
-  if (bestElev > 0) {
-    const centerAz = bestAz;
-    for (let offset = -10; offset <= 10; offset += 2) {
-      const az = (centerAz + offset + 360) % 360;
-      const s = scoreCandidate(az, bestElev);
-      if (s > bestScore) {
-        bestScore = s;
-        bestAz = az;
+    // Fine azimuth refinement around coarse peak
+    if (bestElev > 0) {
+      const centerAz = bestAz;
+      for (let offset = -10; offset <= 10; offset += 2) {
+        const az = (centerAz + offset + 360) % 360;
+        if (excludeAz !== undefined && circularAzimuthDiffDeg(az, excludeAz) < excludeMinSep) {
+          continue;
+        }
+        const s = scoreCandidate(az, bestElev);
+        if (s > bestScore) {
+          bestScore = s;
+          bestAz = az;
+        }
       }
     }
   }
@@ -1409,6 +1434,64 @@ export function beamformHexArray(
       const phase = (-2 * Math.PI * k * tauSamples) / fftSize;
       sRe[k] = Math.cos(phase);
       sIm[k] = Math.sin(phase);
+    }
+  }
+
+  if (
+    options?.nullAzimuthDeg !== undefined
+    && Number.isFinite(options.nullAzimuthDeg)
+    && circularAzimuthDiffDeg(bestAz, options.nullAzimuthDeg) >= 30
+  ) {
+    const nullRad = (options.nullAzimuthDeg * Math.PI) / 180;
+    const nullCos = Math.cos(nullRad);
+    const nullSin = Math.sin(nullRad);
+    const nullElev = bestElev > 0 ? bestElev : 1.0;
+    const nullRe = healthyIndices.map(() => new Float64Array(halfBins));
+    const nullIm = healthyIndices.map(() => new Float64Array(halfBins));
+    for (let hPos = 0; hPos < healthyIndices.length; hPos++) {
+      const chIdx = healthyIndices[hPos]!;
+      const [xm, ym] = coords[chIdx]!;
+      const tauNull = nullElev * ((xm * nullCos + ym * nullSin) / SPEED_OF_SOUND_MPS) * sampleRate;
+      const nRe = nullRe[hPos]!;
+      const nIm = nullIm[hPos]!;
+      for (let k = 0; k < halfBins; k++) {
+        const phase = (-2 * Math.PI * k * tauNull) / fftSize;
+        nRe[k] = Math.cos(phase);
+        nIm[k] = Math.sin(phase);
+      }
+    }
+
+    const invM = 1 / healthyIndices.length;
+    const delta = 0.06;
+    const scale = 1 / (1 + delta);
+    for (let k = 0; k < halfBins; k++) {
+      let cConjRe = 0;
+      let cConjIm = 0;
+      for (let hPos = 0; hPos < healthyIndices.length; hPos++) {
+        const sr = steerRe[hPos]![k]!;
+        const si = steerIm[hPos]![k]!;
+        const nr = nullRe[hPos]![k]!;
+        const ni = nullIm[hPos]![k]!;
+        // a_i(k) * a_s^*(k) where a_i^* = (nr, ni) => a_i = (nr, -ni)
+        cConjRe += nr * sr + ni * si;
+        cConjIm += nr * si - ni * sr;
+      }
+      cConjRe *= invM;
+      cConjIm *= invM;
+      const cMagSq = cConjRe * cConjRe + cConjIm * cConjIm;
+      const denom = Math.max(1e-6, 1 - cMagSq * scale);
+      const betaRe = cConjRe * scale;
+      const betaIm = cConjIm * scale;
+      for (let hPos = 0; hPos < healthyIndices.length; hPos++) {
+        const sr = steerRe[hPos]![k]!;
+        const si = steerIm[hPos]![k]!;
+        const nr = nullRe[hPos]![k]!;
+        const ni = nullIm[hPos]![k]!;
+        const numRe = sr - (betaRe * nr - betaIm * ni);
+        const numIm = si - (betaRe * ni + betaIm * nr);
+        steerRe[hPos]![k] = numRe / denom;
+        steerIm[hPos]![k] = numIm / denom;
+      }
     }
   }
 
@@ -1476,6 +1559,7 @@ export function processMultiChannelUtterance(
   mics: readonly Float32Array[],
   ref: Float32Array | undefined,
   sampleRate = FRONTEND_SAMPLE_RATE,
+  options?: HexBeamformOptions,
 ): { samples: Float32Array; azimuthDeg: number; aecApplied: boolean; echoReductionDb: number } {
   if (mics.length === 0) {
     return { samples: new Float32Array(0), azimuthDeg: 0, aecApplied: false, echoReductionDb: 0 };
@@ -1498,7 +1582,7 @@ export function processMultiChannelUtterance(
     echoReductionDb = totalDb / Math.max(1, mics.length);
   }
 
-  const beamformed = beamformHexArray(processedMics, sampleRate);
+  const beamformed = beamformHexArray(processedMics, sampleRate, LX06_HEX_MIC_COORDS, options);
   return {
     samples: beamformed.samples,
     azimuthDeg: beamformed.azimuthDeg,

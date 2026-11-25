@@ -2218,3 +2218,328 @@ test('XiaoaiKwsMonitor: direct KWS uses trailing-window DOA, rescues borderline 
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test('audio-frontend: beamformHexArray spatial nulling suppresses loud 205deg interferer >=12dB while preserving 90deg speech', () => {
+  const sr = FRONTEND_SAMPLE_RATE;
+  const tv205 = synthHexPlaneWave({
+    durationSec: 0.8,
+    azimuthDeg: 205,
+    signalAtTime: t =>
+      0.16 * Math.sin(2 * Math.PI * 1800 * t)
+      + 0.14 * Math.cos(2 * Math.PI * 2600 * t),
+    seed: 501,
+  });
+  const speech90 = synthHexPlaneWave({
+    durationSec: 0.8,
+    azimuthDeg: 90,
+    signalAtTime: t =>
+      0.06 * Math.sin(2 * Math.PI * 1200 * t)
+      + 0.06 * Math.sin(2 * Math.PI * 3200 * t),
+    seed: 502,
+  });
+  const mixed = tv205.map((ch, idx) => {
+    const out = new Float32Array(ch.length);
+    for (let i = 0; i < ch.length; i++) out[i] = ch[i]! + speech90[idx]![i]!;
+    return out;
+  });
+
+  const steadyStart = 1024;
+  const steadyEnd = mixed[0]!.length - 1024;
+  const singleMic1800 = goertzelAmplitude(mixed[0]!.subarray(steadyStart, steadyEnd), 1800, sr);
+  const singleMic2600 = goertzelAmplitude(mixed[0]!.subarray(steadyStart, steadyEnd), 2600, sr);
+  const pureSpeech1200 = goertzelAmplitude(speech90[0]!.subarray(steadyStart, steadyEnd), 1200, sr);
+  const pureSpeech3200 = goertzelAmplitude(speech90[0]!.subarray(steadyStart, steadyEnd), 3200, sr);
+
+  const nulled = beamformHexArray(mixed, sr, LX06_HEX_MIC_COORDS, {
+    excludeAzimuthDeg: 205,
+    excludeMinSepDeg: 60,
+    nullAzimuthDeg: 205,
+  });
+  assert.ok(circularAzimuthDiffDeg(nulled.azimuthDeg, 90) <= 15, `Expected DOA near 90deg, got ${nulled.azimuthDeg}deg`);
+
+  const outSteady = nulled.samples.subarray(steadyStart, steadyEnd);
+  const out1200 = goertzelAmplitude(outSteady, 1200, sr);
+  const out3200 = goertzelAmplitude(outSteady, 3200, sr);
+  assert.ok(out1200 / pureSpeech1200 >= 0.80, `Expected >=0.80 preservation at 1200Hz, got ${(out1200 / pureSpeech1200).toFixed(3)}`);
+  assert.ok(out3200 / pureSpeech3200 >= 0.80, `Expected >=0.80 preservation at 3200Hz, got ${(out3200 / pureSpeech3200).toFixed(3)}`);
+
+  const out1800 = goertzelAmplitude(outSteady, 1800, sr);
+  const out2600 = goertzelAmplitude(outSteady, 2600, sr);
+  const interfererInPwr = singleMic1800 * singleMic1800 + singleMic2600 * singleMic2600;
+  const interfererOutPwr = out1800 * out1800 + out2600 * out2600;
+  const suppressionDb = 10 * Math.log10(Math.max(1e-12, interfererInPwr) / Math.max(1e-12, interfererOutPwr));
+  assert.ok(suppressionDb >= 12, `Expected >=12 dB spatial nulling at 205deg, got ${suppressionDb.toFixed(2)} dB`);
+});
+
+test('XiaoaiSpeakerManager: verifyWakeSlice relaxes bare wake floor to 0.17 for kws while keeping 0.23 for asr-rescue', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-spk-source-floor-'));
+  try {
+    let score = 0.18;
+    const factory = (): XiaoaiSpeakerExtractor => ({
+      dim: 2,
+      extract: () => new Float32Array([score, Math.sqrt(Math.max(0, 1 - score * score))]),
+      free() {},
+    });
+    const manager = new XiaoaiSpeakerManager({ homeDir: home, extractorFactory: factory });
+    manager.enrollEmbeddings({ name: '主人', role: 'owner', embeddings: [new Float32Array([1, 0])] });
+    manager.configure({ threshold: 0.38 });
+
+    const bareWake = new Float32Array(Math.round(SPEAKER_SAMPLE_RATE * 0.65)).fill(0.05);
+    score = 0.18;
+    const kwsRes = manager.verifyWakeSlice(bareWake, SPEAKER_SAMPLE_RATE, '星期五', { source: 'kws' });
+    const rescueRes = manager.verifyWakeSlice(bareWake, SPEAKER_SAMPLE_RATE, '星期五', { source: 'asr-rescue' });
+    assert.equal(kwsRes.matched, true, 'Direct KWS bare wake score=0.18 should pass >=0.17 floor');
+    assert.equal(rescueRes.matched, false, 'ASR-rescue bare wake score=0.18 must remain rejected <0.23');
+
+    score = 0.14;
+    assert.equal(manager.verifyWakeSlice(bareWake, SPEAKER_SAMPLE_RATE, '星期五', { source: 'kws' }).matched, false);
+    assert.equal(manager.verifyWakeSlice(bareWake, SPEAKER_SAMPLE_RATE, '星期五', { source: 'asr-rescue' }).matched, false);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('XiaoaiKwsMonitor: spatial null rescues TV-dominated direct wakes and two-step utterances, and extends two-step re-arm >=2500ms', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-kws-spatial-rearm-'));
+  let monitor: XiaoaiKwsMonitor | undefined;
+  try {
+    let audioStream: PassThrough | undefined;
+    let triggerWake = false;
+    let denoiserCalls = 0;
+    let liveFinishCalls = 0;
+    let batchCalls = 0;
+    let gateMode: 'spatial_wake_and_utterance' | 'noise_then_owner' = 'spatial_wake_and_utterance';
+    const wakeEvents: string[] = [];
+    const utterances: string[] = [];
+
+    monitor = new XiaoaiKwsMonitor({
+      homeDir: home,
+      modelsDir: join(home, 'kws'),
+      asrModelsDir: join(home, 'asr'),
+      vadModelPath: join(home, 'vad.onnx'),
+      cooldownMs: 30,
+      probeDurationMs: 60,
+      chimeDiscardMs: 20,
+      maxWaitSpeechMs: 2_800,
+      endSilenceMs: 120,
+      asrWakeRescue: false,
+      idleEnergyGate: false,
+      sshRunner: async () => ({ stdout: '', stderr: '', code: 0 }),
+      spotterFactory: () => ({
+        createStream: () => ({}),
+        acceptWaveform: () => {},
+        isReady: () => triggerWake,
+        decode: () => {},
+        getResult: () => {
+          if (!triggerWake) return '';
+          triggerWake = false;
+          return '星期五';
+        },
+        reset: () => { triggerWake = false; },
+      }),
+      vadFactory: () => ({
+        isSpeech: (samples) => computeRms(samples) >= 0.008,
+        reset: () => {},
+      }),
+      denoiserFactory: () => ({
+        denoise: (samples) => {
+          denoiserCalls++;
+          return samples;
+        },
+      }),
+      liveAsrSessionFactory: () => ({
+        isUsable: () => true,
+        pushSamples: () => {},
+        finish: async () => {
+          liveFinishCalls++;
+          return { text: '被电视污染的识别', latencyMs: 10, interimFallback: false };
+        },
+        abort: () => {},
+      }),
+      recognizerFactory: async (): Promise<XiaoaiAsrRecognizer> => ({
+        transcribe: async () => {
+          batchCalls++;
+          return '打开阳台灯';
+        },
+      }),
+      streamFactory: () => {
+        audioStream = new PassThrough();
+        return {
+          stdout: audioStream,
+          sampleFormat: 's16le',
+          channels: 8,
+          kill: () => audioStream?.end(),
+          onClose: () => {},
+        };
+      },
+      speakerGate: {
+        isActive: () => true,
+        verifyWake: ({ samples }) => {
+          const tv1900 = goertzelAmplitude(samples, 1900, FRONTEND_SAMPLE_RATE);
+          const owner1200 = goertzelAmplitude(samples, 1200, FRONTEND_SAMPLE_RATE);
+          if (gateMode === 'noise_then_owner') {
+            return {
+              matched: true,
+              score: 0.55,
+              threshold: 0.17,
+              speaker: { id: 'o1', name: '主人', role: 'owner', score: 0.55 },
+            };
+          }
+          const matched = owner1200 > tv1900 * 1.4;
+          return {
+            matched,
+            score: matched ? 0.48 : 0.10,
+            threshold: 0.17,
+            ...(matched ? { speaker: { id: 'o1', name: '主人', role: 'owner' as const, score: 0.48 } } : {}),
+          };
+        },
+        verifyUtterance: ({ samples }) => {
+          const tv1900 = goertzelAmplitude(samples, 1900, FRONTEND_SAMPLE_RATE);
+          const owner1200 = goertzelAmplitude(samples, 1200, FRONTEND_SAMPLE_RATE);
+          if (gateMode === 'noise_then_owner') {
+            const matched = owner1200 > tv1900 * 1.4;
+            return {
+              matched,
+              score: matched ? 0.50 : 0.08,
+              threshold: 0.24,
+              ...(matched ? { speaker: { id: 'o1', name: '主人', role: 'owner' as const, score: 0.50 } } : {}),
+            };
+          }
+          const matched = owner1200 > tv1900 * 1.4;
+          return {
+            matched,
+            score: matched ? 0.52 : 0.10,
+            threshold: 0.24,
+            ...(matched ? { speaker: { id: 'o1', name: '主人', role: 'owner' as const, score: 0.52 } } : {}),
+          };
+        },
+      },
+      onWake: async (ev) => {
+        wakeEvents.push(ev.keyword);
+        return { woken: true, suppressed: false };
+      },
+      onUtterance: async (ev) => {
+        utterances.push(ev.text);
+      },
+    });
+
+    const channel: ImChannelConfig = {
+      id: 'xiaoai-spatial-test',
+      platform: 'xiaoai',
+      name: 'LX06 Spatial Null',
+      enabled: true,
+      notifyAll: false,
+      apiBase: 'ssh://lx06=root@127.0.0.1?kws=1&chime=0',
+      allowedSenders: [],
+      inboundCount: 0,
+      outboundCount: 0,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    monitor.sync([channel]);
+    await until(() => Boolean(audioStream));
+    audioStream!.write(Buffer.from(AUDIO_STREAM_MAGIC_8CH_S16, 'latin1'));
+
+    const sr = FRONTEND_SAMPLE_RATE;
+    const write8Ch = async (mics: Float32Array[]) => {
+      const zeroRef = new Float32Array(mics[0]!.length);
+      const buf = encodeInterleavedInt16Frames([...mics, zeroRef, zeroRef]);
+      for (let off = 0; off < buf.length; off += 1280) {
+        audioStream!.write(buf.subarray(off, Math.min(buf.length, off + 1280)));
+        await delay(2);
+      }
+    };
+    const mixHex = (a: Float32Array[], b: Float32Array[]): Float32Array[] =>
+      a.map((ch, idx) => {
+        const out = new Float32Array(ch.length);
+        for (let i = 0; i < ch.length; i++) out[i] = ch[i]! + b[idx]![i]!;
+        return out;
+      });
+    const silence = (sec: number) => Array.from({ length: 6 }, () => new Float32Array(Math.round(sr * sec)));
+
+    // Case A & B: Overlapping loud 205deg TV + 90deg owner on both wake and two-step utterance
+    gateMode = 'spatial_wake_and_utterance';
+    const tvWake = synthHexPlaneWave({
+      durationSec: 0.64,
+      azimuthDeg: 205,
+      signalAtTime: t => 0.14 * Math.sin(2 * Math.PI * 1900 * t),
+      seed: 601,
+    });
+    const ownerWake = synthHexPlaneWave({
+      durationSec: 0.64,
+      azimuthDeg: 90,
+      signalAtTime: t => 0.07 * Math.sin(2 * Math.PI * 1200 * t),
+      seed: 602,
+    });
+    const mixedWake = mixHex(tvWake, ownerWake);
+    await write8Ch(mixedWake.map(ch => ch.subarray(0, Math.round(sr * 0.52))));
+    triggerWake = true;
+    await write8Ch(mixedWake.map(ch => ch.subarray(Math.round(sr * 0.52))));
+    await write8Ch(silence(0.10));
+    await until(() => wakeEvents.length === 1);
+    assert.equal(denoiserCalls, 0, 'Spatial nulling must rescue overlapping TV wake synchronously without denoiser');
+
+    const tvCmd = synthHexPlaneWave({
+      durationSec: 0.40,
+      azimuthDeg: 205,
+      signalAtTime: t => 0.14 * Math.sin(2 * Math.PI * 1900 * t),
+      seed: 603,
+    });
+    const ownerCmd = synthHexPlaneWave({
+      durationSec: 0.40,
+      azimuthDeg: 90,
+      signalAtTime: t => 0.07 * Math.sin(2 * Math.PI * 1200 * t),
+      seed: 604,
+    });
+    await write8Ch(mixHex(tvCmd, ownerCmd));
+    await write8Ch(silence(0.20));
+    await until(() => utterances.length === 1);
+    assert.equal(utterances[0], '打开阳台灯', 'Spatially rescued two-step command must bypass TV-polluted Live ASR');
+    assert.equal(batchCalls, 1);
+    assert.ok(liveFinishCalls <= 1);
+
+    // Case C: Two-step capture hit by non-member TV near deadline (<1000ms left) -> re-arms >=2500ms
+    await delay(50);
+    gateMode = 'noise_then_owner';
+    await write8Ch(synthHexPlaneWave({
+      durationSec: 0.48,
+      azimuthDeg: 90,
+      signalAtTime: t => 0.06 * Math.sin(2 * Math.PI * 1200 * t),
+      seed: 605,
+    }));
+    triggerWake = true;
+    await write8Ch(synthHexPlaneWave({
+      durationSec: 0.08,
+      azimuthDeg: 90,
+      signalAtTime: t => 0.06 * Math.sin(2 * Math.PI * 1200 * t),
+      seed: 605,
+    }));
+    await write8Ch(silence(0.10));
+    await until(() => wakeEvents.length === 2);
+
+    // Wait until <900ms remains on original 2800ms deadline, then send 0.4s TV noise
+    await delay(1_950);
+    await write8Ch(synthHexPlaneWave({
+      durationSec: 0.40,
+      azimuthDeg: 205,
+      signalAtTime: t => 0.08 * Math.sin(2 * Math.PI * 1900 * t),
+      seed: 606,
+    }));
+    await write8Ch(silence(0.20));
+    // Wait past the original 2800ms deadline to prove re-armed window (>=2500ms) stayed alive
+    await delay(1_000);
+    await write8Ch(synthHexPlaneWave({
+      durationSec: 0.36,
+      azimuthDeg: 90,
+      signalAtTime: t => 0.07 * Math.sin(2 * Math.PI * 1200 * t),
+      seed: 607,
+    }));
+    await write8Ch(silence(0.20));
+    await until(() => utterances.length === 2);
+    assert.equal(utterances[1], '打开阳台灯');
+
+    monitor.close();
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});

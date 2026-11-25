@@ -269,10 +269,10 @@ function defaultSpeakerExtractorFactory(config: { modelPath: string }): XiaoaiSp
   };
 }
 
-function clampThreshold(value: unknown, fallback = DEFAULT_SPEAKER_THRESHOLD): number {
+function clampThreshold(value: unknown, fallback = DEFAULT_SPEAKER_THRESHOLD, min = 0.20): number {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
-  return Math.max(0.20, Math.min(0.90, Math.round(n * 1000) / 1000));
+  return Math.max(min, Math.min(0.90, Math.round(n * 1000) / 1000));
 }
 
 function makeSpeakerId(name: string): string {
@@ -984,7 +984,11 @@ export class XiaoaiSpeakerManager {
     },
   ): XiaoaiSpeakerMatchResult {
     const data = this.loadRegistry();
-    const threshold = clampThreshold(opts?.thresholdOverride ?? data.threshold, data.threshold);
+    const threshold = clampThreshold(
+      opts?.thresholdOverride ?? data.threshold,
+      data.threshold,
+      opts?.thresholdOverride !== undefined ? 0.15 : 0.20,
+    );
 
     if (opts?.speakerVerify === false) {
       return { matched: true, score: 1, threshold, reason: 'disabled' };
@@ -1054,7 +1058,7 @@ export class XiaoaiSpeakerManager {
     samples: Float32Array,
     sampleRate: number,
     keyword: string,
-    opts?: { speakerVerify?: boolean; thresholdOverride?: number },
+    opts?: { speakerVerify?: boolean; thresholdOverride?: number; source?: 'kws' | 'asr-rescue' },
   ): XiaoaiSpeakerMatchResult {
     const data = this.loadRegistry();
     const baseThreshold = clampThreshold(opts?.thresholdOverride ?? data.threshold, data.threshold);
@@ -1077,7 +1081,9 @@ export class XiaoaiSpeakerManager {
     const isBareWake = keyword.trim() === '星期五';
     const isUltraShortWake = wakeAudio.length <= Math.round(sampleRate * 0.95);
     const wakeThreshold = isBareWake
-      ? Math.max(0.23, baseThreshold - (isUltraShortWake ? 0.19 : 0.15))
+      ? (opts?.source === 'kws'
+        ? Math.max(0.17, baseThreshold - (isUltraShortWake ? 0.21 : 0.18))
+        : Math.max(0.23, baseThreshold - (isUltraShortWake ? 0.19 : 0.15)))
       : Math.max(0.23, baseThreshold - 0.15);
     return this.matchSamples(wakeAudio, sampleRate, {
       speakerVerify: opts?.speakerVerify,
@@ -1151,7 +1157,11 @@ export class XiaoaiSpeakerManager {
     opts?: { speakerVerify?: boolean; thresholdOverride?: number; wakeVerified?: boolean },
   ): XiaoaiSpeakerUtteranceCheck {
     const data = this.loadRegistry();
-    const threshold = clampThreshold(opts?.thresholdOverride ?? data.threshold, data.threshold);
+    const threshold = clampThreshold(
+      opts?.thresholdOverride ?? data.threshold,
+      data.threshold,
+      opts?.thresholdOverride !== undefined ? 0.15 : 0.20,
+    );
     const quick = this.verifyShortOrInactiveUtterance(threshold, samples, sampleRate, opts);
     if (quick) return quick;
 
@@ -1261,7 +1271,11 @@ export class XiaoaiSpeakerManager {
     opts?: { speakerVerify?: boolean; thresholdOverride?: number; wakeVerified?: boolean },
   ): Promise<XiaoaiSpeakerUtteranceCheck> {
     const data = this.loadRegistry();
-    const threshold = clampThreshold(opts?.thresholdOverride ?? data.threshold, data.threshold);
+    const threshold = clampThreshold(
+      opts?.thresholdOverride ?? data.threshold,
+      data.threshold,
+      opts?.thresholdOverride !== undefined ? 0.15 : 0.20,
+    );
     const quick = this.verifyShortOrInactiveUtterance(threshold, samples, sampleRate, opts);
     if (quick) return quick;
 

@@ -44,6 +44,7 @@ import {
   decodePcm16leToFloat32,
   decodePcm32leToFloat32,
   extractLeadingXiaoaiWakeKeyword,
+  extractTrailingXiaoaiWakeKeyword,
   hasLeadingXiaoaiWakeWord,
   isXiaoaiFollowUpCancel,
   normalizeUtteranceSamples,
@@ -1375,9 +1376,20 @@ test('XiaoAI KWS keywords auto-sync, follow-up cancel parsing, and Router non-th
   assert.equal(isXiaoaiFollowUpCancel('发微信'), false);
   assert.equal(isXiaoaiFollowUpCancel('明天上午九点'), false);
   assert.deepEqual(extractLeadingXiaoaiWakeKeyword('<|zh|>星期五。'), { keyword: '星期五', remainder: '' });
+  assert.deepEqual(extractLeadingXiaoaiWakeKeyword('星期5。'), { keyword: '星期五', remainder: '' });
   assert.deepEqual(extractLeadingXiaoaiWakeKeyword('新期五。'), { keyword: '星期五', remainder: '' });
   assert.equal(extractLeadingXiaoaiWakeKeyword('新期五个人去吃饭'), undefined);
   assert.deepEqual(extractLeadingXiaoaiWakeKeyword('星期五，打开客厅灯'), { keyword: '星期五', remainder: '打开客厅灯' });
+  assert.deepEqual(
+    extractTrailingXiaoaiWakeKeyword('太医不是一直说他胎像本空星期5啊。'),
+    { keyword: '星期五', remainder: '' },
+  );
+  assert.deepEqual(
+    extractTrailingXiaoaiWakeKeyword('说了半天你好星期五！'),
+    { keyword: '你好星期五', remainder: '' },
+  );
+  assert.equal(extractTrailingXiaoaiWakeKeyword('下星期五。'), undefined);
+  assert.equal(extractTrailingXiaoaiWakeKeyword('我们约在星期五'), undefined);
 
   // 2. Managed keywords.txt auto-upgrades when version file is missing/outdated; custom file untouched
   const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-xiaoai-kw-'));

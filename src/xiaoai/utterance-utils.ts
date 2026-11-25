@@ -64,7 +64,7 @@ export function stripTrailingPunctuation(rawText: string): string {
 export function hasLeadingXiaoaiWakeWord(rawText: string): boolean {
   if (!rawText) return false;
   const text = stripLeadingAsrControlTags(rawText);
-  return /^(?:(?:你好|您好|嗨|嘿|喂|诶|唉|欸|黑|呼叫)\s*(?:星期五|friday)|(?:星期五|friday))[\s，,。！!？?、：:]*/i.test(text);
+  return /^(?:(?:你好|您好|嗨|嘿|喂|诶|唉|欸|黑|呼叫)\s*(?:星期[五5]|friday)|(?:星期[五5]|friday))[\s，,。！!？?、：:]*/i.test(text);
 }
 
 /**
@@ -82,7 +82,7 @@ export function cleanXiaoaiAsrUtterance(rawText: string): string {
 
   text = text
     .replace(
-      /^(?:(?:(?:你好|您好|嗨|嘿|喂|诶|唉|欸|黑|呼叫)\s*(?:星期[五武午舞屋吾无物务]|新期[五武午舞吾无]|心期[五武午舞吾无]|星[七奇期][五武午舞]|行期[五武午舞]|星期的五|friday)|(?:星期五|friday)|(?:星期[武午舞屋吾无物务]|新期[五武午舞吾无]|心期[五武午舞吾无]|星[七奇期][五武午舞]|行期[五武午舞]|星期的五)(?=$|[\s，,。！!？?、：:]))[\s，,。！!？?、：:]*)+/i,
+      /^(?:(?:(?:你好|您好|嗨|嘿|喂|诶|唉|欸|黑|呼叫)\s*(?:星期[五5武午舞屋吾无物务]|新期[五武午舞吾无]|心期[五武午舞吾无]|星[七奇期][五武午舞]|行期[五武午舞]|星期的五|friday)|(?:星期[五5]|friday)|(?:星期[武午舞屋吾无物务]|新期[五武午舞吾无]|心期[五武午舞吾无]|星[七奇期][五武午舞]|行期[五武午舞]|星期的五)(?=$|[\s，,。！!？?、：:]))[\s，,。！!？?、：:]*)+/i,
       '',
     )
     .trim();
@@ -99,6 +99,15 @@ export function cleanXiaoaiAsrUtterance(rawText: string): string {
   return text;
 }
 
+function mapXiaoaiWakeKeywordPrefix(prefix?: string): string {
+  if (prefix === '你好' || prefix === '您好') return '你好星期五';
+  if (prefix === '嘿' || prefix === '诶' || prefix === '欸' || prefix === '黑') return '嘿星期五';
+  if (prefix === '嗨' || prefix === '唉') return '嗨星期五';
+  if (prefix === '喂') return '喂星期五';
+  if (prefix === '呼叫') return '呼叫星期五';
+  return '星期五';
+}
+
 export function extractLeadingXiaoaiWakeKeyword(
   rawText: string,
 ): { keyword: string; remainder: string } | undefined {
@@ -107,7 +116,7 @@ export function extractLeadingXiaoaiWakeKeyword(
   if (!text) return undefined;
 
   const m = text.match(
-    /^(?:(你好|您好|嗨|嘿|喂|诶|唉|欸|黑|呼叫)\s*)?(?:(星期五|friday)|(星期[武午舞屋吾无物务]|新期[五武午舞吾无]|心期[五武午舞吾无]|星[七奇期][五武午舞]|行期[五武午舞]|星期的五))([\s\S]*)$/i,
+    /^(?:(你好|您好|嗨|嘿|喂|诶|唉|欸|黑|呼叫)\s*)?(?:(星期[五5]|friday)|(星期[武午舞屋吾无物务]|新期[五武午舞吾无]|心期[五武午舞吾无]|星[七奇期][五武午舞]|行期[五武午舞]|星期的五))([\s\S]*)$/i,
   );
   if (!m) return undefined;
 
@@ -120,14 +129,29 @@ export function extractLeadingXiaoaiWakeKeyword(
     return undefined;
   }
 
-  let keyword = '星期五';
-  if (prefix === '你好' || prefix === '您好') keyword = '你好星期五';
-  else if (prefix === '嘿' || prefix === '诶' || prefix === '欸' || prefix === '黑') keyword = '嘿星期五';
-  else if (prefix === '嗨' || prefix === '唉') keyword = '嗨星期五';
-  else if (prefix === '喂') keyword = '喂星期五';
-  else if (prefix === '呼叫') keyword = '呼叫星期五';
+  return { keyword: mapXiaoaiWakeKeywordPrefix(prefix), remainder };
+}
 
-  return { keyword, remainder };
+export function extractTrailingXiaoaiWakeKeyword(
+  rawText: string,
+): { keyword: string; remainder: '' } | undefined {
+  if (!rawText) return undefined;
+  const text = stripLeadingAsrControlTags(rawText)
+    .replace(/[啊呀哇呢吧啦嘛哦噢哈。，,！!？?、：:；;\s]+$/g, '')
+    .trim();
+  if (!text) return undefined;
+
+  const m = text.match(/(?:(你好|您好|嗨|嘿|喂|诶|唉|欸|黑|呼叫)\s*)?(?:星期[五5]|friday)$/i);
+  if (!m || m.index === undefined || m.index === 0) return undefined;
+
+  const before = text.slice(0, m.index).replace(/[\s，,。！!？?、：:；;]+$/g, '').trim();
+  if (!before) return undefined;
+
+  if (!m[1] && /(?:[这那上下每本到是在从于约定改换选]个?|[一二三四五六七八九十\d]+[个周]?)$/.test(before)) {
+    return undefined;
+  }
+
+  return { keyword: mapXiaoaiWakeKeywordPrefix(m[1]), remainder: '' };
 }
 
 /**
