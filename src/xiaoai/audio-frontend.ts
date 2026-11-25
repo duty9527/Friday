@@ -1141,6 +1141,8 @@ export class OnlineHexBeamformer {
         this.beamAmbientRms[b] = 0.85 * amb + 0.15 * rms;
       } else if (rms <= amb * 2.2) {
         this.beamAmbientRms[b] = 0.97 * amb + 0.03 * rms;
+      } else {
+        this.beamAmbientRms[b] = 0.992 * amb + 0.008 * Math.min(rms, amb * 4.0);
       }
       this.beamRmsBuf[b] = rms;
     }
@@ -1584,6 +1586,19 @@ export async function ensureXiaoaiDenoiserModel(options: {
   return task;
 }
 
+export function computeDenoiserPreGain(samples: Float32Array): number {
+  if (samples.length === 0) return 1;
+  const inRms = calcRms(samples);
+  if (inRms <= 1e-5 || inRms >= 0.04) return 1;
+  let peak = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const abs = Math.abs(samples[i] ?? 0);
+    if (abs > peak) peak = abs;
+  }
+  if (peak <= 1e-5) return 1;
+  return Math.max(1, Math.min(80, 0.08 / inRms, 0.85 / peak));
+}
+
 function defaultDenoiserFactory(config: { modelPath: string }): XiaoaiAudioDenoiser {
   const req = createRequire(import.meta.url);
   const sherpa = req('sherpa-onnx-node') as {
@@ -1609,8 +1624,25 @@ function defaultDenoiserFactory(config: { modelPath: string }): XiaoaiAudioDenoi
   });
   return {
     denoise: (samples, sampleRate) => {
-      const out = denoiser.run({ samples, sampleRate });
+      const preGain = computeDenoiserPreGain(samples);
+      let inputSamples = samples;
+      if (preGain > 1.05) {
+        const scaled = new Float32Array(samples.length);
+        for (let i = 0; i < samples.length; i++) {
+          scaled[i] = (samples[i] ?? 0) * preGain;
+        }
+        inputSamples = scaled;
+      }
+      const out = denoiser.run({ samples: inputSamples, sampleRate });
       if (!out?.samples || out.samples.length === 0) return samples;
+      if (preGain > 1.05) {
+        const invGain = 1 / preGain;
+        const restored = new Float32Array(out.samples.length);
+        for (let i = 0; i < out.samples.length; i++) {
+          restored[i] = (out.samples[i] ?? 0) * invGain;
+        }
+        return restored;
+      }
       return out.samples;
     },
   };

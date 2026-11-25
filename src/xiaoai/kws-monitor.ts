@@ -55,98 +55,101 @@ import {
 
 export { computeRms, normalizeUtteranceSamples };
 
-export const XIAOAI_KEYWORDS_VERSION = 'v6';
+export const XIAOAI_KEYWORDS_VERSION = 'v7';
 
 export const DEFAULT_XIAOAI_KEYWORDS = [
   // 星期五 (bare wake word + universal catch-all when prefix is slurred)
-  'x īng q ī w ǔ :1.55 #0.14 @星期五',
-  'x īng q ì w ǔ :1.55 #0.14 @星期五',
-  'x īng q í w ǔ :1.55 #0.14 @星期五',
-  'x īng q ǐ w ǔ :1.50 #0.15 @星期五',
-  'x īng q i w ǔ :1.50 #0.15 @星期五',
-  'x íng q ī w ǔ :1.50 #0.15 @星期五',
-  'x íng q í w ǔ :1.50 #0.15 @星期五',
-  'x īn q ī w ǔ :1.55 #0.14 @星期五',
-  'x īn q ì w ǔ :1.55 #0.14 @星期五',
-  'x īn q í w ǔ :1.55 #0.14 @星期五',
-  'x īn q ǐ w ǔ :1.50 #0.15 @星期五',
-  'x īn q i w ǔ :1.50 #0.15 @星期五',
-  'x ìn q ī w ǔ :1.50 #0.15 @星期五',
-  'x ìn q ì w ǔ :1.50 #0.15 @星期五',
-  'x ìn q í w ǔ :1.50 #0.15 @星期五',
-  'x īng q ī w ù :1.50 #0.15 @星期五',
-  'x īn q ī w ù :1.50 #0.15 @星期五',
-  'x īn q ì w ù :1.50 #0.15 @星期五',
-  'x īng q ī w ú :1.50 #0.15 @星期五',
-  'x īn q ī w ú :1.50 #0.15 @星期五',
-  'x īng q í w ú :1.50 #0.15 @星期五',
-  'x īn q í w ú :1.50 #0.15 @星期五',
+  'x īng q ī w ǔ :1.70 #0.11 @星期五',
+  'x īng q ì w ǔ :1.70 #0.11 @星期五',
+  'x īng q í w ǔ :1.70 #0.11 @星期五',
+  'x īng q ǐ w ǔ :1.60 #0.12 @星期五',
+  'x īng q i w ǔ :1.60 #0.12 @星期五',
+  'x īng q ī w u :1.60 #0.12 @星期五',
+  'x īng q i w u :1.60 #0.12 @星期五',
+  'x íng q ī w ǔ :1.60 #0.12 @星期五',
+  'x íng q í w ǔ :1.60 #0.12 @星期五',
+  'x īn q ī w ǔ :1.70 #0.11 @星期五',
+  'x īn q ì w ǔ :1.70 #0.11 @星期五',
+  'x īn q í w ǔ :1.70 #0.11 @星期五',
+  'x īn q ǐ w ǔ :1.60 #0.12 @星期五',
+  'x īn q i w ǔ :1.60 #0.12 @星期五',
+  'x īn q ī w u :1.60 #0.12 @星期五',
+  'x ìn q ī w ǔ :1.60 #0.12 @星期五',
+  'x ìn q ì w ǔ :1.60 #0.12 @星期五',
+  'x ìn q í w ǔ :1.60 #0.12 @星期五',
+  'x īng q ī w ù :1.60 #0.12 @星期五',
+  'x īn q ī w ù :1.60 #0.12 @星期五',
+  'x īn q ì w ù :1.60 #0.12 @星期五',
+  'x īng q ī w ú :1.60 #0.12 @星期五',
+  'x īn q ī w ú :1.60 #0.12 @星期五',
+  'x īng q í w ú :1.60 #0.12 @星期五',
+  'x īn q í w ú :1.60 #0.12 @星期五',
   // 你好星期五
-  'n ǐ h ǎo x īng q ī w ǔ :1.5 #0.14 @你好星期五',
-  'n í h ǎo x īng q ī w ǔ :1.5 #0.14 @你好星期五',
-  'n í h ǎo x īng q ì w ǔ :1.5 #0.14 @你好星期五',
-  'n í h ǎo x īng q i w ǔ :1.5 #0.14 @你好星期五',
-  'n ǐ h ǎo x īn q ī w ǔ :1.5 #0.14 @你好星期五',
-  'n ǐ h ǎo x īn q ì w ǔ :1.5 #0.14 @你好星期五',
-  'n í h ǎo x īn q ī w ǔ :1.5 #0.14 @你好星期五',
-  'n ǐ h ǎo x īn q ì w ù :1.5 #0.14 @你好星期五',
+  'n ǐ h ǎo x īng q ī w ǔ :1.65 #0.11 @你好星期五',
+  'n í h ǎo x īng q ī w ǔ :1.65 #0.11 @你好星期五',
+  'n í h ǎo x īng q ì w ǔ :1.65 #0.11 @你好星期五',
+  'n í h ǎo x īng q i w ǔ :1.65 #0.11 @你好星期五',
+  'n ǐ h ǎo x īn q ī w ǔ :1.65 #0.11 @你好星期五',
+  'n ǐ h ǎo x īn q ì w ǔ :1.65 #0.11 @你好星期五',
+  'n í h ǎo x īn q ī w ǔ :1.65 #0.11 @你好星期五',
+  'n ǐ h ǎo x īn q ì w ù :1.65 #0.11 @你好星期五',
   // 嘿星期五 / 诶星期五
-  'h ēi x īng q ī w ǔ :1.6 #0.14 @嘿星期五',
-  'h éi x īng q ī w ǔ :1.6 #0.14 @嘿星期五',
-  'h èi x īng q ī w ǔ :1.6 #0.14 @嘿星期五',
-  'h ěi x īng q ī w ǔ :1.6 #0.14 @嘿星期五',
-  'h ēi x īng q ì w ǔ :1.6 #0.14 @嘿星期五',
-  'h éi x īng q ì w ǔ :1.6 #0.14 @嘿星期五',
-  'h èi x īng q ì w ǔ :1.6 #0.14 @嘿星期五',
-  'h ēi x īng q i w ǔ :1.6 #0.14 @嘿星期五',
-  'h éi x īng q i w ǔ :1.6 #0.14 @嘿星期五',
-  'h ēi x íng q ī w ǔ :1.6 #0.14 @嘿星期五',
-  'h ēi x īn q ī w ǔ :1.6 #0.14 @嘿星期五',
-  'h ēi x īn q ì w ǔ :1.6 #0.14 @嘿星期五',
-  'h ēi x ìn q ī w ǔ :1.6 #0.14 @嘿星期五',
-  'h ēi x ìn q ì w ǔ :1.6 #0.14 @嘿星期五',
-  'h éi x īn q ī w ǔ :1.6 #0.14 @嘿星期五',
-  'h èi x īn q ī w ǔ :1.6 #0.14 @嘿星期五',
-  'ēi x īng q ī w ǔ :1.6 #0.14 @嘿星期五',
-  'éi x īng q ī w ǔ :1.6 #0.14 @嘿星期五',
-  'èi x īng q ī w ǔ :1.6 #0.14 @嘿星期五',
-  'ēi x īng q ì w ǔ :1.6 #0.14 @嘿星期五',
-  'éi x īng q ì w ǔ :1.6 #0.14 @嘿星期五',
-  'èi x īng q ì w ǔ :1.6 #0.14 @嘿星期五',
-  'ēi x īn q ī w ǔ :1.6 #0.14 @嘿星期五',
-  'éi x īn q ī w ǔ :1.6 #0.14 @嘿星期五',
-  'èi x īn q ī w ǔ :1.6 #0.14 @嘿星期五',
+  'h ēi x īng q ī w ǔ :1.75 #0.11 @嘿星期五',
+  'h éi x īng q ī w ǔ :1.75 #0.11 @嘿星期五',
+  'h èi x īng q ī w ǔ :1.75 #0.11 @嘿星期五',
+  'h ěi x īng q ī w ǔ :1.75 #0.11 @嘿星期五',
+  'h ēi x īng q ì w ǔ :1.75 #0.11 @嘿星期五',
+  'h éi x īng q ì w ǔ :1.75 #0.11 @嘿星期五',
+  'h èi x īng q ì w ǔ :1.75 #0.11 @嘿星期五',
+  'h ēi x īng q i w ǔ :1.75 #0.11 @嘿星期五',
+  'h éi x īng q i w ǔ :1.75 #0.11 @嘿星期五',
+  'h ēi x íng q ī w ǔ :1.75 #0.11 @嘿星期五',
+  'h ēi x īn q ī w ǔ :1.75 #0.11 @嘿星期五',
+  'h ēi x īn q ì w ǔ :1.75 #0.11 @嘿星期五',
+  'h ēi x ìn q ī w ǔ :1.75 #0.11 @嘿星期五',
+  'h ēi x ìn q ì w ǔ :1.75 #0.11 @嘿星期五',
+  'h éi x īn q ī w ǔ :1.75 #0.11 @嘿星期五',
+  'h èi x īn q ī w ǔ :1.75 #0.11 @嘿星期五',
+  'ēi x īng q ī w ǔ :1.75 #0.11 @嘿星期五',
+  'éi x īng q ī w ǔ :1.75 #0.11 @嘿星期五',
+  'èi x īng q ī w ǔ :1.75 #0.11 @嘿星期五',
+  'ēi x īng q ì w ǔ :1.75 #0.11 @嘿星期五',
+  'éi x īng q ì w ǔ :1.75 #0.11 @嘿星期五',
+  'èi x īng q ì w ǔ :1.75 #0.11 @嘿星期五',
+  'ēi x īn q ī w ǔ :1.75 #0.11 @嘿星期五',
+  'éi x īn q ī w ǔ :1.75 #0.11 @嘿星期五',
+  'èi x īn q ī w ǔ :1.75 #0.11 @嘿星期五',
   // 嗨星期五 / 唉星期五
-  'h āi x īng q ī w ǔ :1.6 #0.14 @嗨星期五',
-  'h ái x īng q ī w ǔ :1.6 #0.14 @嗨星期五',
-  'h ài x īng q ī w ǔ :1.6 #0.14 @嗨星期五',
-  'h āi x īng q ì w ǔ :1.6 #0.14 @嗨星期五',
-  'h ái x īng q ì w ǔ :1.6 #0.14 @嗨星期五',
-  'h ài x īng q ì w ǔ :1.6 #0.14 @嗨星期五',
-  'h āi x īn q ī w ǔ :1.6 #0.14 @嗨星期五',
-  'h ái x īn q ī w ǔ :1.6 #0.14 @嗨星期五',
-  'h ài x īn q ī w ǔ :1.6 #0.14 @嗨星期五',
-  'āi x īng q ī w ǔ :1.6 #0.14 @嗨星期五',
-  'ài x īng q ī w ǔ :1.6 #0.14 @嗨星期五',
-  'āi x īng q ì w ǔ :1.6 #0.14 @嗨星期五',
-  'ài x īng q ì w ǔ :1.6 #0.14 @嗨星期五',
+  'h āi x īng q ī w ǔ :1.75 #0.11 @嗨星期五',
+  'h ái x īng q ī w ǔ :1.75 #0.11 @嗨星期五',
+  'h ài x īng q ī w ǔ :1.75 #0.11 @嗨星期五',
+  'h āi x īng q ì w ǔ :1.75 #0.11 @嗨星期五',
+  'h ái x īng q ì w ǔ :1.75 #0.11 @嗨星期五',
+  'h ài x īng q ì w ǔ :1.75 #0.11 @嗨星期五',
+  'h āi x īn q ī w ǔ :1.75 #0.11 @嗨星期五',
+  'h ái x īn q ī w ǔ :1.75 #0.11 @嗨星期五',
+  'h ài x īn q ī w ǔ :1.75 #0.11 @嗨星期五',
+  'āi x īng q ī w ǔ :1.75 #0.11 @嗨星期五',
+  'ài x īng q ī w ǔ :1.75 #0.11 @嗨星期五',
+  'āi x īng q ì w ǔ :1.75 #0.11 @嗨星期五',
+  'ài x īng q ì w ǔ :1.75 #0.11 @嗨星期五',
   // 喂星期五
-  'w èi x īng q ī w ǔ :1.6 #0.14 @喂星期五',
-  'w éi x īng q ī w ǔ :1.6 #0.14 @喂星期五',
-  'w èi x īng q ì w ǔ :1.6 #0.14 @喂星期五',
-  'w éi x īng q ì w ǔ :1.6 #0.14 @喂星期五',
-  'w èi x īn q ī w ǔ :1.6 #0.14 @喂星期五',
-  'w éi x īn q ī w ǔ :1.6 #0.14 @喂星期五',
+  'w èi x īng q ī w ǔ :1.75 #0.11 @喂星期五',
+  'w éi x īng q ī w ǔ :1.75 #0.11 @喂星期五',
+  'w èi x īng q ì w ǔ :1.75 #0.11 @喂星期五',
+  'w éi x īng q ì w ǔ :1.75 #0.11 @喂星期五',
+  'w èi x īn q ī w ǔ :1.75 #0.11 @喂星期五',
+  'w éi x īn q ī w ǔ :1.75 #0.11 @喂星期五',
   // 呼叫星期五
-  'h ū j iào x īng q ī w ǔ :1.4 #0.16 @呼叫星期五',
-  'h ū j iào x īng q ì w ǔ :1.4 #0.16 @呼叫星期五',
-  'h ū j iāo x īng q ī w ǔ :1.4 #0.16 @呼叫星期五',
-  'h ù j iāo x īn q ī w ǔ :1.4 #0.16 @呼叫星期五',
+  'h ū j iào x īng q ī w ǔ :1.55 #0.13 @呼叫星期五',
+  'h ū j iào x īng q ì w ǔ :1.55 #0.13 @呼叫星期五',
+  'h ū j iāo x īng q ī w ǔ :1.55 #0.13 @呼叫星期五',
+  'h ù j iāo x īn q ī w ǔ :1.55 #0.13 @呼叫星期五',
 ];
 
 const SAMPLE_RATE = 16_000;
 const DEFAULT_COOLDOWN_MS = 1_200;
-const DEFAULT_PROBE_DURATION_MS = 240;
+const DEFAULT_PROBE_DURATION_MS = 180;
 const DEFAULT_CHIME_DISCARD_MS = 260;
 const DEFAULT_MAX_WAIT_SPEECH_MS = 4_500;
 const DEFAULT_FOLLOWUP_WAIT_SPEECH_MS = 8_000;
@@ -458,10 +461,17 @@ interface ActiveWorker {
   kwsPostRescueSpeech: boolean;
   kwsPostRescueSpeechSamples: number;
   kwsPostRescueMaxRms: number;
+  kwsWakeRescueId: number;
+  kwsWakeRescueInFlight: boolean;
+  kwsWakeRescueChunks: Float32Array[];
+  kwsWakeRescueMultiMics: Float32Array[][];
+  kwsWakeRescueMultiRef: Float32Array[];
+  kwsWakeRescueSamples: number;
   reconnectTimer?: ReturnType<typeof setTimeout>;
   reconnectAttempt: number;
   lastWakeAt: number;
   activeKeyword: string;
+  activeProbeDurationMs: number;
   activeWakeDurationMs: number;
   activeWakeUrgent?: boolean;
   activeWakeSpeaker?: XiaoaiMatchedSpeaker;
@@ -656,6 +666,23 @@ function concatMultiArrays(
   return { mics: trimmedMics, ...(ref && ref.length > 0 ? { ref } : {}) };
 }
 
+function concatTrailingMultiArrays(
+  micArrays: Float32Array[][],
+  refArray: Float32Array[],
+  maxSamples: number,
+): { mics: Float32Array[]; ref?: Float32Array } | undefined {
+  const joined = concatMultiArrays(micArrays, refArray);
+  if (!joined) return undefined;
+  const fullLen = joined.mics[0]?.length ?? 0;
+  if (maxSamples <= 0 || fullLen <= maxSamples) return joined;
+  const start = fullLen - maxSamples;
+  const mics = joined.mics.map(m => m.subarray(start));
+  const ref = joined.ref && joined.ref.length >= fullLen
+    ? joined.ref.subarray(start)
+    : joined.ref;
+  return { mics, ...(ref && ref.length > 0 ? { ref } : {}) };
+}
+
 function pushBoundedSamples(
   chunks: Float32Array[],
   currentSamples: number,
@@ -837,10 +864,10 @@ function defaultSpotterFactory(config: { modelsDir: string; keywordsFile: string
       provider: 'cpu',
       debug: 0,
     },
-    maxActivePaths: 8,
+    maxActivePaths: 10,
     numTrailingBlanks: 0,
-    keywordsScore: 1.45,
-    keywordsThreshold: 0.15,
+    keywordsScore: 1.55,
+    keywordsThreshold: 0.12,
     keywordsFile: config.keywordsFile,
   });
   return {
@@ -906,7 +933,7 @@ export function computeKwsGain(samples: Float32Array, ambientRms: number): numbe
     const abs = Math.abs(samples[i] ?? 0);
     if (abs > peak) peak = abs;
   }
-  const ambientGain = Math.min(80, Math.max(1, 0.045 / Math.max(ambientRms || 0.0006, 0.00018)));
+  const ambientGain = Math.min(80, Math.max(1, 0.065 / Math.max(ambientRms || 0.0006, 0.00018)));
   const peakCap = peak > 0.001 ? 0.55 / peak : 80;
   return Math.max(1, Math.min(ambientGain, peakCap));
 }
@@ -1362,9 +1389,16 @@ export class XiaoaiKwsMonitor {
         kwsPostRescueSpeech: false,
         kwsPostRescueSpeechSamples: 0,
         kwsPostRescueMaxRms: 0,
+        kwsWakeRescueId: 0,
+        kwsWakeRescueInFlight: false,
+        kwsWakeRescueChunks: [],
+        kwsWakeRescueMultiMics: createEmptyMicArrays(),
+        kwsWakeRescueMultiRef: [],
+        kwsWakeRescueSamples: 0,
         reconnectAttempt: 0,
         lastWakeAt: 0,
         activeKeyword: '',
+        activeProbeDurationMs: this.probeDurationMs,
         activeWakeDurationMs: 0,
         activeWakeUrgent: undefined,
         activeWakeSpeaker: undefined,
@@ -1460,6 +1494,7 @@ export class XiaoaiKwsMonitor {
     this.resetKwsIdleGate(worker);
     worker.mode = 'capturing';
     worker.activeKeyword = '连续对话';
+    worker.activeProbeDurationMs = this.probeDurationMs;
     worker.activeWakeDurationMs = 0;
     worker.activeWakeUrgent = undefined;
     worker.activeWakeSpeaker = undefined;
@@ -1525,6 +1560,7 @@ export class XiaoaiKwsMonitor {
     this.resetKwsIdleGate(worker);
     worker.mode = 'capturing';
     worker.activeKeyword = preserveTwoStep ? (meta.keyword || '星期五') : '连续对话';
+    worker.activeProbeDurationMs = this.probeDurationMs;
     worker.activeWakeDurationMs = 0;
     worker.activeWakeUrgent = undefined;
     worker.activeWakeSpeaker = preserveTwoStep ? meta.wakeSpeaker : undefined;
@@ -1732,12 +1768,19 @@ export class XiaoaiKwsMonitor {
       worker.kwsPostRescueSpeech = false;
       worker.kwsPostRescueSpeechSamples = 0;
       worker.kwsPostRescueMaxRms = 0;
+      worker.kwsWakeRescueId++;
+      worker.kwsWakeRescueInFlight = false;
+      worker.kwsWakeRescueChunks = [];
+      worker.kwsWakeRescueMultiMics = createEmptyMicArrays();
+      worker.kwsWakeRescueMultiRef = [];
+      worker.kwsWakeRescueSamples = 0;
     }
   }
 
   private resetWorkerCapture(worker: ActiveWorker, spotter?: XiaoaiKwsSpotter): void {
     worker.mode = 'kws';
     worker.activeKeyword = '';
+    worker.activeProbeDurationMs = this.probeDurationMs;
     worker.activeWakeDurationMs = 0;
     worker.activeWakeUrgent = undefined;
     worker.activeWakeSpeaker = undefined;
@@ -1994,7 +2037,7 @@ export class XiaoaiKwsMonitor {
     }
     const targetGain = computeKwsGain(samples, worker.ambientRms);
     const startGain = worker.kwsGainState > 0 ? worker.kwsGainState : targetGain;
-    const smoothAlpha = targetGain < startGain ? 0.65 : 0.15;
+    const smoothAlpha = targetGain < startGain ? 0.65 : 0.30;
     const endGain = worker.kwsGainState > 0
       ? startGain + (targetGain - startGain) * smoothAlpha
       : targetGain;
@@ -2035,6 +2078,17 @@ export class XiaoaiKwsMonitor {
 
     if (worker.mode === 'capturing') {
       this.handleCaptureSamples(worker, spotter, samples, multiChunk);
+      return;
+    }
+
+    if (worker.kwsWakeRescueInFlight) {
+      if (worker.kwsWakeRescueSamples < msToSamples(1_500)) {
+        worker.kwsWakeRescueChunks.push(samples);
+        worker.kwsWakeRescueSamples += samples.length;
+        if (multiChunk) {
+          appendMultiChunk(worker.kwsWakeRescueMultiMics, worker.kwsWakeRescueMultiRef, multiChunk);
+        }
+      }
       return;
     }
 
@@ -2177,7 +2231,7 @@ export class XiaoaiKwsMonitor {
         && worker.kwsBurstSilenceSamples >= msToSamples(120)
       ) {
         worker.kwsBurstFlushedLookahead = true;
-        if (this.feedSpotterAndCheckWake(worker, spotter, new Float32Array(msToSamples(160)), 0)) {
+        if (this.feedSpotterAndCheckWake(worker, spotter, new Float32Array(msToSamples(160)), 0, { fromSilenceFlush: true })) {
           return;
         }
       }
@@ -2191,6 +2245,7 @@ export class XiaoaiKwsMonitor {
     spotter: XiaoaiKwsSpotter,
     preparedSamples: Float32Array,
     chunkRms: number,
+    options?: { fromSilenceFlush?: boolean },
   ): boolean {
     spotter.acceptWaveform(worker.kwsStream, preparedSamples, SAMPLE_RATE);
     while (spotter.isReady(worker.kwsStream)) {
@@ -2215,16 +2270,51 @@ export class XiaoaiKwsMonitor {
         this.resetKwsIdleGate(worker);
         return true;
       }
-      const gateRes = this.evaluateWakeSpeakerGate(worker, keyword);
+      const gateRes = this.evaluateWakeSpeakerGate(worker, keyword, undefined, true);
       if (!gateRes.matched) {
+        const wakeRms = Math.max(chunkRms, ...worker.recentKwsRms);
+        const canRescue =
+          gateRes.score >= 0.14
+          && !worker.kwsWakeRescueInFlight
+          && Boolean(this.denoiserManager?.isModelReady())
+          && gateRes.wakeSlice.length >= msToSamples(450)
+          && gateRes.wakeSlice.length <= msToSamples(2_200);
+        if (!canRescue) {
+          const doaLog = gateRes.doa !== undefined ? ` doa=${gateRes.doa}°` : '';
+          console.log(
+            `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: wake="${keyword}" rejected by speaker gate (score=${gateRes.score.toFixed(3)} < ${gateRes.threshold.toFixed(3)}, dur=${(gateRes.wakeSlice.length / SAMPLE_RATE).toFixed(2)}s maxRms=${computeRms(gateRes.wakeSlice).toFixed(5)}${doaLog})`,
+          );
+          spotter.reset(worker.kwsStream);
+          worker.kwsRingChunks = [];
+          worker.kwsRingSamples = 0;
+          worker.kwsMultiRingMics = createEmptyMicArrays();
+          worker.kwsMultiRingRef = [];
+          worker.kwsMultiRingSamples = 0;
+          this.resetKwsBurst(worker, true);
+          this.resetKwsIdleGate(worker);
+          return true;
+        }
+        const rescueId = ++worker.kwsWakeRescueId;
+        const captureEpoch = worker.captureEpoch;
+        worker.kwsWakeRescueInFlight = true;
+        worker.kwsWakeRescueChunks = [];
+        worker.kwsWakeRescueMultiMics = createEmptyMicArrays();
+        worker.kwsWakeRescueMultiRef = [];
+        worker.kwsWakeRescueSamples = 0;
         spotter.reset(worker.kwsStream);
         worker.kwsRingChunks = [];
         worker.kwsRingSamples = 0;
         worker.kwsMultiRingMics = createEmptyMicArrays();
         worker.kwsMultiRingRef = [];
         worker.kwsMultiRingSamples = 0;
-        this.resetKwsBurst(worker, true);
-        this.resetKwsIdleGate(worker);
+        void this.tryRescueKwsWakeWithDenoiser(worker, spotter, {
+          keyword,
+          gateRes,
+          wakeRms,
+          rescueId,
+          captureEpoch,
+          fromSilenceFlush: options?.fromSilenceFlush,
+        });
         return true;
       }
       const wakeRms = Math.max(chunkRms, ...worker.recentKwsRms);
@@ -2237,6 +2327,7 @@ export class XiaoaiKwsMonitor {
       this.beginWakeProbe(worker, spotter, keyword, {
         wakeDurationMs,
         speaker: gateRes.speaker,
+        ...(options?.fromSilenceFlush ? { probeDurationMs: Math.min(this.probeDurationMs, 80) } : {}),
       });
       return true;
     }
@@ -2405,6 +2496,7 @@ export class XiaoaiKwsMonitor {
     score: number;
     threshold: number;
     wakeSlice: Float32Array;
+    doa?: number;
   } {
     const rawWakeSlice = customSlice ?? concatFloat32Arrays(worker.kwsRingChunks);
     const gate = this.options.speakerGate;
@@ -2415,22 +2507,47 @@ export class XiaoaiKwsMonitor {
       return { matched: true, score: 1, threshold: 0, wakeSlice: rawWakeSlice };
     }
     let wakeSlice = rawWakeSlice;
-    if (!customSlice && worker.kwsMultiRingSamples >= msToSamples(450)) {
-      const multi = concatMultiArrays(worker.kwsMultiRingMics, worker.kwsMultiRingRef);
-      if (multi && multi.mics.length >= 2) {
-        wakeSlice = processMultiChannelUtterance(multi.mics, multi.ref, SAMPLE_RATE).samples;
+    let wakeDoa: number | undefined;
+    let onlineTail: Float32Array | undefined;
+    if (!customSlice) {
+      const wakeWindowSamples = msToSamples(keyword.trim() === '星期五' ? 1_050 : 1_450);
+      onlineTail = rawWakeSlice.length > wakeWindowSamples
+        ? rawWakeSlice.subarray(rawWakeSlice.length - wakeWindowSamples)
+        : rawWakeSlice;
+      wakeSlice = onlineTail;
+      if (worker.kwsMultiRingSamples >= msToSamples(450)) {
+        const multi = concatTrailingMultiArrays(worker.kwsMultiRingMics, worker.kwsMultiRingRef, wakeWindowSamples);
+        if (multi && multi.mics.length >= 2) {
+          const processed = processMultiChannelUtterance(multi.mics, multi.ref, SAMPLE_RATE);
+          wakeSlice = processed.samples;
+          wakeDoa = processed.azimuthDeg;
+        }
       }
     }
-    const verdict = gate.verifyWake({
+    let verdict = gate.verifyWake({
       channel: worker.channel,
       target: worker.target,
       keyword,
       samples: wakeSlice,
       sampleRate: SAMPLE_RATE,
     });
+    if (!verdict.matched && onlineTail && onlineTail.length >= msToSamples(450) && wakeSlice !== onlineTail) {
+      const onlineVerdict = gate.verifyWake({
+        channel: worker.channel,
+        target: worker.target,
+        keyword,
+        samples: onlineTail,
+        sampleRate: SAMPLE_RATE,
+      });
+      if (onlineVerdict.matched || onlineVerdict.score > verdict.score) {
+        verdict = onlineVerdict;
+        wakeSlice = onlineTail;
+      }
+    }
     if (!verdict.matched && !silentLog) {
+      const doaLog = wakeDoa !== undefined ? ` doa=${wakeDoa}°` : '';
       console.log(
-        `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: wake="${keyword}" rejected by speaker gate (score=${verdict.score.toFixed(3)} < ${verdict.threshold.toFixed(3)}, dur=${(wakeSlice.length / SAMPLE_RATE).toFixed(2)}s maxRms=${computeRms(wakeSlice).toFixed(5)})`,
+        `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: wake="${keyword}" rejected by speaker gate (score=${verdict.score.toFixed(3)} < ${verdict.threshold.toFixed(3)}, dur=${(wakeSlice.length / SAMPLE_RATE).toFixed(2)}s maxRms=${computeRms(wakeSlice).toFixed(5)}${doaLog})`,
       );
     }
     return {
@@ -2439,7 +2556,119 @@ export class XiaoaiKwsMonitor {
       score: verdict.score,
       threshold: verdict.threshold,
       wakeSlice,
+      ...(wakeDoa !== undefined ? { doa: wakeDoa } : {}),
     };
+  }
+
+  private async tryRescueKwsWakeWithDenoiser(
+    worker: ActiveWorker,
+    spotter: XiaoaiKwsSpotter,
+    params: {
+      keyword: string;
+      gateRes: {
+        matched: boolean;
+        speaker?: XiaoaiMatchedSpeaker;
+        score: number;
+        threshold: number;
+        wakeSlice: Float32Array;
+        doa?: number;
+      };
+      wakeRms: number;
+      rescueId: number;
+      captureEpoch: number;
+      fromSilenceFlush?: boolean;
+    },
+  ): Promise<void> {
+    const { keyword, gateRes, wakeRms, rescueId, captureEpoch, fromSilenceFlush } = params;
+    try {
+      const isStillValid = () =>
+        !this.closed
+        && !worker.stopped
+        && worker.mode === 'kws'
+        && worker.captureEpoch === captureEpoch
+        && worker.kwsWakeRescueId === rescueId;
+      if (!isStillValid() || !this.denoiserManager) {
+        return;
+      }
+      const denoised = await this.denoiserManager.denoiseAsync(gateRes.wakeSlice, SAMPLE_RATE);
+      if (!isStillValid()) {
+        return;
+      }
+      const denoisedVerdict = denoised !== gateRes.wakeSlice
+        ? this.evaluateWakeSpeakerGate(worker, keyword, denoised, true)
+        : gateRes;
+      const bufferedChunks = worker.kwsWakeRescueChunks;
+      const bufferedMics = worker.kwsWakeRescueMultiMics;
+      const bufferedRef = worker.kwsWakeRescueMultiRef;
+      worker.kwsWakeRescueInFlight = false;
+      worker.kwsWakeRescueChunks = [];
+      worker.kwsWakeRescueMultiMics = createEmptyMicArrays();
+      worker.kwsWakeRescueMultiRef = [];
+      worker.kwsWakeRescueSamples = 0;
+
+      if (denoisedVerdict.matched) {
+        const now = Date.now();
+        if (
+          now - worker.lastWakeAt < this.cooldownMs
+          || isXiaoaiSpeakingSelfEcho(worker.channel.id, worker.target.id, keyword, now)
+          || this.isBypassedLoopbackSelfEcho(worker, keyword, now)
+        ) {
+          this.resetKwsBurst(worker, true);
+          this.resetKwsIdleGate(worker);
+          return;
+        }
+        console.log(
+          `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: wake="${keyword}" speaker gate rescued by denoiser (${gateRes.score.toFixed(3)} -> ${denoisedVerdict.score.toFixed(3)})`,
+        );
+        const wakeDurationMs = measureWakeSpeechDurationMs(denoisedVerdict.wakeSlice, SAMPLE_RATE);
+        worker.lastSpeechRms = wakeRms;
+        worker.vad?.markWake?.(wakeRms);
+        this.resetKwsBurst(worker, true);
+        this.resetKwsIdleGate(worker);
+        this.beginWakeProbe(worker, spotter, keyword, {
+          wakeDurationMs,
+          speaker: denoisedVerdict.speaker,
+          ...(fromSilenceFlush ? { probeDurationMs: Math.min(this.probeDurationMs, 80) } : {}),
+        });
+        for (let i = 0; i < bufferedChunks.length; i++) {
+          if (this.closed || worker.stopped || (worker.mode !== 'probing' && worker.mode !== 'capturing')) {
+            break;
+          }
+          const chunk = bufferedChunks[i]!;
+          let multi: MultiChannelAudioChunk | undefined;
+          if (bufferedMics.length >= 2 && (bufferedMics[0]?.[i]?.length ?? 0) === chunk.length) {
+            const mics = bufferedMics.map(arr => arr[i]!);
+            const ref = bufferedRef[i] && bufferedRef[i]!.length === chunk.length
+              ? bufferedRef[i]!
+              : new Float32Array(0);
+            multi = {
+              mics,
+              ref,
+              refRms: ref.length > 0 ? computeRms(ref) : 0,
+            };
+          }
+          this.processWorkerSamples(worker, spotter, chunk, multi);
+        }
+        return;
+      }
+
+      const doaLog = gateRes.doa !== undefined ? ` doa=${gateRes.doa}°` : '';
+      console.log(
+        `[xiaoai-kws] ${worker.channel.id}/${worker.target.id}: wake="${keyword}" rejected by speaker gate (score=${gateRes.score.toFixed(3)}, denoised=${denoisedVerdict.score.toFixed(3)} < ${gateRes.threshold.toFixed(3)}, dur=${(gateRes.wakeSlice.length / SAMPLE_RATE).toFixed(2)}s maxRms=${computeRms(gateRes.wakeSlice).toFixed(5)}${doaLog})`,
+      );
+      this.resetKwsBurst(worker, true);
+      this.resetKwsIdleGate(worker);
+    } catch (error) {
+      this.options.onError?.(worker.channel.id, error);
+    } finally {
+      if (worker.kwsWakeRescueId === rescueId) {
+        worker.kwsWakeRescueInFlight = false;
+        worker.kwsWakeRescueChunks = [];
+        worker.kwsWakeRescueMultiMics = createEmptyMicArrays();
+        worker.kwsWakeRescueMultiRef = [];
+        worker.kwsWakeRescueSamples = 0;
+      }
+    }
   }
 
   private async tryAsrWakeRescue(
@@ -2780,6 +3009,7 @@ export class XiaoaiKwsMonitor {
       wakeDurationMs?: number;
       urgent?: boolean;
       speaker?: XiaoaiMatchedSpeaker;
+      probeDurationMs?: number;
     },
   ): void {
     const now = Date.now();
@@ -2794,10 +3024,12 @@ export class XiaoaiKwsMonitor {
       return;
     }
 
-    const probeTarget = msToSamples(this.probeDurationMs);
+    const probeDurationMs = Math.max(20, meta?.probeDurationMs ?? this.probeDurationMs);
+    const probeTarget = msToSamples(probeDurationMs);
     worker.captureEpoch++;
     worker.mode = 'probing';
     worker.activeKeyword = keyword;
+    worker.activeProbeDurationMs = probeDurationMs;
     worker.activeWakeDurationMs = meta?.wakeDurationMs ?? 0;
     worker.activeWakeUrgent = meta?.urgent;
     worker.activeWakeSpeaker = meta?.speaker;
@@ -2962,7 +3194,7 @@ export class XiaoaiKwsMonitor {
       worker.probeSawSpeech = true;
     }
 
-    if (worker.probeSamples < msToSamples(this.probeDurationMs)) {
+    if (worker.probeSamples < msToSamples(worker.activeProbeDurationMs)) {
       return;
     }
 

@@ -11,6 +11,7 @@ import {
   AUDIO_STREAM_MAGIC_1CH_S32,
   AUDIO_STREAM_MAGIC_8CH_S16,
   beamformHexArray,
+  computeDenoiserPreGain,
   computeRms,
   decodeInterleavedPcm16le,
   FRONTEND_SAMPLE_RATE,
@@ -1898,6 +1899,322 @@ test('self-wake prevention: enrollment prompt avoids wake word, TTS guard stays 
     monitor.close();
   } finally {
     resetXiaoaiRuntimeState();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('audio-frontend: computeDenoiserPreGain normalizes -50 dBFS audio safely and skips normal speech', () => {
+  const sr = FRONTEND_SAMPLE_RATE;
+  const quiet = new Float32Array(sr);
+  for (let i = 0; i < sr; i++) {
+    quiet[i] = 0.0028 * Math.sin((2 * Math.PI * 750 * i) / sr);
+  }
+  const gainQuiet = computeDenoiserPreGain(quiet);
+  const scaledRms = computeRms(quiet) * gainQuiet;
+  assert.ok(gainQuiet > 25 && gainQuiet <= 80, `Expected high pre-gain for -50dBFS audio, got ${gainQuiet}`);
+  assert.ok(scaledRms >= 0.06 && scaledRms <= 0.09, `Expected scaled RMS ~0.08, got ${scaledRms}`);
+
+  // Peak safety cap: spiky quiet clip must stay <= 0.85 peak
+  const spiky = new Float32Array(sr);
+  for (let i = 0; i < sr; i++) {
+    spiky[i] = 0.0014 * Math.sin((2 * Math.PI * 500 * i) / sr);
+  }
+  spiky[100] = 0.04;
+  const gainSpiky = computeDenoiserPreGain(spiky);
+  assert.ok(0.04 * gainSpiky <= 0.851, `Expected peak * gain <= 0.85, got ${0.04 * gainSpiky}`);
+
+  // Normal-level speech (RMS >= 0.04) requires no pre-gain
+  const normal = new Float32Array(sr);
+  for (let i = 0; i < sr; i++) {
+    normal[i] = 0.08 * Math.sin((2 * Math.PI * 500 * i) / sr);
+  }
+  assert.equal(computeDenoiserPreGain(normal), 1);
+});
+
+test('audio-frontend: OnlineHexBeamformer adapts ceiling for sustained loud 210deg TV and switches to 90deg speech', () => {
+  const sr = FRONTEND_SAMPLE_RATE;
+  const frameLen = 640;
+  const beamformer = new OnlineHexBeamformer(sr);
+
+  // Phase 1: 0.4s quiet ambient
+  const quiet = synthHexPlaneWave({
+    durationSec: 0.4,
+    azimuthDeg: 0,
+    signalAtTime: () => 0,
+    noiseAmp: 0.0004,
+    seed: 301,
+  });
+  for (let off = 0; off + frameLen <= quiet[0]!.length; off += frameLen) {
+    beamformer.process(quiet.map(m => m.subarray(off, off + frameLen)));
+  }
+
+  // Phase 2: 4.8s sustained loud TV from 210deg (>2.2x initial ambient)
+  const loudTv = synthHexPlaneWave({
+    durationSec: 4.8,
+    azimuthDeg: 210,
+    signalAtTime: t =>
+      0.004 * Math.sin(2 * Math.PI * 950 * t)
+      + 0.0035 * Math.cos(2 * Math.PI * 2100 * t),
+    noiseAmp: 0.0003,
+    seed: 302,
+  });
+  for (let off = 0; off + frameLen <= loudTv[0]!.length; off += frameLen) {
+    beamformer.process(loudTv.map(m => m.subarray(off, off + frameLen)));
+  }
+  assert.equal(beamformer.getActiveBeam(), 7, 'Beamformer locks onto 210deg during sustained loud TV');
+
+  // Phase 3: 0.48s owner speech from 90deg slightly quieter than TV peak
+  const owner90 = synthHexPlaneWave({
+    durationSec: 0.48,
+    azimuthDeg: 90,
+    signalAtTime: t =>
+      0.003 * Math.sin(2 * Math.PI * 1100 * t)
+      + 0.003 * Math.sin(2 * Math.PI * 2600 * t),
+    seed: 303,
+  });
+  const tvTail = synthHexPlaneWave({
+    durationSec: 0.48,
+    azimuthDeg: 210,
+    signalAtTime: t =>
+      0.0035 * Math.sin(2 * Math.PI * 950 * t)
+      + 0.003 * Math.cos(2 * Math.PI * 2100 * t),
+    noiseAmp: 0.0003,
+    seed: 304,
+  });
+  const mixed = owner90.map((ch, idx) => {
+    const out = new Float32Array(ch.length);
+    for (let i = 0; i < ch.length; i++) out[i] = ch[i]! + tvTail[idx]![i]!;
+    return out;
+  });
+
+  let lastAz = -1;
+  for (let off = 0; off + frameLen <= mixed[0]!.length; off += frameLen) {
+    const res = beamformer.process(mixed.map(m => m.subarray(off, off + frameLen)));
+    lastAz = res.azimuthDeg;
+  }
+  assert.equal(lastAz, 90, `Expected OnlineHexBeamformer to switch from adapted 210deg TV to 90deg speech, got ${lastAz}deg`);
+});
+
+test('XiaoaiKwsMonitor: direct KWS uses trailing-window DOA, rescues borderline wakes with async GTCRN without dropping speech, and rejects low-score wakes', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-kws-direct-rescue-'));
+  let monitor: XiaoaiKwsMonitor | undefined;
+  try {
+    let audioStream: PassThrough | undefined;
+    let triggerWake = false;
+    let denoiserCalls = 0;
+    let verifyMode: 'trailing_doa' | 'borderline' | 'low_score' = 'trailing_doa';
+    const wakeEvents: string[] = [];
+    const utterances: string[] = [];
+
+    monitor = new XiaoaiKwsMonitor({
+      homeDir: home,
+      modelsDir: join(home, 'kws'),
+      asrModelsDir: join(home, 'asr'),
+      vadModelPath: join(home, 'vad.onnx'),
+      cooldownMs: 30,
+      probeDurationMs: 60,
+      chimeDiscardMs: 20,
+      maxWaitSpeechMs: 2_000,
+      endSilenceMs: 120,
+      asrWakeRescue: false,
+      idleEnergyGate: false,
+      sshRunner: async () => ({ stdout: '', stderr: '', code: 0 }),
+      spotterFactory: () => ({
+        createStream: () => ({}),
+        acceptWaveform: () => {},
+        isReady: () => triggerWake,
+        decode: () => {},
+        getResult: () => {
+          if (!triggerWake) return '';
+          triggerWake = false;
+          return '星期五';
+        },
+        reset: () => { triggerWake = false; },
+      }),
+      vadFactory: () => ({
+        isSpeech: (samples) => computeRms(samples) >= 0.008,
+        reset: () => {},
+      }),
+      denoiserFactory: () => ({
+        denoise: (samples) => {
+          denoiserCalls++;
+          const out = new Float32Array(samples.length);
+          for (let i = 0; i < samples.length; i++) out[i] = samples[i]! * 0.5;
+          return out;
+        },
+      }),
+      recognizerFactory: async (): Promise<XiaoaiAsrRecognizer> => ({
+        transcribe: async () => '打开卧室灯',
+      }),
+      streamFactory: () => {
+        audioStream = new PassThrough();
+        return {
+          stdout: audioStream,
+          sampleFormat: 's16le',
+          channels: 8,
+          kill: () => audioStream?.end(),
+          onClose: () => {},
+        };
+      },
+      speakerGate: {
+        isActive: () => true,
+        verifyWake: ({ samples }) => {
+          if (verifyMode === 'trailing_doa') {
+            // 210deg TV uses 450Hz, 90deg wake uses 1400Hz; trailing window must preserve 1400Hz over 450Hz
+            const tv450 = goertzelAmplitude(samples, 450, FRONTEND_SAMPLE_RATE);
+            const wake1400 = goertzelAmplitude(samples, 1400, FRONTEND_SAMPLE_RATE);
+            const matched = wake1400 > tv450 * 1.4;
+            return {
+              matched,
+              score: matched ? 0.55 : 0.16,
+              threshold: 0.23,
+              ...(matched ? { speaker: { id: 'o1', name: '主人', role: 'owner' as const, score: 0.55 } } : {}),
+            };
+          }
+          if (verifyMode === 'borderline') {
+            // Raw RMS ~0.045 -> borderline 0.19; denoised (0.5x) -> 0.34 pass
+            const rms = computeRms(samples);
+            if (rms > 0.03) {
+              return { matched: false, score: 0.19, threshold: 0.23 };
+            }
+            return {
+              matched: true,
+              score: 0.34,
+              threshold: 0.23,
+              speaker: { id: 'o1', name: '主人', role: 'owner', score: 0.34 },
+            };
+          }
+          return { matched: false, score: 0.05, threshold: 0.23 };
+        },
+        verifyUtterance: () => ({
+          matched: true,
+          score: 0.50,
+          threshold: 0.24,
+          speaker: { id: 'o1', name: '主人', role: 'owner', score: 0.50 },
+        }),
+      },
+      onWake: async (ev) => {
+        wakeEvents.push(ev.keyword);
+        return { woken: true, suppressed: false };
+      },
+      onUtterance: async (ev) => {
+        utterances.push(ev.text);
+      },
+    });
+
+    const channel: ImChannelConfig = {
+      id: 'xiaoai-direct-rescue',
+      platform: 'xiaoai',
+      name: 'LX06 Direct Rescue',
+      enabled: true,
+      notifyAll: false,
+      apiBase: 'ssh://lx06=root@127.0.0.1?kws=1&chime=0',
+      allowedSenders: [],
+      inboundCount: 0,
+      outboundCount: 0,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    monitor.sync([channel]);
+    await until(() => Boolean(audioStream));
+    audioStream!.write(Buffer.from(AUDIO_STREAM_MAGIC_8CH_S16, 'latin1'));
+
+    const sr = FRONTEND_SAMPLE_RATE;
+    const write8Ch = async (mics: Float32Array[]) => {
+      const zeroRef = new Float32Array(mics[0]!.length);
+      const buf = encodeInterleavedInt16Frames([...mics, zeroRef, zeroRef]);
+      for (let off = 0; off < buf.length; off += 1280) {
+        audioStream!.write(buf.subarray(off, Math.min(buf.length, off + 1280)));
+        await delay(2);
+      }
+    };
+    const silence = (sec: number) => Array.from({ length: 6 }, () => new Float32Array(Math.round(sr * sec)));
+
+    // Test A: 1.15s loud 210deg TV followed by 0.65s 90deg wake -> trailing window locks onto 90deg without denoiser
+    verifyMode = 'trailing_doa';
+    await write8Ch(synthHexPlaneWave({
+      durationSec: 1.15,
+      azimuthDeg: 210,
+      signalAtTime: t => 0.05 * Math.sin(2 * Math.PI * 450 * t),
+      seed: 401,
+    }));
+    await write8Ch(synthHexPlaneWave({
+      durationSec: 0.56,
+      azimuthDeg: 90,
+      signalAtTime: t => 0.075 * Math.sin(2 * Math.PI * 1400 * t),
+      seed: 402,
+    }));
+    triggerWake = true;
+    await write8Ch(synthHexPlaneWave({
+      durationSec: 0.12,
+      azimuthDeg: 90,
+      signalAtTime: t => 0.075 * Math.sin(2 * Math.PI * 1400 * t),
+      seed: 402,
+    }));
+    await write8Ch(silence(0.08));
+    await until(() => wakeEvents.length === 1);
+    assert.equal(denoiserCalls, 0, 'Trailing-window DOA must pass verifyWake directly without invoking denoiser');
+
+    // Finish Test A capture cleanly
+    await write8Ch(synthHexPlaneWave({
+      durationSec: 0.24,
+      azimuthDeg: 90,
+      signalAtTime: t => 0.05 * Math.sin(2 * Math.PI * 1100 * t),
+      seed: 403,
+    }));
+    await write8Ch(silence(0.20));
+    await until(() => utterances.length === 1);
+
+    // Test B: Borderline score=0.19 -> async GTCRN rescue passes (0.34) and preserves post-wake utterance
+    await delay(50);
+    verifyMode = 'borderline';
+    await write8Ch(synthHexPlaneWave({
+      durationSec: 0.48,
+      azimuthDeg: 90,
+      signalAtTime: t => 0.065 * Math.sin(2 * Math.PI * 1200 * t),
+      seed: 404,
+    }));
+    triggerWake = true;
+    await write8Ch(synthHexPlaneWave({
+      durationSec: 0.08,
+      azimuthDeg: 90,
+      signalAtTime: t => 0.065 * Math.sin(2 * Math.PI * 1200 * t),
+      seed: 404,
+    }));
+    // Stream follow-on speech immediately while async GTCRN rescue is running
+    await write8Ch(synthHexPlaneWave({
+      durationSec: 0.24,
+      azimuthDeg: 90,
+      signalAtTime: t => 0.05 * Math.sin(2 * Math.PI * 1100 * t),
+      seed: 405,
+    }));
+    await write8Ch(silence(0.20));
+    await until(() => wakeEvents.length === 2 && utterances.length === 2);
+    assert.ok(denoiserCalls >= 1, 'Borderline direct KWS wake must invoke async GTCRN rescue');
+
+    // Test C: Non-member score=0.05 (<0.14) -> rejected immediately without invoking GTCRN denoiser
+    await delay(50);
+    const denoiserCallsBeforeReject = denoiserCalls;
+    verifyMode = 'low_score';
+    await write8Ch(synthHexPlaneWave({
+      durationSec: 0.48,
+      azimuthDeg: 210,
+      signalAtTime: t => 0.05 * Math.sin(2 * Math.PI * 500 * t),
+      seed: 406,
+    }));
+    triggerWake = true;
+    await write8Ch(synthHexPlaneWave({
+      durationSec: 0.08,
+      azimuthDeg: 210,
+      signalAtTime: t => 0.05 * Math.sin(2 * Math.PI * 500 * t),
+      seed: 406,
+    }));
+    await delay(60);
+    assert.equal(wakeEvents.length, 2, 'Low-score wake must be rejected');
+    assert.equal(denoiserCalls, denoiserCallsBeforeReject, 'Score < 0.14 must skip GTCRN denoiser');
+
+    monitor.close();
+  } finally {
     await rm(home, { recursive: true, force: true });
   }
 });

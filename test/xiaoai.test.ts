@@ -1340,12 +1340,13 @@ test('Router HOST_EVENT snapshot compaction and S32LE single-mic ambient/AGC hel
 
 test('XiaoAI KWS keywords auto-sync, follow-up cancel parsing, and Router non-thinking model setup', async () => {
   // 1. DEFAULT_XIAOAI_KEYWORDS covers all wake variants & zero-initial sandhi without comment lines
-  assert.equal(XIAOAI_KEYWORDS_VERSION, 'v6');
+  assert.equal(XIAOAI_KEYWORDS_VERSION, 'v7');
   const joined = DEFAULT_XIAOAI_KEYWORDS.join('\n');
   for (const tag of ['@星期五', '@你好星期五', '@嘿星期五', '@嗨星期五', '@喂星期五', '@呼叫星期五']) {
     assert.ok(joined.includes(tag), `Missing wake keyword ${tag}`);
   }
   assert.ok(joined.includes('x īng q ī w ǔ'), 'Missing bare 星期五 variant');
+  assert.ok(joined.includes('x īng q ī w u'), 'Missing neutral-tone 星期五 variant');
   assert.ok(joined.includes('x īn q ī w ǔ'), 'Missing front-nasal 星期五 variant');
   assert.ok(joined.includes('x īn q í w ǔ'), 'Missing colloquial front-nasal rising-tone 星期五 variant');
   assert.ok(joined.includes('h ēi x ìn q ī w ǔ'), 'Missing h ēi x ìn q ī w ǔ variant');
