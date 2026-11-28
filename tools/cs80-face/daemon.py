@@ -45,6 +45,7 @@ CTL_SLEEP = 2
 CTL_WAKE = 3
 CTL_STATE = 4
 CTL_HELLO = 5
+_BLACK_FRAME_BYTES = bytes(FRAME_BYTES)
 
 SCENE_STATES = (
     "speaking",
@@ -310,6 +311,7 @@ class SidecarBridge:
         self.udev_hint: Optional[str] = None
         self.block_size: int = 0
         self.features: int = 0
+        self._features_ready: bool = False
         self.session: int = 0
         self.last_error: Optional[str] = None
         self.last_frame_ms: int = 0
@@ -350,6 +352,16 @@ class SidecarBridge:
     def is_up(self) -> bool:
         return self.state == "up" and self._proc is not None and self._proc.poll() is None
 
+    def wait_features(self, timeout: float = 0.5) -> int:
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._cond:
+            while not self._features_ready and self.is_up():
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    break
+                self._cond.wait(timeout=rem)
+            return self.features
+
     def snapshot_status(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {
             "device": self.state,
@@ -365,6 +377,7 @@ class SidecarBridge:
                 "backlightPwm": self.device_backlight_pwm,
                 "edges": self.device_edges,
                 "awake": self.device_awake,
+                "sleepSupported": bool(self.features & 0x40),
             },
             "stats": {
                 "frameMs": self.last_frame_ms,
@@ -413,6 +426,8 @@ class SidecarBridge:
             self.state = "connecting"
             self.last_error = None
             with self._cond:
+                self.features = 0
+                self._features_ready = False
                 self._audio_n = 0
                 self._last_audio_ev = None
                 self._last_ctl_ev = None
@@ -508,7 +523,10 @@ class SidecarBridge:
             if self._on_ready:
                 self._on_ready()
         elif kind == "features":
-            self.features = int(ev.get("bits") or 0)
+            with self._cond:
+                self.features = int(ev.get("bits") or 0)
+                self._features_ready = True
+                self._cond.notify_all()
         elif kind in ("frame", "saver"):
             self.last_frame_ms = int(ev.get("ms") or 0)
         elif kind == "patch":
@@ -525,7 +543,7 @@ class SidecarBridge:
                 self._last_ctl_ev = ev
                 self._cond.notify_all()
         elif kind in ("brightness", "power", "hello", "control"):
-            if kind == "power" and ev.get("ok"):
+            if kind == "power" and ev.get("ok") and (self.features & 0x40):
                 self.device_awake = bool(ev.get("awake"))
             with self._cond:
                 self._ctl_seq += 1
@@ -754,7 +772,7 @@ class FaceDaemon:
             self.renderer.invalidate_prev()
 
     def _sync_hardware_standby(self, target_standby: bool, *, force: bool = False) -> Dict[str, Any]:
-        """Apply physical CTL_SLEEP / CTL_WAKE to qdc1 outside self._lock."""
+        """Apply hardware standby (black frame + CTL_SLEEP on 0x40 or CTL_BRIGHTNESS 0/5 on 0.3.0) outside self._lock."""
         with self._hw_power_lock:
             if not self.sidecar.is_up():
                 return {"ok": True, "deferred": True, "standby": target_standby}
@@ -767,19 +785,40 @@ class FaceDaemon:
                 )
             if already_synced:
                 return {"ok": True, "unchanged": True, "standby": target_standby}
+
+            feats = self.sidecar.wait_features(timeout=0.5)
+            supports_hw_sleep = bool(feats & 0x40)
             if target_standby:
-                res = self.sidecar.send_ctl(CTL_SLEEP, 0)
-            else:
+                self.sidecar.send_full_bgr565(_BLACK_FRAME_BYTES)
+                if supports_hw_sleep:
+                    res = self.sidecar.send_ctl(CTL_SLEEP, 0)
+                    self.sidecar.send_ctl(CTL_STATE, 0)
+                else:
+                    res = self.sidecar.send_ctl(CTL_BRIGHTNESS, 0)
+                    if not (res.get("ok") and int(res.get("value", 100)) <= 5):
+                        res = self.sidecar.send_ctl(CTL_BRIGHTNESS, 5)
+                    self.sidecar.send_ctl(CTL_STATE, 0)
+                with self._lock:
+                    self._full_needed = True
+                    self.renderer.invalidate_prev()
+                    if res.get("ok"):
+                        self._hw_standby_applied = True
+                        self._hw_standby_session = session
+                return res
+
+            if supports_hw_sleep:
                 res = self.sidecar.send_ctl(CTL_WAKE, 0)
+            else:
+                res = {"ok": True}
+            with self._lock:
+                bri = self._brightness
+            bri_res = self.sidecar.send_ctl(CTL_BRIGHTNESS, bri)
+            self.sidecar.send_ctl(CTL_STATE, 0)
+            if res.get("ok") and bri_res.get("ok"):
                 with self._lock:
-                    bri = self._brightness
-                self.sidecar.send_ctl(CTL_BRIGHTNESS, bri)
-                self.sidecar.send_ctl(CTL_STATE, 0)
-            if res.get("ok"):
-                with self._lock:
-                    self._hw_standby_applied = target_standby
+                    self._hw_standby_applied = False
                     self._hw_standby_session = session
-            return res
+            return res if not res.get("ok") else bri_res
 
     def _on_sidecar_ready(self) -> None:
         with self._lock:
@@ -1680,6 +1719,14 @@ class FaceDaemon:
         )
         sidecar_status = self.sidecar.snapshot_status()
         layout = self.layout_store.get()
+        if not standby:
+            standby_mode = "none"
+        elif self.sidecar.features & 0x40:
+            standby_mode = "hw_sleep"
+        elif self.sidecar.device_brightness == 0:
+            standby_mode = "backlight_off"
+        else:
+            standby_mode = "black_dim"
         return {
             "ok": True,
             **sidecar_status,
@@ -1691,6 +1738,7 @@ class FaceDaemon:
             "workerCount": snap.worker_count,
             "standby": standby,
             "standbyReason": reason,
+            "standbyMode": standby_mode,
             "tempWakeRemainingSec": temp_wake_rem,
             "screenPolicy": screen_policy,
             "brightness": brightness,
@@ -1891,7 +1939,7 @@ def run_internal_mock_sidecar(mock_log: Optional[Path]) -> int:
             buf = _read_exact_fd(fd, FRAME_BYTES)
             if buf is None:
                 break
-            record({"type": "0x04", "bytes": len(buf)})
+            record({"type": "0x04", "bytes": len(buf), "black": buf == _BLACK_FRAME_BYTES})
             emit({"event": "saver", "ok": 1, "wire": len(buf), "ms": 12})
         elif t == 0x02:
             cnt_raw = _read_exact_fd(fd, 4)

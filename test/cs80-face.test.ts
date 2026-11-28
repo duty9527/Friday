@@ -1501,10 +1501,13 @@ from unittest import mock
 
 sys.path.insert(0, ${JSON.stringify(join(REPO_ROOT, 'tools', 'cs80-face'))})
 from daemon import (
+    CTL_BRIGHTNESS,
     CTL_SLEEP,
+    CTL_STATE,
     CTL_WAKE,
     FaceDaemon,
     ScreenPolicyStore,
+    _BLACK_FRAME_BYTES,
     is_in_time_range,
     normalize_time_range,
 )
@@ -1618,24 +1621,50 @@ with d._lock:
     assert d._last_activity_mono > base_t
     assert d.evaluate_standby(time.monotonic())[0] is False
 
-# 5. Sidecar ready while in standby sends CTL_SLEEP and skips boot chime
-d2 = FaceDaemon(friday_home=str(daemon_home), mock_sidecar=True)
-d2.screen_store.update({"nightStandbyEnabled": True, "nightStandbyHours": "00:00-23:59", "manualStandby": False})
-d2.sidecar.session = 1
-d2.sidecar.is_up = lambda: True
-ctl_calls = []
-d2.sidecar.send_ctl = lambda cmd, arg=0, wait_sec=2.0: ctl_calls.append((cmd, arg)) or {"ok": True}
-chimes = []
-d2.speaker.on_sidecar_ready = lambda: None
-d2.speaker.play_chime = lambda name, **kw: chimes.append(name)
-with d2._lock:
-    in_sb, _ = d2._refresh_standby_state_locked(time.monotonic())
-assert in_sb is True
-d2._sync_hardware_standby(in_sb, force=True)
-if not in_sb:
-    d2.speaker.play_chime("boot", force=False, sleeping=False)
-assert ctl_calls == [(CTL_SLEEP, 0)], ctl_calls
-assert chimes == [], chimes
+# 5. Sidecar ready while in standby:
+#    - Firmware with 0x40 (0x27F): pushes black frame + CTL_SLEEP + CTL_STATE and skips boot chime
+#    - Firmware 0.3.0 (0x23F): pushes black frame + CTL_BRIGHTNESS 0 (or fallback 5) + CTL_STATE, and restores awake brightness on wake
+for feats, reject_zero, expected_sleep_cmds in (
+    (0x27F, False, [(CTL_SLEEP, 0), (CTL_STATE, 0)]),
+    (0x23F, False, [(CTL_BRIGHTNESS, 0), (CTL_STATE, 0)]),
+    (0x23F, True, [(CTL_BRIGHTNESS, 0), (CTL_BRIGHTNESS, 5), (CTL_STATE, 0)]),
+):
+    d2 = FaceDaemon(friday_home=str(daemon_home), mock_sidecar=True)
+    d2.screen_store.update({"brightness": 85, "nightStandbyEnabled": True, "nightStandbyHours": "00:00-23:59", "manualStandby": False})
+    d2._brightness = 85
+    d2.sidecar.session = 1
+    d2.sidecar.features = feats
+    d2.sidecar._features_ready = True
+    d2.sidecar.is_up = lambda: True
+    ctl_calls = []
+    full_frames = []
+    def _fake_send_ctl(cmd, arg=0, wait_sec=2.0, _reject_zero=reject_zero, _calls=ctl_calls):
+        _calls.append((cmd, arg))
+        if cmd == CTL_BRIGHTNESS and arg == 0 and _reject_zero:
+            return {"ok": False, "value": 100}
+        return {"ok": True, "value": arg}
+    d2.sidecar.send_ctl = _fake_send_ctl
+    d2.sidecar.send_full_bgr565 = lambda buf, _frames=full_frames: _frames.append(buf) or True
+    chimes = []
+    d2.speaker.on_sidecar_ready = lambda: None
+    d2.speaker.play_chime = lambda name, **kw: chimes.append(name)
+    with d2._lock:
+        in_sb, _ = d2._refresh_standby_state_locked(time.monotonic())
+    assert in_sb is True
+    d2._sync_hardware_standby(in_sb, force=True)
+    if not in_sb:
+        d2.speaker.play_chime("boot", force=False, sleeping=False)
+    assert len(full_frames) == 1 and full_frames[0] == _BLACK_FRAME_BYTES, len(full_frames)
+    assert ctl_calls == expected_sleep_cmds, (feats, reject_zero, ctl_calls)
+    assert chimes == [], chimes
+
+    # Waking restores awake brightness (85)
+    ctl_calls.clear()
+    d2._sync_hardware_standby(False, force=True)
+    if feats & 0x40:
+        assert ctl_calls == [(CTL_WAKE, 0), (CTL_BRIGHTNESS, 85), (CTL_STATE, 0)], ctl_calls
+    else:
+        assert ctl_calls == [(CTL_BRIGHTNESS, 85), (CTL_STATE, 0)], ctl_calls
 `;
     execFileSync('python3', ['-c', pyStandby], { cwd: REPO_ROOT, stdio: 'pipe' });
 
@@ -1697,9 +1726,15 @@ assert chimes == [], chimes
         const st = await (await fetch(`http://127.0.0.1:${port}/api/status`)).json() as {
           standby?: boolean;
           standbyReason?: string;
-          hwState?: { awake?: boolean };
+          standbyMode?: string;
+          hwState?: { brightness?: number };
         };
-        return st.standby === true && st.standbyReason === 'night' && st.hwState?.awake === false;
+        return (
+          st.standby === true
+          && st.standbyReason === 'night'
+          && st.standbyMode === 'backlight_off'
+          && st.hwState?.brightness === 0
+        );
       }, 100, 25);
 
       // WeChat inbound must NOT wake from night standby
@@ -1716,7 +1751,7 @@ assert chimes == [], chimes
       assert.equal(stAfterWx.standby, true);
       assert.equal(stAfterWx.standbyReason, 'night');
 
-      // Voice listening DOES temporarily wake the screen
+      // Voice listening DOES temporarily wake the screen and restores brightness=100
       await fetch(`http://127.0.0.1:${port}/api/control`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -1726,9 +1761,9 @@ assert chimes == [], chimes
         const st = await (await fetch(`http://127.0.0.1:${port}/api/status`)).json() as {
           standby?: boolean;
           tempWakeRemainingSec?: number;
-          hwState?: { awake?: boolean };
+          hwState?: { brightness?: number };
         };
-        return st.standby === false && (st.tempWakeRemainingSec ?? 0) > 0 && st.hwState?.awake === true;
+        return st.standby === false && (st.tempWakeRemainingSec ?? 0) > 0 && st.hwState?.brightness === 100;
       }, 100, 25);
 
       // Explicit standby=true immediately returns to night standby
@@ -1742,21 +1777,24 @@ assert chimes == [], chimes
       const stBack = await (await fetch(`http://127.0.0.1:${port}/api/status`)).json() as {
         standby?: boolean;
         standbyReason?: string;
+        standbyMode?: string;
         screenPolicy?: { nightStandbyHours?: string; manualStandby?: boolean };
       };
       assert.equal(stBack.standby, true);
       assert.equal(stBack.standbyReason, 'night');
+      assert.equal(stBack.standbyMode, 'backlight_off');
       assert.equal(stBack.screenPolicy?.nightStandbyHours, activeWindow);
       assert.equal(stBack.screenPolicy?.manualStandby, false);
 
-      // Verify mock sidecar recorded CTL_SLEEP (cmd=2) and CTL_WAKE (cmd=3)
+      // Verify mock sidecar recorded pure-black 0x04 frame, CTL_BRIGHTNESS 0 (sleep) and CTL_BRIGHTNESS 100 (wake)
       const lines = (await readFile(mockLog, 'utf8'))
         .trim()
         .split('\n')
         .filter(Boolean)
         .map(line => JSON.parse(line) as Record<string, unknown>);
-      assert.ok(lines.some(r => r.type === '0x03' && r.cmd === 2), 'CTL_SLEEP sent to mock sidecar');
-      assert.ok(lines.some(r => r.type === '0x03' && r.cmd === 3), 'CTL_WAKE sent to mock sidecar');
+      assert.ok(lines.some(r => r.type === '0x04' && r.black === true), 'pure-black 0x04 frame sent to mock sidecar');
+      assert.ok(lines.some(r => r.type === '0x03' && r.cmd === 1 && r.arg === 0), 'CTL_BRIGHTNESS 0 sent to mock sidecar');
+      assert.ok(lines.some(r => r.type === '0x03' && r.cmd === 1 && r.arg === 100), 'CTL_BRIGHTNESS 100 restored on wake');
     } finally {
       if (proc.exitCode === null) {
         proc.kill('SIGTERM');

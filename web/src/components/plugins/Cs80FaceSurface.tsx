@@ -96,6 +96,7 @@ interface Cs80StatusData {
   expression?: string;
   standby?: boolean;
   standbyReason?: 'none' | 'manual' | 'night' | 'idle';
+  standbyMode?: 'none' | 'hw_sleep' | 'backlight_off' | 'black_dim';
   tempWakeRemainingSec?: number;
   screenPolicy?: Cs80ScreenPolicy;
   brightness?: number;
@@ -525,7 +526,11 @@ export default function Cs80FaceSurface() {
                   {st?.standby && (
                     <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-3">
                       <div className="rounded-full border border-amber-500/40 bg-zinc-950/85 px-3 py-1.5 text-center text-[11px] font-medium text-amber-200 shadow-lg">
-                        待机息屏中 · 背光已关
+                        {st.standbyMode === 'hw_sleep' || st.standbyMode === 'backlight_off'
+                          ? '待机息屏中 · 背光已关'
+                          : st.standbyMode === 'black_dim'
+                            ? '待机息屏中 · 纯黑极暗'
+                            : '待机息屏中'}
                       </div>
                     </div>
                   )}
@@ -743,7 +748,7 @@ export default function Cs80FaceSurface() {
               <span>自动待机与夜间息屏</span>
             </CardTitle>
             <CardDescription className="text-xs">
-              待机期间关闭物理背光；仅语音唤醒或手动操作临时亮屏，微信与定时任务不打扰。
+              待机期间自动关闭背光或切换纯黑极暗；仅语音唤醒或手动操作临时亮屏，微信与定时任务不打扰。
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3 text-xs">
