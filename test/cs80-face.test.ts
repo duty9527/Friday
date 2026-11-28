@@ -1485,3 +1485,291 @@ con_n.close()
     await rm(tmpHome, { recursive: true, force: true });
   }
 });
+
+test('10. CS80 hardware standby: night schedule, idle timeout, voice/manual temporary wake, persistence, and mock-sidecar CTL_SLEEP/CTL_WAKE', async () => {
+  const home = await mkdtemp(join(await realpath(tmpdir()), 'friday-cs80-standby-'));
+  const mockLog = join(home, 'mock-standby.jsonl');
+  const prevPortEnv = process.env.CS80_FACE_PORT;
+
+  try {
+    // Part A: Python unit tests for time-window evaluation, ScreenPolicyStore persistence, and wake/sleep state machine
+    const pyStandby = `
+import json, sys, time
+from datetime import datetime
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, ${JSON.stringify(join(REPO_ROOT, 'tools', 'cs80-face'))})
+from daemon import (
+    CTL_SLEEP,
+    CTL_WAKE,
+    FaceDaemon,
+    ScreenPolicyStore,
+    is_in_time_range,
+    normalize_time_range,
+)
+
+# 1. Cross-midnight and same-day time range checks
+assert normalize_time_range("23:00-7:30") == "23:00-07:30"
+assert is_in_time_range("23:00-07:30", datetime(2026, 11, 29, 23, 30)) is True
+assert is_in_time_range("23:00-07:30", datetime(2026, 11, 29, 3, 0)) is True
+assert is_in_time_range("23:00-07:30", datetime(2026, 11, 29, 7, 29)) is True
+assert is_in_time_range("23:00-07:30", datetime(2026, 11, 29, 7, 30)) is False
+assert is_in_time_range("23:00-07:30", datetime(2026, 11, 29, 12, 0)) is False
+assert is_in_time_range("23:00-07:30", datetime(2026, 11, 29, 22, 59)) is False
+assert is_in_time_range("01:00-06:00", datetime(2026, 11, 29, 3, 15)) is True
+assert is_in_time_range("01:00-06:00", datetime(2026, 11, 29, 6, 0)) is False
+
+# 2. ScreenPolicyStore persistence across reload and corrupt-file fallback
+data_dir = Path(${JSON.stringify(home)}) / "py-unit" / "plugins" / "cs80-face"
+store1 = ScreenPolicyStore(data_dir, default_night_enabled=True)
+assert store1.get()["nightStandbyEnabled"] is True
+assert store1.get()["nightStandbyHours"] == "23:00-07:30"
+store1.update({
+    "brightness": 35,
+    "nightStandbyEnabled": True,
+    "nightStandbyHours": "22:30-07:00",
+    "idleStandbyEnabled": True,
+    "idleStandbyMin": 5,
+    "tempWakeSec": 60,
+    "manualStandby": True,
+})
+store2 = ScreenPolicyStore(data_dir, default_night_enabled=False)
+cfg2 = store2.get()
+assert cfg2["brightness"] == 35
+assert cfg2["nightStandbyEnabled"] is True
+assert cfg2["nightStandbyHours"] == "22:30-07:00"
+assert cfg2["idleStandbyEnabled"] is True
+assert cfg2["idleStandbyMin"] == 5
+assert cfg2["tempWakeSec"] == 60
+assert cfg2["manualStandby"] is True
+
+# 3. Night standby + non-waking WeChat/scene vs temporary voice wake + morning auto-wake
+daemon_home = Path(${JSON.stringify(home)}) / "py-daemon"
+d = FaceDaemon(friday_home=str(daemon_home), mock_sidecar=True)
+d.screen_store.update({
+    "nightStandbyEnabled": True,
+    "nightStandbyHours": "00:00-23:59",
+    "idleStandbyEnabled": False,
+    "tempWakeSec": 45,
+    "manualStandby": False,
+})
+now0 = time.monotonic()
+with d._lock:
+    d._temp_wake_until = 0.0
+    st0, r0 = d.evaluate_standby(now0)
+assert (st0, r0) == (True, "night"), (st0, r0)
+
+# WeChat inbound and background scenes must NOT wake from standby
+d.handle_control({"action": "inbound", "channel": "wechat", "text": "晚安消息"})
+d.handle_control({"action": "scene", "scene": "sending_msg", "channel": "wechat", "phase": "start"})
+d.handle_control({"action": "scene", "scene": "operating_tv", "phase": "start"})
+with d._lock:
+    st_wx, r_wx = d.evaluate_standby(time.monotonic())
+assert (st_wx, r_wx) == (True, "night"), (st_wx, r_wx)
+
+# Voice wake temporarily wakes for tempWakeSec then returns to night standby
+d.handle_control({"action": "voice", "phase": "listening", "keyword": "星期五"})
+with d._lock:
+    st_voice, _ = d.evaluate_standby(time.monotonic())
+assert st_voice is False
+d.handle_control({"action": "voice", "phase": "idle"})
+with d._lock:
+    st_after_idle, _ = d.evaluate_standby(time.monotonic() + 2.0)
+    st_expired, r_expired = d.evaluate_standby(time.monotonic() + 100.0)
+assert st_after_idle is False
+assert (st_expired, r_expired) == (True, "night"), (st_expired, r_expired)
+
+# Explicit standby=True during night window clears temp wake and keeps manualStandby=False
+with mock.patch("daemon.is_in_time_range", return_value=True):
+    res_sleep_night = d.handle_control({"action": "screen", "standby": True})
+    assert res_sleep_night["ok"] is True
+    assert res_sleep_night["standbyReason"] == "night"
+    assert d.screen_store.get()["manualStandby"] is False
+
+# Explicit standby=True outside night window sets manualStandby=True
+with mock.patch("daemon.is_in_time_range", return_value=False):
+    res_sleep_day = d.handle_control({"action": "screen", "standby": True})
+    assert res_sleep_day["ok"] is True
+    assert res_sleep_day["standbyReason"] == "manual"
+    assert d.screen_store.get()["manualStandby"] is True
+
+# 4. Idle timeout standby
+d.screen_store.update({
+    "nightStandbyEnabled": False,
+    "idleStandbyEnabled": True,
+    "idleStandbyMin": 5,
+    "tempWakeSec": 30,
+    "manualStandby": False,
+})
+base_t = 5000.0
+with d._lock:
+    d._last_activity_mono = base_t
+    d._temp_wake_until = 0.0
+    assert d.evaluate_standby(base_t + 299.0) == (False, "none")
+    assert d.evaluate_standby(base_t + 300.0) == (True, "idle")
+
+# WeChat inbound must not reset idle clock; express wakes and resets idle clock
+d.handle_control({"action": "inbound", "channel": "wechat", "text": "后台来信"})
+with d._lock:
+    assert d._last_activity_mono == base_t
+d.handle_control({"action": "express", "expr": "happy", "holdSec": 5})
+with d._lock:
+    assert d._last_activity_mono > base_t
+    assert d.evaluate_standby(time.monotonic())[0] is False
+
+# 5. Sidecar ready while in standby sends CTL_SLEEP and skips boot chime
+d2 = FaceDaemon(friday_home=str(daemon_home), mock_sidecar=True)
+d2.screen_store.update({"nightStandbyEnabled": True, "nightStandbyHours": "00:00-23:59", "manualStandby": False})
+d2.sidecar.session = 1
+d2.sidecar.is_up = lambda: True
+ctl_calls = []
+d2.sidecar.send_ctl = lambda cmd, arg=0, wait_sec=2.0: ctl_calls.append((cmd, arg)) or {"ok": True}
+chimes = []
+d2.speaker.on_sidecar_ready = lambda: None
+d2.speaker.play_chime = lambda name, **kw: chimes.append(name)
+with d2._lock:
+    in_sb, _ = d2._refresh_standby_state_locked(time.monotonic())
+assert in_sb is True
+d2._sync_hardware_standby(in_sb, force=True)
+if not in_sb:
+    d2.speaker.play_chime("boot", force=False, sleeping=False)
+assert ctl_calls == [(CTL_SLEEP, 0)], ctl_calls
+assert chimes == [], chimes
+`;
+    execFileSync('python3', ['-c', pyStandby], { cwd: REPO_ROOT, stdio: 'pipe' });
+
+    // Part B: End-to-end daemon.py --mock-sidecar verification
+    const now = new Date();
+    const fmtHm = (d: Date) => `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    const startDt = new Date(now.getTime() - 2 * 60 * 60_000);
+    const endDt = new Date(now.getTime() + 2 * 60 * 60_000);
+    const activeWindow = `${fmtHm(startDt)}-${fmtHm(endDt)}`;
+
+    const proc = spawn(
+      'python3',
+      ['-u', 'tools/cs80-face/daemon.py', '--host', '127.0.0.1', '--port', '0', '--home', home, '--mock-sidecar', '--mock-log', mockLog],
+      { cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    let stdoutBuf = '';
+    proc.stdout.on('data', chunk => { stdoutBuf += String(chunk); });
+
+    try {
+      await until(() => /LISTENING http:\/\/127\.0\.0\.1:(\d+)/.test(stdoutBuf), 300, 25);
+      const match = stdoutBuf.match(/LISTENING http:\/\/127\.0\.0\.1:(\d+)/);
+      assert.ok(match);
+      const port = Number(match[1]);
+      process.env.CS80_FACE_PORT = String(port);
+
+      await until(async () => {
+        const st = await (await fetch(`http://127.0.0.1:${port}/api/status`)).json() as { device?: string };
+        return st.device === 'up';
+      }, 200, 25);
+
+      // Invalid nightStandbyHours and idleStandbyMin return HTTP 400
+      for (const bad of [
+        { action: 'screen', nightStandbyHours: '99:99-07:00' },
+        { action: 'screen', idleStandbyMin: 0 },
+        { action: 'screen', tempWakeSec: 5 },
+      ]) {
+        const resp = await fetch(`http://127.0.0.1:${port}/api/control`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(bad),
+        });
+        assert.equal(resp.status, 400);
+        const body = await resp.json() as { ok?: boolean; err?: string };
+        assert.equal(body.ok, false);
+        assert.ok(body.err);
+      }
+
+      // Enable night standby covering current local time via cs80-face plugin
+      const cfgRes = await runPlugin(home, 'cs80-face', 'screen', {
+        nightStandbyEnabled: true,
+        nightStandbyHours: activeWindow,
+        idleStandbyEnabled: true,
+        idleStandbyMin: 15,
+        tempWakeSec: 60,
+      });
+      assert.equal(cfgRes.ok, true);
+
+      await until(async () => {
+        const st = await (await fetch(`http://127.0.0.1:${port}/api/status`)).json() as {
+          standby?: boolean;
+          standbyReason?: string;
+          hwState?: { awake?: boolean };
+        };
+        return st.standby === true && st.standbyReason === 'night' && st.hwState?.awake === false;
+      }, 100, 25);
+
+      // WeChat inbound must NOT wake from night standby
+      await fetch(`http://127.0.0.1:${port}/api/control`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'inbound', channel: 'wechat', text: '深夜消息不亮屏', holdSec: 5 }),
+      });
+      await delay(250);
+      const stAfterWx = await (await fetch(`http://127.0.0.1:${port}/api/status`)).json() as {
+        standby?: boolean;
+        standbyReason?: string;
+      };
+      assert.equal(stAfterWx.standby, true);
+      assert.equal(stAfterWx.standbyReason, 'night');
+
+      // Voice listening DOES temporarily wake the screen
+      await fetch(`http://127.0.0.1:${port}/api/control`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'voice', phase: 'listening', keyword: '星期五' }),
+      });
+      await until(async () => {
+        const st = await (await fetch(`http://127.0.0.1:${port}/api/status`)).json() as {
+          standby?: boolean;
+          tempWakeRemainingSec?: number;
+          hwState?: { awake?: boolean };
+        };
+        return st.standby === false && (st.tempWakeRemainingSec ?? 0) > 0 && st.hwState?.awake === true;
+      }, 100, 25);
+
+      // Explicit standby=true immediately returns to night standby
+      await fetch(`http://127.0.0.1:${port}/api/control`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'voice', phase: 'idle' }),
+      });
+      const sleepNow = await runPlugin(home, 'cs80-face', 'screen', { standby: true });
+      assert.equal(sleepNow.ok, true);
+      const stBack = await (await fetch(`http://127.0.0.1:${port}/api/status`)).json() as {
+        standby?: boolean;
+        standbyReason?: string;
+        screenPolicy?: { nightStandbyHours?: string; manualStandby?: boolean };
+      };
+      assert.equal(stBack.standby, true);
+      assert.equal(stBack.standbyReason, 'night');
+      assert.equal(stBack.screenPolicy?.nightStandbyHours, activeWindow);
+      assert.equal(stBack.screenPolicy?.manualStandby, false);
+
+      // Verify mock sidecar recorded CTL_SLEEP (cmd=2) and CTL_WAKE (cmd=3)
+      const lines = (await readFile(mockLog, 'utf8'))
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map(line => JSON.parse(line) as Record<string, unknown>);
+      assert.ok(lines.some(r => r.type === '0x03' && r.cmd === 2), 'CTL_SLEEP sent to mock sidecar');
+      assert.ok(lines.some(r => r.type === '0x03' && r.cmd === 3), 'CTL_WAKE sent to mock sidecar');
+    } finally {
+      if (proc.exitCode === null) {
+        proc.kill('SIGTERM');
+        await Promise.race([
+          new Promise<void>(res => proc.once('exit', () => res())),
+          delay(2000),
+        ]);
+        if (proc.exitCode === null) proc.kill('SIGKILL');
+      }
+    }
+  } finally {
+    if (prevPortEnv === undefined) delete process.env.CS80_FACE_PORT;
+    else process.env.CS80_FACE_PORT = prevPortEnv;
+    await rm(home, { recursive: true, force: true });
+  }
+});

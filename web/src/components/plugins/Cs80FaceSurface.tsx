@@ -4,6 +4,7 @@ import {
   ArrowUpIcon,
   LayoutGridIcon,
   MonitorIcon,
+  MoonIcon,
   PlusIcon,
   RefreshCwIcon,
   RotateCcwIcon,
@@ -76,6 +77,16 @@ interface Cs80WidgetSummary {
   ok: boolean;
 }
 
+interface Cs80ScreenPolicy {
+  brightness?: number;
+  nightStandbyEnabled: boolean;
+  nightStandbyHours: string;
+  idleStandbyEnabled: boolean;
+  idleStandbyMin: number;
+  tempWakeSec: number;
+  manualStandby: boolean;
+}
+
 interface Cs80StatusData {
   ok: boolean;
   device?: string;
@@ -84,6 +95,9 @@ interface Cs80StatusData {
   subPhase?: string;
   expression?: string;
   standby?: boolean;
+  standbyReason?: 'none' | 'manual' | 'night' | 'idle';
+  tempWakeRemainingSec?: number;
+  screenPolicy?: Cs80ScreenPolicy;
   brightness?: number;
   lastError?: string | null;
   stats?: { patchMs?: number };
@@ -102,6 +116,40 @@ interface Cs80DashboardPayload {
 const CARD_SIZES: CardSize[] = ['1x1', '2x1', '1x2', '2x2'];
 const BRIGHTNESS_OPTS = [100, 80, 60, 35, 15];
 const VOLUME_OPTS = [100, 85, 65, 45, 25, 0];
+const IDLE_MIN_OPTS = [5, 10, 15, 30, 60, 120];
+const TEMP_WAKE_OPTS = [
+  { value: 30, label: '30 秒' },
+  { value: 60, label: '60 秒' },
+  { value: 90, label: '90 秒' },
+  { value: 180, label: '3 分钟' },
+  { value: 300, label: '5 分钟' },
+];
+
+function localizeStandbyReason(reason?: string): string {
+  switch ((reason ?? '').trim().toLowerCase()) {
+    case 'night':
+      return '夜间待机';
+    case 'idle':
+      return '空闲待机';
+    case 'manual':
+      return '手动待机';
+    default:
+      return '待机';
+  }
+}
+
+function localizeStandbyBanner(reason?: string): string {
+  switch ((reason ?? '').trim().toLowerCase()) {
+    case 'night':
+      return '夜间定时息屏中';
+    case 'idle':
+      return '空闲超时息屏中';
+    case 'manual':
+      return '手动息屏待机中';
+    default:
+      return '待机息屏中';
+  }
+}
 
 const BOT_STATE_LABELS: Record<string, string> = {
   idle: '待机守候',
@@ -244,6 +292,8 @@ export default function Cs80FaceSurface() {
   const [weatherCityDirty, setWeatherCityDirty] = useState(false);
   const [bannerText, setBannerText] = useState('');
   const [quietHours, setQuietHours] = useState('');
+  const [nightHoursDraft, setNightHoursDraft] = useState('23:00-07:30');
+  const [nightHoursDirty, setNightHoursDirty] = useState(false);
   const [renameValue, setRenameValue] = useState('');
   const [renaming, setRenaming] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -283,6 +333,9 @@ export default function Cs80FaceSurface() {
       if (data.status?.speaker && !editingInsideRef.current) {
         setQuietHours(data.status.speaker.quietHours || '');
       }
+      if (data.status?.screenPolicy && !editingInsideRef.current && !nightHoursDirty) {
+        setNightHoursDraft(data.status.screenPolicy.nightStandbyHours || '23:00-07:30');
+      }
       if (data.layout) {
         setDraftLayout(prev => {
           if (!dirty || !prev) {
@@ -293,7 +346,7 @@ export default function Cs80FaceSurface() {
         });
       }
     },
-    [dirty, weatherCityDirty],
+    [dirty, nightHoursDirty, weatherCityDirty],
   );
 
   const refreshDashboard = useCallback(
@@ -438,7 +491,7 @@ export default function Cs80FaceSurface() {
                 <CardTitle className="text-sm">物理副屏实时镜像</CardTitle>
                 <div className="flex items-center gap-1">
                   <Badge size="sm" variant={up ? (st?.standby ? 'warning' : 'success') : 'secondary'}>
-                    {up ? (st?.standby ? '待机' : `USB ${st?.usbSpeed ?? 480}M`) : '仅预览'}
+                    {st?.standby ? localizeStandbyReason(st.standbyReason) : (up ? `USB ${st?.usbSpeed ?? 480}M` : '仅预览')}
                   </Badge>
                   <Badge size="sm" variant={dirty ? 'warning' : 'secondary'}>
                     {dirty ? '同步中…' : '已同步'}
@@ -447,6 +500,7 @@ export default function Cs80FaceSurface() {
               </div>
               <CardDescription className="text-xs">
                 {localizeBotState(st?.botState)} · {localizeExpression(st?.expression)} · 亮度 {st?.brightness ?? 100}%
+                {!st?.standby && (st?.tempWakeRemainingSec ?? 0) > 0 ? ` · 临时亮屏 ${st?.tempWakeRemainingSec}s` : ''}
                 {st?.stats?.patchMs !== undefined ? ` · ${st.stats.patchMs}ms` : ''}
               </CardDescription>
             </CardHeader>
@@ -454,18 +508,25 @@ export default function Cs80FaceSurface() {
               <div className="flex min-h-0 flex-1 items-center justify-center overflow-hidden lg:[container-type:size]">
                 <div
                   data-testid="cs80-preview-frame"
-                  className="flex aspect-[800/1280] items-center justify-center overflow-hidden rounded-2xl border-2 border-border bg-black shadow-inner lg:h-[min(100cqh,calc(100cqw*1280/800))] lg:w-[min(100cqw,calc(100cqh*800/1280))] max-lg:w-full max-lg:max-w-[264px]"
+                  className="relative flex aspect-[800/1280] items-center justify-center overflow-hidden rounded-2xl border-2 border-border bg-black shadow-inner lg:h-[min(100cqh,calc(100cqw*1280/800))] lg:w-[min(100cqw,calc(100cqh*800/1280))] max-lg:w-full max-lg:max-w-[264px]"
                 >
                   {previewUrl ? (
                     <img
                       src={previewUrl}
                       alt="CS80 实时帧预览"
-                      className="block size-full object-contain"
+                      className={`block size-full object-contain transition-opacity ${st?.standby ? 'opacity-30' : 'opacity-100'}`}
                       decoding="async"
                     />
                   ) : (
                     <div className="px-4 text-center text-xs text-zinc-400">
                       暂无画面帧（请确认守护进程已响应）
+                    </div>
+                  )}
+                  {st?.standby && (
+                    <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-3">
+                      <div className="rounded-full border border-amber-500/40 bg-zinc-950/85 px-3 py-1.5 text-center text-[11px] font-medium text-amber-200 shadow-lg">
+                        待机息屏中 · 背光已关
+                      </div>
                     </div>
                   )}
                 </div>
@@ -523,7 +584,9 @@ export default function Cs80FaceSurface() {
             <MonitorIcon className="size-4 text-primary" />
             <h3 className="text-sm font-semibold">桌面副屏 · CS80 互动工作台</h3>
             <Badge variant={up ? (st?.standby ? 'warning' : 'success') : 'secondary'}>
-              {up ? (st?.standby ? '待机息屏中' : `USB ${st?.usbSpeed ?? 480} Mbps 在线`) : '未接入屏幕 / 仅渲染预览'}
+              {st?.standby
+                ? localizeStandbyBanner(st.standbyReason)
+                : (up ? `USB ${st?.usbSpeed ?? 480} Mbps 在线` : '未接入屏幕 / 仅渲染预览')}
             </Badge>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -670,6 +733,135 @@ export default function Cs80FaceSurface() {
                 </Button>
               ))}
             </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="flex items-center gap-1.5 text-sm">
+              <MoonIcon className="size-4" />
+              <span>自动待机与夜间息屏</span>
+            </CardTitle>
+            <CardDescription className="text-xs">
+              待机期间关闭物理背光；仅语音唤醒或手动操作临时亮屏，微信与定时任务不打扰。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3 text-xs">
+            {(() => {
+              const policy = st?.screenPolicy;
+              const nightEnabled = policy?.nightStandbyEnabled ?? true;
+              const idleEnabled = policy?.idleStandbyEnabled ?? false;
+              const idleMin = policy?.idleStandbyMin ?? 15;
+              const tempWakeSec = policy?.tempWakeSec ?? 90;
+              const idleChoices = IDLE_MIN_OPTS.includes(idleMin)
+                ? IDLE_MIN_OPTS
+                : [...IDLE_MIN_OPTS, idleMin].sort((a, b) => a - b);
+              const tempWakeChoices = TEMP_WAKE_OPTS.some(opt => opt.value === tempWakeSec)
+                ? TEMP_WAKE_OPTS
+                : [...TEMP_WAKE_OPTS, { value: tempWakeSec, label: `${tempWakeSec} 秒` }].sort((a, b) => a.value - b.value);
+
+              const updateScreenPolicy = async (patch: Record<string, unknown>, clearNightDirty = false) => {
+                if (authExpired) return;
+                setBusy(true);
+                try {
+                  const res = await callFace('screen', patch);
+                  if (!mountedRef.current) return;
+                  if (res.ok) {
+                    if (clearNightDirty) setNightHoursDirty(false);
+                    setStatus(null);
+                    await refreshDashboard(true);
+                  } else {
+                    setStatus({ text: res.message || '更新待机策略失败', tone: 'err' });
+                  }
+                } catch (err) {
+                  if (mountedRef.current) {
+                    setStatus({ text: `更新待机策略失败：${errorText(err)}`, tone: 'err' });
+                  }
+                } finally {
+                  if (mountedRef.current) setBusy(false);
+                }
+              };
+
+              return (
+                <>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <Switch
+                        checked={nightEnabled}
+                        disabled={busy}
+                        onCheckedChange={checked => void updateScreenPolicy({ nightStandbyEnabled: Boolean(checked) })}
+                      />
+                      <span>夜间定时自动息屏</span>
+                    </label>
+                    <div className="flex items-center gap-1.5">
+                      <Input
+                        size="sm"
+                        className="w-36"
+                        aria-label="夜间息屏时段"
+                        value={nightHoursDraft}
+                        disabled={busy}
+                        onChange={e => {
+                          setNightHoursDirty(true);
+                          setNightHoursDraft(e.target.value);
+                        }}
+                        placeholder="23:00-07:30"
+                      />
+                      <Button
+                        size="xs"
+                        variant="outline"
+                        disabled={busy}
+                        onClick={() => void updateScreenPolicy({ nightStandbyHours: nightHoursDraft.trim() }, true)}
+                      >
+                        保存时段
+                      </Button>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex items-center gap-2">
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <Switch
+                          checked={idleEnabled}
+                          disabled={busy}
+                          onCheckedChange={checked => void updateScreenPolicy({ idleStandbyEnabled: Boolean(checked) })}
+                        />
+                        <span>空闲超时自动息屏</span>
+                      </label>
+                      <select
+                        aria-label="空闲超时时长"
+                        value={String(idleMin)}
+                        disabled={busy}
+                        onChange={e => void updateScreenPolicy({ idleStandbyMin: Number(e.target.value) })}
+                        className="h-7 rounded-md border border-input bg-background px-2 text-xs outline-none"
+                      >
+                        {idleChoices.map(m => (
+                          <option key={m} value={String(m)}>
+                            {m} 分钟
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-muted-foreground">临时唤醒时长：</span>
+                      <select
+                        aria-label="临时唤醒时长"
+                        value={String(tempWakeSec)}
+                        disabled={busy}
+                        onChange={e => void updateScreenPolicy({ tempWakeSec: Number(e.target.value) })}
+                        className="h-7 rounded-md border border-input bg-background px-2 text-xs outline-none"
+                      >
+                        {tempWakeChoices.map(opt => (
+                          <option key={opt.value} value={String(opt.value)}>
+                            {opt.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                </>
+              );
+            })()}
           </CardContent>
         </Card>
 

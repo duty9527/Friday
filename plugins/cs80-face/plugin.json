@@ -2,7 +2,7 @@
   "name": "cs80-face",
   "title": "CS80 实体副屏化身与喇叭",
   "runtime": "in-process",
-  "promptHint": "CS80副屏表情/卡片/喇叭亮度",
+  "promptHint": "CS80副屏表情/卡片/夜间待机/喇叭",
   "description": "连接本地 CS80 伴侣守护进程（127.0.0.1:8788），实时控制 F.R.I.D.A.Y. 实体脸部表情、Bento 插件卡片编排、屏幕亮度待机以及内置喇叭提示音。",
   "entry": "index.mjs",
   "actions": ["status", "dashboard", "layout", "express", "sound", "screen"],
@@ -40,7 +40,7 @@
     {
       "name": "screen",
       "label": "调节屏幕亮度与待机",
-      "description": "调节 CS80 屏幕亮度（5..100，设为 100 时关闭软件 PWM 完全防闪）、切换待机/唤醒或强制刷新整帧。",
+      "description": "调节 CS80 屏幕亮度（brightness: 5..100，设为 100 时关闭软件 PWM 完全防闪）、手动切换待机/唤醒（standby: boolean）、配置夜间定时自动息屏（nightStandbyEnabled: boolean, nightStandbyHours: \"HH:MM-HH:MM\"）、空闲超时自动息屏（idleStandbyEnabled: boolean, idleStandbyMin: 1..720）、待机期间语音/手动临时亮屏时长（tempWakeSec: 15..1800）或强制刷新整帧（refresh: boolean）。",
       "defaultArgs": { "brightness": 100 }
     }
   ]

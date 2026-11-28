@@ -80,11 +80,20 @@ export async function runAction(action = 'status', args = {}, context = {}) {
     if (name === 'status') {
       const st = await callDaemon(baseUrl, '/api/status', { signal: context?.signal, timeoutMs: 6000 });
       const spk = st.speaker ?? {};
+      const sp = st.screenPolicy ?? {};
+      const standbyMap = {
+        night: '夜间定时待机',
+        idle: '空闲超时待机',
+        manual: '手动待机',
+      };
+      const standbyText = st.standby ? (standbyMap[st.standbyReason] ?? '是') : '否';
+      const nightText = sp.nightStandbyEnabled ? (sp.nightStandbyHours || '开') : '关';
+      const idleText = sp.idleStandbyEnabled ? `${sp.idleStandbyMin ?? 15}分钟` : '关';
       const lines = [
         `🖥️ CS80 设备状态：${st.device ?? 'unknown'}${st.usbSpeed ? ` (USB ${st.usbSpeed} Mbps)` : ''}${st.block ? ` · block=${st.block}` : ''}`,
         `🤖 脸部状态：${st.botState ?? 'idle'} (${st.subPhase ?? 'awake'}) · 表情覆盖=${st.expression ?? 'auto'} · 活跃Worker=${st.workerCount ?? 0}`,
         `📐 副屏网格：2x${st.gridRows ?? 2} · 当前第 ${(Number(st.activePage ?? 0) + 1)}/${st.pageCount ?? 1} 页 · 跑马灯=${st.marqueeMode ?? 'auto_pause'}`,
-        `💡 屏幕：亮度=${st.brightness ?? 100}% · 待机=${st.standby ? '是' : '否'} · Cairo=${st.cairo ? 'on' : 'fallback'}`,
+        `💡 屏幕：亮度=${st.brightness ?? 100}% · 待机=${standbyText} · 夜间待机=${nightText} · 空闲待机=${idleText} · Cairo=${st.cairo ? 'on' : 'fallback'}`,
         `🔊 喇叭：音量=${spk.volume ?? 65}% · 静音=${spk.muted ? '是' : '否'} · 夜间免打扰=${spk.quietHours || '关'}`,
       ];
       if (st.udevHint) {
@@ -182,6 +191,21 @@ export async function runAction(action = 'status', args = {}, context = {}) {
     const screenParts = [];
     if (safeArgs.brightness !== undefined) screenParts.push(`亮度=${safeArgs.brightness}%`);
     if (safeArgs.standby !== undefined) screenParts.push(safeArgs.standby ? '进入待机' : '已唤醒');
+    if (safeArgs.nightStandbyEnabled !== undefined) {
+      screenParts.push(`夜间待机=${safeArgs.nightStandbyEnabled ? '开' : '关'}`);
+    }
+    if (safeArgs.nightStandbyHours !== undefined) {
+      screenParts.push(`夜间时段=${String(safeArgs.nightStandbyHours || '关')}`);
+    }
+    if (safeArgs.idleStandbyEnabled !== undefined) {
+      screenParts.push(`空闲待机=${safeArgs.idleStandbyEnabled ? '开' : '关'}`);
+    }
+    if (safeArgs.idleStandbyMin !== undefined) {
+      screenParts.push(`空闲超时=${safeArgs.idleStandbyMin}分钟`);
+    }
+    if (safeArgs.tempWakeSec !== undefined) {
+      screenParts.push(`临时亮屏=${safeArgs.tempWakeSec}秒`);
+    }
     if (safeArgs.refresh) screenParts.push('已全帧刷新');
     return {
       ok,

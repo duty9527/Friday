@@ -250,7 +250,7 @@ export const PLUGIN_PRESENTATION: Record<string, PluginPresentationMeta> = {
   'cs80-face': {
     shortTitle: 'CS80 实体副屏',
     domain: '桌面外设',
-    summary: '控制本地 CS80 桌面副屏的动态表情、Bento 插件卡片编排、屏幕亮度与内置喇叭提示音。',
+    summary: '控制本地 CS80 桌面副屏的动态表情、Bento 插件卡片编排、屏幕亮度、夜间自动待机息屏与内置喇叭提示音。',
     quickCheckArgs: {},
   },
   laifen: {

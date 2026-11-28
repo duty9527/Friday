@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 from collections import deque
+from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -14,6 +15,7 @@ import os
 from pathlib import Path
 import platform
 import queue
+import re
 import signal
 import struct
 import subprocess
@@ -150,6 +152,135 @@ def _parse_int(val: Any, default: Optional[int] = None, name: str = "value") -> 
     return int(round(f))
 
 
+_TIME_RANGE_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$")
+
+
+def normalize_time_range(raw: str, name: str = "nightStandbyHours") -> str:
+    s = raw.strip()
+    if not s:
+        return ""
+    m = _TIME_RANGE_RE.match(s)
+    if not m:
+        raise ValueError(f"invalid-{name}")
+    sh, sm, eh, em = (int(m.group(i)) for i in range(1, 5))
+    if not (0 <= sh <= 23 and 0 <= sm <= 59 and 0 <= eh <= 23 and 0 <= em <= 59):
+        raise ValueError(f"invalid-{name}")
+    if sh * 60 + sm == eh * 60 + em:
+        raise ValueError(f"invalid-{name}")
+    return f"{sh:02d}:{sm:02d}-{eh:02d}:{em:02d}"
+
+
+def is_in_time_range(spec: str, now_dt: Optional[datetime] = None) -> bool:
+    raw = (spec or "").strip()
+    if not raw or "-" not in raw:
+        return False
+    m = _TIME_RANGE_RE.match(raw)
+    if not m:
+        return False
+    sh, sm, eh, em = (int(m.group(i)) for i in range(1, 5))
+    if not (0 <= sh <= 23 and 0 <= sm <= 59 and 0 <= eh <= 23 and 0 <= em <= 59):
+        return False
+    dt = now_dt or datetime.now()
+    cur = dt.hour * 60 + dt.minute
+    start = sh * 60 + sm
+    end = eh * 60 + em
+    if start == end:
+        return False
+    if start < end:
+        return start <= cur < end
+    return cur >= start or cur < end
+
+
+class ScreenPolicyStore:
+    """Thread-safe atomic JSON persistence for CS80 brightness & auto-standby policies."""
+
+    def __init__(self, data_dir: Path, *, default_night_enabled: bool = True) -> None:
+        self.data_dir = Path(data_dir)
+        self.path = self.data_dir / "screen.json"
+        self._default_night_enabled = bool(default_night_enabled)
+        self._lock = threading.Lock()
+        self._config = self._load()
+
+    def _defaults(self) -> Dict[str, Any]:
+        return {
+            "brightness": 100,
+            "nightStandbyEnabled": self._default_night_enabled,
+            "nightStandbyHours": "23:00-07:30",
+            "idleStandbyEnabled": False,
+            "idleStandbyMin": 15,
+            "tempWakeSec": 90,
+            "manualStandby": False,
+        }
+
+    def _normalize(self, raw: Dict[str, Any], base: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        cfg = dict(base or self._defaults())
+        if "brightness" in raw and raw["brightness"] is not None:
+            bri = _parse_int(raw["brightness"], None, "brightness")
+            cfg["brightness"] = max(5, min(100, (bri // 5) * 5))
+        if "nightStandbyEnabled" in raw and raw["nightStandbyEnabled"] is not None:
+            val = raw["nightStandbyEnabled"]
+            if not isinstance(val, bool):
+                raise ValueError("invalid-nightStandbyEnabled")
+            cfg["nightStandbyEnabled"] = val
+        if "nightStandbyHours" in raw and raw["nightStandbyHours"] is not None:
+            val = raw["nightStandbyHours"]
+            if not isinstance(val, str):
+                raise ValueError("invalid-nightStandbyHours")
+            cfg["nightStandbyHours"] = normalize_time_range(val, "nightStandbyHours")
+        if "idleStandbyEnabled" in raw and raw["idleStandbyEnabled"] is not None:
+            val = raw["idleStandbyEnabled"]
+            if not isinstance(val, bool):
+                raise ValueError("invalid-idleStandbyEnabled")
+            cfg["idleStandbyEnabled"] = val
+        if "idleStandbyMin" in raw and raw["idleStandbyMin"] is not None:
+            mins = _parse_int(raw["idleStandbyMin"], None, "idleStandbyMin")
+            if mins < 1 or mins > 720:
+                raise ValueError("invalid-idleStandbyMin")
+            cfg["idleStandbyMin"] = mins
+        if "tempWakeSec" in raw and raw["tempWakeSec"] is not None:
+            sec = _parse_int(raw["tempWakeSec"], None, "tempWakeSec")
+            if sec < 15 or sec > 1800:
+                raise ValueError("invalid-tempWakeSec")
+            cfg["tempWakeSec"] = sec
+        if "manualStandby" in raw and raw["manualStandby"] is not None:
+            val = raw["manualStandby"]
+            if not isinstance(val, bool):
+                raise ValueError("invalid-manualStandby")
+            cfg["manualStandby"] = val
+        return cfg
+
+    def _load(self) -> Dict[str, Any]:
+        defaults = self._defaults()
+        try:
+            raw = json.loads(self.path.read_text("utf-8"))
+            if not isinstance(raw, dict):
+                return defaults
+            return self._normalize(raw, defaults)
+        except (OSError, ValueError, TypeError):
+            return defaults
+
+    def _save_locked(self) -> None:
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        tmp = self.data_dir / f".tmp-screen.{os.getpid()}.{threading.get_ident()}.json"
+        try:
+            tmp.write_text(json.dumps(self._config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            tmp.replace(self.path)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
+
+    def get(self) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._config)
+
+    def update(self, patch: Dict[str, Any]) -> Dict[str, Any]:
+        with self._lock:
+            updated = self._normalize(patch, self._config)
+            self._config = updated
+            self._save_locked()
+            return dict(updated)
+
+
 class SidecarBridge:
     """Thread-safe subprocess wrapper around qdc1 (or --mock-sidecar)."""
 
@@ -187,6 +318,7 @@ class SidecarBridge:
         self.device_brightness: Optional[int] = None
         self.device_backlight_pwm: Optional[int] = None
         self.device_edges: Optional[int] = None
+        self.device_awake: Optional[bool] = None
 
         self._audio_n: int = 0
         self._audio_seq: int = 0
@@ -232,6 +364,7 @@ class SidecarBridge:
                 "brightness": self.device_brightness,
                 "backlightPwm": self.device_backlight_pwm,
                 "edges": self.device_edges,
+                "awake": self.device_awake,
             },
             "stats": {
                 "frameMs": self.last_frame_ms,
@@ -392,6 +525,8 @@ class SidecarBridge:
                 self._last_ctl_ev = ev
                 self._cond.notify_all()
         elif kind in ("brightness", "power", "hello", "control"):
+            if kind == "power" and ev.get("ok"):
+                self.device_awake = bool(ev.get("awake"))
             with self._cond:
                 self._ctl_seq += 1
                 self._last_ctl_ev = ev
@@ -497,11 +632,12 @@ class FaceDaemon:
         friday_home: Optional[str] = None,
         mock_sidecar: bool = False,
         mock_log: Optional[Path] = None,
-        brightness: int = 100,
+        brightness: Optional[int] = None,
     ) -> None:
         self.friday = FridayClient(explicit_home=friday_home)
         self.data_dir = self.friday.home / "plugins" / "cs80-face"
         self.layout_store = LayoutStore(self.data_dir)
+        self.screen_store = ScreenPolicyStore(self.data_dir, default_night_enabled=not mock_sidecar)
         self.widget_hub = WidgetDataHub(
             self.friday.home,
             self.friday.rpc,
@@ -512,12 +648,21 @@ class FaceDaemon:
         self.animator = BotAnimator()
 
         self._lock = threading.Lock()
+        self._hw_power_lock = threading.Lock()
         self._wake_event = threading.Event()
         self._widget_refresh_event = threading.Event()
         self._stop = False
         self._full_needed = True
         self._standby = False
-        self._brightness = max(5, min(100, (int(brightness) // 5) * 5))
+        self._standby_reason = "none"
+        self._last_activity_mono = time.monotonic()
+        self._temp_wake_until = 0.0
+        self._hw_standby_applied: Optional[bool] = None
+        self._hw_standby_session = -1
+        if brightness is not None:
+            self._brightness = max(5, min(100, (int(brightness) // 5) * 5))
+        else:
+            self._brightness = int(self.screen_store.get()["brightness"])
         self._last_session_seen = -1
 
         self._banner_meta: Optional[str] = None
@@ -558,6 +703,83 @@ class FaceDaemon:
             on_patch_lost=self._on_patch_lost,
         )
         self.speaker = SpeakerController(self.data_dir, self.sidecar)
+        with self._lock:
+            self._refresh_standby_state_locked(self._last_activity_mono)
+
+    def evaluate_standby(self, now_mono: float, now_dt: Optional[datetime] = None) -> Tuple[bool, str]:
+        """Evaluate whether the physical CS80 screen should currently be in standby (call under self._lock)."""
+        cfg = self.screen_store.get()
+        voice_active = (
+            (self._voice_state is not None and now_mono < self._voice_until)
+            or (self._last_snapshot.bot_state == "listening")
+        )
+        if voice_active:
+            self._last_activity_mono = now_mono
+            self._temp_wake_until = max(self._temp_wake_until, now_mono + int(cfg["tempWakeSec"]))
+            return False, "none"
+
+        in_night = bool(cfg["nightStandbyEnabled"]) and is_in_time_range(
+            str(cfg["nightStandbyHours"]),
+            now_dt=now_dt,
+        )
+        if cfg["manualStandby"]:
+            if now_mono < self._temp_wake_until:
+                return False, "none"
+            return True, "manual"
+        if in_night:
+            if now_mono < self._temp_wake_until:
+                return False, "none"
+            return True, "night"
+        if cfg["idleStandbyEnabled"]:
+            idle_sec = int(cfg["idleStandbyMin"]) * 60.0
+            if (now_mono - self._last_activity_mono) >= idle_sec and now_mono >= self._temp_wake_until:
+                return True, "idle"
+        return False, "none"
+
+    def _refresh_standby_state_locked(self, now_mono: float, now_dt: Optional[datetime] = None) -> Tuple[bool, str]:
+        standby, reason = self.evaluate_standby(now_mono, now_dt=now_dt)
+        self._standby = standby
+        self._standby_reason = reason
+        return standby, reason
+
+    def _mark_user_activity_locked(self, now_mono: float, *, wake: bool = True) -> None:
+        self._last_activity_mono = now_mono
+        if wake:
+            cfg = self.screen_store.get()
+            self._temp_wake_until = max(self._temp_wake_until, now_mono + int(cfg["tempWakeSec"]))
+        was_standby = self._standby
+        standby_now, _ = self._refresh_standby_state_locked(now_mono)
+        if was_standby and not standby_now:
+            self._full_needed = True
+            self.renderer.invalidate_prev()
+
+    def _sync_hardware_standby(self, target_standby: bool, *, force: bool = False) -> Dict[str, Any]:
+        """Apply physical CTL_SLEEP / CTL_WAKE to qdc1 outside self._lock."""
+        with self._hw_power_lock:
+            if not self.sidecar.is_up():
+                return {"ok": True, "deferred": True, "standby": target_standby}
+            session = self.sidecar.session
+            with self._lock:
+                already_synced = (
+                    not force
+                    and self._hw_standby_session == session
+                    and self._hw_standby_applied == target_standby
+                )
+            if already_synced:
+                return {"ok": True, "unchanged": True, "standby": target_standby}
+            if target_standby:
+                res = self.sidecar.send_ctl(CTL_SLEEP, 0)
+            else:
+                res = self.sidecar.send_ctl(CTL_WAKE, 0)
+                with self._lock:
+                    bri = self._brightness
+                self.sidecar.send_ctl(CTL_BRIGHTNESS, bri)
+                self.sidecar.send_ctl(CTL_STATE, 0)
+            if res.get("ok"):
+                with self._lock:
+                    self._hw_standby_applied = target_standby
+                    self._hw_standby_session = session
+            return res
 
     def _on_sidecar_ready(self) -> None:
         with self._lock:
@@ -590,19 +812,21 @@ class FaceDaemon:
         while not self._stop:
             with self._lock:
                 snap = self._last_snapshot
+                in_standby = self._standby
             last_view = self.friday.last_view
             prev_rev, _ = self.widget_hub.snapshot_all()
             forced = self._widget_refresh_event.is_set()
             if forced:
                 self._widget_refresh_event.clear()
-            try:
-                self.widget_hub.refresh_due(last_view, connected=snap.connected, force=False)
-            except Exception:
-                pass
-            new_rev, _ = self.widget_hub.snapshot_all()
-            if new_rev != prev_rev or forced:
-                self._wake_event.set()
-            self._widget_refresh_event.wait(timeout=2.0)
+            if not in_standby or forced:
+                try:
+                    self.widget_hub.refresh_due(last_view, connected=snap.connected, force=False)
+                except Exception:
+                    pass
+                new_rev, _ = self.widget_hub.snapshot_all()
+                if new_rev != prev_rev or forced:
+                    self._wake_event.set()
+            self._widget_refresh_event.wait(timeout=10.0 if in_standby else 2.0)
 
     def _apply_scene(
         self,
@@ -759,11 +983,11 @@ class FaceDaemon:
             try:
                 if kind == "ready":
                     with self._lock:
-                        brightness = self._brightness
-                    self.sidecar.send_ctl(CTL_BRIGHTNESS, brightness)
-                    self.sidecar.send_ctl(CTL_STATE, 0)
+                        in_standby, _ = self._refresh_standby_state_locked(time.monotonic())
+                    self._sync_hardware_standby(in_standby, force=True)
                     self.speaker.on_sidecar_ready()
-                    self.speaker.play_chime("boot", force=False, sleeping=False)
+                    if not in_standby:
+                        self.speaker.play_chime("boot", force=False, sleeping=False)
                 elif kind == "chime":
                     self.speaker.play_chime(
                         str(args.get("name")),
@@ -811,6 +1035,9 @@ class FaceDaemon:
                         need_wake = True
 
                     active_state = self._resolve_active_state(now, snap)
+                    if snap.bot_state == "listening":
+                        self._mark_user_activity_locked(now, wake=True)
+                        need_wake = True
                     sub_phase = "awake" if active_state in ("listening", "thinking", *SCENE_STATES) else snap.sub_phase
                     if self.animator.set_state(
                         active_state,
@@ -924,128 +1151,156 @@ class FaceDaemon:
             pending_full: Optional[bytes] = None
             pending_patch: Optional[bytes] = None
             frame_session = 0
+            need_hw_sync = False
+            target_hw_standby = False
             delay = 0.5
             try:
                 with self._lock:
-                    active_state = self._resolve_active_state(now, self._last_snapshot)
-                    sub_phase = "awake" if active_state in ("listening", "thinking", *SCENE_STATES) else self._last_snapshot.sub_phase
-                    self.animator.set_state(
-                        active_state,
-                        sub_phase=sub_phase,
-                        worker_count=self._last_snapshot.worker_count,
-                    )
-
-                    layout = self.layout_store.get()
-                    pages = layout.get("pages") or []
-                    rotate_sec = int(layout.get("pageRotateSec") or 0)
-                    preempted = bool(layout.get("autoTaskOverlay", True)) and (
-                        bool(self._last_snapshot.hud.ask_boss_question) or bool(self._last_snapshot.hud.workers)
-                    )
-                    if len(pages) > 1 and rotate_sec > 0 and not preempted and active_state != "listening":
-                        if now - self._last_page_rotate_at >= rotate_sec:
-                            self.layout_store.step_rotation(1)
-                            self._last_page_rotate_at = now
-                            layout = self.layout_store.get()
-                    else:
-                        if active_state == "listening" or preempted:
-                            self._last_page_rotate_at = now
-
-                    data_rev, widget_data = self.widget_hub.snapshot_all()
-                    hud = self._effective_hud(now, layout, data_rev)
-                    geo = stage_geometry_for_rows(hud.grid_rows)
-
-                    # Step animator and marquee together
-                    self.renderer.sync_marquee_metrics(hud)
-                    marquee_moved = self.renderer.marquee.step(dt)
-                    face_snap = self.animator.step(
-                        dt,
-                        now_wall=now,
-                        center_x=geo["face_cx"],
-                        center_y=geo["face_cy"],
-                        base_radius=geo["face_r"],
-                    )
-
-                    hud_changed = (hud != self._last_hud_key) or (hud.clock_hm != self._last_clock_hm)
+                    was_standby = self._standby
+                    standby_now, _ = self._refresh_standby_state_locked(now)
+                    if was_standby and not standby_now:
+                        self._full_needed = True
+                        self.renderer.invalidate_prev()
+                        self._widget_refresh_event.set()
                     sidecar_up = self.sidecar.is_up()
                     session = self.sidecar.session
                     frame_session = session
                     if session != self._last_session_seen:
                         self._last_session_seen = session
                         self._full_needed = True
-
-                    should_draw = (
-                        (not face_snap.settled)
-                        or marquee_moved
-                        or hud_changed
-                        or self._full_needed
-                        or self._render_seq == 0
+                    need_hw_sync = sidecar_up and (
+                        self._hw_standby_session != session or self._hw_standby_applied != standby_now
                     )
-
-                    if should_draw:
-                        active_cards = pages[hud.active_page].get("cards") or [] if pages else []
-                        placed_cards, _ = pack_bento_page(
-                            active_cards,
-                            grid_rows=hud.grid_rows,
-                            x0=36.0,
-                            y0=geo["grid_y"],
-                            total_w=728.0,
-                            total_h=geo["grid_h"],
-                            gap=geo["gap"],
+                    target_hw_standby = standby_now
+                    if standby_now:
+                        sec_in_min = time.localtime().tm_sec
+                        delay = min(15.0, max(0.5, 60.2 - sec_in_min))
+                    else:
+                        active_state = self._resolve_active_state(now, self._last_snapshot)
+                        sub_phase = "awake" if active_state in ("listening", "thinking", *SCENE_STATES) else self._last_snapshot.sub_phase
+                        self.animator.set_state(
+                            active_state,
+                            sub_phase=sub_phase,
+                            worker_count=self._last_snapshot.worker_count,
                         )
-                        full_bytes, patch_info = self.renderer.render_frame(
-                            face_snap,
-                            hud,
-                            placed_cards=placed_cards,
-                            widget_data=widget_data,
-                        )
-                        self._render_seq += 1
-                        self._last_hud_key = hud
-                        self._last_clock_hm = hud.clock_hm
-                        push_full = self._full_needed or patch_info is None
-                        if sidecar_up and not self._standby:
-                            if push_full:
-                                pending_full = full_bytes
-                            elif patch_info is not None and patch_info[0] > 0:
-                                pending_patch = patch_info[1]
-                            elif patch_info is not None and patch_info[0] == 0:
-                                self._full_needed = False
 
-                    delay = self.animator.next_wakeup_delay(now_wall=now)
-                    m_delay = self.renderer.marquee.next_wakeup_delay()
-                    if m_delay is not None:
-                        delay = min(delay, m_delay)
-                    if len(pages) > 1 and rotate_sec > 0 and not preempted and active_state != "listening":
-                        delay = min(delay, max(0.2, (self._last_page_rotate_at + rotate_sec) - now))
-                    for active, deadline in (
-                        (bool(self._banner_text), self._banner_until),
-                        (bool(self._inbound_text), self._inbound_until),
-                        (bool(self._voice_state), self._voice_until),
-                        (bool(self._scene_state), self._scene_until),
-                        (bool(self._transient_state), self._transient_until),
-                    ):
-                        if active and deadline > 0.0:
-                            delay = min(delay, max(0.05, deadline - now))
-                    sec_in_min = time.localtime().tm_sec
-                    delay = min(delay, max(0.2, 60.2 - sec_in_min))
+                        layout = self.layout_store.get()
+                        pages = layout.get("pages") or []
+                        rotate_sec = int(layout.get("pageRotateSec") or 0)
+                        preempted = bool(layout.get("autoTaskOverlay", True)) and (
+                            bool(self._last_snapshot.hud.ask_boss_question) or bool(self._last_snapshot.hud.workers)
+                        )
+                        if len(pages) > 1 and rotate_sec > 0 and not preempted and active_state != "listening":
+                            if now - self._last_page_rotate_at >= rotate_sec:
+                                self.layout_store.step_rotation(1)
+                                self._last_page_rotate_at = now
+                                layout = self.layout_store.get()
+                        else:
+                            if active_state == "listening" or preempted:
+                                self._last_page_rotate_at = now
+
+                        data_rev, widget_data = self.widget_hub.snapshot_all()
+                        hud = self._effective_hud(now, layout, data_rev)
+                        geo = stage_geometry_for_rows(hud.grid_rows)
+
+                        # Step animator and marquee together
+                        self.renderer.sync_marquee_metrics(hud)
+                        marquee_moved = self.renderer.marquee.step(dt)
+                        face_snap = self.animator.step(
+                            dt,
+                            now_wall=now,
+                            center_x=geo["face_cx"],
+                            center_y=geo["face_cy"],
+                            base_radius=geo["face_r"],
+                        )
+
+                        hud_changed = (hud != self._last_hud_key) or (hud.clock_hm != self._last_clock_hm)
+                        should_draw = (
+                            (not face_snap.settled)
+                            or marquee_moved
+                            or hud_changed
+                            or self._full_needed
+                            or self._render_seq == 0
+                        )
+
+                        if should_draw:
+                            active_cards = pages[hud.active_page].get("cards") or [] if pages else []
+                            placed_cards, _ = pack_bento_page(
+                                active_cards,
+                                grid_rows=hud.grid_rows,
+                                x0=36.0,
+                                y0=geo["grid_y"],
+                                total_w=728.0,
+                                total_h=geo["grid_h"],
+                                gap=geo["gap"],
+                            )
+                            full_bytes, patch_info = self.renderer.render_frame(
+                                face_snap,
+                                hud,
+                                placed_cards=placed_cards,
+                                widget_data=widget_data,
+                            )
+                            self._render_seq += 1
+                            self._last_hud_key = hud
+                            self._last_clock_hm = hud.clock_hm
+                            push_full = self._full_needed or patch_info is None
+                            if sidecar_up:
+                                if push_full:
+                                    pending_full = full_bytes
+                                elif patch_info is not None and patch_info[0] > 0:
+                                    pending_patch = patch_info[1]
+                                elif patch_info is not None and patch_info[0] == 0:
+                                    self._full_needed = False
+
+                        delay = self.animator.next_wakeup_delay(now_wall=now)
+                        m_delay = self.renderer.marquee.next_wakeup_delay()
+                        if m_delay is not None:
+                            delay = min(delay, m_delay)
+                        if len(pages) > 1 and rotate_sec > 0 and not preempted and active_state != "listening":
+                            delay = min(delay, max(0.2, (self._last_page_rotate_at + rotate_sec) - now))
+                        for active, deadline in (
+                            (bool(self._banner_text), self._banner_until),
+                            (bool(self._inbound_text), self._inbound_until),
+                            (bool(self._voice_state), self._voice_until),
+                            (bool(self._scene_state), self._scene_until),
+                            (bool(self._transient_state), self._transient_until),
+                        ):
+                            if active and deadline > 0.0:
+                                delay = min(delay, max(0.05, deadline - now))
+                        if self._temp_wake_until > now:
+                            delay = min(delay, max(0.05, self._temp_wake_until - now))
+                        cfg = self.screen_store.get()
+                        if cfg["idleStandbyEnabled"]:
+                            idle_deadline = self._last_activity_mono + int(cfg["idleStandbyMin"]) * 60.0
+                            if idle_deadline > now:
+                                delay = min(delay, max(0.2, idle_deadline - now))
+                        sec_in_min = time.localtime().tm_sec
+                        delay = min(delay, max(0.2, 60.2 - sec_in_min))
 
                 # Write to sidecar outside self._lock so HTTP/poll threads never block on USB writes
-                if pending_full is not None:
-                    if self.sidecar.send_full_bgr565(pending_full):
-                        with self._lock:
-                            if self.sidecar.session == frame_session:
-                                self._full_needed = False
-                            else:
+                if target_hw_standby:
+                    if need_hw_sync:
+                        self._sync_hardware_standby(True)
+                else:
+                    if need_hw_sync:
+                        self._sync_hardware_standby(False)
+                    if pending_full is not None:
+                        if self.sidecar.send_full_bgr565(pending_full):
+                            with self._lock:
+                                if self.sidecar.session == frame_session:
+                                    self._full_needed = False
+                                else:
+                                    self._full_needed = True
+                                    self.renderer.invalidate_prev()
+                        else:
+                            with self._lock:
                                 self._full_needed = True
                                 self.renderer.invalidate_prev()
-                    else:
-                        with self._lock:
-                            self._full_needed = True
-                            self.renderer.invalidate_prev()
-                elif pending_patch is not None:
-                    if not self.sidecar.send_patch(pending_patch):
-                        with self._lock:
-                            self._full_needed = True
-                            self.renderer.invalidate_prev()
+                    elif pending_patch is not None:
+                        if not self.sidecar.send_patch(pending_patch):
+                            with self._lock:
+                                self._full_needed = True
+                                self.renderer.invalidate_prev()
             except Exception as exc:
                 print(f"[cs80-render] error: {exc}", file=sys.stderr, flush=True)
                 delay = 0.4
@@ -1111,6 +1366,7 @@ class FaceDaemon:
                         sub_phase="awake" if active_state in ("listening", "thinking", *SCENE_STATES) else self._last_snapshot.sub_phase,
                         worker_count=self._last_snapshot.worker_count,
                     )
+                self._mark_user_activity_locked(now, wake=True)
             self._wake_event.set()
             return {"ok": True, "action": "voice", "phase": phase}
 
@@ -1143,6 +1399,8 @@ class FaceDaemon:
                     sub_phase="awake" if active_state in ("listening", "thinking", *SCENE_STATES) else self._last_snapshot.sub_phase,
                     worker_count=self._last_snapshot.worker_count,
                 )
+                if phase != "end" and (scene == "speaking" or channel == "xiaoai"):
+                    self._mark_user_activity_locked(now, wake=True)
             self._wake_event.set()
             return {"ok": True, "action": "scene", "scene": scene, "phase": phase, "botState": active_state}
 
@@ -1168,6 +1426,8 @@ class FaceDaemon:
                     self._inbound_text = txt
                     self._inbound_until = now + max(1.0, hold_sec)
                     self._inbound_baseline_sig = self._last_snapshot.reply_sig
+                    if raw_ch == "XIAOAI":
+                        self._mark_user_activity_locked(now, wake=True)
             self._wake_event.set()
             return {"ok": True, "action": "inbound", "source": src_label}
 
@@ -1175,6 +1435,7 @@ class FaceDaemon:
             updated, grid_changed, added_kinds = self.layout_store.apply_patch(body)
             with self._lock:
                 self._last_page_rotate_at = now
+                self._mark_user_activity_locked(now, wake=True)
                 if grid_changed:
                     self._full_needed = True
                     self.renderer.invalidate_prev()
@@ -1271,6 +1532,7 @@ class FaceDaemon:
                     self._banner_text = str(text)
                     self._banner_meta = str(title or "F.R.I.D.A.Y. · 表情互动")
                     self._banner_until = now + hold_sec
+                self._mark_user_activity_locked(now, wake=True)
             self._wake_event.set()
             return {"ok": True, "action": "express", "expr": expr, "scene": scene_arg or None, "poke": poke}
 
@@ -1318,50 +1580,104 @@ class FaceDaemon:
 
         if action == "screen":
             out = {"ok": True, "action": "screen"}
+            policy_patch: Dict[str, Any] = {}
+            bri_val: Optional[int] = None
             if body.get("brightness") is not None:
                 try:
                     raw_bri = _parse_int(body.get("brightness"), None, "brightness")
                 except ValueError as exc:
                     return {"ok": False, "err": str(exc)}
-                val = max(5, min(100, (raw_bri // 5) * 5))
-                with self._lock:
-                    self._brightness = val
-                if self.sidecar.is_up():
-                    out["brightness"] = self.sidecar.send_ctl(CTL_BRIGHTNESS, val)
+                bri_val = max(5, min(100, (raw_bri // 5) * 5))
+                policy_patch["brightness"] = bri_val
+
+            for key in ("nightStandbyEnabled", "nightStandbyHours", "idleStandbyEnabled", "idleStandbyMin", "tempWakeSec"):
+                if key in body and body[key] is not None:
+                    policy_patch[key] = body[key]
+
+            if policy_patch:
+                try:
+                    updated_policy = self.screen_store.update(policy_patch)
+                except ValueError as exc:
+                    return {"ok": False, "err": str(exc)}
+            else:
+                updated_policy = self.screen_store.get()
+
+            standby_arg = body.get("standby")
+            if standby_arg is not None and not isinstance(standby_arg, bool):
+                return {"ok": False, "err": "invalid-standby"}
+
+            if standby_arg is True:
+                in_night_now = bool(updated_policy["nightStandbyEnabled"]) and is_in_time_range(
+                    str(updated_policy["nightStandbyHours"])
+                )
+                updated_policy = self.screen_store.update({"manualStandby": not in_night_now})
+            elif standby_arg is False:
+                updated_policy = self.screen_store.update({"manualStandby": False})
+
+            with self._lock:
+                if bri_val is not None:
+                    self._brightness = bri_val
+                if standby_arg is True:
+                    self._temp_wake_until = 0.0
+                elif standby_arg is False:
+                    self._mark_user_activity_locked(now, wake=True)
+                elif bri_val is not None or body.get("refresh"):
+                    self._mark_user_activity_locked(now, wake=True)
+                elif policy_patch.get("idleStandbyEnabled") is True:
+                    # Reset idle clock when enabling idle standby so it does not snap off mid-click
+                    self._last_activity_mono = now
+
+                was_standby = self._standby
+                standby_now, reason_now = self._refresh_standby_state_locked(now)
+                if not standby_now and (was_standby or body.get("refresh") or standby_arg is False):
+                    self._full_needed = True
+                    self.renderer.invalidate_prev()
+
+            hw_res = self._sync_hardware_standby(standby_now, force=(standby_arg is not None))
+            if standby_arg is not None:
+                out["standby"] = hw_res
+            if bri_val is not None:
+                if not standby_now and self.sidecar.is_up():
+                    out["brightness"] = self.sidecar.send_ctl(CTL_BRIGHTNESS, bri_val)
                     self.sidecar.send_ctl(CTL_STATE, 0)
                 else:
-                    out["brightness"] = {"ok": True, "deferred": True, "value": val}
-            if body.get("standby") is not None:
-                standby = bool(body["standby"])
-                with self._lock:
-                    self._standby = standby
-                if self.sidecar.is_up():
-                    out["standby"] = self.sidecar.send_ctl(CTL_SLEEP if standby else CTL_WAKE, 0)
-                if not standby:
-                    with self._lock:
-                        self._full_needed = True
-                        self.renderer.invalidate_prev()
-                    self._wake_event.set()
+                    out["brightness"] = {"ok": True, "deferred": True, "value": bri_val}
             if body.get("refresh"):
                 self.widget_hub.trigger_refresh()
                 self._widget_refresh_event.set()
-                with self._lock:
-                    self._full_needed = True
-                    self.renderer.invalidate_prev()
-                self._wake_event.set()
                 out["refresh"] = True
+            elif not standby_now and was_standby:
+                self.widget_hub.trigger_refresh()
+                self._widget_refresh_event.set()
+
+            self._wake_event.set()
+            out["standbyActive"] = standby_now
+            out["standbyReason"] = reason_now
+            out["screenPolicy"] = updated_policy
             return out
 
         return {"ok": False, "err": f"unknown-action:{action}"}
 
     def get_status(self) -> Dict[str, Any]:
+        now = time.monotonic()
         with self._lock:
             snap = self._last_snapshot
             state_id = self.animator.state_id
             sub_phase = self.animator.sub_phase
             expr = self.animator.expr_override
-            standby = self._standby
+            standby, reason = self._refresh_standby_state_locked(now)
             brightness = self._brightness
+            temp_wake_until = self._temp_wake_until
+        screen_policy = self.screen_store.get()
+        under_standby_policy = bool(screen_policy["manualStandby"]) or (
+            bool(screen_policy["nightStandbyEnabled"])
+            and is_in_time_range(str(screen_policy["nightStandbyHours"]))
+        )
+        temp_wake_rem = (
+            max(0, int(math.ceil(temp_wake_until - now)))
+            if (not standby and temp_wake_until > now and under_standby_policy)
+            else 0
+        )
         sidecar_status = self.sidecar.snapshot_status()
         layout = self.layout_store.get()
         return {
@@ -1374,6 +1690,9 @@ class FaceDaemon:
             "expression": expr,
             "workerCount": snap.worker_count,
             "standby": standby,
+            "standbyReason": reason,
+            "tempWakeRemainingSec": temp_wake_rem,
+            "screenPolicy": screen_policy,
             "brightness": brightness,
             "speaker": self.speaker.get_config_snapshot(),
             "gridRows": layout.get("gridRows", 2),
@@ -1777,7 +2096,7 @@ def main() -> int:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8788)
     ap.add_argument("--home", default=None, help="Explicit Friday home directory")
-    ap.add_argument("--brightness", type=int, default=100)
+    ap.add_argument("--brightness", type=int, default=None)
     ap.add_argument("--mock-sidecar", action="store_true")
     ap.add_argument("--mock-log", default=None)
     ap.add_argument("--internal-mock-sidecar", action="store_true")
